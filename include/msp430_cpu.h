@@ -125,6 +125,7 @@ typedef void (*event_fn)(void *user_data, msp430_event_t *event);
 
 struct msp430_event {
     int64_t          fire_cycle;
+    int64_t          fire_ns;       /* wall-clock fire time (0 = cycle-based only) */
     event_fn         callback;
     void            *user_data;
     msp430_event_t  *next;
@@ -162,6 +163,10 @@ typedef struct msp430_cpu {
     msp430_event_t *event_queue;
     int64_t         next_event_cycle;
     int64_t         cycle_limit;       /* max cycle for step_until (INT64_MAX = no limit) */
+
+    /* Nanosecond simulation time */
+    int64_t         sim_time_ns;       /* current simulation time in nanoseconds */
+    uint32_t        cpu_freq_hz;       /* current CPU frequency (for ns<->cycle conversion) */
 
     /* Config */
     const msp430_config_t *config;
@@ -205,7 +210,20 @@ void msp430_flag_interrupt(msp430_cpu_t *cpu, int vector, void *source,
 
 /* Events */
 void msp430_schedule_event(msp430_cpu_t *cpu, msp430_event_t *ev, int64_t cycle);
+void msp430_schedule_event_ns(msp430_cpu_t *cpu, msp430_event_t *ev, int64_t fire_ns);
 void msp430_cancel_event(msp430_cpu_t *cpu, msp430_event_t *ev);
+
+/* CPU frequency management */
+void msp430_cpu_set_frequency(msp430_cpu_t *cpu, uint32_t freq_hz);
+
+/* Nanosecond <-> cycle conversion helpers */
+static inline int64_t msp430_ns_to_cycles(int64_t ns, uint32_t freq_hz) {
+    return ns * (int64_t)freq_hz / 1000000000LL;
+}
+static inline int64_t msp430_cycles_to_ns(int64_t cycles, uint32_t freq_hz) {
+    if (freq_hz == 0) return 0;
+    return cycles * 1000000000LL / (int64_t)freq_hz;
+}
 
 /* Memory access (for external use / tests) */
 static inline uint16_t msp430_read_word(const msp430_cpu_t *cpu, uint32_t addr) {

@@ -28,6 +28,9 @@ static void recalculate_dco(msp430_clock_t *clk) {
 
     clk->dco_freq = new_dco;
     clk->smclk_freq = new_smclk;
+
+    /* Update CPU frequency — recomputes fire_cycle for all ns-based events */
+    msp430_cpu_set_frequency(clk->cpu, new_smclk);
 }
 
 static int clock_read(void *user_data, uint32_t addr, bool word, int64_t cycles) {

@@ -14,9 +14,9 @@
 #include <time.h>
 
 #define MAX_NODES 2
-#define TIME_STEP_COARSE  8192    /* ~1ms at 8MHz — idle periods */
-#define DEFAULT_SIM_MS    20000   /* 20 seconds of simulated time */
-#define CYCLES_PER_MS     8000    /* ~8MHz CPU clock */
+#define TIME_STEP_NS      1000000LL  /* 1ms in nanoseconds */
+#define DEFAULT_SIM_MS    20000      /* 20 seconds of simulated time */
+#define MS_TO_NS          1000000LL
 
 static double get_time_ms(void) {
     struct timespec ts;
@@ -173,20 +173,18 @@ int run_multinode_test(int argc, char **argv) {
     }
 
     if (firmware_count == 0) {
-        firmware_paths[0] = "firmware/sky/nullnet-broadcast.sky";
+        firmware_paths[0] = "../firmware/sky/nullnet-broadcast.sky";
         firmware_count = 1;
     }
 
-    int64_t total_cycles = (int64_t)sim_ms * CYCLES_PER_MS;
-    int64_t total_steps = total_cycles / TIME_STEP_COARSE;
+    int64_t total_ns = (int64_t)sim_ms * MS_TO_NS;
 
     printf("=== Multi-Node CC2420 Radio Test ===\n");
     for (int i = 0; i < firmware_count; i++)
         printf("Firmware[%d]: %s\n", i, firmware_paths[i]);
-    printf("Nodes: %d, Simulated time: %d ms (%lld cycles)\n",
-           node_count, sim_ms, (long long)total_cycles);
-    printf("Time step: %d cycles, Total steps: %lld\n\n",
-           TIME_STEP_COARSE, (long long)total_steps);
+    printf("Nodes: %d, Simulated time: %d ms (%lld ns)\n",
+           node_count, sim_ms, (long long)total_ns);
+    printf("Time step: %lld ns\n\n", (long long)TIME_STEP_NS);
 
     num_nodes = node_count;
     for (int i = 0; i < node_count; i++) {
@@ -200,33 +198,40 @@ int run_multinode_test(int argc, char **argv) {
 
     printf("\n--- Simulation running ---\n\n");
 
-    /* Start sim_time at max of all nodes' initial cycles */
-    int64_t sim_time = 0;
+    /* Start sim_time_ns at max of all nodes' current sim_time_ns */
+    int64_t sim_ns = 0;
     for (int i = 0; i < node_count; i++) {
-        if (nodes[i].plat.cpu.cycles > sim_time)
-            sim_time = nodes[i].plat.cpu.cycles;
+        if (nodes[i].plat.cpu.sim_time_ns > sim_ns)
+            sim_ns = nodes[i].plat.cpu.sim_time_ns;
     }
-    printf("  Initial sim_time: %lld cycles (%lld ms)\n",
-           (long long)sim_time, (long long)(sim_time / CYCLES_PER_MS));
+    printf("  Initial sim_time: %lld ns (%lld ms)\n",
+           (long long)sim_ns, (long long)(sim_ns / MS_TO_NS));
 
-    int64_t end_time = sim_time + total_cycles;
-    int64_t progress_interval = total_cycles / 10;
-    int64_t next_progress = sim_time + progress_interval;
+    int64_t end_ns = sim_ns + total_ns;
+    int64_t progress_interval = total_ns / 10;
+    int64_t next_progress = sim_ns + progress_interval;
 
     double t_start = get_time_ms();
 
-    while (sim_time < end_time) {
-        sim_time += TIME_STEP_COARSE;
+    while (sim_ns < end_ns) {
+        sim_ns += TIME_STEP_NS;
 
         for (int i = 0; i < node_count; i++) {
             deliver_rf_bytes(i);
-            msp430_step_until(&nodes[i].plat.cpu, sim_time);
+            /* Convert ns target to cycle target for this node */
+            msp430_cpu_t *cpu = &nodes[i].plat.cpu;
+            int64_t delta_ns = sim_ns - cpu->sim_time_ns;
+            if (delta_ns > 0) {
+                int64_t target_cycle = cpu->cycles +
+                    msp430_ns_to_cycles(delta_ns, cpu->cpu_freq_hz);
+                msp430_step_until(cpu, target_cycle);
+            }
         }
 
-        if (sim_time >= next_progress) {
-            int pct = (int)((sim_time - (end_time - total_cycles)) * 100 / total_cycles);
+        if (sim_ns >= next_progress) {
+            int pct = (int)((sim_ns - (end_ns - total_ns)) * 100 / total_ns);
             printf("  --- Progress: %d%% (%lld ms) rf_bytes=%d uart_bytes=%d ---\n",
-                   pct, (long long)(sim_time / CYCLES_PER_MS),
+                   pct, (long long)(sim_ns / MS_TO_NS),
                    rf_byte_count, uart_byte_count);
             for (int i = 0; i < node_count; i++) {
                 printf("    Node %d: %lld cycles, cc2420_state=%d\n",

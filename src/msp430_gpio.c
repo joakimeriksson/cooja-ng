@@ -6,7 +6,6 @@
  */
 #include "msp430_gpio.h"
 #include <string.h>
-#include <stdio.h>
 
 /* Interrupt-capable port register offsets (P1, P2) */
 #define INT_OFF_IN   0
@@ -112,7 +111,8 @@ static int gpio_read(void *user_data, uint32_t addr, bool word, int64_t cycles) 
         if (port->has_interrupt || port->base_addr == 0) continue;
         if (addr >= port->base_addr && addr < port->base_addr + NOINT_REG_SIZE) {
             switch (addr - port->base_addr) {
-            case NOINT_OFF_IN:  return port->in;
+            case NOINT_OFF_IN:
+                return port->in;
             case NOINT_OFF_OUT: return port->out;
             case NOINT_OFF_DIR: return port->dir;
             case NOINT_OFF_SEL: return port->sel;

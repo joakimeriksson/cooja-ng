@@ -253,11 +253,14 @@ static void symbol_event_callback(void *user_data, msp430_event_t *event) {
     }
 }
 
+/* CC2420 timing constants in nanoseconds (independent of CPU clock) */
+#define CC2420_SYMBOL_PERIOD_NS  16000   /* 62.5 ksym/s = 16 us/symbol */
+#define CC2420_BYTE_PERIOD_NS    32000   /* 2 symbols per byte = 32 us */
+
 static void schedule_symbols(cc2420_t *r, int symbols) {
-    double ms = symbols * CC2420_SYMBOL_PERIOD;
-    int64_t cycles_delay = (int64_t)(ms * 8000.0);  /* ~8MHz CPU clock */
-    int64_t fire = r->cpu->cycles + cycles_delay;
-    msp430_schedule_event(r->cpu, &r->symbol_event, fire);
+    int64_t delay_ns = (int64_t)symbols * CC2420_SYMBOL_PERIOD_NS;
+    int64_t fire_ns = r->cpu->sim_time_ns + delay_ns;
+    msp430_schedule_event_ns(r->cpu, &r->symbol_event, fire_ns);
 }
 
 static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
@@ -762,9 +765,8 @@ static void start_oscillator(cc2420_t *r) {
     if (r->status & CC2420_STATUS_XOSC16M_STABLE)
         return;
     /* ~1ms startup delay */
-    int64_t delay = (int64_t)(1.0 * 8000.0);  /* 1ms at ~8MHz */
-    msp430_schedule_event(r->cpu, &r->oscillator_event,
-                          r->cpu->cycles + delay);
+    int64_t fire_ns = r->cpu->sim_time_ns + 1000000LL;  /* 1ms = 1,000,000 ns */
+    msp430_schedule_event_ns(r->cpu, &r->oscillator_event, fire_ns);
 }
 
 static void stop_oscillator(cc2420_t *r) {

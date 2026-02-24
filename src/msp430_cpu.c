@@ -312,9 +312,37 @@ void msp430_schedule_event(msp430_cpu_t *cpu, msp430_event_t *ev, int64_t cycle)
     msp430_cancel_event(cpu, ev);
 
     ev->fire_cycle = cycle;
+    ev->fire_ns = 0;  /* cycle-based event */
     ev->next = NULL;
 
     /* Insert sorted */
+    if (cpu->event_queue == NULL || cycle < cpu->event_queue->fire_cycle) {
+        ev->next = cpu->event_queue;
+        cpu->event_queue = ev;
+    } else {
+        msp430_event_t *prev = cpu->event_queue;
+        while (prev->next && prev->next->fire_cycle <= cycle) {
+            prev = prev->next;
+        }
+        ev->next = prev->next;
+        prev->next = ev;
+    }
+    cpu->next_event_cycle = cpu->event_queue->fire_cycle;
+}
+
+void msp430_schedule_event_ns(msp430_cpu_t *cpu, msp430_event_t *ev, int64_t fire_ns) {
+    /* Remove if already queued */
+    msp430_cancel_event(cpu, ev);
+
+    ev->fire_ns = fire_ns;
+    /* Compute shadow fire_cycle from ns */
+    int64_t delta_ns = fire_ns - cpu->sim_time_ns;
+    if (delta_ns < 0) delta_ns = 0;
+    ev->fire_cycle = cpu->cycles + msp430_ns_to_cycles(delta_ns, cpu->cpu_freq_hz);
+    ev->next = NULL;
+
+    /* Insert sorted by fire_cycle */
+    int64_t cycle = ev->fire_cycle;
     if (cpu->event_queue == NULL || cycle < cpu->event_queue->fire_cycle) {
         ev->next = cpu->event_queue;
         cpu->event_queue = ev;
@@ -338,6 +366,50 @@ void msp430_cancel_event(msp430_cpu_t *cpu, msp430_event_t *ev) {
         if (prev) prev->next = ev->next;
     }
     ev->next = NULL;
+    ev->fire_ns = 0;
+    cpu->next_event_cycle = cpu->event_queue ? cpu->event_queue->fire_cycle : INT64_MAX;
+}
+
+void msp430_cpu_set_frequency(msp430_cpu_t *cpu, uint32_t freq_hz) {
+    if (freq_hz == 0) return;
+    /* Update sim_time_ns to current cycles before changing frequency */
+    if (cpu->cpu_freq_hz > 0) {
+        cpu->sim_time_ns = msp430_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+    }
+    cpu->cpu_freq_hz = freq_hz;
+
+    /* Recompute fire_cycle for all ns-based events */
+    msp430_event_t *ev = cpu->event_queue;
+    while (ev) {
+        if (ev->fire_ns > 0) {
+            int64_t delta_ns = ev->fire_ns - cpu->sim_time_ns;
+            if (delta_ns < 0) delta_ns = 0;
+            ev->fire_cycle = cpu->cycles + msp430_ns_to_cycles(delta_ns, freq_hz);
+        }
+        ev = ev->next;
+    }
+
+    /* Re-sort event queue (simple insertion sort rebuild) */
+    msp430_event_t *old_queue = cpu->event_queue;
+    cpu->event_queue = NULL;
+    while (old_queue) {
+        msp430_event_t *e = old_queue;
+        old_queue = e->next;
+        e->next = NULL;
+
+        int64_t cycle = e->fire_cycle;
+        if (cpu->event_queue == NULL || cycle < cpu->event_queue->fire_cycle) {
+            e->next = cpu->event_queue;
+            cpu->event_queue = e;
+        } else {
+            msp430_event_t *prev = cpu->event_queue;
+            while (prev->next && prev->next->fire_cycle <= cycle) {
+                prev = prev->next;
+            }
+            e->next = prev->next;
+            prev->next = e;
+        }
+    }
     cpu->next_event_cycle = cpu->event_queue ? cpu->event_queue->fire_cycle : INT64_MAX;
 }
 
@@ -346,6 +418,11 @@ static void execute_events(msp430_cpu_t *cpu) {
         msp430_event_t *ev = cpu->event_queue;
         cpu->event_queue = ev->next;
         ev->next = NULL;
+        /* Update sim_time_ns from current cycles */
+        if (cpu->cpu_freq_hz > 0) {
+            cpu->sim_time_ns = msp430_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+        }
+        ev->fire_ns = 0;
         ev->callback(ev->user_data, ev);
     }
     cpu->next_event_cycle = cpu->event_queue ? cpu->event_queue->fire_cycle : INT64_MAX;
@@ -892,6 +969,10 @@ void msp430_step_until(msp430_cpu_t *cpu, int64_t target_cycle) {
         msp430_step(cpu, steps);
     }
     cpu->cycle_limit = INT64_MAX;
+    /* Keep sim_time_ns synchronized with cycles */
+    if (cpu->cpu_freq_hz > 0) {
+        cpu->sim_time_ns = msp430_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+    }
 }
 
 /* ===================================================================
