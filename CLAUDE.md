@@ -26,13 +26,18 @@ Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet)
 ## Project Structure
 
 ```
-src/                  Source files (~7,700 LOC)
-include/              Header files
+src/
+  msp430/             MSP430 emulator source files
+  arm/                ARM Cortex-M3 emulator source files
+include/
+  msp430/             MSP430 header files
+  arm/                ARM header files
 test/                 Test runner, correctness, benchmarks, firmware, multinode
 firmware/sky/         Pre-compiled Contiki-NG firmware for Tmote Sky
+firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 ```
 
-### Source Files
+### MSP430 Source Files (src/msp430/)
 
 | File | Purpose |
 |------|---------|
