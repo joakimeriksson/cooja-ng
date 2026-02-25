@@ -1,0 +1,2060 @@
+/*
+ * ARM Cortex-M3 CPU emulator — instruction execution engine
+ */
+#include "arm_cpu.h"
+#include "arm_config.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+/* --- Memory access helpers --- */
+
+static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
+    for (int i = 0; i < cpu->num_io_regions; i++) {
+        arm_io_region_t *r = &cpu->io_regions[i];
+        if (addr >= r->base && addr < r->base + r->size)
+            return r;
+    }
+    return NULL;
+}
+
+uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
+    addr &= ~3u;
+    if (addr < ARM_ROM_SIZE) {
+        return cpu->rom[addr] | (cpu->rom[addr+1]<<8) |
+               (cpu->rom[addr+2]<<16) | (cpu->rom[addr+3]<<24);
+    }
+    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
+        uint32_t off = addr - ARM_FLASH_BASE;
+        return cpu->flash[off] | (cpu->flash[off+1]<<8) |
+               (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
+    }
+    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
+        uint32_t off = addr - ARM_SRAM_BASE;
+        return cpu->sram[off] | (cpu->sram[off+1]<<8) |
+               (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
+    }
+    /* Bit-band alias for peripheral region */
+    if (addr >= ARM_BITBAND_BASE && addr < ARM_BITBAND_BASE + 0x02000000) {
+        uint32_t bb_off = addr - ARM_BITBAND_BASE;
+        uint32_t base_addr = ARM_IO_BASE + (bb_off >> 5) * 4;
+        int bit = (bb_off >> 2) & 0x1F;
+        uint32_t val = arm_read32(cpu, base_addr);
+        return (val >> bit) & 1;
+    }
+    /* IO regions */
+    arm_io_region_t *r = find_io_region(cpu, addr);
+    if (r) return r->read(r->user_data, addr);
+    return 0;
+}
+
+uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
+    addr &= ~1u;
+    if (addr < ARM_ROM_SIZE) {
+        return cpu->rom[addr] | (cpu->rom[addr+1]<<8);
+    }
+    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
+        uint32_t off = addr - ARM_FLASH_BASE;
+        return cpu->flash[off] | (cpu->flash[off+1]<<8);
+    }
+    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
+        uint32_t off = addr - ARM_SRAM_BASE;
+        return cpu->sram[off] | (cpu->sram[off+1]<<8);
+    }
+    arm_io_region_t *r = find_io_region(cpu, addr);
+    if (r) return (uint16_t)r->read(r->user_data, addr);
+    return 0;
+}
+
+uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
+    if (addr < ARM_ROM_SIZE) return cpu->rom[addr];
+    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE)
+        return cpu->flash[addr - ARM_FLASH_BASE];
+    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE)
+        return cpu->sram[addr - ARM_SRAM_BASE];
+    arm_io_region_t *r = find_io_region(cpu, addr);
+    if (r) return (uint8_t)r->read(r->user_data, addr);
+    return 0;
+}
+
+void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
+    addr &= ~3u;
+    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
+        uint32_t off = addr - ARM_SRAM_BASE;
+        cpu->sram[off]   = val & 0xFF;
+        cpu->sram[off+1] = (val >> 8) & 0xFF;
+        cpu->sram[off+2] = (val >> 16) & 0xFF;
+        cpu->sram[off+3] = (val >> 24) & 0xFF;
+        return;
+    }
+    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
+        uint32_t off = addr - ARM_FLASH_BASE;
+        cpu->flash[off]   = val & 0xFF;
+        cpu->flash[off+1] = (val >> 8) & 0xFF;
+        cpu->flash[off+2] = (val >> 16) & 0xFF;
+        cpu->flash[off+3] = (val >> 24) & 0xFF;
+        return;
+    }
+    if (addr < ARM_ROM_SIZE) return; /* ROM is read-only */
+    /* Bit-band alias for peripheral region */
+    if (addr >= ARM_BITBAND_BASE && addr < ARM_BITBAND_BASE + 0x02000000) {
+        uint32_t bb_off = addr - ARM_BITBAND_BASE;
+        uint32_t base_addr = ARM_IO_BASE + (bb_off >> 5) * 4;
+        int bit = (bb_off >> 2) & 0x1F;
+        uint32_t old = arm_read32(cpu, base_addr);
+        if (val & 1)
+            arm_write32(cpu, base_addr, old | (1u << bit));
+        else
+            arm_write32(cpu, base_addr, old & ~(1u << bit));
+        return;
+    }
+    arm_io_region_t *r = find_io_region(cpu, addr);
+    if (r) r->write(r->user_data, addr, val);
+}
+
+void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
+    addr &= ~1u;
+    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
+        uint32_t off = addr - ARM_SRAM_BASE;
+        cpu->sram[off]   = val & 0xFF;
+        cpu->sram[off+1] = (val >> 8) & 0xFF;
+        return;
+    }
+    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
+        uint32_t off = addr - ARM_FLASH_BASE;
+        cpu->flash[off]   = val & 0xFF;
+        cpu->flash[off+1] = (val >> 8) & 0xFF;
+        return;
+    }
+    arm_io_region_t *r = find_io_region(cpu, addr);
+    if (r) r->write(r->user_data, addr, val);
+}
+
+void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
+    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
+        cpu->sram[addr - ARM_SRAM_BASE] = val;
+        return;
+    }
+    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
+        cpu->flash[addr - ARM_FLASH_BASE] = val;
+        return;
+    }
+    arm_io_region_t *r = find_io_region(cpu, addr);
+    if (r) r->write(r->user_data, addr, val);
+}
+
+/* --- Inline fetch helpers --- */
+
+static inline uint16_t fetch16(arm_cpu_t *cpu, uint32_t addr) {
+    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
+        uint32_t off = addr - ARM_FLASH_BASE;
+        return cpu->flash[off] | (cpu->flash[off+1] << 8);
+    }
+    if (addr < ARM_ROM_SIZE)
+        return cpu->rom[addr] | (cpu->rom[addr+1] << 8);
+    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
+        uint32_t off = addr - ARM_SRAM_BASE;
+        return cpu->sram[off] | (cpu->sram[off+1] << 8);
+    }
+    return arm_read16(cpu, addr);
+}
+
+/* --- Lifecycle --- */
+
+void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
+    memset(cpu, 0, sizeof(*cpu));
+    cpu->config = config;
+
+    cpu->rom   = (uint8_t *)calloc(ARM_ROM_SIZE, 1);
+    cpu->flash = (uint8_t *)calloc(ARM_FLASH_SIZE, 1);
+    cpu->sram  = (uint8_t *)calloc(ARM_SRAM_SIZE, 1);
+
+    cpu->next_event_cycle = INT64_MAX;
+    cpu->cycle_limit = INT64_MAX;
+    cpu->cpu_freq_hz = config->default_cpu_freq;
+    cpu->interrupts_enabled = true;
+
+    /* CC2538 ROM utility function table layout:
+     * ROM[0x10] = pointer to rom_util_api struct (0x48)
+     * rom_util_api struct at 0x48:
+     *   offset 0x18 (addr 0x60): memset function pointer
+     *   offset 0x1C (addr 0x64): memcpy function pointer
+     *   offset 0x20 (addr 0x68): memcmp function pointer
+     * Firmware loads function pointers via: ldr r3, [r4, #0x60] (with r4=0)
+     * We place trap addresses at those ROM locations and intercept execution there.
+     */
+    cpu->rom_util_memset = 0x00000060;
+    cpu->rom_util_memcpy = 0x00000064;
+    cpu->rom_util_memcmp = 0x00000068;
+
+    /* Write self-referential function pointers into ROM (addr | 1 for Thumb bit) */
+    /* When firmware does ldr+blx, it reads the pointer, then branches to it */
+#define WRITE_ROM32(off, val) do { \
+    cpu->rom[(off)]   = (val) & 0xFF; \
+    cpu->rom[(off)+1] = ((val) >> 8) & 0xFF; \
+    cpu->rom[(off)+2] = ((val) >> 16) & 0xFF; \
+    cpu->rom[(off)+3] = ((val) >> 24) & 0xFF; \
+} while(0)
+    WRITE_ROM32(0x10, 0x00000048);  /* rom_util_api table pointer */
+    WRITE_ROM32(0x60, 0x00000061);  /* memset: points to 0x60 | Thumb */
+    WRITE_ROM32(0x64, 0x00000065);  /* memcpy: points to 0x64 | Thumb */
+    WRITE_ROM32(0x68, 0x00000069);  /* memcmp: points to 0x68 | Thumb */
+#undef WRITE_ROM32
+}
+
+void arm_cpu_destroy(arm_cpu_t *cpu) {
+    free(cpu->rom);
+    free(cpu->flash);
+    free(cpu->sram);
+    cpu->event_queue = NULL;
+}
+
+void arm_cpu_reset(arm_cpu_t *cpu) {
+    memset(cpu->reg, 0, sizeof(cpu->reg));
+    cpu->xpsr = 0;
+    cpu->it_state = 0;
+    cpu->primask = 0;
+    cpu->faultmask = 0;
+    cpu->basepri = 0;
+    cpu->use_psp = false;
+    cpu->interrupts_enabled = true;
+    cpu->cpu_off = false;
+    cpu->stopping = false;
+
+    cpu->event_queue = NULL;
+    cpu->next_event_cycle = INT64_MAX;
+
+    /* Find vector table via CC2538 CCA (Customer Configuration Area).
+     * CCA is at flash end - 0x2C (0x0027FFD4 for 512KB flash).
+     * CCA+8 = app_entry_point = vector table address. */
+    uint32_t cca_addr = ARM_FLASH_BASE + ARM_FLASH_SIZE - 0x2C;
+    cpu->vtor = arm_read32(cpu, cca_addr + 8);
+    if (cpu->vtor < ARM_FLASH_BASE || cpu->vtor >= ARM_FLASH_BASE + ARM_FLASH_SIZE)
+        cpu->vtor = ARM_FLASH_BASE; /* fallback */
+    uint32_t sp = arm_read32(cpu, cpu->vtor);
+    uint32_t pc = arm_read32(cpu, cpu->vtor + 4);
+
+    cpu->reg[ARM_SP] = sp;
+    cpu->msp = sp;
+    cpu->reg[ARM_PC] = pc & ~1u; /* Clear thumb bit */
+    cpu->xpsr = (1u << 24); /* Thumb bit in EPSR must be set */
+}
+
+void arm_stop(arm_cpu_t *cpu) {
+    cpu->stopping = true;
+}
+
+/* --- IO registration --- */
+
+void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
+                     arm_io_read_fn read, arm_io_write_fn write, void *data) {
+    if (cpu->num_io_regions >= ARM_MAX_IO_REGIONS) {
+        fprintf(stderr, "ARM: too many IO regions\n");
+        return;
+    }
+    arm_io_region_t *r = &cpu->io_regions[cpu->num_io_regions++];
+    r->base = base;
+    r->size = size;
+    r->read = read;
+    r->write = write;
+    r->user_data = data;
+}
+
+/* --- Event management --- */
+
+void arm_schedule_event(arm_cpu_t *cpu, arm_event_t *ev, int64_t cycle) {
+    arm_cancel_event(cpu, ev);
+
+    ev->fire_cycle = cycle;
+    ev->fire_ns = 0;
+    ev->next = NULL;
+
+    if (cpu->event_queue == NULL || cycle < cpu->event_queue->fire_cycle) {
+        ev->next = cpu->event_queue;
+        cpu->event_queue = ev;
+    } else {
+        arm_event_t *prev = cpu->event_queue;
+        while (prev->next && prev->next->fire_cycle <= cycle)
+            prev = prev->next;
+        ev->next = prev->next;
+        prev->next = ev;
+    }
+    cpu->next_event_cycle = cpu->event_queue->fire_cycle;
+}
+
+void arm_schedule_event_ns(arm_cpu_t *cpu, arm_event_t *ev, int64_t fire_ns) {
+    arm_cancel_event(cpu, ev);
+
+    ev->fire_ns = fire_ns;
+    int64_t delta_ns = fire_ns - cpu->sim_time_ns;
+    if (delta_ns < 0) delta_ns = 0;
+    ev->fire_cycle = cpu->cycles + arm_ns_to_cycles(delta_ns, cpu->cpu_freq_hz);
+    ev->next = NULL;
+
+    int64_t cycle = ev->fire_cycle;
+    if (cpu->event_queue == NULL || cycle < cpu->event_queue->fire_cycle) {
+        ev->next = cpu->event_queue;
+        cpu->event_queue = ev;
+    } else {
+        arm_event_t *prev = cpu->event_queue;
+        while (prev->next && prev->next->fire_cycle <= cycle)
+            prev = prev->next;
+        ev->next = prev->next;
+        prev->next = ev;
+    }
+    cpu->next_event_cycle = cpu->event_queue->fire_cycle;
+}
+
+void arm_cancel_event(arm_cpu_t *cpu, arm_event_t *ev) {
+    if (cpu->event_queue == ev) {
+        cpu->event_queue = ev->next;
+    } else {
+        arm_event_t *prev = cpu->event_queue;
+        while (prev && prev->next != ev) prev = prev->next;
+        if (prev) prev->next = ev->next;
+    }
+    ev->next = NULL;
+    ev->fire_ns = 0;
+    cpu->next_event_cycle = cpu->event_queue ? cpu->event_queue->fire_cycle : INT64_MAX;
+}
+
+static void execute_events(arm_cpu_t *cpu) {
+    while (cpu->event_queue && cpu->cycles >= cpu->event_queue->fire_cycle) {
+        arm_event_t *ev = cpu->event_queue;
+        cpu->event_queue = ev->next;
+        ev->next = NULL;
+        if (cpu->cpu_freq_hz > 0)
+            cpu->sim_time_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+        ev->fire_ns = 0;
+        ev->callback(ev->user_data, ev);
+    }
+    cpu->next_event_cycle = cpu->event_queue ? cpu->event_queue->fire_cycle : INT64_MAX;
+}
+
+void arm_cpu_set_frequency(arm_cpu_t *cpu, uint32_t freq_hz) {
+    if (freq_hz == 0) return;
+    if (cpu->cpu_freq_hz > 0)
+        cpu->sim_time_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+    cpu->cpu_freq_hz = freq_hz;
+
+    arm_event_t *ev = cpu->event_queue;
+    while (ev) {
+        if (ev->fire_ns > 0) {
+            int64_t delta_ns = ev->fire_ns - cpu->sim_time_ns;
+            if (delta_ns < 0) delta_ns = 0;
+            ev->fire_cycle = cpu->cycles + arm_ns_to_cycles(delta_ns, freq_hz);
+        }
+        ev = ev->next;
+    }
+
+    /* Re-sort event queue */
+    arm_event_t *old_queue = cpu->event_queue;
+    cpu->event_queue = NULL;
+    while (old_queue) {
+        arm_event_t *e = old_queue;
+        old_queue = e->next;
+        e->next = NULL;
+        int64_t cycle = e->fire_cycle;
+        if (cpu->event_queue == NULL || cycle < cpu->event_queue->fire_cycle) {
+            e->next = cpu->event_queue;
+            cpu->event_queue = e;
+        } else {
+            arm_event_t *prev = cpu->event_queue;
+            while (prev->next && prev->next->fire_cycle <= cycle)
+                prev = prev->next;
+            e->next = prev->next;
+            prev->next = e;
+        }
+    }
+    cpu->next_event_cycle = cpu->event_queue ? cpu->event_queue->fire_cycle : INT64_MAX;
+}
+
+/* --- Exception entry/return --- */
+
+void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
+    /* Push exception frame: R0-R3, R12, LR, ReturnAddr, xPSR */
+    uint32_t sp = cpu->reg[ARM_SP];
+    sp &= ~7u; /* 8-byte align */
+    sp -= 32;
+    arm_write32(cpu, sp + 0,  cpu->reg[0]);
+    arm_write32(cpu, sp + 4,  cpu->reg[1]);
+    arm_write32(cpu, sp + 8,  cpu->reg[2]);
+    arm_write32(cpu, sp + 12, cpu->reg[3]);
+    arm_write32(cpu, sp + 16, cpu->reg[12]);
+    arm_write32(cpu, sp + 20, cpu->reg[ARM_LR]);
+    arm_write32(cpu, sp + 24, cpu->reg[ARM_PC]);
+    arm_write32(cpu, sp + 28, cpu->xpsr);
+
+    cpu->reg[ARM_SP] = sp;
+
+    /* Set EXC_RETURN in LR */
+    if (cpu->use_psp && (cpu->xpsr & 0x1FF) == 0) {
+        cpu->reg[ARM_LR] = 0xFFFFFFFD; /* Return to Thread using PSP */
+    } else {
+        cpu->reg[ARM_LR] = 0xFFFFFFF9; /* Return to Thread using MSP */
+    }
+
+    /* Load vector */
+    uint32_t vector = arm_read32(cpu, cpu->vtor + exception_num * 4);
+    cpu->reg[ARM_PC] = vector & ~1u;
+    cpu->xpsr = (cpu->xpsr & ~0x1FFu) | (exception_num & 0x1FF);
+    cpu->xpsr |= (1u << 24); /* Thumb bit */
+
+    cpu->cpu_off = false; /* Wake from WFI */
+    cpu->cycles += 12; /* Exception entry latency */
+}
+
+void arm_check_pending_exceptions(arm_cpu_t *cpu) {
+    /* Simplified: this is called by NVIC when it determines an exception should fire */
+    (void)cpu;
+}
+
+static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
+    /* Pop exception frame */
+    uint32_t sp = cpu->reg[ARM_SP];
+
+    cpu->reg[0]      = arm_read32(cpu, sp + 0);
+    cpu->reg[1]      = arm_read32(cpu, sp + 4);
+    cpu->reg[2]      = arm_read32(cpu, sp + 8);
+    cpu->reg[3]      = arm_read32(cpu, sp + 12);
+    cpu->reg[12]     = arm_read32(cpu, sp + 16);
+    cpu->reg[ARM_LR] = arm_read32(cpu, sp + 20);
+    cpu->reg[ARM_PC] = arm_read32(cpu, sp + 24) & ~1u;
+    cpu->xpsr        = arm_read32(cpu, sp + 28);
+
+    cpu->reg[ARM_SP] = sp + 32;
+
+    /* Return to Thread mode (clear exception number in IPSR) */
+    if ((exc_return & 0xF) == 0x9 || (exc_return & 0xF) == 0xD) {
+        cpu->xpsr &= ~0x1FFu; /* Clear IPSR -> Thread mode */
+    }
+
+    cpu->cycles += 12;
+}
+
+/* --- APSR flag helpers --- */
+
+static inline void set_nz(arm_cpu_t *cpu, uint32_t result) {
+    cpu->xpsr &= ~(APSR_N | APSR_Z);
+    if (result == 0) cpu->xpsr |= APSR_Z;
+    if (result & 0x80000000) cpu->xpsr |= APSR_N;
+}
+
+static inline void set_nzc(arm_cpu_t *cpu, uint32_t result, int carry) {
+    cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C);
+    if (result == 0) cpu->xpsr |= APSR_Z;
+    if (result & 0x80000000) cpu->xpsr |= APSR_N;
+    if (carry) cpu->xpsr |= APSR_C;
+}
+
+static inline void set_add_flags(arm_cpu_t *cpu, uint32_t a, uint32_t b, uint64_t result) {
+    uint32_t r32 = (uint32_t)result;
+    cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
+    if (r32 == 0) cpu->xpsr |= APSR_Z;
+    if (r32 & 0x80000000) cpu->xpsr |= APSR_N;
+    if (result > 0xFFFFFFFF) cpu->xpsr |= APSR_C;
+    if (((a ^ r32) & (b ^ r32)) >> 31) cpu->xpsr |= APSR_V;
+}
+
+static inline void set_sub_flags(arm_cpu_t *cpu, uint32_t a, uint32_t b, uint64_t result) {
+    uint32_t r32 = (uint32_t)result;
+    cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
+    if (r32 == 0) cpu->xpsr |= APSR_Z;
+    if (r32 & 0x80000000) cpu->xpsr |= APSR_N;
+    if (a >= b) cpu->xpsr |= APSR_C; /* No borrow = carry set */
+    if (((a ^ b) & (a ^ r32)) >> 31) cpu->xpsr |= APSR_V;
+}
+
+static inline int condition_passed(arm_cpu_t *cpu, int cond) {
+    uint32_t f = cpu->xpsr;
+    int result;
+    switch (cond >> 1) {
+        case 0: result = (f & APSR_Z) != 0; break;       /* EQ/NE */
+        case 1: result = (f & APSR_C) != 0; break;       /* CS/CC */
+        case 2: result = (f & APSR_N) != 0; break;       /* MI/PL */
+        case 3: result = (f & APSR_V) != 0; break;       /* VS/VC */
+        case 4: result = ((f & APSR_C) != 0) && ((f & APSR_Z) == 0); break; /* HI/LS */
+        case 5: result = ((f >> 31) & 1) == ((f >> 28) & 1); break; /* GE/LT */
+        case 6: result = (((f >> 31) & 1) == ((f >> 28) & 1)) && ((f & APSR_Z) == 0); break; /* GT/LE */
+        case 7: result = 1; break; /* AL */
+        default: result = 1; break;
+    }
+    if (cond & 1) result = !result;
+    return result;
+}
+
+/* --- Barrel shifter helpers --- */
+
+static inline uint32_t lsl_c(uint32_t val, int shift, int *carry) {
+    if (shift == 0) return val;
+    if (shift >= 32) { *carry = (shift == 32) ? (val & 1) : 0; return 0; }
+    *carry = (val >> (32 - shift)) & 1;
+    return val << shift;
+}
+
+static inline uint32_t lsr_c(uint32_t val, int shift, int *carry) {
+    if (shift >= 32) { *carry = (shift == 32) ? ((val >> 31) & 1) : 0; return 0; }
+    *carry = (val >> (shift - 1)) & 1;
+    return val >> shift;
+}
+
+static inline uint32_t asr_c(uint32_t val, int shift, int *carry) {
+    int32_t sval = (int32_t)val;
+    if (shift >= 32) {
+        *carry = (val >> 31) & 1;
+        return (sval < 0) ? 0xFFFFFFFF : 0;
+    }
+    *carry = (val >> (shift - 1)) & 1;
+    return (uint32_t)(sval >> shift);
+}
+
+static inline uint32_t ror_c(uint32_t val, int shift, int *carry) {
+    shift &= 31;
+    if (shift == 0) { *carry = (val >> 31) & 1; return val; }
+    uint32_t result = (val >> shift) | (val << (32 - shift));
+    *carry = (result >> 31) & 1;
+    return result;
+}
+
+/* Thumb-2 modified immediate constant (i:imm3:imm8 with rotation) */
+static inline uint32_t thumb_expand_imm_c(uint16_t imm12, int *carry_out, int carry_in) {
+    if ((imm12 >> 10) == 0) {
+        uint32_t imm8 = imm12 & 0xFF;
+        switch ((imm12 >> 8) & 3) {
+            case 0: *carry_out = carry_in; return imm8;
+            case 1: *carry_out = carry_in; return (imm8 << 16) | imm8;
+            case 2: *carry_out = carry_in; return (imm8 << 24) | (imm8 << 8);
+            case 3: *carry_out = carry_in; return (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8;
+        }
+    }
+    /* ROR rotation */
+    int rot = imm12 >> 7;
+    uint32_t val = 0x80 | (imm12 & 0x7F);
+    return ror_c(val, rot, carry_out);
+}
+
+/* --- ROM utility trap handler --- */
+static int handle_rom_trap(arm_cpu_t *cpu) {
+    uint32_t pc = cpu->reg[ARM_PC];
+
+    if (pc == cpu->rom_util_memcpy || pc == cpu->rom_util_memcpy + 1) {
+        /* memcpy(dst, src, len) - R0=dst, R1=src, R2=len */
+        uint32_t dst = cpu->reg[0], src = cpu->reg[1], len = cpu->reg[2];
+        for (uint32_t i = 0; i < len; i++)
+            arm_write8(cpu, dst + i, arm_read8(cpu, src + i));
+        /* Return value in R0 = dst (already there) */
+        cpu->reg[ARM_PC] = cpu->reg[ARM_LR] & ~1u;
+        cpu->cycles += len + 3;
+        return 1;
+    }
+    if (pc == cpu->rom_util_memset || pc == cpu->rom_util_memset + 1) {
+        /* memset(dst, val, len) - R0=dst, R1=val, R2=len */
+        uint32_t dst = cpu->reg[0], val = cpu->reg[1] & 0xFF, len = cpu->reg[2];
+        for (uint32_t i = 0; i < len; i++)
+            arm_write8(cpu, dst + i, (uint8_t)val);
+        cpu->reg[ARM_PC] = cpu->reg[ARM_LR] & ~1u;
+        cpu->cycles += len + 3;
+        return 1;
+    }
+    if (pc == cpu->rom_util_memcmp || pc == cpu->rom_util_memcmp + 1) {
+        /* memcmp(s1, s2, len) - R0=s1, R1=s2, R2=len */
+        uint32_t s1 = cpu->reg[0], s2 = cpu->reg[1], len = cpu->reg[2];
+        int result = 0;
+        for (uint32_t i = 0; i < len; i++) {
+            int a = arm_read8(cpu, s1 + i), b = arm_read8(cpu, s2 + i);
+            if (a != b) { result = a - b; break; }
+        }
+        cpu->reg[0] = (uint32_t)result;
+        cpu->reg[ARM_PC] = cpu->reg[ARM_LR] & ~1u;
+        cpu->cycles += len + 3;
+        return 1;
+    }
+    return 0;
+}
+
+/* --- Main execution loop --- */
+
+int arm_step(arm_cpu_t *cpu, int count) {
+    int remaining = count;
+
+    while (remaining > 0 && !cpu->stopping) {
+        /* Check events */
+        if (cpu->cycles >= cpu->next_event_cycle)
+            execute_events(cpu);
+
+        /* CPU off (WFI) — advance to next event */
+        if (cpu->cpu_off) {
+            if (cpu->event_queue) {
+                cpu->cycles = cpu->event_queue->fire_cycle;
+                continue;
+            }
+            break;
+        }
+
+        uint32_t pc = cpu->reg[ARM_PC];
+
+        /* ROM utility traps */
+        if (pc < 0x100 && handle_rom_trap(cpu)) {
+            cpu->instructions++;
+            remaining--;
+            continue;
+        }
+
+        /* Fetch first halfword */
+        uint16_t hw1 = fetch16(cpu, pc);
+        uint16_t top5 = hw1 >> 11;
+
+        /* Periodic PC trace for debugging */
+#ifdef DEBUG
+        if ((cpu->instructions % 5000000) == 0)
+            fprintf(stderr, "[%lldM] PC=0x%08x R0=0x%08x R1=0x%08x R2=0x%08x R3=0x%08x SP=0x%08x\n",
+                    cpu->instructions/1000000, pc, cpu->reg[0], cpu->reg[1],
+                    cpu->reg[2], cpu->reg[3], cpu->reg[ARM_SP]);
+#endif
+
+        /* IT block: check if current instruction should execute */
+        int in_it = (cpu->it_state & 0xF) != 0;
+        if (in_it) {
+            int cond = (cpu->it_state >> 4) & 0xF;
+            if (!condition_passed(cpu, cond)) {
+                /* Condition failed — skip instruction */
+                cpu->reg[ARM_PC] = pc + ((top5 >= 0x1D) ? 4 : 2);
+                cpu->cycles += 1;
+                cpu->it_state = (cpu->it_state & 0xE0) | ((cpu->it_state << 1) & 0x1F);
+                cpu->instructions++;
+                remaining--;
+                continue;
+            }
+        }
+
+        if (top5 < 0x1D) {
+            /* 16-bit Thumb instruction */
+            cpu->reg[ARM_PC] = pc + 2;
+            cpu->cycles += 1;
+
+            /* Decode by top bits */
+            if ((hw1 >> 13) == 0) {
+                /* Shift/Add/Sub/Move */
+                if ((hw1 >> 11) == 0) {
+                    /* LSL Rd, Rm, #imm5 */
+                    int rd = hw1 & 7;
+                    int rm = (hw1 >> 3) & 7;
+                    int imm5 = (hw1 >> 6) & 0x1F;
+                    if (imm5 == 0) {
+                        cpu->reg[rd] = cpu->reg[rm];
+                        set_nz(cpu, cpu->reg[rd]);
+                    } else {
+                        int carry;
+                        cpu->reg[rd] = lsl_c(cpu->reg[rm], imm5, &carry);
+                        set_nzc(cpu, cpu->reg[rd], carry);
+                    }
+                } else if ((hw1 >> 11) == 1) {
+                    /* LSR Rd, Rm, #imm5 */
+                    int rd = hw1 & 7;
+                    int rm = (hw1 >> 3) & 7;
+                    int imm5 = (hw1 >> 6) & 0x1F;
+                    int carry;
+                    if (imm5 == 0) imm5 = 32;
+                    cpu->reg[rd] = lsr_c(cpu->reg[rm], imm5, &carry);
+                    set_nzc(cpu, cpu->reg[rd], carry);
+                } else if ((hw1 >> 11) == 2) {
+                    /* ASR Rd, Rm, #imm5 */
+                    int rd = hw1 & 7;
+                    int rm = (hw1 >> 3) & 7;
+                    int imm5 = (hw1 >> 6) & 0x1F;
+                    int carry;
+                    if (imm5 == 0) imm5 = 32;
+                    cpu->reg[rd] = asr_c(cpu->reg[rm], imm5, &carry);
+                    set_nzc(cpu, cpu->reg[rd], carry);
+                } else if ((hw1 >> 9) == 0xC) {
+                    /* ADD Rd, Rn, Rm (3-register) */
+                    int rd = hw1 & 7;
+                    int rn = (hw1 >> 3) & 7;
+                    int rm = (hw1 >> 6) & 7;
+                    uint64_t result = (uint64_t)cpu->reg[rn] + cpu->reg[rm];
+                    cpu->reg[rd] = (uint32_t)result;
+                    set_add_flags(cpu, cpu->reg[rn], cpu->reg[rm], result);
+                } else if ((hw1 >> 9) == 0xD) {
+                    /* SUB Rd, Rn, Rm (3-register) */
+                    int rd = hw1 & 7;
+                    int rn = (hw1 >> 3) & 7;
+                    int rm = (hw1 >> 6) & 7;
+                    uint64_t result = (uint64_t)cpu->reg[rn] - cpu->reg[rm];
+                    cpu->reg[rd] = (uint32_t)result;
+                    set_sub_flags(cpu, cpu->reg[rn], cpu->reg[rm], result);
+                } else if ((hw1 >> 9) == 0xE) {
+                    /* ADD Rd, Rn, #imm3 */
+                    int rd = hw1 & 7;
+                    int rn = (hw1 >> 3) & 7;
+                    uint32_t imm3 = (hw1 >> 6) & 7;
+                    uint64_t result = (uint64_t)cpu->reg[rn] + imm3;
+                    cpu->reg[rd] = (uint32_t)result;
+                    set_add_flags(cpu, cpu->reg[rn], imm3, result);
+                } else if ((hw1 >> 9) == 0xF) {
+                    /* SUB Rd, Rn, #imm3 */
+                    int rd = hw1 & 7;
+                    int rn = (hw1 >> 3) & 7;
+                    uint32_t imm3 = (hw1 >> 6) & 7;
+                    uint64_t result = (uint64_t)cpu->reg[rn] - imm3;
+                    cpu->reg[rd] = (uint32_t)result;
+                    set_sub_flags(cpu, cpu->reg[rn], imm3, result);
+                }
+            } else if ((hw1 >> 13) == 1) {
+                /* MOV/CMP/ADD/SUB with 8-bit immediate */
+                int opcode = (hw1 >> 11) & 3;
+                int rd = (hw1 >> 8) & 7;
+                uint32_t imm8 = hw1 & 0xFF;
+                switch (opcode) {
+                    case 0: /* MOV Rd, #imm8 */
+                        cpu->reg[rd] = imm8;
+                        set_nz(cpu, imm8);
+                        break;
+                    case 1: { /* CMP Rn, #imm8 */
+                        uint64_t result = (uint64_t)cpu->reg[rd] - imm8;
+                        set_sub_flags(cpu, cpu->reg[rd], imm8, result);
+                        break;
+                    }
+                    case 2: { /* ADD Rd, #imm8 */
+                        uint64_t result = (uint64_t)cpu->reg[rd] + imm8;
+                        set_add_flags(cpu, cpu->reg[rd], imm8, result);
+                        cpu->reg[rd] = (uint32_t)result;
+                        break;
+                    }
+                    case 3: { /* SUB Rd, #imm8 */
+                        uint64_t result = (uint64_t)cpu->reg[rd] - imm8;
+                        set_sub_flags(cpu, cpu->reg[rd], imm8, result);
+                        cpu->reg[rd] = (uint32_t)result;
+                        break;
+                    }
+                }
+            } else if ((hw1 >> 10) == 0x10) {
+                /* Data processing (register) */
+                int opcode = (hw1 >> 6) & 0xF;
+                int rd = hw1 & 7;
+                int rm = (hw1 >> 3) & 7;
+                switch (opcode) {
+                    case 0x0: { /* AND */
+                        cpu->reg[rd] &= cpu->reg[rm];
+                        set_nz(cpu, cpu->reg[rd]);
+                        break;
+                    }
+                    case 0x1: { /* EOR */
+                        cpu->reg[rd] ^= cpu->reg[rm];
+                        set_nz(cpu, cpu->reg[rd]);
+                        break;
+                    }
+                    case 0x2: { /* LSL */
+                        int shift = cpu->reg[rm] & 0xFF;
+                        if (shift >= 32) {
+                            int carry = (shift == 32) ? (cpu->reg[rd] & 1) : 0;
+                            cpu->reg[rd] = 0;
+                            set_nzc(cpu, 0, carry);
+                        } else if (shift > 0) {
+                            int carry;
+                            cpu->reg[rd] = lsl_c(cpu->reg[rd], shift, &carry);
+                            set_nzc(cpu, cpu->reg[rd], carry);
+                        } else {
+                            set_nz(cpu, cpu->reg[rd]);
+                        }
+                        break;
+                    }
+                    case 0x3: { /* LSR */
+                        int shift = cpu->reg[rm] & 0xFF;
+                        if (shift >= 32) {
+                            int carry = (shift == 32) ? ((cpu->reg[rd] >> 31) & 1) : 0;
+                            cpu->reg[rd] = 0;
+                            set_nzc(cpu, 0, carry);
+                        } else if (shift > 0) {
+                            int carry;
+                            cpu->reg[rd] = lsr_c(cpu->reg[rd], shift, &carry);
+                            set_nzc(cpu, cpu->reg[rd], carry);
+                        } else {
+                            set_nz(cpu, cpu->reg[rd]);
+                        }
+                        break;
+                    }
+                    case 0x4: { /* ASR */
+                        int shift = cpu->reg[rm] & 0xFF;
+                        if (shift >= 32) {
+                            int carry = (cpu->reg[rd] >> 31) & 1;
+                            cpu->reg[rd] = carry ? 0xFFFFFFFF : 0;
+                            set_nzc(cpu, cpu->reg[rd], carry);
+                        } else if (shift > 0) {
+                            int carry;
+                            cpu->reg[rd] = asr_c(cpu->reg[rd], shift, &carry);
+                            set_nzc(cpu, cpu->reg[rd], carry);
+                        } else {
+                            set_nz(cpu, cpu->reg[rd]);
+                        }
+                        break;
+                    }
+                    case 0x5: { /* ADC */
+                        int carry_in = (cpu->xpsr & APSR_C) ? 1 : 0;
+                        uint64_t result = (uint64_t)cpu->reg[rd] + cpu->reg[rm] + carry_in;
+                        set_add_flags(cpu, cpu->reg[rd], cpu->reg[rm] + carry_in, result);
+                        cpu->reg[rd] = (uint32_t)result;
+                        break;
+                    }
+                    case 0x6: { /* SBC */
+                        int carry_in = (cpu->xpsr & APSR_C) ? 1 : 0;
+                        uint64_t result = (uint64_t)cpu->reg[rd] - cpu->reg[rm] - (1 - carry_in);
+                        uint32_t r32 = (uint32_t)result;
+                        cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
+                        if (r32 == 0) cpu->xpsr |= APSR_Z;
+                        if (r32 & 0x80000000) cpu->xpsr |= APSR_N;
+                        if ((uint64_t)cpu->reg[rd] >= (uint64_t)cpu->reg[rm] + (1 - carry_in))
+                            cpu->xpsr |= APSR_C;
+                        if (((cpu->reg[rd] ^ cpu->reg[rm]) & (cpu->reg[rd] ^ r32)) >> 31)
+                            cpu->xpsr |= APSR_V;
+                        cpu->reg[rd] = r32;
+                        break;
+                    }
+                    case 0x7: { /* ROR */
+                        int shift = cpu->reg[rm] & 0xFF;
+                        if (shift > 0) {
+                            int carry;
+                            cpu->reg[rd] = ror_c(cpu->reg[rd], shift, &carry);
+                            set_nzc(cpu, cpu->reg[rd], carry);
+                        } else {
+                            set_nz(cpu, cpu->reg[rd]);
+                        }
+                        break;
+                    }
+                    case 0x8: { /* TST */
+                        uint32_t result = cpu->reg[rd] & cpu->reg[rm];
+                        set_nz(cpu, result);
+                        break;
+                    }
+                    case 0x9: { /* RSB (NEG) Rd, Rm, #0 */
+                        uint64_t result = (uint64_t)0 - cpu->reg[rm];
+                        cpu->reg[rd] = (uint32_t)result;
+                        set_sub_flags(cpu, 0, cpu->reg[rm], result);
+                        break;
+                    }
+                    case 0xA: { /* CMP */
+                        uint64_t result = (uint64_t)cpu->reg[rd] - cpu->reg[rm];
+                        set_sub_flags(cpu, cpu->reg[rd], cpu->reg[rm], result);
+                        break;
+                    }
+                    case 0xB: { /* CMN */
+                        uint64_t result = (uint64_t)cpu->reg[rd] + cpu->reg[rm];
+                        set_add_flags(cpu, cpu->reg[rd], cpu->reg[rm], result);
+                        break;
+                    }
+                    case 0xC: { /* ORR */
+                        cpu->reg[rd] |= cpu->reg[rm];
+                        set_nz(cpu, cpu->reg[rd]);
+                        break;
+                    }
+                    case 0xD: { /* MUL */
+                        cpu->reg[rd] *= cpu->reg[rm];
+                        set_nz(cpu, cpu->reg[rd]);
+                        break;
+                    }
+                    case 0xE: { /* BIC */
+                        cpu->reg[rd] &= ~cpu->reg[rm];
+                        set_nz(cpu, cpu->reg[rd]);
+                        break;
+                    }
+                    case 0xF: { /* MVN */
+                        cpu->reg[rd] = ~cpu->reg[rm];
+                        set_nz(cpu, cpu->reg[rd]);
+                        break;
+                    }
+                }
+            } else if ((hw1 >> 10) == 0x11) {
+                /* Special data / branch-exchange */
+                int opcode = (hw1 >> 8) & 3;
+                int d = ((hw1 >> 4) & 8) | (hw1 & 7); /* High bit from bit 7 */
+                int m = (hw1 >> 3) & 0xF;
+
+                switch (opcode) {
+                    case 0: /* ADD Rd, Rm (high registers) */
+                        cpu->reg[d] += cpu->reg[m];
+                        if (d == ARM_PC) cpu->reg[ARM_PC] &= ~1u;
+                        break;
+                    case 1: { /* CMP Rn, Rm (high registers) */
+                        uint64_t result = (uint64_t)cpu->reg[d] - cpu->reg[m];
+                        set_sub_flags(cpu, cpu->reg[d], cpu->reg[m], result);
+                        break;
+                    }
+                    case 2: /* MOV Rd, Rm (high registers) */
+                        cpu->reg[d] = cpu->reg[m];
+                        if (d == ARM_PC) cpu->reg[ARM_PC] &= ~1u;
+                        break;
+                    case 3: /* BX / BLX */
+                        if (hw1 & (1 << 7)) {
+                            /* BLX Rm */
+                            cpu->reg[ARM_LR] = (cpu->reg[ARM_PC]) | 1;
+                            cpu->reg[ARM_PC] = cpu->reg[m] & ~1u;
+                        } else {
+                            /* BX Rm */
+                            uint32_t target = cpu->reg[m];
+                            /* Check for exception return */
+                            if ((target & 0xF0000000) == 0xF0000000) {
+                                exception_return(cpu, target);
+                            } else {
+                                cpu->reg[ARM_PC] = target & ~1u;
+                            }
+                        }
+                        break;
+                }
+            } else if ((hw1 >> 11) == 0x09) {
+                /* LDR Rt, [PC, #imm8*4] (PC-relative) */
+                int rt = (hw1 >> 8) & 7;
+                uint32_t imm8 = (hw1 & 0xFF) << 2;
+                uint32_t addr = ((pc + 4) & ~3u) + imm8;
+                cpu->reg[rt] = arm_read32(cpu, addr);
+                cpu->cycles += 1;
+            } else if ((hw1 >> 12) == 0x5) {
+                /* Load/store register offset */
+                int opcode = (hw1 >> 9) & 7;
+                int rm = (hw1 >> 6) & 7;
+                int rn = (hw1 >> 3) & 7;
+                int rt = hw1 & 7;
+                uint32_t addr = cpu->reg[rn] + cpu->reg[rm];
+                switch (opcode) {
+                    case 0: /* STR */
+                        arm_write32(cpu, addr, cpu->reg[rt]);
+                        break;
+                    case 1: /* STRH */
+                        arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]);
+                        break;
+                    case 2: /* STRB */
+                        arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]);
+                        break;
+                    case 3: /* LDRSB */
+                        cpu->reg[rt] = (uint32_t)(int32_t)(int8_t)arm_read8(cpu, addr);
+                        break;
+                    case 4: /* LDR */
+                        cpu->reg[rt] = arm_read32(cpu, addr);
+                        break;
+                    case 5: /* LDRH */
+                        cpu->reg[rt] = arm_read16(cpu, addr);
+                        break;
+                    case 6: /* LDRB */
+                        cpu->reg[rt] = arm_read8(cpu, addr);
+                        break;
+                    case 7: /* LDRSH */
+                        cpu->reg[rt] = (uint32_t)(int32_t)(int16_t)arm_read16(cpu, addr);
+                        break;
+                }
+                cpu->cycles += 1;
+            } else if ((hw1 >> 13) == 3) {
+                /* LDR/STR with 5-bit immediate offset */
+                int is_load = (hw1 >> 11) & 1;
+                int is_byte = (hw1 >> 12) & 1;
+                int imm5 = (hw1 >> 6) & 0x1F;
+                int rn = (hw1 >> 3) & 7;
+                int rt = hw1 & 7;
+
+                if (is_byte) {
+                    uint32_t addr = cpu->reg[rn] + imm5;
+                    if (is_load)
+                        cpu->reg[rt] = arm_read8(cpu, addr);
+                    else
+                        arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]);
+                } else {
+                    uint32_t addr = cpu->reg[rn] + (imm5 << 2);
+                    if (is_load)
+                        cpu->reg[rt] = arm_read32(cpu, addr);
+                    else
+                        arm_write32(cpu, addr, cpu->reg[rt]);
+                }
+                cpu->cycles += 1;
+            } else if ((hw1 >> 12) == 0x8) {
+                /* LDRH/STRH with 5-bit immediate offset */
+                int is_load = (hw1 >> 11) & 1;
+                int imm5 = (hw1 >> 6) & 0x1F;
+                int rn = (hw1 >> 3) & 7;
+                int rt = hw1 & 7;
+                uint32_t addr = cpu->reg[rn] + (imm5 << 1);
+                if (is_load)
+                    cpu->reg[rt] = arm_read16(cpu, addr);
+                else
+                    arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]);
+                cpu->cycles += 1;
+            } else if ((hw1 >> 12) == 0x9) {
+                /* LDR/STR Rt, [SP, #imm8*4] */
+                int is_load = (hw1 >> 11) & 1;
+                int rt = (hw1 >> 8) & 7;
+                uint32_t imm8 = (hw1 & 0xFF) << 2;
+                uint32_t addr = cpu->reg[ARM_SP] + imm8;
+                if (is_load)
+                    cpu->reg[rt] = arm_read32(cpu, addr);
+                else
+                    arm_write32(cpu, addr, cpu->reg[rt]);
+                cpu->cycles += 1;
+            } else if ((hw1 >> 12) == 0xA) {
+                /* ADD Rd, PC/SP, #imm8*4 */
+                int is_sp = (hw1 >> 11) & 1;
+                int rd = (hw1 >> 8) & 7;
+                uint32_t imm8 = (hw1 & 0xFF) << 2;
+                if (is_sp)
+                    cpu->reg[rd] = cpu->reg[ARM_SP] + imm8;
+                else
+                    cpu->reg[rd] = ((pc + 4) & ~3u) + imm8;
+            } else if ((hw1 >> 12) == 0xB) {
+                /* Miscellaneous 16-bit */
+                int sub_op = (hw1 >> 8) & 0xF;
+                switch (sub_op) {
+                    case 0x0: {
+                        /* ADD SP, #imm7*4 or SUB SP, #imm7*4 */
+                        uint32_t imm7 = (hw1 & 0x7F) << 2;
+                        if (hw1 & (1 << 7))
+                            cpu->reg[ARM_SP] -= imm7;
+                        else
+                            cpu->reg[ARM_SP] += imm7;
+                        break;
+                    }
+                    case 0x2: { /* SXTH, SXTB, UXTH, UXTB */
+                        int rd = hw1 & 7;
+                        int rm = (hw1 >> 3) & 7;
+                        int op2 = (hw1 >> 6) & 3;
+                        switch (op2) {
+                            case 0: /* SXTH */
+                                cpu->reg[rd] = (uint32_t)(int32_t)(int16_t)(uint16_t)cpu->reg[rm];
+                                break;
+                            case 1: /* SXTB */
+                                cpu->reg[rd] = (uint32_t)(int32_t)(int8_t)(uint8_t)cpu->reg[rm];
+                                break;
+                            case 2: /* UXTH */
+                                cpu->reg[rd] = cpu->reg[rm] & 0xFFFF;
+                                break;
+                            case 3: /* UXTB */
+                                cpu->reg[rd] = cpu->reg[rm] & 0xFF;
+                                break;
+                        }
+                        break;
+                    }
+                    case 0x1: /* CBZ */
+                    case 0x3: /* CBZ */
+                    case 0x9: /* CBNZ */
+                    case 0xB: { /* CBNZ */
+                        int rn = hw1 & 7;
+                        int i = (hw1 >> 9) & 1;
+                        uint32_t imm5 = (hw1 >> 3) & 0x1F;
+                        uint32_t offset = (i << 6) | (imm5 << 1);
+                        int is_nonzero = (sub_op >> 3) & 1;
+                        if (is_nonzero ? (cpu->reg[rn] != 0) : (cpu->reg[rn] == 0))
+                            cpu->reg[ARM_PC] = pc + 4 + offset;
+                        break;
+                    }
+                    case 0x4: /* PUSH */
+                    case 0x5: { /* PUSH with LR */
+                        uint32_t reglist = hw1 & 0xFF;
+                        int push_lr = (hw1 >> 8) & 1;
+                        int count_regs = 0;
+                        for (int i = 0; i < 8; i++) if (reglist & (1 << i)) count_regs++;
+                        if (push_lr) count_regs++;
+                        uint32_t sp = cpu->reg[ARM_SP] - count_regs * 4;
+                        cpu->reg[ARM_SP] = sp;
+                        uint32_t addr = sp;
+                        for (int i = 0; i < 8; i++) {
+                            if (reglist & (1 << i)) {
+                                arm_write32(cpu, addr, cpu->reg[i]);
+                                addr += 4;
+                            }
+                        }
+                        if (push_lr) arm_write32(cpu, addr, cpu->reg[ARM_LR]);
+                        cpu->cycles += count_regs;
+                        break;
+                    }
+                    case 0x6: { /* CPS (CPSIE/CPSID) */
+                        if (hw1 & (1 << 4))
+                            cpu->primask = 1; /* CPSID i */
+                        else
+                            cpu->primask = 0; /* CPSIE i */
+                        break;
+                    }
+                    case 0xA: { /* REV, REV16, REVSH */
+                        int rd = hw1 & 7;
+                        int rm = (hw1 >> 3) & 7;
+                        int op2 = (hw1 >> 6) & 3;
+                        uint32_t val = cpu->reg[rm];
+                        switch (op2) {
+                            case 0: /* REV */
+                                cpu->reg[rd] = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) |
+                                               ((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF);
+                                break;
+                            case 1: /* REV16 */
+                                cpu->reg[rd] = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8) |
+                                               ((val & 0x00FF0000) << 8) | ((val & 0xFF000000) >> 8);
+                                break;
+                            case 3: /* REVSH */
+                                cpu->reg[rd] = (uint32_t)(int32_t)(int16_t)(
+                                    ((val & 0xFF) << 8) | ((val >> 8) & 0xFF));
+                                break;
+                            default: break;
+                        }
+                        break;
+                    }
+                    case 0xC: /* POP */
+                    case 0xD: { /* POP with PC */
+                        uint32_t reglist = hw1 & 0xFF;
+                        int pop_pc = (hw1 >> 8) & 1;
+                        uint32_t addr = cpu->reg[ARM_SP];
+                        for (int i = 0; i < 8; i++) {
+                            if (reglist & (1 << i)) {
+                                cpu->reg[i] = arm_read32(cpu, addr);
+                                addr += 4;
+                            }
+                        }
+                        if (pop_pc) {
+                            uint32_t target = arm_read32(cpu, addr);
+                            addr += 4;
+                            if ((target & 0xF0000000) == 0xF0000000) {
+                                exception_return(cpu, target);
+                            } else {
+                                cpu->reg[ARM_PC] = target & ~1u;
+                            }
+                        }
+                        cpu->reg[ARM_SP] = addr;
+                        cpu->cycles += 1;
+                        break;
+                    }
+                    case 0xE: { /* BKPT */
+                        /* Treat as NOP in emulation */
+                        break;
+                    }
+                    case 0xF: { /* IT / hints */
+                        if ((hw1 & 0xF) != 0) {
+                            /* IT instruction: firstcond in bits[7:4], mask in bits[3:0] */
+                            cpu->it_state = hw1 & 0xFF;
+                        } else {
+                            /* Hints: NOP, YIELD, WFE, WFI, SEV */
+                            if ((hw1 & 0xFF) == 0x30) {
+                                /* WFI */
+                                cpu->cpu_off = true;
+                            }
+                            /* Other hints: NOP */
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            } else if ((hw1 >> 12) == 0xC) {
+                /* LDM / STM (LDMIA / STMIA) */
+                int is_load = (hw1 >> 11) & 1;
+                int rn = (hw1 >> 8) & 7;
+                uint32_t reglist = hw1 & 0xFF;
+                uint32_t addr = cpu->reg[rn];
+
+                if (is_load) {
+                    for (int i = 0; i < 8; i++) {
+                        if (reglist & (1 << i)) {
+                            cpu->reg[i] = arm_read32(cpu, addr);
+                            addr += 4;
+                        }
+                    }
+                    /* Update Rn if not in reglist */
+                    if (!(reglist & (1 << rn)))
+                        cpu->reg[rn] = addr;
+                } else {
+                    for (int i = 0; i < 8; i++) {
+                        if (reglist & (1 << i)) {
+                            arm_write32(cpu, addr, cpu->reg[i]);
+                            addr += 4;
+                        }
+                    }
+                    cpu->reg[rn] = addr;
+                }
+                cpu->cycles += 1;
+            } else if ((hw1 >> 12) == 0xD) {
+                /* Conditional branch B<cond> */
+                int cond = (hw1 >> 8) & 0xF;
+                if (cond == 0xE) {
+                    /* UDF (undefined) - treat as NOP */
+                } else if (cond == 0xF) {
+                    /* SVC */
+                    /* SVC #imm8 - typically not used in Contiki-NG, treat as NOP */
+                } else {
+                    int8_t imm8 = (int8_t)(hw1 & 0xFF);
+                    if (condition_passed(cpu, cond))
+                        cpu->reg[ARM_PC] = pc + 4 + (int32_t)imm8 * 2;
+                }
+            } else if ((hw1 >> 11) == 0x1C) {
+                /* Unconditional branch B */
+                int32_t imm11 = hw1 & 0x7FF;
+                if (imm11 & 0x400) imm11 |= (int32_t)0xFFFFF800; /* sign extend */
+                cpu->reg[ARM_PC] = pc + 4 + imm11 * 2;
+            }
+        } else {
+            /* 32-bit Thumb-2 instruction */
+            uint16_t hw2 = fetch16(cpu, pc + 2);
+            cpu->reg[ARM_PC] = pc + 4;
+            cpu->cycles += 1;
+
+            uint32_t insn32 = ((uint32_t)hw1 << 16) | hw2;
+            int op1 = (hw1 >> 11) & 3;
+            int op2_5 = (hw1 >> 4) & 0x7F;
+            int op_hw2 = (hw2 >> 15) & 1;
+
+            if (op1 == 1 && (op2_5 & 0x64) == 0x00) {
+                /* Load/Store multiple, SRS, RFE */
+                int W = (hw1 >> 5) & 1;
+                int L = (hw1 >> 4) & 1;  /* 1=load, 0=store */
+                int rn = hw1 & 0xF;
+                uint32_t reglist = hw2;
+                uint32_t addr = cpu->reg[rn];
+
+                if (L) {
+                    /* LDM.W */
+                    for (int i = 0; i < 16; i++) {
+                        if (reglist & (1 << i)) {
+                            uint32_t val = arm_read32(cpu, addr);
+                            if (i == ARM_PC) {
+                                if ((val & 0xF0000000) == 0xF0000000)
+                                    exception_return(cpu, val);
+                                else
+                                    cpu->reg[ARM_PC] = val & ~1u;
+                            } else {
+                                cpu->reg[i] = val;
+                            }
+                            addr += 4;
+                        }
+                    }
+                    if (W && !(reglist & (1 << rn)))
+                        cpu->reg[rn] = addr;
+                } else {
+                    /* STM.W */
+                    /* Check if decrement before (STMDB) */
+                    int U = (hw1 >> 7) & 1; /* 1=increment, 0=decrement */
+                    if (!U) {
+                        int count_regs = 0;
+                        for (int i = 0; i < 16; i++) if (reglist & (1 << i)) count_regs++;
+                        addr -= count_regs * 4;
+                        uint32_t base_addr = addr;
+                        for (int i = 0; i < 16; i++) {
+                            if (reglist & (1 << i)) {
+                                arm_write32(cpu, addr, cpu->reg[i]);
+                                addr += 4;
+                            }
+                        }
+                        if (W) cpu->reg[rn] = base_addr;
+                    } else {
+                        for (int i = 0; i < 16; i++) {
+                            if (reglist & (1 << i)) {
+                                arm_write32(cpu, addr, cpu->reg[i]);
+                                addr += 4;
+                            }
+                        }
+                        if (W) cpu->reg[rn] = addr;
+                    }
+                }
+                cpu->cycles += 1;
+            } else if (op1 == 1 && (op2_5 & 0x64) == 0x04) {
+                /* Load/store dual, exclusive, table branch */
+                int op2_2 = (hw1 >> 4) & 3;
+                int rn = hw1 & 0xF;
+                int rt = (hw2 >> 12) & 0xF;
+                int rt2 = (hw2 >> 8) & 0xF;
+                uint32_t imm8 = (hw2 & 0xFF) << 2;
+                int U = (hw1 >> 7) & 1;
+                int P = (hw1 >> 8) & 1;
+                int W = (hw1 >> 5) & 1;
+                int L = (hw1 >> 4) & 1;
+
+                if ((hw2 & 0xFFF0) == 0xF000) {
+                    /* TBB / TBH (Table Branch Byte / Halfword) */
+                    int H = (hw2 >> 4) & 1;
+                    int rm = hw2 & 0xF;
+                    uint32_t base = (rn == 0xF) ? (pc + 4) : cpu->reg[rn];
+                    if (H) {
+                        /* TBH: halfword table */
+                        uint16_t idx = arm_read16(cpu, base + cpu->reg[rm] * 2);
+                        cpu->reg[ARM_PC] = pc + 4 + idx * 2;
+                    } else {
+                        /* TBB: byte table */
+                        uint8_t idx = arm_read8(cpu, base + cpu->reg[rm]);
+                        cpu->reg[ARM_PC] = pc + 4 + idx * 2;
+                    }
+                } else if (rn == 0xF && L) {
+                    /* LDRD (literal) */
+                    uint32_t base = (pc + 4) & ~3u;
+                    uint32_t addr = U ? base + imm8 : base - imm8;
+                    cpu->reg[rt]  = arm_read32(cpu, addr);
+                    cpu->reg[rt2] = arm_read32(cpu, addr + 4);
+                } else if (op2_2 == 0 && !L) {
+                    /* STREX */
+                    int rd = (hw2 >> 8) & 0xF;
+                    uint32_t addr = cpu->reg[rn] + imm8;
+                    arm_write32(cpu, addr, cpu->reg[rt]);
+                    cpu->reg[rd] = 0; /* Always succeed */
+                } else if (op2_2 == 0 && L) {
+                    /* LDREX */
+                    uint32_t addr = cpu->reg[rn] + imm8;
+                    cpu->reg[rt] = arm_read32(cpu, addr);
+                } else {
+                    /* LDRD / STRD (immediate) */
+                    uint32_t offset = imm8;
+                    uint32_t addr;
+                    if (P) {
+                        addr = U ? cpu->reg[rn] + offset : cpu->reg[rn] - offset;
+                    } else {
+                        addr = cpu->reg[rn];
+                    }
+                    if (L) {
+                        cpu->reg[rt]  = arm_read32(cpu, addr);
+                        cpu->reg[rt2] = arm_read32(cpu, addr + 4);
+                    } else {
+                        arm_write32(cpu, addr, cpu->reg[rt]);
+                        arm_write32(cpu, addr + 4, cpu->reg[rt2]);
+                    }
+                    if (W) {
+                        if (P)
+                            cpu->reg[rn] = addr;
+                        else
+                            cpu->reg[rn] = U ? addr + offset : addr - offset;
+                    }
+                }
+                cpu->cycles += 1;
+            } else if (op1 == 1 && (op2_5 & 0x60) == 0x20) {
+                /* Data processing (shifted register) */
+                int op_dp = (hw1 >> 5) & 0xF;
+                int S = (hw1 >> 4) & 1;
+                int rn = hw1 & 0xF;
+                int rd = (hw2 >> 8) & 0xF;
+                int rm = hw2 & 0xF;
+                int shift_type = (hw2 >> 4) & 3;
+                int imm3 = (hw2 >> 12) & 7;
+                int imm2 = (hw2 >> 6) & 3;
+                int shift_n = (imm3 << 2) | imm2;
+
+                uint32_t rm_val = cpu->reg[rm];
+                int carry_out = (cpu->xpsr & APSR_C) ? 1 : 0;
+
+                /* Apply shift */
+                if (shift_n > 0 || shift_type != 0) {
+                    if (shift_n == 0 && (shift_type == 1 || shift_type == 2)) shift_n = 32;
+                    switch (shift_type) {
+                        case 0: rm_val = lsl_c(rm_val, shift_n, &carry_out); break;
+                        case 1: rm_val = lsr_c(rm_val, shift_n, &carry_out); break;
+                        case 2: rm_val = asr_c(rm_val, shift_n, &carry_out); break;
+                        case 3:
+                            if (shift_n == 0) {
+                                /* RRX */
+                                int old_c = (cpu->xpsr & APSR_C) ? 1 : 0;
+                                carry_out = rm_val & 1;
+                                rm_val = (rm_val >> 1) | (old_c << 31);
+                            } else {
+                                rm_val = ror_c(rm_val, shift_n, &carry_out);
+                            }
+                            break;
+                    }
+                }
+
+                uint32_t result;
+                switch (op_dp) {
+                    case 0x0: /* AND / TST */
+                        result = cpu->reg[rn] & rm_val;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x1: /* BIC */
+                        result = cpu->reg[rn] & ~rm_val;
+                        cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x2: /* ORR / MOV */
+                        if (rn == 0xF) {
+                            result = rm_val; /* MOV */
+                        } else {
+                            result = cpu->reg[rn] | rm_val; /* ORR */
+                        }
+                        cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x3: /* ORN / MVN */
+                        if (rn == 0xF) {
+                            result = ~rm_val; /* MVN */
+                        } else {
+                            result = cpu->reg[rn] | ~rm_val; /* ORN */
+                        }
+                        cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x4: /* EOR / TEQ */
+                        result = cpu->reg[rn] ^ rm_val;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x8: { /* ADD / CMN */
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] + rm_val;
+                        result = (uint32_t)r64;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_add_flags(cpu, cpu->reg[rn], rm_val, r64);
+                        break;
+                    }
+                    case 0xA: { /* ADC */
+                        int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] + rm_val + ci;
+                        result = (uint32_t)r64;
+                        cpu->reg[rd] = result;
+                        if (S) set_add_flags(cpu, cpu->reg[rn], rm_val + ci, r64);
+                        break;
+                    }
+                    case 0xB: { /* SBC */
+                        int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] - rm_val - (1 - ci);
+                        result = (uint32_t)r64;
+                        cpu->reg[rd] = result;
+                        if (S) {
+                            cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
+                            if (result == 0) cpu->xpsr |= APSR_Z;
+                            if (result & 0x80000000) cpu->xpsr |= APSR_N;
+                            if ((uint64_t)cpu->reg[rn] >= (uint64_t)rm_val + (1 - ci))
+                                cpu->xpsr |= APSR_C;
+                            if (((cpu->reg[rn] ^ rm_val) & (cpu->reg[rn] ^ result)) >> 31)
+                                cpu->xpsr |= APSR_V;
+                        }
+                        break;
+                    }
+                    case 0xD: { /* SUB / CMP */
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] - rm_val;
+                        result = (uint32_t)r64;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_sub_flags(cpu, cpu->reg[rn], rm_val, r64);
+                        break;
+                    }
+                    case 0xE: { /* RSB */
+                        uint64_t r64 = (uint64_t)rm_val - cpu->reg[rn];
+                        result = (uint32_t)r64;
+                        cpu->reg[rd] = result;
+                        if (S) set_sub_flags(cpu, rm_val, cpu->reg[rn], r64);
+                        break;
+                    }
+                    default:
+                        result = 0;
+                        break;
+                }
+                if (rd == ARM_PC) cpu->reg[ARM_PC] &= ~1u;
+            } else if (op1 == 2 && (op2_5 & 0x20) == 0 && !op_hw2) {
+                /* Data processing (modified 12-bit immediate) */
+                int op_dp = (hw1 >> 5) & 0xF;
+                int S = (hw1 >> 4) & 1;
+                int rn = hw1 & 0xF;
+                int rd = (hw2 >> 8) & 0xF;
+
+                int i = (hw1 >> 10) & 1;
+                int imm3 = (hw2 >> 12) & 7;
+                int imm8 = hw2 & 0xFF;
+                uint16_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+
+                int carry_out = (cpu->xpsr & APSR_C) ? 1 : 0;
+                uint32_t imm_val = thumb_expand_imm_c(imm12, &carry_out, carry_out);
+
+                uint32_t result;
+                switch (op_dp) {
+                    case 0x0: /* AND / TST */
+                        result = cpu->reg[rn] & imm_val;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x1: /* BIC */
+                        result = cpu->reg[rn] & ~imm_val;
+                        cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x2: /* ORR / MOV */
+                        if (rn == 0xF) {
+                            result = imm_val;
+                        } else {
+                            result = cpu->reg[rn] | imm_val;
+                        }
+                        cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x3: /* ORN / MVN */
+                        if (rn == 0xF) {
+                            result = ~imm_val;
+                        } else {
+                            result = cpu->reg[rn] | ~imm_val;
+                        }
+                        cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x4: /* EOR / TEQ */
+                        result = cpu->reg[rn] ^ imm_val;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_nzc(cpu, result, carry_out);
+                        break;
+                    case 0x8: { /* ADD / CMN */
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] + imm_val;
+                        result = (uint32_t)r64;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_add_flags(cpu, cpu->reg[rn], imm_val, r64);
+                        break;
+                    }
+                    case 0xA: { /* ADC */
+                        int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] + imm_val + ci;
+                        result = (uint32_t)r64;
+                        cpu->reg[rd] = result;
+                        if (S) set_add_flags(cpu, cpu->reg[rn], imm_val + ci, r64);
+                        break;
+                    }
+                    case 0xB: { /* SBC */
+                        int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] - imm_val - (1 - ci);
+                        result = (uint32_t)r64;
+                        cpu->reg[rd] = result;
+                        if (S) {
+                            cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
+                            if (result == 0) cpu->xpsr |= APSR_Z;
+                            if (result & 0x80000000) cpu->xpsr |= APSR_N;
+                            if ((uint64_t)cpu->reg[rn] >= (uint64_t)imm_val + (1 - ci))
+                                cpu->xpsr |= APSR_C;
+                            if (((cpu->reg[rn] ^ imm_val) & (cpu->reg[rn] ^ result)) >> 31)
+                                cpu->xpsr |= APSR_V;
+                        }
+                        break;
+                    }
+                    case 0xD: { /* SUB / CMP */
+                        uint64_t r64 = (uint64_t)cpu->reg[rn] - imm_val;
+                        result = (uint32_t)r64;
+                        if (rd != 0xF) cpu->reg[rd] = result;
+                        if (S) set_sub_flags(cpu, cpu->reg[rn], imm_val, r64);
+                        break;
+                    }
+                    case 0xE: { /* RSB */
+                        uint64_t r64 = (uint64_t)imm_val - cpu->reg[rn];
+                        result = (uint32_t)r64;
+                        cpu->reg[rd] = result;
+                        if (S) set_sub_flags(cpu, imm_val, cpu->reg[rn], r64);
+                        break;
+                    }
+                    default:
+                        result = 0;
+                        break;
+                }
+            } else if (op1 == 2 && (op2_5 & 0x20) == 0x20 && !op_hw2) {
+                /* Data processing (plain 16-bit immediate) */
+                int op_imm = (hw1 >> 4) & 0x1F;
+                int rn = hw1 & 0xF;
+                int rd = (hw2 >> 8) & 0xF;
+
+                int i = (hw1 >> 10) & 1;
+                int imm3 = (hw2 >> 12) & 7;
+                int imm8 = hw2 & 0xFF;
+                uint32_t imm16 = (i << 11) | (imm3 << 8) | imm8 |
+                                 ((hw1 & 0xF) << 12);
+
+                if ((op_imm & 0x1A) == 0x00) {
+                    /* ADDW Rd, Rn, #imm12 */
+                    cpu->reg[rd] = cpu->reg[rn] + imm16;
+                } else if (op_imm == 0x04) {
+                    /* MOVW Rd, #imm16 */
+                    cpu->reg[rd] = imm16;
+                } else if ((op_imm & 0x1A) == 0x0A) {
+                    /* SUBW Rd, Rn, #imm12 */
+                    cpu->reg[rd] = cpu->reg[rn] - imm16;
+                } else if (op_imm == 0x0C) {
+                    /* MOVT Rd, #imm16 */
+                    cpu->reg[rd] = (cpu->reg[rd] & 0xFFFF) | (imm16 << 16);
+                } else if ((op_imm & 0x1C) == 0x10) {
+                    /* SSAT - saturate signed (simplified) */
+                    cpu->reg[rd] = cpu->reg[rn]; /* Simplified */
+                } else if ((op_imm & 0x1C) == 0x14) {
+                    /* SBFX */
+                    int lsb = imm3 * 4 + ((hw2 >> 6) & 3);
+                    int widthm1 = hw2 & 0x1F;
+                    int32_t val = (int32_t)(cpu->reg[rn] << (31 - lsb - widthm1));
+                    cpu->reg[rd] = (uint32_t)(val >> (31 - widthm1));
+                } else if ((op_imm & 0x1C) == 0x18) {
+                    /* BFI / BFC */
+                    int lsb = imm3 * 4 + ((hw2 >> 6) & 3);
+                    int msb = hw2 & 0x1F;
+                    int width = msb - lsb + 1;
+                    uint32_t mask = ((1u << width) - 1) << lsb;
+                    if (rn == 0xF) {
+                        /* BFC: clear bit field */
+                        cpu->reg[rd] &= ~mask;
+                    } else {
+                        /* BFI: insert bit field */
+                        cpu->reg[rd] = (cpu->reg[rd] & ~mask) |
+                                       ((cpu->reg[rn] << lsb) & mask);
+                    }
+                } else if ((op_imm & 0x1C) == 0x1C) {
+                    /* UBFX */
+                    int lsb = imm3 * 4 + ((hw2 >> 6) & 3);
+                    int widthm1 = hw2 & 0x1F;
+                    cpu->reg[rd] = (cpu->reg[rn] >> lsb) & ((1u << (widthm1 + 1)) - 1);
+                } else if ((op_imm & 0x1A) == 0x02) {
+                    /* ADR (subtract) */
+                    cpu->reg[rd] = ((pc + 4) & ~3u) - imm16;
+                }
+            } else if (op1 == 2 && op_hw2) {
+                /* Branches and misc control */
+                int op_br = (hw1 >> 4) & 0x7F;
+                int op2_br = (hw2 >> 12) & 7;
+
+                if ((op2_br & 5) == 0 && (op_br & 0x38) != 0x38) {
+                    /* B<cond>.W — conditional branch */
+                    int cond = (hw1 >> 6) & 0xF;
+                    int S = (hw1 >> 10) & 1;
+                    int J1 = (hw2 >> 13) & 1;
+                    int J2 = (hw2 >> 11) & 1;
+                    int imm6 = hw1 & 0x3F;
+                    int imm11 = hw2 & 0x7FF;
+                    int32_t offset = (S << 20) | (J2 << 19) | (J1 << 18) |
+                                     (imm6 << 12) | (imm11 << 1);
+                    if (S) offset |= (int32_t)0xFFE00000;
+                    if (condition_passed(cpu, cond))
+                        cpu->reg[ARM_PC] = pc + 4 + offset;
+                } else if ((op2_br & 5) == 5) {
+                    /* BL — branch with link */
+                    int S = (hw1 >> 10) & 1;
+                    int J1 = (hw2 >> 13) & 1;
+                    int J2 = (hw2 >> 11) & 1;
+                    int imm10 = hw1 & 0x3FF;
+                    int imm11 = hw2 & 0x7FF;
+                    int I1 = !(J1 ^ S);
+                    int I2 = !(J2 ^ S);
+                    int32_t offset = (S << 24) | (I1 << 23) | (I2 << 22) |
+                                     (imm10 << 12) | (imm11 << 1);
+                    if (S) offset |= (int32_t)0xFE000000;
+                    cpu->reg[ARM_LR] = (pc + 4) | 1;
+                    cpu->reg[ARM_PC] = pc + 4 + offset;
+                } else if ((op2_br & 5) == 1) {
+                    /* B.W — unconditional branch */
+                    int S = (hw1 >> 10) & 1;
+                    int J1 = (hw2 >> 13) & 1;
+                    int J2 = (hw2 >> 11) & 1;
+                    int imm10 = hw1 & 0x3FF;
+                    int imm11 = hw2 & 0x7FF;
+                    int I1 = !(J1 ^ S);
+                    int I2 = !(J2 ^ S);
+                    int32_t offset = (S << 24) | (I1 << 23) | (I2 << 22) |
+                                     (imm10 << 12) | (imm11 << 1);
+                    if (S) offset |= (int32_t)0xFE000000;
+                    cpu->reg[ARM_PC] = pc + 4 + offset;
+                } else if ((op_br & 0x38) == 0x38 && (op2_br & 5) == 0) {
+                    /* MSR, MRS, hints, barriers, misc */
+                    int op_misc = (hw2 >> 8) & 0xFF;
+                    if (op_br == 0x38 && (op_misc & 0xF0) == 0xF0) {
+                        /* DSB, DMB, ISB */
+                        /* Barriers - NOP for single-core emulator */
+                    } else if ((op_br & 0x7E) == 0x3E) {
+                        /* MRS */
+                        int rd = (hw2 >> 8) & 0xF;
+                        int sysm = hw2 & 0xFF;
+                        switch (sysm) {
+                            case 0: cpu->reg[rd] = cpu->xpsr; break;
+                            case 1: cpu->reg[rd] = cpu->xpsr & 0x1FF; break; /* IPSR */
+                            case 2: cpu->reg[rd] = cpu->xpsr & (1u << 24); break; /* EPSR */
+                            case 5: case 6: case 7:
+                                cpu->reg[rd] = cpu->xpsr; break; /* Combined */
+                            case 8: cpu->reg[rd] = cpu->msp; break;
+                            case 9: cpu->reg[rd] = cpu->psp; break;
+                            case 16: cpu->reg[rd] = cpu->primask; break;
+                            case 17: cpu->reg[rd] = cpu->basepri; break;
+                            case 19: cpu->reg[rd] = cpu->faultmask; break;
+                            case 20: cpu->reg[rd] = cpu->use_psp ? 2 : 0; break; /* CONTROL */
+                            default: cpu->reg[rd] = 0; break;
+                        }
+                    } else if ((op_br & 0x7E) == 0x38 && (op_misc & 0xF0) != 0xF0) {
+                        /* MSR */
+                        int rn = hw1 & 0xF;
+                        int sysm = hw2 & 0xFF;
+                        uint32_t val = cpu->reg[rn];
+                        switch (sysm) {
+                            case 0: /* APSR */
+                                cpu->xpsr = (cpu->xpsr & 0x0FFFFFFF) | (val & 0xF0000000);
+                                break;
+                            case 8: cpu->msp = val; cpu->reg[ARM_SP] = val; break;
+                            case 9: cpu->psp = val; break;
+                            case 16: cpu->primask = val & 1; break;
+                            case 17: cpu->basepri = val & 0xFF; break;
+                            case 19: cpu->faultmask = val & 1; break;
+                            case 20: /* CONTROL */
+                                cpu->use_psp = (val & 2) != 0;
+                                break;
+                            default: break;
+                        }
+                    }
+                }
+            } else if (op1 == 3 && (op2_5 & 0x71) == 0x00) {
+                /* Store single: STR.W, STRB.W, STRH.W (12-bit immediate) */
+                int size = (hw1 >> 5) & 3; /* 0=STRB, 1=STRH, 2=STR */
+                int rn = hw1 & 0xF;
+                int rt = (hw2 >> 12) & 0xF;
+                if (hw1 & (1 << 7)) {
+                    /* 12-bit unsigned offset (T2/T3 encoding: hw1 bit 7 = 1) */
+                    uint32_t imm12 = hw2 & 0xFFF;
+                    uint32_t addr = cpu->reg[rn] + imm12;
+                    switch (size) {
+                        case 0: arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]); break;
+                        case 1: arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]); break;
+                        case 2: arm_write32(cpu, addr, cpu->reg[rt]); break;
+                    }
+                } else {
+                    /* 8-bit immediate with pre/post index, or register */
+                    int P = (hw2 >> 10) & 1;
+                    int U = (hw2 >> 9) & 1;
+                    int W = (hw2 >> 8) & 1;
+
+                    if (P == 0 && U == 0 && W == 0) {
+                        /* Register offset: STR Rt, [Rn, Rm, LSL #imm2] */
+                        int rm = hw2 & 0xF;
+                        int imm2 = (hw2 >> 4) & 3;
+                        uint32_t addr = cpu->reg[rn] + (cpu->reg[rm] << imm2);
+                        switch (size) {
+                            case 0: arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]); break;
+                            case 1: arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]); break;
+                            case 2: arm_write32(cpu, addr, cpu->reg[rt]); break;
+                        }
+                    } else {
+                        uint32_t imm8 = hw2 & 0xFF;
+                        uint32_t addr;
+                        if (P) {
+                            addr = U ? cpu->reg[rn] + imm8 : cpu->reg[rn] - imm8;
+                        } else {
+                            addr = cpu->reg[rn];
+                        }
+                        switch (size) {
+                            case 0: arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]); break;
+                            case 1: arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]); break;
+                            case 2: arm_write32(cpu, addr, cpu->reg[rt]); break;
+                        }
+                        if (W) {
+                            if (P)
+                                cpu->reg[rn] = addr;
+                            else
+                                cpu->reg[rn] = U ? addr + imm8 : addr - imm8;
+                        }
+                    }
+                }
+                cpu->cycles += 1;
+            } else if (op1 == 3 && (op2_5 & 0x71) == 0x01) {
+                /* Load byte/halfword: LDR.W, LDRB.W, LDRH.W, LDRSB.W, LDRSH.W */
+                int size = (hw1 >> 5) & 3;
+                int sign_extend = (hw1 >> 8) & 1;
+                int rn = hw1 & 0xF;
+                int rt = (hw2 >> 12) & 0xF;
+
+                uint32_t addr;
+                if (rn == 0xF) {
+                    /* PC-relative (literal) */
+                    uint32_t imm12 = hw2 & 0xFFF;
+                    int U = (hw1 >> 7) & 1;
+                    uint32_t base = (pc + 4) & ~3u;
+                    addr = U ? base + imm12 : base - imm12;
+                } else if (hw1 & (1 << 7)) {
+                    /* 12-bit unsigned offset (T2/T3 encoding: hw1 bit 7 = 1) */
+                    uint32_t imm12 = hw2 & 0xFFF;
+                    addr = cpu->reg[rn] + imm12;
+                } else if ((hw2 & 0xFC0) == 0) {
+                    /* Register offset */
+                    int rm = hw2 & 0xF;
+                    int imm2 = (hw2 >> 4) & 3;
+                    addr = cpu->reg[rn] + (cpu->reg[rm] << imm2);
+                } else {
+                    /* 8-bit immediate with P/U/W */
+                    int P = (hw2 >> 10) & 1;
+                    int U = (hw2 >> 9) & 1;
+                    int W = (hw2 >> 8) & 1;
+                    uint32_t imm8 = hw2 & 0xFF;
+                    if (P) {
+                        addr = U ? cpu->reg[rn] + imm8 : cpu->reg[rn] - imm8;
+                    } else {
+                        addr = cpu->reg[rn];
+                    }
+                    if (W) {
+                        if (P)
+                            cpu->reg[rn] = addr;
+                        else
+                            cpu->reg[rn] = U ? addr + imm8 : addr - imm8;
+                    }
+                }
+
+                uint32_t val;
+                switch (size) {
+                    case 0: /* Byte */
+                        val = arm_read8(cpu, addr);
+                        if (sign_extend) val = (uint32_t)(int32_t)(int8_t)val;
+                        break;
+                    case 1: /* Halfword */
+                        val = arm_read16(cpu, addr);
+                        if (sign_extend) val = (uint32_t)(int32_t)(int16_t)val;
+                        break;
+                    case 2: /* Word */
+                    default:
+                        val = arm_read32(cpu, addr);
+                        break;
+                }
+                if (rt == ARM_PC) {
+                    if ((val & 0xF0000000) == 0xF0000000)
+                        exception_return(cpu, val);
+                    else
+                        cpu->reg[ARM_PC] = val & ~1u;
+                } else {
+                    cpu->reg[rt] = val;
+                }
+                cpu->cycles += 1;
+            } else if (op1 == 3 && (op2_5 & 0x71) == 0x10) {
+                /* Store single: STR.W 12-bit offset alternate encoding */
+                int rn = hw1 & 0xF;
+                int rt = (hw2 >> 12) & 0xF;
+                uint32_t imm12 = hw2 & 0xFFF;
+                uint32_t addr = cpu->reg[rn] + imm12;
+                arm_write32(cpu, addr, cpu->reg[rt]);
+                cpu->cycles += 1;
+            } else if (op1 == 3 && (op2_5 & 0x71) == 0x11) {
+                /* Load word: LDR.W 12-bit offset alternate encoding */
+                int rn = hw1 & 0xF;
+                int rt = (hw2 >> 12) & 0xF;
+                uint32_t imm12 = hw2 & 0xFFF;
+                uint32_t addr;
+                if (rn == 0xF) {
+                    uint32_t base = (pc + 4) & ~3u;
+                    int U = (hw1 >> 7) & 1;
+                    addr = U ? base + imm12 : base - imm12;
+                } else {
+                    addr = cpu->reg[rn] + imm12;
+                }
+                uint32_t val = arm_read32(cpu, addr);
+                if (rt == ARM_PC) {
+                    if ((val & 0xF0000000) == 0xF0000000)
+                        exception_return(cpu, val);
+                    else
+                        cpu->reg[ARM_PC] = val & ~1u;
+                } else {
+                    cpu->reg[rt] = val;
+                }
+                cpu->cycles += 1;
+            } else if (op1 == 3 && (op2_5 & 0x60) == 0x20) {
+                /* Data processing (register): shifts, multiply, divide, misc */
+                int op_misc = (hw1 >> 4) & 0xF;
+                int rn = hw1 & 0xF;
+                int rd = (hw2 >> 8) & 0xF;
+                int rm = hw2 & 0xF;
+                int ra = (hw2 >> 12) & 0xF;
+                int op2_misc = (hw2 >> 4) & 0xF;
+
+                if (!(hw1 & 0x100) && op_misc < 8) {
+                    /* Register-register shifts: LSL, LSR, ASR, ROR (hw1=0xFA0.-0xFA7.) */
+                    int shift_type = (hw1 >> 5) & 3; /* 0=LSL,1=LSR,2=ASR,3=ROR */
+                    int S = (hw1 >> 4) & 1;
+                    uint32_t val = cpu->reg[rn];
+                    uint32_t shift_n = cpu->reg[rm] & 0xFF;
+                    uint32_t result;
+                    int carry = (cpu->xpsr >> 29) & 1; /* current C */
+
+                    switch (shift_type) {
+                        case 0: /* LSL */
+                            if (shift_n == 0) { result = val; }
+                            else if (shift_n < 32) { carry = (val >> (32 - shift_n)) & 1; result = val << shift_n; }
+                            else if (shift_n == 32) { carry = val & 1; result = 0; }
+                            else { carry = 0; result = 0; }
+                            break;
+                        case 1: /* LSR */
+                            if (shift_n == 0) { result = val; }
+                            else if (shift_n < 32) { carry = (val >> (shift_n - 1)) & 1; result = val >> shift_n; }
+                            else if (shift_n == 32) { carry = (val >> 31) & 1; result = 0; }
+                            else { carry = 0; result = 0; }
+                            break;
+                        case 2: /* ASR */
+                            if (shift_n == 0) { result = val; }
+                            else if (shift_n < 32) { carry = (val >> (shift_n - 1)) & 1; result = (uint32_t)((int32_t)val >> shift_n); }
+                            else { carry = (val >> 31) & 1; result = (uint32_t)((int32_t)val >> 31); }
+                            break;
+                        case 3: /* ROR */
+                            if (shift_n == 0) { result = val; }
+                            else { shift_n &= 31; if (shift_n == 0) { carry = (val >> 31) & 1; result = val; } else { carry = (val >> (shift_n - 1)) & 1; result = (val >> shift_n) | (val << (32 - shift_n)); } }
+                            break;
+                        default: result = val; break;
+                    }
+                    cpu->reg[rd] = result;
+                    if (S) {
+                        /* Update N, Z, C flags (V unchanged) */
+                        cpu->xpsr = (cpu->xpsr & ~(APSR_N | APSR_Z | APSR_C))
+                                  | (result & 0x80000000 ? APSR_N : 0)
+                                  | (result == 0 ? APSR_Z : 0)
+                                  | (carry ? APSR_C : 0);
+                    }
+                } else if (op_misc == 0) {
+                    /* MUL / MLA / MLS (hw1=0xFB0.) */
+                    if (ra == 0xF) {
+                        /* MUL Rd, Rn, Rm */
+                        cpu->reg[rd] = cpu->reg[rn] * cpu->reg[rm];
+                    } else if (op2_misc == 0) {
+                        /* MLA Rd, Rn, Rm, Ra */
+                        cpu->reg[rd] = cpu->reg[rn] * cpu->reg[rm] + cpu->reg[ra];
+                    } else if (op2_misc == 1) {
+                        /* MLS Rd, Rn, Rm, Ra */
+                        cpu->reg[rd] = cpu->reg[ra] - cpu->reg[rn] * cpu->reg[rm];
+                    }
+                } else if (op_misc == 8) {
+                    /* SMULL RdLo, RdHi, Rn, Rm (hw1=0xFB8.) */
+                    int64_t result = (int64_t)(int32_t)cpu->reg[rn] *
+                                     (int64_t)(int32_t)cpu->reg[rm];
+                    cpu->reg[rd] = (uint32_t)result;
+                    cpu->reg[ra] = (uint32_t)(result >> 32);
+                } else if (op_misc == 9) {
+                    if (hw1 & 0x100) {
+                        /* SDIV Rd, Rn, Rm (hw1=0xFB9.) */
+                        int32_t denom = (int32_t)cpu->reg[rm];
+                        if (denom == 0)
+                            cpu->reg[rd] = 0;
+                        else
+                            cpu->reg[rd] = (uint32_t)((int32_t)cpu->reg[rn] / denom);
+                    } else {
+                        /* Misc register ops (hw1=0xFA9.): REV, REV16, RBIT, REVSH */
+                        if (op2_misc == 8) {
+                            /* REV */
+                            uint32_t val = cpu->reg[rm];
+                            cpu->reg[rd] = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) |
+                                           ((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF);
+                        } else if (op2_misc == 9) {
+                            /* REV16 */
+                            uint32_t val = cpu->reg[rm];
+                            cpu->reg[rd] = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8) |
+                                           ((val & 0x00FF0000) << 8) | ((val & 0xFF000000) >> 8);
+                        } else if (op2_misc == 0xA) {
+                            /* RBIT */
+                            uint32_t val = cpu->reg[rm];
+                            uint32_t result = 0;
+                            for (int i = 0; i < 32; i++)
+                                if (val & (1u << i)) result |= (1u << (31 - i));
+                            cpu->reg[rd] = result;
+                        } else if (op2_misc == 0xB) {
+                            /* REVSH */
+                            uint32_t val = cpu->reg[rm];
+                            cpu->reg[rd] = (uint32_t)(int32_t)(int16_t)
+                                           (uint16_t)(((val & 0xFF) << 8) | ((val >> 8) & 0xFF));
+                        }
+                    }
+                } else if (op_misc == 0xA) {
+                    if (hw1 & 0x100) {
+                        /* UMULL RdLo, RdHi, Rn, Rm (hw1=0xFBA.) */
+                        uint64_t result = (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm];
+                        cpu->reg[rd] = (uint32_t)result;  /* RdLo = rd */
+                        cpu->reg[ra] = (uint32_t)(result >> 32); /* RdHi = ra */
+                    }
+                    /* hw1=0xFAA. is reserved/unused on Cortex-M3 */
+                } else if (op_misc == 0xB) {
+                    if (hw1 & 0x100) {
+                        /* UDIV Rd, Rn, Rm (hw1=0xFBB.) */
+                        if (cpu->reg[rm] == 0)
+                            cpu->reg[rd] = 0;
+                        else
+                            cpu->reg[rd] = cpu->reg[rn] / cpu->reg[rm];
+                    } else {
+                        /* CLZ (hw1=0xFAB.) */
+                        if (op2_misc == 8) {
+                            uint32_t val = cpu->reg[rm];
+                            int count = 0;
+                            if (val == 0) { count = 32; }
+                            else { while (!(val & 0x80000000)) { count++; val <<= 1; } }
+                            cpu->reg[rd] = count;
+                        }
+                    }
+                } else if (op_misc == 0xC) {
+                    /* SMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBC.) */
+                    int64_t acc = ((int64_t)(int32_t)cpu->reg[rd]) |
+                                  ((int64_t)(int32_t)cpu->reg[ra] << 32);
+                    acc += (int64_t)(int32_t)cpu->reg[rn] * (int64_t)(int32_t)cpu->reg[rm];
+                    cpu->reg[rd] = (uint32_t)acc;
+                    cpu->reg[ra] = (uint32_t)(acc >> 32);
+                } else if (op_misc == 0xE) {
+                    /* UMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBE.) */
+                    uint64_t acc = ((uint64_t)cpu->reg[rd]) |
+                                   ((uint64_t)cpu->reg[ra] << 32);
+                    acc += (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm];
+                    cpu->reg[rd] = (uint32_t)acc;
+                    cpu->reg[ra] = (uint32_t)(acc >> 32);
+                }
+            } else if (op1 == 3 && (op2_5 & 0x60) == 0x40) {
+                /* Misc instructions: UXTB, UXTH, SXTB, SXTH, etc. */
+                int op_ext = (hw1 >> 4) & 0x1F;
+                int rn = hw1 & 0xF;
+                int rd = (hw2 >> 8) & 0xF;
+                int rm = hw2 & 0xF;
+                int rot = ((hw2 >> 4) & 3) * 8;
+                uint32_t rm_val = cpu->reg[rm];
+                if (rot) rm_val = (rm_val >> rot) | (rm_val << (32 - rot));
+
+                switch (op_ext & 0x1F) {
+                    case 0x00: /* SXTH / SXTAH */
+                        if (rn == 0xF)
+                            cpu->reg[rd] = (uint32_t)(int32_t)(int16_t)(uint16_t)rm_val;
+                        else
+                            cpu->reg[rd] = cpu->reg[rn] + (uint32_t)(int32_t)(int16_t)(uint16_t)rm_val;
+                        break;
+                    case 0x01: /* UXTH / UXTAH */
+                        if (rn == 0xF)
+                            cpu->reg[rd] = rm_val & 0xFFFF;
+                        else
+                            cpu->reg[rd] = cpu->reg[rn] + (rm_val & 0xFFFF);
+                        break;
+                    case 0x04: /* SXTB / SXTAB */
+                        if (rn == 0xF)
+                            cpu->reg[rd] = (uint32_t)(int32_t)(int8_t)(uint8_t)rm_val;
+                        else
+                            cpu->reg[rd] = cpu->reg[rn] + (uint32_t)(int32_t)(int8_t)(uint8_t)rm_val;
+                        break;
+                    case 0x05: /* UXTB / UXTAB */
+                        if (rn == 0xF)
+                            cpu->reg[rd] = rm_val & 0xFF;
+                        else
+                            cpu->reg[rd] = cpu->reg[rn] + (rm_val & 0xFF);
+                        break;
+                    default:
+                        break;
+                }
+            } else {
+                /* Unhandled 32-bit instruction */
+                fprintf(stderr, "ARM: unhandled 32-bit insn at PC=0x%08x: %04x %04x\n",
+                        pc, hw1, hw2);
+                (void)insn32;
+            }
+        }
+
+        /* Advance IT state after each executed instruction */
+        if (in_it) {
+            cpu->it_state = (cpu->it_state & 0xE0) | ((cpu->it_state << 1) & 0x1F);
+        }
+
+        cpu->instructions++;
+        remaining--;
+    }
+
+    if (cpu->cpu_freq_hz > 0)
+        cpu->sim_time_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+
+    return remaining;
+}
+
+void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
+    cpu->cycle_limit = target_cycle;
+    while (cpu->cycles < target_cycle && !cpu->stopping) {
+        if (cpu->cycles >= cpu->next_event_cycle)
+            execute_events(cpu);
+        if (cpu->cpu_off) {
+            if (cpu->event_queue && cpu->event_queue->fire_cycle <= target_cycle) {
+                cpu->cycles = cpu->event_queue->fire_cycle;
+                continue;
+            }
+            cpu->cycles = target_cycle;
+            break;
+        }
+
+        uint32_t pc = cpu->reg[ARM_PC];
+
+        /* ROM utility traps */
+        if (pc < 0x100 && handle_rom_trap(cpu)) {
+            cpu->instructions++;
+            continue;
+        }
+
+        /* Re-use arm_step for the actual execution */
+        cpu->stopping = false;
+        arm_step(cpu, 1);
+        cpu->stopping = false;
+    }
+    cpu->cycle_limit = INT64_MAX;
+    if (cpu->cpu_freq_hz > 0)
+        cpu->sim_time_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+}
