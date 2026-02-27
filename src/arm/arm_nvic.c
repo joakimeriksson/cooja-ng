@@ -122,6 +122,7 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         case SCB_ICSR:
             if (value & (1u << 28)) { /* PENDSVSET */
                 nvic->pending_exception = EXC_PENDSV;
+                nvic->has_pending = true;
                 arm_nvic_check_pending(nvic);
             }
             if (value & (1u << 27)) { /* PENDSVCLR */
@@ -130,6 +131,7 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             }
             if (value & (1u << 26)) { /* PENDSTSET */
                 nvic->pending_exception = EXC_SYSTICK;
+                nvic->has_pending = true;
                 arm_nvic_check_pending(nvic);
             }
             if (value & (1u << 25)) { /* PENDSTCLR */
@@ -188,6 +190,9 @@ void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu) {
     nvic->vtor = ARM_FLASH_BASE; /* CC2538 default VTOR */
     nvic->ccr = 0x200; /* STKALIGN=1 by default */
 
+    /* Set back-pointer so exception_return can access NVIC */
+    cpu->nvic = nvic;
+
     arm_register_io(cpu, NVIC_IO_BASE, NVIC_IO_SIZE, nvic_read, nvic_write, nvic);
 }
 
@@ -196,6 +201,7 @@ void arm_nvic_set_pending(arm_nvic_t *nvic, int irq_num) {
     int idx = irq_num / 32;
     int bit = irq_num % 32;
     nvic->ispr[idx] |= (1u << bit);
+    nvic->has_pending = true;
     arm_nvic_check_pending(nvic);
 }
 
@@ -258,13 +264,17 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
         }
     }
 
-    if (best_exc < 0) return;
+    if (best_exc < 0) {
+        nvic->has_pending = false;
+        return;
+    }
 
     /* Check if we can preempt the current handler */
     if (nvic->active_exception > 0) {
         int active_prio = arm_nvic_get_priority(nvic, nvic->active_exception);
-        if (best_prio >= active_prio) return; /* Cannot preempt */
+        if (best_prio >= active_prio) return; /* Cannot preempt, stay pending */
     }
+    nvic->has_pending = false;
 
     /* Clear pending bit */
     if (best_exc >= 16) {

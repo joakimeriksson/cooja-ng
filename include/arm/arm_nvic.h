@@ -57,6 +57,10 @@ typedef struct arm_nvic {
     /* Currently active exception (0 = Thread mode) */
     int       active_exception;
     int       pending_exception;  /* highest priority pending, -1 = none */
+
+    /* Flag: set when there may be serviceable pending interrupts.
+     * Checked in the main execution loop to avoid scanning ISPR on every insn. */
+    bool      has_pending;
 } arm_nvic_t;
 
 /* Initialize NVIC and register IO regions */

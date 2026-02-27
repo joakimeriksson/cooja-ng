@@ -14,6 +14,7 @@
 #include "cc2538_sys_ctrl.h"
 #include "cc2538_ioc.h"
 #include "cc2538_rfcore.h"
+#include "cc2538_sleeptimer.h"
 
 /* UART TX callback */
 typedef void (*arm_uart_tx_callback)(void *user_data, uint8_t byte);
@@ -37,6 +38,9 @@ typedef struct arm_platform {
     cc2538_sys_ctrl_t sys_ctrl;
     cc2538_ioc_t      ioc;
     cc2538_rfcore_t   rfcore;
+    cc2538_sleeptimer_t sleeptimer;
+    /* uDMA state (opaque, allocated by platform init) */
+    void *udma;
     const arm_platform_config_t *config;
 } arm_platform_t;
 

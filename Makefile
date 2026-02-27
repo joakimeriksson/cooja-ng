@@ -35,7 +35,8 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/cc2538_gptimer.c \
               $(ARM_SRC_DIR)/cc2538_sys_ctrl.c \
               $(ARM_SRC_DIR)/cc2538_ioc.c \
-              $(ARM_SRC_DIR)/cc2538_rfcore.c
+              $(ARM_SRC_DIR)/cc2538_rfcore.c \
+              $(ARM_SRC_DIR)/cc2538_sleeptimer.c
 
 ifneq ($(LIGHTNING_LIBS),)
   CFLAGS += $(LIGHTNING_CFLAGS) -DHAVE_LIGHTNING

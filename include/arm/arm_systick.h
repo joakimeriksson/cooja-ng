@@ -37,4 +37,8 @@ void arm_systick_init(arm_systick_t *st, arm_cpu_t *cpu, arm_nvic_t *nvic);
 /* Recalculate and schedule next tick event */
 void arm_systick_update(arm_systick_t *st);
 
+/* Debug: SysTick fire counter */
+int arm_systick_get_fire_count(void);
+void arm_systick_reset_fire_count(void);
+
 #endif /* ARM_SYSTICK_H */

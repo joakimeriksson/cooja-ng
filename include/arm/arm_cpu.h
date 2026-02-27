@@ -145,6 +145,20 @@ typedef struct arm_cpu {
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
     uint32_t  rom_util_memset;    /* Address of rom_util_memset entry */
     uint32_t  rom_util_memcmp;    /* Address of rom_util_memcmp entry */
+
+    /* Firmware helper traps (resolved from ELF symbols) */
+    uint32_t  fw_udivmoddi4;      /* __udivmoddi4 */
+    uint32_t  fw_aeabi_uldivmod;  /* __aeabi_uldivmod */
+
+    /* Back-pointer to NVIC (set by arm_nvic_init) */
+    void     *nvic;
+
+    /* Debug: non-zero enables debug tracing */
+    int       debug_flags;
+
+    /* PC trace callback: called after each instruction if non-NULL */
+    void    (*pc_callback)(void *user_data, uint32_t pc);
+    void     *pc_callback_data;
 } arm_cpu_t;
 
 /* --- Public API --- */

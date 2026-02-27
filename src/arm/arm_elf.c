@@ -158,6 +158,11 @@ int arm_load_elf(arm_cpu_t *cpu, const char *path) {
     }
 
     fclose(f);
+
+    /* Resolve firmware helper symbols (optional).
+       Strip Thumb bit (bit 0) so addresses match the even-aligned PC. */
+    cpu->fw_udivmoddi4 = arm_elf_find_symbol(path, "__udivmoddi4") & ~1u;
+    cpu->fw_aeabi_uldivmod = arm_elf_find_symbol(path, "__aeabi_uldivmod") & ~1u;
     return 0;
 }
 

@@ -1,16 +1,27 @@
 # Cooja-NG
 
-A fast MSP430 emulator and network simulator written in C, designed for large-scale IoT simulation with Contiki-NG firmware.
+A fast multi-architecture emulator and network simulator written in C, designed for large-scale IoT simulation with Contiki-NG firmware.
 
 ## Features
 
+### MSP430
 - **MSP430/MSP430X CPU emulator** with threaded interpreter (computed goto dispatch)
 - **JIT compiler** using GNU Lightning for hot basic blocks (~430 MIPS on Apple Silicon)
 - **CC2420 802.15.4 radio** with full state machine, SPI, TX/RX FIFO, CRC, and auto-ACK
-- **Multi-node simulation** with time-stepped RF byte delivery
 - **Peripherals**: Timer A/B, USART, GPIO, clock system (DCO/MCLK/SMCLK/ACLK)
 - **Platform support**: Tmote Sky (MSP430F1611 + CC2420)
+
+### ARM Cortex-M3
+- **ARM Cortex-M3 CPU emulator** with Thumb/Thumb-2 interpreter
+- **CC2538 SoC** with on-chip 802.15.4 radio (RF Core), NVIC, SysTick
+- **Peripherals**: UART, GPIO, General Purpose Timers, Sleep Timer, System Control, IOC
+- **Platform support**: CC2538DK (SmartRF06 + CC2538EM)
+- **RPL-UDP networking**: full 6LoWPAN/RPL stack convergence in multi-node simulation
+
+### Common
+- **Multi-node simulation** with time-stepped RF byte delivery
 - **ELF loader** for Contiki-NG firmware binaries
+- **Nanosecond simulation time** for CPU-clock-independent scheduling
 
 ## Building
 
@@ -23,6 +34,8 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 
 ## Running tests
 
+### MSP430
+
 ```sh
 ./build/test_runner correctness      # 68 instruction-level tests
 ./build/test_runner bench            # micro-benchmarks + firmware benchmarks
@@ -30,11 +43,22 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner multinode        # 2-node nullnet-broadcast simulation
 ```
 
-Multi-node options:
+### ARM Cortex-M3
 
 ```sh
-# RPL-UDP server + client, 60 seconds simulated time
+./build/test_runner arm-correctness      # 33 instruction-level tests
+./build/test_runner arm-firmware         # firmware boot test (hello-world)
+./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
+```
+
+### Multi-node options
+
+```sh
+# MSP430: RPL-UDP server + client, 60 seconds simulated time
 ./build/test_runner multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
+
+# ARM: RPL-UDP server + client, 60 seconds simulated time
+./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
 
 # Quiet mode (no per-node UART output)
 ./build/test_runner multinode -q -t 60000
@@ -44,13 +68,20 @@ Multi-node options:
 
 On Apple Silicon (M-series, PGO build):
 
-| Benchmark | MIPS |
-|-----------|------|
-| Micro-benchmarks (avg) | ~430 |
-| Firmware blink.sky | ~195 |
-| Firmware energest-demo.sky | ~196 |
-| 2-node nullnet (60s sim) | 500x real-time |
-| 2-node RPL-UDP (60s sim) | 1600x real-time |
+### MSP430 (with JIT)
+
+| Benchmark | Speed |
+|-----------|-------|
+| Micro-benchmarks (avg) | ~430 MIPS |
+| Firmware blink.sky | ~195 MIPS |
+| 2-node nullnet (60s sim) | ~500x real-time |
+| 2-node RPL-UDP (60s sim) | ~1600x real-time |
+
+### ARM Cortex-M3 (interpreter)
+
+| Benchmark | Speed |
+|-----------|-------|
+| 2-node RPL-UDP (60s sim) | ~4x real-time |
 
 ## JIT configuration
 
@@ -64,10 +95,15 @@ Environment variables:
 ## Project structure
 
 ```
-src/            MSP430 CPU, peripherals, JIT compiler
-include/        Header files
-test/           Test runner, correctness tests, benchmarks, multi-node sim
-firmware/sky/   Pre-compiled Contiki-NG firmware for Tmote Sky
+src/
+  msp430/             MSP430 CPU, peripherals, JIT compiler
+  arm/                ARM Cortex-M3 CPU, CC2538 peripherals
+include/
+  msp430/             MSP430 header files
+  arm/                ARM header files
+test/                 Test runner, correctness tests, benchmarks, multi-node sim
+firmware/sky/         Pre-compiled Contiki-NG firmware for Tmote Sky
+firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 ```
 
 ## License

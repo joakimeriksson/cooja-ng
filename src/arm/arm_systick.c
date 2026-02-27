@@ -3,13 +3,18 @@
  */
 #include "arm_systick.h"
 #include <string.h>
+#include <stdio.h>
 
 #define SYSTICK_IO_BASE  0xE000E010
 #define SYSTICK_IO_SIZE  0x10
 
+static int systick_fire_count = 0;
+
 static void systick_fire(void *user_data, arm_event_t *ev) {
     arm_systick_t *st = (arm_systick_t *)user_data;
     (void)ev;
+
+    systick_fire_count++;
 
     /* Reload counter */
     st->cvr = st->rvr & 0x00FFFFFF;
@@ -20,7 +25,9 @@ static void systick_fire(void *user_data, arm_event_t *ev) {
 
     /* Generate interrupt if TICKINT is set */
     if (st->csr & SYST_CSR_TICKINT) {
-        arm_nvic_set_pending(st->nvic, EXC_SYSTICK - 16);
+        st->nvic->pending_exception = EXC_SYSTICK;
+        st->nvic->has_pending = true;
+        arm_nvic_check_pending(st->nvic);
     }
 
     /* Schedule next tick */
@@ -108,4 +115,12 @@ void arm_systick_update(arm_systick_t *st) {
         arm_schedule_event(st->cpu, &st->tick_event,
                           st->cpu->cycles + st->rvr + 1);
     }
+}
+
+int arm_systick_get_fire_count(void) {
+    return systick_fire_count;
+}
+
+void arm_systick_reset_fire_count(void) {
+    systick_fire_count = 0;
 }

@@ -7,6 +7,31 @@
 
 #define GPTIMER_REG_SIZE  0x1000
 
+/* Check if timer A has expired (one-shot auto-stop, periodic wrap) */
+static void gptimer_check_ta_expiry(cc2538_gptimer_t *timer) {
+    if (!(timer->ctl & GPTIMER_CTL_TAEN)) return;
+
+    int64_t elapsed_cycles = timer->cpu->cycles - timer->ta_start_cycle;
+    if (elapsed_cycles < 0) elapsed_cycles = 0;
+
+    /* Prescaler: in 16-bit individual mode (cfg=0x04), TAPR divides clock */
+    uint32_t prescaler = (timer->cfg == 0x04) ? (timer->tapr + 1) : 1;
+    uint32_t elapsed_ticks = (uint32_t)((uint64_t)elapsed_cycles / prescaler);
+
+    /* Load value (16-bit in individual mode, 32-bit otherwise) */
+    uint32_t load = timer->tailr;
+    if (timer->cfg == 0x04) load &= 0xFFFF;
+
+    uint32_t mode = timer->tamr & 0x03;
+
+    if (mode == 0x01 && elapsed_ticks >= load) {
+        /* One-shot: timer expired — clear TAEN (auto-stop) */
+        timer->ctl &= ~GPTIMER_CTL_TAEN;
+        timer->tav = 0;
+        timer->ris |= (1 << 0);  /* TATORIS: timeout raw interrupt */
+    }
+}
+
 static int gptimer_read(void *user_data, uint32_t addr) {
     cc2538_gptimer_t *timer = (cc2538_gptimer_t *)user_data;
     uint32_t offset = addr - timer->base_addr;
@@ -15,10 +40,16 @@ static int gptimer_read(void *user_data, uint32_t addr) {
         case GPTIMER_CFG:      return (int)timer->cfg;
         case GPTIMER_TAMR:     return (int)timer->tamr;
         case GPTIMER_TBMR:     return (int)timer->tbmr;
-        case GPTIMER_CTL:      return (int)timer->ctl;
+        case GPTIMER_CTL:
+            gptimer_check_ta_expiry(timer);
+            return (int)timer->ctl;
         case GPTIMER_IMR:      return (int)timer->imr;
-        case GPTIMER_RIS:      return (int)timer->ris;
-        case GPTIMER_MIS:      return (int)(timer->ris & timer->imr);
+        case GPTIMER_RIS:
+            gptimer_check_ta_expiry(timer);
+            return (int)timer->ris;
+        case GPTIMER_MIS:
+            gptimer_check_ta_expiry(timer);
+            return (int)(timer->ris & timer->imr);
         case GPTIMER_ICR:      return 0;
         case GPTIMER_TAILR:    return (int)timer->tailr;
         case GPTIMER_TBILR:    return (int)timer->tbilr;
@@ -28,10 +59,20 @@ static int gptimer_read(void *user_data, uint32_t addr) {
         case GPTIMER_TBPR:     return (int)timer->tbpr;
         case GPTIMER_TAR:
         case GPTIMER_TAV: {
-            /* On-demand counter value */
+            gptimer_check_ta_expiry(timer);
             if (timer->ctl & GPTIMER_CTL_TAEN) {
                 int64_t elapsed = timer->cpu->cycles - timer->ta_start_cycle;
-                return (int)((timer->tav + (uint32_t)elapsed) & 0xFFFFFFFF);
+                uint32_t prescaler = (timer->cfg == 0x04) ? (timer->tapr + 1) : 1;
+                uint32_t elapsed_ticks = (uint32_t)((uint64_t)elapsed / prescaler);
+                uint32_t load = timer->tailr;
+                if (timer->cfg == 0x04) load &= 0xFFFF;
+                int count_down = !(timer->tamr & (1 << 4)); /* TACDIR: 0=down */
+                if (count_down) {
+                    if (elapsed_ticks >= load) return 0;
+                    return (int)(load - elapsed_ticks);
+                } else {
+                    return (int)(elapsed_ticks % (load + 1));
+                }
             }
             return (int)timer->tav;
         }

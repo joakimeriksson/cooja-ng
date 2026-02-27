@@ -5,6 +5,7 @@
 #define CC2538_RFCORE_H
 
 #include "arm_cpu.h"
+#include "arm_nvic.h"
 
 /* RF Core base addresses */
 #define RFCORE_FFSM_BASE   0x40088000
@@ -32,6 +33,9 @@
 #define RFCORE_XREG_RFC_OBS_CTRL0 0x1AC
 #define RFCORE_XREG_RFC_OBS_CTRL1 0x1B0
 #define RFCORE_XREG_RFC_OBS_CTRL2 0x1B4
+#define RFCORE_XREG_RFIRQM0   0x08C
+#define RFCORE_XREG_RFIRQM1   0x090
+#define RFCORE_XREG_RFERRM    0x094
 #define RFCORE_XREG_TXFILTCFG  0x1E8
 
 /* SFR offsets (relative to SFR_BASE) */
@@ -42,13 +46,13 @@
 #define RFCORE_SFR_MTMSEL      0x010
 #define RFCORE_SFR_MTM0        0x014
 #define RFCORE_SFR_MTM1        0x018
-#define RFCORE_SFR_MTMOVF0     0x01C
+#define RFCORE_SFR_MTMOVF2     0x01C
 #define RFCORE_SFR_MTMOVF1     0x020
-#define RFCORE_SFR_MTMOVF2     0x024
+#define RFCORE_SFR_MTMOVF0     0x024
 #define RFCORE_SFR_RFDATA      0x028
 #define RFCORE_SFR_RFERRF      0x02C
-#define RFCORE_SFR_RFIRQF0     0x030
-#define RFCORE_SFR_RFIRQF1     0x034
+#define RFCORE_SFR_RFIRQF1     0x030
+#define RFCORE_SFR_RFIRQF0     0x034
 #define RFCORE_SFR_RFST        0x038   /* CSP strobe register */
 
 /* CSP strobes */
@@ -89,8 +93,14 @@ typedef enum {
 
 typedef void (*cc2538_rf_tx_fn)(void *user_data, uint8_t byte);
 
+/* RX frame parsing states */
+#define RF_RX_PREAMBLE  0
+#define RF_RX_LENGTH    1
+#define RF_RX_PAYLOAD   2
+
 typedef struct cc2538_rfcore {
     arm_cpu_t  *cpu;
+    arm_nvic_t *nvic;
 
     /* State */
     rf_state_t  state;
@@ -121,6 +131,11 @@ typedef struct cc2538_rfcore {
     uint32_t    txfiltcfg;
     uint32_t    rxenable;
 
+    /* Interrupt mask registers */
+    uint32_t    rfirqm0;
+    uint32_t    rfirqm1;
+    uint32_t    rferrm;
+
     /* SFR registers */
     uint32_t    mtcspcfg;
     uint32_t    mtctrl;
@@ -136,6 +151,11 @@ typedef struct cc2538_rfcore {
     uint32_t    rfirqf0;
     uint32_t    rfirqf1;
 
+    /* FFSM address registers */
+    uint8_t     ext_addr[8];   /* IEEE 64-bit extended address (EXT_ADDR0..7) */
+    uint16_t    short_addr;    /* SHORT_ADDR0/1 */
+    uint16_t    pan_id;        /* PAN_ID0/1 */
+
     /* Pseudo-random number generator state (for RFRND register) */
     uint32_t    rfrnd_state;
 
@@ -143,10 +163,22 @@ typedef struct cc2538_rfcore {
     uint8_t     rx_incoming[256];
     int         rx_incoming_len;
 
+    /* RX frame parsing state */
+    int         rx_frame_state;     /* RF_RX_PREAMBLE / RF_RX_LENGTH / RF_RX_PAYLOAD */
+    int         zero_symbols;       /* Consecutive 0x00 preamble bytes */
+    int         rxlen;              /* Expected frame length (from length byte) */
+    int         rx_byte_count;      /* Bytes received in current frame payload */
+    uint8_t     rx_fcf0;            /* Frame Control Field byte 0 */
+    uint8_t     rx_dsn;             /* Data Sequence Number */
+    bool        rx_ack_request;     /* ACK requested in received frame */
+
     /* RF TX callback */
     cc2538_rf_tx_fn  tx_callback;
     void            *tx_user_data;
     int              node_id;
+
+    /* Software-off flag: firmware called ISRFOFF but we keep receiving */
+    bool             software_off;
 
     /* Events */
     arm_event_t      tx_event;
@@ -154,7 +186,7 @@ typedef struct cc2538_rfcore {
 } cc2538_rfcore_t;
 
 /* Initialize RF Core and register IO regions */
-void cc2538_rfcore_init(cc2538_rfcore_t *rf, arm_cpu_t *cpu);
+void cc2538_rfcore_init(cc2538_rfcore_t *rf, arm_cpu_t *cpu, arm_nvic_t *nvic);
 
 /* Set RF TX callback (for multi-node simulation) */
 void cc2538_rfcore_set_tx_callback(cc2538_rfcore_t *rf,

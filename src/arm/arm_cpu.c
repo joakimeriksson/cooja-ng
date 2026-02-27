@@ -3,6 +3,7 @@
  */
 #include "arm_cpu.h"
 #include "arm_config.h"
+#include "arm_nvic.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -10,12 +11,15 @@
 /* --- Memory access helpers --- */
 
 static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
+    arm_io_region_t *best = NULL;
     for (int i = 0; i < cpu->num_io_regions; i++) {
         arm_io_region_t *r = &cpu->io_regions[i];
-        if (addr >= r->base && addr < r->base + r->size)
-            return r;
+        if (addr >= r->base && addr < r->base + r->size) {
+            if (!best || r->size < best->size)
+                best = r;
+        }
     }
-    return NULL;
+    return best;
 }
 
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
@@ -42,10 +46,45 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
         uint32_t val = arm_read32(cpu, base_addr);
         return (val >> bit) & 1;
     }
-    /* IO regions */
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) return r->read(r->user_data, addr);
     return 0;
+}
+
+/* Unaligned read/write for LDR/STR/LDRH/STRH (Cortex-M3 supports these) */
+static inline uint32_t arm_read32_unaligned(arm_cpu_t *cpu, uint32_t addr) {
+    if (addr & 3) {
+        return arm_read8(cpu, addr) | ((uint32_t)arm_read8(cpu, addr+1) << 8) |
+               ((uint32_t)arm_read8(cpu, addr+2) << 16) | ((uint32_t)arm_read8(cpu, addr+3) << 24);
+    }
+    return arm_read32(cpu, addr);
+}
+
+static inline void arm_write32_unaligned(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
+    if (addr & 3) {
+        arm_write8(cpu, addr, val & 0xFF);
+        arm_write8(cpu, addr+1, (val >> 8) & 0xFF);
+        arm_write8(cpu, addr+2, (val >> 16) & 0xFF);
+        arm_write8(cpu, addr+3, (val >> 24) & 0xFF);
+        return;
+    }
+    arm_write32(cpu, addr, val);
+}
+
+static inline uint16_t arm_read16_unaligned(arm_cpu_t *cpu, uint32_t addr) {
+    if (addr & 1) {
+        return arm_read8(cpu, addr) | ((uint16_t)arm_read8(cpu, addr+1) << 8);
+    }
+    return arm_read16(cpu, addr);
+}
+
+static inline void arm_write16_unaligned(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
+    if (addr & 1) {
+        arm_write8(cpu, addr, val & 0xFF);
+        arm_write8(cpu, addr+1, (val >> 8) & 0xFF);
+        return;
+    }
+    arm_write16(cpu, addr, val);
 }
 
 uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
@@ -132,7 +171,8 @@ void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
 
 void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
     if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        cpu->sram[addr - ARM_SRAM_BASE] = val;
+        uint32_t off = addr - ARM_SRAM_BASE;
+        cpu->sram[off] = val;
         return;
     }
     if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
@@ -374,8 +414,19 @@ void arm_cpu_set_frequency(arm_cpu_t *cpu, uint32_t freq_hz) {
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     /* Push exception frame: R0-R3, R12, LR, ReturnAddr, xPSR */
     uint32_t sp = cpu->reg[ARM_SP];
+    uint32_t sp_align = sp & 4u; /* Non-zero if 4-byte but not 8-byte aligned */
     sp &= ~7u; /* 8-byte align */
     sp -= 32;
+
+    /* Encode IT state into xPSR before saving.
+     * ITSTATE is in xPSR bits [26:25] (lower 2) and [15:10] (upper 6).
+     * Bit 9 indicates stack alignment padding occurred. */
+    uint32_t saved_xpsr = cpu->xpsr;
+    saved_xpsr &= ~((0x3u << 25) | (0x3Fu << 10) | (1u << 9)); /* Clear IT + align bits */
+    saved_xpsr |= ((uint32_t)(cpu->it_state & 0x3) << 25);
+    saved_xpsr |= ((uint32_t)((cpu->it_state >> 2) & 0x3F) << 10);
+    if (sp_align) saved_xpsr |= (1u << 9); /* Mark alignment padding */
+
     arm_write32(cpu, sp + 0,  cpu->reg[0]);
     arm_write32(cpu, sp + 4,  cpu->reg[1]);
     arm_write32(cpu, sp + 8,  cpu->reg[2]);
@@ -383,9 +434,10 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     arm_write32(cpu, sp + 16, cpu->reg[12]);
     arm_write32(cpu, sp + 20, cpu->reg[ARM_LR]);
     arm_write32(cpu, sp + 24, cpu->reg[ARM_PC]);
-    arm_write32(cpu, sp + 28, cpu->xpsr);
+    arm_write32(cpu, sp + 28, saved_xpsr);
 
     cpu->reg[ARM_SP] = sp;
+    cpu->it_state = 0; /* Clear IT state for handler */
 
     /* Set EXC_RETURN in LR */
     if (cpu->use_psp && (cpu->xpsr & 0x1FF) == 0) {
@@ -399,6 +451,11 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     cpu->reg[ARM_PC] = vector & ~1u;
     cpu->xpsr = (cpu->xpsr & ~0x1FFu) | (exception_num & 0x1FF);
     cpu->xpsr |= (1u << 24); /* Thumb bit */
+
+    /* Debug: trace RF Core interrupt entry */
+    if (exception_num == 157)
+        fprintf(stderr, "[ARM] Exception %d entry: vector=0x%08x (from vtor=0x%08x+0x%x)\n",
+                exception_num, vector, cpu->vtor, exception_num * 4);
 
     cpu->cpu_off = false; /* Wake from WFI */
     cpu->cycles += 12; /* Exception entry latency */
@@ -422,11 +479,23 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     cpu->reg[ARM_PC] = arm_read32(cpu, sp + 24) & ~1u;
     cpu->xpsr        = arm_read32(cpu, sp + 28);
 
-    cpu->reg[ARM_SP] = sp + 32;
+    /* Restore IT state from xPSR bits [26:25] and [15:10] */
+    cpu->it_state = (uint8_t)(((cpu->xpsr >> 25) & 0x3) |
+                              (((cpu->xpsr >> 10) & 0x3F) << 2));
+
+    /* Account for stack alignment padding (xPSR bit 9) */
+    cpu->reg[ARM_SP] = sp + 32 + ((cpu->xpsr & (1u << 9)) ? 4 : 0);
 
     /* Return to Thread mode (clear exception number in IPSR) */
     if ((exc_return & 0xF) == 0x9 || (exc_return & 0xF) == 0xD) {
         cpu->xpsr &= ~0x1FFu; /* Clear IPSR -> Thread mode */
+    }
+
+    /* Clear active exception in NVIC and check for tail-chained interrupts */
+    if (cpu->nvic) {
+        arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
+        nvic->active_exception = 0;
+        arm_nvic_check_pending(nvic);
     }
 
     cpu->cycles += 12;
@@ -534,6 +603,55 @@ static inline uint32_t thumb_expand_imm_c(uint16_t imm12, int *carry_out, int ca
 }
 
 /* --- ROM utility trap handler --- */
+static int handle_fw_trap(arm_cpu_t *cpu) {
+    uint32_t pc = cpu->reg[ARM_PC];
+
+    if (cpu->fw_udivmoddi4 && pc == cpu->fw_udivmoddi4) {
+        /* __udivmoddi4(uint64_t num, uint64_t den, uint64_t *rem_p)
+           R0:R1 = numerator, R2:R3 = denominator, [SP] = remainder pointer */
+        uint64_t num = ((uint64_t)cpu->reg[1] << 32) | cpu->reg[0];
+        uint64_t den = ((uint64_t)cpu->reg[3] << 32) | cpu->reg[2];
+        uint64_t quot = 0;
+        uint64_t rem = 0;
+        if (den != 0) {
+            quot = num / den;
+            rem = num % den;
+        }
+        cpu->reg[0] = (uint32_t)(quot & 0xFFFFFFFFu);
+        cpu->reg[1] = (uint32_t)(quot >> 32);
+        /* Write remainder via pointer (5th arg on stack) */
+        uint32_t rem_p = arm_read32(cpu, cpu->reg[ARM_SP]);
+        if (rem_p) {
+            arm_write32(cpu, rem_p, (uint32_t)(rem & 0xFFFFFFFFu));
+            arm_write32(cpu, rem_p + 4, (uint32_t)(rem >> 32));
+        }
+        cpu->reg[ARM_PC] = cpu->reg[ARM_LR] & ~1u;
+        cpu->cycles += 20;
+        return 1;
+    }
+
+    if (cpu->fw_aeabi_uldivmod && pc == cpu->fw_aeabi_uldivmod) {
+        /* __aeabi_uldivmod: R0:R1=num, R2:R3=den -> R0:R1=quot, R2:R3=rem */
+        uint64_t num = ((uint64_t)cpu->reg[1] << 32) | cpu->reg[0];
+        uint64_t den = ((uint64_t)cpu->reg[3] << 32) | cpu->reg[2];
+        uint64_t quot = 0;
+        uint64_t rem = 0;
+        if (den != 0) {
+            quot = num / den;
+            rem = num % den;
+        }
+        cpu->reg[0] = (uint32_t)(quot & 0xFFFFFFFFu);
+        cpu->reg[1] = (uint32_t)(quot >> 32);
+        cpu->reg[2] = (uint32_t)(rem & 0xFFFFFFFFu);
+        cpu->reg[3] = (uint32_t)(rem >> 32);
+        cpu->reg[ARM_PC] = cpu->reg[ARM_LR] & ~1u;
+        cpu->cycles += 20;
+        return 1;
+    }
+
+    return 0;
+}
+
 static int handle_rom_trap(arm_cpu_t *cpu) {
     uint32_t pc = cpu->reg[ARM_PC];
 
@@ -582,8 +700,15 @@ int arm_step(arm_cpu_t *cpu, int count) {
         if (cpu->cycles >= cpu->next_event_cycle)
             execute_events(cpu);
 
-        /* CPU off (WFI) — advance to next event */
+        /* CPU off (WFI) — advance to next event or wake on interrupt */
         if (cpu->cpu_off) {
+            if (cpu->nvic) {
+                arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
+                if (nvic->has_pending) {
+                    arm_nvic_check_pending(nvic);
+                    if (!cpu->cpu_off) continue;
+                }
+            }
             if (cpu->event_queue) {
                 cpu->cycles = cpu->event_queue->fire_cycle;
                 continue;
@@ -594,6 +719,11 @@ int arm_step(arm_cpu_t *cpu, int count) {
         uint32_t pc = cpu->reg[ARM_PC];
 
         /* ROM utility traps */
+        if (handle_fw_trap(cpu)) {
+            cpu->instructions++;
+            remaining--;
+            continue;
+        }
         if (pc < 0x100 && handle_rom_trap(cpu)) {
             cpu->instructions++;
             remaining--;
@@ -625,6 +755,28 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 remaining--;
                 continue;
             }
+        }
+
+        /*
+         * In IT blocks, Thumb-16 data processing instructions do NOT update
+         * condition flags (the implicit S suffix is suppressed). Exceptions
+         * are CMP, CMN, and TST which always update flags.
+         * Save flags before and restore after, unless it's a compare/test.
+         */
+        uint32_t saved_flags_it = 0;
+        int it_suppress_flags = 0;
+        if (in_it && top5 < 0x1D) {
+            saved_flags_it = cpu->xpsr & (APSR_N | APSR_Z | APSR_C | APSR_V);
+            it_suppress_flags = 1;
+            /* Check if instruction is CMP/CMN/TST — these always update flags */
+            if ((hw1 >> 13) == 1 && ((hw1 >> 11) & 3) == 1)
+                it_suppress_flags = 0; /* CMP Rn, #imm8 */
+            else if ((hw1 >> 10) == 0x10) {
+                int dp_op = (hw1 >> 6) & 0xF;
+                if (dp_op == 0x8 || dp_op == 0xA || dp_op == 0xB)
+                    it_suppress_flags = 0; /* TST, CMP, CMN */
+            } else if ((hw1 >> 10) == 0x11 && ((hw1 >> 8) & 3) == 1)
+                it_suppress_flags = 0; /* CMP Rn, Rm (high) */
         }
 
         if (top5 < 0x1D) {
@@ -904,7 +1056,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 int rt = (hw1 >> 8) & 7;
                 uint32_t imm8 = (hw1 & 0xFF) << 2;
                 uint32_t addr = ((pc + 4) & ~3u) + imm8;
-                cpu->reg[rt] = arm_read32(cpu, addr);
+                cpu->reg[rt] = arm_read32_unaligned(cpu, addr);
                 cpu->cycles += 1;
             } else if ((hw1 >> 12) == 0x5) {
                 /* Load/store register offset */
@@ -915,10 +1067,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 uint32_t addr = cpu->reg[rn] + cpu->reg[rm];
                 switch (opcode) {
                     case 0: /* STR */
-                        arm_write32(cpu, addr, cpu->reg[rt]);
+                        arm_write32_unaligned(cpu, addr, cpu->reg[rt]);
                         break;
                     case 1: /* STRH */
-                        arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]);
+                        arm_write16_unaligned(cpu, addr, (uint16_t)cpu->reg[rt]);
                         break;
                     case 2: /* STRB */
                         arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]);
@@ -927,16 +1079,16 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         cpu->reg[rt] = (uint32_t)(int32_t)(int8_t)arm_read8(cpu, addr);
                         break;
                     case 4: /* LDR */
-                        cpu->reg[rt] = arm_read32(cpu, addr);
+                        cpu->reg[rt] = arm_read32_unaligned(cpu, addr);
                         break;
                     case 5: /* LDRH */
-                        cpu->reg[rt] = arm_read16(cpu, addr);
+                        cpu->reg[rt] = arm_read16_unaligned(cpu, addr);
                         break;
                     case 6: /* LDRB */
                         cpu->reg[rt] = arm_read8(cpu, addr);
                         break;
                     case 7: /* LDRSH */
-                        cpu->reg[rt] = (uint32_t)(int32_t)(int16_t)arm_read16(cpu, addr);
+                        cpu->reg[rt] = (uint32_t)(int32_t)(int16_t)arm_read16_unaligned(cpu, addr);
                         break;
                 }
                 cpu->cycles += 1;
@@ -957,9 +1109,9 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 } else {
                     uint32_t addr = cpu->reg[rn] + (imm5 << 2);
                     if (is_load)
-                        cpu->reg[rt] = arm_read32(cpu, addr);
+                        cpu->reg[rt] = arm_read32_unaligned(cpu, addr);
                     else
-                        arm_write32(cpu, addr, cpu->reg[rt]);
+                        arm_write32_unaligned(cpu, addr, cpu->reg[rt]);
                 }
                 cpu->cycles += 1;
             } else if ((hw1 >> 12) == 0x8) {
@@ -970,9 +1122,9 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 int rt = hw1 & 7;
                 uint32_t addr = cpu->reg[rn] + (imm5 << 1);
                 if (is_load)
-                    cpu->reg[rt] = arm_read16(cpu, addr);
+                    cpu->reg[rt] = arm_read16_unaligned(cpu, addr);
                 else
-                    arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]);
+                    arm_write16_unaligned(cpu, addr, (uint16_t)cpu->reg[rt]);
                 cpu->cycles += 1;
             } else if ((hw1 >> 12) == 0x9) {
                 /* LDR/STR Rt, [SP, #imm8*4] */
@@ -981,9 +1133,9 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 uint32_t imm8 = (hw1 & 0xFF) << 2;
                 uint32_t addr = cpu->reg[ARM_SP] + imm8;
                 if (is_load)
-                    cpu->reg[rt] = arm_read32(cpu, addr);
+                    cpu->reg[rt] = arm_read32_unaligned(cpu, addr);
                 else
-                    arm_write32(cpu, addr, cpu->reg[rt]);
+                    arm_write32_unaligned(cpu, addr, cpu->reg[rt]);
                 cpu->cycles += 1;
             } else if ((hw1 >> 12) == 0xA) {
                 /* ADD Rd, PC/SP, #imm8*4 */
@@ -1103,13 +1255,17 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (pop_pc) {
                             uint32_t target = arm_read32(cpu, addr);
                             addr += 4;
+                            /* Update SP BEFORE exception_return so it reads
+                               the exception frame from the correct address */
+                            cpu->reg[ARM_SP] = addr;
                             if ((target & 0xF0000000) == 0xF0000000) {
                                 exception_return(cpu, target);
                             } else {
                                 cpu->reg[ARM_PC] = target & ~1u;
                             }
+                        } else {
+                            cpu->reg[ARM_SP] = addr;
                         }
-                        cpu->reg[ARM_SP] = addr;
                         cpu->cycles += 1;
                         break;
                     }
@@ -1200,15 +1356,19 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 uint32_t addr = cpu->reg[rn];
 
                 if (L) {
-                    /* LDM.W */
+                    /* LDM.W — defer exception_return until after writeback */
+                    uint32_t exc_ret = 0;
+                    bool do_exc_ret = false;
                     for (int i = 0; i < 16; i++) {
                         if (reglist & (1 << i)) {
                             uint32_t val = arm_read32(cpu, addr);
                             if (i == ARM_PC) {
-                                if ((val & 0xF0000000) == 0xF0000000)
-                                    exception_return(cpu, val);
-                                else
+                                if ((val & 0xF0000000) == 0xF0000000) {
+                                    do_exc_ret = true;
+                                    exc_ret = val;
+                                } else {
                                     cpu->reg[ARM_PC] = val & ~1u;
+                                }
                             } else {
                                 cpu->reg[i] = val;
                             }
@@ -1217,6 +1377,8 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     }
                     if (W && !(reglist & (1 << rn)))
                         cpu->reg[rn] = addr;
+                    if (do_exc_ret)
+                        exception_return(cpu, exc_ret);
                 } else {
                     /* STM.W */
                     /* Check if decrement before (STMDB) */
@@ -1276,14 +1438,14 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     uint32_t addr = U ? base + imm8 : base - imm8;
                     cpu->reg[rt]  = arm_read32(cpu, addr);
                     cpu->reg[rt2] = arm_read32(cpu, addr + 4);
-                } else if (op2_2 == 0 && !L) {
-                    /* STREX */
+                } else if (op2_2 == 0 && !P && !U && !L) {
+                    /* STREX (only when P=0, U=0) */
                     int rd = (hw2 >> 8) & 0xF;
                     uint32_t addr = cpu->reg[rn] + imm8;
                     arm_write32(cpu, addr, cpu->reg[rt]);
                     cpu->reg[rd] = 0; /* Always succeed */
-                } else if (op2_2 == 0 && L) {
-                    /* LDREX */
+                } else if (op2_2 == 0 && !P && !U && L) {
+                    /* LDREX (only when P=0, U=0) */
                     uint32_t addr = cpu->reg[rn] + imm8;
                     cpu->reg[rt] = arm_read32(cpu, addr);
                 } else {
@@ -1538,21 +1700,23 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 int i = (hw1 >> 10) & 1;
                 int imm3 = (hw2 >> 12) & 7;
                 int imm8 = hw2 & 0xFF;
-                uint32_t imm16 = (i << 11) | (imm3 << 8) | imm8 |
-                                 ((hw1 & 0xF) << 12);
+                /* 12-bit immediate for ADDW/SUBW: i:imm3:imm8 */
+                uint32_t imm12 = (i << 11) | (imm3 << 8) | imm8;
+                /* 16-bit immediate for MOVW/MOVT: imm4:i:imm3:imm8 */
+                uint32_t imm16 = ((hw1 & 0xF) << 12) | imm12;
 
-                if ((op_imm & 0x1A) == 0x00) {
-                    /* ADDW Rd, Rn, #imm12 */
-                    cpu->reg[rd] = cpu->reg[rn] + imm16;
-                } else if (op_imm == 0x04) {
+                if (op_imm == 0x04) {
                     /* MOVW Rd, #imm16 */
                     cpu->reg[rd] = imm16;
-                } else if ((op_imm & 0x1A) == 0x0A) {
-                    /* SUBW Rd, Rn, #imm12 */
-                    cpu->reg[rd] = cpu->reg[rn] - imm16;
                 } else if (op_imm == 0x0C) {
                     /* MOVT Rd, #imm16 */
                     cpu->reg[rd] = (cpu->reg[rd] & 0xFFFF) | (imm16 << 16);
+                } else if ((op_imm & 0x1A) == 0x00) {
+                    /* ADDW Rd, Rn, #imm12 */
+                    cpu->reg[rd] = cpu->reg[rn] + imm12;
+                } else if ((op_imm & 0x1A) == 0x0A) {
+                    /* SUBW Rd, Rn, #imm12 */
+                    cpu->reg[rd] = cpu->reg[rn] - imm12;
                 } else if ((op_imm & 0x1C) == 0x10) {
                     /* SSAT - saturate signed (simplified) */
                     cpu->reg[rd] = cpu->reg[rn]; /* Simplified */
@@ -1583,7 +1747,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     cpu->reg[rd] = (cpu->reg[rn] >> lsb) & ((1u << (widthm1 + 1)) - 1);
                 } else if ((op_imm & 0x1A) == 0x02) {
                     /* ADR (subtract) */
-                    cpu->reg[rd] = ((pc + 4) & ~3u) - imm16;
+                    cpu->reg[rd] = ((pc + 4) & ~3u) - imm12;
                 }
             } else if (op1 == 2 && op_hw2) {
                 /* Branches and misc control */
@@ -1686,8 +1850,8 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     uint32_t addr = cpu->reg[rn] + imm12;
                     switch (size) {
                         case 0: arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]); break;
-                        case 1: arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]); break;
-                        case 2: arm_write32(cpu, addr, cpu->reg[rt]); break;
+                        case 1: arm_write16_unaligned(cpu, addr, (uint16_t)cpu->reg[rt]); break;
+                        case 2: arm_write32_unaligned(cpu, addr, cpu->reg[rt]); break;
                     }
                 } else {
                     /* 8-bit immediate with pre/post index, or register */
@@ -1702,8 +1866,8 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         uint32_t addr = cpu->reg[rn] + (cpu->reg[rm] << imm2);
                         switch (size) {
                             case 0: arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]); break;
-                            case 1: arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]); break;
-                            case 2: arm_write32(cpu, addr, cpu->reg[rt]); break;
+                            case 1: arm_write16_unaligned(cpu, addr, (uint16_t)cpu->reg[rt]); break;
+                            case 2: arm_write32_unaligned(cpu, addr, cpu->reg[rt]); break;
                         }
                     } else {
                         uint32_t imm8 = hw2 & 0xFF;
@@ -1715,8 +1879,8 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         }
                         switch (size) {
                             case 0: arm_write8(cpu, addr, (uint8_t)cpu->reg[rt]); break;
-                            case 1: arm_write16(cpu, addr, (uint16_t)cpu->reg[rt]); break;
-                            case 2: arm_write32(cpu, addr, cpu->reg[rt]); break;
+                            case 1: arm_write16_unaligned(cpu, addr, (uint16_t)cpu->reg[rt]); break;
+                            case 2: arm_write32_unaligned(cpu, addr, cpu->reg[rt]); break;
                         }
                         if (W) {
                             if (P)
@@ -1727,8 +1891,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     }
                 }
                 cpu->cycles += 1;
-            } else if (op1 == 3 && (op2_5 & 0x71) == 0x01) {
-                /* Load byte/halfword: LDR.W, LDRB.W, LDRH.W, LDRSB.W, LDRSH.W */
+            } else if (op1 == 3 && (op2_5 & 0x61) == 0x01) {
+                /* Load byte/halfword: LDR.W, LDRB.W, LDRH.W, LDRSB.W, LDRSH.W
+                   Mask 0x61 matches bits[6:5]=size, bit[0]=load; excludes bit[4]
+                   (hw1[8]) which is the sign-extend bit, handled inside. */
                 int size = (hw1 >> 5) & 3;
                 int sign_extend = (hw1 >> 8) & 1;
                 int rn = hw1 & 0xF;
@@ -1776,12 +1942,12 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (sign_extend) val = (uint32_t)(int32_t)(int8_t)val;
                         break;
                     case 1: /* Halfword */
-                        val = arm_read16(cpu, addr);
+                        val = arm_read16_unaligned(cpu, addr);
                         if (sign_extend) val = (uint32_t)(int32_t)(int16_t)val;
                         break;
                     case 2: /* Word */
                     default:
-                        val = arm_read32(cpu, addr);
+                        val = arm_read32_unaligned(cpu, addr);
                         break;
                 }
                 if (rt == ARM_PC) {
@@ -1833,8 +1999,9 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 int ra = (hw2 >> 12) & 0xF;
                 int op2_misc = (hw2 >> 4) & 0xF;
 
-                if (!(hw1 & 0x100) && op_misc < 8) {
-                    /* Register-register shifts: LSL, LSR, ASR, ROR (hw1=0xFA0.-0xFA7.) */
+                if (!(hw1 & 0x100) && op_misc < 8 && (op2_misc & 0x8) == 0) {
+                    /* Register-register shifts: LSL, LSR, ASR, ROR (hw1=0xFA0.-0xFA7.)
+                       hw2[7:4] must be 0000 to distinguish from extend instructions */
                     int shift_type = (hw1 >> 5) & 3; /* 0=LSL,1=LSR,2=ASR,3=ROR */
                     int S = (hw1 >> 4) & 1;
                     uint32_t val = cpu->reg[rn];
@@ -1874,6 +2041,39 @@ int arm_step(arm_cpu_t *cpu, int count) {
                                   | (result == 0 ? APSR_Z : 0)
                                   | (carry ? APSR_C : 0);
                     }
+                } else if (!(hw1 & 0x100) && op_misc < 6 && (op2_misc & 0x8)) {
+                    /* Signed/unsigned extend (and add): SXTH, UXTH, SXTB, UXTB, etc.
+                       hw2[7:4] has bit 7 set, rotation in hw2[5:4] */
+                    int rot = ((hw2 >> 4) & 3) * 8;
+                    uint32_t rm_val = cpu->reg[rm];
+                    if (rot) rm_val = (rm_val >> rot) | (rm_val << (32 - rot));
+                    uint32_t result;
+                    switch (op_misc) {
+                        case 0: /* SXTH / SXTAH */
+                            result = (uint32_t)(int32_t)(int16_t)(uint16_t)rm_val;
+                            if (rn != 0xF) result += cpu->reg[rn];
+                            break;
+                        case 1: /* UXTH / UXTAH */
+                            result = rm_val & 0xFFFF;
+                            if (rn != 0xF) result += cpu->reg[rn];
+                            break;
+                        case 2: /* SXTB16 / SXTAB16 (M4+, skip for M3) */
+                        case 3: /* UXTB16 / UXTAB16 (M4+, skip for M3) */
+                            result = rm_val; /* Not supported on M3 */
+                            break;
+                        case 4: /* SXTB / SXTAB */
+                            result = (uint32_t)(int32_t)(int8_t)(uint8_t)rm_val;
+                            if (rn != 0xF) result += cpu->reg[rn];
+                            break;
+                        case 5: /* UXTB / UXTAB */
+                            result = rm_val & 0xFF;
+                            if (rn != 0xF) result += cpu->reg[rn];
+                            break;
+                        default:
+                            result = rm_val;
+                            break;
+                    }
+                    cpu->reg[rd] = result;
                 } else if (op_misc == 0) {
                     /* MUL / MLA / MLS (hw1=0xFB0.) */
                     if (ra == 0xF) {
@@ -1887,11 +2087,12 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         cpu->reg[rd] = cpu->reg[ra] - cpu->reg[rn] * cpu->reg[rm];
                     }
                 } else if (op_misc == 8) {
-                    /* SMULL RdLo, RdHi, Rn, Rm (hw1=0xFB8.) */
+                    /* SMULL RdLo, RdHi, Rn, Rm (hw1=0xFB8.)
+                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
                     int64_t result = (int64_t)(int32_t)cpu->reg[rn] *
                                      (int64_t)(int32_t)cpu->reg[rm];
-                    cpu->reg[rd] = (uint32_t)result;
-                    cpu->reg[ra] = (uint32_t)(result >> 32);
+                    cpu->reg[ra] = (uint32_t)result;          /* RdLo */
+                    cpu->reg[rd] = (uint32_t)(result >> 32);  /* RdHi */
                 } else if (op_misc == 9) {
                     if (hw1 & 0x100) {
                         /* SDIV Rd, Rn, Rm (hw1=0xFB9.) */
@@ -1928,81 +2129,44 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     }
                 } else if (op_misc == 0xA) {
                     if (hw1 & 0x100) {
-                        /* UMULL RdLo, RdHi, Rn, Rm (hw1=0xFBA.) */
+                        /* UMULL RdLo, RdHi, Rn, Rm (hw1=0xFBA.)
+                           hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
                         uint64_t result = (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm];
-                        cpu->reg[rd] = (uint32_t)result;  /* RdLo = rd */
-                        cpu->reg[ra] = (uint32_t)(result >> 32); /* RdHi = ra */
+                        cpu->reg[ra] = (uint32_t)result;          /* RdLo */
+                        cpu->reg[rd] = (uint32_t)(result >> 32);  /* RdHi */
                     }
                     /* hw1=0xFAA. is reserved/unused on Cortex-M3 */
                 } else if (op_misc == 0xB) {
-                    if (hw1 & 0x100) {
+                    if (op2_misc == 8) {
+                        /* CLZ (Count Leading Zeros) */
+                        uint32_t val = cpu->reg[rm];
+                        int count = 0;
+                        if (val == 0) { count = 32; }
+                        else { while (!(val & 0x80000000)) { count++; val <<= 1; } }
+                        cpu->reg[rd] = count;
+                    } else if (hw1 & 0x100) {
                         /* UDIV Rd, Rn, Rm (hw1=0xFBB.) */
                         if (cpu->reg[rm] == 0)
                             cpu->reg[rd] = 0;
                         else
                             cpu->reg[rd] = cpu->reg[rn] / cpu->reg[rm];
-                    } else {
-                        /* CLZ (hw1=0xFAB.) */
-                        if (op2_misc == 8) {
-                            uint32_t val = cpu->reg[rm];
-                            int count = 0;
-                            if (val == 0) { count = 32; }
-                            else { while (!(val & 0x80000000)) { count++; val <<= 1; } }
-                            cpu->reg[rd] = count;
-                        }
                     }
                 } else if (op_misc == 0xC) {
-                    /* SMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBC.) */
-                    int64_t acc = ((int64_t)(int32_t)cpu->reg[rd]) |
-                                  ((int64_t)(int32_t)cpu->reg[ra] << 32);
+                    /* SMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBC.)
+                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
+                    int64_t acc = ((int64_t)(uint32_t)cpu->reg[ra]) |
+                                  ((int64_t)(int32_t)cpu->reg[rd] << 32);
                     acc += (int64_t)(int32_t)cpu->reg[rn] * (int64_t)(int32_t)cpu->reg[rm];
-                    cpu->reg[rd] = (uint32_t)acc;
-                    cpu->reg[ra] = (uint32_t)(acc >> 32);
+                    cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
+                    cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
                 } else if (op_misc == 0xE) {
-                    /* UMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBE.) */
-                    uint64_t acc = ((uint64_t)cpu->reg[rd]) |
-                                   ((uint64_t)cpu->reg[ra] << 32);
+                    /* UMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBE.)
+                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
+                    uint64_t acc = ((uint64_t)cpu->reg[ra]) |
+                                   ((uint64_t)cpu->reg[rd] << 32);
                     acc += (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm];
-                    cpu->reg[rd] = (uint32_t)acc;
-                    cpu->reg[ra] = (uint32_t)(acc >> 32);
-                }
-            } else if (op1 == 3 && (op2_5 & 0x60) == 0x40) {
-                /* Misc instructions: UXTB, UXTH, SXTB, SXTH, etc. */
-                int op_ext = (hw1 >> 4) & 0x1F;
-                int rn = hw1 & 0xF;
-                int rd = (hw2 >> 8) & 0xF;
-                int rm = hw2 & 0xF;
-                int rot = ((hw2 >> 4) & 3) * 8;
-                uint32_t rm_val = cpu->reg[rm];
-                if (rot) rm_val = (rm_val >> rot) | (rm_val << (32 - rot));
-
-                switch (op_ext & 0x1F) {
-                    case 0x00: /* SXTH / SXTAH */
-                        if (rn == 0xF)
-                            cpu->reg[rd] = (uint32_t)(int32_t)(int16_t)(uint16_t)rm_val;
-                        else
-                            cpu->reg[rd] = cpu->reg[rn] + (uint32_t)(int32_t)(int16_t)(uint16_t)rm_val;
-                        break;
-                    case 0x01: /* UXTH / UXTAH */
-                        if (rn == 0xF)
-                            cpu->reg[rd] = rm_val & 0xFFFF;
-                        else
-                            cpu->reg[rd] = cpu->reg[rn] + (rm_val & 0xFFFF);
-                        break;
-                    case 0x04: /* SXTB / SXTAB */
-                        if (rn == 0xF)
-                            cpu->reg[rd] = (uint32_t)(int32_t)(int8_t)(uint8_t)rm_val;
-                        else
-                            cpu->reg[rd] = cpu->reg[rn] + (uint32_t)(int32_t)(int8_t)(uint8_t)rm_val;
-                        break;
-                    case 0x05: /* UXTB / UXTAB */
-                        if (rn == 0xF)
-                            cpu->reg[rd] = rm_val & 0xFF;
-                        else
-                            cpu->reg[rd] = cpu->reg[rn] + (rm_val & 0xFF);
-                        break;
-                    default:
-                        break;
+                    cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
+                    cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
                 }
             } else {
                 /* Unhandled 32-bit instruction */
@@ -2012,6 +2176,12 @@ int arm_step(arm_cpu_t *cpu, int count) {
             }
         }
 
+        /* Restore flags for Thumb-16 in IT block (suppress implicit S) */
+        if (it_suppress_flags) {
+            cpu->xpsr = (cpu->xpsr & ~(APSR_N | APSR_Z | APSR_C | APSR_V))
+                      | saved_flags_it;
+        }
+
         /* Advance IT state after each executed instruction */
         if (in_it) {
             cpu->it_state = (cpu->it_state & 0xE0) | ((cpu->it_state << 1) & 0x1F);
@@ -2019,6 +2189,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         cpu->instructions++;
         remaining--;
+
+        /* PC trace callback */
+        if (cpu->pc_callback)
+            cpu->pc_callback(cpu->pc_callback_data, cpu->reg[ARM_PC]);
     }
 
     if (cpu->cpu_freq_hz > 0)
@@ -2033,6 +2207,14 @@ void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
         if (cpu->cycles >= cpu->next_event_cycle)
             execute_events(cpu);
         if (cpu->cpu_off) {
+            /* Check for pending NVIC interrupts that should wake from WFI */
+            if (cpu->nvic) {
+                arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
+                if (nvic->has_pending) {
+                    arm_nvic_check_pending(nvic);
+                    if (!cpu->cpu_off) continue; /* Woke up */
+                }
+            }
             if (cpu->event_queue && cpu->event_queue->fire_cycle <= target_cycle) {
                 cpu->cycles = cpu->event_queue->fire_cycle;
                 continue;

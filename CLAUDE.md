@@ -14,11 +14,18 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ## Testing
 
 ```sh
+# MSP430 tests
 ./build/test_runner correctness -v    # 68 instruction-level tests
 ./build/test_runner bench             # 7 micro-benchmarks + 2 firmware benchmarks
 ./build/test_runner firmware          # Firmware integration tests (cputest.sky, timertest.sky)
 ./build/test_runner multinode         # 2-node nullnet-broadcast (default 20s)
 ./build/test_runner multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
+
+# ARM Cortex-M3 tests
+./build/test_runner arm-correctness -v   # 33 instruction-level tests
+./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
+./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
+./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
@@ -52,6 +59,24 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `msp430_jit.c` | GNU Lightning JIT: compiles hot basic blocks to native ARM64/x86 code |
 | `msp430_elf.c` | ELF loader: loads sections into memory, symbol lookup |
 | `cc2420.c` | CC2420 radio: SPI protocol, TX/RX state machine, CRC, auto-ACK, GPIO pins |
+
+### ARM Source Files (src/arm/)
+
+| File | Purpose |
+|------|---------|
+| `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until |
+| `arm_config.c` | MCU configurations: CC2538 (512KB flash, 32KB SRAM, 32MHz) |
+| `arm_elf.c` | ELF loader: loads sections into flash/SRAM, symbol lookup |
+| `arm_nvic.c` | NVIC: interrupt priority, pending/enable registers, exception entry/return |
+| `arm_systick.c` | SysTick timer: periodic tick generation via event queue |
+| `arm_platform.c` | Platform bundles: CPU + all CC2538 peripherals |
+| `cc2538_uart.c` | UART: TX callback, status registers (TXFF/TXFE) |
+| `cc2538_gpio.c` | GPIO: port A-D, interrupt support |
+| `cc2538_gptimer.c` | General Purpose Timers: one-shot, periodic, prescaler |
+| `cc2538_sys_ctrl.c` | System control: clock config, OSC32K selection |
+| `cc2538_ioc.c` | IO Controller: pin mux, pad configuration |
+| `cc2538_rfcore.c` | RF Core: 802.15.4 TX/RX, FFSM address registers, RFRND |
+| `cc2538_sleeptimer.c` | Sleep Timer: 32kHz counter, compare match interrupts |
 
 ## Architecture
 
@@ -172,6 +197,7 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **wismote** | MSP430F5437 | No | USART1 | WisMote |
 | **exp5438** | MSP430F5437 | No | USART1 | MSP-EXP5438 |
 | **cc430** | CC430F5137 | No | USART0 | CC430 eval board |
+| **cc2538dk** | CC2538 (ARM Cortex-M3) | Yes (on-chip) | UART0 | TI SmartRF06 + CC2538EM |
 
 ## MCU Configurations
 
@@ -207,6 +233,19 @@ while (sim_ns < end_ns) {
 
 This correctly handles nodes running at different CPU frequencies after DCO calibration.
 
+### ARM Multi-Node (CC2538)
+
+Same time-stepped architecture as MSP430, with CC2538 RF Core for 802.15.4 radio:
+
+1. Initialize nodes: load ELF, run crt0 to main, patch `linkaddr_node_addr` per node
+2. Each node gets unique IEEE address (00:12:74:node_id:00:00:00:node_id)
+3. RF Core TX callback buffers frames, `arm_deliver_rf_bytes()` delivers between time steps
+4. Auto-ACK at link layer, CSMA retransmissions, 6LoWPAN/RPL networking all functional
+
+**Supported firmware:**
+- `nullnet-broadcast.cc2538dk` — simple broadcast, 2-node
+- `udp-server.cc2538dk` + `udp-client.cc2538dk` — RPL-UDP with DAG formation
+
 ## MSP430 Instruction Encoding Notes
 
 - Double-op format: `opcode(4)|src_reg(4)|Ad(1)|BW(1)|As(2)|dst_reg(4)`
@@ -224,3 +263,9 @@ This correctly handles nodes running at different CPU frequencies after DCO cali
 | Firmware energest-demo.sky | ~196 |
 | 2-node nullnet (20s sim) | ~800x real-time |
 | 2-node RPL-UDP (60s sim) | ~2400x real-time |
+
+### ARM (CC2538, interpreter only)
+
+| Benchmark | Speed |
+|-----------|-------|
+| 2-node RPL-UDP (60s sim) | ~4x real-time |

@@ -2,6 +2,7 @@
  * ARM multi-node simulation test — CC2538 nodes with RF Core
  */
 #include "arm_platform.h"
+#include "arm_systick.h"
 #include "arm_elf.h"
 #include <stdio.h>
 #include <string.h>
@@ -94,12 +95,51 @@ static int arm_init_node(int idx, const char *firmware_path, int node_id) {
     arm_platform_set_console(&node->plat, arm_uart_callback, node);
     cc2538_rfcore_set_tx_callback(&node->plat.rfcore, arm_rf_tx_handler, node);
     node->plat.rfcore.node_id = node_id;
+
+    /* Seed RFRND uniquely per node */
+    node->plat.rfcore.rfrnd_state = 0xDEADBEEF + (uint32_t)node_id;
+
+    /* Set unique IEEE 64-bit extended address: 00:12:74:XX:00:00:00:XX
+     * The info page stores bytes in little-endian order; ieee_addr_cpy_to()
+     * reverses them: dst[i] = location[len-1-i].  So we store reversed. */
+    uint8_t unique_addr[8] = { (uint8_t)node_id, 0x00, 0x00, 0x00,
+                                (uint8_t)node_id, 0x74, 0x12, 0x00 };
+    memcpy(node->plat.rfcore.ext_addr, unique_addr, 8);
+
+    /* Reset and run past crt0 to main */
     arm_cpu_reset(&node->plat.cpu);
+
+    uint32_t main_addr = arm_elf_find_symbol(firmware_path, "main") & ~1u;
+    if (main_addr) {
+        for (int s = 0; s < 500000; s++) {
+            arm_step(&node->plat.cpu, 1);
+            if ((node->plat.cpu.reg[ARM_PC] & ~1u) == main_addr)
+                break;
+        }
+        printf("  Node %d: ran to main (0x%08x) in %lld cycles\n",
+               node_id, main_addr, (long long)node->plat.cpu.cycles);
+
+        /* Patch linkaddr_node_addr with the address as it appears after
+         * ieee_addr_cpy_to() reversal: 00:12:74:XX:00:00:00:XX */
+        uint32_t la_addr = arm_elf_find_symbol(firmware_path, "linkaddr_node_addr");
+        if (la_addr) {
+            la_addr &= ~1u;
+            uint8_t la_bytes[8] = { 0x00, 0x12, 0x74, (uint8_t)node_id,
+                                     0x00, 0x00, 0x00, (uint8_t)node_id };
+            for (int b = 0; b < 8; b++)
+                arm_write8(&node->plat.cpu, la_addr + (uint32_t)b, la_bytes[b]);
+            printf("  Node %d: patched linkaddr_node_addr at 0x%08x\n",
+                   node_id, la_addr);
+        }
+    } else {
+        printf("  Node %d: 'main' symbol not found, skipping crt0 run\n", node_id);
+    }
 
     printf("  Node %d initialized: PC=0x%08x SP=0x%08x\n",
            node_id, node->plat.cpu.reg[ARM_PC], node->plat.cpu.reg[ARM_SP]);
     return 0;
 }
+
 
 int run_arm_multinode_test(int argc, char **argv) {
     const char *firmware_paths[ARM_MAX_NODES] = { NULL };
@@ -183,6 +223,7 @@ int run_arm_multinode_test(int argc, char **argv) {
     printf("\n--- Simulation complete ---\n");
     printf("  Total RF bytes: %d\n", arm_rf_byte_count);
     printf("  Total UART bytes: %d\n", arm_uart_byte_count);
+    printf("  SysTick fires: %d\n", arm_systick_get_fire_count());
     for (int i = 0; i < node_count; i++) {
         printf("  Node %d: %lld cycles, %lld instructions\n",
                arm_nodes[i].id,
