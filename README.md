@@ -124,4 +124,4 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 
 ## License
 
-TBD
+3-clause BSD. See [LICENSE](LICENSE).
