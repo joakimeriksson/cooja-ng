@@ -9,6 +9,7 @@
  *   ./test_runner arm-correctness [-v]     Run ARM correctness tests
  *   ./test_runner arm-firmware [-v]        Run ARM firmware tests
  *   ./test_runner arm-multinode [opts]     Run ARM multi-node radio test
+ *   ./test_runner mixed-multinode [opts]   Run mixed MSP430+ARM multi-node test
  *   ./test_runner all [-v]                 Run all (except multinode)
  */
 #include <stdio.h>
@@ -25,6 +26,9 @@ extern int run_arm_correctness_tests(int verbose);
 extern int run_arm_firmware_tests(int verbose);
 extern int run_arm_multinode_test(int argc, char **argv);
 
+/* Mixed-platform test */
+extern int run_mixed_multinode_test(int argc, char **argv);
+
 int main(int argc, char **argv) {
     int verbose = 0;
 
@@ -39,6 +43,7 @@ int main(int argc, char **argv) {
         printf("Usage: %s <mode> [-v]\n", argv[0]);
         printf("MSP430 modes: correctness, bench, firmware, multinode\n");
         printf("ARM modes:    arm-correctness, arm-firmware, arm-multinode\n");
+        printf("Mixed:        mixed-multinode\n");
         printf("Combined:     all\n");
         return 1;
     }
@@ -73,6 +78,11 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "arm-multinode") == 0) {
         failures += run_arm_multinode_test(argc - 2, argv + 2);
+    }
+
+    /* Mixed-platform mode */
+    if (strcmp(mode, "mixed-multinode") == 0) {
+        failures += run_mixed_multinode_test(argc - 2, argv + 2);
     }
 
     return failures > 0 ? 1 : 0;

@@ -54,7 +54,8 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_multinode.c \
                $(TEST_DIR)/test_arm_correctness.c \
                $(TEST_DIR)/test_arm_firmware.c \
-               $(TEST_DIR)/test_arm_multinode.c
+               $(TEST_DIR)/test_arm_multinode.c \
+               $(TEST_DIR)/test_mixed_multinode.c
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 

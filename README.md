@@ -20,6 +20,7 @@ A fast multi-architecture emulator and network simulator written in C, designed 
 
 ### Common
 - **Multi-node simulation** with time-stepped RF byte delivery
+- **Mixed-platform simulation**: MSP430 and ARM nodes in the same network
 - **ELF loader** for Contiki-NG firmware binaries
 - **Nanosecond simulation time** for CPU-clock-independent scheduling
 
@@ -50,6 +51,21 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner arm-firmware         # firmware boot test (hello-world)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ```
+
+### Mixed-platform (MSP430 + ARM)
+
+```sh
+# Nullnet broadcast: Sky + CC2538DK in the same network
+./build/test_runner mixed-multinode firmware/sky/nullnet-broadcast.sky firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
+
+# RPL-UDP: Sky server + CC2538DK client
+./build/test_runner mixed-multinode firmware/sky/udp-server.sky firmware/cc2538dk/udp-client.cc2538dk -t 60000
+
+# RPL-UDP: CC2538DK server + Sky client
+./build/test_runner mixed-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/sky/udp-client.sky -t 60000
+```
+
+Node type is auto-detected from firmware file extension (`.sky` → MSP430, `.cc2538dk` → ARM).
 
 ### Multi-node options
 
