@@ -406,8 +406,13 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     cpu->reg[ARM_SP] = sp;
     cpu->it_state = 0; /* Clear IT state for handler */
 
-    /* Set EXC_RETURN in LR */
-    if (cpu->use_psp && (cpu->xpsr & 0x1FF) == 0) {
+    /* Set EXC_RETURN in LR.
+     * 0xFFFFFFF1 = Return to Handler mode (nested interrupt), MSP
+     * 0xFFFFFFF9 = Return to Thread mode, MSP
+     * 0xFFFFFFFD = Return to Thread mode, PSP */
+    if ((cpu->xpsr & 0x1FF) != 0) {
+        cpu->reg[ARM_LR] = 0xFFFFFFF1; /* Nested: return to Handler, MSP */
+    } else if (cpu->use_psp) {
         cpu->reg[ARM_LR] = 0xFFFFFFFD; /* Return to Thread using PSP */
     } else {
         cpu->reg[ARM_LR] = 0xFFFFFFF9; /* Return to Thread using MSP */
@@ -418,11 +423,6 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     cpu->reg[ARM_PC] = vector & ~1u;
     cpu->xpsr = (cpu->xpsr & ~0x1FFu) | (exception_num & 0x1FF);
     cpu->xpsr |= (1u << 24); /* Thumb bit */
-
-    /* Debug: trace RF Core interrupt entry */
-    if (exception_num == 157)
-        fprintf(stderr, "[ARM] Exception %d entry: vector=0x%08x (from vtor=0x%08x+0x%x)\n",
-                exception_num, vector, cpu->vtor, exception_num * 4);
 
     cpu->cpu_off = false; /* Wake from WFI */
     cpu->cycles += 12; /* Exception entry latency */
@@ -453,15 +453,18 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     /* Account for stack alignment padding (xPSR bit 9) */
     cpu->reg[ARM_SP] = sp + 32 + ((cpu->xpsr & (1u << 9)) ? 4 : 0);
 
-    /* Return to Thread mode (clear exception number in IPSR) */
+    /* Restore execution mode from EXC_RETURN.
+     * 0xFFFFFFF1: Return to Handler mode (nested) — keep IPSR from popped xPSR
+     * 0xFFFFFFF9/FD: Return to Thread mode — clear IPSR */
     if ((exc_return & 0xF) == 0x9 || (exc_return & 0xF) == 0xD) {
         cpu->xpsr &= ~0x1FFu; /* Clear IPSR -> Thread mode */
     }
+    /* else: 0xFFFFFFF1 — IPSR already restored from popped xPSR (outer handler) */
 
-    /* Clear active exception in NVIC and check for tail-chained interrupts */
+    /* Restore active exception from the IPSR of the state we're returning to */
     if (cpu->nvic) {
         arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
-        nvic->active_exception = 0;
+        nvic->active_exception = cpu->xpsr & 0x1FF;
         arm_nvic_check_pending(nvic);
     }
 
@@ -1518,7 +1521,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 int W = (hw1 >> 5) & 1;
                 int L = (hw1 >> 4) & 1;
 
-                if ((hw2 & 0xFFF0) == 0xF000) {
+                if ((hw2 & 0xFFE0) == 0xF000) {
                     /* TBB / TBH (Table Branch Byte / Halfword) */
                     int H = (hw2 >> 4) & 1;
                     int rm = hw2 & 0xF;
