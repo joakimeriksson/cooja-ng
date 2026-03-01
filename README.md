@@ -18,17 +18,24 @@ A fast multi-architecture emulator and network simulator written in C, designed 
 - **Platform support**: CC2538DK (SmartRF06 + CC2538EM)
 - **RPL-UDP networking**: full 6LoWPAN/RPL stack convergence in multi-node simulation
 
+### Native Cooja Motes
+- **Native node support** via dlopen of `.cooja` shared libraries
+- **Cross-platform networking**: native, MSP430, and ARM nodes in the same simulation
+
 ### Common
 - **Multi-node simulation** with time-stepped RF byte delivery
-- **Mixed-platform simulation**: MSP430 and ARM nodes in the same network
-- **ELF loader** for Contiki-NG firmware binaries
-- **Nanosecond simulation time** for CPU-clock-independent scheduling
+- **Mixed-platform simulation**: MSP430, ARM, and native nodes in the same network
+- **Shared ELF loader** for Contiki-NG firmware binaries
+- **Nanosecond simulation time** with shared event queue for CPU-clock-independent scheduling
+- **JSON simulation configs** for defining multi-node topologies
 
 ## Building
 
 ```sh
-make        # standard build
+make        # standard build (O3, LTO, auto-detects GNU Lightning for JIT)
+make debug  # debug build (O0, -g, DEBUG flag)
 make pgo    # profile-guided optimization (~40% faster)
+make clean  # remove build/
 ```
 
 GNU Lightning is optional (auto-detected via pkg-config). Without it, the interpreter is used for all execution.
@@ -52,7 +59,7 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ```
 
-### Mixed-platform (MSP430 + ARM)
+### Mixed-platform
 
 ```sh
 # Nullnet broadcast: Sky + CC2538DK in the same network
@@ -65,9 +72,24 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner mixed-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/sky/udp-client.sky -t 60000
 ```
 
-Node type is auto-detected from firmware file extension (`.sky` → MSP430, `.cc2538dk` → ARM).
+Node type is auto-detected from firmware file extension (`.sky` → MSP430, `.cc2538dk` → ARM, `.cooja` → Native).
+
+### JSON simulation configs
+
+```sh
+./build/test_runner mixed-multinode configs/rpl-udp-sky.json -t 60000
+./build/test_runner mixed-multinode configs/rpl-udp-cc2538dk.json -t 60000
+./build/test_runner mixed-multinode configs/rpl-udp-native.json -t 60000
+```
 
 ### Multi-node options
+
+| Option | Description |
+|--------|-------------|
+| `-t ms` | Simulation duration in milliseconds |
+| `-n nodes` | Number of nodes |
+| `-v` | Verbose output |
+| `-q` | Quiet mode (no per-node UART output) |
 
 ```sh
 # MSP430: RPL-UDP server + client, 60 seconds simulated time
@@ -112,12 +134,17 @@ Environment variables:
 
 ```
 src/
+  common/             Shared ELF loader
   msp430/             MSP430 CPU, peripherals, JIT compiler
   arm/                ARM Cortex-M3 CPU, CC2538 peripherals
+  native/             Native Cooja mote support
 include/
+  common/             Shared headers (ELF, event queue, time conversion)
   msp430/             MSP430 header files
   arm/                ARM header files
+  native/             Native node header files
 test/                 Test runner, correctness tests, benchmarks, multi-node sim
+configs/              JSON simulation configuration files
 firmware/sky/         Pre-compiled Contiki-NG firmware for Tmote Sky
 firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 ```

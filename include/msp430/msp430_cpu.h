@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "cpu_time.h"
 
 /* Forward declare decoded types */
 struct decoded_insn;
@@ -216,14 +217,9 @@ void msp430_cancel_event(msp430_cpu_t *cpu, msp430_event_t *ev);
 /* CPU frequency management */
 void msp430_cpu_set_frequency(msp430_cpu_t *cpu, uint32_t freq_hz);
 
-/* Nanosecond <-> cycle conversion helpers */
-static inline int64_t msp430_ns_to_cycles(int64_t ns, uint32_t freq_hz) {
-    return ns * (int64_t)freq_hz / 1000000000LL;
-}
-static inline int64_t msp430_cycles_to_ns(int64_t cycles, uint32_t freq_hz) {
-    if (freq_hz == 0) return 0;
-    return cycles * 1000000000LL / (int64_t)freq_hz;
-}
+/* Nanosecond <-> cycle conversion: provided by cpu_time.h as macros
+ * msp430_ns_to_cycles -> cpu_ns_to_cycles
+ * msp430_cycles_to_ns -> cpu_cycles_to_ns */
 
 /* Memory access (for external use / tests) */
 static inline uint16_t msp430_read_word(const msp430_cpu_t *cpu, uint32_t addr) {

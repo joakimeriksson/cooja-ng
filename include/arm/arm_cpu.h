@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <limits.h>
+#include "cpu_time.h"
 
 /* --- Register indices --- */
 #define ARM_R0   0
@@ -193,14 +194,9 @@ void arm_cancel_event(arm_cpu_t *cpu, arm_event_t *ev);
 /* CPU frequency management */
 void arm_cpu_set_frequency(arm_cpu_t *cpu, uint32_t freq_hz);
 
-/* Nanosecond <-> cycle conversion helpers */
-static inline int64_t arm_ns_to_cycles(int64_t ns, uint32_t freq_hz) {
-    return ns * (int64_t)freq_hz / 1000000000LL;
-}
-static inline int64_t arm_cycles_to_ns(int64_t cycles, uint32_t freq_hz) {
-    if (freq_hz == 0) return 0;
-    return cycles * 1000000000LL / (int64_t)freq_hz;
-}
+/* Nanosecond <-> cycle conversion: provided by cpu_time.h as macros
+ * arm_ns_to_cycles -> cpu_ns_to_cycles
+ * arm_cycles_to_ns -> cpu_cycles_to_ns */
 
 /* Exception/interrupt triggering (called by NVIC) */
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num);

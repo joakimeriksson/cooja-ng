@@ -14,19 +14,18 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* MSP430 test functions */
 extern int run_correctness_tests(int verbose);
 extern int run_benchmarks(void);
 extern int run_firmware_tests(int verbose);
-extern int run_multinode_test(int argc, char **argv);
 
 /* ARM test functions */
 extern int run_arm_correctness_tests(int verbose);
 extern int run_arm_firmware_tests(int verbose);
-extern int run_arm_multinode_test(int argc, char **argv);
 
-/* Mixed-platform test */
+/* Mixed-platform test (handles MSP430, ARM, and native nodes) */
 extern int run_mixed_multinode_test(int argc, char **argv);
 
 int main(int argc, char **argv) {
@@ -64,7 +63,34 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(mode, "multinode") == 0) {
-        failures += run_multinode_test(argc - 2, argv + 2);
+        /* Route to mixed-multinode with default MSP430/Sky firmware */
+        int extra_argc = argc - 2;
+        char **extra_argv = argv + 2;
+
+        /* If no firmware specified, provide default MSP430 firmware.
+         * Skip values belonging to -t and -n flags. */
+        int has_firmware = 0;
+        for (int i = 0; i < extra_argc; i++) {
+            if ((strcmp(extra_argv[i], "-t") == 0 ||
+                 strcmp(extra_argv[i], "-n") == 0) && i + 1 < extra_argc) {
+                i++;  /* skip the value */
+            } else if (extra_argv[i][0] != '-') {
+                has_firmware = 1; break;
+            }
+        }
+        if (!has_firmware) {
+            /* Build new argv with default firmware prepended */
+            int new_argc = extra_argc + 1;
+            char **new_argv = malloc((new_argc + 1) * sizeof(char *));
+            new_argv[0] = (char *)"firmware/sky/nullnet-broadcast.sky";
+            for (int i = 0; i < extra_argc; i++)
+                new_argv[i + 1] = extra_argv[i];
+            new_argv[new_argc] = NULL;
+            failures += run_mixed_multinode_test(new_argc, new_argv);
+            free(new_argv);
+        } else {
+            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+        }
     }
 
     /* ARM modes */
@@ -77,7 +103,8 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(mode, "arm-multinode") == 0) {
-        failures += run_arm_multinode_test(argc - 2, argv + 2);
+        /* Route to mixed-multinode (ARM firmware auto-detected by extension) */
+        failures += run_mixed_multinode_test(argc - 2, argv + 2);
     }
 
     /* Mixed-platform mode */
