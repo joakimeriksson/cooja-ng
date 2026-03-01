@@ -1,0 +1,13 @@
+{
+  "title": "Hello World native boot test",
+  "timeout_ms": 5000,
+  "nodes": [
+    { "firmware": "firmware/cooja/hello-world.cooja", "id": 1 }
+  ],
+  "test": {
+    "steps": [
+      { "wait": "Starting Contiki-NG" },
+      { "wait": "Hello, world" }
+    ]
+  }
+}

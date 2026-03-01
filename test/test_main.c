@@ -43,6 +43,7 @@ int main(int argc, char **argv) {
         printf("MSP430 modes: correctness, bench, firmware, multinode\n");
         printf("ARM modes:    arm-correctness, arm-firmware, arm-multinode\n");
         printf("Mixed:        mixed-multinode\n");
+        printf("Test:         test <config.json> [-v] [-t ms]\n");
         printf("Combined:     all\n");
         return 1;
     }
@@ -109,6 +110,11 @@ int main(int argc, char **argv) {
 
     /* Mixed-platform mode */
     if (strcmp(mode, "mixed-multinode") == 0) {
+        failures += run_mixed_multinode_test(argc - 2, argv + 2);
+    }
+
+    /* Test scripting mode (alias for mixed-multinode with test assertions) */
+    if (strcmp(mode, "test") == 0) {
         failures += run_mixed_multinode_test(argc - 2, argv + 2);
     }
 

@@ -19,12 +19,13 @@
 #include "arm_elf.h"
 #include "native_node.h"
 #include "sim_config.h"
+#include "radio_medium.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 
-#define MAX_NODES 16
+#define MAX_NODES 128
 #define TIME_STEP_NS      1000000LL  /* 1ms in nanoseconds */
 #define DEFAULT_SIM_MS    20000      /* 20 seconds of simulated time */
 #define MS_TO_NS          1000000LL
@@ -56,6 +57,57 @@ static int verbose = 1;
 static rf_buffer_t rf_pending[MAX_NODES];
 static int rf_byte_count = 0;
 static int uart_byte_count = 0;
+static radio_medium_t radio_medium;
+static int64_t current_sim_ns = 0;
+
+/* Statistics counters */
+static int stat_rx_frames_queued = 0;
+static int stat_rx_frames_collided = 0;
+static int stat_rx_frames_queue_full = 0;
+static bool channels_dirty = false;
+
+/* --- Test scripting state --- */
+
+typedef struct {
+    const sim_test_config_t *config;
+    int  current_step;
+    int  match_count;
+    int64_t step_start_ns;
+    int  finished;          /* 0=running, 1=pass, -1=fail */
+    char fail_reason[512];
+} sim_test_state_t;
+
+static sim_test_state_t *active_test = NULL;
+
+static void sim_test_check_line(int node_id, const char *line, int64_t sim_ns) {
+    if (!active_test || active_test->finished)
+        return;
+
+    const sim_test_step_t *step =
+        &active_test->config->steps[active_test->current_step];
+
+    /* Node filter: -1 = any */
+    if (step->node >= 0 && step->node != node_id)
+        return;
+
+    /* Substring match */
+    if (!strstr(line, step->pattern))
+        return;
+
+    active_test->match_count++;
+    if (active_test->match_count >= step->count) {
+        printf("  TEST step %d PASS: \"%s\" matched %d/%d (node %d, %lld ms)\n",
+               active_test->current_step, step->pattern,
+               active_test->match_count, step->count, node_id,
+               (long long)(sim_ns / MS_TO_NS));
+        active_test->current_step++;
+        active_test->match_count = 0;
+        active_test->step_start_ns = sim_ns;
+
+        if (active_test->current_step >= active_test->config->step_count)
+            active_test->finished = 1;  /* all steps passed */
+    }
+}
 
 static double get_time_ms(void) {
     struct timespec ts;
@@ -116,11 +168,19 @@ static const char *node_type_str(int idx) {
  */
 static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     mixed_node_t *sender = (mixed_node_t *)user_data;
+    int sender_idx = (int)(sender - nodes);
     rf_byte_count++;
+    channels_dirty = true;
     for (int i = 0; i < num_nodes; i++) {
         if (&nodes[i] != sender) {
+            /* Native-to-native: skip byte-stream path, handled by frame handler */
+            if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
+                continue;
+            /* Apply radio medium filter */
+            if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
+                continue;
             if (nodes[i].type == NODE_NATIVE) {
-                /* Feed byte into native node's reassembler */
+                /* Feed byte into native node's reassembler (emulated->native) */
                 native_rx_assembler_feed(&nodes[i].plat.native, byte);
             } else {
                 /* Buffer byte for emulated node delivery */
@@ -139,13 +199,57 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
  */
 static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int len) {
     mixed_node_t *sender = (mixed_node_t *)user_data;
-    for (int i = 0; i < num_nodes; i++) {
-        if (&nodes[i] != sender) {
+    int sender_idx = (int)(sender - nodes);
+
+    channels_dirty = true;  /* TX happened, channels may have changed */
+
+    if (radio_medium.type != RADIO_MEDIUM_NONE) {
+        /* UDGM: iterate precomputed TX-range neighbors */
+        neighbor_list_t *nl = &radio_medium.neighbors[sender_idx];
+        for (int n = 0; n < nl->count; n++) {
+            int i = nl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) {
-                /* Native-to-native: direct frame copy */
-                native_deliver_frame(&nodes[i].plat.native, frame, len);
+                if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
+                    native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
+                    if (q->count >= NATIVE_RX_QUEUE_SIZE)
+                        stat_rx_frames_queue_full++;
+                    native_deliver_frame(&nodes[i].plat.native, frame, len,
+                                         current_sim_ns, sender_idx);
+                    stat_rx_frames_queued++;
+                }
             }
             /* Native-to-emulated: handled via rf_tx_callback (byte stream) */
+        }
+
+        /* Interference-range neighbors: mark overlapping frames as collided */
+        neighbor_list_t *inl = &radio_medium.interference_neighbors[sender_idx];
+        int64_t tx_start = current_sim_ns;
+        int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
+        for (int n = 0; n < inl->count; n++) {
+            int i = inl->neighbors[n];
+            if (nodes[i].type != NODE_NATIVE) continue;
+            native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
+            for (int f = 0; f < q->count; f++) {
+                int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
+                native_pending_frame_t *existing = &q->frames[idx];
+                if (tx_start < existing->end_ns &&
+                    existing->arrival_ns < tx_end) {
+                    if (!existing->collided) stat_rx_frames_collided++;
+                    existing->collided = true;
+                }
+            }
+        }
+    } else {
+        /* NONE: deliver to all other nodes */
+        for (int i = 0; i < num_nodes; i++) {
+            if (&nodes[i] != sender && nodes[i].type == NODE_NATIVE) {
+                native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
+                if (q->count >= NATIVE_RX_QUEUE_SIZE)
+                    stat_rx_frames_queue_full++;
+                native_deliver_frame(&nodes[i].plat.native, frame, len,
+                                     current_sim_ns, sender_idx);
+                stat_rx_frames_queued++;
+            }
         }
     }
 }
@@ -173,6 +277,7 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
         node->line_buf[node->line_pos] = '\0';
         if (verbose)
             printf("  [Node %d/%s] %s\n", node->id, node_type_str((int)(node - nodes)), node->line_buf);
+        sim_test_check_line(node->id, node->line_buf, current_sim_ns);
         node->line_pos = 0;
     } else if (byte == '\r') {
         /* ignore */
@@ -380,6 +485,44 @@ static void step_node_until(int idx, int64_t target) {
         native_step_until_ns(&nodes[idx].plat.native, target);
 }
 
+/* Check if a native node has pending work at the given sim time */
+static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
+    if (*node->simInSize > 0) return true;  /* frame ready for delivery */
+    if (*node->simProcessRunValue) return true;
+    if (*node->simEtimerPending) {
+        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
+        if (et_ns <= sim_ns) return true;
+    }
+    if (*node->simRtimerPending) {
+        int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
+        if (rt_ns <= sim_ns) return true;
+    }
+    return false;
+}
+
+/* --- Channel synchronization --- */
+
+static void sync_node_channels(void) {
+    for (int i = 0; i < num_nodes; i++) {
+        int ch = -1;
+        if (nodes[i].type == NODE_MSP430) {
+            /* CC2420: FSCTRL register (0x18), channel = (FREQ[9:0] - 357) / 5 + 11 */
+            uint16_t fsctrl = nodes[i].plat.msp.cc2420.registers[CC2420_REG_FSCTRL];
+            int freq = fsctrl & 0x3FF;
+            if (freq >= 357)
+                ch = (freq - 357) / 5 + 11;
+        } else if (nodes[i].type == NODE_ARM) {
+            /* CC2538: channel already computed on FREQCTRL write */
+            ch = nodes[i].plat.arm.rfcore.channel;
+        } else {
+            /* Native: simRadioChannel pointer */
+            if (nodes[i].plat.native.simRadioChannel)
+                ch = *nodes[i].plat.native.simRadioChannel;
+        }
+        radio_medium_set_channel(&radio_medium, i, ch);
+    }
+}
+
 /* --- Main entry point --- */
 
 /* Check if path ends with .json */
@@ -477,6 +620,42 @@ int run_mixed_multinode_test(int argc, char **argv) {
         }
     }
 
+    /* Initialize radio medium */
+    radio_medium_init(&radio_medium, node_count);
+    if (config_loaded && config.medium_type == 1) {
+        radio_medium_configure_udgm(&radio_medium,
+            config.tx_range, config.interference_range,
+            config.success_ratio_tx, config.success_ratio_rx);
+        for (int i = 0; i < node_count; i++) {
+            if (i < config.node_count && config.nodes[i].has_position)
+                radio_medium_set_position(&radio_medium, i,
+                    config.nodes[i].x, config.nodes[i].y);
+        }
+        radio_medium_compute_neighbors(&radio_medium);
+        if (config.seed)
+            radio_medium_set_seed(&radio_medium, (uint32_t)config.seed);
+        printf("Radio medium: UDGM (tx_range=%.1f m, interference=%.1f m, "
+               "tx_ratio=%.2f, rx_ratio=%.2f)\n",
+               config.tx_range, config.interference_range,
+               config.success_ratio_tx, config.success_ratio_rx);
+        for (int i = 0; i < node_count; i++) {
+            printf("  Node %d: pos=(%.1f, %.1f) neighbors=%d\n", nodes[i].id,
+                   radio_medium.nodes[i].x, radio_medium.nodes[i].y,
+                   radio_medium.neighbors[i].count);
+        }
+    }
+
+    /* Initialize test engine if config has test section */
+    sim_test_state_t test_state;
+    if (config_loaded && config.has_test) {
+        memset(&test_state, 0, sizeof(test_state));
+        test_state.config = &config.test;
+        active_test = &test_state;
+        printf("Test: %d steps to verify\n", config.test.step_count);
+    } else {
+        active_test = NULL;
+    }
+
     printf("\n--- Simulation running ---\n\n");
 
     /* Start sim_time_ns at max of all nodes' current sim_time_ns */
@@ -496,13 +675,27 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
     while (sim_ns < end_ns) {
         sim_ns += TIME_STEP_NS;
+        current_sim_ns = sim_ns;
+
+        /* Lazy channel sync: only when TX activity has occurred */
+        if (channels_dirty && radio_medium.type != RADIO_MEDIUM_NONE) {
+            sync_node_channels();
+            channels_dirty = false;
+        }
 
         for (int i = 0; i < node_count; i++) {
             /* Deliver pending RF bytes to emulated nodes */
             mixed_deliver_rf_bytes(i);
 
             if (nodes[i].type == NODE_NATIVE) {
-                /* Native nodes step by nanoseconds directly */
+                /* Dequeue one non-collided frame for delivery */
+                native_dequeue_rx_frame(&nodes[i].plat.native);
+
+                /* Skip idle native nodes — just advance their time */
+                if (!native_has_pending_work(&nodes[i].plat.native, sim_ns)) {
+                    nodes[i].plat.native.sim_time_ns = sim_ns;
+                    continue;
+                }
                 step_node_until(i, sim_ns);
             } else {
                 /* Emulated nodes step by cycle count */
@@ -517,6 +710,26 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 }
             }
         }
+
+        /* Test engine: check per-step timeout */
+        if (active_test && !active_test->finished) {
+            const sim_test_step_t *step =
+                &active_test->config->steps[active_test->current_step];
+            int step_timeout = step->timeout_ms > 0
+                ? step->timeout_ms : sim_ms;
+            int64_t elapsed_step_ns = sim_ns - active_test->step_start_ns;
+            if (elapsed_step_ns >= (int64_t)step_timeout * MS_TO_NS) {
+                active_test->finished = -1;
+                snprintf(active_test->fail_reason,
+                         sizeof(active_test->fail_reason),
+                         "step %d timed out after %d ms waiting for \"%s\" "
+                         "(matched %d/%d)",
+                         active_test->current_step, step_timeout,
+                         step->pattern, active_test->match_count, step->count);
+            }
+        }
+        if (active_test && active_test->finished)
+            break;
 
         if (sim_ns >= next_progress) {
             int pct = (int)((sim_ns - (end_ns - total_ns)) * 100 / total_ns);
@@ -535,9 +748,52 @@ int run_mixed_multinode_test(int argc, char **argv) {
     double t_end = get_time_ms();
     double elapsed_ms = t_end - t_start;
 
+    /* If test is still running when simulation ends, mark as failed */
+    int test_exit_code = 0;
+    if (active_test && !active_test->finished) {
+        active_test->finished = -1;
+        const sim_test_step_t *step =
+            &active_test->config->steps[active_test->current_step];
+        snprintf(active_test->fail_reason, sizeof(active_test->fail_reason),
+                 "simulation ended at %lld ms, step %d waiting for \"%s\" "
+                 "(matched %d/%d)",
+                 (long long)(sim_ns / MS_TO_NS), active_test->current_step,
+                 step->pattern, active_test->match_count, step->count);
+    }
+    if (active_test) {
+        printf("\n--- Test Results ---\n");
+        for (int i = 0; i < active_test->config->step_count; i++) {
+            const sim_test_step_t *s = &active_test->config->steps[i];
+            const char *status;
+            if (i < active_test->current_step)
+                status = "PASS";
+            else if (i == active_test->current_step && active_test->finished == -1)
+                status = "FAIL";
+            else
+                status = "SKIP";
+            printf("  Step %d [%s]: wait \"%s\"", i, status, s->pattern);
+            if (s->node >= 0)
+                printf(" node=%d", s->node);
+            if (s->count > 1)
+                printf(" count=%d", s->count);
+            printf("\n");
+        }
+        if (active_test->finished == 1) {
+            printf("\n  TEST PASSED (%lld ms simulated)\n",
+                   (long long)(sim_ns / MS_TO_NS));
+        } else {
+            printf("\n  TEST FAILED: %s\n", active_test->fail_reason);
+            test_exit_code = 1;
+        }
+        active_test = NULL;
+    }
+
     printf("\n--- Simulation complete ---\n");
     printf("  Total RF bytes: %d\n", rf_byte_count);
     printf("  Total UART bytes: %d\n", uart_byte_count);
+    printf("  RX frames queued: %d\n", stat_rx_frames_queued);
+    printf("  RX frames collided: %d\n", stat_rx_frames_collided);
+    printf("  RX frames queue full: %d\n", stat_rx_frames_queue_full);
 
     int64_t total_node_cycles = 0;
     int64_t total_node_instructions = 0;
@@ -563,5 +819,5 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("  Throughput:       %.1f MIPS (total), %.1f MIPS (per-node)\n",
            mips, mips / node_count);
 
-    return 0;
+    return test_exit_code;
 }

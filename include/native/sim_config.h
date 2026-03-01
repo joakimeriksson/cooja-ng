@@ -17,11 +17,26 @@
 #ifndef SIM_CONFIG_H
 #define SIM_CONFIG_H
 
-#define MAX_SIM_NODES 16
+#define MAX_SIM_NODES 128
+#define MAX_TEST_STEPS 32
+
+typedef struct {
+    char pattern[256];
+    int  node;          /* -1 = any */
+    int  count;         /* default 1 */
+    int  timeout_ms;    /* 0 = use global */
+} sim_test_step_t;
+
+typedef struct {
+    int step_count;
+    sim_test_step_t steps[MAX_TEST_STEPS];
+} sim_test_config_t;
 
 typedef struct {
     char firmware[256];
     int  id;         /* 0 = auto-assign */
+    double x, y;     /* position in meters */
+    int  has_position; /* true if x,y specified in JSON */
 } sim_node_config_t;
 
 typedef struct {
@@ -30,6 +45,17 @@ typedef struct {
     int  seed;         /* 0 = not set */
     int  node_count;
     sim_node_config_t nodes[MAX_SIM_NODES];
+
+    /* Radio medium (0=NONE, 1=UDGM) */
+    int    medium_type;
+    double tx_range;             /* default 50.0 */
+    double interference_range;   /* default 100.0 */
+    double success_ratio_tx;     /* default 1.0 */
+    double success_ratio_rx;     /* default 1.0 */
+
+    /* Test scripting */
+    int has_test;
+    sim_test_config_t test;
 } sim_config_t;
 
 /* Load a JSON config file. Returns 0 on success, -1 on error. */

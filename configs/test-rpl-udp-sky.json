@@ -1,0 +1,15 @@
+{
+  "title": "RPL-UDP Sky convergence test",
+  "timeout_ms": 120000,
+  "nodes": [
+    { "firmware": "firmware/sky/udp-server.sky", "id": 1 },
+    { "firmware": "firmware/sky/udp-client.sky", "id": 2 }
+  ],
+  "test": {
+    "steps": [
+      { "wait": "Sending request", "node": 2, "timeout_ms": 60000 },
+      { "wait": "Received request", "node": 1, "timeout_ms": 30000 },
+      { "wait": "Received response", "node": 2, "count": 3 }
+    ]
+  }
+}
