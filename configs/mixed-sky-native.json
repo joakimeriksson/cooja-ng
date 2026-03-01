@@ -1,0 +1,8 @@
+{
+  "title": "Mixed Sky + Native RPL-UDP test",
+  "timeout_ms": 60000,
+  "nodes": [
+    { "firmware": "firmware/sky/udp-server.sky", "id": 1 },
+    { "firmware": "firmware/cooja/udp-client.cooja", "id": 2 }
+  ]
+}

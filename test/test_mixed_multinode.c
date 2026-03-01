@@ -1,14 +1,15 @@
 /*
  * Mixed-platform multi-node simulation test
  *
- * Runs MSP430 (Tmote Sky / CC2420) and ARM (CC2538DK / RF Core) nodes in
- * the same simulation. Both radios use wire-compatible 802.15.4 frames
- * (4x0x00 preamble + 0x7A SFD + length + payload), enabling cross-platform
- * Contiki-NG networking (RPL, nullnet, etc.).
+ * Runs MSP430 (Tmote Sky / CC2420), ARM (CC2538DK / RF Core), and native
+ * Cooja motes in the same simulation. All radios use wire-compatible
+ * 802.15.4 frames (4x0x00 preamble + 0x7A SFD + length + payload),
+ * enabling cross-platform Contiki-NG networking (RPL, nullnet, etc.).
  *
  * Node type is auto-detected from firmware file extension:
  *   .sky      -> MSP430 (Tmote Sky)
  *   .cc2538dk -> ARM (CC2538DK)
+ *   .cooja    -> Native (Cooja mote via dlopen)
  */
 #include "msp430_platform.h"
 #include "msp430_elf.h"
@@ -16,17 +17,19 @@
 #include "arm_platform.h"
 #include "arm_systick.h"
 #include "arm_elf.h"
+#include "native_node.h"
+#include "sim_config.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 
-#define MAX_NODES 2
+#define MAX_NODES 16
 #define TIME_STEP_NS      1000000LL  /* 1ms in nanoseconds */
 #define DEFAULT_SIM_MS    20000      /* 20 seconds of simulated time */
 #define MS_TO_NS          1000000LL
 
-typedef enum { NODE_MSP430, NODE_ARM } node_type_t;
+typedef enum { NODE_MSP430, NODE_ARM, NODE_NATIVE } node_type_t;
 
 typedef struct {
     node_type_t type;
@@ -36,6 +39,7 @@ typedef struct {
     union {
         msp430_platform_t msp;
         arm_platform_t arm;
+        native_node_t native;
     } plat;
 } mixed_node_t;
 
@@ -64,45 +68,84 @@ static double get_time_ms(void) {
 static int64_t node_sim_time_ns(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return nodes[idx].plat.msp.cpu.sim_time_ns;
-    else
+    else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.sim_time_ns;
+    else
+        return nodes[idx].plat.native.sim_time_ns;
 }
 
 static int64_t node_cycles(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return nodes[idx].plat.msp.cpu.cycles;
-    else
+    else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.cycles;
+    else
+        return nodes[idx].plat.native.sim_time_ns / 1000LL; /* pseudo-cycles: us */
 }
 
 static uint32_t node_freq(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return nodes[idx].plat.msp.cpu.cpu_freq_hz;
-    else
+    else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.cpu_freq_hz;
+    else
+        return 1000000; /* native: 1 MHz pseudo-freq (1 cycle = 1 us) */
 }
 
 static int64_t node_instructions(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return nodes[idx].plat.msp.cpu.instructions;
-    else
+    else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.instructions;
+    else
+        return 0; /* native: not tracked */
 }
 
 static const char *node_type_str(int idx) {
-    return nodes[idx].type == NODE_MSP430 ? "MSP430" : "ARM";
+    if (nodes[idx].type == NODE_MSP430) return "MSP430";
+    if (nodes[idx].type == NODE_ARM) return "ARM";
+    return "NATIVE";
 }
 
 /* --- RF TX/RX bridging --- */
 
+/*
+ * Byte-level TX handler: called by CC2420 and CC2538 RF when transmitting
+ * individual bytes. Also called by native_check_radio_tx() when converting
+ * a native frame to byte-stream for emulated receivers.
+ */
 static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     mixed_node_t *sender = (mixed_node_t *)user_data;
     rf_byte_count++;
     for (int i = 0; i < num_nodes; i++) {
         if (&nodes[i] != sender) {
-            rf_buffer_t *buf = &rf_pending[i];
-            if (buf->count < RF_BUF_SIZE)
-                buf->bytes[buf->count++] = byte;
+            if (nodes[i].type == NODE_NATIVE) {
+                /* Feed byte into native node's reassembler */
+                native_rx_assembler_feed(&nodes[i].plat.native, byte);
+            } else {
+                /* Buffer byte for emulated node delivery */
+                rf_buffer_t *buf = &rf_pending[i];
+                if (buf->count < RF_BUF_SIZE)
+                    buf->bytes[buf->count++] = byte;
+            }
+        }
+    }
+}
+
+/*
+ * Frame-level TX handler: called by native_check_radio_tx() when a native
+ * node transmits. Delivers the frame directly to other native nodes and
+ * converts to byte-stream for emulated nodes.
+ */
+static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int len) {
+    mixed_node_t *sender = (mixed_node_t *)user_data;
+    for (int i = 0; i < num_nodes; i++) {
+        if (&nodes[i] != sender) {
+            if (nodes[i].type == NODE_NATIVE) {
+                /* Native-to-native: direct frame copy */
+                native_deliver_frame(&nodes[i].plat.native, frame, len);
+            }
+            /* Native-to-emulated: handled via rf_tx_callback (byte stream) */
         }
     }
 }
@@ -113,8 +156,9 @@ static void mixed_deliver_rf_bytes(int idx) {
     for (int j = 0; j < buf->count; j++) {
         if (nodes[idx].type == NODE_MSP430)
             cc2420_receive_byte(&nodes[idx].plat.msp.cc2420, buf->bytes[j]);
-        else
+        else if (nodes[idx].type == NODE_ARM)
             cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, buf->bytes[j]);
+        /* NODE_NATIVE bytes go through the assembler in mixed_rf_tx_handler */
     }
     buf->count = 0;
 }
@@ -143,6 +187,8 @@ static node_type_t detect_node_type(const char *path) {
     const char *dot = strrchr(path, '.');
     if (dot && strcmp(dot, ".cc2538dk") == 0)
         return NODE_ARM;
+    if (dot && strcmp(dot, ".cooja") == 0)
+        return NODE_NATIVE;
     return NODE_MSP430;  /* default to MSP430 (.sky or other) */
 }
 
@@ -265,6 +311,32 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     return 0;
 }
 
+/* --- Native node initialization --- */
+
+static int init_native_node(int idx, const char *firmware_path, int node_id) {
+    mixed_node_t *node = &nodes[idx];
+    native_node_t *nat = &node->plat.native;
+
+    if (native_node_init(nat, firmware_path, node_id) != 0)
+        return -1;
+
+    /* Set up UART/log callback */
+    nat->log_callback = mixed_uart_callback;
+    nat->log_callback_data = node;
+
+    /* Set up RF callbacks: byte-stream for emulated, frame for native */
+    nat->rf_tx_callback = mixed_rf_tx_handler;
+    nat->rf_tx_callback_data = node;
+    nat->rf_frame_callback = mixed_rf_frame_handler;
+    nat->rf_frame_callback_data = node;
+
+    /* Reset the RX assembler */
+    native_rx_assembler_reset(&nat->rx_asm);
+
+    printf("  Node %d [NATIVE] initialized\n", node_id);
+    return 0;
+}
+
 /* --- Top-level node init (dispatches by type) --- */
 
 static int init_node(int idx, const char *firmware_path, int node_id) {
@@ -275,12 +347,15 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
 
     printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
-           node->type == NODE_MSP430 ? "MSP430/Sky" : "ARM/CC2538DK");
+           node->type == NODE_MSP430 ? "MSP430/Sky" :
+           node->type == NODE_ARM ? "ARM/CC2538DK" : "Native/Cooja");
 
     if (node->type == NODE_MSP430)
         return init_msp430_node(idx, firmware_path, node_id);
-    else
+    else if (node->type == NODE_ARM)
         return init_arm_node(idx, firmware_path, node_id);
+    else
+        return init_native_node(idx, firmware_path, node_id);
 }
 
 /* --- Destroy node --- */
@@ -288,26 +363,40 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
 static void destroy_node(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         msp430_platform_destroy(&nodes[idx].plat.msp);
-    else
+    else if (nodes[idx].type == NODE_ARM)
         arm_platform_destroy(&nodes[idx].plat.arm);
+    else
+        native_node_destroy(&nodes[idx].plat.native);
 }
 
 /* --- Simulation step for one node --- */
 
-static void step_node_until(int idx, int64_t target_cycle) {
+static void step_node_until(int idx, int64_t target) {
     if (nodes[idx].type == NODE_MSP430)
-        msp430_step_until(&nodes[idx].plat.msp.cpu, target_cycle);
+        msp430_step_until(&nodes[idx].plat.msp.cpu, target);
+    else if (nodes[idx].type == NODE_ARM)
+        arm_step_until(&nodes[idx].plat.arm.cpu, target);
     else
-        arm_step_until(&nodes[idx].plat.arm.cpu, target_cycle);
+        native_step_until_ns(&nodes[idx].plat.native, target);
 }
 
 /* --- Main entry point --- */
 
+/* Check if path ends with .json */
+static int is_json_file(const char *path) {
+    const char *dot = strrchr(path, '.');
+    return dot && strcmp(dot, ".json") == 0;
+}
+
 int run_mixed_multinode_test(int argc, char **argv) {
-    const char *firmware_paths[MAX_NODES] = { NULL };
+    static const char *firmware_paths[MAX_NODES] = { NULL };
+    static char firmware_bufs[MAX_NODES][256]; /* storage for config-loaded paths */
     int firmware_count = 0;
     int sim_ms = DEFAULT_SIM_MS;
-    int node_count = 2;
+    int node_count = 0;
+    int sim_ms_set = 0;  /* track if -t was given (overrides config) */
+    sim_config_t config;
+    int config_loaded = 0;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
@@ -317,17 +406,51 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (node_count > MAX_NODES) node_count = MAX_NODES;
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             sim_ms = atoi(argv[++i]);
+            sim_ms_set = 1;
         } else if (argv[i][0] != '-') {
-            if (firmware_count < MAX_NODES)
-                firmware_paths[firmware_count++] = argv[i];
+            if (is_json_file(argv[i])) {
+                /* Load JSON config */
+                if (sim_config_load(&config, argv[i]) != 0)
+                    return 1;
+                config_loaded = 1;
+                sim_config_print(&config);
+            } else {
+                if (firmware_count < MAX_NODES)
+                    firmware_paths[firmware_count++] = argv[i];
+            }
         }
     }
 
-    if (firmware_count < 2) {
-        printf("Usage: test_runner mixed-multinode <firmware1> <firmware2> [-t ms] [-n nodes] [-v] [-q]\n");
-        printf("  Firmware types detected by extension: .sky (MSP430), .cc2538dk (ARM)\n");
+    /* If a JSON config was loaded, populate firmware_paths from it */
+    if (config_loaded) {
+        if (firmware_count == 0) {
+            /* No CLI firmware args — use all nodes from config */
+            for (int i = 0; i < config.node_count && i < MAX_NODES; i++) {
+                snprintf(firmware_bufs[i], sizeof(firmware_bufs[i]),
+                         "%s", config.nodes[i].firmware);
+                firmware_paths[i] = firmware_bufs[i];
+            }
+            firmware_count = config.node_count;
+        }
+        if (!sim_ms_set)
+            sim_ms = config.timeout_ms;
+        if (node_count == 0)
+            node_count = config.node_count;
+    }
+
+    if (node_count == 0)
+        node_count = firmware_count;
+
+    if (firmware_count < 1) {
+        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [-v] [-q]\n");
+        printf("       test_runner mixed-multinode <config.json> [-t ms] [-v] [-q]\n");
+        printf("  Firmware types detected by extension:\n");
+        printf("    .sky      -> MSP430 (Tmote Sky)\n");
+        printf("    .cc2538dk -> ARM (CC2538DK)\n");
+        printf("    .cooja    -> Native (Cooja mote)\n");
         printf("Example:\n");
-        printf("  test_runner mixed-multinode firmware/sky/udp-server.sky firmware/cc2538dk/udp-client.cc2538dk -t 60000\n");
+        printf("  test_runner mixed-multinode firmware/sky/udp-server.sky firmware/cooja/udp-client.cooja -t 60000\n");
+        printf("  test_runner mixed-multinode configs/rpl-udp-native.json -v\n");
         return 1;
     }
 
@@ -337,7 +460,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     for (int i = 0; i < firmware_count; i++) {
         node_type_t t = detect_node_type(firmware_paths[i]);
         printf("Firmware[%d]: %s (%s)\n", i, firmware_paths[i],
-               t == NODE_MSP430 ? "MSP430" : "ARM");
+               t == NODE_MSP430 ? "MSP430" : t == NODE_ARM ? "ARM" : "NATIVE");
     }
     printf("Nodes: %d, Simulated time: %d ms (%lld ns)\n",
            node_count, sim_ms, (long long)total_ns);
@@ -346,8 +469,10 @@ int run_mixed_multinode_test(int argc, char **argv) {
     num_nodes = node_count;
     for (int i = 0; i < node_count; i++) {
         const char *fw = firmware_paths[i < firmware_count ? i : firmware_count - 1];
-        if (init_node(i, fw, i + 1) != 0) {
-            fprintf(stderr, "Failed to initialize node %d\n", i + 1);
+        int node_id = (config_loaded && i < config.node_count)
+                      ? config.nodes[i].id : i + 1;
+        if (init_node(i, fw, node_id) != 0) {
+            fprintf(stderr, "Failed to initialize node %d\n", node_id);
             return 1;
         }
     }
@@ -373,16 +498,23 @@ int run_mixed_multinode_test(int argc, char **argv) {
         sim_ns += TIME_STEP_NS;
 
         for (int i = 0; i < node_count; i++) {
+            /* Deliver pending RF bytes to emulated nodes */
             mixed_deliver_rf_bytes(i);
 
-            int64_t delta_ns = sim_ns - node_sim_time_ns(i);
-            if (delta_ns > 0) {
-                int64_t target_cycle;
-                if (nodes[i].type == NODE_MSP430)
-                    target_cycle = node_cycles(i) + msp430_ns_to_cycles(delta_ns, node_freq(i));
-                else
-                    target_cycle = node_cycles(i) + arm_ns_to_cycles(delta_ns, node_freq(i));
-                step_node_until(i, target_cycle);
+            if (nodes[i].type == NODE_NATIVE) {
+                /* Native nodes step by nanoseconds directly */
+                step_node_until(i, sim_ns);
+            } else {
+                /* Emulated nodes step by cycle count */
+                int64_t delta_ns = sim_ns - node_sim_time_ns(i);
+                if (delta_ns > 0) {
+                    int64_t target_cycle;
+                    if (nodes[i].type == NODE_MSP430)
+                        target_cycle = node_cycles(i) + msp430_ns_to_cycles(delta_ns, node_freq(i));
+                    else
+                        target_cycle = node_cycles(i) + arm_ns_to_cycles(delta_ns, node_freq(i));
+                    step_node_until(i, target_cycle);
+                }
             }
         }
 

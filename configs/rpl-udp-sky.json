@@ -1,0 +1,8 @@
+{
+  "title": "RPL-UDP Sky test",
+  "timeout_ms": 60000,
+  "nodes": [
+    { "firmware": "firmware/sky/udp-server.sky", "id": 1 },
+    { "firmware": "firmware/sky/udp-client.sky", "id": 2 }
+  ]
+}

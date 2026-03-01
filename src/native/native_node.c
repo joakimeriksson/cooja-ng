@@ -1,0 +1,252 @@
+/*
+ * Native Cooja mote — dlopen/tick/step implementation
+ *
+ * Each native node is a TARGET=cooja Contiki-NG shared library loaded
+ * via dlopen(). The library exports cooja_init()/cooja_tick() and shared
+ * variables for time, radio, and serial I/O.
+ *
+ * To ensure independent instances, the .cooja file is copied to a
+ * per-node temp file before loading.
+ */
+#include "native_node.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <dlfcn.h>
+
+/* Resolve a dlsym symbol, print error and return -1 on failure */
+#define RESOLVE_SYM(node, name, type) do { \
+    (node)->name = (type)dlsym((node)->dl_handle, #name); \
+    if (!(node)->name) { \
+        fprintf(stderr, "native_node: dlsym(%s) failed: %s\n", #name, dlerror()); \
+        return -1; \
+    } \
+} while (0)
+
+/* Resolve a dlsym symbol, allow NULL (optional) */
+#define RESOLVE_SYM_OPT(node, name, type) do { \
+    (node)->name = (type)dlsym((node)->dl_handle, #name); \
+} while (0)
+
+static int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in); fclose(out); return -1;
+        }
+    }
+    fclose(in);
+    fclose(out);
+    return 0;
+}
+
+int native_node_init(native_node_t *node, const char *firmware_path, int node_id) {
+    memset(node, 0, sizeof(*node));
+    node->node_id = node_id;
+
+    /* Copy firmware to a per-node temp file for independent dlopen */
+#ifdef __APPLE__
+    const char *ext = ".dylib";
+#else
+    const char *ext = ".so";
+#endif
+    snprintf(node->dl_path, sizeof(node->dl_path),
+             "/tmp/csim_node_%d_%d%s", node_id, (int)getpid(), ext);
+    node->dl_path_is_temp = true;
+
+    if (copy_file(firmware_path, node->dl_path) != 0) {
+        fprintf(stderr, "native_node: failed to copy %s -> %s\n",
+                firmware_path, node->dl_path);
+        return -1;
+    }
+
+    /* dlopen with RTLD_NOW | RTLD_LOCAL for independent symbol spaces */
+    node->dl_handle = dlopen(node->dl_path, RTLD_NOW | RTLD_LOCAL);
+    if (!node->dl_handle) {
+        fprintf(stderr, "native_node: dlopen(%s) failed: %s\n",
+                node->dl_path, dlerror());
+        unlink(node->dl_path);
+        return -1;
+    }
+
+    /* Resolve function pointers */
+    RESOLVE_SYM(node, cooja_init, int (*)(void));
+    RESOLVE_SYM(node, cooja_tick, void (*)(void));
+
+    /* Resolve shared variable pointers */
+    RESOLVE_SYM(node, simCurrentTime, uint64_t *);
+    RESOLVE_SYM(node, simRtimerCurrentTicks, uint64_t *);
+    RESOLVE_SYM(node, simEtimerPending, int *);
+    RESOLVE_SYM(node, simEtimerNextExpirationTime, uint64_t *);
+    RESOLVE_SYM(node, simRtimerPending, int *);
+    RESOLVE_SYM(node, simRtimerNextExpirationTime, uint64_t *);
+    RESOLVE_SYM(node, simProcessRunValue, int *);
+    RESOLVE_SYM(node, simInDataBuffer, char *);
+    RESOLVE_SYM(node, simInSize, int *);
+    RESOLVE_SYM(node, simOutDataBuffer, char *);
+    RESOLVE_SYM(node, simOutSize, int *);
+    RESOLVE_SYM(node, simRadioHWOn, char *);
+    RESOLVE_SYM(node, simRadioChannel, int *);
+    RESOLVE_SYM(node, simReceiving, char *);
+    RESOLVE_SYM(node, simLoggedData, char *);
+    RESOLVE_SYM(node, simLoggedLength, int *);
+    RESOLVE_SYM(node, simLoggedFlag, char *);
+    RESOLVE_SYM(node, simMoteID, int *);
+    RESOLVE_SYM(node, simMoteIDChanged, char *);
+    RESOLVE_SYM(node, simRandomSeed, int *);
+
+    /* Set initial state before cooja_init */
+    *node->simMoteID = node_id;
+    *node->simMoteIDChanged = 1;
+    *node->simRandomSeed = node_id * 12345 + 67890;
+    *node->simCurrentTime = 0;
+    *node->simRtimerCurrentTicks = 0;
+    *node->simInSize = 0;
+    *node->simOutSize = 0;
+    *node->simLoggedFlag = 0;
+    *node->simLoggedLength = 0;
+
+    printf("  Native node %d: calling cooja_init()...\n", node_id);
+    int ret = node->cooja_init();
+    if (ret != 0) {
+        fprintf(stderr, "native_node: cooja_init() returned %d\n", ret);
+    }
+
+    /* One initial tick to complete boot */
+    *node->simProcessRunValue = 1;
+    node->cooja_tick();
+    native_check_log_output(node);
+
+    node->sim_time_ns = 0;
+    printf("  Native node %d: initialized successfully\n", node_id);
+    return 0;
+}
+
+void native_node_destroy(native_node_t *node) {
+    if (node->dl_handle) {
+        dlclose(node->dl_handle);
+        node->dl_handle = NULL;
+    }
+    if (node->dl_path_is_temp && node->dl_path[0]) {
+        unlink(node->dl_path);
+        node->dl_path[0] = '\0';
+    }
+}
+
+/* Compute the next time the node needs to wake up (ns) */
+static int64_t compute_next_wakeup(native_node_t *node) {
+    int64_t next_ns = INT64_MAX;
+
+    /* Etimer: expiration time is in ms */
+    if (*node->simEtimerPending) {
+        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
+        if (et_ns < next_ns) next_ns = et_ns;
+    }
+
+    /* Rtimer: expiration time is in us */
+    if (*node->simRtimerPending) {
+        int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
+        if (rt_ns < next_ns) next_ns = rt_ns;
+    }
+
+    /* If there's a pending RX frame, wake up immediately */
+    if (node->pending_rx_frame.valid) {
+        next_ns = node->sim_time_ns;
+    }
+
+    /* processRunValue forces a tick */
+    if (*node->simProcessRunValue) {
+        next_ns = node->sim_time_ns;
+    }
+
+    return next_ns;
+}
+
+void native_step_until_ns(native_node_t *node, int64_t target_ns) {
+    while (node->sim_time_ns < target_ns) {
+        int64_t next_ns = compute_next_wakeup(node);
+        if (next_ns > target_ns) {
+            node->sim_time_ns = target_ns;
+            break;
+        }
+
+        /* Advance time to the next event */
+        if (next_ns > node->sim_time_ns)
+            node->sim_time_ns = next_ns;
+
+        /* Deliver pending RX frame before ticking */
+        if (node->pending_rx_frame.valid) {
+            memcpy(node->simInDataBuffer,
+                   node->pending_rx_frame.data,
+                   (size_t)node->pending_rx_frame.len);
+            *node->simInSize = node->pending_rx_frame.len;
+            node->pending_rx_frame.valid = false;
+        }
+
+        /* Update simulation time variables */
+        *node->simCurrentTime        = (uint64_t)(node->sim_time_ns / 1000000LL);
+        *node->simRtimerCurrentTicks = (uint64_t)(node->sim_time_ns / 1000LL);
+
+        node->cooja_tick();
+
+        /* Check for TX and log output after each tick */
+        native_check_radio_tx(node);
+        native_check_log_output(node);
+    }
+}
+
+void native_check_log_output(native_node_t *node) {
+    if (!*node->simLoggedFlag) return;
+
+    if (node->log_callback) {
+        int len = *node->simLoggedLength;
+        for (int i = 0; i < len; i++) {
+            node->log_callback(node->log_callback_data,
+                               (uint8_t)node->simLoggedData[i]);
+        }
+        /* Add newline if not already present */
+        if (len > 0 && node->simLoggedData[len - 1] != '\n') {
+            node->log_callback(node->log_callback_data, '\n');
+        }
+    }
+
+    *node->simLoggedFlag = 0;
+    *node->simLoggedLength = 0;
+}
+
+void native_check_radio_tx(native_node_t *node) {
+    if (*node->simOutSize <= 0) return;
+
+    int frame_len = *node->simOutSize;
+    uint8_t *frame = (uint8_t *)node->simOutDataBuffer;
+
+    /* Notify frame callback (for native-to-native) */
+    if (node->rf_frame_callback) {
+        node->rf_frame_callback(node->rf_frame_callback_data, frame, frame_len);
+    }
+
+    /* Notify byte-stream callback (for native-to-emulated) */
+    if (node->rf_tx_callback) {
+        uint8_t byte_buf[300];
+        int byte_len = native_frame_to_bytes(frame, frame_len, byte_buf, sizeof(byte_buf));
+        for (int i = 0; i < byte_len; i++) {
+            node->rf_tx_callback(node->rf_tx_callback_data, byte_buf[i]);
+        }
+    }
+
+    *node->simOutSize = 0;
+}
+
+void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len) {
+    if (len > 128) len = 128;
+    memcpy(node->pending_rx_frame.data, frame, (size_t)len);
+    node->pending_rx_frame.len = len;
+    node->pending_rx_frame.valid = true;
+}

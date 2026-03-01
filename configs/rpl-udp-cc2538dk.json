@@ -1,0 +1,8 @@
+{
+  "title": "RPL-UDP CC2538DK test",
+  "timeout_ms": 60000,
+  "nodes": [
+    { "firmware": "firmware/cc2538dk/udp-server.cc2538dk", "id": 1 },
+    { "firmware": "firmware/cc2538dk/udp-client.cc2538dk", "id": 2 }
+  ]
+}

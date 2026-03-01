@@ -1,0 +1,8 @@
+{
+  "title": "RPL-UDP native test",
+  "timeout_ms": 60000,
+  "nodes": [
+    { "firmware": "firmware/cooja/udp-server.cooja", "id": 1 },
+    { "firmware": "firmware/cooja/udp-client.cooja", "id": 2 }
+  ]
+}
