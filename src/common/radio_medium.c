@@ -179,6 +179,28 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
     return rng_next(rm) < prob;
 }
 
+int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver) {
+    if (rm->type == RADIO_MEDIUM_NONE)
+        return -50;
+
+    double dx = rm->nodes[sender].x - rm->nodes[receiver].x;
+    double dy = rm->nodes[sender].y - rm->nodes[receiver].y;
+    double dist = sqrt(dx * dx + dy * dy);
+    double range = rm->udgm.tx_range;
+
+    if (range <= 0.0)
+        return -90;
+
+    double ratio = dist / range;
+    if (ratio > 1.0) ratio = 1.0;
+
+    /* Linear interpolation: -10 dBm at distance 0, -90 dBm at tx_range */
+    double rssi = -10.0 - 80.0 * ratio;
+    if (rssi < -128.0) rssi = -128.0;
+    if (rssi > 0.0) rssi = 0.0;
+    return (int8_t)rssi;
+}
+
 bool radio_medium_filter_byte(radio_medium_t *rm, int sender, int receiver, uint8_t byte) {
     /* NONE type: pass everything through */
     if (rm->type == RADIO_MEDIUM_NONE)

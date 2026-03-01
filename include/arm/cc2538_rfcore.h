@@ -88,8 +88,11 @@ typedef enum {
 #define RFCORE_RX_TX_IRQ   141  /* RF Core Rx/Tx */
 #define RFCORE_ERR_IRQ     26   /* RF Core Error */
 
-/* TX/RX FIFO sizes */
-#define RF_FIFO_SIZE  128
+/* TX/RX FIFO sizes.
+ * Real CC2538 has 128-byte circular RXFIFO, but in simulation multiple
+ * frames may be delivered in one batch (before the ISR can consume them).
+ * Use a larger buffer to avoid overflow when frames accumulate. */
+#define RF_FIFO_SIZE  512
 
 typedef void (*cc2538_rf_tx_fn)(void *user_data, uint8_t byte);
 
@@ -176,6 +179,9 @@ typedef struct cc2538_rfcore {
     cc2538_rf_tx_fn  tx_callback;
     void            *tx_user_data;
     int              node_id;
+
+    /* RSSI value set by radio medium for current RX frame */
+    int8_t           rx_rssi;
 
     /* Software-off flag: firmware called ISRFOFF but we keep receiving */
     bool             software_off;

@@ -596,10 +596,14 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
             rx_frames_completed++;
 
             /* Replace last 2 bytes with RSSI + (corrval | crc_ok<<7) */
-            uint8_t rssi_val = r->registers[CC2420_REG_RSSI] & 0xFF;
-            uint8_t corr_val = 110;  /* default correlation value */
+            uint8_t rssi_val = (uint8_t)(int8_t)r->rx_rssi;
+            /* Derive correlation from RSSI: map [-10..-90] -> [110..50]
+             * dist_ratio = -(rssi + 10) / 80; corr = 110 - dist_ratio * 60 */
+            int corr = 110 + ((int)r->rx_rssi + 10) * 60 / 80;
+            if (corr < 50) corr = 50;
+            if (corr > 110) corr = 110;
             rxfifo_set(r, -2, rssi_val);
-            rxfifo_set(r, -1, (corr_val & 0x7F) | (r->crc_ok ? 0x80 : 0));
+            rxfifo_set(r, -1, (uint8_t)((corr & 0x7F) | (r->crc_ok ? 0x80 : 0)));
 
             /* Set FIFOP for completed packet */
             if (r->rx_fifo_len <= r->rxlen + 1)
@@ -968,6 +972,7 @@ static void cc2420_reset(cc2420_t *r) {
     r->overflow = false;
     r->should_ack = false;
     r->fifop_thr = 64;  /* default FIFOP threshold */
+    r->rx_rssi = -50;   /* default RSSI (backward compatible) */
 }
 
 void cc2420_init(cc2420_t *radio, msp430_cpu_t *cpu, msp430_gpio_t *gpio) {

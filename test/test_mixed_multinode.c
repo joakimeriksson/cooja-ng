@@ -187,6 +187,12 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
                 rf_buffer_t *buf = &rf_pending[i];
                 if (buf->count < RF_BUF_SIZE)
                     buf->bytes[buf->count++] = byte;
+                /* Set RSSI on receiver's radio (used at frame completion) */
+                int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
+                if (nodes[i].type == NODE_MSP430)
+                    nodes[i].plat.msp.cc2420.rx_rssi = rssi;
+                else if (nodes[i].type == NODE_ARM)
+                    nodes[i].plat.arm.rfcore.rx_rssi = rssi;
             }
         }
     }

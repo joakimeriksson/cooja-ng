@@ -456,6 +456,7 @@ void cc2538_rfcore_init(cc2538_rfcore_t *rf, arm_cpu_t *cpu, arm_nvic_t *nvic) {
     rf->txfiltcfg = 0x09;
     rf->txpower = 0xFF;        /* Max power */
     rf->rfrnd_state = 0xDEADBEEF;
+    rf->rx_rssi = -50;  /* default RSSI (backward compatible) */
 
     rf->tx_event.callback = rfcore_tx_done;
     rf->tx_event.user_data = rf;
@@ -547,8 +548,13 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                  *   byte N   = CRC_OK (bit 7) | CORR/LQI (bits 6:0)
                  * The firmware checks CRC_OK before accepting a frame. */
                 if (rf->rxfifo_len >= 2) {
-                    rf->rxfifo[rf->rxfifo_len - 2] = (uint8_t)(-50 & 0xFF); /* RSSI */
-                    rf->rxfifo[rf->rxfifo_len - 1] = 0x80 | 50; /* CRC_OK | LQI */
+                    rf->rxfifo[rf->rxfifo_len - 2] = (uint8_t)(int8_t)rf->rx_rssi; /* RSSI */
+                    /* Derive LQI from RSSI: map [-10..-90] -> [100..20]
+                     * dist_ratio = -(rssi + 10) / 80; lqi = 100 - dist_ratio * 80 */
+                    int lqi = (int)rf->rx_rssi + 110;
+                    if (lqi < 20) lqi = 20;
+                    if (lqi > 100) lqi = 100;
+                    rf->rxfifo[rf->rxfifo_len - 1] = (uint8_t)(0x80 | (lqi & 0x7F)); /* CRC_OK | LQI */
                 }
 
                 rf->rfirqf0 |= RFIRQF0_RXPKTDONE | RFIRQF0_FIFOP;

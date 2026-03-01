@@ -114,4 +114,11 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver);
  */
 void radio_medium_compute_neighbors(radio_medium_t *rm);
 
+/*
+ * Compute RSSI (in dBm) for a frame from sender to receiver.
+ * Linear-in-dB model: -10 dBm at distance 0, -90 dBm at tx_range.
+ * Returns -50 dBm when radio medium is NONE (backward compatible).
+ */
+int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver);
+
 #endif /* RADIO_MEDIUM_H */

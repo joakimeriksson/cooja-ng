@@ -233,6 +233,9 @@ typedef struct cc2420 {
     /* Debug: node identity for logging */
     int node_id;
 
+    /* RSSI value set by radio medium for current RX frame */
+    int8_t rx_rssi;
+
     /* RF listener */
     cc2420_rf_callback_fn rf_tx_callback;
     void *rf_tx_data;
