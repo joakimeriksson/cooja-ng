@@ -1,0 +1,16 @@
+{
+    "title": "UDGM in-range test (30m < 50m TX range)",
+    "timeout_ms": 10000,
+    "seed": 42,
+    "radiomedium": {
+        "type": "udgm",
+        "tx_range": 50.0,
+        "interference_range": 100.0,
+        "success_ratio_tx": 1.0,
+        "success_ratio_rx": 1.0
+    },
+    "nodes": [
+        { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 1, "x": 0.0, "y": 0.0 },
+        { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 2, "x": 30.0, "y": 0.0 }
+    ]
+}

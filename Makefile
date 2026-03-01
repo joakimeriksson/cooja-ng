@@ -44,7 +44,8 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/cc2538_rfcore.c \
               $(ARM_SRC_DIR)/cc2538_sleeptimer.c
 
-COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c
+COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
+                 $(COMMON_SRC_DIR)/radio_medium.c
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \

@@ -19,12 +19,22 @@
 extern "C" {
 #endif
 
-/* Forward-declare the frame queue used for native-to-native delivery */
+/* RX frame queue for native-to-native delivery (replaces single pending slot) */
+#define NATIVE_RX_QUEUE_SIZE 8
+
 typedef struct native_pending_frame {
     uint8_t data[128];
     int     len;
-    bool    valid;
+    int64_t arrival_ns;   /* sim time when queued */
+    int64_t end_ns;       /* arrival + frame duration */
+    int     sender_idx;   /* sending node index (-1 for emulated) */
+    bool    collided;     /* corrupted by overlapping TX */
 } native_pending_frame_t;
+
+typedef struct {
+    native_pending_frame_t frames[NATIVE_RX_QUEUE_SIZE];
+    int head, count;
+} native_rx_queue_t;
 
 /* State machine for reassembling byte-stream into 802.15.4 frames */
 typedef enum {
@@ -79,7 +89,7 @@ typedef struct native_node {
     int      node_id;
 
     /* Radio state */
-    native_pending_frame_t pending_rx_frame;   /* queued frame for delivery */
+    native_rx_queue_t      rx_queue;           /* queued frames for delivery */
     native_rx_assembler_t  rx_asm;             /* byte-stream reassembler */
 
     /* UART/log callback */
@@ -113,7 +123,14 @@ void native_check_log_output(native_node_t *node);
 void native_check_radio_tx(native_node_t *node);
 
 /* Deliver a complete frame to this native node (native-to-native) */
-void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len);
+void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
+                          int64_t arrival_ns, int sender_idx);
+
+/* Dequeue one non-collided frame into simInDataBuffer. Returns true if delivered. */
+bool native_dequeue_rx_frame(native_node_t *node);
+
+/* Return the next time the node needs to wake up (ns), INT64_MAX if idle */
+int64_t native_next_wakeup_ns(const native_node_t *node);
 
 /* Feed a byte from emulated radio byte-stream into the reassembler */
 void native_rx_assembler_feed(native_node_t *node, uint8_t byte);

@@ -140,8 +140,10 @@ void native_node_destroy(native_node_t *node) {
     }
 }
 
-/* Compute the next time the node needs to wake up (ns) */
-static int64_t compute_next_wakeup(native_node_t *node) {
+/* Compute the next time the node needs to wake up (ns).
+ * Only checks timer events and processRunValue.
+ * RX frame queue is handled externally by native_dequeue_rx_frame(). */
+static int64_t compute_next_wakeup(const native_node_t *node) {
     int64_t next_ns = INT64_MAX;
 
     /* Etimer: expiration time is in ms */
@@ -156,17 +158,50 @@ static int64_t compute_next_wakeup(native_node_t *node) {
         if (rt_ns < next_ns) next_ns = rt_ns;
     }
 
-    /* If there's a pending RX frame, wake up immediately */
-    if (node->pending_rx_frame.valid) {
-        next_ns = node->sim_time_ns;
-    }
-
     /* processRunValue forces a tick */
     if (*node->simProcessRunValue) {
         next_ns = node->sim_time_ns;
     }
 
     return next_ns;
+}
+
+int64_t native_next_wakeup_ns(const native_node_t *node) {
+    /* Only report timer-based wakeups for adaptive stepping.
+     * processRunValue and rx_queue are handled by idle-skip in the outer loop. */
+    int64_t next_ns = INT64_MAX;
+    if (*node->simEtimerPending) {
+        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
+        if (et_ns < next_ns) next_ns = et_ns;
+    }
+    if (*node->simRtimerPending) {
+        int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
+        if (rt_ns < next_ns) next_ns = rt_ns;
+    }
+    return next_ns;
+}
+
+/*
+ * Dequeue one frame from the RX queue for delivery.
+ * Skips collided frames. Returns true if a good frame was delivered.
+ */
+bool native_dequeue_rx_frame(native_node_t *node) {
+    while (node->rx_queue.count > 0) {
+        native_pending_frame_t *head =
+            &node->rx_queue.frames[node->rx_queue.head];
+        node->rx_queue.head =
+            (node->rx_queue.head + 1) % NATIVE_RX_QUEUE_SIZE;
+        node->rx_queue.count--;
+
+        if (!head->collided) {
+            /* Good frame — deliver to simInDataBuffer */
+            memcpy(node->simInDataBuffer, head->data, (size_t)head->len);
+            *node->simInSize = head->len;
+            return true;
+        }
+        /* Collided frame — skip it and try next */
+    }
+    return false;
 }
 
 void native_step_until_ns(native_node_t *node, int64_t target_ns) {
@@ -181,24 +216,28 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
         if (next_ns > node->sim_time_ns)
             node->sim_time_ns = next_ns;
 
-        /* Deliver pending RX frame before ticking */
-        if (node->pending_rx_frame.valid) {
-            memcpy(node->simInDataBuffer,
-                   node->pending_rx_frame.data,
-                   (size_t)node->pending_rx_frame.len);
-            *node->simInSize = node->pending_rx_frame.len;
-            node->pending_rx_frame.valid = false;
-        }
-
         /* Update simulation time variables */
         *node->simCurrentTime        = (uint64_t)(node->sim_time_ns / 1000000LL);
         *node->simRtimerCurrentTicks = (uint64_t)(node->sim_time_ns / 1000LL);
 
-        node->cooja_tick();
+        /* Process up to 20 ticks at the same time (processRunValue loops),
+         * then yield back to the outer loop to let other nodes run. */
+        for (int same_time = 0; same_time < 20; same_time++) {
+            node->cooja_tick();
+            native_check_radio_tx(node);
+            native_check_log_output(node);
+            if (!*node->simProcessRunValue) break;
+        }
 
-        /* Check for TX and log output after each tick */
-        native_check_radio_tx(node);
-        native_check_log_output(node);
+        /* If processRunValue still set after safety limit, fast-forward to
+         * target_ns and yield.  The node will be ticked again next time step.
+         * This prevents a single node from monopolizing the simulation. */
+        if (*node->simProcessRunValue) {
+            node->sim_time_ns = target_ns;
+            *node->simCurrentTime        = (uint64_t)(node->sim_time_ns / 1000000LL);
+            *node->simRtimerCurrentTicks = (uint64_t)(node->sim_time_ns / 1000LL);
+            break;
+        }
     }
 }
 
@@ -244,9 +283,42 @@ void native_check_radio_tx(native_node_t *node) {
     *node->simOutSize = 0;
 }
 
-void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len) {
+void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
+                          int64_t arrival_ns, int sender_idx) {
     if (len > 128) len = 128;
-    memcpy(node->pending_rx_frame.data, frame, (size_t)len);
-    node->pending_rx_frame.len = len;
-    node->pending_rx_frame.valid = true;
+
+    native_rx_queue_t *q = &node->rx_queue;
+
+    /* If queue is full, drop oldest */
+    if (q->count >= NATIVE_RX_QUEUE_SIZE) {
+        q->head = (q->head + 1) % NATIVE_RX_QUEUE_SIZE;
+        q->count--;
+    }
+
+    /* Compute slot for new frame */
+    int tail = (q->head + q->count) % NATIVE_RX_QUEUE_SIZE;
+    native_pending_frame_t *slot = &q->frames[tail];
+
+    memcpy(slot->data, frame, (size_t)len);
+    slot->len = len;
+    slot->arrival_ns = arrival_ns;
+    /* Frame duration: (len + 6) bytes at 32us/byte = (len+6)*32000 ns
+     * The +6 accounts for preamble(4) + SFD(1) + length(1) */
+    slot->end_ns = arrival_ns + (int64_t)(len + 6) * 32000LL;
+    slot->sender_idx = sender_idx;
+    slot->collided = false;
+
+    /* Check temporal overlap with existing queued frames → collision */
+    for (int i = 0; i < q->count; i++) {
+        int idx = (q->head + i) % NATIVE_RX_QUEUE_SIZE;
+        native_pending_frame_t *existing = &q->frames[idx];
+        /* Two frames overlap if one starts before the other ends */
+        if (slot->arrival_ns < existing->end_ns &&
+            existing->arrival_ns < slot->end_ns) {
+            existing->collided = true;
+            slot->collided = true;
+        }
+    }
+
+    q->count++;
 }

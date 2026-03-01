@@ -1,0 +1,614 @@
+{
+  "title": "UDGM 100-node 10x10 grid RPL-UDP (5-hop depth)",
+  "timeout_ms": 180000,
+  "seed": 42,
+  "radiomedium": {
+    "type": "udgm",
+    "tx_range": 50.0,
+    "interference_range": 100.0,
+    "success_ratio_tx": 1.0,
+    "success_ratio_rx": 1.0
+  },
+  "nodes": [
+    {
+      "firmware": "firmware/cooja/udp-server.cooja",
+      "id": 1,
+      "x": 150.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 2,
+      "x": 0.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 3,
+      "x": 30.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 4,
+      "x": 60.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 5,
+      "x": 90.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 6,
+      "x": 120.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 7,
+      "x": 150.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 8,
+      "x": 180.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 9,
+      "x": 210.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 10,
+      "x": 240.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 11,
+      "x": 270.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 12,
+      "x": 0.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 13,
+      "x": 30.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 14,
+      "x": 60.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 15,
+      "x": 90.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 16,
+      "x": 120.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 17,
+      "x": 150.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 18,
+      "x": 180.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 19,
+      "x": 210.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 20,
+      "x": 240.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 21,
+      "x": 270.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 22,
+      "x": 0.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 23,
+      "x": 30.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 24,
+      "x": 60.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 25,
+      "x": 90.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 26,
+      "x": 120.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 27,
+      "x": 150.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 28,
+      "x": 180.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 29,
+      "x": 210.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 30,
+      "x": 240.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 31,
+      "x": 270.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 32,
+      "x": 0.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 33,
+      "x": 30.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 34,
+      "x": 60.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 35,
+      "x": 90.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 36,
+      "x": 120.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 37,
+      "x": 150.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 38,
+      "x": 180.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 39,
+      "x": 210.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 40,
+      "x": 240.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 41,
+      "x": 270.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 42,
+      "x": 0.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 43,
+      "x": 30.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 44,
+      "x": 60.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 45,
+      "x": 90.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 46,
+      "x": 120.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 47,
+      "x": 150.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 48,
+      "x": 180.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 49,
+      "x": 210.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 50,
+      "x": 240.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 51,
+      "x": 270.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 52,
+      "x": 0.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 53,
+      "x": 30.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 54,
+      "x": 60.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 55,
+      "x": 90.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 56,
+      "x": 120.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 57,
+      "x": 180.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 58,
+      "x": 210.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 59,
+      "x": 240.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 60,
+      "x": 270.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 61,
+      "x": 0.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 62,
+      "x": 30.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 63,
+      "x": 60.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 64,
+      "x": 90.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 65,
+      "x": 120.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 66,
+      "x": 150.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 67,
+      "x": 180.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 68,
+      "x": 210.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 69,
+      "x": 240.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 70,
+      "x": 270.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 71,
+      "x": 0.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 72,
+      "x": 30.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 73,
+      "x": 60.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 74,
+      "x": 90.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 75,
+      "x": 120.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 76,
+      "x": 150.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 77,
+      "x": 180.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 78,
+      "x": 210.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 79,
+      "x": 240.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 80,
+      "x": 270.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 81,
+      "x": 0.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 82,
+      "x": 30.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 83,
+      "x": 60.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 84,
+      "x": 90.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 85,
+      "x": 120.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 86,
+      "x": 150.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 87,
+      "x": 180.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 88,
+      "x": 210.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 89,
+      "x": 240.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 90,
+      "x": 270.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 91,
+      "x": 0.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 92,
+      "x": 30.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 93,
+      "x": 60.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 94,
+      "x": 90.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 95,
+      "x": 120.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 96,
+      "x": 150.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 97,
+      "x": 180.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 98,
+      "x": 210.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 99,
+      "x": 240.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cooja/udp-client.cooja",
+      "id": 100,
+      "x": 270.0,
+      "y": 270.0
+    }
+  ]
+}

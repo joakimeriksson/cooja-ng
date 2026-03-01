@@ -1,0 +1,17 @@
+{
+    "title": "UDGM 3-node linear topology (node1-node2 in range, node3 out of range of node1)",
+    "timeout_ms": 30000,
+    "seed": 42,
+    "radiomedium": {
+        "type": "udgm",
+        "tx_range": 50.0,
+        "interference_range": 100.0,
+        "success_ratio_tx": 1.0,
+        "success_ratio_rx": 1.0
+    },
+    "nodes": [
+        { "firmware": "firmware/sky/udp-server.sky", "id": 1, "x": 0.0, "y": 0.0 },
+        { "firmware": "firmware/sky/udp-client.sky", "id": 2, "x": 30.0, "y": 0.0 },
+        { "firmware": "firmware/sky/udp-client.sky", "id": 3, "x": 80.0, "y": 0.0 }
+    ]
+}

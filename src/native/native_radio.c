@@ -128,7 +128,9 @@ void native_rx_assembler_feed(native_node_t *node, uint8_t byte) {
             /* Frame complete: strip FCS (last 2 bytes), deliver to native node */
             int frame_len = a->expected_len - 2;
             if (frame_len > 0 && frame_len <= 128) {
-                native_deliver_frame(node, a->buf, frame_len);
+                /* Byte-stream reassembly: use node's current time, sender unknown */
+                native_deliver_frame(node, a->buf, frame_len,
+                                     node->sim_time_ns, -1);
             }
             native_rx_assembler_reset(a);
         }
