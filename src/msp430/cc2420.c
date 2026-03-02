@@ -101,15 +101,22 @@ static void rxfifo_restore(cc2420_t *r) {
 static int fifop_high_count;
 static int rxfifo_spi_reads;
 static int spi_exchange_count;
+static int rx_bytes_buffered;
+static int rx_bytes_replayed;
+static int rx_bytes_direct;
+static int rx_bytes_dropped;
+static int auto_ack_count;
+static int sfd_high_count;
+static int sfd_low_count;
+static int sfd_deferred_count;
 
 /* ================================================================
  * Pin control
  * ================================================================ */
 
 static void set_fifop(cc2420_t *r, bool val) {
-    if (val && !r->current_fifop) {
+    if (val && !r->current_fifop)
         fifop_high_count++;
-    }
     r->current_fifop = val;
     bool pin_val = val;
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_FIFOP_POLARITY)
@@ -127,6 +134,7 @@ static void set_fifo(cc2420_t *r, bool val) {
 
 static void set_sfd(cc2420_t *r, bool val) {
     r->current_sfd = val;
+    if (val) sfd_high_count++; else sfd_low_count++;
     bool pin_val = val;
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_SFD_POLARITY)
         pin_val = !pin_val;
@@ -172,6 +180,7 @@ static void flush_rx(cc2420_t *r) {
     r->overflow = false;
     r->frame_rejected = false;
     r->rx_incoming_count = 0;
+    msp430_cancel_event(r->cpu, &r->sfd_clear_event);
     set_fifo(r, false);
     set_fifop(r, false);
     set_sfd(r, false);
@@ -198,6 +207,18 @@ static void reject_frame(cc2420_t *r) {
     r->frame_rejected = true;
 }
 
+/* Deferred SFD clear: fires 1 symbol after frame completion so that
+ * the firmware's SFD polling loop can observe SFD=1 during the CPU step.
+ * In our batch-delivery model, frame bytes are processed atomically before
+ * the step, so without this deferral, SFD goes high→low with 0 CPU cycles
+ * in between, making ACK reception invisible to CC2420 firmware drivers. */
+static void sfd_clear_callback(void *user_data, msp430_event_t *event) {
+    cc2420_t *r = (cc2420_t *)user_data;
+    (void)event;
+    if (r->current_sfd)
+        set_sfd(r, false);
+}
+
 /* Forward declarations for event callbacks */
 static void shr_next(cc2420_t *r);
 static void tx_next(cc2420_t *r);
@@ -212,13 +233,7 @@ static void symbol_event_callback(void *user_data, msp430_event_t *event) {
     switch (r->state) {
     case CC2420_RX_CALIBRATE:
         set_state(r, CC2420_RX_SFD_SEARCH);
-        /* Process any bytes buffered during calibration */
-        if (r->rx_incoming_count > 0) {
-            int count = r->rx_incoming_count;
-            r->rx_incoming_count = 0;
-            for (int i = 0; i < count; i++)
-                cc2420_receive_byte(r, r->rx_incoming[i]);
-        }
+        /* Buffered bytes are replayed inside set_state(RX_SFD_SEARCH) */
         break;
     case CC2420_TX_CALIBRATE:
         set_state(r, CC2420_TX_PREAMBLE);
@@ -240,13 +255,7 @@ static void symbol_event_callback(void *user_data, msp430_event_t *event) {
         break;
     case CC2420_RX_WAIT:
         set_state(r, CC2420_RX_SFD_SEARCH);
-        /* Process any bytes buffered during wait */
-        if (r->rx_incoming_count > 0) {
-            int count = r->rx_incoming_count;
-            r->rx_incoming_count = 0;
-            for (int i = 0; i < count; i++)
-                cc2420_receive_byte(r, r->rx_incoming[i]);
-        }
+        /* Buffered bytes are replayed inside set_state(RX_SFD_SEARCH) */
         break;
     default:
         break;
@@ -297,6 +306,14 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
         r->registers[CC2420_REG_RSSI] =
             (r->registers[CC2420_REG_RSSI] & 0xFF00) | (uint8_t)(int8_t)-55;
         update_cca(r);
+        /* Replay any bytes buffered while in non-RX states */
+        if (r->rx_incoming_count > 0) {
+            int count = r->rx_incoming_count;
+            r->rx_incoming_count = 0;
+            rx_bytes_replayed += count;
+            for (int i = 0; i < count; i++)
+                cc2420_receive_byte(r, r->rx_incoming[i]);
+        }
         break;
 
     case CC2420_RX_FRAME:
@@ -312,6 +329,8 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
         break;
 
     case CC2420_TX_CALIBRATE:
+        /* Cancel any pending deferred SFD clear from frame RX */
+        msp430_cancel_event(r->cpu, &r->sfd_clear_event);
         /* 14 symbol periods (12 cal + 2 settling) */
         schedule_symbols(r, 14);
         break;
@@ -328,6 +347,9 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
         break;
 
     case CC2420_TX_ACK_CALIBRATE:
+        /* Cancel any pending deferred SFD clear — ACK TX will manage SFD */
+        msp430_cancel_event(r->cpu, &r->sfd_clear_event);
+        set_sfd(r, false);  /* clear SFD from received frame before ACK TX */
         r->status |= CC2420_STATUS_TX_ACTIVE;
         /* aTurnaroundTime = 12 symbols per 802.15.4 spec */
         schedule_symbols(r, 12);
@@ -441,7 +463,6 @@ static int rx_frames_rejected = 0;
 static int rx_frames_overflow = 0;
 static int rx_crc_ok = 0;
 static int rx_crc_fail = 0;
-static int rx_bytes_dropped = 0;
 /* fifop_high_count, rxfifo_spi_reads, spi_exchange_count declared above */
 
 void cc2420_get_rx_stats(int *started, int *completed, int *rejected,
@@ -460,18 +481,20 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
     cc2420_t *r = radio;
 
     if (r->state != CC2420_RX_SFD_SEARCH && r->state != CC2420_RX_FRAME) {
-        /* Buffer bytes during RX_CALIBRATE/RX_WAIT — they'll be processed
-         * when the radio transitions to RX_SFD_SEARCH.  This models the
-         * 802.15.4 turnaround: ACK preamble arrives during/just after the
-         * sender's RX calibration. */
-        if ((r->state == CC2420_RX_CALIBRATE || r->state == CC2420_RX_WAIT) &&
-            r->rx_incoming_count < 256) {
+        /* Buffer bytes in any non-RX state — they'll be processed when the
+         * radio transitions to RX_SFD_SEARCH.  In our batch-delivery
+         * simulation model, bytes may arrive when the radio is briefly in
+         * IDLE, TX, or other transient states. */
+        if (r->rx_incoming_count < 256) {
             r->rx_incoming[r->rx_incoming_count++] = data;
+            rx_bytes_buffered++;
             return;
         }
         rx_bytes_dropped++;
         return;
     }
+
+    rx_bytes_direct++;
 
     if (r->state == CC2420_RX_SFD_SEARCH) {
         if (data == 0) {
@@ -609,11 +632,47 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
             if (r->rx_fifo_len <= r->rxlen + 1)
                 set_fifop(r, true);
 
-            set_sfd(r, false);
+            /* Defer SFD clear: schedule 1 symbol period later so the firmware
+             * can observe SFD=1 during the CPU step.  This is critical for
+             * ACK detection — the CC2420 driver busy-waits for SFD transitions. */
+            {
+                sfd_deferred_count++;
+                int64_t fire_ns = r->cpu->sim_time_ns + CC2420_SYMBOL_PERIOD_NS;
+                msp430_schedule_event_ns(r->cpu, &r->sfd_clear_event, fire_ns);
+            }
 
-            /* Auto-ACK */
+            /* Auto-ACK: emit bytes immediately so that in the time-stepped
+             * simulation the ACK is available during the same delivery pass.
+             * Without this, the event-driven TX_ACK state machine would only
+             * emit bytes during CPU stepping, adding 1+ time steps of latency
+             * (~750 us) which exceeds the CSMA ACK timeout (~400 us).
+             * This matches the CC2538 RF Core approach (cc2538_rfcore.c:576). */
             if (((r->auto_ack && r->ack_request) || r->should_ack) && r->crc_ok) {
-                set_state(r, CC2420_TX_ACK_CALIBRATE);
+                auto_ack_count++;
+                if (r->rf_tx_callback) {
+                    /* SHR: 4 preamble bytes + SFD */
+                    static const uint8_t SHR_SEQ[] = {0x00, 0x00, 0x00, 0x00, 0x7A};
+                    for (int k = 0; k < 5; k++)
+                        r->rf_tx_callback(r->rf_tx_data, SHR_SEQ[k]);
+
+                    /* ACK frame: length(1) + FCF(2) + DSN(1) + CRC(2) */
+                    uint8_t ack[6];
+                    ack[0] = 5;    /* length */
+                    ack[1] = 0x02; /* FCF low: ACK frame type */
+                    ack[2] = 0x00; /* FCF high */
+                    if (r->ack_frame_pending)
+                        ack[1] |= 0x10;
+                    ack[3] = (uint8_t)r->dsn;
+                    uint16_t crc = 0;
+                    for (int k = 1; k <= 3; k++)
+                        crc = crc_add_bitrev(crc, ack[k]);
+                    ack[4] = bitrev((crc >> 8) & 0xFF);
+                    ack[5] = bitrev(crc & 0xFF);
+                    for (int k = 0; k < 6; k++)
+                        r->rf_tx_callback(r->rf_tx_data, ack[k]);
+                }
+                r->ack_frame_pending = false;
+                set_state(r, CC2420_RX_CALIBRATE);
             } else {
                 set_state(r, CC2420_RX_WAIT);
             }
@@ -792,6 +851,7 @@ void cc2420_set_vreg(cc2420_t *radio, bool on) {
         msp430_cancel_event(radio->cpu, &radio->vreg_event);
         msp430_cancel_event(radio->cpu, &radio->oscillator_event);
         msp430_cancel_event(radio->cpu, &radio->symbol_event);
+        msp430_cancel_event(radio->cpu, &radio->sfd_clear_event);
         set_state(radio, CC2420_VREG_OFF);
     }
 }
@@ -988,6 +1048,8 @@ void cc2420_init(cc2420_t *radio, msp430_cpu_t *cpu, msp430_gpio_t *gpio) {
     radio->oscillator_event.user_data = radio;
     radio->symbol_event.callback = symbol_event_callback;
     radio->symbol_event.user_data = radio;
+    radio->sfd_clear_event.callback = sfd_clear_callback;
+    radio->sfd_clear_event.user_data = radio;
 
     cc2420_reset(radio);
 }

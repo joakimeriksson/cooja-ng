@@ -18,6 +18,32 @@
 #define IEEE802154_SFD  0x7A
 #define PREAMBLE_MIN    4
 
+/* ================================================================
+ * CRC — CCITT-16 with bit reversal (matches CC2420 wire format)
+ * ================================================================ */
+
+static uint8_t bitrev(uint8_t data) {
+    return (uint8_t)(
+        ((data << 7) & 0x80) | ((data << 5) & 0x40) |
+        ((data << 3) & 0x20) | ((data << 1) & 0x10) |
+        ((data >> 7) & 0x01) | ((data >> 5) & 0x02) |
+        ((data >> 3) & 0x04) | ((data >> 1) & 0x08)
+    );
+}
+
+static uint16_t crc_add(uint16_t crc, uint8_t data) {
+    uint16_t newcrc = ((crc >> 8) & 0xff) | ((crc << 8) & 0xffff);
+    newcrc ^= data;
+    newcrc ^= (newcrc & 0xff) >> 4;
+    newcrc ^= (newcrc << 12) & 0xffff;
+    newcrc ^= (newcrc & 0xff) << 5;
+    return newcrc & 0xffff;
+}
+
+static uint16_t crc_add_bitrev(uint16_t crc, uint8_t data) {
+    return crc_add(crc, bitrev(data));
+}
+
 /* MAC timer runs at 32.768 kHz — period in nanoseconds */
 #define MT_PERIOD_NS  30517  /* 1e9 / 32768 */
 
@@ -26,20 +52,8 @@
 static void rfcore_check_interrupts(cc2538_rfcore_t *rf) {
     uint32_t masked0 = rf->rfirqf0 & rf->rfirqm0;
     uint32_t masked1 = rf->rfirqf1 & rf->rfirqm1;
-    if (masked0 || masked1) {
-        /* Debug: trace RXPKTDONE interrupt */
-        if (masked0 & RFIRQF0_RXPKTDONE) {
-            int iser_idx = RFCORE_RX_TX_IRQ / 32;
-            int iser_bit = RFCORE_RX_TX_IRQ % 32;
-            int enabled = (rf->nvic->iser[iser_idx] >> iser_bit) & 1;
-            fprintf(stderr, "[RF node%d] RXPKTDONE IRQ: irq=%d iser[%d]bit%d=%d "
-                    "primask=%d active_exc=%d vtor=0x%08x\n",
-                    rf->node_id, RFCORE_RX_TX_IRQ, iser_idx, iser_bit, enabled,
-                    rf->cpu->primask, rf->nvic->active_exception,
-                    rf->cpu->vtor);
-        }
+    if (masked0 || masked1)
         arm_nvic_set_pending(rf->nvic, RFCORE_RX_TX_IRQ);
-    }
     if (rf->rferrf & rf->rferrm)
         arm_nvic_set_pending(rf->nvic, RFCORE_ERR_IRQ);
 }
@@ -125,6 +139,7 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
             rf->software_off = false;
             rfcore_set_state(rf, RF_STATE_TX_CALIBR);
             rfcore_set_state(rf, RF_STATE_TX);
+#ifdef DEBUG
             /* Debug: dump TX frame */
             {
                 fprintf(stderr, "[RF node%d] TX frame len=%d: ",
@@ -133,6 +148,7 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
                     fprintf(stderr, "%02x ", rf->txfifo[k]);
                 fprintf(stderr, "...\n");
             }
+#endif
             /* Emit 802.15.4 preamble + SFD, then TXFIFO bytes + auto-CRC */
             if (rf->tx_callback) {
                 /* 4-byte preamble */
@@ -143,11 +159,14 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
                 /* TXFIFO data (length byte + payload) */
                 for (int i = 0; i < rf->txfifo_len; i++)
                     rf->tx_callback(rf->tx_user_data, rf->txfifo[i]);
-                /* Auto-append 2-byte FCS (dummy CRC) — the length field
-                 * includes these bytes but firmware doesn't write them */
+                /* Auto-append 2-byte FCS — compute CCITT CRC with bit
+                 * reversal to match CC2420 wire format for mixed sims */
                 if (rf->frmctrl0 & (1 << 6)) {
-                    rf->tx_callback(rf->tx_user_data, 0x00);
-                    rf->tx_callback(rf->tx_user_data, 0x00);
+                    uint16_t crc = 0;
+                    for (int i = 1; i < rf->txfifo_len; i++)
+                        crc = crc_add_bitrev(crc, rf->txfifo[i]);
+                    rf->tx_callback(rf->tx_user_data, bitrev((crc >> 8) & 0xFF));
+                    rf->tx_callback(rf->tx_user_data, bitrev(crc & 0xFF));
                 }
             }
             /* Schedule TX-done event: leave TX_ACTIVE set so firmware can
@@ -289,9 +308,9 @@ static int xreg_read(void *user_data, uint32_t addr) {
             return rf->software_off ? 0 : (int)rf->fsmstat0;
         case RFCORE_XREG_FSMSTAT1: {
             uint32_t val = rf->software_off ? 0 : rf->fsmstat1;
-            /* FIFO (bit 5): RX FIFO has data */
+            /* FIFO (bit 7): RX FIFO has data */
             if (rf->rxfifo_rd < rf->rxfifo_len)
-                val |= (1 << 5);
+                val |= (1 << 7);
             /* FIFOP (bit 6): live status — complete frame available in FIFO.
              * Unlike the RFIRQF0.FIFOP interrupt flag (which gets cleared by
              * the ISR), this hardware signal stays high as long as there are
@@ -385,8 +404,6 @@ static int sfr_read(void *user_data, uint32_t addr) {
                  * bytes are automatically freed.  The driver's read()
                  * does NOT call ISFLUSHRX after a successful read. */
                 if (rf->rxfifo_rd >= rf->rxfifo_len) {
-                    fprintf(stderr, "[RF node%d] RFDATA: frame consumed (%d bytes)\n",
-                            rf->node_id, rf->rxfifo_len);
                     rf->rxfifo_rd = 0;
                     rf->rxfifo_len = 0;
                 }
@@ -498,6 +515,17 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
             if (byte == 0x00) {
                 rf->zero_symbols++;
             } else if (rf->zero_symbols >= PREAMBLE_MIN && byte == IEEE802154_SFD) {
+                /* Compact RXFIFO before new frame — reclaim consumed space.
+                 * Real CC2538 has a circular FIFO; we simulate this by
+                 * shifting remaining unread bytes to the front. */
+                if (rf->rxfifo_rd > 0) {
+                    int remaining = rf->rxfifo_len - rf->rxfifo_rd;
+                    if (remaining > 0)
+                        memmove(rf->rxfifo, rf->rxfifo + rf->rxfifo_rd,
+                                (size_t)remaining);
+                    rf->rxfifo_len = remaining;
+                    rf->rxfifo_rd = 0;
+                }
                 /* SFD detected — transition to RX_FRAME */
                 rfcore_set_state(rf, RF_STATE_RX);
                 rf->rfirqf0 |= RFIRQF0_SFD;
@@ -558,6 +586,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                 }
 
                 rf->rfirqf0 |= RFIRQF0_RXPKTDONE | RFIRQF0_FIFOP;
+#ifdef DEBUG
                 /* Debug: dump received frame for RPL debugging */
                 {
                     int start = rf->rxfifo_len - rf->rxlen;
@@ -567,6 +596,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                         fprintf(stderr, "%02x ", rf->rxfifo[k]);
                     fprintf(stderr, "\n");
                 }
+#endif
                 rfcore_check_interrupts(rf);
 
                 /* Auto-ACK: if FRMCTRL0.AUTOACK (bit 5) is set and the
@@ -577,11 +607,19 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                         rf->tx_callback(rf->tx_user_data, 0x00);
                     rf->tx_callback(rf->tx_user_data, IEEE802154_SFD);
                     rf->tx_callback(rf->tx_user_data, 5);    /* length: FCF(2) + DSN(1) + FCS(2) */
-                    rf->tx_callback(rf->tx_user_data, 0x02); /* FCF byte 0: frame type = ACK */
-                    rf->tx_callback(rf->tx_user_data, 0x00); /* FCF byte 1 */
-                    rf->tx_callback(rf->tx_user_data, rf->rx_dsn); /* echo DSN */
-                    rf->tx_callback(rf->tx_user_data, 0x00); /* FCS (dummy) */
-                    rf->tx_callback(rf->tx_user_data, 0x00); /* FCS (dummy) */
+                    uint8_t ack_fcf0 = 0x02; /* frame type = ACK */
+                    uint8_t ack_fcf1 = 0x00;
+                    uint8_t ack_dsn  = rf->rx_dsn;
+                    rf->tx_callback(rf->tx_user_data, ack_fcf0);
+                    rf->tx_callback(rf->tx_user_data, ack_fcf1);
+                    rf->tx_callback(rf->tx_user_data, ack_dsn);
+                    /* Compute FCS (CCITT CRC with bit reversal) */
+                    uint16_t ack_crc = 0;
+                    ack_crc = crc_add_bitrev(ack_crc, ack_fcf0);
+                    ack_crc = crc_add_bitrev(ack_crc, ack_fcf1);
+                    ack_crc = crc_add_bitrev(ack_crc, ack_dsn);
+                    rf->tx_callback(rf->tx_user_data, bitrev((ack_crc >> 8) & 0xFF));
+                    rf->tx_callback(rf->tx_user_data, bitrev(ack_crc & 0xFF));
                     rf->rfirqf1 |= RFIRQF1_TXACKDONE;
                     rfcore_check_interrupts(rf);
                 }

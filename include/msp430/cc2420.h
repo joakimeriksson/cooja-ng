@@ -220,6 +220,7 @@ typedef struct cc2420 {
     msp430_event_t vreg_event;
     msp430_event_t oscillator_event;
     msp430_event_t symbol_event;
+    msp430_event_t sfd_clear_event;  /* deferred SFD pin clear after frame RX */
 
     /* ACK state */
     uint8_t ack_buf[6];
