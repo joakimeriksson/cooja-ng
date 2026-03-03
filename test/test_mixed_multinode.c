@@ -236,6 +236,20 @@ static void ui_message_handler(const char *data, int len, void *userdata) {
             ui_paused = 1;
         } else if (strcmp(cmd->valuestring, "play") == 0) {
             ui_paused = 0;
+        } else if (strcmp(cmd->valuestring, "move") == 0) {
+            cJSON *jnode = cJSON_GetObjectItem(root, "node");
+            cJSON *jx = cJSON_GetObjectItem(root, "x");
+            cJSON *jy = cJSON_GetObjectItem(root, "y");
+            if (jnode && cJSON_IsNumber(jnode) && jx && cJSON_IsNumber(jx) && jy && cJSON_IsNumber(jy)) {
+                int nid = jnode->valueint;
+                for (int i = 0; i < num_nodes; i++) {
+                    if (nodes[i].id == nid) {
+                        radio_medium_set_position(&radio_medium, i, jx->valuedouble, jy->valuedouble);
+                        radio_medium_compute_neighbors(&radio_medium);
+                        break;
+                    }
+                }
+            }
         }
     }
     cJSON_Delete(root);

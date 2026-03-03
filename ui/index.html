@@ -17,7 +17,6 @@ header h1 { font-size: 14px; color: #58a6ff; font-weight: 600; }
 .main { display: flex; flex: 1; overflow: hidden; }
 #canvas-wrap { flex: 1; position: relative; min-width: 0; }
 canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
-canvas:active { cursor: grabbing; }
 .sidebar { width: 360px; flex-shrink: 0; border-left: 1px solid #30363d; overflow-y: auto; background: #161b22; }
 .node-card { border-bottom: 1px solid #30363d; padding: 10px 12px; }
 .node-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
@@ -39,12 +38,12 @@ canvas:active { cursor: grabbing; }
   <span class="stat">UART: <b id="uart-bytes">0</b> B</span>
   <span class="stat">TX Frames: <b id="rx-frames">0</b></span>
   <span class="stat">Links: <b id="active-links" style="color:#f0883e">0</b></span>
-  <button id="pause-btn" style="background:#30363d; color:#c9d1d9; border:1px solid #484f58; border-radius:4px; padding:2px 10px; font-family:inherit; font-size:12px; cursor:pointer;" title="Pause/Play">Pause</button>
-  <span class="stat">Speed: <b id="speed-val">10</b>x
+  <button id="pause-btn" style="background:#30363d; color:#c9d1d9; border:1px solid #484f58; border-radius:4px; padding:6px 16px; font-family:inherit; font-size:12px; cursor:pointer; min-width:64px; flex-shrink:0; position:relative; z-index:1;" title="Pause/Play (Space)">Pause</button>
+  <span class="stat" style="display:flex; align-items:center; gap:6px; flex-shrink:0;">Speed: <b id="speed-val">10</b>x
     <input type="range" id="speed-slider" min="1" max="100" value="10"
-           style="width:80px; vertical-align:middle; margin-left:4px;">
+           style="width:200px;">
   </span>
-  <span class="zoom-hint">Scroll to zoom, drag to pan</span>
+  <span class="zoom-hint">Scroll to zoom, drag to pan, drag node to move</span>
   <div id="conn-status" title="Disconnected"></div>
 </header>
 <div class="main">
@@ -71,6 +70,15 @@ canvas:active { cursor: grabbing; }
   let dragStartX = 0, dragStartY = 0;
   let camStartX = 0, camStartY = 0;
 
+  // Transform state saved from drawCanvas for screen<->world conversion
+  let lastScale = 1, lastCenterX = 0, lastCenterY = 0, lastW = 1, lastH = 1;
+
+  // Node drag state
+  let dragNodeIdx = -1;
+
+  function screenToWorldX(sx) { return (sx - lastW/2 - camX) / lastScale + lastCenterX; }
+  function screenToWorldY(sy) { return (sy - lastH/2 - camY) / lastScale + lastCenterY; }
+
   // Zoom with mouse wheel
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -85,8 +93,25 @@ canvas:active { cursor: grabbing; }
     if (state) drawCanvas(state);
   }, { passive: false });
 
-  // Pan with mouse drag
+  // Pan with mouse drag / node drag
   canvas.addEventListener('mousedown', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    // Check if clicking on a node
+    if (state && state.nodes) {
+      const nodeRadius = Math.max(12, Math.min(22, 18 * camZoom));
+      const hitR = nodeRadius + 4; // slightly generous hit area
+      const wx = screenToWorldX(mx), wy = screenToWorldY(my);
+      for (let i = 0; i < state.nodes.length; i++) {
+        const dx = wx - state.nodes[i].x, dy = wy - state.nodes[i].y;
+        if (dx*dx + dy*dy <= (hitR / lastScale) * (hitR / lastScale)) {
+          dragNodeIdx = i;
+          canvas.style.cursor = 'grabbing';
+          return;
+        }
+      }
+    }
     dragging = true;
     dragStartX = e.clientX;
     dragStartY = e.clientY;
@@ -94,12 +119,46 @@ canvas:active { cursor: grabbing; }
     camStartY = camY;
   });
   window.addEventListener('mousemove', (e) => {
-    if (!dragging) return;
+    if (dragNodeIdx >= 0) {
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      state.nodes[dragNodeIdx].x = screenToWorldX(mx);
+      state.nodes[dragNodeIdx].y = screenToWorldY(my);
+      if (state) drawCanvas(state);
+      return;
+    }
+    if (!dragging) {
+      // Update cursor on hover
+      if (state && state.nodes) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const nodeRadius = Math.max(12, Math.min(22, 18 * camZoom));
+        const hitR = nodeRadius + 4;
+        const wx = screenToWorldX(mx), wy = screenToWorldY(my);
+        let onNode = false;
+        for (const n of state.nodes) {
+          const dx = wx - n.x, dy = wy - n.y;
+          if (dx*dx + dy*dy <= (hitR / lastScale) * (hitR / lastScale)) { onNode = true; break; }
+        }
+        canvas.style.cursor = onNode ? 'pointer' : 'grab';
+      }
+      return;
+    }
     camX = camStartX + (e.clientX - dragStartX);
     camY = camStartY + (e.clientY - dragStartY);
     if (state) drawCanvas(state);
   });
-  window.addEventListener('mouseup', () => { dragging = false; });
+  window.addEventListener('mouseup', () => {
+    if (dragNodeIdx >= 0 && state && ws && ws.readyState === 1) {
+      const n = state.nodes[dragNodeIdx];
+      ws.send(JSON.stringify({cmd: 'move', node: n.id, x: n.x, y: n.y}));
+    }
+    dragNodeIdx = -1;
+    dragging = false;
+    canvas.style.cursor = 'grab';
+  });
 
   // Double-click to reset view
   canvas.addEventListener('dblclick', () => {
@@ -119,9 +178,19 @@ canvas:active { cursor: grabbing; }
       ws.send(JSON.stringify({cmd: 'speed', value: v}));
   });
 
-  pauseBtn.addEventListener('click', () => {
+  function togglePause() {
     if (ws && ws.readyState === 1)
       ws.send(JSON.stringify({cmd: isPaused ? 'play' : 'pause'}));
+  }
+
+  pauseBtn.addEventListener('click', togglePause);
+
+  // Spacebar toggles pause/play (unless typing in an input)
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && e.target.tagName !== 'INPUT') {
+      e.preventDefault();
+      togglePause();
+    }
   });
 
   function connect() {
@@ -132,7 +201,15 @@ canvas:active { cursor: grabbing; }
     ws.onerror = () => ws.close();
     ws.onmessage = (ev) => {
       try {
-        state = JSON.parse(ev.data);
+        const newState = JSON.parse(ev.data);
+        // Preserve dragged node's local position over server state
+        if (dragNodeIdx >= 0 && state && state.nodes[dragNodeIdx]) {
+          const localX = state.nodes[dragNodeIdx].x;
+          const localY = state.nodes[dragNodeIdx].y;
+          newState.nodes[dragNodeIdx].x = localX;
+          newState.nodes[dragNodeIdx].y = localY;
+        }
+        state = newState;
         mergeConsole(state);
         updateHeader(state);
         updateSidebar(state);
@@ -396,6 +473,13 @@ canvas:active { cursor: grabbing; }
     ctx.font = '10px SF Mono, Menlo, monospace';
     ctx.textAlign = 'left';
     ctx.fillText((camZoom * 100).toFixed(0) + '%', 8, H - 8);
+
+    // Save transform state for mouse hit-testing
+    lastScale = scale;
+    lastCenterX = centerX;
+    lastCenterY = centerY;
+    lastW = W;
+    lastH = H;
 
     // Update active links counter in header
     document.getElementById('active-links').textContent = arrowCount;
