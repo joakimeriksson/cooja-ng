@@ -57,10 +57,92 @@ typedef struct {
     int count;
 } rf_buffer_t;
 
+/* TX frame assembler: detects complete 802.15.4 frames in byte stream.
+ * Per-sender state machine: preamble(4×0x00) + SFD(0x7A) + length → complete. */
+#define TX_ASM_PREAMBLE  0
+#define TX_ASM_LENGTH    1
+#define TX_ASM_PAYLOAD   2
+
+typedef struct {
+    int state;
+    int zero_count;
+    int expected_len;   /* PHY length byte value */
+    int payload_count;  /* bytes received after length byte */
+} tx_frame_asm_t;
+
+/* Returns true when a complete frame has been assembled */
+static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
+    switch (a->state) {
+    case TX_ASM_PREAMBLE:
+        if (byte == 0x00) {
+            a->zero_count++;
+        } else if (a->zero_count >= 4 && byte == 0x7A) {
+            a->state = TX_ASM_LENGTH;
+        } else {
+            a->zero_count = 0;
+        }
+        return false;
+
+    case TX_ASM_LENGTH:
+        a->expected_len = byte;
+        if (byte < 3 || byte > 127) {
+            /* Invalid length, reset */
+            a->state = TX_ASM_PREAMBLE;
+            a->zero_count = 0;
+            return false;
+        }
+        a->state = TX_ASM_PAYLOAD;
+        a->payload_count = 0;
+        return false;
+
+    case TX_ASM_PAYLOAD:
+        a->payload_count++;
+        /* expected_len = PHY length byte = payload + FCS(2).
+         * On the wire after length: (expected_len - 2) payload + 2 auto-CRC
+         * = expected_len bytes total. */
+        if (a->payload_count >= a->expected_len) {
+            /* Frame complete — reset for next frame */
+            a->state = TX_ASM_PREAMBLE;
+            a->zero_count = 0;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static void tx_frame_asm_reset(tx_frame_asm_t *a) {
+    a->state = TX_ASM_PREAMBLE;
+    a->zero_count = 0;
+    a->expected_len = 0;
+    a->payload_count = 0;
+}
+
+/* Per-receiver RX frame queue for emulated nodes */
+#define EMU_RX_QUEUE_SIZE 16
+#define EMU_RX_FRAME_MAX  160  /* preamble(4)+SFD(1)+len(1)+payload(≤127)+CRC(2) */
+
+typedef struct {
+    uint8_t data[EMU_RX_FRAME_MAX];
+    int     len;
+    int8_t  rssi;
+    int64_t arrival_ns;
+    int64_t end_ns;
+    bool    collided;
+} emu_rx_frame_t;
+
+typedef struct {
+    emu_rx_frame_t frames[EMU_RX_QUEUE_SIZE];
+    int head, count;
+} emu_rx_queue_t;
+
 static mixed_node_t nodes[MAX_NODES];
 static int num_nodes = 0;
 static int verbose = 1;
 static rf_buffer_t rf_pending[MAX_NODES];
+static tx_frame_asm_t tx_asm[MAX_NODES];     /* per-sender frame assembler */
+static emu_rx_queue_t emu_rx_queue[MAX_NODES]; /* per-receiver frame queue */
+static int64_t emu_rx_end_ns[MAX_NODES];      /* end time of last RX for each emulated receiver */
 static int rf_byte_count = 0;
 static int uart_byte_count = 0;
 static radio_medium_t radio_medium;
@@ -68,6 +150,11 @@ static int64_t current_sim_ns = 0;
 
 /* Statistics counters */
 static int stat_rf_frames = 0;       /* total TX frames (all node types) */
+static int stat_emu_rx_direct = 0;   /* frames delivered synchronously (auto-ACK works) */
+static int stat_emu_rx_queued = 0;   /* frames queued (RXFIFO busy) */
+static int stat_emu_rx_drained = 0;  /* frames delivered from queue via mini-step */
+static int stat_emu_rx_dropped = 0;  /* frames dropped (queue full) */
+static int stat_emu_rx_collided = 0; /* frames dropped due to RF collision */
 static int stat_rx_frames_queued = 0;
 static int stat_rx_frames_collided = 0;
 static int stat_rx_frames_queue_full = 0;
@@ -235,44 +322,223 @@ static const char *node_type_str(int idx) {
 
 /* --- RF TX/RX bridging --- */
 
+/* Forward declarations */
+static void mixed_deliver_rf_bytes(int idx);
+static void step_node_until(int idx, int64_t target);
+
+/* Check available RXFIFO space for an emulated node */
+static int emulated_rxfifo_available(int idx) {
+    if (nodes[idx].type == NODE_MSP430)
+        return 128 - nodes[idx].plat.msp.cc2420.rx_fifo_len;
+    else if (nodes[idx].type == NODE_ARM) {
+        cc2538_rfcore_t *rf = &nodes[idx].plat.arm.rfcore;
+        return RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
+    }
+    return 0;
+}
+
+/* Push a complete frame into an emulated node's RX queue.
+ * Collision detection is NOT done here — it's handled by:
+ *   1. emu_rx_end_ns[] check before delivery (multi-sender same-step collision)
+ *   2. Interference-range loops marking queued frames as collided
+ * Doing overlap checks here would cause false positives (e.g., a data frame
+ * and its auto-ACK from the same sender queued to the same receiver). */
+static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
+                               int8_t rssi, int64_t arrival_ns, int64_t end_ns) {
+    emu_rx_queue_t *q = &emu_rx_queue[idx];
+    if (q->count >= EMU_RX_QUEUE_SIZE) {
+        stat_emu_rx_dropped++;
+        return;
+    }
+    int slot = (q->head + q->count) % EMU_RX_QUEUE_SIZE;
+    int copy_len = len < EMU_RX_FRAME_MAX ? len : EMU_RX_FRAME_MAX;
+    memcpy(q->frames[slot].data, data, (size_t)copy_len);
+    q->frames[slot].len = copy_len;
+    q->frames[slot].rssi = rssi;
+    q->frames[slot].arrival_ns = arrival_ns;
+    q->frames[slot].end_ns = end_ns;
+    q->frames[slot].collided = false;
+    q->count++;
+    stat_emu_rx_queued++;
+}
+
+/* Deliver buffered bytes directly to an emulated node's radio */
+static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
+                               int8_t rssi) {
+    if (nodes[idx].type == NODE_MSP430) {
+        nodes[idx].plat.msp.cc2420.rx_rssi = rssi;
+        for (int j = 0; j < len; j++)
+            cc2420_receive_byte(&nodes[idx].plat.msp.cc2420, data[j]);
+    } else if (nodes[idx].type == NODE_ARM) {
+        nodes[idx].plat.arm.rfcore.rx_rssi = rssi;
+        for (int j = 0; j < len; j++)
+            cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
+    }
+}
+
 /*
  * Byte-level TX handler: called by CC2420 and CC2538 RF when transmitting
  * individual bytes. Also called by native_check_radio_tx() when converting
  * a native frame to byte-stream for emulated receivers.
+ *
+ * Strategy: always buffer bytes for emulated receivers. When the per-sender
+ * frame assembler signals frame complete, decide per-receiver:
+ *   - RXFIFO has room -> deliver synchronously (auto-ACK works)
+ *   - RXFIFO full -> queue for later delivery via mini-step
+ *
+ * Re-entrancy guard: auto-ACK bytes from synchronous delivery re-enter
+ * this handler. Those bytes are buffered and flushed after the outer
+ * delivery completes to prevent byte interleaving.
  */
+static int rf_tx_depth = 0;
+
 static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     mixed_node_t *sender = (mixed_node_t *)user_data;
     int sender_idx = (int)(sender - nodes);
     rf_byte_count++;
     channels_dirty = true;
     node_last_tx_ns[sender_idx] = current_sim_ns;
-    for (int i = 0; i < num_nodes; i++) {
-        if (&nodes[i] != sender) {
-            /* Native-to-native: skip byte-stream path, handled by frame handler */
+
+    if (rf_tx_depth > 0) {
+        /* Re-entrant call (auto-ACK from a receiver). Buffer for all
+         * eligible neighbors — flushed after outer delivery completes. */
+        for (int i = 0; i < num_nodes; i++) {
+            if (&nodes[i] == sender) continue;
             if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
                 continue;
-            /* Apply radio medium filter */
             if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
                 continue;
             if (nodes[i].type == NODE_NATIVE) {
-                /* Feed byte into native node's reassembler (emulated->native) */
                 native_rx_assembler_feed(&nodes[i].plat.native, byte);
             } else {
-                /* Synchronous delivery: deliver bytes directly to the
-                 * receiver's radio.  This ensures auto-ACK responses
-                 * arrive back at the sender within the same CPU step,
-                 * so the firmware's CSMA ACK timeout (~400us) works. */
-                int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
-                if (nodes[i].type == NODE_MSP430) {
-                    nodes[i].plat.msp.cc2420.rx_rssi = rssi;
-                    cc2420_receive_byte(&nodes[i].plat.msp.cc2420, byte);
-                } else if (nodes[i].type == NODE_ARM) {
-                    nodes[i].plat.arm.rfcore.rx_rssi = rssi;
-                    cc2538_rfcore_receive_byte(&nodes[i].plat.arm.rfcore, byte);
+                rf_buffer_t *buf = &rf_pending[i];
+                if (buf->count < RF_BUF_SIZE)
+                    buf->bytes[buf->count++] = byte;
+            }
+        }
+        return;
+    }
+
+    /* Outer (non-reentrant) call: buffer byte for each emulated receiver,
+     * feed native assemblers directly. */
+    for (int i = 0; i < num_nodes; i++) {
+        if (&nodes[i] == sender) continue;
+        if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
+            continue;
+        if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
+            continue;
+        if (nodes[i].type == NODE_NATIVE) {
+            native_rx_assembler_feed(&nodes[i].plat.native, byte);
+        } else {
+            rf_buffer_t *buf = &rf_pending[i];
+            if (buf->count < RF_BUF_SIZE)
+                buf->bytes[buf->count++] = byte;
+        }
+    }
+
+    /* Feed the per-sender frame assembler */
+    if (!tx_frame_asm_feed(&tx_asm[sender_idx], byte))
+        return;  /* frame not yet complete */
+
+    /* Frame complete — snapshot each receiver's frame data, then deliver.
+     * Snapshot is necessary because synchronous delivery triggers auto-ACK,
+     * which re-enters and appends ACK bytes to OTHER receivers' rf_pending.
+     * Without snapshot, later receivers would see corrupted (interleaved) data. */
+    stat_rf_frames++;
+    rf_tx_depth++;
+
+    /* Snapshot: copy frame data and RSSI for each emulated receiver */
+    static uint8_t frame_snap[MAX_NODES][EMU_RX_FRAME_MAX];
+    static int frame_snap_len[MAX_NODES];
+    static int8_t frame_snap_rssi[MAX_NODES];
+    int snap_count = 0;
+    static int snap_indices[MAX_NODES];
+
+    for (int i = 0; i < num_nodes; i++) {
+        rf_buffer_t *buf = &rf_pending[i];
+        if (buf->count == 0 || nodes[i].type == NODE_NATIVE)
+            continue;
+        int copy_len = buf->count < EMU_RX_FRAME_MAX ? buf->count : EMU_RX_FRAME_MAX;
+        memcpy(frame_snap[i], buf->bytes, (size_t)copy_len);
+        frame_snap_len[i] = copy_len;
+        frame_snap_rssi[i] = radio_medium_get_rssi(&radio_medium, sender_idx, i);
+        snap_indices[snap_count++] = i;
+        buf->count = 0;  /* Clear before delivery to isolate from re-entrancy */
+    }
+
+    /* Deliver from snapshots — auto-ACK re-entrancy now writes to
+     * empty rf_pending buffers, not our snapshot data.
+     * Flush ACK bytes after EACH delivery to prevent concatenation of
+     * multiple ACK frames in the same rf_pending buffer. */
+    for (int s = 0; s < snap_count; s++) {
+        int i = snap_indices[s];
+        /* Collision window: one time step. Frames are delivered synchronously
+         * (all bytes at once), so the collision granularity is the time step.
+         * Using frame_len * 32000 would span multiple steps and cause false
+         * positives when legitimate frames arrive in subsequent steps. */
+        int64_t tx_start = current_sim_ns;
+        int64_t tx_end = current_sim_ns + TIME_STEP_NS;
+
+        /* Collision check: does this frame overlap with a previously
+         * delivered frame on this receiver? */
+        if (tx_start < emu_rx_end_ns[i]) {
+            /* Collision with previously delivered frame — drop this one */
+            stat_emu_rx_collided++;
+            continue;
+        }
+
+        int frame_payload = (frame_snap_len[i] > 5) ? frame_snap[i][5] : 0;
+        if (emulated_rxfifo_available(i) >= frame_payload + 1) {
+            emu_deliver_bytes(i, frame_snap[i], frame_snap_len[i],
+                              frame_snap_rssi[i]);
+            stat_emu_rx_direct++;
+            emu_rx_end_ns[i] = tx_end;
+        } else {
+            emu_rx_queue_push(i, frame_snap[i], frame_snap_len[i],
+                              frame_snap_rssi[i], tx_start, tx_end);
+            emu_rx_end_ns[i] = tx_end;
+        }
+
+        /* Flush auto-ACK bytes generated by this delivery.
+         * Each ACK is a single frame — flush immediately to prevent
+         * multiple ACKs concatenating in the same rf_pending buffer.
+         * ACK timing is NOT tracked in emu_rx_end_ns — auto-ACK is
+         * a response to the data frame and shouldn't block future frames. */
+        for (int j = 0; j < num_nodes; j++) {
+            if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
+                int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
+                if (emulated_rxfifo_available(j) >= ack_payload + 1)
+                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count, -50);
+                else
+                    emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
+                                      -50, tx_start, tx_end);
+                rf_pending[j].count = 0;
+            }
+        }
+    }
+
+    /* Interference check for emulated nodes: mark existing queued frames
+     * as collided if a TX-range or interference-range neighbor transmitted. */
+    if (radio_medium.type != RADIO_MEDIUM_NONE) {
+        neighbor_list_t *inl = &radio_medium.interference_neighbors[sender_idx];
+        int64_t int_start = current_sim_ns;
+        int64_t int_end = current_sim_ns + TIME_STEP_NS;
+        for (int n = 0; n < inl->count; n++) {
+            int i = inl->neighbors[n];
+            if (nodes[i].type == NODE_NATIVE) continue;  /* native handled elsewhere */
+            emu_rx_queue_t *q = &emu_rx_queue[i];
+            for (int f = 0; f < q->count; f++) {
+                int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
+                emu_rx_frame_t *existing = &q->frames[fi];
+                if (int_start < existing->end_ns && existing->arrival_ns < int_end) {
+                    if (!existing->collided) stat_emu_rx_collided++;
+                    existing->collided = true;
                 }
             }
         }
     }
+
+    rf_tx_depth--;
 }
 
 /*
@@ -312,15 +578,28 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
-            if (nodes[i].type != NODE_NATIVE) continue;
-            native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-            for (int f = 0; f < q->count; f++) {
-                int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
-                native_pending_frame_t *existing = &q->frames[idx];
-                if (tx_start < existing->end_ns &&
-                    existing->arrival_ns < tx_end) {
-                    if (!existing->collided) stat_rx_frames_collided++;
-                    existing->collided = true;
+            if (nodes[i].type == NODE_NATIVE) {
+                native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
+                for (int f = 0; f < q->count; f++) {
+                    int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
+                    native_pending_frame_t *existing = &q->frames[idx];
+                    if (tx_start < existing->end_ns &&
+                        existing->arrival_ns < tx_end) {
+                        if (!existing->collided) stat_rx_frames_collided++;
+                        existing->collided = true;
+                    }
+                }
+            } else {
+                /* Emulated receiver: mark queued frames as collided */
+                emu_rx_queue_t *q = &emu_rx_queue[i];
+                for (int f = 0; f < q->count; f++) {
+                    int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
+                    emu_rx_frame_t *existing = &q->frames[fi];
+                    if (tx_start < existing->end_ns &&
+                        existing->arrival_ns < tx_end) {
+                        if (!existing->collided) stat_emu_rx_collided++;
+                        existing->collided = true;
+                    }
                 }
             }
         }
@@ -339,17 +618,56 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
     }
 }
 
+/* Deliver buffered RF bytes to a native node's assembler.
+ * Only called for native nodes — emulated nodes' bytes stay in rf_pending
+ * until the per-sender frame assembler detects a complete frame. */
 static void mixed_deliver_rf_bytes(int idx) {
     rf_buffer_t *buf = &rf_pending[idx];
     if (buf->count == 0) return;
-    for (int j = 0; j < buf->count; j++) {
-        if (nodes[idx].type == NODE_MSP430)
-            cc2420_receive_byte(&nodes[idx].plat.msp.cc2420, buf->bytes[j]);
-        else if (nodes[idx].type == NODE_ARM)
-            cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, buf->bytes[j]);
-        /* NODE_NATIVE bytes go through the assembler in mixed_rf_tx_handler */
-    }
+    emu_deliver_bytes(idx, buf->bytes, buf->count, 0);
     buf->count = 0;
+}
+
+/*
+ * Drain queued RX frames for an emulated node. Delivers one frame at a time
+ * with CPU mini-steps between to let the ISR read the RXFIFO.
+ */
+static void emu_rx_queue_drain(int idx) {
+    emu_rx_queue_t *q = &emu_rx_queue[idx];
+    while (q->count > 0) {
+        emu_rx_frame_t *f = &q->frames[q->head];
+
+        /* Skip collided frames (like native_dequeue_rx_frame does) */
+        if (f->collided) {
+            q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
+            q->count--;
+            continue;
+        }
+
+        /* PHY length byte is at data[5] (after 4×preamble + SFD) */
+        int frame_payload = (f->len > 5) ? f->data[5] : 0;
+        if (emulated_rxfifo_available(idx) < frame_payload + 1)
+            break;  /* RXFIFO still busy, try next time step */
+
+        /* Reset collision tracking before each drain delivery.
+         * Delivering a queued frame may trigger auto-ACK, which goes through
+         * the frame assembler and sets emu_rx_end_ns on the ACK receiver.
+         * Without reset, sequential drain deliveries would falsely collide
+         * (each auto-ACK would see emu_rx_end_ns set by the previous one). */
+        memset(emu_rx_end_ns, 0, sizeof(emu_rx_end_ns));
+
+        /* Deliver frame bytes to radio */
+        emu_deliver_bytes(idx, f->data, f->len, f->rssi);
+        stat_emu_rx_drained++;
+
+        q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
+        q->count--;
+
+        /* Mini-step CPU to process RX interrupt + read RXFIFO.
+         * 5000 cycles at 32 MHz = ~156us, enough for ISR. */
+        if (q->count > 0)
+            step_node_until(idx, node_cycles(idx) + 5000);
+    }
 }
 
 /* --- UART callback --- */
@@ -445,14 +763,16 @@ static void threaded_uart_callback(void *user_data, uint8_t byte) {
  */
 static void distribute_rf_outgoing(void) {
     for (int sender = 0; sender < num_nodes; sender++) {
-        /* Distribute byte-stream RF */
+        /* Distribute byte-stream RF with frame assembly */
         rf_outgoing_t *out = &rf_outgoing[sender];
         if (out->count > 0) {
+            /* NOTE: do NOT reset tx_asm[sender] here — frame assembly state
+             * must persist across time steps since frames may span multiple
+             * steps (at 250kbps, a 100-byte frame takes ~3.2ms > 1ms step). */
             for (int b = 0; b < out->count; b++) {
                 uint8_t byte = out->bytes[b];
                 for (int i = 0; i < num_nodes; i++) {
                     if (i == sender) continue;
-                    /* Native-to-native: skip byte-stream path */
                     if (nodes[sender].type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
                         continue;
                     if (!radio_medium_filter_byte(&radio_medium, sender, i, byte))
@@ -463,11 +783,60 @@ static void distribute_rf_outgoing(void) {
                         rf_buffer_t *buf = &rf_pending[i];
                         if (buf->count < RF_BUF_SIZE)
                             buf->bytes[buf->count++] = byte;
+                    }
+                }
+
+                /* Check if frame is complete */
+                if (tx_frame_asm_feed(&tx_asm[sender], byte)) {
+                    stat_rf_frames++;
+                    /* Deliver or queue each emulated receiver's buffered frame */
+                    for (int i = 0; i < num_nodes; i++) {
+                        rf_buffer_t *buf = &rf_pending[i];
+                        if (buf->count == 0 || nodes[i].type == NODE_NATIVE)
+                            continue;
+                        int64_t tx_start = current_sim_ns;
+                        int64_t tx_end = current_sim_ns + TIME_STEP_NS;
+
+                        /* Collision check against previously delivered frame */
+                        if (tx_start < emu_rx_end_ns[i]) {
+                            stat_emu_rx_collided++;
+                            buf->count = 0;
+                            continue;
+                        }
+
                         int8_t rssi = radio_medium_get_rssi(&radio_medium, sender, i);
-                        if (nodes[i].type == NODE_MSP430)
-                            nodes[i].plat.msp.cc2420.rx_rssi = rssi;
-                        else if (nodes[i].type == NODE_ARM)
-                            nodes[i].plat.arm.rfcore.rx_rssi = rssi;
+                        int frame_payload = (buf->count > 5) ? buf->bytes[5] : 0;
+                        if (emulated_rxfifo_available(i) >= frame_payload + 1) {
+                            emu_deliver_bytes(i, buf->bytes, buf->count, rssi);
+                            stat_emu_rx_direct++;
+                            emu_rx_end_ns[i] = tx_end;
+                        } else {
+                            emu_rx_queue_push(i, buf->bytes, buf->count, rssi,
+                                              tx_start, tx_end);
+                            emu_rx_end_ns[i] = tx_end;
+                        }
+                        buf->count = 0;
+                    }
+
+                    /* Interference check for emulated nodes */
+                    if (radio_medium.type != RADIO_MEDIUM_NONE) {
+                        neighbor_list_t *inl = &radio_medium.interference_neighbors[sender];
+                        int64_t int_start = current_sim_ns;
+                        int64_t int_end = current_sim_ns + TIME_STEP_NS;
+                        for (int n = 0; n < inl->count; n++) {
+                            int i = inl->neighbors[n];
+                            if (nodes[i].type == NODE_NATIVE) continue;
+                            emu_rx_queue_t *q = &emu_rx_queue[i];
+                            for (int f = 0; f < q->count; f++) {
+                                int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
+                                emu_rx_frame_t *existing = &q->frames[fi];
+                                if (int_start < existing->end_ns &&
+                                    existing->arrival_ns < int_end) {
+                                    if (!existing->collided) stat_emu_rx_collided++;
+                                    existing->collided = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -501,15 +870,27 @@ static void distribute_rf_outgoing(void) {
                 int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
                 for (int n = 0; n < inl->count; n++) {
                     int i = inl->neighbors[n];
-                    if (nodes[i].type != NODE_NATIVE) continue;
-                    native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-                    for (int ff = 0; ff < q->count; ff++) {
-                        int idx = (q->head + ff) % NATIVE_RX_QUEUE_SIZE;
-                        native_pending_frame_t *existing = &q->frames[idx];
-                        if (tx_start < existing->end_ns &&
-                            existing->arrival_ns < tx_end) {
-                            if (!existing->collided) stat_rx_frames_collided++;
-                            existing->collided = true;
+                    if (nodes[i].type == NODE_NATIVE) {
+                        native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
+                        for (int ff = 0; ff < q->count; ff++) {
+                            int idx = (q->head + ff) % NATIVE_RX_QUEUE_SIZE;
+                            native_pending_frame_t *existing = &q->frames[idx];
+                            if (tx_start < existing->end_ns &&
+                                existing->arrival_ns < tx_end) {
+                                if (!existing->collided) stat_rx_frames_collided++;
+                                existing->collided = true;
+                            }
+                        }
+                    } else {
+                        emu_rx_queue_t *q = &emu_rx_queue[i];
+                        for (int ff = 0; ff < q->count; ff++) {
+                            int fi = (q->head + ff) % EMU_RX_QUEUE_SIZE;
+                            emu_rx_frame_t *existing = &q->frames[fi];
+                            if (tx_start < existing->end_ns &&
+                                existing->arrival_ns < tx_end) {
+                                if (!existing->collided) stat_emu_rx_collided++;
+                                existing->collided = true;
+                            }
                         }
                     }
                 }
@@ -730,6 +1111,9 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     node->type = detect_node_type(firmware_path);
     node->id = node_id;
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
+    memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
+    emu_rx_end_ns[idx] = 0;
+    tx_frame_asm_reset(&tx_asm[idx]);
 
     printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
            node->type == NODE_MSP430 ? "MSP430/Sky" :
@@ -1107,13 +1491,16 @@ int run_mixed_multinode_test(int argc, char **argv) {
             distribute_rf_outgoing();
             time_distribute += get_time_ms() - t_phase;
 
-            /* Sequential: deliver to radios (native node frames only;
-             * emulated-to-emulated bytes are delivered synchronously) */
+            /* Sequential: deliver to radios (native nodes only).
+             * Emulated nodes' bytes stay in rf_pending until the per-sender
+             * frame assembler detects a complete frame — delivering partial
+             * frames would leave the radio mid-RX and corrupt the queue. */
             t_phase = get_time_ms();
             for (int i = 0; i < node_count; i++) {
-                mixed_deliver_rf_bytes(i);
-                if (nodes[i].type == NODE_NATIVE)
+                if (nodes[i].type == NODE_NATIVE) {
+                    mixed_deliver_rf_bytes(i);
                     native_dequeue_rx_frame(&nodes[i].plat.native);
+                }
             }
             time_deliver += get_time_ms() - t_phase;
 
@@ -1121,6 +1508,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
             t_phase = get_time_ms();
             sim_thread_pool_run(&thread_pool, threaded_step_node, (void *)(intptr_t)sim_ns);
             time_step += get_time_ms() - t_phase;
+
+            /* Sequential: drain queued RX frames for emulated nodes */
+            for (int i = 0; i < node_count; i++) {
+                if (nodes[i].type != NODE_NATIVE)
+                    emu_rx_queue_drain(i);
+            }
 
             /* Sequential: flush deferred output, merge counters */
             t_phase = get_time_ms();
@@ -1131,10 +1524,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
             t_phase = get_time_ms();
             for (int i = 0; i < node_count; i++) {
-                /* Deliver any remaining buffered RF bytes (e.g., from native nodes) */
-                mixed_deliver_rf_bytes(i);
-                if (nodes[i].type == NODE_NATIVE)
+                /* Deliver only to native nodes — emulated nodes' bytes stay
+                 * in rf_pending until frame assembler completes the frame. */
+                if (nodes[i].type == NODE_NATIVE) {
+                    mixed_deliver_rf_bytes(i);
                     native_dequeue_rx_frame(&nodes[i].plat.native);
+                }
             }
             time_deliver += get_time_ms() - t_phase;
 
@@ -1166,6 +1561,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
                         step_node_until(i, target_cycle);
                     }
                 }
+            }
+            /* Drain queued RX frames for emulated nodes */
+            for (int i = 0; i < node_count; i++) {
+                if (nodes[i].type != NODE_NATIVE)
+                    emu_rx_queue_drain(i);
             }
             time_step += get_time_ms() - t_phase;
         }
@@ -1314,9 +1714,14 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("\n--- Simulation complete ---\n");
     printf("  Total RF bytes: %d\n", rf_byte_count);
     printf("  Total UART bytes: %d\n", uart_byte_count);
-    printf("  RX frames queued: %d\n", stat_rx_frames_queued);
-    printf("  RX frames collided: %d\n", stat_rx_frames_collided);
-    printf("  RX frames queue full: %d\n", stat_rx_frames_queue_full);
+    printf("  Emu RX frames: %d direct, %d queued, %d drained, %d dropped, %d collided\n",
+           stat_emu_rx_direct, stat_emu_rx_queued, stat_emu_rx_drained,
+           stat_emu_rx_dropped, stat_emu_rx_collided);
+    printf("  Native RX frames queued: %d\n", stat_rx_frames_queued);
+    printf("  Native RX frames collided: %d\n", stat_rx_frames_collided);
+    printf("  Native RX frames queue full: %d\n", stat_rx_frames_queue_full);
+    extern int cc2538_rfcore_get_rxfifo_overflows(void);
+    printf("  CC2538 RXFIFO overflows: %d\n", cc2538_rfcore_get_rxfifo_overflows());
 
     int64_t total_node_cycles = 0;
     int64_t total_node_instructions = 0;
