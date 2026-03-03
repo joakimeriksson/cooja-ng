@@ -255,20 +255,25 @@ static void ui_message_handler(const char *data, int len, void *userdata) {
     cJSON_Delete(root);
 }
 
-static void ui_add_console_line(int node_idx, const char *line) {
+static void ui_add_console_line(int node_idx, int64_t sim_ns, const char *line) {
+    /* Prepend simulation timestamp */
+    char stamped[UI_CONSOLE_LINELEN];
+    double sim_s = (double)sim_ns / 1e9;
+    snprintf(stamped, sizeof(stamped), "[%7.3f] %s", sim_s, line);
+
     /* Add to ring buffer */
     int slot = (ui_console_head[node_idx] + ui_console_count[node_idx]) % UI_CONSOLE_LINES;
     if (ui_console_count[node_idx] < UI_CONSOLE_LINES)
         ui_console_count[node_idx]++;
     else
         ui_console_head[node_idx] = (ui_console_head[node_idx] + 1) % UI_CONSOLE_LINES;
-    strncpy(ui_console[node_idx][slot], line, UI_CONSOLE_LINELEN - 1);
+    strncpy(ui_console[node_idx][slot], stamped, UI_CONSOLE_LINELEN - 1);
     ui_console[node_idx][slot][UI_CONSOLE_LINELEN - 1] = '\0';
 
     /* Add to new-lines buffer for next broadcast */
     if (ui_console_new_count[node_idx] < UI_CONSOLE_LINES) {
         int ni = ui_console_new_count[node_idx]++;
-        strncpy(ui_console_new[node_idx][ni], line, UI_CONSOLE_LINELEN - 1);
+        strncpy(ui_console_new[node_idx][ni], stamped, UI_CONSOLE_LINELEN - 1);
         ui_console_new[node_idx][ni][UI_CONSOLE_LINELEN - 1] = '\0';
     }
 }
@@ -726,11 +731,14 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
 
     if (byte == '\n') {
         node->line_buf[node->line_pos] = '\0';
+        int nidx = (int)(node - nodes);
+        int64_t ns = node_sim_time_ns(nidx);
         if (verbose)
-            printf("  [Node %d/%s] %s\n", node->id, node_type_str((int)(node - nodes)), node->line_buf);
-        sim_test_check_line(node->id, node->line_buf, current_sim_ns);
+            printf("  %7.3f [Node %d/%s] %s\n", (double)ns / 1e9,
+                   node->id, node_type_str(nidx), node->line_buf);
+        sim_test_check_line(node->id, node->line_buf, ns);
         if (ui_server)
-            ui_add_console_line((int)(node - nodes), node->line_buf);
+            ui_add_console_line(nidx, ns, node->line_buf);
         node->line_pos = 0;
     } else if (byte == '\r') {
         /* ignore */
@@ -987,10 +995,11 @@ static void flush_pending_output(void) {
             int nidx = ts->node_idx[l];
             int nid = ts->node_id[l];
             if (verbose)
-                printf("  [Node %d/%s] %s\n", nid, node_type_str(nidx), ts->lines[l]);
+                printf("  %7.3f [Node %d/%s] %s\n", (double)current_sim_ns / 1e9,
+                       nid, node_type_str(nidx), ts->lines[l]);
             sim_test_check_line(nid, ts->lines[l], current_sim_ns);
             if (ui_server)
-                ui_add_console_line(nidx, ts->lines[l]);
+                ui_add_console_line(nidx, current_sim_ns, ts->lines[l]);
         }
         ts->count = 0;
     }
@@ -1085,8 +1094,18 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     cc2538_rfcore_set_tx_callback(&plat->rfcore, mixed_rf_tx_handler, node);
     plat->rfcore.node_id = node_id;
 
-    /* Seed RFRND uniquely per node */
-    plat->rfcore.rfrnd_state = 0xDEADBEEF + (uint32_t)node_id;
+    /* Seed RFRND and sleep timer uniquely per node.
+     * Use bit mixing so close IDs produce divergent sequences. */
+    {
+        uint32_t h = (uint32_t)node_id;
+        h ^= h << 13; h ^= h >> 17; h ^= h << 5;   /* xorshift32 */
+        h *= 2654435761u;                             /* Knuth multiplicative hash */
+        h ^= h >> 16;
+        plat->rfcore.rfrnd_state = h ? h : 0xDEADBEEF;
+
+        if (verbose)
+            printf("  Node %d: rfrnd_seed=0x%08x\n", node_id, h);
+    }
 
     /* Set unique IEEE 64-bit extended address: 00:12:74:XX:00:00:00:XX
      * Stored in little-endian (reversed) for ieee_addr_cpy_to() reversal */
@@ -1474,7 +1493,25 @@ int run_mixed_multinode_test(int argc, char **argv) {
         for (int i = 0; i < node_count; i++) {
             delay_seed = delay_seed * 1103515245 + 12345;
             int delay_ms = (int)(delay_seed % (unsigned int)config.startup_delay_ms);
-            node_start_ns[i] = node_sim_time_ns(i) + (int64_t)delay_ms * MS_TO_NS;
+            int64_t delay_ns = (int64_t)delay_ms * MS_TO_NS;
+
+            /* Shift each node's sim_time_ns and cycle counter forward by the
+             * delay.  This makes the sleep timer (which derives ticks from
+             * sim_time_ns) show different elapsed times per node, genuinely
+             * desynchronizing Contiki-NG's etimer tick phase.  Pending boot
+             * events fire immediately on the first step (the CPU is in WFI
+             * between clock ticks anyway, so the cascade is harmless). */
+            if (nodes[i].type == NODE_ARM) {
+                arm_cpu_t *cpu = &nodes[i].plat.arm.cpu;
+                cpu->sim_time_ns += delay_ns;
+                cpu->cycles += delay_ns * cpu->cpu_freq_hz / 1000000000LL;
+            } else if (nodes[i].type == NODE_MSP430) {
+                msp430_cpu_t *cpu = &nodes[i].plat.msp.cpu;
+                cpu->sim_time_ns += delay_ns;
+                cpu->cycles += (uint64_t)delay_ns * cpu->cpu_freq_hz / 1000000000ULL;
+            }
+
+            node_start_ns[i] = node_sim_time_ns(i);
             printf("  Node %d: start at %lld ms (delay %d ms)\n",
                    nodes[i].id,
                    (long long)(node_start_ns[i] / MS_TO_NS), delay_ms);

@@ -6,28 +6,29 @@
 <title>CSIM Simulator</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-header { background: #161b22; border-bottom: 1px solid #30363d; padding: 8px 16px; display: flex; align-items: center; gap: 24px; flex-shrink: 0; }
-header h1 { font-size: 14px; color: #58a6ff; font-weight: 600; }
-.stat { font-size: 12px; color: #8b949e; }
-.stat b { color: #c9d1d9; }
+body { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+header { background: var(--header-bg); border-bottom: 1px solid var(--border); padding: 8px 16px; display: flex; align-items: center; gap: 24px; flex-shrink: 0; }
+header h1 { font-size: 14px; color: var(--accent); font-weight: 600; }
+.stat { font-size: 12px; color: var(--muted); }
+.stat b { color: var(--text); }
 #conn-status { width: 8px; height: 8px; border-radius: 50%; background: #f85149; margin-left: auto; }
 #conn-status.connected { background: #3fb950; }
-.zoom-hint { font-size: 10px; color: #484f58; margin-left: 8px; }
+.zoom-hint { font-size: 10px; color: var(--dim); margin-left: 8px; }
 .main { display: flex; flex: 1; overflow: hidden; }
 #canvas-wrap { flex: 1; position: relative; min-width: 0; }
-canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
-.sidebar { width: 360px; flex-shrink: 0; border-left: 1px solid #30363d; overflow-y: auto; background: #161b22; }
-.node-card { border-bottom: 1px solid #30363d; padding: 10px 12px; }
+canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
+.sidebar { width: 360px; flex-shrink: 0; border-left: 1px solid var(--border); overflow-y: auto; background: var(--header-bg); }
+.node-card { border-bottom: 1px solid var(--border); padding: 10px 12px; }
 .node-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.node-id { font-size: 14px; font-weight: 600; color: #58a6ff; }
+.node-id { font-size: 14px; font-weight: 600; color: var(--accent); }
 .badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; }
-.badge-msp { background: #1f6feb33; color: #58a6ff; }
-.badge-arm { background: #3fb95033; color: #3fb950; }
-.badge-native { background: #d29922; color: #0d1117; }
-.node-stats { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
-.console-box { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 4px 6px; max-height: 120px; overflow-y: auto; font-size: 11px; line-height: 1.5; }
-.console-box .line { color: #7ee787; white-space: pre-wrap; word-break: break-all; }
+.badge-msp { background: var(--badge-msp-bg); color: var(--accent); }
+.badge-arm { background: var(--badge-arm-bg); color: var(--green); }
+.badge-native { background: var(--yellow); color: var(--bg); }
+.node-stats { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.console-box { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; max-height: 120px; overflow-y: auto; font-size: 11px; line-height: 1.5; }
+.console-box .line { color: var(--console-text); white-space: pre-wrap; word-break: break-all; }
+#theme-btn { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; font-family: inherit; font-size: 12px; cursor: pointer; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -37,13 +38,14 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
   <span class="stat">RF: <b id="rf-bytes">0</b> B</span>
   <span class="stat">UART: <b id="uart-bytes">0</b> B</span>
   <span class="stat">TX Frames: <b id="rx-frames">0</b></span>
-  <span class="stat">Links: <b id="active-links" style="color:#f0883e">0</b></span>
-  <button id="pause-btn" style="background:#30363d; color:#c9d1d9; border:1px solid #484f58; border-radius:4px; padding:6px 16px; font-family:inherit; font-size:12px; cursor:pointer; min-width:64px; flex-shrink:0; position:relative; z-index:1;" title="Pause/Play (Space)">Pause</button>
+  <span class="stat">Links: <b id="active-links" style="color:var(--accent)">0</b></span>
+  <button id="pause-btn" style="background:var(--btn-bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:6px 16px; font-family:inherit; font-size:12px; cursor:pointer; min-width:64px; flex-shrink:0; position:relative; z-index:1;" title="Pause/Play (Space)">Pause</button>
   <span class="stat" style="display:flex; align-items:center; gap:6px; flex-shrink:0;">Speed: <b id="speed-val">10</b>x
     <input type="range" id="speed-slider" min="1" max="100" value="10"
            style="width:200px;">
   </span>
   <span class="zoom-hint">Scroll to zoom, drag to pan, drag node to move</span>
+  <button id="theme-btn" title="Toggle light/dark mode">Light</button>
   <div id="conn-status" title="Disconnected"></div>
 </header>
 <div class="main">
@@ -52,6 +54,54 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
 </div>
 <script>
 (function() {
+  const themes = {
+    dark: {
+      bg:'#0d1117', headerBg:'#161b22', border:'#30363d', text:'#c9d1d9',
+      muted:'#8b949e', dim:'#484f58', accent:'#58a6ff', green:'#3fb950',
+      yellow:'#d29922', consoleTxt:'#7ee787', badgeMspBg:'#1f6feb33',
+      badgeArmBg:'#3fb95033', btnBg:'#30363d', btnActiveBg:'#1f6feb',
+      link:'#30363d', txRange:'#58a6ff', arrowHot:'#ff9f43', arrow:'#f0883e',
+      nodeLabel:'#c9d1d9', nodeType:'#8b949e', zoomTxt:'#484f58',
+    },
+    light: {
+      bg:'#ffffff', headerBg:'#f6f8fa', border:'#d0d7de', text:'#1f2328',
+      muted:'#656d76', dim:'#8c959f', accent:'#0969da', green:'#1a7f37',
+      yellow:'#9a6700', consoleTxt:'#116329', badgeMspBg:'#0969da22',
+      badgeArmBg:'#1a7f3722', btnBg:'#d0d7de', btnActiveBg:'#0969da',
+      link:'#d0d7de', txRange:'#0969da', arrowHot:'#cf222e', arrow:'#bf3989',
+      nodeLabel:'#1f2328', nodeType:'#656d76', zoomTxt:'#8c959f',
+    },
+  };
+  let curTheme = localStorage.getItem('csim-theme') || 'dark';
+
+  function applyTheme(name) {
+    curTheme = name;
+    const t = themes[name];
+    const s = document.documentElement.style;
+    s.setProperty('--bg', t.bg);
+    s.setProperty('--header-bg', t.headerBg);
+    s.setProperty('--border', t.border);
+    s.setProperty('--text', t.text);
+    s.setProperty('--muted', t.muted);
+    s.setProperty('--dim', t.dim);
+    s.setProperty('--accent', t.accent);
+    s.setProperty('--green', t.green);
+    s.setProperty('--yellow', t.yellow);
+    s.setProperty('--console-text', t.consoleTxt);
+    s.setProperty('--badge-msp-bg', t.badgeMspBg);
+    s.setProperty('--badge-arm-bg', t.badgeArmBg);
+    s.setProperty('--btn-bg', t.btnBg);
+    localStorage.setItem('csim-theme', name);
+    document.getElementById('theme-btn').textContent = name === 'dark' ? 'Light' : 'Dark';
+  }
+  applyTheme(curTheme);
+  document.getElementById('theme-btn').addEventListener('click', () => {
+    applyTheme(curTheme === 'dark' ? 'light' : 'dark');
+    if (state) drawCanvas(state);
+  });
+
+  function T() { return themes[curTheme]; }
+
   const canvas = document.getElementById('topo');
   const ctx = canvas.getContext('2d');
   const sidebar = document.getElementById('sidebar');
@@ -241,7 +291,7 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
     if (s.stats.paused !== undefined) {
       isPaused = s.stats.paused;
       pauseBtn.textContent = isPaused ? 'Play' : 'Pause';
-      pauseBtn.style.background = isPaused ? '#1f6feb' : '#30363d';
+      pauseBtn.style.background = isPaused ? T().btnActiveBg : T().btnBg;
     }
   }
 
@@ -305,13 +355,15 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
   }
 
   function drawCanvas(s) {
+    const t = T();
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.parentElement.getBoundingClientRect();
     canvas.width = rect.width * dpr;
     canvas.height = rect.height * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const W = rect.width, H = rect.height;
-    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = t.bg;
+    ctx.fillRect(0, 0, W, H);
 
     if (!s.nodes.length) return;
 
@@ -343,13 +395,13 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
         const r = txr * scale;
         // Fill
         ctx.globalAlpha = 0.05;
-        ctx.fillStyle = '#58a6ff';
+        ctx.fillStyle = t.txRange;
         ctx.beginPath();
         ctx.arc(tx(n.x), ty(n.y), r, 0, Math.PI*2);
         ctx.fill();
         // Stroke
         ctx.globalAlpha = 0.2;
-        ctx.strokeStyle = '#58a6ff';
+        ctx.strokeStyle = t.txRange;
         ctx.lineWidth = 1;
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
@@ -362,7 +414,7 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
 
     // Draw neighbor links
     const neighbors = s.radio.neighbors || [];
-    ctx.strokeStyle = '#30363d';
+    ctx.strokeStyle = t.link;
     ctx.lineWidth = 1;
     for (let i = 0; i < neighbors.length && i < s.nodes.length; i++) {
       const from = s.nodes[i];
@@ -412,7 +464,7 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
         const endY = dy - uy * nodeRadius;
         // Line — hot phase uses brighter color and thicker stroke
         ctx.globalAlpha = alpha * (hot ? 0.9 : 0.5);
-        ctx.strokeStyle = hot ? '#ff9f43' : '#f0883e';
+        ctx.strokeStyle = hot ? t.arrowHot : t.arrow;
         ctx.lineWidth = Math.max(2, (hot ? 4 : 2.5) * camZoom);
         ctx.beginPath();
         ctx.moveTo(startX, startY);
@@ -421,7 +473,7 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
         // Arrowhead
         const angle = Math.atan2(endY - startY, endX - startX);
         const aLen = hot ? arrowLen * 1.3 : arrowLen;
-        ctx.fillStyle = hot ? '#ff9f43' : '#f0883e';
+        ctx.fillStyle = hot ? t.arrowHot : t.arrow;
         ctx.beginPath();
         ctx.moveTo(endX, endY);
         ctx.lineTo(endX - aLen * Math.cos(angle - arrowAngle),
@@ -436,10 +488,10 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
     ctx.globalAlpha = 1;
 
     // Draw nodes
-    const colors = { MSP430: '#58a6ff', ARM: '#3fb950', NATIVE: '#d29922' };
+    const colors = { MSP430: t.accent, ARM: t.green, NATIVE: t.yellow };
     for (const n of s.nodes) {
       const cx = tx(n.x), cy = ty(n.y);
-      const col = colors[n.type] || '#8b949e';
+      const col = colors[n.type] || t.muted;
 
       // Outer circle
       ctx.beginPath();
@@ -457,19 +509,19 @@ canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
       ctx.fill();
 
       // Label
-      ctx.fillStyle = '#c9d1d9';
+      ctx.fillStyle = t.nodeLabel;
       ctx.font = '11px SF Mono, Menlo, monospace';
       ctx.textAlign = 'center';
       ctx.fillText('Node ' + n.id, cx, cy + nodeRadius + 14);
 
       // Type label
-      ctx.fillStyle = '#8b949e';
+      ctx.fillStyle = t.nodeType;
       ctx.font = '9px SF Mono, Menlo, monospace';
       ctx.fillText(n.type, cx, cy + nodeRadius + 26);
     }
 
     // Zoom indicator
-    ctx.fillStyle = '#484f58';
+    ctx.fillStyle = t.zoomTxt;
     ctx.font = '10px SF Mono, Menlo, monospace';
     ctx.textAlign = 'left';
     ctx.fillText((camZoom * 100).toFixed(0) + '%', 8, H - 8);
