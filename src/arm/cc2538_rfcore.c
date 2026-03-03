@@ -18,6 +18,10 @@
 #define IEEE802154_SFD  0x7A
 #define PREAMBLE_MIN    4
 
+/* Debug counters */
+static int rxfifo_overflow_count = 0;
+int cc2538_rfcore_get_rxfifo_overflows(void) { return rxfifo_overflow_count; }
+
 /* ================================================================
  * CRC — CCITT-16 with bit reversal (matches CC2420 wire format)
  * ================================================================ */
@@ -436,7 +440,7 @@ static void sfr_write(void *user_data, uint32_t addr, uint32_t value) {
         case RFCORE_SFR_MTMOVF1:  rf->mtmovf1 = value; break;
         case RFCORE_SFR_MTMOVF2:  rf->mtmovf2 = value; break;
         case RFCORE_SFR_RFDATA:
-            if (rf->txfifo_len < RF_FIFO_SIZE)
+            if (rf->txfifo_len < RF_TXFIFO_SIZE)
                 rf->txfifo[rf->txfifo_len++] = (uint8_t)(value & 0xFF);
             break;
         case RFCORE_SFR_RFERRF:
@@ -531,6 +535,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                 rf->rfirqf0 |= RFIRQF0_SFD;
                 rfcore_check_interrupts(rf);
                 rf->rx_frame_state = RF_RX_LENGTH;
+                rf->rx_overflow = false;
             } else {
                 /* Not a valid preamble sequence, reset */
                 rf->zero_symbols = 0;
@@ -541,8 +546,12 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
             rf->rxlen = byte;
             rf->rx_byte_count = 0;
             /* Write length byte to RXFIFO */
-            if (rf->rxfifo_len < RF_FIFO_SIZE)
+            if (rf->rxfifo_len < RF_RXFIFO_SIZE)
                 rf->rxfifo[rf->rxfifo_len++] = byte;
+            else {
+                rxfifo_overflow_count++;
+                rf->rx_overflow = true;
+            }
             if (rf->rxlen == 0) {
                 /* Empty frame — back to preamble search */
                 rf->rx_frame_state = RF_RX_PREAMBLE;
@@ -555,8 +564,12 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
 
         case RF_RX_PAYLOAD:
             /* Write byte to RXFIFO */
-            if (rf->rxfifo_len < RF_FIFO_SIZE)
+            if (rf->rxfifo_len < RF_RXFIFO_SIZE)
                 rf->rxfifo[rf->rxfifo_len++] = byte;
+            else {
+                rxfifo_overflow_count++;
+                rf->rx_overflow = true;
+            }
 
             /* Extract frame header fields */
             if (rf->rx_byte_count == 0) {
@@ -575,7 +588,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                  *   byte N-1 = RSSI (signed, we use a fixed value)
                  *   byte N   = CRC_OK (bit 7) | CORR/LQI (bits 6:0)
                  * The firmware checks CRC_OK before accepting a frame. */
-                if (rf->rxfifo_len >= 2) {
+                if (rf->rxfifo_len >= 2 && !rf->rx_overflow) {
                     rf->rxfifo[rf->rxfifo_len - 2] = (uint8_t)(int8_t)rf->rx_rssi; /* RSSI */
                     /* Derive LQI from RSSI: map [-10..-90] -> [100..20]
                      * dist_ratio = -(rssi + 10) / 80; lqi = 100 - dist_ratio * 80 */
@@ -601,8 +614,11 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
 
                 /* Auto-ACK: if FRMCTRL0.AUTOACK (bit 5) is set and the
                  * received frame has ACK_REQUEST, transmit an ACK frame.
+                 * Skip if RXFIFO overflowed — the frame is corrupted, so
+                 * we must NOT ACK.  This lets the sender's CSMA retransmit.
                  * ACK frame: preamble(4) + SFD(1) + len(1) + FCF(2) + DSN(1) + FCS(2) */
-                if ((rf->frmctrl0 & (1 << 5)) && rf->rx_ack_request && rf->tx_callback) {
+                if ((rf->frmctrl0 & (1 << 5)) && rf->rx_ack_request &&
+                    rf->tx_callback && !rf->rx_overflow) {
                     for (int i = 0; i < PREAMBLE_MIN; i++)
                         rf->tx_callback(rf->tx_user_data, 0x00);
                     rf->tx_callback(rf->tx_user_data, IEEE802154_SFD);

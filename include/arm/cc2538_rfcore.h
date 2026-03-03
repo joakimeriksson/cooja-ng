@@ -88,11 +88,11 @@ typedef enum {
 #define RFCORE_RX_TX_IRQ   141  /* RF Core Rx/Tx */
 #define RFCORE_ERR_IRQ     26   /* RF Core Error */
 
-/* TX/RX FIFO sizes.
- * Real CC2538 has 128-byte circular RXFIFO, but in simulation multiple
- * frames may be delivered in one batch (before the ISR can consume them).
- * Use a larger buffer to avoid overflow when frames accumulate. */
-#define RF_FIFO_SIZE  512
+/* TX/RX FIFO sizes — match real CC2538 hardware (128 bytes each).
+ * Frame-level RX queuing in the simulation layer prevents overflow
+ * by delivering one frame at a time with CPU mini-steps between. */
+#define RF_TXFIFO_SIZE 128
+#define RF_RXFIFO_SIZE 128
 
 typedef void (*cc2538_rf_tx_fn)(void *user_data, uint8_t byte);
 
@@ -110,9 +110,9 @@ typedef struct cc2538_rfcore {
     int         channel;
 
     /* FIFOs */
-    uint8_t     txfifo[RF_FIFO_SIZE];
+    uint8_t     txfifo[RF_TXFIFO_SIZE];
     int         txfifo_len;
-    uint8_t     rxfifo[RF_FIFO_SIZE];
+    uint8_t     rxfifo[RF_RXFIFO_SIZE];
     int         rxfifo_len;
     int         rxfifo_rd;
 
@@ -174,6 +174,7 @@ typedef struct cc2538_rfcore {
     uint8_t     rx_fcf0;            /* Frame Control Field byte 0 */
     uint8_t     rx_dsn;             /* Data Sequence Number */
     bool        rx_ack_request;     /* ACK requested in received frame */
+    bool        rx_overflow;        /* RXFIFO overflowed during current frame */
 
     /* RF TX callback */
     cc2538_rf_tx_fn  tx_callback;
