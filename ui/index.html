@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CSIM Simulator</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+header { background: #161b22; border-bottom: 1px solid #30363d; padding: 8px 16px; display: flex; align-items: center; gap: 24px; flex-shrink: 0; }
+header h1 { font-size: 14px; color: #58a6ff; font-weight: 600; }
+.stat { font-size: 12px; color: #8b949e; }
+.stat b { color: #c9d1d9; }
+#conn-status { width: 8px; height: 8px; border-radius: 50%; background: #f85149; margin-left: auto; }
+#conn-status.connected { background: #3fb950; }
+.zoom-hint { font-size: 10px; color: #484f58; margin-left: 8px; }
+.main { display: flex; flex: 1; overflow: hidden; }
+#canvas-wrap { flex: 1; position: relative; min-width: 0; }
+canvas { width: 100%; height: 100%; background: #0d1117; cursor: grab; }
+canvas:active { cursor: grabbing; }
+.sidebar { width: 360px; flex-shrink: 0; border-left: 1px solid #30363d; overflow-y: auto; background: #161b22; }
+.node-card { border-bottom: 1px solid #30363d; padding: 10px 12px; }
+.node-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.node-id { font-size: 14px; font-weight: 600; color: #58a6ff; }
+.badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; }
+.badge-msp { background: #1f6feb33; color: #58a6ff; }
+.badge-arm { background: #3fb95033; color: #3fb950; }
+.badge-native { background: #d29922; color: #0d1117; }
+.node-stats { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+.console-box { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 4px 6px; max-height: 120px; overflow-y: auto; font-size: 11px; line-height: 1.5; }
+.console-box .line { color: #7ee787; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CSIM Simulator</h1>
+  <span class="stat">Time: <b id="sim-time">0 ms</b></span>
+  <span class="stat">RF: <b id="rf-bytes">0</b> B</span>
+  <span class="stat">UART: <b id="uart-bytes">0</b> B</span>
+  <span class="stat">TX Frames: <b id="rx-frames">0</b></span>
+  <span class="stat">Links: <b id="active-links" style="color:#f0883e">0</b></span>
+  <span class="zoom-hint">Scroll to zoom, drag to pan</span>
+  <div id="conn-status" title="Disconnected"></div>
+</header>
+<div class="main">
+  <div id="canvas-wrap"><canvas id="topo"></canvas></div>
+  <div class="sidebar" id="sidebar"></div>
+</div>
+<script>
+(function() {
+  const canvas = document.getElementById('topo');
+  const ctx = canvas.getContext('2d');
+  const sidebar = document.getElementById('sidebar');
+  const connDot = document.getElementById('conn-status');
+
+  let state = null;
+  let ws = null;
+  let consoleHistory = {}; // nodeId -> array of lines
+
+  const MAX_CONSOLE = 50;
+
+  // Camera state for zoom/pan
+  let camZoom = 1.0;
+  let camX = 0, camY = 0; // pan offset in screen pixels
+  let dragging = false;
+  let dragStartX = 0, dragStartY = 0;
+  let camStartX = 0, camStartY = 0;
+
+  // Zoom with mouse wheel
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    // Zoom towards mouse position
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    camX = mx - (mx - camX) * zoomFactor;
+    camY = my - (my - camY) * zoomFactor;
+    camZoom *= zoomFactor;
+    if (state) drawCanvas(state);
+  }, { passive: false });
+
+  // Pan with mouse drag
+  canvas.addEventListener('mousedown', (e) => {
+    dragging = true;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    camStartX = camX;
+    camStartY = camY;
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    camX = camStartX + (e.clientX - dragStartX);
+    camY = camStartY + (e.clientY - dragStartY);
+    if (state) drawCanvas(state);
+  });
+  window.addEventListener('mouseup', () => { dragging = false; });
+
+  // Double-click to reset view
+  canvas.addEventListener('dblclick', () => {
+    camZoom = 1.0; camX = 0; camY = 0;
+    if (state) drawCanvas(state);
+  });
+
+  function connect() {
+    const loc = window.location;
+    ws = new WebSocket('ws://' + loc.host + '/ws');
+    ws.onopen = () => { connDot.className = 'connected'; connDot.title = 'Connected'; };
+    ws.onclose = () => { connDot.className = ''; connDot.title = 'Disconnected'; setTimeout(connect, 2000); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
+      try {
+        state = JSON.parse(ev.data);
+        mergeConsole(state);
+        updateHeader(state);
+        updateSidebar(state);
+        drawCanvas(state);
+      } catch(e) { console.error('Parse error:', e); }
+    };
+  }
+
+  function mergeConsole(s) {
+    for (const node of s.nodes) {
+      if (!consoleHistory[node.id]) consoleHistory[node.id] = [];
+      const hist = consoleHistory[node.id];
+      for (const line of node.console) {
+        hist.push(line);
+        if (hist.length > MAX_CONSOLE) hist.shift();
+      }
+    }
+  }
+
+  function updateHeader(s) {
+    document.getElementById('sim-time').textContent = fmtTime(s.sim_time_ms);
+    document.getElementById('rf-bytes').textContent = fmt(s.stats.rf_bytes);
+    document.getElementById('uart-bytes').textContent = fmt(s.stats.uart_bytes);
+    document.getElementById('rx-frames').textContent = fmt(s.stats.rx_frames_queued);
+  }
+
+  function fmt(n) {
+    if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+    return '' + n;
+  }
+
+  function fmtTime(ms) {
+    if (ms >= 60000) return (ms/60000).toFixed(1) + ' min';
+    if (ms >= 1000) return (ms/1000).toFixed(1) + ' s';
+    return Math.round(ms) + ' ms';
+  }
+
+  function badgeClass(type) {
+    if (type === 'ARM') return 'badge badge-arm';
+    if (type === 'NATIVE') return 'badge badge-native';
+    return 'badge badge-msp';
+  }
+
+  function updateSidebar(s) {
+    let html = '';
+    for (const node of s.nodes) {
+      const hist = consoleHistory[node.id] || [];
+      html += '<div class="node-card">';
+      html += '<div class="node-header">';
+      html += '<span class="node-id">Node ' + node.id + '</span>';
+      html += '<span class="' + badgeClass(node.type) + '">' + node.type + '</span>';
+      html += '</div>';
+      html += '<div class="node-stats">' + fmtCycles(node.cycles) + ' cycles &middot; ' +
+              fmtFreq(node.freq) + '</div>';
+      html += '<div class="console-box" id="con-' + node.id + '">';
+      for (const line of hist)
+        html += '<div class="line">' + esc(line) + '</div>';
+      html += '</div></div>';
+    }
+    sidebar.innerHTML = html;
+    // Auto-scroll console boxes
+    for (const node of s.nodes) {
+      const box = document.getElementById('con-' + node.id);
+      if (box) box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  function fmtCycles(c) {
+    if (c >= 1e9) return (c/1e9).toFixed(2) + 'G';
+    if (c >= 1e6) return (c/1e6).toFixed(2) + 'M';
+    if (c >= 1e3) return (c/1e3).toFixed(1) + 'K';
+    return '' + c;
+  }
+
+  function fmtFreq(f) {
+    if (f >= 1e6) return (f/1e6).toFixed(2) + ' MHz';
+    if (f >= 1e3) return (f/1e3).toFixed(1) + ' kHz';
+    return f + ' Hz';
+  }
+
+  function esc(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function drawCanvas(s) {
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width, H = rect.height;
+    ctx.clearRect(0, 0, W, H);
+
+    if (!s.nodes.length) return;
+
+    // Compute bounds with padding — include tx_range in bounds so circles are visible
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    const txr = (s.radio.type === 'UDGM' && s.radio.tx_range > 0) ? s.radio.tx_range : 0;
+    for (const n of s.nodes) {
+      minX = Math.min(minX, n.x - txr);
+      maxX = Math.max(maxX, n.x + txr);
+      minY = Math.min(minY, n.y - txr);
+      maxY = Math.max(maxY, n.y + txr);
+    }
+
+    const pad = 40;
+    const rangeX = maxX - minX || 1;
+    const rangeY = maxY - minY || 1;
+    const baseScale = Math.min((W - pad*2) / rangeX, (H - pad*2) / rangeY);
+    const scale = baseScale * camZoom;
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    // Transform: world coords -> screen coords with zoom + pan
+    function tx(x) { return W/2 + (x - centerX) * scale + camX; }
+    function ty(y) { return H/2 + (y - centerY) * scale + camY; }
+
+    // Draw TX range circles
+    if (txr > 0) {
+      for (const n of s.nodes) {
+        const r = txr * scale;
+        // Fill
+        ctx.globalAlpha = 0.05;
+        ctx.fillStyle = '#58a6ff';
+        ctx.beginPath();
+        ctx.arc(tx(n.x), ty(n.y), r, 0, Math.PI*2);
+        ctx.fill();
+        // Stroke
+        ctx.globalAlpha = 0.2;
+        ctx.strokeStyle = '#58a6ff';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(tx(n.x), ty(n.y), r, 0, Math.PI*2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Draw neighbor links
+    const neighbors = s.radio.neighbors || [];
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < neighbors.length && i < s.nodes.length; i++) {
+      const from = s.nodes[i];
+      for (const j of neighbors[i]) {
+        if (j > i && j < s.nodes.length) {
+          const to = s.nodes[j];
+          ctx.beginPath();
+          ctx.moveTo(tx(from.x), ty(from.y));
+          ctx.lineTo(tx(to.x), ty(to.y));
+          ctx.stroke();
+        }
+      }
+    }
+
+    // Node sizing (needed by arrows and node drawing)
+    const nodeRadius = Math.max(12, Math.min(22, 18 * camZoom));
+    const dotRadius = Math.max(3, Math.min(6, 5 * camZoom));
+
+    // Draw communication arrows (TX events)
+    // Longer fade (10s sim time) so arrows stay visible between periodic TXes.
+    // "Hot" phase (first 1s) shows brighter, thicker arrows.
+    const TX_FADE_MS = 10000;
+    const TX_HOT_MS = 1000;
+    const arrowLen = Math.max(8, 12 * camZoom);
+    const arrowAngle = Math.PI / 7;
+    let arrowCount = 0;
+    for (let i = 0; i < s.nodes.length; i++) {
+      const n = s.nodes[i];
+      if (!n.last_tx_ms || n.last_tx_ms <= 0) continue;
+      const age = s.sim_time_ms - n.last_tx_ms;
+      if (age < 0 || age > TX_FADE_MS) continue;
+      const hot = age <= TX_HOT_MS;
+      const alpha = hot ? 1.0 : 1.0 - (age - TX_HOT_MS) / (TX_FADE_MS - TX_HOT_MS);
+      const nbs = neighbors[i] || [];
+      for (const j of nbs) {
+        if (j >= s.nodes.length) continue;
+        const dst = s.nodes[j];
+        const sx = tx(n.x), sy = ty(n.y);
+        const dx = tx(dst.x), dy = ty(dst.y);
+        // Shorten arrow to stop at node edge
+        const dist = Math.sqrt((dx-sx)*(dx-sx) + (dy-sy)*(dy-sy));
+        if (dist < 1) continue;
+        const ux = (dx-sx)/dist, uy = (dy-sy)/dist;
+        const startX = sx + ux * nodeRadius;
+        const startY = sy + uy * nodeRadius;
+        const endX = dx - ux * nodeRadius;
+        const endY = dy - uy * nodeRadius;
+        // Line — hot phase uses brighter color and thicker stroke
+        ctx.globalAlpha = alpha * (hot ? 0.9 : 0.5);
+        ctx.strokeStyle = hot ? '#ff9f43' : '#f0883e';
+        ctx.lineWidth = Math.max(2, (hot ? 4 : 2.5) * camZoom);
+        ctx.beginPath();
+        ctx.moveTo(startX, startY);
+        ctx.lineTo(endX, endY);
+        ctx.stroke();
+        // Arrowhead
+        const angle = Math.atan2(endY - startY, endX - startX);
+        const aLen = hot ? arrowLen * 1.3 : arrowLen;
+        ctx.fillStyle = hot ? '#ff9f43' : '#f0883e';
+        ctx.beginPath();
+        ctx.moveTo(endX, endY);
+        ctx.lineTo(endX - aLen * Math.cos(angle - arrowAngle),
+                   endY - aLen * Math.sin(angle - arrowAngle));
+        ctx.lineTo(endX - aLen * Math.cos(angle + arrowAngle),
+                   endY - aLen * Math.sin(angle + arrowAngle));
+        ctx.closePath();
+        ctx.fill();
+        arrowCount++;
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw nodes
+    const colors = { MSP430: '#58a6ff', ARM: '#3fb950', NATIVE: '#d29922' };
+    for (const n of s.nodes) {
+      const cx = tx(n.x), cy = ty(n.y);
+      const col = colors[n.type] || '#8b949e';
+
+      // Outer circle
+      ctx.beginPath();
+      ctx.arc(cx, cy, nodeRadius, 0, Math.PI*2);
+      ctx.fillStyle = col + '22';
+      ctx.fill();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Inner dot
+      ctx.beginPath();
+      ctx.arc(cx, cy, dotRadius, 0, Math.PI*2);
+      ctx.fillStyle = col;
+      ctx.fill();
+
+      // Label
+      ctx.fillStyle = '#c9d1d9';
+      ctx.font = '11px SF Mono, Menlo, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Node ' + n.id, cx, cy + nodeRadius + 14);
+
+      // Type label
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '9px SF Mono, Menlo, monospace';
+      ctx.fillText(n.type, cx, cy + nodeRadius + 26);
+    }
+
+    // Zoom indicator
+    ctx.fillStyle = '#484f58';
+    ctx.font = '10px SF Mono, Menlo, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText((camZoom * 100).toFixed(0) + '%', 8, H - 8);
+
+    // Update active links counter in header
+    document.getElementById('active-links').textContent = arrowCount;
+  }
+
+  // Handle resize
+  window.addEventListener('resize', () => { if (state) drawCanvas(state); });
+
+  connect();
+})();
+</script>
+</body>
+</html>

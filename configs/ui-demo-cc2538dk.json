@@ -1,0 +1,16 @@
+{
+    "title": "2-node CC2538DK nullnet broadcast with UDGM (UI demo)",
+    "timeout_ms": 600000,
+    "seed": 42,
+    "radiomedium": {
+        "type": "udgm",
+        "tx_range": 50.0,
+        "interference_range": 100.0,
+        "success_ratio_tx": 1.0,
+        "success_ratio_rx": 1.0
+    },
+    "nodes": [
+        { "firmware": "firmware/cc2538dk/nullnet-broadcast.cc2538dk", "id": 1, "x": 10.0, "y": 20.0 },
+        { "firmware": "firmware/cc2538dk/nullnet-broadcast.cc2538dk", "id": 2, "x": 40.0, "y": 20.0 }
+    ]
+}

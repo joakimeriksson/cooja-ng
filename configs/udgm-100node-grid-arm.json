@@ -1,0 +1,614 @@
+{
+  "title": "UDGM 100-node 10x10 grid RPL-UDP (5-hop depth)",
+  "timeout_ms": 60000,
+  "seed": 42,
+  "radiomedium": {
+    "type": "udgm",
+    "tx_range": 50.0,
+    "interference_range": 100.0,
+    "success_ratio_tx": 1.0,
+    "success_ratio_rx": 1.0
+  },
+  "nodes": [
+    {
+      "firmware": "firmware/cc2538dk/udp-server.cc2538dk",
+      "id": 1,
+      "x": 150.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 2,
+      "x": 0.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 3,
+      "x": 30.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 4,
+      "x": 60.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 5,
+      "x": 90.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 6,
+      "x": 120.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 7,
+      "x": 150.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 8,
+      "x": 180.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 9,
+      "x": 210.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 10,
+      "x": 240.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 11,
+      "x": 270.0,
+      "y": 0.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 12,
+      "x": 0.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 13,
+      "x": 30.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 14,
+      "x": 60.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 15,
+      "x": 90.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 16,
+      "x": 120.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 17,
+      "x": 150.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 18,
+      "x": 180.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 19,
+      "x": 210.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 20,
+      "x": 240.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 21,
+      "x": 270.0,
+      "y": 30.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 22,
+      "x": 0.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 23,
+      "x": 30.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 24,
+      "x": 60.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 25,
+      "x": 90.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 26,
+      "x": 120.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 27,
+      "x": 150.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 28,
+      "x": 180.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 29,
+      "x": 210.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 30,
+      "x": 240.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 31,
+      "x": 270.0,
+      "y": 60.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 32,
+      "x": 0.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 33,
+      "x": 30.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 34,
+      "x": 60.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 35,
+      "x": 90.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 36,
+      "x": 120.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 37,
+      "x": 150.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 38,
+      "x": 180.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 39,
+      "x": 210.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 40,
+      "x": 240.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 41,
+      "x": 270.0,
+      "y": 90.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 42,
+      "x": 0.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 43,
+      "x": 30.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 44,
+      "x": 60.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 45,
+      "x": 90.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 46,
+      "x": 120.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 47,
+      "x": 150.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 48,
+      "x": 180.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 49,
+      "x": 210.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 50,
+      "x": 240.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 51,
+      "x": 270.0,
+      "y": 120.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 52,
+      "x": 0.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 53,
+      "x": 30.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 54,
+      "x": 60.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 55,
+      "x": 90.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 56,
+      "x": 120.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 57,
+      "x": 180.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 58,
+      "x": 210.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 59,
+      "x": 240.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 60,
+      "x": 270.0,
+      "y": 150.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 61,
+      "x": 0.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 62,
+      "x": 30.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 63,
+      "x": 60.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 64,
+      "x": 90.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 65,
+      "x": 120.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 66,
+      "x": 150.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 67,
+      "x": 180.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 68,
+      "x": 210.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 69,
+      "x": 240.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 70,
+      "x": 270.0,
+      "y": 180.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 71,
+      "x": 0.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 72,
+      "x": 30.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 73,
+      "x": 60.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 74,
+      "x": 90.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 75,
+      "x": 120.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 76,
+      "x": 150.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 77,
+      "x": 180.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 78,
+      "x": 210.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 79,
+      "x": 240.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 80,
+      "x": 270.0,
+      "y": 210.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 81,
+      "x": 0.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 82,
+      "x": 30.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 83,
+      "x": 60.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 84,
+      "x": 90.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 85,
+      "x": 120.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 86,
+      "x": 150.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 87,
+      "x": 180.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 88,
+      "x": 210.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 89,
+      "x": 240.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 90,
+      "x": 270.0,
+      "y": 240.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 91,
+      "x": 0.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 92,
+      "x": 30.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 93,
+      "x": 60.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 94,
+      "x": 90.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 95,
+      "x": 120.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 96,
+      "x": 150.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 97,
+      "x": 180.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 98,
+      "x": 210.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 99,
+      "x": 240.0,
+      "y": 270.0
+    },
+    {
+      "firmware": "firmware/cc2538dk/udp-client.cc2538dk",
+      "id": 100,
+      "x": 270.0,
+      "y": 270.0
+    }
+  ]
+}
