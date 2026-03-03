@@ -22,6 +22,12 @@ void ws_server_broadcast(ws_server_t *srv, const char *data, int len);
 /* Set the HTML content to serve on GET /. The data is copied internally. */
 void ws_server_set_html(ws_server_t *srv, const char *html, int len);
 
+/* Callback for incoming text/binary messages from clients. */
+typedef void (*ws_message_cb_t)(const char *data, int len, void *userdata);
+
+/* Set a callback for incoming WebSocket messages. */
+void ws_server_set_message_callback(ws_server_t *srv, ws_message_cb_t cb, void *userdata);
+
 /* Shut down all connections and free resources. */
 void ws_server_destroy(ws_server_t *srv);
 

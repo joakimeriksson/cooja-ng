@@ -65,6 +65,8 @@ char *sim_state_to_json(const sim_node_info_t *nodes, int node_count,
     cJSON_AddNumberToObject(jstats, "uart_bytes", stats->uart_bytes);
     cJSON_AddNumberToObject(jstats, "rx_frames_queued", stats->rx_frames_queued);
     cJSON_AddNumberToObject(jstats, "rx_frames_collided", stats->rx_frames_collided);
+    cJSON_AddNumberToObject(jstats, "speed", stats->speed_ratio);
+    cJSON_AddBoolToObject(jstats, "paused", stats->paused);
     cJSON_AddItemToObject(root, "stats", jstats);
 
     char *json = cJSON_PrintUnformatted(root);

@@ -2,6 +2,7 @@
     "title": "16-node RPL-UDP 4x4 grid with UDGM (UI demo)",
     "timeout_ms": 3600000,
     "seed": 42,
+    "startup_delay_ms": 1000,
     "radiomedium": {
         "type": "udgm",
         "tx_range": 55.0,

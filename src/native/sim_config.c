@@ -66,6 +66,16 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
         cfg->seed = seed->valueint;
     }
 
+    cJSON *startup_delay = cJSON_GetObjectItemCaseSensitive(root, "startup_delay_ms");
+    if (cJSON_IsNumber(startup_delay)) {
+        cfg->startup_delay_ms = startup_delay->valueint;
+    }
+
+    cJSON *speed = cJSON_GetObjectItemCaseSensitive(root, "speed");
+    if (cJSON_IsNumber(speed)) {
+        cfg->speed = speed->valuedouble;
+    }
+
     /* Parse optional radiomedium object */
     cJSON *medium = cJSON_GetObjectItemCaseSensitive(root, "radiomedium");
     if (cJSON_IsObject(medium)) {
@@ -201,6 +211,10 @@ void sim_config_print(const sim_config_t *cfg) {
     printf("  timeout_ms: %d\n", cfg->timeout_ms);
     if (cfg->seed)
         printf("  seed: %d\n", cfg->seed);
+    if (cfg->startup_delay_ms > 0)
+        printf("  startup_delay_ms: %d\n", cfg->startup_delay_ms);
+    if (cfg->speed > 0)
+        printf("  speed: %.1fx\n", cfg->speed);
     if (cfg->medium_type == 1) {
         printf("  radiomedium: UDGM\n");
         printf("    tx_range: %.1f m\n", cfg->tx_range);

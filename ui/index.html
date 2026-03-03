@@ -39,6 +39,11 @@ canvas:active { cursor: grabbing; }
   <span class="stat">UART: <b id="uart-bytes">0</b> B</span>
   <span class="stat">TX Frames: <b id="rx-frames">0</b></span>
   <span class="stat">Links: <b id="active-links" style="color:#f0883e">0</b></span>
+  <button id="pause-btn" style="background:#30363d; color:#c9d1d9; border:1px solid #484f58; border-radius:4px; padding:2px 10px; font-family:inherit; font-size:12px; cursor:pointer;" title="Pause/Play">Pause</button>
+  <span class="stat">Speed: <b id="speed-val">10</b>x
+    <input type="range" id="speed-slider" min="1" max="100" value="10"
+           style="width:80px; vertical-align:middle; margin-left:4px;">
+  </span>
   <span class="zoom-hint">Scroll to zoom, drag to pan</span>
   <div id="conn-status" title="Disconnected"></div>
 </header>
@@ -102,6 +107,23 @@ canvas:active { cursor: grabbing; }
     if (state) drawCanvas(state);
   });
 
+  const speedSlider = document.getElementById('speed-slider');
+  const speedVal = document.getElementById('speed-val');
+  const pauseBtn = document.getElementById('pause-btn');
+  let isPaused = false;
+
+  speedSlider.addEventListener('input', () => {
+    const v = parseInt(speedSlider.value);
+    speedVal.textContent = v;
+    if (ws && ws.readyState === 1)
+      ws.send(JSON.stringify({cmd: 'speed', value: v}));
+  });
+
+  pauseBtn.addEventListener('click', () => {
+    if (ws && ws.readyState === 1)
+      ws.send(JSON.stringify({cmd: isPaused ? 'play' : 'pause'}));
+  });
+
   function connect() {
     const loc = window.location;
     ws = new WebSocket('ws://' + loc.host + '/ws');
@@ -135,6 +157,15 @@ canvas:active { cursor: grabbing; }
     document.getElementById('rf-bytes').textContent = fmt(s.stats.rf_bytes);
     document.getElementById('uart-bytes').textContent = fmt(s.stats.uart_bytes);
     document.getElementById('rx-frames').textContent = fmt(s.stats.rx_frames_queued);
+    if (s.stats.speed !== undefined) {
+      speedVal.textContent = Math.round(s.stats.speed);
+      speedSlider.value = Math.round(s.stats.speed);
+    }
+    if (s.stats.paused !== undefined) {
+      isPaused = s.stats.paused;
+      pauseBtn.textContent = isPaused ? 'Play' : 'Pause';
+      pauseBtn.style.background = isPaused ? '#1f6feb' : '#30363d';
+    }
   }
 
   function fmt(n) {

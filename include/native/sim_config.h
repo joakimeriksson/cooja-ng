@@ -53,6 +53,12 @@ typedef struct {
     double success_ratio_tx;     /* default 1.0 */
     double success_ratio_rx;     /* default 1.0 */
 
+    /* Startup delay spread: each node gets a random delay in [0, startup_delay_ms) */
+    int startup_delay_ms;   /* 0 = no stagger (default) */
+
+    /* Simulation speed multiplier for real-time pacing (UI mode) */
+    double speed;           /* 0 = default (10x), e.g. 1.0 = real-time, 100.0 = 100x */
+
     /* Test scripting */
     int has_test;
     sim_test_config_t test;

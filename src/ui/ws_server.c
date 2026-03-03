@@ -44,6 +44,8 @@ struct ws_server {
     int client_count;
     char *html;
     int html_len;
+    ws_message_cb_t msg_cb;
+    void *msg_userdata;
 };
 
 /* ---- SHA-1 (public domain, from RFC 3174 / Steve Reid) ---- */
@@ -259,7 +261,10 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
             if (payload_len > 0)
                 send(c->fd, buf + header_len, (int)payload_len, 0);
         }
-        /* Ignore text/binary data frames */
+        /* Dispatch text/binary data frames to callback */
+        if ((opcode == 0x1 || opcode == 0x2) && srv->msg_cb) {
+            srv->msg_cb((const char *)(buf + header_len), (int)payload_len, srv->msg_userdata);
+        }
 
         /* Remove consumed frame from buffer */
         memmove(c->recv_buf, c->recv_buf + total, c->recv_len - total);
@@ -399,6 +404,12 @@ void ws_server_broadcast(ws_server_t *srv, const char *data, int len) {
         sent = send(srv->clients[i].fd, data, len, MSG_NOSIGNAL);
         if (sent < 0) { close_client(srv, i); i--; continue; }
     }
+}
+
+void ws_server_set_message_callback(ws_server_t *srv, ws_message_cb_t cb, void *userdata) {
+    if (!srv) return;
+    srv->msg_cb = cb;
+    srv->msg_userdata = userdata;
 }
 
 void ws_server_set_html(ws_server_t *srv, const char *html, int len) {

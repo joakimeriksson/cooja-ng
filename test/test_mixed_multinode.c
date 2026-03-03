@@ -23,6 +23,7 @@
 #include "ws_server.h"
 #include "sim_state.h"
 #include "sim_threads.h"
+#include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -198,6 +199,13 @@ static node_thread_state_t thread_state[MAX_NODES];
 /* Per-node last TX timestamp for UI communication arrows */
 static int64_t node_last_tx_ns[MAX_NODES];
 
+/* Per-node start time: node is inactive (no step, no RF) until sim_ns >= start_ns */
+static int64_t node_start_ns[MAX_NODES];  /* 0 = start immediately */
+
+static inline int node_active(int idx) {
+    return current_sim_ns >= node_start_ns[idx];
+}
+
 /* --- WebSocket UI state --- */
 static ws_server_t *ui_server = NULL;
 #define UI_CONSOLE_LINES 20
@@ -208,6 +216,30 @@ static int ui_console_count[MAX_NODES];
 /* New lines since last broadcast */
 static char ui_console_new[MAX_NODES][UI_CONSOLE_LINES][UI_CONSOLE_LINELEN];
 static int ui_console_new_count[MAX_NODES];
+static double ui_speed_ratio = 10.0;  /* adjustable from UI, default 10x */
+static int ui_paused = 0;             /* play/pause state */
+
+static void ui_message_handler(const char *data, int len, void *userdata) {
+    (void)userdata;
+    cJSON *root = cJSON_ParseWithLength(data, len);
+    if (!root) return;
+    cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
+    if (cmd && cJSON_IsString(cmd)) {
+        if (strcmp(cmd->valuestring, "speed") == 0) {
+            cJSON *val = cJSON_GetObjectItem(root, "value");
+            if (val && cJSON_IsNumber(val)) {
+                double v = val->valuedouble;
+                if (v >= 0.1 && v <= 1000.0)
+                    ui_speed_ratio = v;
+            }
+        } else if (strcmp(cmd->valuestring, "pause") == 0) {
+            ui_paused = 1;
+        } else if (strcmp(cmd->valuestring, "play") == 0) {
+            ui_paused = 0;
+        }
+    }
+    cJSON_Delete(root);
+}
 
 static void ui_add_console_line(int node_idx, const char *line) {
     /* Add to ring buffer */
@@ -404,6 +436,7 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
          * eligible neighbors — flushed after outer delivery completes. */
         for (int i = 0; i < num_nodes; i++) {
             if (&nodes[i] == sender) continue;
+            if (!node_active(i)) continue;
             if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
                 continue;
             if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
@@ -423,6 +456,7 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
      * feed native assemblers directly. */
     for (int i = 0; i < num_nodes; i++) {
         if (&nodes[i] == sender) continue;
+        if (!node_active(i)) continue;
         if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
             continue;
         if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
@@ -773,6 +807,7 @@ static void distribute_rf_outgoing(void) {
                 uint8_t byte = out->bytes[b];
                 for (int i = 0; i < num_nodes; i++) {
                     if (i == sender) continue;
+                    if (!node_active(i)) continue;
                     if (nodes[sender].type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
                         continue;
                     if (!radio_medium_filter_byte(&radio_medium, sender, i, byte))
@@ -1174,6 +1209,8 @@ static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
 static void threaded_step_node(int idx, void *user_data) {
     int64_t sim_ns = (int64_t)(intptr_t)user_data;
 
+    if (!node_active(idx)) return;
+
     if (nodes[idx].type == NODE_NATIVE) {
         if (!native_has_pending_work(&nodes[idx].plat.native, sim_ns)) {
             nodes[idx].plat.native.sim_time_ns = sim_ns;
@@ -1387,6 +1424,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     if (ui_enabled) {
         ui_server = ws_server_init(ui_port);
         if (ui_server) {
+            ws_server_set_message_callback(ui_server, ui_message_handler, NULL);
             /* Load HTML from ui/index.html */
             FILE *hf = fopen("ui/index.html", "r");
             if (hf) {
@@ -1406,6 +1444,26 @@ int run_mixed_multinode_test(int argc, char **argv) {
             }
         } else {
             fprintf(stderr, "Warning: failed to start UI server on port %d\n", ui_port);
+        }
+    }
+
+    /* Set initial simulation speed from config */
+    if (config_loaded && config.speed > 0)
+        ui_speed_ratio = config.speed;
+
+    /* Apply per-node startup delay to desynchronize timers.
+     * Each node gets a random start_ns offset. Before its start time,
+     * the node is not stepped and does not receive RF. */
+    if (config_loaded && config.startup_delay_ms > 0) {
+        unsigned int delay_seed = config.seed ? (unsigned int)config.seed : 12345;
+        printf("Applying startup delay spread: 0-%d ms\n", config.startup_delay_ms);
+        for (int i = 0; i < node_count; i++) {
+            delay_seed = delay_seed * 1103515245 + 12345;
+            int delay_ms = (int)(delay_seed % (unsigned int)config.startup_delay_ms);
+            node_start_ns[i] = node_sim_time_ns(i) + (int64_t)delay_ms * MS_TO_NS;
+            printf("  Node %d: start at %lld ms (delay %d ms)\n",
+                   nodes[i].id,
+                   (long long)(node_start_ns[i] / MS_TO_NS), delay_ms);
         }
     }
 
@@ -1470,7 +1528,16 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
     double t_start = get_time_ms();
 
-    while (sim_ns < end_ns) {
+    while (sim_ns < end_ns || ui_server) {
+        /* When paused, poll WebSocket and sleep but skip to UI broadcast */
+        if (ui_paused && ui_server) {
+            ws_server_poll(ui_server);
+            usleep(50000); /* 50ms */
+            /* Reset pacing baseline so resuming doesn't cause a burst */
+            t_start = get_time_ms() - (double)(sim_ns - (end_ns - total_ns)) / 1e6 / ui_speed_ratio;
+            goto ui_broadcast;
+        }
+
         sim_ns += TIME_STEP_NS;
         current_sim_ns = sim_ns;
 
@@ -1497,6 +1564,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
              * frames would leave the radio mid-RX and corrupt the queue. */
             t_phase = get_time_ms();
             for (int i = 0; i < node_count; i++) {
+                if (!node_active(i)) continue;
                 if (nodes[i].type == NODE_NATIVE) {
                     mixed_deliver_rf_bytes(i);
                     native_dequeue_rx_frame(&nodes[i].plat.native);
@@ -1511,6 +1579,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
             /* Sequential: drain queued RX frames for emulated nodes */
             for (int i = 0; i < node_count; i++) {
+                if (!node_active(i)) continue;
                 if (nodes[i].type != NODE_NATIVE)
                     emu_rx_queue_drain(i);
             }
@@ -1524,6 +1593,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
             t_phase = get_time_ms();
             for (int i = 0; i < node_count; i++) {
+                if (!node_active(i)) continue;
                 /* Deliver only to native nodes — emulated nodes' bytes stay
                  * in rf_pending until frame assembler completes the frame. */
                 if (nodes[i].type == NODE_NATIVE) {
@@ -1535,6 +1605,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
             t_phase = get_time_ms();
             for (int i = 0; i < node_count; i++) {
+                if (!node_active(i)) continue;
                 if (nodes[i].type == NODE_NATIVE) {
                     /* Skip idle native nodes — just advance their time */
                     if (!native_has_pending_work(&nodes[i].plat.native, sim_ns)) {
@@ -1564,6 +1635,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             }
             /* Drain queued RX frames for emulated nodes */
             for (int i = 0; i < node_count; i++) {
+                if (!node_active(i)) continue;
                 if (nodes[i].type != NODE_NATIVE)
                     emu_rx_queue_drain(i);
             }
@@ -1591,10 +1663,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
             break;
 
         /* WebSocket UI: poll and broadcast state */
+        ui_broadcast:
         if (ui_server) {
-            ws_server_poll(ui_server);
-            if (sim_ns >= next_ui_ns) {
-                next_ui_ns = sim_ns + ui_interval_ns;
+            if (!ui_paused) ws_server_poll(ui_server);
+            if (sim_ns >= next_ui_ns || ui_paused) {
+                if (!ui_paused) next_ui_ns = sim_ns + ui_interval_ns;
 
                 /* Build node info array with only new console lines */
                 sim_node_info_t ni[MAX_NODES];
@@ -1636,6 +1709,8 @@ int run_mixed_multinode_test(int argc, char **argv) {
                     .uart_bytes = uart_byte_count,
                     .rx_frames_queued = (int)radio_medium.next_frame_id + stat_rf_frames,
                     .rx_frames_collided = stat_rx_frames_collided,
+                    .speed_ratio = ui_speed_ratio,
+                    .paused = ui_paused,
                 };
 
                 char *json = sim_state_to_json(ni, node_count, &ri, &st);
@@ -1644,12 +1719,18 @@ int run_mixed_multinode_test(int argc, char **argv) {
                     free(json);
                 }
 
-                /* Real-time pacing: throttle to ~10x real-time for UI */
-                double wall_elapsed = get_time_ms() - t_start;
+                /* Real-time pacing: throttle to target speed for UI.
+                 * Sleep in small increments (50ms max) so ws_server_poll
+                 * can process incoming speed changes promptly. */
                 double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
-                double target_wall = sim_elapsed_ms / 10.0; /* 10x real-time */
-                if (wall_elapsed < target_wall) {
-                    usleep((useconds_t)((target_wall - wall_elapsed) * 1000.0));
+                for (;;) {
+                    double wall_elapsed = get_time_ms() - t_start;
+                    double target_wall = sim_elapsed_ms / ui_speed_ratio;
+                    double wait_ms = target_wall - wall_elapsed;
+                    if (wait_ms <= 0) break;
+                    if (wait_ms > 50.0) wait_ms = 50.0;
+                    usleep((useconds_t)(wait_ms * 1000.0));
+                    ws_server_poll(ui_server);
                 }
             }
         }

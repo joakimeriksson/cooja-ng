@@ -39,6 +39,8 @@ typedef struct {
     int uart_bytes;
     int rx_frames_queued;
     int rx_frames_collided;
+    double speed_ratio;     /* current speed multiplier (e.g. 10.0 = 10x real-time) */
+    int paused;             /* 1 if simulation is paused */
 } sim_stats_t;
 
 /*
