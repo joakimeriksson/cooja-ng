@@ -36,6 +36,8 @@
 
 typedef void (*cc2538_uart_tx_fn)(void *user_data, uint8_t byte);
 
+struct arm_nvic;  /* forward declaration */
+
 typedef struct cc2538_uart {
     arm_cpu_t          *cpu;
     uint32_t            base_addr;
@@ -57,6 +59,12 @@ typedef struct cc2538_uart {
     /* TX callback */
     cc2538_uart_tx_fn   tx_callback;
     void               *tx_user_data;
+
+    /* RX FIFO for serial input */
+    uint8_t             rx_fifo[16];
+    int                 rx_fifo_head;
+    int                 rx_fifo_count;
+    struct arm_nvic    *nvic;
 } cc2538_uart_t;
 
 /* Initialize UART and register IO region */
@@ -66,5 +74,11 @@ void cc2538_uart_init(cc2538_uart_t *uart, arm_cpu_t *cpu,
 /* Set TX callback */
 void cc2538_uart_set_callback(cc2538_uart_t *uart,
                               cc2538_uart_tx_fn cb, void *user_data);
+
+/* Receive a byte into the RX FIFO (serial input to mote) */
+void cc2538_uart_receive_byte(cc2538_uart_t *uart, uint8_t byte);
+
+/* Set NVIC pointer for interrupt generation on RX */
+void cc2538_uart_set_nvic(cc2538_uart_t *uart, struct arm_nvic *nvic);
 
 #endif /* CC2538_UART_H */

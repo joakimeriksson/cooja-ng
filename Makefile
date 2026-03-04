@@ -82,7 +82,7 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 
-.PHONY: all clean test bench test-firmware test-arm
+.PHONY: all clean test bench test-firmware test-arm cooja-tests
 
 all: $(BUILD_DIR)/test_runner
 
@@ -145,6 +145,10 @@ test-arm: $(BUILD_DIR)/test_runner
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Run Contiki-NG Cooja test suite
+cooja-tests: $(BUILD_DIR)/test_runner
+	./tools/run-cooja-tests.sh $(CONTIKI_DIR)
 
 # Debug build
 debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -DDEBUG

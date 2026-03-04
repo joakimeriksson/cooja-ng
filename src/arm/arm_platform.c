@@ -230,6 +230,8 @@ void arm_platform_init(arm_platform_t *plat, const arm_platform_config_t *config
     /* UARTs */
     cc2538_uart_init(&plat->uart0, &plat->cpu, 0x4000C000, 5);
     cc2538_uart_init(&plat->uart1, &plat->cpu, 0x4000D000, 6);
+    cc2538_uart_set_nvic(&plat->uart0, &plat->nvic);
+    cc2538_uart_set_nvic(&plat->uart1, &plat->nvic);
 
     /* GPIO */
     cc2538_gpio_init(&plat->gpio, &plat->cpu);

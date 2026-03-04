@@ -17,8 +17,12 @@
 #ifndef SIM_CONFIG_H
 #define SIM_CONFIG_H
 
+#include <stdint.h>
+
 #define MAX_SIM_NODES 128
 #define MAX_TEST_STEPS 32
+#define MAX_FAIL_PATTERNS 8
+#define MAX_TEST_ACTIONS 64
 
 typedef struct {
     char pattern[256];
@@ -27,9 +31,33 @@ typedef struct {
     int  timeout_ms;    /* 0 = use global */
 } sim_test_step_t;
 
+typedef enum {
+    TEST_ACTION_MOVE = 1,
+    TEST_ACTION_SEND = 2,
+} test_action_type_t;
+
+typedef struct {
+    test_action_type_t type;
+    int64_t at_ms;
+    int     node;       /* node ID */
+    double  x, y;       /* for move */
+    char    data[256];  /* for send */
+} sim_test_action_t;
+
 typedef struct {
     int step_count;
     sim_test_step_t steps[MAX_TEST_STEPS];
+
+    /* fail_on: patterns that cause immediate test failure */
+    int fail_on_count;
+    char fail_on[MAX_FAIL_PATTERNS][256];
+
+    /* timeout_is_success: reaching timeout without failure = PASS */
+    int timeout_is_success;
+
+    /* timed actions (move, send) */
+    int action_count;
+    sim_test_action_t actions[MAX_TEST_ACTIONS];
 } sim_test_config_t;
 
 typedef struct {

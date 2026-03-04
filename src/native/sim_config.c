@@ -149,9 +149,11 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
     /* Parse optional test section */
     cJSON *test = cJSON_GetObjectItemCaseSensitive(root, "test");
     if (cJSON_IsObject(test)) {
+        cfg->has_test = 1;
+
+        /* Parse test steps */
         cJSON *steps = cJSON_GetObjectItemCaseSensitive(test, "steps");
         if (cJSON_IsArray(steps)) {
-            cfg->has_test = 1;
             int si = 0;
             cJSON *step_item;
             cJSON_ArrayForEach(step_item, steps) {
@@ -190,6 +192,72 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
                 si++;
             }
             cfg->test.step_count = si;
+        }
+
+        /* Parse fail_on patterns */
+        cJSON *fail_on = cJSON_GetObjectItemCaseSensitive(test, "fail_on");
+        if (cJSON_IsArray(fail_on)) {
+            int fi = 0;
+            cJSON *fp;
+            cJSON_ArrayForEach(fp, fail_on) {
+                if (fi >= MAX_FAIL_PATTERNS) break;
+                if (cJSON_IsString(fp) && fp->valuestring) {
+                    snprintf(cfg->test.fail_on[fi], sizeof(cfg->test.fail_on[fi]),
+                             "%s", fp->valuestring);
+                    fi++;
+                }
+            }
+            cfg->test.fail_on_count = fi;
+        }
+
+        /* Parse timeout_is_success */
+        cJSON *tis = cJSON_GetObjectItemCaseSensitive(test, "timeout_is_success");
+        if (cJSON_IsTrue(tis))
+            cfg->test.timeout_is_success = 1;
+
+        /* Parse actions array */
+        cJSON *actions = cJSON_GetObjectItemCaseSensitive(test, "actions");
+        if (cJSON_IsArray(actions)) {
+            int ai = 0;
+            cJSON *act_item;
+            cJSON_ArrayForEach(act_item, actions) {
+                if (ai >= MAX_TEST_ACTIONS) {
+                    fprintf(stderr, "sim_config: too many test actions (max %d)\n",
+                            MAX_TEST_ACTIONS);
+                    break;
+                }
+                sim_test_action_t *a = &cfg->test.actions[ai];
+                memset(a, 0, sizeof(*a));
+
+                cJSON *at_ms = cJSON_GetObjectItemCaseSensitive(act_item, "at_ms");
+                if (cJSON_IsNumber(at_ms))
+                    a->at_ms = (int64_t)at_ms->valuedouble;
+
+                cJSON *atype = cJSON_GetObjectItemCaseSensitive(act_item, "type");
+                if (cJSON_IsString(atype) && atype->valuestring) {
+                    if (strcmp(atype->valuestring, "move") == 0)
+                        a->type = TEST_ACTION_MOVE;
+                    else if (strcmp(atype->valuestring, "send") == 0)
+                        a->type = TEST_ACTION_SEND;
+                }
+
+                cJSON *anode = cJSON_GetObjectItemCaseSensitive(act_item, "node");
+                if (cJSON_IsNumber(anode))
+                    a->node = anode->valueint;
+
+                cJSON *ax = cJSON_GetObjectItemCaseSensitive(act_item, "x");
+                if (cJSON_IsNumber(ax)) a->x = ax->valuedouble;
+
+                cJSON *ay = cJSON_GetObjectItemCaseSensitive(act_item, "y");
+                if (cJSON_IsNumber(ay)) a->y = ay->valuedouble;
+
+                cJSON *adata = cJSON_GetObjectItemCaseSensitive(act_item, "data");
+                if (cJSON_IsString(adata) && adata->valuestring)
+                    snprintf(a->data, sizeof(a->data), "%s", adata->valuestring);
+
+                ai++;
+            }
+            cfg->test.action_count = ai;
         }
     }
 
@@ -245,6 +313,28 @@ void sim_config_print(const sim_config_t *cfg) {
             if (s->timeout_ms > 0)
                 printf(" timeout=%dms", s->timeout_ms);
             printf("\n");
+        }
+        if (cfg->test.fail_on_count > 0) {
+            printf("  fail_on: ");
+            for (int i = 0; i < cfg->test.fail_on_count; i++) {
+                printf("\"%s\"%s", cfg->test.fail_on[i],
+                       i < cfg->test.fail_on_count - 1 ? ", " : "");
+            }
+            printf("\n");
+        }
+        if (cfg->test.timeout_is_success)
+            printf("  timeout_is_success: true\n");
+        if (cfg->test.action_count > 0) {
+            printf("  actions: %d\n", cfg->test.action_count);
+            for (int i = 0; i < cfg->test.action_count; i++) {
+                const sim_test_action_t *a = &cfg->test.actions[i];
+                if (a->type == TEST_ACTION_MOVE)
+                    printf("    [%d] at %lld ms: move node %d to (%.1f, %.1f)\n",
+                           i, (long long)a->at_ms, a->node, a->x, a->y);
+                else if (a->type == TEST_ACTION_SEND)
+                    printf("    [%d] at %lld ms: send node %d \"%s\"\n",
+                           i, (long long)a->at_ms, a->node, a->data);
+            }
         }
     }
 }

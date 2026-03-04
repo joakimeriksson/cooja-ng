@@ -2,6 +2,7 @@
  * CC2538 UART peripheral
  */
 #include "cc2538_uart.h"
+#include "arm_nvic.h"
 #include <string.h>
 
 #define UART_REG_SIZE  0x1000
@@ -11,7 +12,17 @@ static int uart_read(void *user_data, uint32_t addr) {
     uint32_t offset = addr - uart->base_addr;
 
     switch (offset) {
-        case UART_DR:   return (int)uart->dr;
+        case UART_DR:
+            if (uart->rx_fifo_count > 0) {
+                uint8_t byte = uart->rx_fifo[uart->rx_fifo_head];
+                uart->rx_fifo_head = (uart->rx_fifo_head + 1) % 16;
+                uart->rx_fifo_count--;
+                if (uart->rx_fifo_count == 0)
+                    uart->fr |= UART_FR_RXFE;   /* RX FIFO empty */
+                uart->fr &= ~UART_FR_RXFF;      /* RX FIFO not full */
+                return (int)byte;
+            }
+            return (int)uart->dr;
         case UART_RSR:  return (int)uart->rsr;
         case UART_FR:   return (int)uart->fr;
         case UART_IBRD: return (int)uart->ibrd;
@@ -84,4 +95,32 @@ void cc2538_uart_set_callback(cc2538_uart_t *uart,
                               cc2538_uart_tx_fn cb, void *user_data) {
     uart->tx_callback = cb;
     uart->tx_user_data = user_data;
+}
+
+void cc2538_uart_set_nvic(cc2538_uart_t *uart, struct arm_nvic *nvic) {
+    uart->nvic = nvic;
+}
+
+void cc2538_uart_receive_byte(cc2538_uart_t *uart, uint8_t byte) {
+    if (uart->rx_fifo_count >= 16) {
+        /* FIFO full, set overrun */
+        uart->fr |= UART_FR_RXFF;
+        return;
+    }
+    int tail = (uart->rx_fifo_head + uart->rx_fifo_count) % 16;
+    uart->rx_fifo[tail] = byte;
+    uart->rx_fifo_count++;
+
+    /* Clear RX FIFO empty flag */
+    uart->fr &= ~UART_FR_RXFE;
+    if (uart->rx_fifo_count >= 16)
+        uart->fr |= UART_FR_RXFF;
+
+    /* Set RX interrupt (RXRIS = bit 4) */
+    uart->ris |= (1 << 4);
+
+    /* Fire NVIC interrupt if RX interrupt is masked in */
+    if (uart->nvic && (uart->im & (1 << 4))) {
+        arm_nvic_set_pending(uart->nvic, uart->irq_num);
+    }
 }
