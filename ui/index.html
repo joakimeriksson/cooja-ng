@@ -132,7 +132,7 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
   // Zoom with mouse wheel
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const zoomFactor = e.deltaY < 0 ? 1.04 : 1 / 1.04;
     // Zoom towards mouse position
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left;

@@ -10,9 +10,16 @@
 #define SMWDTHROSC_BASE  0x400D5000
 #define SMWDTHROSC_SIZE  0x1000
 
-/* Compute current counter value from simulation time */
+/* Current ns derived from CPU cycles — always accurate, even mid-step.
+ * (sim_time_ns is only updated at end of arm_step/arm_step_until batches,
+ *  so using it here returns frozen values during CSMA busy-waits.) */
+static inline int64_t sleeptimer_now_ns(cc2538_sleeptimer_t *st) {
+    return arm_cycles_to_ns(st->cpu->cycles, st->cpu->cpu_freq_hz);
+}
+
+/* Compute current counter value from CPU cycles */
 static uint32_t sleeptimer_get_count(cc2538_sleeptimer_t *st) {
-    int64_t elapsed_ns = st->cpu->sim_time_ns - st->base_ns;
+    int64_t elapsed_ns = sleeptimer_now_ns(st) - st->base_ns;
     if (elapsed_ns < 0) elapsed_ns = 0;
     /* ticks = elapsed_ns * 32768 / 1_000_000_000 */
     uint64_t ticks = (uint64_t)elapsed_ns * SLEEPTIMER_FREQ_HZ / 1000000000ULL;
@@ -32,7 +39,7 @@ static void sleeptimer_schedule_compare(cc2538_sleeptimer_t *st) {
     int64_t delta_ns = (int64_t)delta * 1000000000LL / SLEEPTIMER_FREQ_HZ;
 
     arm_schedule_event_ns(st->cpu, &st->compare_event,
-                          st->cpu->sim_time_ns + delta_ns);
+                          sleeptimer_now_ns(st) + delta_ns);
 }
 
 /* Compare match callback — fires interrupt */
@@ -40,9 +47,9 @@ static void sleeptimer_compare_fire(void *user_data, arm_event_t *ev) {
     cc2538_sleeptimer_t *st = (cc2538_sleeptimer_t *)user_data;
     (void)ev;
 
-    /* Update base to current time */
+    /* Update base to current time (use cycles-derived ns, not sim_time_ns) */
     st->base_count = sleeptimer_get_count(st);
-    st->base_ns = st->cpu->sim_time_ns;
+    st->base_ns = sleeptimer_now_ns(st);
 
     /* Set interrupt pending — wakes CPU from WFI */
     arm_nvic_set_pending(st->nvic, st->irq);

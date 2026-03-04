@@ -101,15 +101,10 @@ static void rfcore_tx_done(void *user_data, arm_event_t *ev) {
         rfcore_set_state(rf, RF_STATE_SFD_WAIT);
         rf->rx_frame_state = RF_RX_PREAMBLE;
         rf->zero_symbols = 0;
-        /* Deliver any bytes that arrived during TX */
-        if (rf->rx_incoming_len > 0) {
-            int len = rf->rx_incoming_len;
-            uint8_t buf[256];
-            memcpy(buf, rf->rx_incoming, (size_t)len);
-            rf->rx_incoming_len = 0;
-            for (int i = 0; i < len; i++)
-                cc2538_rfcore_receive_byte(rf, buf[i]);
-        }
+        /* Discard bytes that arrived during TX — on real hardware these
+         * are collisions (can't TX and RX simultaneously).  The auto-ACK
+         * is already injected into RXFIFO by the ISTXON handler. */
+        rf->rx_incoming_len = 0;
     } else {
         rfcore_set_state(rf, RF_STATE_IDLE);
     }
@@ -128,31 +123,15 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
             /* Reset frame parsing state */
             rf->rx_frame_state = RF_RX_PREAMBLE;
             rf->zero_symbols = 0;
-            /* Deliver any buffered incoming bytes */
-            if (rf->rx_incoming_len > 0) {
-                int len = rf->rx_incoming_len;
-                uint8_t buf[256];
-                memcpy(buf, rf->rx_incoming, (size_t)len);
-                rf->rx_incoming_len = 0;
-                for (int i = 0; i < len; i++)
-                    cc2538_rfcore_receive_byte(rf, buf[i]);
-            }
+            /* Discard bytes buffered while radio was off/idle — on real
+             * hardware the radio wasn't listening. */
+            rf->rx_incoming_len = 0;
             break;
 
         case CSP_ISTXON: {
             rf->software_off = false;
             rfcore_set_state(rf, RF_STATE_TX_CALIBR);
             rfcore_set_state(rf, RF_STATE_TX);
-#ifdef DEBUG
-            /* Debug: dump TX frame */
-            {
-                fprintf(stderr, "[RF node%d] TX frame len=%d: ",
-                        rf->node_id, rf->txfifo_len > 0 ? rf->txfifo[0] : 0);
-                for (int k = 1; k < rf->txfifo_len && k < 21; k++)
-                    fprintf(stderr, "%02x ", rf->txfifo[k]);
-                fprintf(stderr, "...\n");
-            }
-#endif
             /* Emit 802.15.4 preamble + SFD, then TXFIFO bytes + auto-CRC */
             if (rf->tx_callback) {
                 /* 4-byte preamble */
@@ -184,6 +163,58 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
                 arm_schedule_event_ns(rf->cpu, &rf->tx_event,
                                       rf->cpu->sim_time_ns + tx_ns);
             }
+            /* Inject auto-ACK bytes directly into RXFIFO.
+             *
+             * On real CC2538, the ACK arrives ~200µs after TX completes.
+             * In our simulation, all bytes are emitted/delivered in the
+             * ISTXON handler.  The receiver's auto-ACK bytes land in
+             * rx_incoming (sender is in TX state).  If we wait for tx_done
+             * (3+ ms) to replay them, the firmware's CSMA ACK busy-wait
+             * (RTIMER-based, but RTIMER is frozen during arm_step_until)
+             * may loop forever or fail to find the ACK.
+             *
+             * Fix: parse rx_incoming to extract the ACK frame and inject
+             * it directly into the RXFIFO.  We skip preamble+SFD and just
+             * write [length][payload...] + RSSI/CRC_OK metadata.  No
+             * interrupts are raised here — RXPKTDONE will be set later
+             * when tx_done fires and transitions to RX. */
+            if (rf->rx_incoming_len > 0 && rf->rxenable) {
+                /* Find SFD in rx_incoming to locate the frame */
+                int sfd_pos = -1;
+                for (int i = 0; i < rf->rx_incoming_len; i++) {
+                    if (rf->rx_incoming[i] == IEEE802154_SFD) {
+                        sfd_pos = i;
+                        break;
+                    }
+                }
+                if (sfd_pos >= 0 && sfd_pos + 1 < rf->rx_incoming_len) {
+                    int frame_start = sfd_pos + 1; /* length byte */
+                    int frame_len = rf->rx_incoming[frame_start]; /* payload length */
+                    int total = 1 + frame_len; /* length byte + payload */
+                    /* Compact RXFIFO first to reclaim read space */
+                    if (rf->rxfifo_rd > 0) {
+                        int remaining = rf->rxfifo_len - rf->rxfifo_rd;
+                        if (remaining > 0)
+                            memmove(rf->rxfifo, rf->rxfifo + rf->rxfifo_rd,
+                                    (size_t)remaining);
+                        rf->rxfifo_len = remaining;
+                        rf->rxfifo_rd = 0;
+                    }
+                    if (frame_start + total <= rf->rx_incoming_len &&
+                        rf->rxfifo_len + total <= RF_RXFIFO_SIZE) {
+                        /* Copy frame into RXFIFO */
+                        memcpy(rf->rxfifo + rf->rxfifo_len,
+                               rf->rx_incoming + frame_start, (size_t)total);
+                        rf->rxfifo_len += total;
+                        /* Replace last 2 bytes with RSSI + CRC_OK|LQI */
+                        if (rf->rxfifo_len >= 2) {
+                            rf->rxfifo[rf->rxfifo_len - 2] = (uint8_t)(int8_t)(-50);
+                            rf->rxfifo[rf->rxfifo_len - 1] = 0x80 | 50;
+                        }
+                    }
+                }
+                rf->rx_incoming_len = 0;
+            }
             break;
         }
 
@@ -203,6 +234,7 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
         case CSP_ISFLUSHRX:
             rf->rxfifo_len = 0;
             rf->rxfifo_rd = 0;
+            rf->rx_overflow = false;
             /* Do NOT clear rx_incoming here: those are bytes from future
              * transmissions buffered because the radio was busy.  They
              * will be delivered when ISRXON is next called. */
@@ -239,18 +271,19 @@ static void info_page_write(void *user_data, uint32_t addr, uint32_t value) {
 /* --- FFSM registers (address matching, EXT_ADDR, SHORT_ADDR, PAN_ID) --- */
 
 /* FFSM register offsets */
-#define FFSM_PAN_ID0      0x098
-#define FFSM_PAN_ID1      0x09C
-#define FFSM_SHORT_ADDR0  0x0A0
-#define FFSM_SHORT_ADDR1  0x0A4
-#define FFSM_EXT_ADDR0    0x0A8
-#define FFSM_EXT_ADDR1    0x0AC
-#define FFSM_EXT_ADDR2    0x0B0
-#define FFSM_EXT_ADDR3    0x0B4
-#define FFSM_EXT_ADDR4    0x0B8
-#define FFSM_EXT_ADDR5    0x0BC
-#define FFSM_EXT_ADDR6    0x0C0
-#define FFSM_EXT_ADDR7    0x0C4
+/* CC2538 FFSM address register offsets (from RFCORE_FFSM_BASE 0x40088000) */
+#define FFSM_EXT_ADDR0    0x5A8
+#define FFSM_EXT_ADDR1    0x5AC
+#define FFSM_EXT_ADDR2    0x5B0
+#define FFSM_EXT_ADDR3    0x5B4
+#define FFSM_EXT_ADDR4    0x5B8
+#define FFSM_EXT_ADDR5    0x5BC
+#define FFSM_EXT_ADDR6    0x5C0
+#define FFSM_EXT_ADDR7    0x5C4
+#define FFSM_PAN_ID0      0x5C8
+#define FFSM_PAN_ID1      0x5CC
+#define FFSM_SHORT_ADDR0  0x5D0
+#define FFSM_SHORT_ADDR1  0x5D4
 
 static int ffsm_read(void *user_data, uint32_t addr) {
     cc2538_rfcore_t *rf = (cc2538_rfcore_t *)user_data;
@@ -312,13 +345,15 @@ static int xreg_read(void *user_data, uint32_t addr) {
             return rf->software_off ? 0 : (int)rf->fsmstat0;
         case RFCORE_XREG_FSMSTAT1: {
             uint32_t val = rf->software_off ? 0 : rf->fsmstat1;
-            /* FIFO (bit 7): RX FIFO has data */
-            if (rf->rxfifo_rd < rf->rxfifo_len)
+            /* FIFO (bit 7): RX FIFO has data — but goes LOW on overflow.
+             * Real CC2538 uses FIFOP=1 && FIFO=0 as the overflow indicator;
+             * firmware detects this and does ISFLUSHRX to recover. */
+            if (rf->rxfifo_rd < rf->rxfifo_len && !rf->rx_overflow)
                 val |= (1 << 7);
             /* FIFOP (bit 6): live status — complete frame available in FIFO.
              * Unlike the RFIRQF0.FIFOP interrupt flag (which gets cleared by
              * the ISR), this hardware signal stays high as long as there are
-             * unread bytes in the RXFIFO. */
+             * unread bytes in the RXFIFO.  Stays high during overflow. */
             if (rf->rxfifo_rd < rf->rxfifo_len)
                 val |= (1 << 6);
             /* CCA (bit 4): always set — channel clear for simulation */
@@ -500,6 +535,50 @@ void cc2538_rfcore_set_tx_callback(cc2538_rfcore_t *rf,
     rf->tx_user_data = user_data;
 }
 
+/* --- 802.15.4 address filter for auto-ACK --- */
+
+/* Check if the received frame's destination address matches this node.
+ * Returns true for broadcast or matching short/ext address.
+ * Frame layout in RXFIFO: [len][FCF0][FCF1][DSN][DestPAN_lo][DestPAN_hi][DestAddr...]
+ * The 'base' index points to FCF0 (first byte after the length byte). */
+static bool rfcore_dest_addr_matches(cc2538_rfcore_t *rf) {
+    int base = rf->rxfifo_len - rf->rxlen; /* index of FCF0 */
+    if (base < 0 || rf->rxlen < 3) return true; /* too short, accept */
+
+    uint8_t fcf1 = rf->rxfifo[base + 1];
+    int dest_addr_mode = (fcf1 >> 2) & 0x03;
+
+    if (dest_addr_mode == 0) {
+        /* No destination address (beacons, ACKs) — accept */
+        return true;
+    }
+
+    /* Need DSN(1) + DestPAN(2) = 3 bytes after FCF, so at least 5 payload bytes */
+    if (rf->rxlen < 5) return true;
+
+    uint16_t dest_pan = rf->rxfifo[base + 3] | ((uint16_t)rf->rxfifo[base + 4] << 8);
+    /* PAN ID must match or be broadcast */
+    if (dest_pan != 0xFFFF && dest_pan != rf->pan_id) {
+        return false;
+    }
+
+    if (dest_addr_mode == 2) {
+        /* Short address (16-bit) */
+        if (rf->rxlen < 7) return true;
+        uint16_t dest_addr = rf->rxfifo[base + 5] | ((uint16_t)rf->rxfifo[base + 6] << 8);
+        return (dest_addr == 0xFFFF || dest_addr == rf->short_addr);
+    } else if (dest_addr_mode == 3) {
+        /* Extended address (64-bit) */
+        if (rf->rxlen < 13) return true;
+        for (int i = 0; i < 8; i++) {
+            if (rf->rxfifo[base + 5 + i] != rf->ext_addr[i]) return false;
+        }
+        return true;
+    }
+
+    return true; /* Unknown mode, accept */
+}
+
 /* --- RX byte processing with 802.15.4 frame parsing --- */
 
 void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
@@ -550,6 +629,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                 rf->rxfifo[rf->rxfifo_len++] = byte;
             else {
                 rxfifo_overflow_count++;
+
                 rf->rx_overflow = true;
             }
             if (rf->rxlen == 0) {
@@ -568,6 +648,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                 rf->rxfifo[rf->rxfifo_len++] = byte;
             else {
                 rxfifo_overflow_count++;
+
                 rf->rx_overflow = true;
             }
 
@@ -599,17 +680,6 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                 }
 
                 rf->rfirqf0 |= RFIRQF0_RXPKTDONE | RFIRQF0_FIFOP;
-#ifdef DEBUG
-                /* Debug: dump received frame for RPL debugging */
-                {
-                    int start = rf->rxfifo_len - rf->rxlen;
-                    fprintf(stderr, "[RF node%d] RX frame len=%d: ",
-                            rf->node_id, rf->rxlen);
-                    for (int k = start; k < rf->rxfifo_len; k++)
-                        fprintf(stderr, "%02x ", rf->rxfifo[k]);
-                    fprintf(stderr, "\n");
-                }
-#endif
                 rfcore_check_interrupts(rf);
 
                 /* Auto-ACK: if FRMCTRL0.AUTOACK (bit 5) is set and the
@@ -618,7 +688,8 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                  * we must NOT ACK.  This lets the sender's CSMA retransmit.
                  * ACK frame: preamble(4) + SFD(1) + len(1) + FCF(2) + DSN(1) + FCS(2) */
                 if ((rf->frmctrl0 & (1 << 5)) && rf->rx_ack_request &&
-                    rf->tx_callback && !rf->rx_overflow) {
+                    rf->tx_callback && !rf->rx_overflow &&
+                    rfcore_dest_addr_matches(rf)) {
                     for (int i = 0; i < PREAMBLE_MIN; i++)
                         rf->tx_callback(rf->tx_user_data, 0x00);
                     rf->tx_callback(rf->tx_user_data, IEEE802154_SFD);

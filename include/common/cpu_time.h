@@ -7,12 +7,12 @@
 #include <stdint.h>
 
 static inline int64_t cpu_ns_to_cycles(int64_t ns, uint32_t freq_hz) {
-    return ns * (int64_t)freq_hz / 1000000000LL;
+    return (int64_t)((__int128)ns * (int64_t)freq_hz / 1000000000LL);
 }
 
 static inline int64_t cpu_cycles_to_ns(int64_t cycles, uint32_t freq_hz) {
     if (freq_hz == 0) return 0;
-    return cycles * 1000000000LL / (int64_t)freq_hz;
+    return (int64_t)((__int128)cycles * 1000000000LL / (int64_t)freq_hz);
 }
 
 /* Architecture-specific aliases for backward compatibility */
