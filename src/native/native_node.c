@@ -101,6 +101,9 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
     RESOLVE_SYM(node, simMoteID, int *);
     RESOLVE_SYM(node, simMoteIDChanged, char *);
     RESOLVE_SYM(node, simRandomSeed, int *);
+    RESOLVE_SYM_OPT(node, simSerialReceivingData, char *);
+    RESOLVE_SYM_OPT(node, simSerialReceivingLength, int *);
+    RESOLVE_SYM_OPT(node, simSerialReceivingFlag, char *);
 
     /* Set initial state before cooja_init */
     *node->simMoteID = node_id;

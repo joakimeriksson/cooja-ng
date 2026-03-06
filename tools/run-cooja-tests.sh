@@ -50,8 +50,8 @@ echo "  Test pattern: $TEST_PATTERN"
 echo "  Firmware: $FIRMWARE_DIR"
 echo ""
 
-# Skip patterns: TSCH tests, border-router, node-reboot tests
-SKIP_PATTERNS="tsch|border-router|br-|reboot|TSCH"
+# Skip patterns: TSCH tests, border-router
+SKIP_PATTERNS="tsch|border-router|br-|TSCH"
 
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT

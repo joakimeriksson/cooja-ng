@@ -115,7 +115,15 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
 
         fw_name = source_to_firmware_name(source)
         if fw_name and firmware_dir:
-            fw_path = os.path.join(firmware_dir, fw_name + ".cc2538dk")
+            # Auto-detect extension: try .cooja, .cc2538dk, .sky
+            fw_path = None
+            for ext in (".cooja", ".cc2538dk", ".sky"):
+                candidate = os.path.join(firmware_dir, fw_name + ext)
+                if os.path.exists(candidate):
+                    fw_path = candidate
+                    break
+            if fw_path is None:
+                fw_path = os.path.join(firmware_dir, fw_name + ".cc2538dk")
         elif fw_name:
             fw_path = fw_name + ".cc2538dk"
         else:
@@ -206,12 +214,11 @@ def clean_script(script):
 def detect_unsupported_features(script):
     """Detect features that can't be converted."""
     features = []
-    if re.search(r'sim\.removeMote\s*\(', script):
-        features.append("removeMote")
-    if re.search(r'sim\.addMote\s*\(', script):
-        features.append("addMote")
     if re.search(r'generateMote\s*\(', script):
-        features.append("generateMote")
+        # generateMote is only unsupported when NOT part of a remove/add pattern
+        # Check if all generateMote calls are in addMote handlers
+        if not re.search(r'sim\.addMote\s*\(', script):
+            features.append("generateMote")
     if re.search(r'java\.util\.Random', script):
         features.append("java.util.Random")
     return features
@@ -219,26 +226,146 @@ def detect_unsupported_features(script):
 
 def parse_timeout(script):
     """Parse TIMEOUT(ms) or TIMEOUT(ms, callback).
-    Returns (timeout_ms, timeout_is_success, fail_on_patterns)."""
+    Returns (timeout_ms, timeout_is_success, fail_on_patterns, validators)."""
+    validators = []
+
     # TIMEOUT(ms, if(condition) { log.testOK(); })
     m = re.search(
         r'TIMEOUT\s*\(\s*(\d+)\s*,\s*if\s*\(([^)]+)\)\s*\{\s*log\.testOK\(\)\s*;?\s*\}',
         script
     )
     if m:
-        return int(m.group(1)), True, []
+        timeout_ms = int(m.group(1))
+        condition = m.group(2)
+        validators = _extract_validators(condition, script)
+        return timeout_ms, True, [], validators
 
     # TIMEOUT(ms, log.testFailed())
     m = re.search(r'TIMEOUT\s*\(\s*(\d+)\s*,\s*log\.testFailed\(\)', script)
     if m:
-        return int(m.group(1)), False, []
+        return int(m.group(1)), False, [], []
 
     # Simple TIMEOUT(ms)
     m = re.search(r'TIMEOUT\s*\(\s*(\d+)\s*\)', script)
     if m:
-        return int(m.group(1)), False, []
+        return int(m.group(1)), False, [], []
 
-    return None, False, []
+    return None, False, [], []
+
+
+def _extract_validators(condition, script):
+    """Extract validators from a TIMEOUT condition expression.
+    Detects patterns like:
+      seenMsgs > 15           -> min_count = 16
+      lastMsg != -1           -> min_count = 1  (at least one Data msg)
+      lastMsg >= 62           -> min_count = 63
+      lostMsgs == 0           -> (ignored, can't model with counters)
+    The pattern ("Data") is detected from the script body."""
+    validators = []
+
+    # Detect the counting pattern from the script body
+    pattern = _detect_counted_pattern(script)
+    if not pattern:
+        return validators
+
+    # seenMsgs > N  ->  min_count = N+1
+    m = re.search(r'seenMsgs\s*>\s*(\d+)', condition)
+    if m:
+        validators.append({
+            "pattern": pattern,
+            "min_count": int(m.group(1)) + 1,
+            "node": -1
+        })
+        return validators
+
+    # seenMsgs >= N  ->  min_count = N
+    m = re.search(r'seenMsgs\s*>=\s*(\d+)', condition)
+    if m:
+        validators.append({
+            "pattern": pattern,
+            "min_count": int(m.group(1)),
+            "node": -1
+        })
+        return validators
+
+    # lastMsg >= N  ->  min_count = N+1 (at least N+1 messages seen)
+    m = re.search(r'lastMsg\s*>=\s*(\d+)', condition)
+    if m:
+        validators.append({
+            "pattern": pattern,
+            "min_count": int(m.group(1)) + 1,
+            "node": -1
+        })
+        return validators
+
+    # lastMsg != -1  ->  min_count = 1 (at least one message)
+    if re.search(r'lastMsg\s*!=\s*-1', condition):
+        validators.append({
+            "pattern": pattern,
+            "min_count": 1,
+            "node": -1
+        })
+        return validators
+
+    # packetsReceived.length > N  ->  min_count = N+1
+    m = re.search(r'packetsReceived\.length\s*>\s*(\d+)', condition)
+    if m:
+        validators.append({
+            "pattern": pattern,
+            "min_count": int(m.group(1)) + 1,
+            "node": -1
+        })
+        return validators
+
+    # packetsReceived.length >= N  ->  min_count = N
+    m = re.search(r'packetsReceived\.length\s*>=\s*(\d+)', condition)
+    if m:
+        validators.append({
+            "pattern": pattern,
+            "min_count": int(m.group(1)),
+            "node": -1
+        })
+        return validators
+
+    return validators
+
+
+def _detect_counted_pattern(script):
+    """Detect which message pattern is being counted in the script.
+    Looks for seenMsgs++ or lastMsg assignment in the same block as
+    msg.startsWith/contains check."""
+    # Find all msg.startsWith("X") or msg.contains("X") blocks
+    for m in re.finditer(
+        r'msg\.(?:startsWith|contains)\s*\(\s*["\']([^"\']+)["\']\s*\)',
+        script
+    ):
+        pattern = m.group(1)
+        # Get the block between the { } of this else-if branch
+        rest = script[m.end():]
+        block = ""
+        depth = 0
+        started = False
+        for i, ch in enumerate(rest):
+            if ch == '{':
+                if not started:
+                    started = True
+                    depth = 1
+                    continue
+                depth += 1
+            elif ch == '}':
+                if started:
+                    depth -= 1
+                    if depth == 0:
+                        block = rest[:i]
+                        break
+            if started:
+                block += ch
+            if i > 2000:  # safety limit
+                break
+        if re.search(r'seenMsgs\s*\+\+|lastMsg\s*=|packetsReceived\.push', block):
+            return pattern
+
+    return None
 
 
 def parse_wait_until_sequence(script):
@@ -376,16 +503,78 @@ def parse_counter_loop(script):
     return steps
 
 
+def _resolve_script_vars(script):
+    """Extract simple variable declarations: var name = number_or_string."""
+    vars = {}
+    for m in re.finditer(r'var\s+(\w+)\s*=\s*(\d+)\s*;', script):
+        vars[m.group(1)] = int(m.group(2))
+    return vars
+
+
+def _resolve_value(expr, vars):
+    """Resolve a numeric expression (literal or variable name) to int."""
+    expr = expr.strip()
+    if expr.isdigit():
+        return int(expr)
+    if expr in vars:
+        return vars[expr]
+    return None
+
+
+def _resolve_string(expr, vars):
+    """Resolve a string expression like '"text" + var' or '"text"'."""
+    expr = expr.strip()
+    # Simple string literal
+    m = re.match(r'^["\']([^"\']*)["\']$', expr)
+    if m:
+        return m.group(1)
+    # String concatenation: "text" + var
+    parts = re.split(r'\s*\+\s*', expr)
+    result = ""
+    for p in parts:
+        p = p.strip()
+        sm = re.match(r'^["\']([^"\']*)["\']$', p)
+        if sm:
+            result += sm.group(1)
+        elif p in vars:
+            result += str(vars[p])
+        else:
+            return None  # can't resolve
+    return result
+
+
 def parse_generate_msg(script):
-    """Parse GENERATE_MSG(timestamp, "label") calls.
+    """Parse GENERATE_MSG(timestamp, "label") and MY_GENERATE_MSG calls.
     Returns list of (timestamp_ms, label)."""
     msgs = []
+    vars = _resolve_script_vars(script)
+
+    # Standard GENERATE_MSG(timestamp, "label")
     for m in re.finditer(
-        r'GENERATE_MSG\s*\(\s*(\d+)\s*,\s*["\']([^"\']+)["\']\s*\)', script
+        r'(?<!MY_)GENERATE_MSG\s*\(\s*(\d+)\s*,\s*["\']([^"\']+)["\']\s*\)', script
     ):
         timestamp_ms = int(m.group(1))
         label = m.group(2)
         msgs.append((timestamp_ms, label))
+
+    # MY_GENERATE_MSG with accumulated time:
+    # function MY_GENERATE_MSG(wait, string) { last_msg += wait; GENERATE_MSG(last_msg, string); }
+    if re.search(r'function\s+MY_GENERATE_MSG', script):
+        accumulated = 0
+        for m in re.finditer(
+            r'MY_GENERATE_MSG\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)', script
+        ):
+            wait_expr = m.group(1).strip()
+            label_expr = m.group(2).strip()
+
+            wait_val = _resolve_value(wait_expr, vars)
+            label_val = _resolve_string(label_expr, vars)
+
+            if wait_val is not None:
+                accumulated += wait_val
+            if label_val is not None:
+                msgs.append((accumulated, label_val))
+
     return msgs
 
 
@@ -413,21 +602,166 @@ def parse_setcoordinates(script, gen_msgs):
     return actions
 
 
+def _find_handler_block(script, label):
+    """Find handler code block(s) matching a GENERATE_MSG label.
+    Tries exact match first, then startsWith prefix match.
+    Returns list of (handler_start, block_text) tuples."""
+    results = []
+
+    # Try exact match: msg.equals("label")
+    for m in re.finditer(
+        r'msg\.equals\s*\(\s*["\']' + re.escape(label) + r'["\']\s*\)',
+        script
+    ):
+        start = m.start()
+        block = script[start:start + 500]
+        results.append((start, block))
+
+    # Try startsWith: msg.startsWith("prefix") where label starts with prefix
+    for m in re.finditer(
+        r'msg\.startsWith\s*\(\s*["\']([^"\']+)["\']\s*\)',
+        script
+    ):
+        prefix = m.group(1)
+        if label.startswith(prefix):
+            start = m.start()
+            block = script[start:start + 500]
+            results.append((start, block))
+
+    # Try contains: msg.contains("substring") where label contains substring
+    for m in re.finditer(
+        r'msg\.contains\s*\(\s*["\']([^"\']+)["\']\s*\)',
+        script
+    ):
+        substring = m.group(1)
+        if substring in label:
+            start = m.start()
+            block = script[start:start + 500]
+            results.append((start, block))
+
+    return results
+
+
+def _extract_node_id_from_block(block, script):
+    """Extract node ID from a handler block, trying literal then variable."""
+    # Try literal getMoteWithID(N) or setMoteID(N)
+    for pattern in [r'getMoteWithID\s*\(\s*(\d+)\s*\)',
+                    r'setMoteID\s*\(\s*(\d+)\s*\)']:
+        id_m = re.search(pattern, block)
+        if id_m:
+            return int(id_m.group(1))
+
+    # Try variable-based: getMoteWithID(var) or setMoteID(var)
+    for pattern in [r'getMoteWithID\s*\(\s*(\w+)\s*\)',
+                    r'setMoteID\s*\(\s*(\w+)\s*\)']:
+        id_m = re.search(pattern, block)
+        if id_m:
+            var_name = id_m.group(1)
+            if var_name.isdigit():
+                continue
+            var_m = re.search(
+                r'var\s+' + re.escape(var_name) + r'\s*=\s*(\d+)',
+                script
+            )
+            if var_m:
+                return int(var_m.group(1))
+
+    return None
+
+
+def parse_remove_add_actions(script, gen_msgs):
+    """Parse removeMote/addMote patterns triggered by GENERATE_MSG labels.
+    Returns list of action dicts with type 'remove' or 'add'."""
+    actions = []
+
+    if not re.search(r'sim\.removeMote\s*\(', script) and \
+       not re.search(r'sim\.addMote\s*\(', script):
+        return actions
+
+    for timestamp_ms, label in gen_msgs:
+        handlers = _find_handler_block(script, label)
+        for _, block in handlers:
+            if re.search(r'sim\.removeMote\s*\(', block):
+                node_id = _extract_node_id_from_block(block, script)
+                if node_id is not None:
+                    actions.append({
+                        "type": "remove", "node": node_id,
+                        "at_ms": timestamp_ms
+                    })
+                    break
+            elif re.search(r'sim\.addMote\s*\(', block):
+                node_id = _extract_node_id_from_block(block, script)
+                if node_id is not None:
+                    actions.append({
+                        "type": "add", "node": node_id,
+                        "at_ms": timestamp_ms
+                    })
+                    break
+
+    return actions
+
+
 def parse_write_calls(script, gen_msgs):
-    """Parse write(sim.getMoteWithID(N), "command") patterns.
+    """Parse write(mote, "command") patterns triggered by GENERATE_MSG labels.
+    Matches handler blocks to extract node ID, data, and timing.
     Returns list of action dicts."""
     actions = []
 
-    # Direct write calls at specific times (via GENERATE_MSG triggers)
-    for m in re.finditer(
-        r'write\s*\(\s*sim\.getMoteWithID\s*\(\s*(\d+)\s*\)\s*,\s*["\']([^"\']+)["\']\s*\)',
-        script
-    ):
-        node_id = int(m.group(1))
-        data = m.group(2)
-        if not data.endswith("\n"):
-            data += "\n"
-        actions.append({"type": "send", "node": node_id, "data": data})
+    if not re.search(r'write\s*\(', script):
+        return actions
+
+    for timestamp_ms, label in gen_msgs:
+        handlers = _find_handler_block(script, label)
+        for _, block in handlers:
+            # Match write(m, "data") or write(motes[i], "data") patterns
+            wm = re.search(
+                r'write\s*\(\s*(\w+(?:\[\w+\])?)\s*,\s*["\']([^"\']+)["\']\s*\)',
+                block
+            )
+            if not wm:
+                continue
+
+            data = wm.group(2)
+            if not data.endswith("\n"):
+                data += "\n"
+
+            var_name = wm.group(1)
+            # Check if it's write(motes[i], ...) — broadcast to all nodes
+            if re.match(r'motes\[', var_name) or var_name == 'motes':
+                actions.append({
+                    "type": "send_all",
+                    "data": data, "at_ms": timestamp_ms
+                })
+                break
+
+            # Find node ID: look for getMoteWithID(N) assignment to var
+            node_id = None
+            # Same block: m = sim.getMoteWithID(N) ... write(m, ...)
+            id_m = re.search(
+                r'getMoteWithID\s*\(\s*(\d+)\s*\)', block
+            )
+            if id_m:
+                node_id = int(id_m.group(1))
+            else:
+                # Variable-based: getMoteWithID(var)
+                id_m = re.search(
+                    r'getMoteWithID\s*\(\s*(\w+)\s*\)', block
+                )
+                if id_m:
+                    vn = id_m.group(1)
+                    var_m = re.search(
+                        r'var\s+' + re.escape(vn) + r'\s*=\s*(\d+)',
+                        script
+                    )
+                    if var_m:
+                        node_id = int(var_m.group(1))
+
+            if node_id is not None:
+                actions.append({
+                    "type": "send", "node": node_id,
+                    "data": data, "at_ms": timestamp_ms
+                })
+                break
 
     return actions
 
@@ -440,11 +774,13 @@ def translate_script(script, nodes):
     unsupported = detect_unsupported_features(script)
 
     test = {}
-    timeout_ms, timeout_is_success, _ = parse_timeout(script)
+    timeout_ms, timeout_is_success, _, validators = parse_timeout(script)
     if timeout_ms:
         test["timeout_ms"] = timeout_ms
     if timeout_is_success:
         test["timeout_is_success"] = True
+    if validators:
+        test["validators"] = validators
 
     # Extract fail_on patterns
     fail_on = parse_fail_conditions(script)
@@ -475,17 +811,47 @@ def translate_script(script, nodes):
     # the test succeeds if it runs to timeout without hitting fail_on.
     # No steps needed — just fail_on + timeout_is_success.
 
+    # Parse GENERATE_MSG for timed actions
+    gen_msgs = parse_generate_msg(script)
+
+    # Filter out steps that match GENERATE_MSG labels (script-internal messages,
+    # not node output). If a filtered step was the termination condition,
+    # convert to timeout_is_success at that timestamp.
+    if steps and gen_msgs:
+        gen_labels = {label for _, label in gen_msgs}
+        filtered = [s for s in steps if s.get("wait") not in gen_labels]
+        removed = [s for s in steps if s.get("wait") in gen_labels]
+        if removed and not filtered:
+            # All steps were script-internal — use timeout_is_success
+            # with the latest matching GENERATE_MSG timestamp
+            for s in removed:
+                for ts, label in gen_msgs:
+                    if label == s.get("wait"):
+                        if not timeout_ms or ts > timeout_ms:
+                            timeout_ms = ts + 5000  # small margin
+                            test["timeout_ms"] = timeout_ms
+            test["timeout_is_success"] = True
+            timeout_is_success = True
+        steps = filtered
+
     if steps:
         test["steps"] = steps
 
-    # Parse GENERATE_MSG for timed actions
-    gen_msgs = parse_generate_msg(script)
+    # If no explicit TIMEOUT, derive from last GENERATE_MSG timestamp + margin
+    if not timeout_ms and gen_msgs:
+        last_ts = max(ts for ts, _ in gen_msgs)
+        if last_ts > 0:
+            timeout_ms = last_ts + 30000  # 30s margin
+            test["timeout_ms"] = timeout_ms
 
     # Parse position changes
     move_actions = parse_setcoordinates(script, gen_msgs)
     write_actions = parse_write_calls(script, gen_msgs)
+    remove_add_actions = parse_remove_add_actions(script, gen_msgs)
 
-    actions = move_actions + write_actions
+    actions = move_actions + write_actions + remove_add_actions
+    # Sort by time so the simulation executes them in order
+    actions.sort(key=lambda a: a.get("at_ms", 0))
     if actions:
         test["actions"] = actions
 

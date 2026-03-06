@@ -215,6 +215,43 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
         if (cJSON_IsTrue(tis))
             cfg->test.timeout_is_success = 1;
 
+        /* Parse validators array */
+        cJSON *validators = cJSON_GetObjectItemCaseSensitive(test, "validators");
+        if (cJSON_IsArray(validators)) {
+            int vi = 0;
+            cJSON *val_item;
+            cJSON_ArrayForEach(val_item, validators) {
+                if (vi >= MAX_TEST_VALIDATORS) {
+                    fprintf(stderr, "sim_config: too many validators (max %d)\n",
+                            MAX_TEST_VALIDATORS);
+                    break;
+                }
+                sim_test_validator_t *v = &cfg->test.validators[vi];
+                v->node = -1;
+                v->min_count = 1;
+
+                cJSON *vpat = cJSON_GetObjectItemCaseSensitive(val_item, "pattern");
+                if (cJSON_IsString(vpat) && vpat->valuestring) {
+                    snprintf(v->pattern, sizeof(v->pattern), "%s",
+                             vpat->valuestring);
+                } else {
+                    fprintf(stderr, "sim_config: validator %d missing 'pattern'\n", vi);
+                    continue;
+                }
+
+                cJSON *vmin = cJSON_GetObjectItemCaseSensitive(val_item, "min_count");
+                if (cJSON_IsNumber(vmin))
+                    v->min_count = vmin->valueint;
+
+                cJSON *vnode = cJSON_GetObjectItemCaseSensitive(val_item, "node");
+                if (cJSON_IsNumber(vnode))
+                    v->node = vnode->valueint;
+
+                vi++;
+            }
+            cfg->test.validator_count = vi;
+        }
+
         /* Parse actions array */
         cJSON *actions = cJSON_GetObjectItemCaseSensitive(test, "actions");
         if (cJSON_IsArray(actions)) {
@@ -239,6 +276,12 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
                         a->type = TEST_ACTION_MOVE;
                     else if (strcmp(atype->valuestring, "send") == 0)
                         a->type = TEST_ACTION_SEND;
+                    else if (strcmp(atype->valuestring, "remove") == 0)
+                        a->type = TEST_ACTION_REMOVE;
+                    else if (strcmp(atype->valuestring, "add") == 0)
+                        a->type = TEST_ACTION_ADD;
+                    else if (strcmp(atype->valuestring, "send_all") == 0)
+                        a->type = TEST_ACTION_SEND_ALL;
                 }
 
                 cJSON *anode = cJSON_GetObjectItemCaseSensitive(act_item, "node");
@@ -324,6 +367,16 @@ void sim_config_print(const sim_config_t *cfg) {
         }
         if (cfg->test.timeout_is_success)
             printf("  timeout_is_success: true\n");
+        if (cfg->test.validator_count > 0) {
+            printf("  validators: %d\n", cfg->test.validator_count);
+            for (int i = 0; i < cfg->test.validator_count; i++) {
+                const sim_test_validator_t *v = &cfg->test.validators[i];
+                printf("    [%d] \"%s\" min_count=%d", i, v->pattern, v->min_count);
+                if (v->node >= 0)
+                    printf(" node=%d", v->node);
+                printf("\n");
+            }
+        }
         if (cfg->test.action_count > 0) {
             printf("  actions: %d\n", cfg->test.action_count);
             for (int i = 0; i < cfg->test.action_count; i++) {
@@ -334,6 +387,15 @@ void sim_config_print(const sim_config_t *cfg) {
                 else if (a->type == TEST_ACTION_SEND)
                     printf("    [%d] at %lld ms: send node %d \"%s\"\n",
                            i, (long long)a->at_ms, a->node, a->data);
+                else if (a->type == TEST_ACTION_REMOVE)
+                    printf("    [%d] at %lld ms: remove node %d\n",
+                           i, (long long)a->at_ms, a->node);
+                else if (a->type == TEST_ACTION_ADD)
+                    printf("    [%d] at %lld ms: add node %d\n",
+                           i, (long long)a->at_ms, a->node);
+                else if (a->type == TEST_ACTION_SEND_ALL)
+                    printf("    [%d] at %lld ms: send_all \"%s\"\n",
+                           i, (long long)a->at_ms, a->data);
             }
         }
     }

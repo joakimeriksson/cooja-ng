@@ -23,6 +23,7 @@
 #define MAX_TEST_STEPS 32
 #define MAX_FAIL_PATTERNS 8
 #define MAX_TEST_ACTIONS 64
+#define MAX_TEST_VALIDATORS 8
 
 typedef struct {
     char pattern[256];
@@ -34,7 +35,16 @@ typedef struct {
 typedef enum {
     TEST_ACTION_MOVE = 1,
     TEST_ACTION_SEND = 2,
+    TEST_ACTION_REMOVE = 3,
+    TEST_ACTION_ADD = 4,
+    TEST_ACTION_SEND_ALL = 5,
 } test_action_type_t;
+
+typedef struct {
+    char pattern[256];
+    int  min_count;    /* minimum matches required at end of test */
+    int  node;         /* -1 = any */
+} sim_test_validator_t;
 
 typedef struct {
     test_action_type_t type;
@@ -58,6 +68,10 @@ typedef struct {
     /* timed actions (move, send) */
     int action_count;
     sim_test_action_t actions[MAX_TEST_ACTIONS];
+
+    /* end-of-test validators: pattern counters checked at timeout */
+    int validator_count;
+    sim_test_validator_t validators[MAX_TEST_VALIDATORS];
 } sim_test_config_t;
 
 typedef struct {

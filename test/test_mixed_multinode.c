@@ -44,6 +44,7 @@ typedef struct {
     int id;
     char line_buf[256];
     int line_pos;
+    char firmware_path[256];
     union {
         msp430_platform_t msp;
         arm_platform_t arm;
@@ -287,6 +288,7 @@ typedef struct {
     int64_t step_start_ns;
     int  finished;          /* 0=running, 1=pass, -1=fail */
     char fail_reason[512];
+    int  validator_counts[MAX_TEST_VALIDATORS];
 } sim_test_state_t;
 
 static sim_test_state_t *active_test = NULL;
@@ -305,6 +307,15 @@ static void sim_test_check_line(int node_id, const char *line, int64_t sim_ns) {
                      (long long)(sim_ns / MS_TO_NS), line);
             return;
         }
+    }
+
+    /* Update validator counters (always, regardless of steps) */
+    for (int i = 0; i < active_test->config->validator_count; i++) {
+        const sim_test_validator_t *v = &active_test->config->validators[i];
+        if (v->node >= 0 && v->node != node_id)
+            continue;
+        if (strstr(line, v->pattern))
+            active_test->validator_counts[i]++;
     }
 
     /* If no steps, nothing more to check (fail_on-only or timeout_is_success test) */
@@ -1237,6 +1248,7 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     memset(node, 0, sizeof(*node));
     node->type = detect_node_type(firmware_path);
     node->id = node_id;
+    snprintf(node->firmware_path, sizeof(node->firmware_path), "%s", firmware_path);
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     emu_rx_end_ns[idx] = 0;
@@ -1263,6 +1275,25 @@ static void destroy_node(int idx) {
         arm_platform_destroy(&nodes[idx].plat.arm);
     else
         native_node_destroy(&nodes[idx].plat.native);
+}
+
+/* --- Reboot node (destroy + reinitialize) --- */
+
+static int reboot_node(int idx) {
+    int node_id = nodes[idx].id;
+    /* Copy firmware path before destroy — init_node's memset would zero it */
+    char fw[256];
+    snprintf(fw, sizeof(fw), "%s", nodes[idx].firmware_path);
+
+    /* Clear RF state for this node */
+    memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
+    memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
+    emu_rx_end_ns[idx] = 0;
+    tx_frame_asm_reset(&tx_asm[idx]);
+
+    /* Destroy and reinitialize */
+    destroy_node(idx);
+    return init_node(idx, fw, node_id);
 }
 
 /* --- Simulation step for one node --- */
@@ -1512,6 +1543,8 @@ int run_mixed_multinode_test(int argc, char **argv) {
             printf(", %d fail_on patterns", config.test.fail_on_count);
         if (config.test.timeout_is_success)
             printf(", timeout_is_success");
+        if (config.test.validator_count > 0)
+            printf(", %d validators", config.test.validator_count);
         if (config.test.action_count > 0)
             printf(", %d actions", config.test.action_count);
         printf("\n");
@@ -1680,7 +1713,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
                         }
                     }
                 } else if (act->type == TEST_ACTION_SEND) {
-                    /* Find node index by ID and send data via UART RX */
+                    /* Find node index by ID and send data via serial input */
                     for (int i = 0; i < node_count; i++) {
                         if (nodes[i].id == act->node) {
                             if (nodes[i].type == NODE_ARM) {
@@ -1688,11 +1721,80 @@ int run_mixed_multinode_test(int argc, char **argv) {
                                     cc2538_uart_receive_byte(
                                         &nodes[i].plat.arm.uart0,
                                         (uint8_t)act->data[b]);
+                            } else if (nodes[i].type == NODE_NATIVE) {
+                                native_node_t *nat = &nodes[i].plat.native;
+                                if (nat->simSerialReceivingData) {
+                                    int len = (int)strlen(act->data);
+                                    memcpy(nat->simSerialReceivingData,
+                                           act->data, (size_t)len);
+                                    *nat->simSerialReceivingLength = len;
+                                    *nat->simSerialReceivingFlag = 1;
+                                }
                             }
                             if (verbose)
                                 printf("  ACTION: send to node %d \"%s\" at %lld ms\n",
                                        act->node, act->data,
                                        (long long)(sim_ns / MS_TO_NS));
+                            break;
+                        }
+                    }
+                } else if (act->type == TEST_ACTION_SEND_ALL) {
+                    /* Send data via serial input to all active nodes */
+                    for (int i = 0; i < node_count; i++) {
+                        if (node_start_ns[i] > sim_ns)
+                            continue;  /* not yet started or removed */
+                        if (nodes[i].type == NODE_ARM) {
+                            for (int b = 0; act->data[b]; b++)
+                                cc2538_uart_receive_byte(
+                                    &nodes[i].plat.arm.uart0,
+                                    (uint8_t)act->data[b]);
+                        } else if (nodes[i].type == NODE_NATIVE) {
+                            native_node_t *nat = &nodes[i].plat.native;
+                            if (nat->simSerialReceivingData) {
+                                int len = (int)strlen(act->data);
+                                memcpy(nat->simSerialReceivingData,
+                                       act->data, (size_t)len);
+                                *nat->simSerialReceivingLength = len;
+                                *nat->simSerialReceivingFlag = 1;
+                            }
+                        }
+                    }
+                    if (verbose)
+                        printf("  ACTION: send_all \"%s\" at %lld ms\n",
+                               act->data, (long long)(sim_ns / MS_TO_NS));
+                } else if (act->type == TEST_ACTION_REMOVE) {
+                    /* Stop node: set start_ns to far future so it's never active */
+                    for (int i = 0; i < node_count; i++) {
+                        if (nodes[i].id == act->node) {
+                            node_start_ns[i] = INT64_MAX;
+                            if (verbose)
+                                printf("  ACTION: remove node %d at %lld ms\n",
+                                       act->node, (long long)(sim_ns / MS_TO_NS));
+                            break;
+                        }
+                    }
+                } else if (act->type == TEST_ACTION_ADD) {
+                    /* Reboot node: destroy, reinitialize, set time to now */
+                    for (int i = 0; i < node_count; i++) {
+                        if (nodes[i].id == act->node) {
+                            if (verbose)
+                                printf("  ACTION: add (reboot) node %d at %lld ms\n",
+                                       act->node, (long long)(sim_ns / MS_TO_NS));
+                            reboot_node(i);
+                            /* Set sim_time_ns to current time so stepping
+                             * resumes correctly (don't catch up from t=0) */
+                            if (nodes[i].type == NODE_MSP430) {
+                                msp430_cpu_t *cpu = &nodes[i].plat.msp.cpu;
+                                cpu->sim_time_ns = sim_ns;
+                                cpu->cycles = (uint64_t)sim_ns * cpu->cpu_freq_hz / 1000000000ULL;
+                            } else if (nodes[i].type == NODE_ARM) {
+                                arm_cpu_t *cpu = &nodes[i].plat.arm.cpu;
+                                cpu->sim_time_ns = sim_ns;
+                                cpu->cycles = sim_ns * cpu->cpu_freq_hz / 1000000000LL;
+                            } else {
+                                nodes[i].plat.native.sim_time_ns = sim_ns;
+                            }
+                            node_start_ns[i] = sim_ns;
                             break;
                         }
                     }
@@ -1933,6 +2035,22 @@ int run_mixed_multinode_test(int argc, char **argv) {
                      step->pattern, active_test->match_count, step->count);
         }
     }
+    /* Check validators at end of test (when test would otherwise pass) */
+    if (active_test && active_test->finished == 1 &&
+        active_test->config->validator_count > 0) {
+        for (int i = 0; i < active_test->config->validator_count; i++) {
+            if (active_test->validator_counts[i] <
+                active_test->config->validators[i].min_count) {
+                active_test->finished = -1;
+                snprintf(active_test->fail_reason, sizeof(active_test->fail_reason),
+                         "validator \"%s\" matched %d/%d times",
+                         active_test->config->validators[i].pattern,
+                         active_test->validator_counts[i],
+                         active_test->config->validators[i].min_count);
+                break;
+            }
+        }
+    }
     if (active_test) {
         printf("\n--- Test Results ---\n");
         for (int i = 0; i < active_test->config->step_count; i++) {
@@ -1949,6 +2067,17 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 printf(" node=%d", s->node);
             if (s->count > 1)
                 printf(" count=%d", s->count);
+            printf("\n");
+        }
+        /* Print validator results */
+        for (int i = 0; i < active_test->config->validator_count; i++) {
+            const sim_test_validator_t *v = &active_test->config->validators[i];
+            int count = active_test->validator_counts[i];
+            const char *vstat = (count >= v->min_count) ? "PASS" : "FAIL";
+            printf("  Validator [%s]: \"%s\" matched %d/%d",
+                   vstat, v->pattern, count, v->min_count);
+            if (v->node >= 0)
+                printf(" node=%d", v->node);
             printf("\n");
         }
         if (active_test->finished == 1) {
