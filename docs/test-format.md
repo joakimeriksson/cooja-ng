@@ -136,14 +136,54 @@ The test engine has two timeout modes:
 
 **No-steps tests:** If `steps` is empty (or absent) and `timeout_is_success` is not set, the test passes if no `fail_on` pattern is hit during the simulation. This is equivalent to a `fail_on`-only test.
 
+### Validators
+
+Validators are pattern counters that run throughout the entire simulation and are checked at the end. Unlike steps (which are sequential and end the test early on completion), validators never affect test flow — they just count and are evaluated at timeout.
+
+```json
+"test": {
+    "timeout_is_success": true,
+    "validators": [
+        { "pattern": "Data", "min_count": 16 },
+        { "pattern": "fd00::", "min_count": 4, "node": 1 }
+    ]
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pattern` | string | **required** | Substring to match in console output (`strstr`) |
+| `min_count` | int | 1 | Minimum matches required to pass |
+| `node` | int | -1 (any) | Only count matches from this node ID |
+
+**How they work:**
+
+- Every console output line is checked against every validator's pattern (independently of steps).
+- Each match increments that validator's counter.
+- When the simulation ends and the test would otherwise pass (timeout_is_success, or all steps completed), all validators are checked.
+- If **any** validator's count is below its `min_count`, the test **fails**.
+
+**Validators vs. steps:** Steps model sequential events ("first see X, then see Y"). Validators model aggregate counts ("see X at least N times total"). Use validators when the Cooja script counts messages over the full run, e.g. `if(seenMsgs > 15) testOK()`.
+
+**Output:**
+
+```
+Validator [PASS]: "Data" matched 23/16
+Validator [FAIL]: "fd00::" matched 2/4 node=1
+TEST FAILED: validator "fd00::" matched 2/4 times
+```
+
 ### Timed Actions
 
-Actions execute at specific simulation times, enabling dynamic scenarios like topology changes or serial input.
+Actions execute at specific simulation times, enabling dynamic scenarios like topology changes, serial input, and node reboot.
 
 ```json
 "actions": [
     { "at_ms": 60000,  "type": "move", "node": 4, "x": 58.0, "y": 108.0 },
-    { "at_ms": 120000, "type": "send", "node": 1, "data": "rpl-set-root 1\n" }
+    { "at_ms": 120000, "type": "send", "node": 1, "data": "rpl-set-root 1\n" },
+    { "at_ms": 120000, "type": "send_all", "data": "ip-addr\n" },
+    { "at_ms": 180000, "type": "remove", "node": 3 },
+    { "at_ms": 200000, "type": "add", "node": 3 }
 ]
 ```
 
@@ -169,6 +209,36 @@ Sends data to a node's UART RX (serial input). This is how you send shell comman
 | `node` | int | Node ID to send to |
 | `data` | string | Data to send (include `\n` for newline) |
 
+#### Send All Action
+
+Sends data to all active nodes' UART RX. Useful for broadcast queries like `ip-addr`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `at_ms` | int | Simulation time to execute (ms) |
+| `type` | string | `"send_all"` |
+| `data` | string | Data to send to every active node |
+
+#### Remove Action
+
+Removes a node from the simulation (stops stepping it). The node can be re-added later with `add`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `at_ms` | int | Simulation time to execute (ms) |
+| `type` | string | `"remove"` |
+| `node` | int | Node ID to remove |
+
+#### Add Action
+
+Re-adds a previously removed node by rebooting it (re-runs firmware from reset). The node resumes at current simulation time, not from t=0.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `at_ms` | int | Simulation time to execute (ms) |
+| `type` | string | `"add"` |
+| `node` | int | Node ID to reboot/add |
+
 Actions must be ordered by `at_ms`. They are executed in order as the simulation clock advances past each action's timestamp.
 
 ## Test Engine Evaluation Order
@@ -176,20 +246,22 @@ Actions must be ordered by `at_ms`. They are executed in order as the simulation
 On every line of console output from any node:
 
 1. Check all `fail_on` patterns. If any match → **FAIL** immediately.
-2. Check current step's `wait` pattern (with optional `node` filter). If match → increment match count.
-3. If match count reaches step's `count` → advance to next step.
-4. If all steps completed → **PASS**.
+2. Update all validator counters (increment count for each matching validator).
+3. Check current step's `wait` pattern (with optional `node` filter). If match → increment match count.
+4. If match count reaches step's `count` → advance to next step.
+5. If all steps completed → check validators → **PASS** or **FAIL**.
 
 On each simulation time step:
 
-5. Execute any pending actions whose `at_ms` has been reached.
-6. Check per-step timeout. If exceeded → **FAIL**.
+6. Execute any pending actions whose `at_ms` has been reached.
+7. Check per-step timeout. If exceeded → **FAIL**.
 
 On simulation end (global `timeout_ms` reached):
 
-7. If `timeout_is_success` → **PASS**.
-8. If no steps defined and no `fail_on` hit → **PASS**.
+8. If `timeout_is_success` or no steps defined → check validators → **PASS** or **FAIL**.
 9. Otherwise → **FAIL** (incomplete steps).
+
+Validator check: if any validator's count is below its `min_count`, the test fails even if steps/timeout would have passed.
 
 ## Examples
 
@@ -273,6 +345,53 @@ Runs for 1000 seconds of simulated time. Passes if no "packet loss" message appe
 
 Fails immediately if any output contains "FAILED". Passes when "DONE" appears.
 
+### RPL data exchange validation (validators)
+
+```json
+{
+    "timeout_ms": 2000000,
+    "radiomedium": { "type": "udgm", "tx_range": 50.0 },
+    "nodes": [
+        { "firmware": "firmware/cooja/root-node.cooja",     "id": 3, "x": 0, "y": 0 },
+        { "firmware": "firmware/cooja/sender-node.cooja",   "id": 2, "x": 30, "y": 0 },
+        { "firmware": "firmware/cooja/receiver-node.cooja", "id": 1, "x": 7, "y": -26 }
+    ],
+    "test": {
+        "timeout_is_success": true,
+        "validators": [
+            { "pattern": "Data", "min_count": 16 }
+        ]
+    }
+}
+```
+
+Runs for 2000 seconds. Passes only if at least 16 lines containing "Data" appear in console output. This validates that RPL converges and UDP data exchange actually happens, rather than just "no crash".
+
+### Node reboot with serial query
+
+```json
+{
+    "timeout_ms": 300000,
+    "nodes": [ "..." ],
+    "test": {
+        "timeout_is_success": true,
+        "validators": [
+            { "pattern": "fd00::", "min_count": 4 }
+        ],
+        "actions": [
+            { "at_ms": 1000,  "type": "send", "node": 4, "data": "rpl-set-root 1\n" },
+            { "at_ms": 61000, "type": "send_all", "data": "ip-addr\n" },
+            { "at_ms": 63000, "type": "remove", "node": 4 },
+            { "at_ms": 64000, "type": "add",    "node": 4 },
+            { "at_ms": 65000, "type": "send", "node": 4, "data": "rpl-set-root 1\n" },
+            { "at_ms": 125000, "type": "send_all", "data": "ip-addr\n" }
+        ]
+    }
+}
+```
+
+Sets node 4 as RPL root, queries all nodes for IP addresses, reboots the root, re-queries. Validates that at least 4 `fd00::` address lines appear (meaning nodes have RPL addresses).
+
 ### Dynamic topology with timed actions
 
 ```json
@@ -320,23 +439,26 @@ python3 tools/csc2json.py test.csc --firmware-dir firmware/cc2538dk --warn
 | Cooja JS | csim JSON |
 |----------|-----------|
 | `TIMEOUT(ms)` | `timeout_ms` |
-| `TIMEOUT(ms, if(cond) testOK())` | `timeout_is_success: true` |
+| `TIMEOUT(ms, if(cond) testOK())` | `timeout_is_success: true` + `validators` |
+| `TIMEOUT(ms, if(seenMsgs > 15) testOK())` | `validators: [{"pattern": "Data", "min_count": 16}]` |
+| `TIMEOUT(ms, if(lastMsg != -1) testOK())` | `validators: [{"pattern": "Data", "min_count": 1}]` |
 | `WAIT_UNTIL(id == N && msg.contains("X"))` | `{"wait": "X", "node": N}` |
 | `WAIT_UNTIL(msg.contains("X"))` | `{"wait": "X"}` |
 | `if(msg.contains("X")) testFailed()` | `"fail_on": ["X"]` |
 | `if(msg.contains("DONE")) break; testOK()` | `{"wait": "DONE"}` |
 | `GENERATE_MSG` + `setCoordinates` | `actions` with `type: "move"` |
+| `GENERATE_MSG` + `removeMote/addMote` | `actions` with `type: "remove"/"add"` |
 | `write(sim.getMoteWithID(N), "cmd")` | `actions` with `type: "send"` |
+| `write(motes[i], "cmd")` (broadcast) | `actions` with `type: "send_all"` |
 
 ### Unsupported Features
 
-Some Cooja test scripts use features that csim doesn't support. The converter flags these in an `unsupported_features` array in the output JSON:
+Some Cooja test scripts use features that can't be fully auto-converted. The converter flags these in an `unsupported_features` array in the output JSON:
 
-- `removeMote` / `addMote` — dynamic node creation/removal (node reboot tests)
-- `generateMote` — creating new mote instances at runtime
+- `generateMote` — creating new mote instances at runtime (without a matching addMote)
 - `java.util.Random` — Java random number generator in script logic
 
-Tests with these features may still work if the unsupported code paths aren't critical to the test outcome (e.g., commented-out removeMote calls).
+Complex validation logic (e.g., collecting IP addresses and cross-checking per-node) requires manual validators in the JSON config.
 
 ## Running Tests
 
@@ -370,5 +492,6 @@ Tests with these features may still work if the unsupported code paths aren't cr
 | Nodes | 128 |
 | Test steps | 32 |
 | Fail-on patterns | 8 |
+| Validators | 8 |
 | Actions | 64 |
 | Pattern length | 255 chars |
