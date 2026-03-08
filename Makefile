@@ -82,7 +82,13 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 
-.PHONY: all clean test bench test-firmware test-arm cooja-tests
+# Read CONTIKI_DIR from csim.conf if not set via env/cmdline
+CONTIKI_DIR ?= $(shell grep -s '^CONTIKI_DIR=' csim.conf | cut -d= -f2-)
+ifeq ($(CONTIKI_DIR),)
+  CONTIKI_DIR = ../contiki-ng
+endif
+
+.PHONY: all clean test bench test-firmware test-arm cooja-tests build-firmware configure
 
 all: $(BUILD_DIR)/test_runner
 
@@ -148,7 +154,16 @@ clean:
 
 # Run Contiki-NG Cooja test suite
 cooja-tests: $(BUILD_DIR)/test_runner
-	./tools/run-cooja-tests.sh $(CONTIKI_DIR)
+	CONTIKI_DIR=$(CONTIKI_DIR) ./tools/run-cooja-tests.sh $(PATTERN) $(if $(VERBOSE),-v)
+
+# Build firmware for Cooja tests
+build-firmware:
+	CONTIKI_DIR=$(CONTIKI_DIR) ./tools/build-test-firmware.sh --target cooja $(PATTERN)
+
+# Write csim.conf with CONTIKI_DIR
+configure:
+	@echo "CONTIKI_DIR=$(CONTIKI_DIR)" > csim.conf
+	@echo "Wrote csim.conf: CONTIKI_DIR=$(CONTIKI_DIR)"
 
 # Debug build
 debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -DDEBUG

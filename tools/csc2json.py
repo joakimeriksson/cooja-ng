@@ -53,16 +53,21 @@ def extract_radio_medium(sim_elem):
 
 
 def extract_mote_types(sim_elem, csc_dir):
-    """Extract mote type definitions: maps description to source file."""
+    """Extract mote type definitions: maps description to source file and build info."""
     mote_types = {}
     for mt in sim_elem.findall("motetype"):
         desc_elem = mt.find("description")
         source_elem = mt.find("source")
+        commands_elem = mt.find("commands")
         desc = desc_elem.text.strip() if desc_elem is not None and desc_elem.text else None
         source = source_elem.text.strip() if source_elem is not None and source_elem.text else None
+        commands = commands_elem.text if commands_elem is not None else None
 
         if source:
             source = source.replace("[CONFIG_DIR]", csc_dir)
+
+        # Parse build info from <commands>
+        build = parse_build_commands(commands)
 
         # Collect motes under this type
         motes = []
@@ -82,10 +87,52 @@ def extract_mote_types(sim_elem, csc_dir):
             motes.append(mote_info)
 
         if desc:
-            mote_types[desc] = {"source": source, "motes": motes}
+            mote_types[desc] = {"source": source, "motes": motes, "build": build}
         # Also index by ordinal (for getMoteTypes()[index] references)
 
     return mote_types
+
+
+def parse_build_commands(commands_text):
+    """Parse Contiki-NG <commands> element to extract build info.
+
+    Extracts TARGET, BOARD, DEFINES, and other KEY=VALUE make arguments
+    from the build command (the non-clean line).
+
+    Returns dict with keys: target, board, make_args (list of extra KEY=VALUE).
+    """
+    if not commands_text:
+        return None
+
+    build = {}
+    make_args = []
+
+    # Find the actual build line (not the clean line)
+    for line in commands_text.strip().split("\n"):
+        line = line.strip()
+        if not line or "clean" in line:
+            continue
+
+        # Parse KEY=VALUE tokens from the make command
+        for token in line.split():
+            if "=" not in token:
+                continue
+            key, val = token.split("=", 1)
+            if key == "TARGET":
+                build["target"] = val
+            elif key == "BOARD":
+                build["board"] = val
+            elif key in ("$(MAKE)", "CONTIKI", "WERROR"):
+                continue  # skip make itself and contiki path
+            elif key.startswith("-"):
+                continue  # skip flags like -j$(CPUS)
+            else:
+                make_args.append(f"{key}={val}")
+
+    if make_args:
+        build["make_args"] = make_args
+
+    return build if build else None
 
 
 def source_to_firmware_name(source_path):
@@ -99,7 +146,7 @@ def source_to_firmware_name(source_path):
 
 
 def extract_nodes(sim_elem, csc_dir, firmware_dir):
-    """Extract all nodes with positions, IDs, and firmware paths."""
+    """Extract all nodes with positions, IDs, firmware paths, and build info."""
     mote_types = extract_mote_types(sim_elem, csc_dir)
     nodes = []
 
@@ -107,30 +154,54 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
     for mt in sim_elem.findall("motetype"):
         desc_elem = mt.find("description")
         source_elem = mt.find("source")
+        commands_elem = mt.find("commands")
         desc = desc_elem.text.strip() if desc_elem is not None and desc_elem.text else ""
         source = source_elem.text.strip() if source_elem is not None and source_elem.text else None
+        commands = commands_elem.text if commands_elem is not None else None
 
         if source:
             source = source.replace("[CONFIG_DIR]", csc_dir)
+
+        # Parse build info to get target for extension detection
+        build = parse_build_commands(commands)
+        build_target = build.get("target") if build else None
 
         fw_name = source_to_firmware_name(source)
         if fw_name and firmware_dir:
             # Auto-detect extension: try .cooja, .cc2538dk, .sky
             fw_path = None
-            for ext in (".cooja", ".cc2538dk", ".sky"):
+            # If build target is known, try that extension first
+            if build_target:
+                ext = "." + build_target
                 candidate = os.path.join(firmware_dir, fw_name + ext)
                 if os.path.exists(candidate):
                     fw_path = candidate
-                    break
             if fw_path is None:
-                fw_path = os.path.join(firmware_dir, fw_name + ".cc2538dk")
+                for ext in (".cooja", ".cc2538dk", ".sky"):
+                    candidate = os.path.join(firmware_dir, fw_name + ext)
+                    if os.path.exists(candidate):
+                        fw_path = candidate
+                        break
+            if fw_path is None:
+                # Fall back to build target extension, then .cc2538dk
+                fallback_ext = "." + build_target if build_target else ".cc2538dk"
+                fw_path = os.path.join(firmware_dir, fw_name + fallback_ext)
         elif fw_name:
-            fw_path = fw_name + ".cc2538dk"
+            fallback_ext = "." + build_target if build_target else ".cc2538dk"
+            fw_path = fw_name + fallback_ext
         else:
             fw_path = "unknown.cc2538dk"
 
         for mote_elem in mt.findall("mote"):
             node = {"firmware": fw_path}
+
+            # Add build info if present
+            if build:
+                node["build"] = build
+                # Also store source dir for building
+                if source:
+                    node["build"]["source_dir"] = os.path.dirname(source)
+
             for ic in mote_elem.findall("interface_config"):
                 ic_text = (ic.text or "").strip()
                 if "Position" in ic_text:

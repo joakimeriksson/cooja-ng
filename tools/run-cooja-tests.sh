@@ -2,35 +2,43 @@
 #
 # Run Contiki-NG Cooja test suite using csim
 #
-# Usage: ./tools/run-cooja-tests.sh <contiki-ng-root> [test-dir-pattern] [options]
+# Usage: ./tools/run-cooja-tests.sh [test-dir-pattern] [-v] [--no-build]
 #
 # Converts each .csc → JSON, runs csim mixed-multinode, reports PASS/FAIL/SKIP.
+# Auto-builds missing firmware unless --no-build is passed.
 # Exit code 0 if all non-skipped tests pass.
+#
+# CONTIKI_DIR resolution: env variable → csim.conf → ../contiki-ng
 #
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CSIM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CSC2JSON="$SCRIPT_DIR/csc2json.py"
+BUILD_FIRMWARE="$SCRIPT_DIR/build-test-firmware.sh"
 TEST_RUNNER="$CSIM_DIR/build/test_runner"
-FIRMWARE_DIR="$CSIM_DIR/firmware/cc2538dk"
 
-if [ -z "$1" ]; then
-    echo "Usage: $0 <contiki-ng-root> [test-dir-pattern] [--verbose]"
-    echo "  test-dir-pattern: glob to filter test dirs (e.g. '07-*' or '14-rpl-lite')"
-    echo "  --verbose: show test output"
-    exit 1
-fi
-
-CONTIKI_DIR="$(cd "$1" && pwd)"
-shift
+# Parse arguments
 TEST_PATTERN="*"
 VERBOSE=""
+AUTO_BUILD=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --verbose|-v)
             VERBOSE="-v"
+            ;;
+        --no-build)
+            AUTO_BUILD=0
+            ;;
+        -h|--help)
+            echo "Usage: $0 [test-dir-pattern] [-v] [--no-build]"
+            echo "  test-dir-pattern: glob to filter test dirs (e.g. '07-*' or '14-rpl-lite')"
+            echo "  -v, --verbose: show test output"
+            echo "  --no-build: skip auto-building missing firmware"
+            echo ""
+            echo "CONTIKI_DIR resolution: env variable -> csim.conf -> ../contiki-ng"
+            exit 0
             ;;
         *)
             TEST_PATTERN="$1"
@@ -38,6 +46,36 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Resolve CONTIKI_DIR: env -> csim.conf -> default
+if [ -z "$CONTIKI_DIR" ]; then
+    if [ -f "$CSIM_DIR/csim.conf" ]; then
+        CONTIKI_DIR=$(grep -s '^CONTIKI_DIR=' "$CSIM_DIR/csim.conf" | cut -d= -f2-)
+    fi
+fi
+if [ -z "$CONTIKI_DIR" ]; then
+    CONTIKI_DIR="$CSIM_DIR/../contiki-ng"
+fi
+
+if [ ! -d "$CONTIKI_DIR" ]; then
+    echo "Error: Contiki-NG directory not found: $CONTIKI_DIR"
+    echo "Set CONTIKI_DIR via environment, csim.conf, or make configure"
+    echo "  Example: make configure CONTIKI_DIR=/path/to/contiki-ng"
+    exit 1
+fi
+
+CONTIKI_DIR="$(cd "$CONTIKI_DIR" && pwd)"
+
+# Auto-detect firmware target: prefer cooja, fall back to cc2538dk
+if [ -d "$CSIM_DIR/firmware/cooja" ] && ls "$CSIM_DIR/firmware/cooja"/*.cooja >/dev/null 2>&1; then
+    FIRMWARE_TARGET="cooja"
+elif [ -d "$CSIM_DIR/firmware/cc2538dk" ] && ls "$CSIM_DIR/firmware/cc2538dk"/*.cc2538dk >/dev/null 2>&1; then
+    FIRMWARE_TARGET="cc2538dk"
+else
+    # No firmware yet — default to cooja (will auto-build)
+    FIRMWARE_TARGET="cooja"
+fi
+FIRMWARE_DIR="$CSIM_DIR/firmware/$FIRMWARE_TARGET"
 
 if [ ! -f "$TEST_RUNNER" ]; then
     echo "Error: test_runner not found at $TEST_RUNNER (run 'make' first)"
@@ -47,7 +85,8 @@ fi
 echo "=== Cooja Test Suite (csim) ==="
 echo "  Contiki-NG: $CONTIKI_DIR"
 echo "  Test pattern: $TEST_PATTERN"
-echo "  Firmware: $FIRMWARE_DIR"
+echo "  Firmware target: $FIRMWARE_TARGET"
+echo "  Firmware dir: $FIRMWARE_DIR"
 echo ""
 
 # Skip patterns: TSCH tests, border-router
@@ -62,91 +101,19 @@ skipped=0
 errors=0
 total=0
 
-declare -a FAILED_TESTS
-declare -a SKIPPED_TESTS
+FAILED_TESTS=""
+SKIPPED_TESTS=""
+failed_count=0
+skipped_count=0
 
-for csc_file in "$CONTIKI_DIR"/tests/$TEST_PATTERN/*.csc; do
-    [ -f "$csc_file" ] || continue
-    total=$((total + 1))
+# Track tests needing firmware rebuild
+NEED_REBUILD_FILE="$TMP_DIR/need_rebuild.txt"
+touch "$NEED_REBUILD_FILE"
 
-    test_name="$(basename "$(dirname "$csc_file")")/$(basename "$csc_file" .csc)"
+run_test() {
+    local test_name="$1"
+    local json_file="$2"
 
-    # Skip TSCH and known-unsupported tests
-    if echo "$test_name" | grep -qiE "$SKIP_PATTERNS"; then
-        echo "  SKIP  $test_name (filtered)"
-        SKIPPED_TESTS+=("$test_name (filtered)")
-        skipped=$((skipped + 1))
-        continue
-    fi
-
-    # Convert .csc to JSON (use relative firmware paths for portability)
-    json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
-    if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/cc2538dk" -o "$json_file" 2>/dev/null; then
-        echo "  ERROR $test_name (conversion failed)"
-        errors=$((errors + 1))
-        continue
-    fi
-
-    # Note unsupported features (advisory, still try to run)
-    unsupported=$(python3 -c "
-import json, sys
-with open('$json_file') as f:
-    d = json.load(f)
-t = d.get('test', {})
-u = t.get('unsupported_features', [])
-if u:
-    print(','.join(u))
-" 2>/dev/null || true)
-
-    # Check if test has any meaningful test criteria
-    has_test=$(python3 -c "
-import json, sys
-with open('$json_file') as f:
-    d = json.load(f)
-t = d.get('test', {})
-has_steps = len(t.get('steps', [])) > 0
-has_fail_on = len(t.get('fail_on', [])) > 0
-has_tis = t.get('timeout_is_success', False)
-if has_steps or has_fail_on or has_tis:
-    print('yes')
-" 2>/dev/null || true)
-
-    if [ "$has_test" != "yes" ]; then
-        echo "  SKIP  $test_name (no test criteria)"
-        SKIPPED_TESTS+=("$test_name (no test criteria)")
-        skipped=$((skipped + 1))
-        continue
-    fi
-
-    # Check firmware exists
-    missing_fw=""
-    for fw_path in $(python3 -c "
-import json
-with open('$json_file') as f:
-    d = json.load(f)
-for n in d.get('nodes', []):
-    print(n['firmware'])
-" 2>/dev/null | sort -u); do
-        # Handle both absolute and relative firmware paths
-        if [ "${fw_path:0:1}" = "/" ]; then
-            check_path="$fw_path"
-        else
-            check_path="$CSIM_DIR/$fw_path"
-        fi
-        if [ ! -f "$check_path" ]; then
-            missing_fw="$fw_path"
-            break
-        fi
-    done
-
-    if [ -n "$missing_fw" ]; then
-        echo "  SKIP  $test_name (missing: $(basename "$missing_fw"))"
-        SKIPPED_TESTS+=("$test_name (missing firmware)")
-        skipped=$((skipped + 1))
-        continue
-    fi
-
-    # Run the test
     log_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').log"
     printf "  RUN   %-60s" "$test_name"
 
@@ -164,15 +131,165 @@ for n in d.get('nodes', []):
         passed=$((passed + 1))
     else
         echo "FAIL (${elapsed}s)"
-        FAILED_TESTS+=("$test_name")
+        FAILED_TESTS="$FAILED_TESTS
+  - $test_name"
         failed=$((failed + 1))
-        # Show last few lines of output on failure
+        failed_count=$((failed_count + 1))
         if [ -z "$VERBOSE" ]; then
             echo "    --- Last 5 lines ---"
             tail -5 "$log_file" | sed 's/^/    /'
         fi
     fi
+}
+
+for csc_file in "$CONTIKI_DIR"/tests/$TEST_PATTERN/*.csc; do
+    [ -f "$csc_file" ] || continue
+    total=$((total + 1))
+
+    test_name="$(basename "$(dirname "$csc_file")")/$(basename "$csc_file" .csc)"
+
+    # Skip TSCH and known-unsupported tests
+    if echo "$test_name" | grep -qiE "$SKIP_PATTERNS"; then
+        echo "  SKIP  $test_name (filtered)"
+        SKIPPED_TESTS="$SKIPPED_TESTS
+  - $test_name (filtered)"
+        skipped=$((skipped + 1))
+        skipped_count=$((skipped_count + 1))
+        continue
+    fi
+
+    # Convert .csc to JSON
+    json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
+    if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" -o "$json_file" 2>/dev/null; then
+        echo "  ERROR $test_name (conversion failed)"
+        errors=$((errors + 1))
+        continue
+    fi
+
+    # Check if test has any meaningful test criteria
+    has_test=$(python3 -c "
+import json, sys
+with open('$json_file') as f:
+    d = json.load(f)
+t = d.get('test', {})
+has_steps = len(t.get('steps', [])) > 0
+has_fail_on = len(t.get('fail_on', [])) > 0
+has_tis = t.get('timeout_is_success', False)
+if has_steps or has_fail_on or has_tis:
+    print('yes')
+" 2>/dev/null || true)
+
+    if [ "$has_test" != "yes" ]; then
+        echo "  SKIP  $test_name (no test criteria)"
+        SKIPPED_TESTS="$SKIPPED_TESTS
+  - $test_name (no test criteria)"
+        skipped=$((skipped + 1))
+        skipped_count=$((skipped_count + 1))
+        continue
+    fi
+
+    # Check firmware exists
+    missing_fw=""
+    for fw_path in $(python3 -c "
+import json
+with open('$json_file') as f:
+    d = json.load(f)
+for n in d.get('nodes', []):
+    print(n['firmware'])
+" 2>/dev/null | sort -u); do
+        if [ "${fw_path:0:1}" = "/" ]; then
+            check_path="$fw_path"
+        else
+            check_path="$CSIM_DIR/$fw_path"
+        fi
+        if [ ! -f "$check_path" ]; then
+            missing_fw="$fw_path"
+            break
+        fi
+    done
+
+    if [ -n "$missing_fw" ]; then
+        if [ $AUTO_BUILD -eq 1 ]; then
+            echo "  NEED  $test_name (missing: $(basename "$missing_fw"))"
+            echo "$test_name" >> "$NEED_REBUILD_FILE"
+            # Save JSON file path for --from-json build
+            echo "$json_file" >> "$NEED_REBUILD_FILE.jsons"
+        else
+            echo "  SKIP  $test_name (missing: $(basename "$missing_fw"))"
+            SKIPPED_TESTS="$SKIPPED_TESTS
+  - $test_name (missing firmware)"
+            skipped=$((skipped + 1))
+            skipped_count=$((skipped_count + 1))
+        fi
+        continue
+    fi
+
+    run_test "$test_name" "$json_file"
 done
+
+# Auto-build missing firmware and re-run those tests
+need_rebuild_count=$(wc -l < "$NEED_REBUILD_FILE" | tr -d ' ')
+if [ "$need_rebuild_count" -gt 0 ]; then
+    echo ""
+    echo "=== Auto-building missing firmware ==="
+    mkdir -p "$FIRMWARE_DIR"
+
+    # Use --from-json to get per-firmware build info (target, board, make_args)
+    json_list=$(cat "$NEED_REBUILD_FILE.jsons" 2>/dev/null | sort -u)
+    CONTIKI_DIR="$CONTIKI_DIR" "$BUILD_FIRMWARE" --from-json $json_list
+    rm -f "$NEED_REBUILD_FILE.jsons"
+
+    echo ""
+    echo "=== Re-running tests that needed firmware ==="
+
+    while IFS= read -r test_name; do
+        [ -n "$test_name" ] || continue
+
+        csc_base="$(echo "$test_name" | cut -d/ -f2)"
+        test_suite="$(echo "$test_name" | cut -d/ -f1)"
+        csc_file="$CONTIKI_DIR/tests/$test_suite/$csc_base.csc"
+
+        [ -f "$csc_file" ] || continue
+
+        json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
+        if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" -o "$json_file" 2>/dev/null; then
+            echo "  ERROR $test_name (conversion failed)"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        # Check firmware exists now
+        missing_fw=""
+        for fw_path in $(python3 -c "
+import json
+with open('$json_file') as f:
+    d = json.load(f)
+for n in d.get('nodes', []):
+    print(n['firmware'])
+" 2>/dev/null | sort -u); do
+            if [ "${fw_path:0:1}" = "/" ]; then
+                check_path="$fw_path"
+            else
+                check_path="$CSIM_DIR/$fw_path"
+            fi
+            if [ ! -f "$check_path" ]; then
+                missing_fw="$fw_path"
+                break
+            fi
+        done
+
+        if [ -n "$missing_fw" ]; then
+            echo "  SKIP  $test_name (still missing: $(basename "$missing_fw"))"
+            SKIPPED_TESTS="$SKIPPED_TESTS
+  - $test_name (missing firmware)"
+            skipped=$((skipped + 1))
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+
+        run_test "$test_name" "$json_file"
+    done < "$NEED_REBUILD_FILE"
+fi
 
 echo ""
 echo "=== Results ==="
@@ -182,20 +299,14 @@ echo "  Failed: $failed"
 echo "  Skipped: $skipped"
 echo "  Errors: $errors"
 
-if [ ${#FAILED_TESTS[@]} -gt 0 ]; then
+if [ $failed_count -gt 0 ]; then
     echo ""
-    echo "Failed tests:"
-    for t in "${FAILED_TESTS[@]}"; do
-        echo "  - $t"
-    done
+    echo "Failed tests:$FAILED_TESTS"
 fi
 
-if [ ${#SKIPPED_TESTS[@]} -gt 0 ] && [ -n "$VERBOSE" ]; then
+if [ $skipped_count -gt 0 ] && [ -n "$VERBOSE" ]; then
     echo ""
-    echo "Skipped tests:"
-    for t in "${SKIPPED_TESTS[@]}"; do
-        echo "  - $t"
-    done
+    echo "Skipped tests:$SKIPPED_TESTS"
 fi
 
 # Exit with failure if any test failed
