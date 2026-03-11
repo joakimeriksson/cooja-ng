@@ -7,17 +7,27 @@
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-header { background: var(--header-bg); border-bottom: 1px solid var(--border); padding: 8px 16px; display: flex; align-items: center; gap: 24px; flex-shrink: 0; }
+header { background: var(--header-bg); border-bottom: 1px solid var(--border); padding: 8px 16px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; flex-wrap: wrap; }
 header h1 { font-size: 14px; color: var(--accent); font-weight: 600; }
 .stat { font-size: 12px; color: var(--muted); }
 .stat b { color: var(--text); }
-#conn-status { width: 8px; height: 8px; border-radius: 50%; background: #f85149; margin-left: auto; }
+#conn-status { width: 8px; height: 8px; border-radius: 50%; background: #f85149; flex-shrink: 0; }
 #conn-status.connected { background: #3fb950; }
 .zoom-hint { font-size: 10px; color: var(--dim); margin-left: 8px; }
 .main { display: flex; flex: 1; overflow: hidden; }
-#canvas-wrap { flex: 1; position: relative; min-width: 0; }
-canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
-.sidebar { width: 360px; flex-shrink: 0; border-left: 1px solid var(--border); overflow-y: auto; background: var(--header-bg); }
+.left-panel { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+#canvas-wrap { flex: 1; position: relative; min-width: 0; overflow: hidden; }
+canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg); cursor: grab; }
+#timeline-wrap { height: 0; border-top: 1px solid var(--border); overflow: hidden; transition: height 0.2s; position: relative; flex-shrink: 0; }
+#timeline-wrap.open { height: 200px; }
+#timeline-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--header-bg); cursor: grab; z-index: 1; }
+.tl-ctrl { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; font-family: inherit; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+.sidebar { width: 360px; flex-shrink: 0; border-left: 1px solid var(--border); overflow-y: auto; background: var(--header-bg); display: flex; flex-direction: column; }
+.sidebar-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.sidebar-tabs button { flex: 1; padding: 6px 8px; font-family: inherit; font-size: 11px; background: none; color: var(--muted); border: none; cursor: pointer; border-bottom: 2px solid transparent; }
+.sidebar-tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-content { display: none; flex: 1; overflow-y: auto; }
+.tab-content.active { display: block; }
 .node-card { border-bottom: 1px solid var(--border); padding: 10px 12px; }
 .node-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .node-id { font-size: 14px; font-weight: 600; color: var(--accent); }
@@ -25,10 +35,41 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
 .badge-msp { background: var(--badge-msp-bg); color: var(--accent); }
 .badge-arm { background: var(--badge-arm-bg); color: var(--green); }
 .badge-native { background: var(--yellow); color: var(--bg); }
+.badge-radio { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+.badge-radio-tx { background: #58a6ff22; color: #58a6ff; }
+.badge-radio-rx { background: #3fb95022; color: #3fb950; }
+.badge-radio-on { background: #48505822; color: #8b949e; }
+.badge-radio-intf { background: #f8514922; color: #f85149; }
+.badge-radio-off { background: var(--border); color: var(--dim); }
+.led-row { display: flex; gap: 4px; margin-left: auto; }
+.led { width: 10px; height: 10px; border-radius: 50%; border: 1px solid var(--border); }
+.led-0-on { background: #3fb950; box-shadow: 0 0 4px #3fb950; }
+.led-1-on { background: #d29922; box-shadow: 0 0 4px #d29922; }
+.led-2-on { background: #f85149; box-shadow: 0 0 4px #f85149; }
+.led-off { background: var(--dim); opacity: 0.3; }
 .node-stats { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
 .console-box { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; max-height: 120px; overflow-y: auto; font-size: 11px; line-height: 1.5; }
 .console-box .line { color: var(--console-text); white-space: pre-wrap; word-break: break-all; }
+.pkt-log { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; overflow-y: auto; max-height: 100%; }
+.pkt-header { display: flex; gap: 0; background: var(--header-bg); border-bottom: 1px solid var(--border); position: sticky; top: 0; font-weight: 600; color: var(--muted); }
+.pkt-header span, .pkt-row span { padding: 2px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pkt-row { display: flex; gap: 0; color: var(--text); border-bottom: 1px solid var(--border); cursor: pointer; }
+.pkt-row:hover { background: var(--border); }
+.pkt-row.selected { background: var(--btn-active-bg); color: #fff; }
+.pkt-col-no { width: 30px; color: var(--dim); text-align: right; }
+.pkt-col-time { width: 65px; color: var(--muted); }
+.pkt-col-src { width: 30px; text-align: center; }
+.pkt-col-dst { width: 40px; text-align: center; }
+.pkt-col-type { width: 50px; font-weight: 600; }
+.pkt-col-info { flex: 1; }
+.pkt-type-rpl { color: #d29922; }
+.pkt-type-udp { color: #58a6ff; }
+.pkt-type-ack { color: var(--dim); }
+.pkt-type-data { color: var(--text); }
+.pkt-detail { display: none; position: fixed; background: var(--header-bg); border: 1px solid var(--accent); border-radius: 6px; padding: 8px 10px; font-size: 11px; font-family: 'SF Mono', Menlo, monospace; color: var(--text); white-space: pre-wrap; max-width: 500px; z-index: 100; box-shadow: 0 4px 16px rgba(0,0,0,0.4); pointer-events: auto; }
+.pkt-detail.visible { display: block; }
 #theme-btn { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; font-family: inherit; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+#tl-btn { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; font-family: inherit; font-size: 12px; cursor: pointer; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -44,32 +85,65 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     <input type="range" id="speed-slider" min="1" max="100" value="10"
            style="width:200px;">
   </span>
-  <span class="zoom-hint">Scroll to zoom, drag to pan, drag node to move</span>
+  <button id="tl-btn" title="Toggle timeline panel">Timeline</button>
+  <button id="tl-zoom-in" class="tl-ctrl" title="Zoom in timeline" style="display:none;">TL +</button>
+  <button id="tl-zoom-out" class="tl-ctrl" title="Zoom out timeline" style="display:none;">TL -</button>
+  <button id="tl-reset" class="tl-ctrl" title="Reset zoom, follow latest" style="display:none;">TL reset</button>
   <button id="theme-btn" title="Toggle light/dark mode">Light</button>
+  <button id="restart-btn" style="background:#d9534f; color:#fff; border:1px solid #c9302c; border-radius:4px; padding:6px 16px; font-family:inherit; font-size:12px; cursor:pointer; flex-shrink:0;" title="Restart simulation">Restart</button>
+  <div style="flex:1"></div>
+  <span class="zoom-hint">Scroll/drag canvas to zoom/pan</span>
   <div id="conn-status" title="Disconnected"></div>
 </header>
 <div class="main">
-  <div id="canvas-wrap"><canvas id="topo"></canvas></div>
-  <div class="sidebar" id="sidebar"></div>
+  <div class="left-panel">
+    <div id="canvas-wrap"><canvas id="topo"></canvas></div>
+    <div id="timeline-wrap"><canvas id="timeline-canvas"></canvas></div>
+  </div>
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-tabs">
+      <button class="active" data-tab="nodes-tab">Nodes</button>
+      <button data-tab="packets-tab">Packets</button>
+    </div>
+    <div class="tab-content active" id="nodes-tab"></div>
+    <div class="tab-content" id="packets-tab" style="display:flex;flex-direction:column;gap:4px;overflow:hidden;">
+      <div style="font-size:11px;color:var(--muted);padding:2px 4px;" id="pkt-count">Radio messages: 0 packets</div>
+      <div class="pkt-log" id="pkt-log">
+        <div class="pkt-header">
+          <span class="pkt-col-no">#</span>
+          <span class="pkt-col-time">Time</span>
+          <span class="pkt-col-src">Src</span>
+          <span class="pkt-col-dst">Dst</span>
+          <span class="pkt-col-type">Type</span>
+          <span class="pkt-col-info">Info</span>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
+<div class="pkt-detail" id="pkt-detail"></div>
 <script>
 (function() {
   const themes = {
     dark: {
       bg:'#0d1117', headerBg:'#161b22', border:'#30363d', text:'#c9d1d9',
       muted:'#8b949e', dim:'#484f58', accent:'#58a6ff', green:'#3fb950',
-      yellow:'#d29922', consoleTxt:'#7ee787', badgeMspBg:'#1f6feb33',
+      yellow:'#d29922', red:'#f85149', consoleTxt:'#7ee787', badgeMspBg:'#1f6feb33',
       badgeArmBg:'#3fb95033', btnBg:'#30363d', btnActiveBg:'#1f6feb',
       link:'#30363d', txRange:'#58a6ff', arrowHot:'#ff9f43', arrow:'#f0883e',
       nodeLabel:'#c9d1d9', nodeType:'#8b949e', zoomTxt:'#484f58',
+      tlBg:'#161b22', tlGrid:'#21262d', tlTx:'#58a6ff', tlRx:'#3fb950', tlOff:'#22272e', tlOn:'#484f58', tlIntf:'#f85149',
+      tlLed0:'#3fb950', tlLed1:'#d29922', tlLed2:'#f85149',
     },
     light: {
       bg:'#ffffff', headerBg:'#f6f8fa', border:'#d0d7de', text:'#1f2328',
       muted:'#656d76', dim:'#8c959f', accent:'#0969da', green:'#1a7f37',
-      yellow:'#9a6700', consoleTxt:'#116329', badgeMspBg:'#0969da22',
+      yellow:'#9a6700', red:'#cf222e', consoleTxt:'#116329', badgeMspBg:'#0969da22',
       badgeArmBg:'#1a7f3722', btnBg:'#d0d7de', btnActiveBg:'#0969da',
       link:'#d0d7de', txRange:'#0969da', arrowHot:'#cf222e', arrow:'#bf3989',
       nodeLabel:'#1f2328', nodeType:'#656d76', zoomTxt:'#8c959f',
+      tlBg:'#f6f8fa', tlGrid:'#d0d7de', tlTx:'#0969da', tlRx:'#1a7f37', tlOff:'#ffffff', tlOn:'#c0c0c0', tlIntf:'#cf222e',
+      tlLed0:'#1a7f37', tlLed1:'#9a6700', tlLed2:'#cf222e',
     },
   };
   let curTheme = localStorage.getItem('csim-theme') || 'dark';
@@ -97,33 +171,67 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
   applyTheme(curTheme);
   document.getElementById('theme-btn').addEventListener('click', () => {
     applyTheme(curTheme === 'dark' ? 'light' : 'dark');
-    if (state) drawCanvas(state);
+    if (state) { drawCanvas(state); drawTimeline(); }
   });
 
   function T() { return themes[curTheme]; }
 
   const canvas = document.getElementById('topo');
   const ctx = canvas.getContext('2d');
-  const sidebar = document.getElementById('sidebar');
   const connDot = document.getElementById('conn-status');
+  const nodesTab = document.getElementById('nodes-tab');
+  const packetsTab = document.getElementById('packets-tab');
+  const pktLog = document.getElementById('pkt-log');
+  const pktDetail = document.getElementById('pkt-detail');
+
+  // Dismiss packet detail popup on click outside
+  document.addEventListener('click', function(e) {
+    if (!e.target.closest('.pkt-row') && !e.target.closest('.pkt-detail')) {
+      pktDetail.classList.remove('visible');
+      document.querySelectorAll('.pkt-row.selected').forEach(r => r.classList.remove('selected'));
+    }
+  });
 
   let state = null;
   let ws = null;
   let consoleHistory = {}; // nodeId -> array of lines
 
   const MAX_CONSOLE = 50;
+  const MAX_PACKETS = 200;
+
+  // Packet log: array of {t, n, dir, src, dst, type, info, summary}
+  let packetLog = [];
+  let selectedPkt = -1;
+
+  // Timeline data: per-node arrays of {t, type} events
+  let timelineData = {}; // nodeId -> [{t, type, v, s}]
+  const TL_MAX_EVENTS = 50000; // per-node limit
+
+  // Per-node "known state" — survives even when old events are evicted
+  let nodeRadioState = {};  // nodeId -> 'off'|'on'|'tx'|'rx'|'intf'
+  let nodeRadioBaseState = {};  // state before first event in buffer
+  let nodeLedState = {};    // nodeId -> [bool, bool, bool]
+
+  // Timeline zoom/pan state
+  let tlWindowMs = 30000;      // visible time window duration in ms
+  let tlEndMs = -1;            // right edge of timeline (-1 = auto-follow latest)
+  let tlDragging = false;
+  let tlDragStartX = 0;
+  let tlDragStartEnd = 0;
+  // Selection state (shift+drag)
+  let tlSelecting = false;
+  let tlSelStartMs = -1, tlSelEndMs = -1;
+  const TL_MIN_WINDOW = 100;   // minimum zoom: 100ms
+  const TL_MAX_WINDOW = 300000; // maximum zoom: 5 minutes
 
   // Camera state for zoom/pan
   let camZoom = 1.0;
-  let camX = 0, camY = 0; // pan offset in screen pixels
+  let camX = 0, camY = 0;
   let dragging = false;
   let dragStartX = 0, dragStartY = 0;
   let camStartX = 0, camStartY = 0;
 
-  // Transform state saved from drawCanvas for screen<->world conversion
   let lastScale = 1, lastCenterX = 0, lastCenterY = 0, lastW = 1, lastH = 1;
-
-  // Node drag state
   let dragNodeIdx = -1;
 
   function screenToWorldX(sx) { return (sx - lastW/2 - camX) / lastScale + lastCenterX; }
@@ -133,7 +241,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
     const zoomFactor = e.deltaY < 0 ? 1.04 : 1 / 1.04;
-    // Zoom towards mouse position
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
@@ -148,10 +255,9 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
-    // Check if clicking on a node
     if (state && state.nodes) {
       const nodeRadius = Math.max(12, Math.min(22, 18 * camZoom));
-      const hitR = nodeRadius + 4; // slightly generous hit area
+      const hitR = nodeRadius + 4;
       const wx = screenToWorldX(mx), wy = screenToWorldY(my);
       for (let i = 0; i < state.nodes.length; i++) {
         const dx = wx - state.nodes[i].x, dy = wy - state.nodes[i].y;
@@ -179,7 +285,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
       return;
     }
     if (!dragging) {
-      // Update cursor on hover
       if (state && state.nodes) {
         const rect = canvas.getBoundingClientRect();
         const mx = e.clientX - rect.left;
@@ -210,7 +315,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     canvas.style.cursor = 'grab';
   });
 
-  // Double-click to reset view
   canvas.addEventListener('dblclick', () => {
     camZoom = 1.0; camX = 0; camY = 0;
     if (state) drawCanvas(state);
@@ -235,7 +339,13 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
 
   pauseBtn.addEventListener('click', togglePause);
 
-  // Spacebar toggles pause/play (unless typing in an input)
+  document.getElementById('restart-btn').addEventListener('click', () => {
+    if (ws && ws.readyState === 1) {
+      if (confirm('Restart simulation? All current state will be reset.'))
+        ws.send(JSON.stringify({cmd: 'restart'}));
+    }
+  });
+
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space' && e.target.tagName !== 'INPUT') {
       e.preventDefault();
@@ -243,29 +353,405 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     }
   });
 
+  // Sidebar tabs
+  document.querySelectorAll('.sidebar-tabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.sidebar-tabs button').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById(btn.dataset.tab).classList.add('active');
+    });
+  });
+
+  // Timeline toggle
+  const tlWrap = document.getElementById('timeline-wrap');
+  const tlCtrlBtns = document.querySelectorAll('.tl-ctrl');
+  document.getElementById('tl-btn').addEventListener('click', () => {
+    tlWrap.classList.toggle('open');
+    const show = tlWrap.classList.contains('open');
+    tlCtrlBtns.forEach(b => b.style.display = show ? '' : 'none');
+    setTimeout(() => { if (state) { drawCanvas(state); drawTimeline(); } }, 250);
+  });
+
+  // Timeline zoom (mouse wheel) and pan (drag)
+  const tlCanvasEl = document.getElementById('timeline-canvas');
+  tlCanvasEl.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = tlCanvasEl.getBoundingClientRect();
+    const labelW = 60;
+    const chartW = rect.width - labelW - 10;
+    if (chartW <= 0) return;
+    const simMs = state ? state.sim_time_ms : 1;
+
+    // Mouse position as fraction of chart area
+    const mx = (e.clientX - rect.left - labelW) / chartW;
+    const curEnd = tlEndMs < 0 ? simMs : tlEndMs;
+    const curStart = curEnd - tlWindowMs;
+    const mouseMs = curStart + mx * tlWindowMs;
+
+    // Zoom: scroll up = zoom in, scroll down = zoom out
+    const factor = e.deltaY > 0 ? 1.3 : 1 / 1.3;
+    tlWindowMs = Math.max(TL_MIN_WINDOW, Math.min(TL_MAX_WINDOW, tlWindowMs * factor));
+
+    // Keep the time under cursor fixed
+    const newStart = mouseMs - mx * tlWindowMs;
+    tlEndMs = newStart + tlWindowMs;
+    // Clamp
+    if (tlEndMs > simMs + tlWindowMs * 0.1) tlEndMs = simMs + tlWindowMs * 0.1;
+    if (tlEndMs - tlWindowMs < 0) tlEndMs = tlWindowMs;
+
+    drawTimeline();
+  }, { passive: false });
+
+  function tlPxToMs(clientX) {
+    const rect = tlCanvasEl.getBoundingClientRect();
+    const labelW = 60, chartW = rect.width - labelW - 10;
+    if (chartW <= 0) return 0;
+    const simMs = state ? state.sim_time_ms : 1;
+    const endMs = tlEndMs < 0 ? simMs : tlEndMs;
+    const startMs = endMs - tlWindowMs;
+    const mx = (clientX - rect.left - labelW) / chartW;
+    return startMs + mx * tlWindowMs;
+  }
+
+  tlCanvasEl.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    if (e.shiftKey) {
+      // Shift+drag: select time range
+      tlSelecting = true;
+      tlSelStartMs = tlPxToMs(e.clientX);
+      tlSelEndMs = tlSelStartMs;
+      tlCanvasEl.style.cursor = 'crosshair';
+    } else {
+      tlSelStartMs = -1; tlSelEndMs = -1; // clear selection
+      tlDragging = true;
+      tlDragStartX = e.clientX;
+      const simMs = state ? state.sim_time_ms : 1;
+      tlDragStartEnd = tlEndMs < 0 ? simMs : tlEndMs;
+      tlCanvasEl.style.cursor = 'grabbing';
+    }
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (tlSelecting) {
+      tlSelEndMs = tlPxToMs(e.clientX);
+      drawTimeline();
+      return;
+    }
+    if (!tlDragging) return;
+    const rect = tlCanvasEl.getBoundingClientRect();
+    const labelW = 60;
+    const chartW = rect.width - labelW - 10;
+    if (chartW <= 0) return;
+    const dx = e.clientX - tlDragStartX;
+    const dMs = -(dx / chartW) * tlWindowMs;
+    tlEndMs = tlDragStartEnd + dMs;
+    // Clamp
+    const simMs = state ? state.sim_time_ms : 1;
+    if (tlEndMs > simMs + tlWindowMs * 0.1) tlEndMs = simMs + tlWindowMs * 0.1;
+    if (tlEndMs - tlWindowMs < 0) tlEndMs = tlWindowMs;
+    drawTimeline();
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (tlSelecting) {
+      tlSelecting = false;
+      tlCanvasEl.style.cursor = 'default';
+      tlSelEndMs = tlPxToMs(e.clientX);
+      if (Math.abs(tlSelEndMs - tlSelStartMs) > 0.1) {
+        exportTimelineSelection();
+      }
+      return;
+    }
+    if (!tlDragging) return;
+    tlDragging = false;
+    tlCanvasEl.style.cursor = 'default';
+  });
+
+  function exportTimelineSelection() {
+    const sMs = Math.min(tlSelStartMs, tlSelEndMs);
+    const eMs = Math.max(tlSelStartMs, tlSelEndMs);
+    if (!state || !state.nodes) return;
+    const lines = [];
+    lines.push(`Timeline selection: ${sMs.toFixed(3)} ms - ${eMs.toFixed(3)} ms (${(eMs-sMs).toFixed(3)} ms)`);
+    lines.push('');
+    for (const node of state.nodes) {
+      const events = timelineData[node.id] || [];
+      // Find TX/RX spans that overlap the selection range
+      // A span is: tx/rx event followed by the next state change (on/off/tx/rx/intf)
+      const spans = [];
+      const frames = [];
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (ev.e === 'frame' && ev.t >= sMs && ev.t <= eMs) {
+          frames.push(ev);
+        }
+        if (ev.e !== 'tx' && ev.e !== 'rx' && ev.e !== 'intf') continue;
+        const startMs = ev.t;
+        // Find end: next radio state event
+        let endMs = null;
+        for (let j = i + 1; j < events.length; j++) {
+          if (['tx','rx','on','off','intf'].includes(events[j].e)) {
+            endMs = events[j].t;
+            break;
+          }
+        }
+        // Include span if it overlaps selection
+        if (endMs !== null && startMs <= eMs && endMs >= sMs) {
+          spans.push({ type: ev.e.toUpperCase(), start: startMs, end: endMs, dur: endMs - startMs });
+        }
+      }
+      if (spans.length === 0 && frames.length === 0) continue;
+      // Merge spans and frames into a single sorted list
+      const merged = [];
+      for (const sp of spans)
+        merged.push({ t: sp.start, text: `  ${sp.type}  ${sp.start.toFixed(3)} - ${sp.end.toFixed(3)} ms  (${(sp.dur * 1000).toFixed(0)} us)` });
+      for (const fr of frames) {
+        const dir = fr.v === 1 ? 'TX' : 'RX';
+        merged.push({ t: fr.t, text: `  FRAME(${dir})  ${fr.t.toFixed(3)} ms  ${fr.s || ''}` });
+      }
+      merged.sort((a, b) => a.t - b.t);
+      lines.push(`Node ${node.id}:`);
+      for (const m of merged) lines.push(m.text);
+    }
+    const text = lines.join('\n');
+    // Copy to clipboard and show in console
+    navigator.clipboard.writeText(text).then(() => {
+      console.log('Timeline selection copied to clipboard');
+    }).catch(() => {});
+    // Also show in a popup
+    const pre = document.createElement('pre');
+    pre.style.cssText = 'position:fixed;top:10%;left:10%;right:10%;bottom:10%;z-index:1000;background:#1a1a2e;color:#e0e0e0;padding:16px;overflow:auto;border-radius:8px;font-size:12px;white-space:pre;box-shadow:0 4px 24px rgba(0,0,0,0.5);';
+    pre.textContent = text;
+    pre.addEventListener('click', () => pre.remove());
+    pre.title = 'Click to close';
+    document.body.appendChild(pre);
+  }
+
+  // Double-click to reset to auto-follow
+  tlCanvasEl.addEventListener('dblclick', () => {
+    tlEndMs = -1;
+    tlWindowMs = 30000;
+    drawTimeline();
+  });
+
+  // Zoom/pan helper for buttons
+  function tlZoom(factor) {
+    const simMs = state ? state.sim_time_ms : 1;
+    const curEnd = tlEndMs < 0 ? simMs : tlEndMs;
+    const center = curEnd - tlWindowMs / 2;
+    tlWindowMs = Math.max(TL_MIN_WINDOW, Math.min(TL_MAX_WINDOW, tlWindowMs * factor));
+    tlEndMs = center + tlWindowMs / 2;
+    if (tlEndMs > simMs + tlWindowMs * 0.1) tlEndMs = simMs + tlWindowMs * 0.1;
+    if (tlEndMs - tlWindowMs < 0) tlEndMs = tlWindowMs;
+    drawTimeline();
+  }
+  document.getElementById('tl-zoom-in').addEventListener('click', () => tlZoom(1 / 2));
+  document.getElementById('tl-zoom-out').addEventListener('click', () => tlZoom(2));
+  document.getElementById('tl-reset').addEventListener('click', () => {
+    tlEndMs = -1;
+    tlWindowMs = 30000;
+    drawTimeline();
+  });
+
+  /* Minimal CBOR decoder */
+  function decodeCBOR(buf) {
+    const dv = new DataView(buf);
+    let off = 0;
+    function readUint() {
+      const b = dv.getUint8(off++);
+      const ai = b & 0x1f;
+      if (ai < 24) return ai;
+      if (ai === 24) return dv.getUint8(off++);
+      if (ai === 25) { const v = dv.getUint16(off); off += 2; return v; }
+      if (ai === 26) { const v = dv.getUint32(off); off += 4; return v; }
+      if (ai === 27) {
+        const hi = dv.getUint32(off), lo = dv.getUint32(off+4); off += 8;
+        return hi * 0x100000000 + lo;
+      }
+      return 0;
+    }
+    function decode() {
+      const b = dv.getUint8(off);
+      const mt = b >> 5;
+      if (mt === 0) return readUint(); // unsigned
+      if (mt === 1) return -1 - readUint(); // negative
+      if (mt === 2) { const len = readUint(); const d = new Uint8Array(buf, off, len); off += len; return d; } // bytes
+      if (mt === 3) { const len = readUint(); const s = new TextDecoder().decode(new Uint8Array(buf, off, len)); off += len; return s; } // text
+      if (mt === 4) { const len = readUint(); const a = []; for (let i=0;i<len;i++) a.push(decode()); return a; } // array
+      if (mt === 5) { const len = readUint(); const m = {}; for (let i=0;i<len;i++) { const k = decode(); m[k] = decode(); } return m; } // map
+      if (mt === 7) { const ai = b & 0x1f; off++; if (ai === 20) return false; if (ai === 21) return true; if (ai === 22) return null; return undefined; } // simple
+      off++; return undefined;
+    }
+    return decode();
+  }
+
+  const RADIO_NAMES = ['off','on','tx','rx','intf'];
+  const TL_TYPE_NAMES = ['off','on','tx','rx','intf','led_on','led_off','frame','log'];
+
+  function handleCBORDelta(d) {
+    if (!state) {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd: 'full'}));
+      return;
+    }
+    // Key 0: sim_time_ms
+    if (d[0] !== undefined) state.sim_time_ms = d[0];
+    // Key 1: stats [rf_bytes, uart_bytes, rx_queued, rx_collided, speed_x10, paused]
+    if (d[1]) {
+      const s = d[1];
+      state.stats.rf_bytes = s[0];
+      state.stats.uart_bytes = s[1];
+      state.stats.rx_frames_queued = s[2];
+      state.stats.rx_frames_collided = s[3];
+      state.stats.speed = s[4] / 10;
+      state.stats.paused = s[5];
+    }
+    // Key 2: radio changes { node_id: state_enum }
+    if (d[2]) {
+      for (const [nid, rs] of Object.entries(d[2])) {
+        const sn = state.nodes.find(n => n.id == nid);
+        if (sn) sn.radio = RADIO_NAMES[rs] || 'off';
+      }
+    }
+    // Key 3: LED changes { node_id: [r,g,b] }
+    if (d[3]) {
+      for (const [nid, leds] of Object.entries(d[3])) {
+        const sn = state.nodes.find(n => n.id == nid);
+        if (sn) sn.leds = leds;
+      }
+    }
+    // Key 4: last_tx_ms { node_id: ms }
+    if (d[4]) {
+      for (const [nid, ms] of Object.entries(d[4])) {
+        const sn = state.nodes.find(n => n.id == nid);
+        if (sn) sn.last_tx_ms = ms;
+      }
+    }
+    // Key 5: console { node_id: [lines...] }
+    if (d[5]) {
+      for (const [nid, lines] of Object.entries(d[5])) {
+        if (!consoleHistory[nid]) consoleHistory[nid] = [];
+        const hist = consoleHistory[nid];
+        for (const line of lines) { hist.push(line); if (hist.length > MAX_CONSOLE) hist.shift(); }
+      }
+    }
+    // Key 6: timeline array of [t_us, node_id, type, value, summary?]
+    if (d[6]) {
+      for (const ev of d[6]) {
+        const tev = { t: ev[0] / 1000, n: ev[1], e: TL_TYPE_NAMES[ev[2]] || '?', v: ev[3] };
+        if (ev.length > 4) tev.s = ev[4];
+        const nid = tev.n;
+        if (!timelineData[nid]) timelineData[nid] = [];
+        const arr = timelineData[nid];
+        arr.push(tev);
+        while (arr.length > TL_MAX_EVENTS) {
+          const evicted = arr.shift();
+          if (['tx','rx','off','on','intf'].includes(evicted.e))
+            nodeRadioBaseState[nid] = evicted.e;
+        }
+        if (['tx','rx','off','on','intf'].includes(tev.e)) {
+          nodeRadioState[nid] = tev.e;
+        } else if (tev.e === 'led_on' || tev.e === 'led_off') {
+          if (!nodeLedState[nid]) nodeLedState[nid] = [false, false, false];
+          nodeLedState[nid][tev.v] = tev.e === 'led_on';
+        }
+        if (tev.e === 'frame' && tev.s) {
+          const p = parsePktSummary(tev.s, nid, tev.v === 1 ? 'TX' : 'RX', tev.t);
+          packetLog.push(p);
+          if (packetLog.length > MAX_PACKETS) { packetLog.shift(); pktLogRendered = Math.max(0, pktLogRendered - 1); }
+        }
+      }
+    }
+  }
+
   function connect() {
     const loc = window.location;
     ws = new WebSocket('ws://' + loc.host + '/ws');
-    ws.onopen = () => { connDot.className = 'connected'; connDot.title = 'Connected'; };
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      connDot.className = 'connected'; connDot.title = 'Connected';
+      ws.send(JSON.stringify({cmd: 'full'}));
+    };
     ws.onclose = () => { connDot.className = ''; connDot.title = 'Disconnected'; setTimeout(connect, 2000); };
     ws.onerror = () => ws.close();
     ws.onmessage = (ev) => {
       try {
-        const newState = JSON.parse(ev.data);
-        // Preserve dragged node's local position over server state
-        if (dragNodeIdx >= 0 && state && state.nodes[dragNodeIdx]) {
-          const localX = state.nodes[dragNodeIdx].x;
-          const localY = state.nodes[dragNodeIdx].y;
-          newState.nodes[dragNodeIdx].x = localX;
-          newState.nodes[dragNodeIdx].y = localY;
+        if (ev.data instanceof ArrayBuffer) {
+          // Binary frame: CBOR delta
+          const d = decodeCBOR(ev.data);
+          handleCBORDelta(d);
+        } else {
+          // Text frame: JSON (full state)
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'full') { console.log('Full state:', msg.nodes?.length, 'nodes'); handleFullState(msg); }
+          else handleFullState(msg); // Legacy
         }
-        state = newState;
-        mergeConsole(state);
-        updateHeader(state);
-        updateSidebar(state);
-        drawCanvas(state);
-      } catch(e) { console.error('Parse error:', e); }
+        if (state) {
+          updateHeader(state);
+          updateSidebar(state);
+          updatePacketLog();
+          drawCanvas(state);
+          drawTimeline();
+        }
+      } catch(e) { console.error('WS parse error:', e, e.stack); }
     };
+  }
+
+  function handleFullState(msg) {
+    // Full state: replace everything
+    if (dragNodeIdx >= 0 && state && state.nodes[dragNodeIdx]) {
+      const localX = state.nodes[dragNodeIdx].x;
+      const localY = state.nodes[dragNodeIdx].y;
+      msg.nodes[dragNodeIdx].x = localX;
+      msg.nodes[dragNodeIdx].y = localY;
+    }
+    state = msg;
+
+    // Reset timeline/console state and rebuild from full data
+    consoleHistory = {};
+    timelineData = {};
+    nodeRadioState = {};
+    nodeRadioBaseState = {};
+    nodeLedState = {};
+    packetLog = [];
+    pktLogRendered = 0;
+    // Rebuild packet log header
+    const header = pktLog.querySelector('.pkt-header');
+    pktLog.innerHTML = '';
+    if (header) pktLog.appendChild(header);
+
+    sidebarBuilt = false;
+    mergeConsole(state);
+    mergeTimeline(state);
+  }
+
+  function handleDelta(msg) {
+    if (!state) {
+      // No full state yet — request one
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd: 'full'}));
+      return;
+    }
+    // Update sim time and stats
+    state.sim_time_ms = msg.sim_time_ms;
+    state.stats = msg.stats;
+
+    // Merge per-node updates
+    if (msg.nodes) {
+      for (const dn of msg.nodes) {
+        // Find matching node in state by id
+        const sn = state.nodes.find(n => n.id === dn.id);
+        if (!sn) continue;
+        if (dn.cycles !== undefined) sn.cycles = dn.cycles;
+        if (dn.freq !== undefined) sn.freq = dn.freq;
+        if (dn.radio !== undefined) sn.radio = dn.radio;
+        if (dn.leds !== undefined) sn.leds = dn.leds;
+        if (dn.last_tx_ms !== undefined) sn.last_tx_ms = dn.last_tx_ms;
+        // Console: only present if there are new lines
+        sn.console = dn.console || [];
+      }
+    }
+    mergeConsole(state);
+    mergeTimeline(msg);  // timeline is on the msg, not state
   }
 
   function mergeConsole(s) {
@@ -275,6 +761,41 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
       for (const line of node.console) {
         hist.push(line);
         if (hist.length > MAX_CONSOLE) hist.shift();
+      }
+    }
+  }
+
+  function mergeTimeline(s) {
+    if (!s.timeline) return;
+    for (const ev of s.timeline) {
+      const nid = ev.n;
+      if (!timelineData[nid]) timelineData[nid] = [];
+      const arr = timelineData[nid];
+      arr.push(ev);
+      while (arr.length > TL_MAX_EVENTS) {
+        const evicted = arr.shift();
+        // Track the state of evicted events so we know the base state
+        // before the first event in the buffer
+        if (evicted.e === 'tx' || evicted.e === 'rx' || evicted.e === 'off' || evicted.e === 'on' || evicted.e === 'intf')
+          nodeRadioBaseState[nid] = evicted.e;
+      }
+
+      // Track current state per node (survives event eviction)
+      if (ev.e === 'tx' || ev.e === 'rx' || ev.e === 'off' || ev.e === 'on' || ev.e === 'intf') {
+        nodeRadioState[nid] = ev.e;
+      } else if (ev.e === 'led_on' || ev.e === 'led_off') {
+        if (!nodeLedState[nid]) nodeLedState[nid] = [false, false, false];
+        nodeLedState[nid][ev.v] = ev.e === 'led_on';
+      }
+
+      // Also add frame events to packet log (parse summary into columns)
+      if (ev.e === 'frame' && ev.s) {
+        const p = parsePktSummary(ev.s, nid, ev.v === 1 ? 'TX' : 'RX', ev.t);
+        packetLog.push(p);
+        if (packetLog.length > MAX_PACKETS) {
+          packetLog.shift();
+          pktLogRendered = Math.max(0, pktLogRendered - 1);
+        }
       }
     }
   }
@@ -301,7 +822,21 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     return '' + n;
   }
 
-  function fmtTime(ms) {
+  function fmtTime(ms, windowMs) {
+    if (windowMs !== undefined) {
+      // Adaptive formatting based on zoom level
+      if (windowMs <= 100) return ms.toFixed(1) + ' ms';
+      if (windowMs <= 2000) return (ms/1000).toFixed(3) + ' s';
+      if (windowMs <= 10000) return (ms/1000).toFixed(2) + ' s';
+      if (windowMs <= 60000) return (ms/1000).toFixed(1) + ' s';
+      if (windowMs <= 600000) {
+        const m = Math.floor(ms / 60000);
+        const s = ((ms % 60000) / 1000).toFixed(0);
+        return m + ':' + String(s).padStart(2, '0');
+      }
+      return (ms/60000).toFixed(1) + ' min';
+    }
+    // Fallback without zoom context
     if (ms >= 60000) return (ms/60000).toFixed(1) + ' min';
     if (ms >= 1000) return (ms/1000).toFixed(1) + ' s';
     return Math.round(ms) + ' ms';
@@ -313,28 +848,181 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     return 'badge badge-msp';
   }
 
-  function updateSidebar(s) {
+  function radioStateClass(rs) {
+    if (rs === 'tx') return 'badge-radio badge-radio-tx';
+    if (rs === 'rx') return 'badge-radio badge-radio-rx';
+    if (rs === 'on') return 'badge-radio badge-radio-on';
+    if (rs === 'intf') return 'badge-radio badge-radio-intf';
+    return 'badge-radio badge-radio-off';
+  }
+
+  function radioStateLabel(rs) {
+    if (rs === 'tx') return 'TX';
+    if (rs === 'rx') return 'RX';
+    if (rs === 'on') return 'ON';
+    if (rs === 'intf') return 'INTF';
+    return 'OFF';
+  }
+
+  // Track what we've already rendered to avoid full DOM rebuilds
+  let sidebarBuilt = false;
+  let pktLogRendered = 0;
+
+  function buildSidebar(s) {
+    // One-time full build of sidebar structure
     let html = '';
     for (const node of s.nodes) {
-      const hist = consoleHistory[node.id] || [];
-      html += '<div class="node-card">';
+      html += '<div class="node-card" id="card-' + node.id + '">';
       html += '<div class="node-header">';
       html += '<span class="node-id">Node ' + node.id + '</span>';
       html += '<span class="' + badgeClass(node.type) + '">' + node.type + '</span>';
+      html += '<span class="badge-radio badge-radio-off" id="radio-' + node.id + '">OFF</span>';
+      html += '<div class="led-row" id="leds-' + node.id + '">';
+      for (let l = 0; l < 3; l++)
+        html += '<div class="led led-off" id="led-' + node.id + '-' + l + '" title="LED ' + l + '"></div>';
       html += '</div>';
-      html += '<div class="node-stats">' + fmtCycles(node.cycles) + ' cycles &middot; ' +
-              fmtFreq(node.freq) + '</div>';
-      html += '<div class="console-box" id="con-' + node.id + '">';
-      for (const line of hist)
-        html += '<div class="line">' + esc(line) + '</div>';
-      html += '</div></div>';
+      html += '</div>';
+      html += '<div class="node-stats" id="stats-' + node.id + '"></div>';
+      html += '<div class="console-box" id="con-' + node.id + '"></div>';
+      html += '</div>';
     }
-    sidebar.innerHTML = html;
-    // Auto-scroll console boxes
+    nodesTab.innerHTML = html;
+    sidebarBuilt = true;
+  }
+
+  function updateSidebar(s) {
+    if (!sidebarBuilt) buildSidebar(s);
+
     for (const node of s.nodes) {
+      // Update radio badge
+      const rb = document.getElementById('radio-' + node.id);
+      if (rb && node.radio !== undefined) {
+        rb.className = radioStateClass(node.radio);
+        rb.textContent = radioStateLabel(node.radio);
+      }
+
+      // Update LEDs
+      if (node.leds) {
+        for (let l = 0; l < node.leds.length; l++) {
+          const el = document.getElementById('led-' + node.id + '-' + l);
+          if (el) el.className = 'led ' + (node.leds[l] ? 'led-' + l + '-on' : 'led-off');
+        }
+      }
+
+      // Update stats
+      const st = document.getElementById('stats-' + node.id);
+      if (st) st.innerHTML = fmtCycles(node.cycles) + ' cycles &middot; ' + fmtFreq(node.freq);
+
+      // Append only new console lines
+      const hist = consoleHistory[node.id] || [];
       const box = document.getElementById('con-' + node.id);
-      if (box) box.scrollTop = box.scrollHeight;
+      if (box && node.console && node.console.length > 0) {
+        for (const line of node.console) {
+          const div = document.createElement('div');
+          div.className = 'line';
+          div.textContent = line;
+          box.appendChild(div);
+        }
+        // Trim old lines in DOM
+        while (box.children.length > MAX_CONSOLE)
+          box.removeChild(box.firstChild);
+        box.scrollTop = box.scrollHeight;
+      }
     }
+  }
+
+  /* Parse packet summary string into structured fields for table display.
+   * Summary format: "Data #0 97B N1->bcast DIO [fe80::... -> ff02::...]"
+   *            or: "ACK seq=2"
+   *            or: "Data #5 48B N2->N1 UDP 8765->5678 [...]" */
+  function parsePktSummary(summary, nodeId, dir, timeMs) {
+    const p = { t: timeMs, n: nodeId, dir: dir, src: '', dst: '', type: '', info: '', summary: summary };
+    // Parse source -> dest
+    const addrMatch = summary.match(/\b(N\d+|[0-9A-Fa-f]{4})\s*->\s*(bcast|N\d+|[0-9A-Fa-f]{4})/);
+    if (addrMatch) {
+      p.src = addrMatch[1];
+      p.dst = addrMatch[2];
+    } else if (summary.startsWith('ACK')) {
+      p.src = ''; p.dst = '';
+    }
+    // Parse protocol type
+    if (summary.includes('DIO')) { p.type = 'DIO'; }
+    else if (summary.includes('DAO-ACK')) { p.type = 'DAO-ACK'; }
+    else if (summary.includes('DAO')) { p.type = 'DAO'; }
+    else if (summary.includes('DIS')) { p.type = 'DIS'; }
+    else if (summary.includes('NS')) { p.type = 'NS'; }
+    else if (summary.includes('NA')) { p.type = 'NA'; }
+    else if (summary.match(/UDP \d+->\d+/)) { p.type = 'UDP'; }
+    else if (summary.startsWith('ACK')) { p.type = 'ACK'; }
+    else if (summary.includes('6LoWPAN')) { p.type = '6LoWPAN'; }
+    else { p.type = 'Data'; }
+    // Build info column
+    const ipMatch = summary.match(/\[(.+)\]/);
+    if (p.type === 'UDP') {
+      const portMatch = summary.match(/UDP (\d+)->(\d+)/);
+      p.info = portMatch ? 'Ports ' + portMatch[1] + ' -> ' + portMatch[2] : '';
+      if (ipMatch) p.info += '  ' + ipMatch[1];
+    } else if (p.type === 'ACK') {
+      const seqMatch = summary.match(/seq=(\d+)/);
+      p.info = seqMatch ? 'Seq ' + seqMatch[1] : '';
+    } else {
+      if (ipMatch) p.info = ipMatch[1];
+    }
+    // Extract byte count
+    const sizeMatch = summary.match(/(\d+)B/);
+    if (sizeMatch) p.info = sizeMatch[1] + 'B' + (p.info ? '  ' + p.info : '');
+    return p;
+  }
+
+  let pktSeqNo = 0;
+
+  function updatePacketLog() {
+    const newPkts = packetLog.slice(pktLogRendered);
+    if (newPkts.length === 0) return;
+
+    const pktCount = document.getElementById('pkt-count');
+
+    for (const p of newPkts) {
+      pktSeqNo++;
+      const typeClass = (p.type === 'DIO' || p.type === 'DAO' || p.type === 'DAO-ACK' || p.type === 'DIS')
+        ? 'pkt-type-rpl' : p.type === 'UDP' ? 'pkt-type-udp'
+        : p.type === 'ACK' ? 'pkt-type-ack' : 'pkt-type-data';
+      const row = document.createElement('div');
+      row.className = 'pkt-row';
+      row.dataset.idx = pktSeqNo;
+      row.innerHTML =
+        '<span class="pkt-col-no">' + pktSeqNo + '</span>' +
+        '<span class="pkt-col-time">' + fmtTime(p.t) + '</span>' +
+        '<span class="pkt-col-src">' + esc(p.src || 'N' + p.n) + '</span>' +
+        '<span class="pkt-col-dst">' + esc(p.dst) + '</span>' +
+        '<span class="pkt-col-type ' + typeClass + '">' + esc(p.type) + '</span>' +
+        '<span class="pkt-col-info">' + esc(p.info) + '</span>';
+      row.addEventListener('click', function(e) {
+        document.querySelectorAll('.pkt-row.selected').forEach(r => r.classList.remove('selected'));
+        row.classList.add('selected');
+        pktDetail.textContent = '#' + row.dataset.idx + '  ' + fmtTime(p.t) +
+          '  Node ' + p.n + ' ' + p.dir + '\n' +
+          'Src: ' + (p.src || '?') + '  Dst: ' + (p.dst || '?') +
+          '  Type: ' + p.type + '\n' + p.summary;
+        // Position popup near clicked row
+        const rect = row.getBoundingClientRect();
+        let top = rect.bottom + 4;
+        let left = rect.left;
+        // Keep within viewport
+        if (top + 100 > window.innerHeight) top = rect.top - 100;
+        if (left + 400 > window.innerWidth) left = window.innerWidth - 410;
+        pktDetail.style.top = top + 'px';
+        pktDetail.style.left = left + 'px';
+        pktDetail.classList.add('visible');
+      });
+      pktLog.appendChild(row);
+    }
+    // Trim old rows (keep header)
+    while (pktLog.children.length > MAX_PACKETS + 1)
+      pktLog.removeChild(pktLog.children[1]);
+    pktLogRendered = packetLog.length;
+    pktLog.scrollTop = pktLog.scrollHeight;
+    if (pktCount) pktCount.textContent = 'Radio messages: ' + packetLog.length + ' packets';
   }
 
   function fmtCycles(c) {
@@ -354,12 +1042,245 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
 
+  // --- Timeline drawing ---
+  function drawTimeline() {
+    const tlCanvas = document.getElementById('timeline-canvas');
+    if (!tlCanvas || !tlWrap.classList.contains('open') || !state) return;
+
+    const t = T();
+    const dpr = window.devicePixelRatio || 1;
+    const rect = tlCanvas.parentElement.getBoundingClientRect();
+    if (rect.width < 10 || rect.height < 10) return;
+    const tlW = Math.round(rect.width * dpr);
+    const tlH = Math.round(rect.height * dpr);
+    if (tlCanvas.width !== tlW || tlCanvas.height !== tlH) {
+      tlCanvas.width = tlW;
+      tlCanvas.height = tlH;
+    }
+    const tlCtx = tlCanvas.getContext('2d');
+    tlCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width, H = rect.height;
+
+    tlCtx.fillStyle = t.tlBg;
+    tlCtx.fillRect(0, 0, W, H);
+
+    if (!state.nodes || state.nodes.length === 0) return;
+
+    const numNodes = state.nodes.length;
+    const labelW = 60;
+    const rowH = Math.min(40, (H - 20) / numNodes);
+    const barH = Math.max(4, rowH * 0.3);
+    const ledH = Math.max(3, rowH * 0.15);
+    const chartW = W - labelW - 10;
+    const simMs = state.sim_time_ms || 1;
+
+    // Time window: use zoom/pan state
+    const windowMs = Math.min(tlWindowMs, Math.max(simMs, TL_MIN_WINDOW));
+    const endMs = tlEndMs < 0 ? simMs : tlEndMs;
+    const startMs = Math.max(0, endMs - windowMs);
+
+    // Draw time axis
+    tlCtx.fillStyle = t.muted;
+    tlCtx.font = '9px SF Mono, Menlo, monospace';
+    tlCtx.textAlign = 'center';
+    const tickInterval = windowMs <= 100 ? 10 :
+                         windowMs <= 500 ? 50 :
+                         windowMs <= 2000 ? 200 :
+                         windowMs <= 5000 ? 1000 :
+                         windowMs <= 20000 ? 2000 :
+                         windowMs <= 60000 ? 5000 :
+                         windowMs <= 300000 ? 30000 : 60000;
+    for (let ms = Math.ceil(startMs / tickInterval) * tickInterval; ms <= simMs; ms += tickInterval) {
+      const x = labelW + ((ms - startMs) / windowMs) * chartW;
+      tlCtx.fillText(fmtTime(ms, windowMs), x, H - 2);
+      tlCtx.strokeStyle = t.tlGrid;
+      tlCtx.lineWidth = 0.5;
+      tlCtx.beginPath();
+      tlCtx.moveTo(x, 0);
+      tlCtx.lineTo(x, H - 14);
+      tlCtx.stroke();
+    }
+
+    // Draw per-node rows
+    for (let i = 0; i < numNodes; i++) {
+      const node = state.nodes[i];
+      const y = i * rowH + 4;
+      const events = timelineData[node.id] || [];
+
+      // Node label
+      tlCtx.fillStyle = t.muted;
+      tlCtx.font = '10px SF Mono, Menlo, monospace';
+      tlCtx.textAlign = 'right';
+      tlCtx.fillText('N' + node.id, labelW - 4, y + barH);
+
+      // Radio state bar: pixel-aggregate rendering.
+      // For each pixel column, find the highest-priority state that occurs
+      // in that time range. Priority: intf > rx > tx > on > off.
+      // This prevents sub-pixel events from causing visual chaos when zoomed out.
+      const statePri = { off: 0, on: 1, rx: 2, tx: 3, intf: 4 };
+      const stateColor = { on: t.tlOn, tx: t.tlTx, rx: t.tlRx, intf: t.tlIntf };
+
+      // Find initial state before visible window
+      let prevState = nodeRadioBaseState[node.id] || 'off';
+      let evIdx = 0;
+      for (let ei = 0; ei < events.length; ei++) {
+        const ev = events[ei];
+        if (ev.e !== 'tx' && ev.e !== 'rx' && ev.e !== 'off' && ev.e !== 'on' && ev.e !== 'intf') continue;
+        if (ev.t < startMs) { prevState = ev.e; evIdx = ei + 1; continue; }
+        break;
+      }
+
+      // For each pixel column, determine the highest-priority state
+      const msPerPx = windowMs / chartW;
+      let curState = prevState;
+      for (let px = 0; px < chartW; px++) {
+        const pxStartMs = startMs + px * msPerPx;
+        const pxEndMs = pxStartMs + msPerPx;
+        let best = curState;
+
+        // Advance through events in this pixel's time range
+        while (evIdx < events.length) {
+          const ev = events[evIdx];
+          if (ev.e !== 'tx' && ev.e !== 'rx' && ev.e !== 'off' && ev.e !== 'on' && ev.e !== 'intf') { evIdx++; continue; }
+          if (ev.t > pxEndMs) break;
+          // The previous state was active during [prevEvTime, ev.t]
+          if ((statePri[curState] || 0) > (statePri[best] || 0)) best = curState;
+          curState = ev.e;
+          evIdx++;
+        }
+        // Current state covers the rest of this pixel
+        if ((statePri[curState] || 0) > (statePri[best] || 0)) best = curState;
+
+        if (best === 'off') continue;
+        const x = labelW + px;
+        tlCtx.fillStyle = stateColor[best] || t.tlOn;
+        tlCtx.globalAlpha = 0.9;
+        tlCtx.fillRect(x, y, 1, barH);
+        tlCtx.globalAlpha = 1;
+      }
+
+      // Collision markers: draw after all nodes so they overlay everything
+
+      // LED bars (below radio bar)
+      const ledColors = [t.tlLed0, t.tlLed1, t.tlLed2];
+      const knownLeds = nodeLedState[node.id] || [false, false, false];
+      for (let l = 0; l < 3; l++) {
+        let lPrevX = labelW;
+        let lOn = knownLeds[l]; // start with known state
+        const ledY = y + barH + 2 + l * (ledH + 1);
+        for (const ev of events) {
+          if (ev.e !== 'led_on' && ev.e !== 'led_off') continue;
+          if (ev.v !== l) continue;
+          if (ev.t < startMs) { lOn = ev.e === 'led_on'; continue; }
+          const x = labelW + ((ev.t - startMs) / windowMs) * chartW;
+          if (lOn && x > lPrevX) {
+            tlCtx.fillStyle = ledColors[l];
+            tlCtx.globalAlpha = 0.7;
+            tlCtx.fillRect(lPrevX, ledY, x - lPrevX, ledH);
+            tlCtx.globalAlpha = 1;
+          }
+          lPrevX = x;
+          lOn = ev.e === 'led_on';
+        }
+        const ledEndX = labelW + chartW;
+        if (lOn && ledEndX > lPrevX) {
+          tlCtx.fillStyle = ledColors[l];
+          tlCtx.globalAlpha = 0.7;
+          tlCtx.fillRect(lPrevX, ledY, ledEndX - lPrevX, ledH);
+          tlCtx.globalAlpha = 1;
+        }
+      }
+
+      // Frame markers (vertical ticks)
+      for (const ev of events) {
+        if (ev.e !== 'frame' || ev.t < startMs) continue;
+        const x = labelW + ((ev.t - startMs) / windowMs) * chartW;
+        tlCtx.strokeStyle = ev.v === 1 ? t.tlTx : t.tlRx;
+        tlCtx.lineWidth = 1.5;
+        tlCtx.globalAlpha = 0.9;
+        tlCtx.beginPath();
+        tlCtx.moveTo(x, y - 1);
+        tlCtx.lineTo(x, y + barH + 1);
+        tlCtx.stroke();
+        tlCtx.globalAlpha = 1;
+      }
+
+      // Row separator
+      tlCtx.strokeStyle = t.tlGrid;
+      tlCtx.lineWidth = 0.5;
+      tlCtx.beginPath();
+      tlCtx.moveTo(labelW, y + rowH - 1);
+      tlCtx.lineTo(W, y + rowH - 1);
+      tlCtx.stroke();
+    }
+
+    // Collision markers: second pass over all nodes, drawn on top
+    tlCtx.fillStyle = t.tlIntf;
+    tlCtx.strokeStyle = t.tlIntf;
+    for (let i = 0; i < numNodes; i++) {
+      const node = state.nodes[i];
+      const y = i * rowH + 4;
+      const events = timelineData[node.id] || [];
+      for (const ev of events) {
+        if (ev.e !== 'intf') continue;
+        if (ev.t < startMs || ev.t > endMs) continue;
+        const cx = labelW + ((ev.t - startMs) / windowMs) * chartW;
+        // Vertical red line spanning full chart height
+        tlCtx.globalAlpha = 0.4;
+        tlCtx.lineWidth = 1;
+        tlCtx.beginPath();
+        tlCtx.moveTo(cx, 0);
+        tlCtx.lineTo(cx, H - 14);
+        tlCtx.stroke();
+        // Red X marker on the affected node's row
+        tlCtx.globalAlpha = 1;
+        tlCtx.lineWidth = 2;
+        const my = y + barH / 2;
+        tlCtx.beginPath();
+        tlCtx.moveTo(cx - 4, my - 4);
+        tlCtx.lineTo(cx + 4, my + 4);
+        tlCtx.moveTo(cx + 4, my - 4);
+        tlCtx.lineTo(cx - 4, my + 4);
+        tlCtx.stroke();
+      }
+    }
+    tlCtx.globalAlpha = 1;
+
+    // Selection overlay
+    if (tlSelStartMs >= 0 && tlSelEndMs >= 0) {
+      const sMs = Math.min(tlSelStartMs, tlSelEndMs);
+      const eMs = Math.max(tlSelStartMs, tlSelEndMs);
+      const sx = labelW + ((sMs - startMs) / windowMs) * chartW;
+      const ex = labelW + ((eMs - startMs) / windowMs) * chartW;
+      tlCtx.fillStyle = 'rgba(88, 166, 255, 0.15)';
+      tlCtx.fillRect(sx, 0, ex - sx, H - 14);
+      tlCtx.strokeStyle = '#58a6ff';
+      tlCtx.lineWidth = 1;
+      tlCtx.setLineDash([4, 2]);
+      tlCtx.beginPath();
+      tlCtx.moveTo(sx, 0); tlCtx.lineTo(sx, H - 14);
+      tlCtx.moveTo(ex, 0); tlCtx.lineTo(ex, H - 14);
+      tlCtx.stroke();
+      tlCtx.setLineDash([]);
+    }
+  }
+
+  // --- Topology canvas ---
+  let canvasW = 0, canvasH = 0;
+
   function drawCanvas(s) {
     const t = T();
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.parentElement.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
+    const newW = Math.round(rect.width * dpr);
+    const newH = Math.round(rect.height * dpr);
+    // Only resize canvas when container size actually changes
+    if (newW !== canvasW || newH !== canvasH) {
+      canvas.width = newW;
+      canvas.height = newH;
+      canvasW = newW;
+      canvasH = newH;
+    }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const W = rect.width, H = rect.height;
     ctx.fillStyle = t.bg;
@@ -367,7 +1288,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
 
     if (!s.nodes.length) return;
 
-    // Compute bounds with padding — include tx_range in bounds so circles are visible
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     const txr = (s.radio.type === 'UDGM' && s.radio.tx_range > 0) ? s.radio.tx_range : 0;
     for (const n of s.nodes) {
@@ -385,7 +1305,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     const centerX = (minX + maxX) / 2;
     const centerY = (minY + maxY) / 2;
 
-    // Transform: world coords -> screen coords with zoom + pan
     function tx(x) { return W/2 + (x - centerX) * scale + camX; }
     function ty(y) { return H/2 + (y - centerY) * scale + camY; }
 
@@ -393,13 +1312,11 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     if (txr > 0) {
       for (const n of s.nodes) {
         const r = txr * scale;
-        // Fill
         ctx.globalAlpha = 0.05;
         ctx.fillStyle = t.txRange;
         ctx.beginPath();
         ctx.arc(tx(n.x), ty(n.y), r, 0, Math.PI*2);
         ctx.fill();
-        // Stroke
         ctx.globalAlpha = 0.2;
         ctx.strokeStyle = t.txRange;
         ctx.lineWidth = 1;
@@ -429,13 +1346,10 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
       }
     }
 
-    // Node sizing (needed by arrows and node drawing)
     const nodeRadius = Math.max(12, Math.min(22, 18 * camZoom));
     const dotRadius = Math.max(3, Math.min(6, 5 * camZoom));
 
-    // Draw communication arrows (TX events)
-    // Longer fade (10s sim time) so arrows stay visible between periodic TXes.
-    // "Hot" phase (first 1s) shows brighter, thicker arrows.
+    // Draw communication arrows
     const TX_FADE_MS = 10000;
     const TX_HOT_MS = 1000;
     const arrowLen = Math.max(8, 12 * camZoom);
@@ -454,7 +1368,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
         const dst = s.nodes[j];
         const sx = tx(n.x), sy = ty(n.y);
         const dx = tx(dst.x), dy = ty(dst.y);
-        // Shorten arrow to stop at node edge
         const dist = Math.sqrt((dx-sx)*(dx-sx) + (dy-sy)*(dy-sy));
         if (dist < 1) continue;
         const ux = (dx-sx)/dist, uy = (dy-sy)/dist;
@@ -462,7 +1375,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
         const startY = sy + uy * nodeRadius;
         const endX = dx - ux * nodeRadius;
         const endY = dy - uy * nodeRadius;
-        // Line — hot phase uses brighter color and thicker stroke
         ctx.globalAlpha = alpha * (hot ? 0.9 : 0.5);
         ctx.strokeStyle = hot ? t.arrowHot : t.arrow;
         ctx.lineWidth = Math.max(2, (hot ? 4 : 2.5) * camZoom);
@@ -470,7 +1382,6 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
         ctx.moveTo(startX, startY);
         ctx.lineTo(endX, endY);
         ctx.stroke();
-        // Arrowhead
         const angle = Math.atan2(endY - startY, endX - startX);
         const aLen = hot ? arrowLen * 1.3 : arrowLen;
         ctx.fillStyle = hot ? t.arrowHot : t.arrow;
@@ -487,11 +1398,26 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     }
     ctx.globalAlpha = 1;
 
-    // Draw nodes
+    // Draw nodes with radio state ring
     const colors = { MSP430: t.accent, ARM: t.green, NATIVE: t.yellow };
     for (const n of s.nodes) {
       const cx = tx(n.x), cy = ty(n.y);
       const col = colors[n.type] || t.muted;
+
+      // Radio state ring (Cooja Classic: blue=TX, green=RX, red=intf, gray=on)
+      const ringColor = n.radio === 'tx' ? t.accent :
+                        n.radio === 'rx' ? t.green :
+                        n.radio === 'intf' ? t.red :
+                        n.radio === 'on' ? t.muted : null;
+      if (ringColor) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, nodeRadius + 4, 0, Math.PI*2);
+        ctx.strokeStyle = ringColor;
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = (n.radio === 'on') ? 0.3 : 0.6;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
 
       // Outer circle
       ctx.beginPath();
@@ -508,16 +1434,39 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
       ctx.fillStyle = col;
       ctx.fill();
 
+      // LED indicators (small circles below node)
+      if (n.leds) {
+        const ledR = Math.max(2, 3 * camZoom);
+        const ledGap = ledR * 3;
+        const ledY = cy + nodeRadius + 6;
+        const ledStartX = cx - ((n.leds.length - 1) * ledGap) / 2;
+        const ledC = [t.green, t.yellow, t.red];
+        for (let l = 0; l < n.leds.length; l++) {
+          ctx.beginPath();
+          ctx.arc(ledStartX + l * ledGap, ledY, ledR, 0, Math.PI*2);
+          if (n.leds[l]) {
+            ctx.fillStyle = ledC[l];
+            ctx.globalAlpha = 0.9;
+          } else {
+            ctx.fillStyle = t.dim;
+            ctx.globalAlpha = 0.3;
+          }
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+      }
+
       // Label
       ctx.fillStyle = t.nodeLabel;
       ctx.font = '11px SF Mono, Menlo, monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('Node ' + n.id, cx, cy + nodeRadius + 14);
+      const labelY = n.leds ? cy + nodeRadius + 20 : cy + nodeRadius + 14;
+      ctx.fillText('Node ' + n.id, cx, labelY);
 
       // Type label
       ctx.fillStyle = t.nodeType;
       ctx.font = '9px SF Mono, Menlo, monospace';
-      ctx.fillText(n.type, cx, cy + nodeRadius + 26);
+      ctx.fillText(n.type, cx, labelY + 12);
     }
 
     // Zoom indicator
@@ -526,19 +1475,16 @@ canvas { width: 100%; height: 100%; background: var(--bg); cursor: grab; }
     ctx.textAlign = 'left';
     ctx.fillText((camZoom * 100).toFixed(0) + '%', 8, H - 8);
 
-    // Save transform state for mouse hit-testing
     lastScale = scale;
     lastCenterX = centerX;
     lastCenterY = centerY;
     lastW = W;
     lastH = H;
 
-    // Update active links counter in header
     document.getElementById('active-links').textContent = arrowCount;
   }
 
-  // Handle resize
-  window.addEventListener('resize', () => { if (state) drawCanvas(state); });
+  window.addEventListener('resize', () => { if (state) { drawCanvas(state); drawTimeline(); } });
 
   connect();
 })();

@@ -3,6 +3,7 @@
  */
 #include "cc2538_sys_ctrl.h"
 #include <string.h>
+#include <stdio.h>
 
 #define SYS_CTRL_REG_SIZE  0x1000
 
@@ -52,13 +53,13 @@ static void sys_ctrl_write(void *user_data, uint32_t addr, uint32_t value) {
              * CC2538 CLOCK_STA register layout:
              *   [2:0]  SYS_DIV, [10:8] IO_DIV — mirror CLOCK_CTRL
              *   [16]   SOURCE_CHANGE = 0 (switch complete)
-             *   [22]   XOSC_STB   = 1 when XOSC selected (OSC bit=0)
-             *   [24]   HSOSC_STB  = 1 when RCOSC selected (OSC bit=1)
+             *   [19]   XOSC_STB   = 1 when XOSC selected (OSC bit=0)
+             *   [18]   HSOSC_STB  = 1 when RCOSC selected (OSC bit=1)
              *   [26]   OSC32K     = set after transition delay */
             {
                 int osc = (value >> 6) & 1;
                 sc->clock_sta = (value & 0x707) |           /* SYS_DIV, IO_DIV, OSC */
-                                (osc ? (1u << 24) : (1u << 22)); /* stable bit */
+                                (osc ? (1u << 18) : (1u << 19)); /* stable bit */
                 /* OSC32K transition: firmware expects bit 26 to be 0 first, then 1 */
                 if ((value >> 17) & 1)
                     sc->osc32k_pending = 2; /* will set after 2 reads */
@@ -93,7 +94,8 @@ void cc2538_sys_ctrl_init(cc2538_sys_ctrl_t *sc, arm_cpu_t *cpu) {
 
     /* Default clock: 32 MHz from 32 MHz XOSC */
     sc->clock_ctrl = 0;
-    sc->clock_sta = (1u << 22); /* XOSC_STB (32MHz crystal stable, default source) */
+    /* CLOCK_STA: XOSC_STB=bit19, HSOSC_STB=bit18, SYNC_32K=bit26 */
+    sc->clock_sta = (1u << 19) | (1u << 18) | (1u << 26);
 
     arm_register_io(cpu, SYS_CTRL_BASE, SYS_CTRL_REG_SIZE,
                     sys_ctrl_read, sys_ctrl_write, sc);

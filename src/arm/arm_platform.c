@@ -116,6 +116,39 @@ static void i2c_write(void *user_data, uint32_t addr, uint32_t value) {
     (void)user_data; (void)addr; (void)value;
 }
 
+/* USB controller stub (0x40089000)
+ * Firmware polls USB_CTRL (offset 0x3C) bit 7 during usb_arch_setup.
+ * We store writes and return them on reads, with bit 7 always set
+ * so the firmware doesn't spin forever. */
+#define USB_BASE  0x40089000
+#define USB_SIZE  0x1000
+
+typedef struct {
+    uint32_t regs[USB_SIZE / 4];
+} usb_state_t;
+
+static int usb_read(void *user_data, uint32_t addr) {
+    usb_state_t *usb = (usb_state_t *)user_data;
+    uint32_t offset = addr - USB_BASE;
+    uint32_t idx = offset / 4;
+    if (idx < USB_SIZE / 4) {
+        uint32_t val = usb->regs[idx];
+        /* USB_CTRL at offset 0x3C: bit 7 = USB PLL locked */
+        if (offset == 0x3C)
+            val |= (1u << 7);
+        return (int)val;
+    }
+    return 0;
+}
+
+static void usb_write(void *user_data, uint32_t addr, uint32_t value) {
+    usb_state_t *usb = (usb_state_t *)user_data;
+    uint32_t offset = addr - USB_BASE;
+    uint32_t idx = offset / 4;
+    if (idx < USB_SIZE / 4)
+        usb->regs[idx] = value;
+}
+
 /* Minimal uDMA — supports byte transfers for RF TX FIFO */
 #define UDMA_BASE         0x400FF000
 #define UDMA_SIZE         0x1000
@@ -265,10 +298,18 @@ void arm_platform_init(arm_platform_t *plat, const arm_platform_config_t *config
         plat->udma = dma;
         arm_register_io(&plat->cpu, UDMA_BASE, UDMA_SIZE, udma_read, udma_write, dma);
     }
+
+    /* USB stub */
+    {
+        usb_state_t *usb = (usb_state_t *)calloc(1, sizeof(usb_state_t));
+        plat->usb = usb;
+        arm_register_io(&plat->cpu, USB_BASE, USB_SIZE, usb_read, usb_write, usb);
+    }
 }
 
 void arm_platform_destroy(arm_platform_t *plat) {
     free(plat->udma);
+    free(plat->usb);
     arm_cpu_destroy(&plat->cpu);
 }
 

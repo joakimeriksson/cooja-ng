@@ -23,6 +23,8 @@
 #include "ws_server.h"
 #include "sim_state.h"
 #include "sim_threads.h"
+#include "timeline.h"
+#include "packet_analyzer.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -219,6 +221,115 @@ static char ui_console_new[MAX_NODES][UI_CONSOLE_LINES][UI_CONSOLE_LINELEN];
 static int ui_console_new_count[MAX_NODES];
 static double ui_speed_ratio = 10.0;  /* adjustable from UI, default 10x */
 static int ui_paused = 0;             /* play/pause state */
+static int ui_full_state_requested = 1; /* send full state on first broadcast */
+static int ui_restart_requested = 0;   /* restart simulation from UI */
+
+/* --- Timeline and packet analyzer state --- */
+static timeline_t timeline;
+static sim_node_state_t node_states[MAX_NODES];
+static sim_node_state_t prev_node_states[MAX_NODES]; /* previous delta state for change detection */
+static int64_t prev_last_tx_ns[MAX_NODES];           /* previous TX timestamps for change detection */
+static int suppress_state_callback = 0; /* suppress during synchronous delivery */
+
+/* RF state change callback — fires during CPU step for real-time timeline tracking.
+ * TX and RX events are handled by explicit timeline events in the TX/delivery
+ * handlers (with proper frame duration). This callback handles radio ON/OFF
+ * transitions (ISRXON, ISRFOFF, tx_done return-to-RX). */
+static void mixed_rf_state_handler(void *user_data, int old_state, int new_state) {
+    if (!ui_server || suppress_state_callback) return;
+    mixed_node_t *node = (mixed_node_t *)user_data;
+    int idx = (int)(node - nodes);
+
+    sim_radio_state_t sim_state = SIM_RADIO_OFF;
+    if (new_state >= RF_STATE_TX_CALIBR && new_state <= RF_STATE_TX_FINAL)
+        sim_state = SIM_RADIO_TX;
+    else if (new_state == RF_STATE_RX)
+        sim_state = SIM_RADIO_RX;
+    else if (new_state == RF_STATE_RX_CALIBR || new_state == RF_STATE_SFD_WAIT)
+        sim_state = SIM_RADIO_ON;
+
+    /* Skip TX/RX events — explicit timeline events handle those with
+     * proper frame duration.  Only emit ON/OFF transitions here. */
+    if (sim_state == SIM_RADIO_TX || sim_state == SIM_RADIO_RX) {
+        node_states[idx].radio_state = sim_state;
+        return;
+    }
+
+    if (sim_state != node_states[idx].radio_state) {
+        node_states[idx].radio_state = sim_state;
+        tl_event_type_t etype;
+        switch (sim_state) {
+        case SIM_RADIO_ON:   etype = TL_RADIO_ON;   break;
+        default:             etype = TL_RADIO_OFF;   break;
+        }
+        /* Use CPU cycles for accurate intra-step timing */
+        int64_t ts = arm_cycles_to_ns(node->plat.arm.cpu.cycles,
+                                       node->plat.arm.cpu.cpu_freq_hz);
+        tl_radio_event(&timeline, node->id, ts, etype);
+    }
+}
+
+/* Track per-node radio state for timeline events */
+static void update_radio_state(int idx) {
+    sim_radio_state_t new_state = SIM_RADIO_OFF;
+    if (nodes[idx].type == NODE_MSP430) {
+        cc2420_radio_state_t rs = nodes[idx].plat.msp.cc2420.state;
+        if (rs >= CC2420_TX_CALIBRATE && rs <= CC2420_TX_UNDERFLOW)
+            new_state = SIM_RADIO_TX;
+        else if (rs == CC2420_RX_FRAME)
+            new_state = SIM_RADIO_RX;       /* actively receiving data (green) */
+        else if (rs == CC2420_RX_CALIBRATE || rs == CC2420_RX_SFD_SEARCH)
+            new_state = SIM_RADIO_ON;       /* on, listening (gray) */
+        /* else: VREG_OFF, POWER_DOWN, IDLE -> OFF (white) */
+    } else if (nodes[idx].type == NODE_ARM) {
+        rf_state_t rs = nodes[idx].plat.arm.rfcore.state;
+        if (rs >= RF_STATE_TX_CALIBR && rs <= RF_STATE_TX_FINAL)
+            new_state = SIM_RADIO_TX;
+        else if (rs == RF_STATE_RX)
+            new_state = SIM_RADIO_RX;       /* actively receiving data (green) */
+        else if (rs == RF_STATE_RX_CALIBR || rs == RF_STATE_SFD_WAIT)
+            new_state = SIM_RADIO_ON;       /* on, listening (gray) */
+        /* else: IDLE -> OFF (white) */
+    }
+    if (new_state != node_states[idx].radio_state) {
+        node_states[idx].radio_state = new_state;
+        if (ui_server) {
+            tl_event_type_t etype;
+            switch (new_state) {
+            case SIM_RADIO_TX:   etype = TL_RADIO_TX;   break;
+            case SIM_RADIO_RX:   etype = TL_RADIO_RX;   break;
+            case SIM_RADIO_ON:   etype = TL_RADIO_ON;   break;
+            case SIM_RADIO_INTF: etype = TL_RADIO_INTF; break;
+            default:             etype = TL_RADIO_OFF;   break;
+            }
+            tl_radio_event(&timeline, nodes[idx].id, current_sim_ns, etype);
+        }
+    }
+}
+
+/* Track LED state changes for Tmote Sky (P5.4=green, P5.5=yellow, P5.6=red)
+ * and CC2538DK (PC0=red, PC1=yellow, PC2=green) */
+static void update_led_state(int idx) {
+    uint8_t leds[SIM_MAX_LEDS] = {0, 0, 0};
+    if (nodes[idx].type == NODE_MSP430) {
+        uint8_t p5out = nodes[idx].plat.msp.gpio.ports[4].out;
+        leds[0] = (p5out >> 4) & 1;  /* green  = P5.4 */
+        leds[1] = (p5out >> 5) & 1;  /* yellow = P5.5 */
+        leds[2] = (p5out >> 6) & 1;  /* red    = P5.6 */
+    } else if (nodes[idx].type == NODE_ARM) {
+        uint32_t pc_data = nodes[idx].plat.arm.gpio.ports[2].data;
+        leds[0] = (pc_data >> 0) & 1;  /* red */
+        leds[1] = (pc_data >> 1) & 1;  /* yellow */
+        leds[2] = (pc_data >> 2) & 1;  /* green */
+    }
+    for (int l = 0; l < SIM_MAX_LEDS; l++) {
+        if (leds[l] != node_states[idx].led[l]) {
+            node_states[idx].led[l] = leds[l];
+            if (ui_server)
+                tl_led_event(&timeline, nodes[idx].id, current_sim_ns, l, leds[l]);
+        }
+    }
+}
 
 static void ui_message_handler(const char *data, int len, void *userdata) {
     (void)userdata;
@@ -236,6 +347,11 @@ static void ui_message_handler(const char *data, int len, void *userdata) {
         } else if (strcmp(cmd->valuestring, "pause") == 0) {
             ui_paused = 1;
         } else if (strcmp(cmd->valuestring, "play") == 0) {
+            ui_paused = 0;
+        } else if (strcmp(cmd->valuestring, "full") == 0) {
+            ui_full_state_requested = 1;
+        } else if (strcmp(cmd->valuestring, "restart") == 0) {
+            ui_restart_requested = 1;
             ui_paused = 0;
         } else if (strcmp(cmd->valuestring, "move") == 0) {
             cJSON *jnode = cJSON_GetObjectItem(root, "node");
@@ -440,9 +556,22 @@ static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
     stat_emu_rx_queued++;
 }
 
-/* Deliver buffered bytes directly to an emulated node's radio */
+/* 802.15.4 byte duration at 250 kbps = 32 µs = 32000 ns */
+#define IEEE802154_BYTE_NS 32000LL
+
+/* Deliver buffered bytes directly to an emulated node's radio.
+ * Emits explicit RX timeline events with computed frame air time,
+ * since all bytes are delivered synchronously at the same sim time. */
 static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
-                               int8_t rssi) {
+                               int8_t rssi, int64_t air_time_ns) {
+    /* Emit RX timeline event using the provided air-time timestamp
+     * (derived from the sender's TX timing) for consistency. */
+    if (ui_server && len > 0) {
+        int64_t rx_dur = (int64_t)len * IEEE802154_BYTE_NS;
+        tl_radio_event(&timeline, nodes[idx].id, air_time_ns, TL_RADIO_RX);
+        tl_radio_event(&timeline, nodes[idx].id, air_time_ns + rx_dur, TL_RADIO_ON);
+        node_states[idx].radio_state = SIM_RADIO_ON;
+    }
     if (nodes[idx].type == NODE_MSP430) {
         nodes[idx].plat.msp.cc2420.rx_rssi = rssi;
         for (int j = 0; j < len; j++)
@@ -525,7 +654,61 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
      * which re-enters and appends ACK bytes to OTHER receivers' rf_pending.
      * Without snapshot, later receivers would see corrupted (interleaved) data. */
     stat_rf_frames++;
+
+    /* Compute cycle-accurate TX timestamps for timeline and RX delivery.
+     * Total bytes on air: 4 preamble + 1 SFD + 1 length + expected_len */
+    int total_air_bytes = 4 + 1 + 1 + tx_asm[sender_idx].expected_len;
+    int64_t frame_air_dur = (int64_t)total_air_bytes * IEEE802154_BYTE_NS;
+    int64_t accurate_tx_end;
+    if (nodes[sender_idx].type == NODE_ARM)
+        accurate_tx_end = arm_cycles_to_ns(nodes[sender_idx].plat.arm.cpu.cycles,
+                                            nodes[sender_idx].plat.arm.cpu.cpu_freq_hz);
+    else if (nodes[sender_idx].type == NODE_MSP430)
+        accurate_tx_end = msp430_cycles_to_ns(nodes[sender_idx].plat.msp.cpu.cycles,
+                                               nodes[sender_idx].plat.msp.cpu.cpu_freq_hz);
+    else
+        accurate_tx_end = current_sim_ns;
+    int64_t accurate_tx_start = accurate_tx_end - frame_air_dur;
+    if (accurate_tx_start < 0) accurate_tx_start = 0;
+
+    /* Emit explicit TX timeline event */
+    if (ui_server) {
+        tl_radio_event(&timeline, nodes[sender_idx].id, accurate_tx_start, TL_RADIO_TX);
+        tl_radio_event(&timeline, nodes[sender_idx].id, accurate_tx_end, TL_RADIO_ON);
+        node_states[sender_idx].radio_state = SIM_RADIO_ON;
+    }
+
+    /* Packet analysis: decode and log frame contents */
+    if (ui_server || verbose) {
+        /* Find any receiver's buffered frame to decode (they're all identical) */
+        for (int i = 0; i < num_nodes; i++) {
+            if (rf_pending[i].count >= 6 && &nodes[i] != sender) {
+                /* Frame data: starts at preamble. Find length byte (after 4×0x00+0x7A SFD) */
+                uint8_t *buf = rf_pending[i].bytes;
+                int fstart = -1;
+                for (int b = 0; b + 5 < rf_pending[i].count; b++) {
+                    if (buf[b] == 0x7A && b >= 4) {
+                        fstart = b + 1; /* length byte position */
+                        break;
+                    }
+                }
+                if (fstart >= 0 && fstart < rf_pending[i].count) {
+                    pkt_info_t pinfo;
+                    pkt_analyze(buf + fstart, rf_pending[i].count - fstart, &pinfo);
+                    if (verbose)
+                        fprintf(stderr, "  [PKT] Node %d TX: %s\n",
+                                nodes[sender_idx].id, pinfo.summary);
+                    if (ui_server)
+                        tl_frame_event(&timeline, nodes[sender_idx].id,
+                                       accurate_tx_start, 1, pinfo.summary);
+                }
+                break;
+            }
+        }
+    }
+
     rf_tx_depth++;
+    suppress_state_callback = 1;  /* explicit timeline events emitted above */
 
     /* Snapshot: copy frame data and RSSI for each emulated receiver */
     static uint8_t frame_snap[MAX_NODES][EMU_RX_FRAME_MAX];
@@ -564,18 +747,29 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
      * multiple ACK frames in the same rf_pending buffer. */
     for (int s = 0; s < snap_count; s++) {
         int i = snap_indices[s];
-        /* Collision window: one time step. Frames are delivered synchronously
-         * (all bytes at once), so the collision granularity is the time step.
-         * Using frame_len * 32000 would span multiple steps and cause false
-         * positives when legitimate frames arrive in subsequent steps. */
-        int64_t tx_start = current_sim_ns;
-        int64_t tx_end = current_sim_ns + TIME_STEP_NS;
+        /* Collision window: use actual frame air time for realistic
+         * hidden-terminal collision detection. A frame occupies the
+         * channel from accurate_tx_start to accurate_tx_end. */
+        int64_t coll_start = accurate_tx_start;
+        int64_t coll_end = accurate_tx_end;
 
         /* Collision check: does this frame overlap with a previously
          * delivered frame on this receiver? */
-        if (tx_start < emu_rx_end_ns[i]) {
+        if (coll_start < emu_rx_end_ns[i]) {
             /* Collision with previously delivered frame — drop this one */
             stat_emu_rx_collided++;
+            if (verbose)
+                fprintf(stderr, "  [COLLISION] Node %d->%d frame dropped @ %.3f s "
+                        "(channel busy until %.3f s)\n",
+                        nodes[sender_idx].id, nodes[i].id,
+                        (double)coll_start / 1e9,
+                        (double)emu_rx_end_ns[i] / 1e9);
+            /* Emit interference event on the receiver's timeline */
+            if (ui_server) {
+                int64_t intf_dur = (int64_t)frame_snap_len[i] * IEEE802154_BYTE_NS;
+                tl_radio_event(&timeline, nodes[i].id, accurate_tx_start, TL_RADIO_INTF);
+                tl_radio_event(&timeline, nodes[i].id, accurate_tx_start + intf_dur, TL_RADIO_ON);
+            }
             continue;
         }
 
@@ -590,28 +784,56 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         }
         if (emulated_rxfifo_available(i) >= frame_payload + 1) {
             emu_deliver_bytes(i, frame_snap[i], frame_snap_len[i],
-                              frame_snap_rssi[i]);
+                              frame_snap_rssi[i], accurate_tx_start);
             stat_emu_rx_direct++;
-            emu_rx_end_ns[i] = tx_end;
+            emu_rx_end_ns[i] = coll_end;
+
+            /* Generate RX frame event for packet log.
+             * Parse the frame from after preamble+SFD (byte 5 onward). */
+            if (ui_server && frame_snap_len[i] > 5) {
+                int fstart = -1;
+                for (int b = 0; b + 5 < frame_snap_len[i]; b++) {
+                    if (frame_snap[i][b] == 0x7A && b >= 4) {
+                        fstart = b + 1;
+                        break;
+                    }
+                }
+                if (fstart >= 0 && fstart < frame_snap_len[i]) {
+                    pkt_info_t rxinfo;
+                    pkt_analyze(frame_snap[i] + fstart,
+                                frame_snap_len[i] - fstart, &rxinfo);
+                    tl_frame_event(&timeline, nodes[i].id,
+                                   accurate_tx_start, 0, rxinfo.summary);
+                }
+            }
         } else {
             emu_rx_queue_push(i, frame_snap[i], frame_snap_len[i],
-                              frame_snap_rssi[i], tx_start, tx_end);
-            emu_rx_end_ns[i] = tx_end;
+                              frame_snap_rssi[i], accurate_tx_start, coll_end);
+            emu_rx_end_ns[i] = coll_end;
         }
 
         /* Flush auto-ACK bytes generated by this delivery.
          * Each ACK is a single frame — flush immediately to prevent
          * multiple ACKs concatenating in the same rf_pending buffer.
-         * ACK timing is NOT tracked in emu_rx_end_ns — auto-ACK is
-         * a response to the data frame and shouldn't block future frames. */
+         * ACK timing: ACK starts after data frame ends + 192µs turnaround
+         * (12 symbol periods per 802.15.4). */
+        int64_t ack_start = accurate_tx_end + 192000LL; /* 192µs turnaround */
+        int ack_tx_emitted = 0;  /* emit ACK TX event only once */
         for (int j = 0; j < num_nodes; j++) {
             if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
+                /* Emit TX timeline event for the auto-ACK sender (node i) — once */
+                if (ui_server && !ack_tx_emitted) {
+                    int64_t ack_dur = (int64_t)rf_pending[j].count * IEEE802154_BYTE_NS;
+                    tl_radio_event(&timeline, nodes[i].id, ack_start, TL_RADIO_TX);
+                    tl_radio_event(&timeline, nodes[i].id, ack_start + ack_dur, TL_RADIO_ON);
+                    ack_tx_emitted = 1;
+                }
                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
                 if (emulated_rxfifo_available(j) >= ack_payload + 1)
-                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count, -50);
+                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count, -50, ack_start);
                 else
                     emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                      -50, tx_start, tx_end);
+                                      -50, ack_start, coll_end);
                 rf_pending[j].count = 0;
             }
         }
@@ -639,6 +861,7 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     }
 
     rf_tx_depth--;
+    suppress_state_callback = 0;
 }
 
 /*
@@ -724,7 +947,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 static void mixed_deliver_rf_bytes(int idx) {
     rf_buffer_t *buf = &rf_pending[idx];
     if (buf->count == 0) return;
-    emu_deliver_bytes(idx, buf->bytes, buf->count, 0);
+    emu_deliver_bytes(idx, buf->bytes, buf->count, 0, current_sim_ns);
     buf->count = 0;
 }
 
@@ -757,7 +980,7 @@ static void emu_rx_queue_drain(int idx) {
         memset(emu_rx_end_ns, 0, sizeof(emu_rx_end_ns));
 
         /* Deliver frame bytes to radio */
-        emu_deliver_bytes(idx, f->data, f->len, f->rssi);
+        emu_deliver_bytes(idx, f->data, f->len, f->rssi, current_sim_ns);
         stat_emu_rx_drained++;
 
         q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
@@ -913,7 +1136,7 @@ static void distribute_rf_outgoing(void) {
                         if (emulated_rxfifo_available(i) < frame_payload + 1)
                             step_node_until(i, node_cycles(i) + 5000);
                         if (emulated_rxfifo_available(i) >= frame_payload + 1) {
-                            emu_deliver_bytes(i, buf->bytes, buf->count, rssi);
+                            emu_deliver_bytes(i, buf->bytes, buf->count, rssi, tx_start);
                             stat_emu_rx_direct++;
                             emu_rx_end_ns[i] = tx_end;
                         } else {
@@ -925,15 +1148,18 @@ static void distribute_rf_outgoing(void) {
                     }
 
                     /* Flush auto-ACK bytes generated by this delivery */
-                    for (int j = 0; j < num_nodes; j++) {
-                        if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
-                            int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
-                            if (emulated_rxfifo_available(j) >= ack_payload + 1)
-                                emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count, -50);
-                            else
-                                emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                                  -50, current_sim_ns, current_sim_ns + TIME_STEP_NS);
-                            rf_pending[j].count = 0;
+                    {
+                        int64_t native_ack_start = current_sim_ns + 192000LL;
+                        for (int j = 0; j < num_nodes; j++) {
+                            if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
+                                int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
+                                if (emulated_rxfifo_available(j) >= ack_payload + 1)
+                                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count, -50, native_ack_start);
+                                else
+                                    emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
+                                                      -50, current_sim_ns, current_sim_ns + TIME_STEP_NS);
+                                rf_pending[j].count = 0;
+                            }
                         }
                     }
 
@@ -1155,6 +1381,8 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     arm_platform_set_console(plat, mixed_uart_callback, node);
     cc2538_rfcore_set_tx_callback(&plat->rfcore, mixed_rf_tx_handler, node);
     plat->rfcore.node_id = node_id;
+    plat->rfcore.state_callback = mixed_rf_state_handler;
+    plat->rfcore.state_user_data = node;
 
     /* Seed RFRND and sleep timer uniquely per node.
      * Use bit mixing so close IDs produce divergent sequences. */
@@ -1191,6 +1419,15 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         }
         printf("  Node %d [ARM]: ran to main (0x%08x) in %lld cycles\n",
                node_id, main_addr, (long long)plat->cpu.cycles);
+
+        /* Patch node_id (uint16_t, little-endian) */
+        uint32_t nid_addr = arm_elf_find_symbol(firmware_path, "node_id");
+        if (nid_addr) {
+            nid_addr &= ~1u;
+            arm_write8(&plat->cpu, nid_addr, (uint8_t)(node_id & 0xFF));
+            arm_write8(&plat->cpu, nid_addr + 1, (uint8_t)(node_id >> 8));
+            printf("  Node %d [ARM]: patched node_id at 0x%08x\n", node_id, nid_addr);
+        }
 
         /* Patch linkaddr_node_addr */
         uint32_t la_addr = arm_elf_find_symbol(firmware_path, "linkaddr_node_addr");
@@ -1484,6 +1721,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("Time step: %lld ns\n\n", (long long)TIME_STEP_NS);
 
     num_nodes = node_count;
+sim_restart:
     for (int i = 0; i < node_count; i++) {
         const char *fw = firmware_paths[i < firmware_count ? i : firmware_count - 1];
         int node_id = (config_loaded && i < config.node_count)
@@ -1521,10 +1759,18 @@ int run_mixed_multinode_test(int argc, char **argv) {
         radio_medium_compute_neighbors(&radio_medium);
         if (config.seed)
             radio_medium_set_seed(&radio_medium, (uint32_t)config.seed);
+    } else if (!config_loaded || config.medium_type == 0) {
+        /* Default: UDGM with tx_range covering all nodes (radius*2 + margin) */
+        double default_range = (node_count > 1) ? 50.0 : 10.0;
+        radio_medium_configure_udgm(&radio_medium,
+            default_range, default_range * 2.0, 1.0, 1.0);
+        radio_medium_compute_neighbors(&radio_medium);
+    }
+    if (radio_medium.type == RADIO_MEDIUM_UDGM) {
         printf("Radio medium: UDGM (tx_range=%.1f m, interference=%.1f m, "
                "tx_ratio=%.2f, rx_ratio=%.2f)\n",
-               config.tx_range, config.interference_range,
-               config.success_ratio_tx, config.success_ratio_rx);
+               radio_medium.udgm.tx_range, radio_medium.udgm.interference_range,
+               radio_medium.udgm.success_ratio_tx, radio_medium.udgm.success_ratio_rx);
         for (int i = 0; i < node_count; i++) {
             printf("  Node %d: pos=(%.1f, %.1f) neighbors=%d\n", nodes[i].id,
                    radio_medium.nodes[i].x, radio_medium.nodes[i].y,
@@ -1552,8 +1798,14 @@ int run_mixed_multinode_test(int argc, char **argv) {
         active_test = NULL;
     }
 
-    /* Initialize WebSocket UI server */
-    if (ui_enabled) {
+    /* Initialize timeline and node state tracking */
+    tl_init(&timeline);
+    memset(node_states, 0, sizeof(node_states));
+    memset(prev_node_states, 0, sizeof(prev_node_states));
+    memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
+
+    /* Initialize WebSocket UI server (only on first run, not restart) */
+    if (ui_enabled && !ui_server) {
         ui_server = ws_server_init(ui_port);
         if (ui_server) {
             ws_server_set_message_callback(ui_server, ui_message_handler, NULL);
@@ -1682,6 +1934,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
     double t_start = get_time_ms();
 
     while (sim_ns < end_ns || ui_server) {
+        /* Check for restart request from UI */
+        if (ui_restart_requested) break;
+
         /* When paused, poll WebSocket and sleep but skip to UI broadcast */
         if (ui_paused && ui_server) {
             ws_server_poll(ui_server);
@@ -1904,6 +2159,16 @@ int run_mixed_multinode_test(int argc, char **argv) {
             time_step += get_time_ms() - t_phase;
         }
 
+        /* Update per-node radio/LED state for timeline */
+        if (ui_server) {
+            for (int i = 0; i < node_count; i++) {
+                if (!node_active(i) || nodes[i].type == NODE_NATIVE) continue;
+                if (nodes[i].type == NODE_MSP430)
+                    update_radio_state(i);  /* ARM uses state callback instead */
+                update_led_state(i);
+            }
+        }
+
         /* Test engine: check per-step timeout */
         if (active_test && !active_test->finished &&
             active_test->config->step_count > 0) {
@@ -1932,40 +2197,6 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (sim_ns >= next_ui_ns || ui_paused) {
                 if (!ui_paused) next_ui_ns = sim_ns + ui_interval_ns;
 
-                /* Build node info array with only new console lines */
-                sim_node_info_t ni[MAX_NODES];
-                const char *con_ptrs[MAX_NODES][UI_CONSOLE_LINES];
-                for (int i = 0; i < node_count; i++) {
-                    ni[i].id = nodes[i].id;
-                    ni[i].type = node_type_str(i);
-                    ni[i].x = radio_medium.nodes[i].x;
-                    ni[i].y = radio_medium.nodes[i].y;
-                    ni[i].cycles = node_cycles(i);
-                    ni[i].freq_hz = node_freq(i);
-                    ni[i].sim_time_ns = node_sim_time_ns(i);
-                    ni[i].last_tx_ns = node_last_tx_ns[i];
-                    ni[i].console_count = ui_console_new_count[i];
-                    for (int c = 0; c < ui_console_new_count[i]; c++)
-                        con_ptrs[i][c] = ui_console_new[i][c];
-                    ni[i].console = con_ptrs[i];
-                    ui_console_new_count[i] = 0;
-                }
-
-                /* Build radio info */
-                int neighbor_counts[MAX_NODES];
-                const int *neighbor_ptrs[MAX_NODES];
-                for (int i = 0; i < node_count; i++) {
-                    neighbor_ptrs[i] = radio_medium.neighbors[i].neighbors;
-                    neighbor_counts[i] = radio_medium.neighbors[i].count;
-                }
-                sim_radio_info_t ri = {
-                    .type = radio_medium.type == RADIO_MEDIUM_UDGM ? "UDGM" : "NONE",
-                    .tx_range = radio_medium.udgm.tx_range,
-                    .node_count = node_count,
-                    .neighbors = neighbor_ptrs,
-                    .neighbor_counts = neighbor_counts,
-                };
-
                 sim_stats_t st = {
                     .sim_time_ns = sim_ns,
                     .rf_bytes = rf_byte_count,
@@ -1976,7 +2207,109 @@ int run_mixed_multinode_test(int argc, char **argv) {
                     .paused = ui_paused,
                 };
 
-                char *json = sim_state_to_json(ni, node_count, &ri, &st);
+                int has_clients = ws_server_client_count(ui_server) > 0;
+                char *json = NULL;
+
+                if (ui_full_state_requested && has_clients) {
+                    /* === Full state: on connect/reload === */
+                    ui_full_state_requested = 0;
+
+                    /* Build full node info with ALL console history */
+                    sim_node_info_t ni[MAX_NODES];
+                    const char *con_ptrs[MAX_NODES][UI_CONSOLE_LINES];
+                    for (int i = 0; i < node_count; i++) {
+                        ni[i].id = nodes[i].id;
+                        ni[i].type = node_type_str(i);
+                        ni[i].x = radio_medium.nodes[i].x;
+                        ni[i].y = radio_medium.nodes[i].y;
+                        ni[i].cycles = node_cycles(i);
+                        ni[i].freq_hz = node_freq(i);
+                        ni[i].sim_time_ns = node_sim_time_ns(i);
+                        ni[i].last_tx_ns = node_last_tx_ns[i];
+                        /* Send ALL console history for full state */
+                        ni[i].console_count = ui_console_count[i];
+                        int base = (ui_console_head[i] - ui_console_count[i]
+                                    + UI_CONSOLE_LINES) % UI_CONSOLE_LINES;
+                        for (int c = 0; c < ui_console_count[i]; c++)
+                            con_ptrs[i][c] = ui_console[i][(base + c) % UI_CONSOLE_LINES];
+                        ni[i].console = con_ptrs[i];
+                        /* Don't reset new counts — delta still needs them */
+                    }
+
+                    /* Build radio info */
+                    int neighbor_counts[MAX_NODES];
+                    const int *neighbor_ptrs[MAX_NODES];
+                    for (int i = 0; i < node_count; i++) {
+                        neighbor_ptrs[i] = radio_medium.neighbors[i].neighbors;
+                        neighbor_counts[i] = radio_medium.neighbors[i].count;
+                    }
+                    sim_radio_info_t ri = {
+                        .type = radio_medium.type == RADIO_MEDIUM_UDGM ? "UDGM" : "NONE",
+                        .tx_range = radio_medium.udgm.tx_range,
+                        .node_count = node_count,
+                        .neighbors = neighbor_ptrs,
+                        .neighbor_counts = neighbor_counts,
+                    };
+
+                    /* Skip timeline in full state — viewer accumulates
+                     * events from CBOR deltas after connect.  This keeps the
+                     * full state JSON small (~10 KB vs multi-MB). */
+                    json = sim_state_to_json(ni, node_count, &ri, &st,
+                                             node_states, NULL);
+                    /* Flush old timeline events so the first delta only
+                     * contains events from NOW, not stale history that
+                     * would be off-screen in the viewer. */
+                    tl_flush_new(&timeline);
+                    /* Clear new console counts */
+                    for (int i = 0; i < node_count; i++)
+                        ui_console_new_count[i] = 0;
+
+                } else if (has_clients) {
+                    /* === Delta: CBOR binary, change-only === */
+                    int ids[MAX_NODES];
+                    const char *con_new_ptrs[MAX_NODES][UI_CONSOLE_LINES];
+                    const char **con_ptr_arr[MAX_NODES];
+                    int con_counts[MAX_NODES];
+
+                    for (int i = 0; i < node_count; i++) {
+                        ids[i] = nodes[i].id;
+                        con_counts[i] = ui_console_new_count[i];
+                        for (int c = 0; c < ui_console_new_count[i]; c++)
+                            con_new_ptrs[i][c] = ui_console_new[i][c];
+                        con_ptr_arr[i] = con_new_ptrs[i];
+                        ui_console_new_count[i] = 0;
+                    }
+
+                    /* Encode timeline events to CBOR.
+                     * Always flush new_count to prevent accumulation if
+                     * buffer overflows — losing a batch is better than
+                     * permanently losing all future events. */
+                    static uint8_t tl_cbor_buf[262144];
+                    int tl_cbor_len = tl_events_to_cbor(
+                        (struct timeline_s *)&timeline,
+                        tl_cbor_buf, (int)sizeof(tl_cbor_buf));
+                    tl_flush_new(&timeline);
+
+                    /* Encode full delta to CBOR — must be large enough
+                     * for timeline data + stats + console + radio changes */
+                    static uint8_t cbor_buf[524288];
+                    int cbor_len = sim_state_delta_cbor(
+                        cbor_buf, (int)sizeof(cbor_buf),
+                        &st, node_states, prev_node_states,
+                        node_count, ids,
+                        node_last_tx_ns, prev_last_tx_ns,
+                        (const char ***)con_ptr_arr, con_counts,
+                        tl_cbor_buf, tl_cbor_len);
+
+                    if (cbor_len > 0)
+                        ws_server_broadcast_binary(ui_server, cbor_buf, cbor_len);
+
+                    /* Save current state as previous for next delta */
+                    memcpy(prev_node_states, node_states, sizeof(node_states));
+                    memcpy(prev_last_tx_ns, node_last_tx_ns, sizeof(prev_last_tx_ns));
+                }
+
+                /* Broadcast the JSON (full state only) */
                 if (json) {
                     ws_server_broadcast(ui_server, json, (int)strlen(json));
                     free(json);
@@ -2010,6 +2343,58 @@ int run_mixed_multinode_test(int argc, char **argv) {
             }
             next_progress += progress_interval;
         }
+    }
+
+    /* Handle restart request from UI */
+    if (ui_restart_requested && ui_server) {
+        printf("\n--- Restarting simulation (requested from UI) ---\n\n");
+        ui_restart_requested = 0;
+
+        /* Destroy all nodes */
+        for (int i = 0; i < node_count; i++)
+            destroy_node(i);
+
+        /* Cleanup thread pool */
+        if (num_threads > 0)
+            sim_thread_pool_destroy(&thread_pool);
+
+        /* Reset all global state */
+        rf_byte_count = 0;
+        uart_byte_count = 0;
+        current_sim_ns = 0;
+        stat_rf_frames = 0;
+        stat_emu_rx_direct = 0;
+        stat_emu_rx_queued = 0;
+        stat_emu_rx_drained = 0;
+        stat_emu_rx_dropped = 0;
+        stat_emu_rx_collided = 0;
+        stat_rx_frames_queued = 0;
+        stat_rx_frames_collided = 0;
+        stat_rx_frames_queue_full = 0;
+        channels_dirty = false;
+        memset(rf_pending, 0, sizeof(rf_pending));
+        memset(emu_rx_queue, 0, sizeof(emu_rx_queue));
+        memset(emu_rx_end_ns, 0, sizeof(emu_rx_end_ns));
+        memset(tx_asm, 0, sizeof(tx_asm));
+        memset(rf_outgoing, 0, sizeof(rf_outgoing));
+        memset(frame_outgoing, 0, sizeof(frame_outgoing));
+        memset(thread_state, 0, sizeof(thread_state));
+        memset(node_last_tx_ns, 0, sizeof(node_last_tx_ns));
+        memset(node_start_ns, 0, sizeof(node_start_ns));
+        memset(ui_console, 0, sizeof(ui_console));
+        memset(ui_console_head, 0, sizeof(ui_console_head));
+        memset(ui_console_count, 0, sizeof(ui_console_count));
+        memset(ui_console_new, 0, sizeof(ui_console_new));
+        memset(ui_console_new_count, 0, sizeof(ui_console_new_count));
+        memset(node_states, 0, sizeof(node_states));
+        tl_init(&timeline);
+        extern void cc2538_rfcore_reset_rxfifo_overflows(void);
+        cc2538_rfcore_reset_rxfifo_overflows();
+
+        /* Request full state send on first UI broadcast */
+        ui_full_state_requested = 1;
+
+        goto sim_restart;
     }
 
     double t_end = get_time_ms();

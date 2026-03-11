@@ -6,6 +6,7 @@
  */
 #include "cc2538_sleeptimer.h"
 #include <string.h>
+#include <stdio.h>
 
 #define SMWDTHROSC_BASE  0x400D5000
 #define SMWDTHROSC_SIZE  0x1000
@@ -26,7 +27,13 @@ static uint32_t sleeptimer_get_count(cc2538_sleeptimer_t *st) {
     return st->base_count + (uint32_t)ticks;
 }
 
-/* Schedule the compare match event */
+/* Schedule the compare match event.
+ * Uses direct cycle-based scheduling (arm_schedule_event) instead of ns-based
+ * (arm_schedule_event_ns) because the latter uses sim_time_ns which is only
+ * updated at the end of arm_step_until() batches.  When the compare fires
+ * mid-step and firmware immediately schedules the next compare (e.g. TSCH
+ * slot timing), the stale sim_time_ns caused fire_cycle to be up to 1ms late,
+ * breaking TSCH deadline checks. */
 static void sleeptimer_schedule_compare(cc2538_sleeptimer_t *st) {
     uint32_t current = sleeptimer_get_count(st);
     uint32_t delta = (st->compare - current) & 0xFFFFFFFF;
@@ -35,11 +42,14 @@ static void sleeptimer_schedule_compare(cc2538_sleeptimer_t *st) {
        just schedule a tiny delta to fire soon */
     if (delta == 0) delta = 1;
 
-    /* Convert ticks to ns: delta_ns = delta * 1_000_000_000 / 32768 */
-    int64_t delta_ns = (int64_t)delta * 1000000000LL / SLEEPTIMER_FREQ_HZ;
+    /* Convert delta ticks directly to CPU cycles:
+     * delta_cycles = delta * cpu_freq / 32768
+     * Use 128-bit arithmetic to avoid overflow. */
+    int64_t delta_cycles = (int64_t)((__int128)delta * st->cpu->cpu_freq_hz
+                                     / SLEEPTIMER_FREQ_HZ);
 
-    arm_schedule_event_ns(st->cpu, &st->compare_event,
-                          sleeptimer_now_ns(st) + delta_ns);
+    arm_schedule_event(st->cpu, &st->compare_event,
+                       st->cpu->cycles + delta_cycles);
 }
 
 /* Compare match callback — fires interrupt */
@@ -50,6 +60,7 @@ static void sleeptimer_compare_fire(void *user_data, arm_event_t *ev) {
     /* Update base to current time (use cycles-derived ns, not sim_time_ns) */
     st->base_count = sleeptimer_get_count(st);
     st->base_ns = sleeptimer_now_ns(st);
+
 
     /* Set interrupt pending — wakes CPU from WFI */
     arm_nvic_set_pending(st->nvic, st->irq);

@@ -4,6 +4,7 @@
 #include "cc2538_uart.h"
 #include "arm_nvic.h"
 #include <string.h>
+#include <stdio.h>
 
 #define UART_REG_SIZE  0x1000
 

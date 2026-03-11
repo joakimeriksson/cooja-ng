@@ -48,7 +48,9 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
 
 COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/radio_medium.c \
-                 $(COMMON_SRC_DIR)/sim_threads.c
+                 $(COMMON_SRC_DIR)/sim_threads.c \
+                 $(COMMON_SRC_DIR)/packet_analyzer.c \
+                 $(COMMON_SRC_DIR)/timeline.c
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
@@ -57,7 +59,8 @@ NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
 UI_SOURCES = $(UI_SRC_DIR)/ws_server.c \
              $(UI_SRC_DIR)/sim_state.c
 
-LIB_SOURCES = $(LIB_SRC_DIR)/cJSON.c
+LIB_SOURCES = $(LIB_SRC_DIR)/cJSON.c \
+              $(LIB_SRC_DIR)/cbor.c
 
 ifneq ($(LIGHTNING_LIBS),)
   CFLAGS += $(LIGHTNING_CFLAGS) -DHAVE_LIGHTNING
@@ -78,7 +81,8 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_firmware.c \
                $(TEST_DIR)/test_arm_correctness.c \
                $(TEST_DIR)/test_arm_firmware.c \
-               $(TEST_DIR)/test_mixed_multinode.c
+               $(TEST_DIR)/test_mixed_multinode.c \
+               $(TEST_DIR)/test_timeline.c
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 

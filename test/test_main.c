@@ -28,6 +28,9 @@ extern int run_arm_firmware_tests(int verbose);
 /* Mixed-platform test (handles MSP430, ARM, and native nodes) */
 extern int run_mixed_multinode_test(int argc, char **argv);
 
+/* Timeline unit tests */
+extern int run_timeline_tests(int verbose);
+
 int main(int argc, char **argv) {
     int verbose = 0;
 
@@ -116,6 +119,11 @@ int main(int argc, char **argv) {
     /* Test scripting mode (alias for mixed-multinode with test assertions) */
     if (strcmp(mode, "test") == 0) {
         failures += run_mixed_multinode_test(argc - 2, argv + 2);
+    }
+
+    /* Timeline unit tests */
+    if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_timeline_tests(verbose);
     }
 
     return failures > 0 ? 1 : 0;

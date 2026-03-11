@@ -41,6 +41,8 @@ typedef struct arm_platform {
     cc2538_sleeptimer_t sleeptimer;
     /* uDMA state (opaque, allocated by platform init) */
     void *udma;
+    /* USB state (opaque, allocated by platform init) */
+    void *usb;
     const arm_platform_config_t *config;
 } arm_platform_t;
 

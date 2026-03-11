@@ -21,6 +21,7 @@
 /* Debug counters */
 static int rxfifo_overflow_count = 0;
 int cc2538_rfcore_get_rxfifo_overflows(void) { return rxfifo_overflow_count; }
+void cc2538_rfcore_reset_rxfifo_overflows(void) { rxfifo_overflow_count = 0; }
 
 /* ================================================================
  * CRC — CCITT-16 with bit reversal (matches CC2420 wire format)
@@ -48,8 +49,14 @@ static uint16_t crc_add_bitrev(uint16_t crc, uint8_t data) {
     return crc_add(crc, bitrev(data));
 }
 
-/* MAC timer runs at 32.768 kHz — period in nanoseconds */
-#define MT_PERIOD_NS  30517  /* 1e9 / 32768 */
+/* MAC timer (T2) runs at 32 MHz system clock (not 32.768 kHz like the sleep timer).
+ * The firmware uses RADIO_TO_RTIMER(delta) = delta * 32768 / 32000000
+ * to convert MAC timer ticks to rtimer (sleep timer) ticks. */
+#define MT_FREQ_HZ  32000000
+/* Convert ns to MAC timer ticks */
+static inline int64_t ns_to_mt_ticks(int64_t ns) {
+    return ns * MT_FREQ_HZ / 1000000000LL;
+}
 
 /* --- Interrupt helper --- */
 
@@ -65,7 +72,10 @@ static void rfcore_check_interrupts(cc2538_rfcore_t *rf) {
 /* --- State management --- */
 
 static void rfcore_set_state(cc2538_rfcore_t *rf, rf_state_t state) {
+    int old = rf->state;
     rf->state = state;
+    if (rf->state_callback && old != (int)state)
+        rf->state_callback(rf->state_user_data, old, (int)state);
     switch (state) {
         case RF_STATE_IDLE:
             rf->fsmstat1 = 0;
@@ -137,8 +147,16 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
                 /* 4-byte preamble */
                 for (int i = 0; i < PREAMBLE_MIN; i++)
                     rf->tx_callback(rf->tx_user_data, 0x00);
-                /* SFD */
+                /* SFD — capture MAC timer for TX timestamp */
+                {
+                    int64_t ns = arm_cycles_to_ns(rf->cpu->cycles, rf->cpu->cpu_freq_hz);
+                    int64_t mt_ticks = ns_to_mt_ticks(ns);
+                    rf->mt_sfd_capture = (uint16_t)(mt_ticks & 0xFFFF);
+                    rf->mt_sfd_ovf_capture = (uint32_t)(mt_ticks >> 16) & 0xFFFFFF;
+                }
                 rf->tx_callback(rf->tx_user_data, IEEE802154_SFD);
+                rf->rfirqf0 |= RFIRQF0_SFD;
+                rfcore_check_interrupts(rf);
                 /* TXFIFO data (length byte + payload) */
                 for (int i = 0; i < rf->txfifo_len; i++)
                     rf->tx_callback(rf->tx_user_data, rf->txfifo[i]);
@@ -226,9 +244,11 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
         case CSP_ISRFOFF:
             rf->rxenable = 0;
             rf->software_off = true;
-            /* Don't actually go to IDLE — keep the RX frame parser
-             * active so the simulation medium can deliver frames.
+            /* Report IDLE to the state callback (for timeline tracking)
+             * but keep the RX frame parser active so the simulation
+             * medium can still deliver frames.
              * FSMSTAT0 reads will report IDLE when software_off is set. */
+            rfcore_set_state(rf, RF_STATE_IDLE);
             break;
 
         case CSP_ISFLUSHRX:
@@ -418,22 +438,64 @@ static int sfr_read(void *user_data, uint32_t addr) {
         case RFCORE_SFR_MTIRQF:   return (int)rf->mtirqf;
         case RFCORE_SFR_MTMSEL:   return (int)rf->mtmsel;
         case RFCORE_SFR_MTM0:
-        case RFCORE_SFR_MTM1:
+        case RFCORE_SFR_MTM1: {
+            /* MAC timer MTM0/MTM1: multiplexed via MTMSEL[2:0]
+             * 0=Timer, 1=Capture(SFD), 2=Period, 3-7=Compare */
+            int sel = rf->mtmsel & 0x07;
+            uint16_t val;
+            if (sel == 0) {
+                /* Free-running timer counter */
+                int64_t ns = arm_cycles_to_ns(rf->cpu->cycles, rf->cpu->cpu_freq_hz);
+                int64_t mt_ticks = ns_to_mt_ticks(ns);
+                val = (uint16_t)(mt_ticks & 0xFFFF);
+                /* LATCH_MODE: reading MTM0 latches the overflow counter */
+                if (offset == RFCORE_SFR_MTM0 && (rf->mtctrl & 0x08)) {
+                    rf->mt_ovf_latched = (uint32_t)(mt_ticks >> 16) & 0xFFFFFF;
+                    rf->mt_ovf_latch_valid = true;
+                }
+            } else if (sel == 1) {
+                /* SFD capture */
+                val = rf->mt_sfd_capture;
+            } else if (sel == 2) {
+                /* Period */
+                val = rf->mt_cmp_period;
+            } else {
+                val = 0;
+            }
+            if (offset == RFCORE_SFR_MTM0) return val & 0xFF;
+            return (val >> 8) & 0xFF;
+        }
         case RFCORE_SFR_MTMOVF0:
         case RFCORE_SFR_MTMOVF1:
         case RFCORE_SFR_MTMOVF2: {
-            /* MAC timer: 40-bit counter at 32.768 kHz derived from CPU cycles.
-             * Use cycles directly (not sim_time_ns) since sim_time_ns may not
-             * be synced during arm_step()-based execution. */
-            int64_t ns = arm_cycles_to_ns(rf->cpu->cycles, rf->cpu->cpu_freq_hz);
-            int64_t mt_ticks = ns / MT_PERIOD_NS;
-            uint16_t mt_count = (uint16_t)(mt_ticks & 0xFFFF);
-            uint32_t mt_ovf = (uint32_t)(mt_ticks >> 16);
-            if (offset == RFCORE_SFR_MTM0)     return mt_count & 0xFF;
-            if (offset == RFCORE_SFR_MTM1)     return (mt_count >> 8) & 0xFF;
-            if (offset == RFCORE_SFR_MTMOVF0)  return mt_ovf & 0xFF;
-            if (offset == RFCORE_SFR_MTMOVF1)  return (mt_ovf >> 8) & 0xFF;
-            return (int)((mt_ovf >> 16) & 0xFF); /* MTMOVF2 */
+            /* MAC timer overflow: multiplexed via MTMSEL[6:4]
+             * 0=Overflow counter, 1=Overflow capture(SFD), 2=Overflow period */
+            int sel = (rf->mtmsel >> 4) & 0x07;
+            uint32_t val;
+            if (sel == 0) {
+                /* If latched by MTM0 read in LATCH_MODE, use latched value.
+                 * Don't clear the latch here — it persists until the next
+                 * MTM0 read triggers a new latch. Firmware reads MTMOVF0,
+                 * MTMOVF1, MTMOVF2 in sequence from the same latch. */
+                if (rf->mt_ovf_latch_valid) {
+                    val = rf->mt_ovf_latched;
+                } else {
+                    int64_t ns = arm_cycles_to_ns(rf->cpu->cycles, rf->cpu->cpu_freq_hz);
+                    int64_t mt_ticks = ns_to_mt_ticks(ns);
+                    val = (uint32_t)(mt_ticks >> 16) & 0xFFFFFF;
+                }
+            } else if (sel == 1) {
+                /* SFD overflow capture */
+                val = rf->mt_sfd_ovf_capture;
+            } else if (sel == 2) {
+                /* Overflow period */
+                val = rf->mt_cmp_ovf_period;
+            } else {
+                val = 0;
+            }
+            if (offset == RFCORE_SFR_MTMOVF0) return val & 0xFF;
+            if (offset == RFCORE_SFR_MTMOVF1) return (val >> 8) & 0xFF;
+            return (val >> 16) & 0xFF; /* MTMOVF2 */
         }
         case RFCORE_SFR_RFDATA: {
             if (rf->rxfifo_rd < rf->rxfifo_len) {
@@ -465,7 +527,15 @@ static void sfr_write(void *user_data, uint32_t addr, uint32_t value) {
 
     switch (offset) {
         case RFCORE_SFR_MTCSPCFG: rf->mtcspcfg = value; break;
-        case RFCORE_SFR_MTCTRL:   rf->mtctrl = value; break;
+        case RFCORE_SFR_MTCTRL:
+            rf->mtctrl = value;
+            /* STATE (bit 2) mirrors RUN (bit 0) — firmware busy-waits for this */
+            if (value & 0x01) /* RUN */
+                rf->mtctrl |= 0x04; /* STATE = running */
+            else
+                rf->mtctrl &= ~0x04; /* STATE = stopped */
+
+            break;
         case RFCORE_SFR_MTIRQM:   rf->mtirqm = value; break;
         case RFCORE_SFR_MTIRQF:   rf->mtirqf &= value; break; /* W0C */
         case RFCORE_SFR_MTMSEL:   rf->mtmsel = value; break;
@@ -509,6 +579,7 @@ void cc2538_rfcore_init(cc2538_rfcore_t *rf, arm_cpu_t *cpu, arm_nvic_t *nvic) {
     rf->rssi = -128 & 0xFF;   /* No signal */
     rf->ccactrl0 = 0xF8;      /* Default CCA threshold */
     rf->agcctrl1 = 0x11;
+    rf->sfd_delivery_ns = -1; /* Use cpu->cycles for SFD capture by default */
     rf->txfiltcfg = 0x09;
     rf->txpower = 0xFF;        /* Max power */
     rf->rfrnd_state = 0xDEADBEEF;
@@ -609,7 +680,17 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                     rf->rxfifo_len = remaining;
                     rf->rxfifo_rd = 0;
                 }
-                /* SFD detected — transition to RX_FRAME */
+                /* SFD detected — capture MAC timer.
+                 * Always use cpu->cycles (not sim_ns) so the capture is
+                 * consistent with the current timer read in get_sfd_timestamp().
+                 * The firmware computes delta = timer_val - sfd; both must
+                 * use the same time base for the delta to be correct. */
+                {
+                    int64_t ns = arm_cycles_to_ns(rf->cpu->cycles, rf->cpu->cpu_freq_hz);
+                    int64_t mt_ticks = ns_to_mt_ticks(ns);
+                    rf->mt_sfd_capture = (uint16_t)(mt_ticks & 0xFFFF);
+                    rf->mt_sfd_ovf_capture = (uint32_t)(mt_ticks >> 16) & 0xFFFFFF;
+                }
                 rfcore_set_state(rf, RF_STATE_RX);
                 rf->rfirqf0 |= RFIRQF0_SFD;
                 rfcore_check_interrupts(rf);

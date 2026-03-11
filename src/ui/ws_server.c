@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <signal.h>
 
 /* macOS uses SO_NOSIGPIPE instead of MSG_NOSIGNAL */
 #ifndef MSG_NOSIGNAL
@@ -201,6 +202,7 @@ static void handle_http_request(ws_server_t *srv, int idx) {
         int hlen = snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/html; charset=utf-8\r\n"
+            "Cache-Control: no-cache, no-store\r\n"
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n", blen);
         send(c->fd, hdr, hlen, 0);
@@ -277,6 +279,9 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
 ws_server_t *ws_server_init(int port) {
     ws_server_t *srv = calloc(1, sizeof(ws_server_t));
     if (!srv) return NULL;
+
+    /* Ignore SIGPIPE globally — broken WebSocket connections must not kill the process */
+    signal(SIGPIPE, SIG_IGN);
 
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv->listen_fd < 0) { free(srv); return NULL; }
@@ -370,21 +375,36 @@ void ws_server_poll(ws_server_t *srv) {
     }
 }
 
-void ws_server_broadcast(ws_server_t *srv, const char *data, int len) {
-    if (!srv || len <= 0) return;
+/* Send all bytes, retrying on partial writes.  Returns 0 on success, -1 on error. */
+static int send_all(int fd, const void *buf, int len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    int remaining = len;
+    while (remaining > 0) {
+        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Brief spin for non-blocking socket — data should drain quickly */
+                usleep(100);
+                continue;
+            }
+            return -1;
+        }
+        p += n;
+        remaining -= (int)n;
+    }
+    return 0;
+}
 
-    /* Build WebSocket text frame header */
-    uint8_t header[10];
-    int hlen;
-    header[0] = 0x81; /* FIN + text opcode */
+static int ws_build_header(uint8_t *header, uint8_t opcode, int len) {
+    header[0] = 0x80 | opcode; /* FIN + opcode */
     if (len < 126) {
         header[1] = (uint8_t)len;
-        hlen = 2;
+        return 2;
     } else if (len < 65536) {
         header[1] = 126;
         header[2] = (uint8_t)(len >> 8);
         header[3] = (uint8_t)(len & 0xFF);
-        hlen = 4;
+        return 4;
     } else {
         header[1] = 127;
         memset(header + 2, 0, 4);
@@ -392,17 +412,39 @@ void ws_server_broadcast(ws_server_t *srv, const char *data, int len) {
         header[7] = (uint8_t)((len >> 16) & 0xFF);
         header[8] = (uint8_t)((len >> 8) & 0xFF);
         header[9] = (uint8_t)(len & 0xFF);
-        hlen = 10;
+        return 10;
     }
+}
+
+void ws_server_broadcast(ws_server_t *srv, const char *data, int len) {
+    if (!srv || len <= 0) return;
+
+    uint8_t header[10];
+    int hlen = ws_build_header(header, 0x01, len); /* text */
 
     for (int i = 0; i < srv->client_count; i++) {
         if (srv->clients[i].state != CLIENT_WS)
             continue;
-        /* Best-effort send: drop client if send fails */
-        ssize_t sent = send(srv->clients[i].fd, header, hlen, MSG_NOSIGNAL);
-        if (sent < 0) { close_client(srv, i); i--; continue; }
-        sent = send(srv->clients[i].fd, data, len, MSG_NOSIGNAL);
-        if (sent < 0) { close_client(srv, i); i--; continue; }
+        if (send_all(srv->clients[i].fd, header, hlen) < 0 ||
+            send_all(srv->clients[i].fd, data, len) < 0) {
+            close_client(srv, i); i--;
+        }
+    }
+}
+
+void ws_server_broadcast_binary(ws_server_t *srv, const uint8_t *data, int len) {
+    if (!srv || len <= 0) return;
+
+    uint8_t header[10];
+    int hlen = ws_build_header(header, 0x02, len); /* binary */
+
+    for (int i = 0; i < srv->client_count; i++) {
+        if (srv->clients[i].state != CLIENT_WS)
+            continue;
+        if (send_all(srv->clients[i].fd, header, hlen) < 0 ||
+            send_all(srv->clients[i].fd, data, len) < 0) {
+            close_client(srv, i); i--;
+        }
     }
 }
 
@@ -421,6 +463,10 @@ void ws_server_set_html(ws_server_t *srv, const char *html, int len) {
         srv->html[len] = '\0';
         srv->html_len = len;
     }
+}
+
+int ws_server_client_count(ws_server_t *srv) {
+    return srv ? srv->client_count : 0;
 }
 
 void ws_server_destroy(ws_server_t *srv) {

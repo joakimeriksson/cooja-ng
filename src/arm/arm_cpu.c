@@ -688,6 +688,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         uint32_t pc = cpu->reg[ARM_PC];
 
+
         /* ROM utility traps */
         if (handle_fw_trap(cpu)) {
             cpu->instructions++;

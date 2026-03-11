@@ -95,6 +95,7 @@ typedef enum {
 #define RF_RXFIFO_SIZE 128
 
 typedef void (*cc2538_rf_tx_fn)(void *user_data, uint8_t byte);
+typedef void (*cc2538_rf_state_fn)(void *user_data, int old_state, int new_state);
 
 /* RX frame parsing states */
 #define RF_RX_PREAMBLE  0
@@ -181,11 +182,32 @@ typedef struct cc2538_rfcore {
     void            *tx_user_data;
     int              node_id;
 
+    /* State change callback (for timeline tracking) */
+    cc2538_rf_state_fn state_callback;
+    void              *state_user_data;
+
     /* RSSI value set by radio medium for current RX frame */
     int8_t           rx_rssi;
 
     /* Software-off flag: firmware called ISRFOFF but we keep receiving */
     bool             software_off;
+
+    /* MAC Timer SFD capture (latched when SFD detected) */
+    uint16_t         mt_sfd_capture;     /* 16-bit timer value at SFD */
+    uint32_t         mt_sfd_ovf_capture; /* 24-bit overflow value at SFD */
+
+    /* Delivery timestamp override: when set, SFD capture uses this ns
+     * instead of cpu->cycles. Set by simulation layer for synchronous
+     * frame delivery when receiver hasn't been stepped yet. */
+    int64_t          sfd_delivery_ns;    /* -1 = use cpu->cycles */
+
+    /* MAC Timer overflow latch (for LATCH_MODE) */
+    uint32_t         mt_ovf_latched;
+    bool             mt_ovf_latch_valid;
+
+    /* MAC Timer compare registers */
+    uint16_t         mt_cmp_period;   /* timer period compare */
+    uint32_t         mt_cmp_ovf_period; /* overflow period compare */
 
     /* Events */
     arm_event_t      tx_event;

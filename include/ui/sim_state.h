@@ -43,13 +43,84 @@ typedef struct {
     int paused;             /* 1 if simulation is paused */
 } sim_stats_t;
 
+/* Per-node radio state for timeline (Cooja Classic semantics) */
+typedef enum {
+    SIM_RADIO_OFF  = 0,   /* Transceiver off (white) */
+    SIM_RADIO_ON   = 1,   /* On, listening (gray) */
+    SIM_RADIO_TX   = 2,   /* Transmitting (blue) */
+    SIM_RADIO_RX   = 3,   /* Receiving data (green) */
+    SIM_RADIO_INTF = 4,   /* Interference (red) */
+} sim_radio_state_t;
+
+/* Per-node LED state */
+#define SIM_MAX_LEDS 3
+
+typedef struct {
+    sim_radio_state_t radio_state;
+    uint8_t led[SIM_MAX_LEDS];     /* 1=on, 0=off per LED */
+} sim_node_state_t;
+
 /*
- * Serialize simulation state to JSON string.
+ * Serialize full simulation state to JSON string (type: "full").
+ * Includes node positions, topology, all console lines, all state.
+ * Used on initial client connect and explicit refresh requests.
  * Caller must free() the returned string.
- * Returns NULL on failure.
  */
 char *sim_state_to_json(const sim_node_info_t *nodes, int node_count,
                         const sim_radio_info_t *radio,
-                        const sim_stats_t *stats);
+                        const sim_stats_t *stats,
+                        const sim_node_state_t *node_states,
+                        const char *timeline_json);
+
+/*
+ * Serialize delta state to JSON string (type: "delta").
+ * Only includes changing data: stats, per-node cycles/freq/radio/leds,
+ * new console lines (sparse), and new timeline events.
+ * Caller must free() the returned string.
+ */
+char *sim_state_delta_json(const sim_stats_t *stats,
+                           const sim_node_state_t *node_states,
+                           int node_count,
+                           const int *node_ids,
+                           const int64_t *node_cycles,
+                           const uint32_t *node_freqs,
+                           const int64_t *node_last_tx_ns,
+                           const char ***console_lines,
+                           const int *console_counts,
+                           const char *timeline_json);
+
+/*
+ * Serialize delta state to CBOR binary (sent as WebSocket binary frame).
+ * Only includes fields that changed since prev_* state.
+ * Returns size written to buf, or 0 on error.
+ *
+ * CBOR map with integer keys:
+ *   0: sim_time_ms (unsigned)
+ *   1: stats array [rf_bytes, uart_bytes, rx_queued, rx_collided, speed_x10, paused]
+ *   2: radio changes map { node_id: state_enum }
+ *   3: LED changes map { node_id: [r,g,b] }
+ *   4: last_tx_ms map { node_id: ms }
+ *   5: console map { node_id: [lines...] }
+ *   6: timeline array of arrays [[t_ms*1000, node_id, type, value, summary?], ...]
+ */
+int sim_state_delta_cbor(uint8_t *buf, int buf_size,
+                         const sim_stats_t *stats,
+                         const sim_node_state_t *node_states,
+                         const sim_node_state_t *prev_node_states,
+                         int node_count,
+                         const int *node_ids,
+                         const int64_t *node_last_tx_ns,
+                         const int64_t *prev_last_tx_ns,
+                         const char ***console_lines,
+                         const int *console_counts,
+                         const uint8_t *tl_cbor,
+                         int tl_cbor_len);
+
+/*
+ * Serialize new timeline events to CBOR.
+ * Returns size written, or 0 on error.
+ */
+struct timeline_s;
+int tl_events_to_cbor(struct timeline_s *tl, uint8_t *buf, int buf_size);
 
 #endif /* SIM_STATE_H */
