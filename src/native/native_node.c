@@ -234,13 +234,27 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
         /* Process ticks at the same time. When simProcessRunValue stays 1,
          * the firmware is in RTIMER_BUSYWAIT_UNTIL (e.g. waiting for ACK).
          * Call the yield callback between ticks so the outer simulation loop
-         * can deliver pending RF frames (the ACK). */
+         * can deliver pending RF frames (the ACK).
+         *
+         * Note: The TX yield (while(simOutSize>0) cooja_mt_yield()) does NOT
+         * set simProcessRunValue=1, so we must also call the yield callback
+         * after picking up a TX frame, then tick again to let the firmware
+         * reach the ACK busy-wait. */
         for (int same_time = 0; same_time < 20; same_time++) {
             node->cooja_tick();
+            int had_tx = (*node->simOutSize > 0);
             native_check_radio_tx(node);
             native_check_log_output(node);
+
+            if (had_tx && node->yield_callback) {
+                /* Just picked up a TX frame — deliver to receivers and get ACK.
+                 * Then tick again: firmware exits TX yield, enters ACK busywait. */
+                node->yield_callback(node->yield_callback_data);
+                continue;  /* tick again to let firmware process ACK */
+            }
+
             if (!*node->simProcessRunValue) break;
-            /* Firmware yielded (busy-wait) — let outer loop deliver frames */
+            /* Firmware yielded in busy-wait — deliver pending frames */
             if (node->yield_callback)
                 node->yield_callback(node->yield_callback_data);
         }

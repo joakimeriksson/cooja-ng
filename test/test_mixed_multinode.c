@@ -1477,44 +1477,53 @@ static void native_yield_callback(void *user_data) {
     int sender_idx = (int)(sender - nodes);
     int64_t now_ns = sender->plat.native.sim_time_ns;
 
-    /* Step all native receivers that have pending frames from this sender.
-     * The receiver needs to: read frame → CSMA input → send soft ACK.
-     * This may take multiple ticks (cooja_mt_yield between stages). */
     for (int r = 0; r < num_nodes; r++) {
         if (r == sender_idx || !node_active(r)) continue;
         if (nodes[r].type != NODE_NATIVE) continue;
-        if (nodes[r].plat.native.rx_queue.count == 0) continue;
+        if (nodes[r].plat.native.rx_queue.count == 0 &&
+            *nodes[r].plat.native.simInSize == 0) continue;
 
         native_node_t *rcv = &nodes[r].plat.native;
 
-        /* Deliver frame to receiver */
-        native_dequeue_rx_frame(rcv);
+        /* Deliver frame to receiver if not already in simInDataBuffer */
+        if (*rcv->simInSize == 0)
+            native_dequeue_rx_frame(rcv);
 
-        /* Update receiver's time and tick until it finishes processing
-         * (processRunValue==0) or generates a TX (soft ACK). */
+        if (*rcv->simInSize == 0) continue;  /* no frame to process */
+
+        /* Update receiver's time */
         rcv->sim_time_ns = now_ns;
         *rcv->simCurrentTime = (uint64_t)(now_ns / 1000000LL);
         *rcv->simRtimerCurrentTicks = (uint64_t)(now_ns / 1000LL);
 
         /* Temporarily disable receiver's yield callback to prevent recursion */
-        void *saved_cb = rcv->yield_callback;
+        void (*saved_cb)(void*) = rcv->yield_callback;
         rcv->yield_callback = NULL;
 
+        /* Tick receiver until it finishes processing.
+         * Track if receiver generates a TX (soft ACK). */
+        int ack_sent = 0;
         for (int tick = 0; tick < 20; tick++) {
             *rcv->simProcessRunValue = 1;
             rcv->cooja_tick();
             if (*rcv->simOutSize > 0) {
-                /* Receiver generated a frame (likely soft ACK) */
                 native_check_radio_tx(rcv);
+                ack_sent = 1;
             }
             native_check_log_output(rcv);
             if (!*rcv->simProcessRunValue) break;
         }
 
         rcv->yield_callback = saved_cb;
+
+        /* If receiver sent an ACK, deliver it to the sender now */
+        if (ack_sent) {
+            if (*sender->plat.native.simInSize == 0)
+                native_dequeue_rx_frame(&sender->plat.native);
+        }
     }
 
-    /* Now deliver any ACK (or other frame) back to this sender */
+    /* Also check for byte-stream ACK delivery (emulated→native path) */
     mixed_deliver_rf_bytes(sender_idx);
     if (*sender->plat.native.simInSize == 0)
         native_dequeue_rx_frame(&sender->plat.native);
