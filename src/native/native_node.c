@@ -231,13 +231,18 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
         *node->simCurrentTime        = (uint64_t)(node->sim_time_ns / 1000000LL);
         *node->simRtimerCurrentTicks = (uint64_t)(node->sim_time_ns / 1000LL);
 
-        /* Process up to 20 ticks at the same time (processRunValue loops),
-         * then yield back to the outer loop to let other nodes run. */
+        /* Process ticks at the same time. When simProcessRunValue stays 1,
+         * the firmware is in RTIMER_BUSYWAIT_UNTIL (e.g. waiting for ACK).
+         * Call the yield callback between ticks so the outer simulation loop
+         * can deliver pending RF frames (the ACK). */
         for (int same_time = 0; same_time < 20; same_time++) {
             node->cooja_tick();
             native_check_radio_tx(node);
             native_check_log_output(node);
             if (!*node->simProcessRunValue) break;
+            /* Firmware yielded (busy-wait) — let outer loop deliver frames */
+            if (node->yield_callback)
+                node->yield_callback(node->yield_callback_data);
         }
 
         /* If processRunValue still set after safety limit, fast-forward to

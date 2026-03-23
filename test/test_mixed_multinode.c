@@ -1466,6 +1466,60 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
 
 /* --- Native node initialization --- */
 
+/* Yield callback: called when a native node is in RTIMER_BUSYWAIT_UNTIL
+ * (e.g. waiting for 802.15.4 ACK after TX). This node just sent a frame
+ * and is waiting for the ACK. We need to:
+ * 1. Deliver the frame to receivers
+ * 2. Step the receivers so they generate the ACK
+ * 3. Deliver the ACK back to this node */
+static void native_yield_callback(void *user_data) {
+    mixed_node_t *sender = (mixed_node_t *)user_data;
+    int sender_idx = (int)(sender - nodes);
+    int64_t now_ns = sender->plat.native.sim_time_ns;
+
+    /* Step all native receivers that have pending frames from this sender.
+     * The receiver needs to: read frame → CSMA input → send soft ACK.
+     * This may take multiple ticks (cooja_mt_yield between stages). */
+    for (int r = 0; r < num_nodes; r++) {
+        if (r == sender_idx || !node_active(r)) continue;
+        if (nodes[r].type != NODE_NATIVE) continue;
+        if (nodes[r].plat.native.rx_queue.count == 0) continue;
+
+        native_node_t *rcv = &nodes[r].plat.native;
+
+        /* Deliver frame to receiver */
+        native_dequeue_rx_frame(rcv);
+
+        /* Update receiver's time and tick until it finishes processing
+         * (processRunValue==0) or generates a TX (soft ACK). */
+        rcv->sim_time_ns = now_ns;
+        *rcv->simCurrentTime = (uint64_t)(now_ns / 1000000LL);
+        *rcv->simRtimerCurrentTicks = (uint64_t)(now_ns / 1000LL);
+
+        /* Temporarily disable receiver's yield callback to prevent recursion */
+        void *saved_cb = rcv->yield_callback;
+        rcv->yield_callback = NULL;
+
+        for (int tick = 0; tick < 20; tick++) {
+            *rcv->simProcessRunValue = 1;
+            rcv->cooja_tick();
+            if (*rcv->simOutSize > 0) {
+                /* Receiver generated a frame (likely soft ACK) */
+                native_check_radio_tx(rcv);
+            }
+            native_check_log_output(rcv);
+            if (!*rcv->simProcessRunValue) break;
+        }
+
+        rcv->yield_callback = saved_cb;
+    }
+
+    /* Now deliver any ACK (or other frame) back to this sender */
+    mixed_deliver_rf_bytes(sender_idx);
+    if (*sender->plat.native.simInSize == 0)
+        native_dequeue_rx_frame(&sender->plat.native);
+}
+
 static int init_native_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     native_node_t *nat = &node->plat.native;
@@ -1482,6 +1536,8 @@ static int init_native_node(int idx, const char *firmware_path, int node_id) {
     nat->rf_tx_callback_data = node;
     nat->rf_frame_callback = mixed_rf_frame_handler;
     nat->rf_frame_callback_data = node;
+    nat->yield_callback = native_yield_callback;
+    nat->yield_callback_data = node;
 
     /* Reset the RX assembler */
     native_rx_assembler_reset(&nat->rx_asm);
@@ -1557,6 +1613,34 @@ static void step_node_until(int idx, int64_t target) {
 }
 
 /* Check if a native node has pending work at the given sim time */
+/* Compute the next time a node needs to wake up (ns).
+ * Used by event-driven stepping to skip idle periods. */
+static int64_t node_next_wakeup_ns(int idx) {
+    if (!node_active(idx)) return INT64_MAX;
+    if (nodes[idx].type == NODE_NATIVE) {
+        native_node_t *nat = &nodes[idx].plat.native;
+        /* Check immediate work first */
+        if (*nat->simInSize > 0 || nat->rx_queue.count > 0 ||
+            *nat->simProcessRunValue)
+            return nat->sim_time_ns;
+        return native_next_wakeup_ns(nat);
+    } else if (nodes[idx].type == NODE_ARM) {
+        arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
+        if (cpu->next_event_cycle <= cpu->cycles)
+            return cpu->sim_time_ns;
+        int64_t delta = arm_cycles_to_ns(
+            cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+        return cpu->sim_time_ns + delta;
+    } else {
+        msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
+        if ((int64_t)cpu->next_event_cycle <= (int64_t)cpu->cycles)
+            return cpu->sim_time_ns;
+        int64_t delta = msp430_cycles_to_ns(
+            cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+        return cpu->sim_time_ns + delta;
+    }
+}
+
 static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
     if (*node->simInSize > 0) return true;  /* frame ready for delivery */
     if (node->rx_queue.count > 0) return true;  /* queued frames waiting */
@@ -2005,7 +2089,21 @@ sim_restart:
             goto ui_broadcast;
         }
 
-        sim_ns += TIME_STEP_NS;
+        /* Adaptive time step: jump to earliest node event, capped at 1ms.
+         * For threaded mode, always use fixed 1ms steps. */
+        if (num_threads > 0) {
+            sim_ns += TIME_STEP_NS;
+        } else {
+            int64_t earliest = sim_ns + TIME_STEP_NS;
+            for (int i = 0; i < node_count; i++) {
+                if (!node_active(i)) continue;
+                int64_t nw = node_next_wakeup_ns(i);
+                if (nw < earliest) earliest = nw;
+            }
+            /* Ensure we advance by at least 1µs to avoid infinite loops */
+            if (earliest <= sim_ns) earliest = sim_ns + 1000;
+            sim_ns = earliest;
+        }
         current_sim_ns = sim_ns;
 
         /* Execute timed actions */
@@ -2264,31 +2362,38 @@ sim_restart:
             flush_pending_output();
             time_flush += get_time_ms() - t_phase;
         } else {
-            /* === SEQUENTIAL PATH (unchanged) === */
+            /* === SEQUENTIAL EVENT-DRIVEN PATH ===
+             * Step each node to sim_ns. After each node steps, if it TX'd
+             * a frame, immediately deliver to receivers and step them so
+             * ACKs arrive within the same simulation time (like COOJA's
+             * requestImmediateWakeup). */
 
             t_phase = get_time_ms();
+
+            /* Deliver pending bytes from previous step to native assemblers */
             for (int i = 0; i < node_count; i++) {
-                if (!node_active(i)) continue;
-                /* Deliver only to native nodes — emulated nodes' bytes stay
-                 * in rf_pending until frame assembler completes the frame. */
-                if (nodes[i].type == NODE_NATIVE) {
-                    mixed_deliver_rf_bytes(i);
-                    native_dequeue_rx_frame(&nodes[i].plat.native);
-                }
+                if (!node_active(i) || nodes[i].type != NODE_NATIVE) continue;
+                mixed_deliver_rf_bytes(i);
+                native_dequeue_rx_frame(&nodes[i].plat.native);
             }
-            time_deliver += get_time_ms() - t_phase;
 
-            t_phase = get_time_ms();
+            /* Step each node to sim_ns, with synchronous RX delivery */
             for (int i = 0; i < node_count; i++) {
                 if (!node_active(i)) continue;
+
+                /* Snapshot receiver queues to detect new TX from this node */
+                int rx_counts_before[MAX_NODES];
+                for (int r = 0; r < node_count; r++)
+                    rx_counts_before[r] = (nodes[r].type == NODE_NATIVE)
+                        ? nodes[r].plat.native.rx_queue.count : 0;
+
                 if (nodes[i].type == NODE_NATIVE) {
-                    /* Skip idle native nodes — just advance their time */
                     if (!native_has_pending_work(&nodes[i].plat.native, sim_ns)) {
                         nodes[i].plat.native.sim_time_ns = sim_ns;
                         continue;
                     }
                     step_node_until(i, sim_ns);
-                    /* Process additional queued frames within this time step */
+                    /* Process queued frames within this time step */
                     while (*nodes[i].plat.native.simInSize == 0 &&
                            nodes[i].plat.native.rx_queue.count > 0 &&
                            nodes[i].plat.native.sim_time_ns < sim_ns) {
@@ -2307,24 +2412,35 @@ sim_restart:
                         step_node_until(i, target_cycle);
                     }
                 }
-            }
-            /* Drain queued RX frames for emulated nodes */
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i)) continue;
-                if (nodes[i].type != NODE_NATIVE)
-                    emu_rx_queue_drain(i);
-            }
 
-            /* Second pass: dequeue + step native nodes that received frames
-             * during THIS time step (from other nodes' TX). */
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i) || nodes[i].type != NODE_NATIVE) continue;
-                while (nodes[i].plat.native.rx_queue.count > 0) {
-                    native_dequeue_rx_frame(&nodes[i].plat.native);
-                    if (*nodes[i].plat.native.simInSize > 0)
-                        step_node_until(i, sim_ns);
+                /* Synchronous RX delivery: if this node TX'd a frame that
+                 * landed in a native receiver's queue, dequeue and step the
+                 * receiver immediately so it can generate an ACK. */
+                for (int r = 0; r < node_count; r++) {
+                    if (r == i || !node_active(r)) continue;
+                    if (nodes[r].type == NODE_NATIVE &&
+                        nodes[r].plat.native.rx_queue.count > rx_counts_before[r]) {
+                        native_dequeue_rx_frame(&nodes[r].plat.native);
+                        step_node_until(r, sim_ns);
+                        /* If receiver TX'd (e.g. ACK), deliver back */
+                        for (int r2 = 0; r2 < node_count; r2++) {
+                            if (r2 == r || !node_active(r2)) continue;
+                            if (nodes[r2].type == NODE_NATIVE &&
+                                nodes[r2].plat.native.rx_queue.count > 0) {
+                                native_dequeue_rx_frame(&nodes[r2].plat.native);
+                                step_node_until(r2, sim_ns);
+                            }
+                        }
+                    }
                 }
             }
+
+            /* Drain queued RX frames for emulated nodes */
+            for (int i = 0; i < node_count; i++) {
+                if (!node_active(i) || nodes[i].type == NODE_NATIVE) continue;
+                emu_rx_queue_drain(i);
+            }
+
             time_step += get_time_ms() - t_phase;
         }
 

@@ -106,6 +106,12 @@ typedef struct native_node {
     /* RF frame callback (for native-to-native frame delivery) */
     void (*rf_frame_callback)(void *user_data, const uint8_t *frame, int len);
     void *rf_frame_callback_data;
+
+    /* Yield callback: called between ticks when simProcessRunValue==1
+     * (firmware is in RTIMER_BUSYWAIT_UNTIL). Allows the outer simulation
+     * loop to deliver pending RF frames to this node so ACKs arrive. */
+    void (*yield_callback)(void *user_data);
+    void *yield_callback_data;
 } native_node_t;
 
 /* --- Public API --- */
