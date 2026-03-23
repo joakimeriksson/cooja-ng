@@ -957,7 +957,7 @@ def list_firmware_files(root, csc_dir):
     return sorted(firmware)
 
 
-def convert_csc(csc_path, contiki_dir=None, firmware_dir=None):
+def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False):
     """Convert a .csc file to csim JSON config dict.
     Returns (config_dict, warnings_list)."""
     csc_dir = os.path.dirname(os.path.abspath(csc_path))
@@ -1000,15 +1000,23 @@ def convert_csc(csc_path, contiki_dir=None, firmware_dir=None):
     # Test script
     script = extract_script(root, csc_dir)
     if script:
-        test_config, script_warnings = translate_script(script, nodes)
-        warnings.extend(script_warnings)
+        if js_native:
+            # Embed raw JS for native execution via QuickJS
+            cleaned = clean_script(script)
+            timeout_ms, _, _, _ = parse_timeout(cleaned)
+            if timeout_ms:
+                config["timeout_ms"] = timeout_ms
+            config["test"] = {"js_script_inline": cleaned}
+        else:
+            test_config, script_warnings = translate_script(script, nodes)
+            warnings.extend(script_warnings)
 
-        if test_config:
-            # Timeout from script overrides any default
-            if "timeout_ms" in test_config:
-                config["timeout_ms"] = test_config.pop("timeout_ms")
+            if test_config:
+                # Timeout from script overrides any default
+                if "timeout_ms" in test_config:
+                    config["timeout_ms"] = test_config.pop("timeout_ms")
 
-            config["test"] = test_config
+                config["test"] = test_config
     else:
         warnings.append("No test script found in .csc file")
 
@@ -1027,6 +1035,9 @@ def main():
                         help="Just list needed firmware files and exit")
     parser.add_argument("--warn", action="store_true",
                         help="Show warnings on stderr")
+    parser.add_argument("--js-native", action="store_true",
+                        help="Embed raw JS script for native QuickJS execution "
+                             "instead of converting to JSON steps")
 
     args = parser.parse_args()
 
@@ -1044,7 +1055,8 @@ def main():
             print(fw)
         return
 
-    config, warnings = convert_csc(csc_path, args.contiki, args.firmware_dir)
+    config, warnings = convert_csc(csc_path, args.contiki, args.firmware_dir,
+                                    js_native=args.js_native)
 
     if warnings and args.warn:
         for w in warnings:

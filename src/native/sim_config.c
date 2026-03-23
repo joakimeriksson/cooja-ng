@@ -151,6 +151,19 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
     if (cJSON_IsObject(test)) {
         cfg->has_test = 1;
 
+        /* Check for JavaScript test script */
+        cJSON *js_path = cJSON_GetObjectItemCaseSensitive(test, "js_script");
+        if (cJSON_IsString(js_path) && js_path->valuestring) {
+            snprintf(cfg->js_script_path, sizeof(cfg->js_script_path),
+                     "%s", js_path->valuestring);
+            cfg->has_js_script = 1;
+        }
+        cJSON *js_inline = cJSON_GetObjectItemCaseSensitive(test, "js_script_inline");
+        if (cJSON_IsString(js_inline) && js_inline->valuestring) {
+            cfg->js_script_inline = strdup(js_inline->valuestring);
+            cfg->has_js_script = 1;
+        }
+
         /* Parse test steps */
         cJSON *steps = cJSON_GetObjectItemCaseSensitive(test, "steps");
         if (cJSON_IsArray(steps)) {

@@ -1,0 +1,10 @@
+{
+  "title": "JS engine test: hello-world",
+  "timeout_ms": 10000,
+  "nodes": [
+    { "firmware": "firmware/cc2538dk/hello-world.cc2538dk", "id": 1 }
+  ],
+  "test": {
+    "js_script_inline": "TIMEOUT(10000);\nwhile(true) {\n  YIELD();\n  if(msg.contains('Hello')) {\n    log.log('Found hello message from node ' + id);\n    log.testOK();\n  }\n}"
+  }
+}

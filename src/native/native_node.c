@@ -122,7 +122,15 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
         fprintf(stderr, "native_node: cooja_init() returned %d\n", ret);
     }
 
-    /* One initial tick to complete boot */
+    /* Initial ticks to complete boot.
+     * Tick 1: contiki_init() runs, reads simMoteID.
+     * Tick 2: process simMoteIDChanged (node_id_init re-reads if changed). */
+    *node->simProcessRunValue = 1;
+    node->cooja_tick();
+    native_check_log_output(node);
+
+    /* Ensure node_id is applied — set changed flag and tick again */
+    *node->simMoteIDChanged = 1;
     *node->simProcessRunValue = 1;
     node->cooja_tick();
     native_check_log_output(node);

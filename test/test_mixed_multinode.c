@@ -26,6 +26,7 @@
 #include "timeline.h"
 #include "packet_analyzer.h"
 #include "cJSON.h"
+#include "js_test_engine.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -408,6 +409,7 @@ typedef struct {
 } sim_test_state_t;
 
 static sim_test_state_t *active_test = NULL;
+static js_test_engine_t *active_js_engine = NULL;
 
 static void sim_test_check_line(int node_id, const char *line, int64_t sim_ns) {
     if (!active_test || active_test->finished)
@@ -461,6 +463,16 @@ static void sim_test_check_line(int node_id, const char *line, int64_t sim_ns) {
 
         if (active_test->current_step >= active_test->config->step_count)
             active_test->finished = 1;  /* all steps passed */
+    }
+}
+
+/* Feed a console line to whichever test engine is active */
+static void test_check_line(int node_id, const char *line, int64_t sim_ns) {
+    if (active_js_engine) {
+        js_test_feed_line(active_js_engine, line, node_id, sim_ns / 1000);
+    }
+    if (active_test) {
+        sim_test_check_line(node_id, line, sim_ns);
     }
 }
 
@@ -1006,7 +1018,7 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
         if (verbose)
             printf("  %7.3f [Node %d/%s] %s\n", (double)ns / 1e9,
                    node->id, node_type_str(nidx), node->line_buf);
-        sim_test_check_line(node->id, node->line_buf, ns);
+        test_check_line(node->id, node->line_buf, ns);
         if (ui_server)
             ui_add_console_line(nidx, ns, node->line_buf);
         node->line_pos = 0;
@@ -1285,7 +1297,7 @@ static void flush_pending_output(void) {
             if (verbose)
                 printf("  %7.3f [Node %d/%s] %s\n", (double)current_sim_ns / 1e9,
                        nid, node_type_str(nidx), ts->lines[l]);
-            sim_test_check_line(nid, ts->lines[l], current_sim_ns);
+            test_check_line(nid, ts->lines[l], current_sim_ns);
             if (ui_server)
                 ui_add_console_line(nidx, current_sim_ns, ts->lines[l]);
         }
@@ -1780,7 +1792,54 @@ sim_restart:
 
     /* Initialize test engine if config has test section */
     sim_test_state_t test_state;
-    if (config_loaded && config.has_test) {
+    js_test_engine_t js_engine;
+    bool use_js_engine = false;
+
+    if (config_loaded && config.has_js_script) {
+        /* Load JS script */
+        char *js_script = NULL;
+        if (config.js_script_inline) {
+            js_script = config.js_script_inline;
+        } else if (config.js_script_path[0]) {
+            FILE *jf = fopen(config.js_script_path, "r");
+            if (!jf) {
+                fprintf(stderr, "Failed to open JS script: %s\n",
+                        config.js_script_path);
+                return 1;
+            }
+            fseek(jf, 0, SEEK_END);
+            long jlen = ftell(jf);
+            fseek(jf, 0, SEEK_SET);
+            js_script = malloc((size_t)jlen + 1);
+            fread(js_script, 1, (size_t)jlen, jf);
+            js_script[jlen] = '\0';
+            fclose(jf);
+        }
+        if (js_script) {
+            /* Collect node IDs */
+            int js_node_ids[MAX_NODES];
+            for (int i = 0; i < node_count; i++)
+                js_node_ids[i] = nodes[i].id;
+
+            if (js_test_init(&js_engine, js_script, js_node_ids, node_count) == 0) {
+                use_js_engine = true;
+                active_js_engine = &js_engine;
+                /* Use timeout from JS TIMEOUT() call if set, else from config.
+                 * Add margin so the sim loop runs past the timeout point,
+                 * allowing js_test_check_timeout to fire the callback. */
+                if (js_engine.timeout_us > 0)
+                    total_ns = js_engine.timeout_us * 1000LL + 10 * MS_TO_NS;
+                printf("Test: JavaScript engine (timeout=%lld ms)\n",
+                       (long long)(js_engine.timeout_us / 1000));
+            } else {
+                fprintf(stderr, "Failed to initialize JS test engine\n");
+                return 1;
+            }
+            if (js_script != config.js_script_inline)
+                free(js_script);
+        }
+        active_test = NULL;
+    } else if (config_loaded && config.has_test) {
         memset(&test_state, 0, sizeof(test_state));
         test_state.config = &config.test;
         active_test = &test_state;
@@ -2058,6 +2117,105 @@ sim_restart:
             }
         }
 
+        /* JS engine: check GENERATE_MSG events and drain pending actions */
+        if (use_js_engine) {
+            js_test_check_gen_msgs(&js_engine, sim_ns / 1000);
+            sim_test_action_t js_actions[16];
+            int js_act_count = js_test_drain_actions(&js_engine, js_actions, 16);
+            for (int ja = 0; ja < js_act_count; ja++) {
+                const sim_test_action_t *act = &js_actions[ja];
+                if (act->type == TEST_ACTION_SEND) {
+                    for (int i = 0; i < node_count; i++) {
+                        if (nodes[i].id == act->node) {
+                            if (nodes[i].type == NODE_ARM) {
+                                for (int b = 0; act->data[b]; b++)
+                                    cc2538_uart_receive_byte(
+                                        &nodes[i].plat.arm.uart0, (uint8_t)act->data[b]);
+                            } else if (nodes[i].type == NODE_NATIVE) {
+                                native_node_t *nat = &nodes[i].plat.native;
+                                if (nat->simSerialReceivingData) {
+                                    int len = (int)strlen(act->data);
+                                    memcpy(nat->simSerialReceivingData, act->data, (size_t)len);
+                                    *nat->simSerialReceivingLength = len;
+                                    *nat->simSerialReceivingFlag = 1;
+                                }
+                            }
+                            if (verbose)
+                                printf("  JS ACTION: send node %d \"%s\"\n",
+                                       act->node, act->data);
+                            break;
+                        }
+                    }
+                } else if (act->type == TEST_ACTION_SEND_ALL) {
+                    for (int i = 0; i < node_count; i++) {
+                        if (node_start_ns[i] > sim_ns) continue;
+                        if (nodes[i].type == NODE_ARM) {
+                            for (int b = 0; act->data[b]; b++)
+                                cc2538_uart_receive_byte(
+                                    &nodes[i].plat.arm.uart0, (uint8_t)act->data[b]);
+                        } else if (nodes[i].type == NODE_NATIVE) {
+                            native_node_t *nat = &nodes[i].plat.native;
+                            if (nat->simSerialReceivingData) {
+                                int len = (int)strlen(act->data);
+                                memcpy(nat->simSerialReceivingData, act->data, (size_t)len);
+                                *nat->simSerialReceivingLength = len;
+                                *nat->simSerialReceivingFlag = 1;
+                            }
+                        }
+                    }
+                    if (verbose)
+                        printf("  JS ACTION: send_all \"%s\"\n", act->data);
+                } else if (act->type == TEST_ACTION_REMOVE) {
+                    for (int i = 0; i < node_count; i++) {
+                        if (nodes[i].id == act->node) {
+                            node_start_ns[i] = INT64_MAX;
+                            if (verbose)
+                                printf("  JS ACTION: remove node %d\n", act->node);
+                            break;
+                        }
+                    }
+                } else if (act->type == TEST_ACTION_ADD) {
+                    for (int i = 0; i < node_count; i++) {
+                        if (nodes[i].id == act->node) {
+                            if (verbose)
+                                printf("  JS ACTION: add (reboot) node %d\n", act->node);
+                            reboot_node(i);
+                            if (nodes[i].type == NODE_MSP430) {
+                                msp430_cpu_t *cpu = &nodes[i].plat.msp.cpu;
+                                cpu->sim_time_ns = sim_ns;
+                                cpu->cycles = (uint64_t)sim_ns * cpu->cpu_freq_hz / 1000000000ULL;
+                            } else if (nodes[i].type == NODE_ARM) {
+                                arm_cpu_t *cpu = &nodes[i].plat.arm.cpu;
+                                cpu->sim_time_ns = sim_ns;
+                                cpu->cycles = sim_ns * cpu->cpu_freq_hz / 1000000000LL;
+                            } else {
+                                nodes[i].plat.native.sim_time_ns = sim_ns;
+                            }
+                            node_start_ns[i] = sim_ns;
+                            break;
+                        }
+                    }
+                } else if (act->type == TEST_ACTION_MOVE) {
+                    for (int i = 0; i < node_count; i++) {
+                        if (nodes[i].id == act->node) {
+                            radio_medium_set_position(&radio_medium, i, act->x, act->y);
+                            radio_medium_compute_neighbors(&radio_medium);
+                            if (verbose)
+                                printf("  JS ACTION: move node %d to (%.1f, %.1f)\n",
+                                       act->node, act->x, act->y);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            /* Check JS timeout and test completion */
+            if (js_engine.finished != 0)
+                break;
+            if (js_test_check_timeout(&js_engine, sim_ns / 1000) != 0)
+                break;
+        }
+
         /* Lazy channel sync: only when TX activity has occurred */
         double t_phase;
         if (channels_dirty && radio_medium.type != RADIO_MEDIUM_NONE) {
@@ -2155,6 +2313,17 @@ sim_restart:
                 if (!node_active(i)) continue;
                 if (nodes[i].type != NODE_NATIVE)
                     emu_rx_queue_drain(i);
+            }
+
+            /* Second pass: dequeue + step native nodes that received frames
+             * during THIS time step (from other nodes' TX). */
+            for (int i = 0; i < node_count; i++) {
+                if (!node_active(i) || nodes[i].type != NODE_NATIVE) continue;
+                while (nodes[i].plat.native.rx_queue.count > 0) {
+                    native_dequeue_rx_frame(&nodes[i].plat.native);
+                    if (*nodes[i].plat.native.simInSize > 0)
+                        step_node_until(i, sim_ns);
+                }
             }
             time_step += get_time_ms() - t_phase;
         }
@@ -2473,6 +2642,20 @@ sim_restart:
             test_exit_code = 1;
         }
         active_test = NULL;
+    }
+
+    /* JS test engine results */
+    if (use_js_engine) {
+        printf("\n--- JS Test Results ---\n");
+        if (js_engine.finished == 1) {
+            printf("  TEST PASSED (%lld ms simulated)\n",
+                   (long long)(sim_ns / MS_TO_NS));
+        } else {
+            printf("  TEST FAILED: %s\n", js_test_fail_reason(&js_engine));
+            test_exit_code = 1;
+        }
+        js_test_destroy(&js_engine);
+        active_js_engine = NULL;
     }
 
     printf("\n--- Simulation complete ---\n");

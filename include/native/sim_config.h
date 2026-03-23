@@ -104,6 +104,11 @@ typedef struct {
     /* Test scripting */
     int has_test;
     sim_test_config_t test;
+
+    /* JavaScript test script (alternative to JSON test steps) */
+    int has_js_script;
+    char js_script_path[512];       /* path to .js file */
+    char *js_script_inline;         /* inline script (malloc'd, or NULL) */
 } sim_config_t;
 
 /* Load a JSON config file. Returns 0 on success, -1 on error. */
