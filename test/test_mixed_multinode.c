@@ -2098,12 +2098,16 @@ sim_restart:
             goto ui_broadcast;
         }
 
-        /* Adaptive time step: jump to earliest node event, capped at 1ms.
+        /* Adaptive time step: jump to earliest node event.
+         * Cap at 100ms for UI mode (responsiveness), unlimited for headless.
          * For threaded mode, always use fixed 1ms steps. */
         if (num_threads > 0) {
             sim_ns += TIME_STEP_NS;
         } else {
-            int64_t earliest = sim_ns + TIME_STEP_NS;
+            /* Cap max jump: 100ms for UI, 1s for headless.
+             * Too large a cap misses nodes with no pending timers (freshly booted). */
+            int64_t max_step = ui_server ? 100LL * MS_TO_NS : 1000LL * MS_TO_NS;
+            int64_t earliest = sim_ns + max_step;
             for (int i = 0; i < node_count; i++) {
                 if (!node_active(i)) continue;
                 int64_t nw = node_next_wakeup_ns(i);
