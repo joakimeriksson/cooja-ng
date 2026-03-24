@@ -124,16 +124,16 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
 
     /* Initial ticks to complete boot.
      * Tick 1: contiki_init() runs, reads simMoteID.
-     * Tick 2: process simMoteIDChanged (node_id_init re-reads if changed). */
+     * Tick 2: process simMoteIDChanged (node_id_init re-reads if changed).
+     * Note: don't call native_check_log_output here — the caller sets up
+     * the log callback after init, then does additional boot ticks. */
     *node->simProcessRunValue = 1;
     node->cooja_tick();
-    native_check_log_output(node);
 
     /* Ensure node_id is applied — set changed flag and tick again */
     *node->simMoteIDChanged = 1;
     *node->simProcessRunValue = 1;
     node->cooja_tick();
-    native_check_log_output(node);
 
     node->sim_time_ns = 0;
     printf("  Native node %d: initialized successfully\n", node_id);

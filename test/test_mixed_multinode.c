@@ -2245,6 +2245,9 @@ sim_restart:
                                     memcpy(nat->simSerialReceivingData, act->data, (size_t)len);
                                     *nat->simSerialReceivingLength = len;
                                     *nat->simSerialReceivingFlag = 1;
+                                    /* Step the node so it processes the serial input */
+                                    *nat->simProcessRunValue = 1;
+                                    step_node_until(i, sim_ns);
                                 }
                             }
                             if (verbose)
@@ -2267,6 +2270,8 @@ sim_restart:
                                 memcpy(nat->simSerialReceivingData, act->data, (size_t)len);
                                 *nat->simSerialReceivingLength = len;
                                 *nat->simSerialReceivingFlag = 1;
+                                *nat->simProcessRunValue = 1;
+                                step_node_until(i, sim_ns);
                             }
                         }
                     }
