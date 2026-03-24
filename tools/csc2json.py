@@ -168,10 +168,11 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
 
         fw_name = source_to_firmware_name(source)
         if fw_name and firmware_dir:
-            # Generate variant name from DEFINES (e.g., "intermediate-mpl")
+            # Generate variant name from DEFINES or routing config
             fw_variant = fw_name
-            if build and build.get("make_args"):
-                for arg in build["make_args"]:
+            if build:
+                # Check DEFINES (e.g., "intermediate-mpl")
+                for arg in build.get("make_args", []):
                     if arg.startswith("DEFINES="):
                         defines = arg[8:]
                         for d in defines.split(","):
@@ -180,6 +181,10 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
                                 short = val.split("_")[-1].lower() if "_" in val else val.lower()
                                 fw_variant = f"{fw_name}-{short}"
                                 break
+                # Check source path for routing variant (rpl-classic vs rpl-lite)
+                src_path = source or ""
+                if "rpl-classic" in src_path and fw_variant == fw_name:
+                    fw_variant = f"{fw_name}-classic"
 
             # Auto-detect extension: try variant name first, then base name
             fw_path = None
