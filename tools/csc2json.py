@@ -168,24 +168,39 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
 
         fw_name = source_to_firmware_name(source)
         if fw_name and firmware_dir:
-            # Auto-detect extension: try .cooja, .cc2538dk, .sky
+            # Generate variant name from DEFINES (e.g., "intermediate-mpl")
+            fw_variant = fw_name
+            if build and build.get("make_args"):
+                for arg in build["make_args"]:
+                    if arg.startswith("DEFINES="):
+                        defines = arg[8:]
+                        for d in defines.split(","):
+                            if "=" in d:
+                                val = d.split("=")[-1]
+                                short = val.split("_")[-1].lower() if "_" in val else val.lower()
+                                fw_variant = f"{fw_name}-{short}"
+                                break
+
+            # Auto-detect extension: try variant name first, then base name
             fw_path = None
-            # If build target is known, try that extension first
-            if build_target:
-                ext = "." + build_target
-                candidate = os.path.join(firmware_dir, fw_name + ext)
-                if os.path.exists(candidate):
-                    fw_path = candidate
-            if fw_path is None:
-                for ext in (".cooja", ".cc2538dk", ".sky"):
-                    candidate = os.path.join(firmware_dir, fw_name + ext)
+            for name_candidate in ([fw_variant, fw_name] if fw_variant != fw_name else [fw_name]):
+                if build_target:
+                    ext = "." + build_target
+                    candidate = os.path.join(firmware_dir, name_candidate + ext)
                     if os.path.exists(candidate):
                         fw_path = candidate
                         break
+                for ext in (".cooja", ".cc2538dk", ".sky"):
+                    candidate = os.path.join(firmware_dir, name_candidate + ext)
+                    if os.path.exists(candidate):
+                        fw_path = candidate
+                        break
+                if fw_path:
+                    break
             if fw_path is None:
-                # Fall back to build target extension, then .cc2538dk
+                # Fall back to variant name with target extension
                 fallback_ext = "." + build_target if build_target else ".cc2538dk"
-                fw_path = os.path.join(firmware_dir, fw_name + fallback_ext)
+                fw_path = os.path.join(firmware_dir, fw_variant + fallback_ext)
         elif fw_name:
             fallback_ext = "." + build_target if build_target else ".cc2538dk"
             fw_path = fw_name + fallback_ext
