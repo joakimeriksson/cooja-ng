@@ -58,9 +58,10 @@ typedef struct {
     /* Timeout */
     int64_t timeout_us;     /* 0 = no timeout */
 
-    /* Node list (read-only after init) */
+    /* Node list */
     int node_ids[128];
     int node_count;
+    bool node_removed[128];  /* true if removeMote was called for this node */
 
     /* Tracks whether JS thread is waiting in YIELD */
     bool js_waiting;

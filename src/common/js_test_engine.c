@@ -395,9 +395,10 @@ static JSValue js_sim_get_mote_with_id(JSContext *ctx, JSValueConst this_val,
     int32_t target_id;
     if (JS_ToInt32(ctx, &target_id, argv[0]) < 0)
         return JS_EXCEPTION;
-    /* Return null if node doesn't exist (scripts check if(!sim.getMoteWithID(n))) */
+    /* Return null if node doesn't exist or was removed
+     * (scripts check if(!sim.getMoteWithID(n))) */
     for (int i = 0; i < e->node_count; i++)
-        if (e->node_ids[i] == target_id)
+        if (e->node_ids[i] == target_id && !e->node_removed[i])
             return make_mote_obj(ctx, target_id);
     return JS_NULL;
 }
@@ -423,11 +424,18 @@ static JSValue js_sim_remove_mote(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     js_test_engine_t *e = get_engine(ctx);
     JSValue id_val = JS_GetPropertyStr(ctx, argv[0], "id");
+    int32_t node_id = 0;
+    JS_ToInt32(ctx, &node_id, id_val);
+    JS_FreeValue(ctx, id_val);
+
+    /* Mark node as removed so getMoteWithID returns null */
+    for (int i = 0; i < e->node_count; i++)
+        if (e->node_ids[i] == node_id) { e->node_removed[i] = true; break; }
+
     sim_test_action_t act = {0};
     act.type = TEST_ACTION_REMOVE;
+    act.node = node_id;
     act.at_ms = e->time_us / 1000;
-    JS_ToInt32(ctx, &act.node, id_val);
-    JS_FreeValue(ctx, id_val);
     pthread_mutex_lock(&e->mutex);
     queue_action(e, &act);
     pthread_mutex_unlock(&e->mutex);
@@ -438,11 +446,18 @@ static JSValue js_sim_add_mote(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv) {
     js_test_engine_t *e = get_engine(ctx);
     JSValue id_val = JS_GetPropertyStr(ctx, argv[0], "id");
+    int32_t node_id = 0;
+    JS_ToInt32(ctx, &node_id, id_val);
+    JS_FreeValue(ctx, id_val);
+
+    /* Mark node as active again */
+    for (int i = 0; i < e->node_count; i++)
+        if (e->node_ids[i] == node_id) { e->node_removed[i] = false; break; }
+
     sim_test_action_t act = {0};
     act.type = TEST_ACTION_ADD;
+    act.node = node_id;
     act.at_ms = e->time_us / 1000;
-    JS_ToInt32(ctx, &act.node, id_val);
-    JS_FreeValue(ctx, id_val);
     pthread_mutex_lock(&e->mutex);
     queue_action(e, &act);
     pthread_mutex_unlock(&e->mutex);
