@@ -157,16 +157,20 @@ void native_node_destroy(native_node_t *node) {
 static int64_t compute_next_wakeup(const native_node_t *node) {
     int64_t next_ns = INT64_MAX;
 
-    /* Etimer: expiration time is in ms */
+    /* Etimer: expiration time is in ms.
+     * If the expiration is at or before current time, the timer already
+     * fired — don't schedule another tick for it (COOJA behavior). */
     if (*node->simEtimerPending) {
         int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
-        if (et_ns < next_ns) next_ns = et_ns;
+        if (et_ns > node->sim_time_ns && et_ns < next_ns)
+            next_ns = et_ns;
     }
 
     /* Rtimer: expiration time is in us */
     if (*node->simRtimerPending) {
         int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
-        if (rt_ns < next_ns) next_ns = rt_ns;
+        if (rt_ns > node->sim_time_ns && rt_ns < next_ns)
+            next_ns = rt_ns;
     }
 
     /* processRunValue forces a tick */
@@ -183,11 +187,13 @@ int64_t native_next_wakeup_ns(const native_node_t *node) {
     int64_t next_ns = INT64_MAX;
     if (*node->simEtimerPending) {
         int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
-        if (et_ns < next_ns) next_ns = et_ns;
+        if (et_ns > node->sim_time_ns && et_ns < next_ns)
+            next_ns = et_ns;
     }
     if (*node->simRtimerPending) {
         int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
-        if (rt_ns < next_ns) next_ns = rt_ns;
+        if (rt_ns > node->sim_time_ns && rt_ns < next_ns)
+            next_ns = rt_ns;
     }
     return next_ns;
 }

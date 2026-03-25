@@ -1654,13 +1654,16 @@ static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
     if (*node->simInSize > 0) return true;  /* frame ready for delivery */
     if (node->rx_queue.count > 0) return true;  /* queued frames waiting */
     if (*node->simProcessRunValue) return true;
+    /* Timer checks: only pending if expiration is AFTER last step time
+     * (node->sim_time_ns) and at or before current sim_ns. An already-
+     * processed timer (expiration <= node->sim_time_ns) is stale. */
     if (*node->simEtimerPending) {
         int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
-        if (et_ns <= sim_ns) return true;
+        if (et_ns > node->sim_time_ns && et_ns <= sim_ns) return true;
     }
     if (*node->simRtimerPending) {
         int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
-        if (rt_ns <= sim_ns) return true;
+        if (rt_ns > node->sim_time_ns && rt_ns <= sim_ns) return true;
     }
     return false;
 }
