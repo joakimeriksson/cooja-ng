@@ -896,9 +896,9 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         for (int n = 0; n < nl->count; n++) {
             int i = nl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) {
-                /* Deliver if receiver's radio is ON (like COOJA's UDGM).
-                 * TODO: For TSCH, check channel match too. */
-                if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
+                /* Only deliver to receivers with radio ON (like COOJA's UDGM). */
+                if (*nodes[i].plat.native.simRadioHWOn &&
+                    radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
                     native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
                     if (q->count >= NATIVE_RX_QUEUE_SIZE)
                         stat_rx_frames_queue_full++;
@@ -1634,28 +1634,19 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
     *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
 
-    /* Deliver pending RX frame before tick (like COOJA's doActionsBeforeTick).
-     * Set simReceiving=1 while frame is in transit, then clear it and set
-     * simInSize when frame is ready. This matches COOJA's
-     * signalReceptionStart/signalReceptionEnd model. */
+    /* Deliver pending RX frame before tick (like COOJA's doActionsBeforeTick) */
     if (*nat->simInSize == 0 && nat->rx_queue.count > 0) {
-        /* Clear simReceiving before delivery (frame is now complete) */
         *nat->simReceiving = 0;
         native_dequeue_rx_frame(nat);
     }
 
     nat->cooja_tick();
-
-    /* Sync ALL nodes' channels after tick (needed for TSCH channel hopping).
-     * The sender's channel changed during the tick; receivers' channels
-     * need to be current for frame filtering. */
-    for (int n = 0; n < num_nodes; n++) {
-        if (nodes[n].type == NODE_NATIVE && nodes[n].plat.native.simRadioChannel)
-            radio_medium_set_channel(&radio_medium, n, *nodes[n].plat.native.simRadioChannel);
-    }
-
     native_check_radio_tx(nat);
     native_check_log_output(nat);
+
+    /* Sync this node's channel (for TSCH hopping) */
+    if (nat->simRadioChannel)
+        radio_medium_set_channel(&radio_medium, idx, *nat->simRadioChannel);
 }
 
 /* Schedule a native node's next wakeup in the event queue.
@@ -1683,7 +1674,12 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
             sim_eq_schedule(eq, idx, now + 1000000LL);  /* stale → +1ms */
         else
             sim_eq_schedule(eq, idx, et);
+        return;
     }
+
+    /* No timers or process work — schedule a check in 1ms.
+     * This ensures nodes don't go silent (TSCH scanning needs periodic ticks). */
+    sim_eq_schedule(eq, idx, now + 1000000LL);
 }
 
 /* Schedule an emulated node's next wakeup */
@@ -2479,11 +2475,15 @@ sim_restart:
 
             /* Process events up to sim_ns */
             while (!sim_eq_empty(&sim_eq) && sim_eq_peek_time(&sim_eq) <= sim_ns) {
-                /* Sync channels before each event (needed for TSCH hopping) */
-                if (channels_dirty) {
-                    sync_node_channels();
-                    channels_dirty = false;
+                /* Sync ALL native node channels before each event.
+                 * TSCH hops channels during ticks; we need current state
+                 * for frame delivery filtering. */
+                for (int n = 0; n < node_count; n++) {
+                    if (nodes[n].type == NODE_NATIVE && nodes[n].plat.native.simRadioChannel)
+                        radio_medium_set_channel(&radio_medium, n,
+                            *nodes[n].plat.native.simRadioChannel);
                 }
+                channels_dirty = false;
 
                 sim_event_t ev = sim_eq_pop(&sim_eq);
                 int i = ev.node_idx;
