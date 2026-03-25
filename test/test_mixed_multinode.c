@@ -896,6 +896,8 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         for (int n = 0; n < nl->count; n++) {
             int i = nl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) {
+                /* Deliver if receiver's radio is ON (like COOJA's UDGM).
+                 * TODO: For TSCH, check channel match too. */
                 if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
                     native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
                     if (q->count >= NATIVE_RX_QUEUE_SIZE)
@@ -1632,9 +1634,15 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
     *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
 
-    /* Deliver pending RX frame before tick (like COOJA's doActionsBeforeTick) */
-    if (*nat->simInSize == 0 && nat->rx_queue.count > 0)
+    /* Deliver pending RX frame before tick (like COOJA's doActionsBeforeTick).
+     * Set simReceiving=1 while frame is in transit, then clear it and set
+     * simInSize when frame is ready. This matches COOJA's
+     * signalReceptionStart/signalReceptionEnd model. */
+    if (*nat->simInSize == 0 && nat->rx_queue.count > 0) {
+        /* Clear simReceiving before delivery (frame is now complete) */
+        *nat->simReceiving = 0;
         native_dequeue_rx_frame(nat);
+    }
 
     nat->cooja_tick();
     native_check_radio_tx(nat);
@@ -2496,12 +2504,15 @@ sim_restart:
                 }
 
                 /* RF delivery: if this node TX'd, schedule receivers
-                 * at the same time (requestImmediateWakeup) */
+                 * at the same time (requestImmediateWakeup).
+                 * Set simReceiving=1 on receivers so TSCH knows a frame
+                 * is in the air (like COOJA's signalReceptionStart).
+                 * Note: radio-off filtering is done in mixed_rf_frame_handler. */
                 for (int r = 0; r < node_count; r++) {
                     if (r == i || !node_active(r)) continue;
                     if (nodes[r].type == NODE_NATIVE &&
                         nodes[r].plat.native.rx_queue.count > rx_before[r]) {
-                        /* Receiver has a new frame — schedule at same time */
+                        *nodes[r].plat.native.simReceiving = 1;
                         sim_eq_schedule(&sim_eq, r, ev_time);
                     }
                 }
