@@ -27,6 +27,7 @@
 #include "packet_analyzer.h"
 #include "cJSON.h"
 #include "js_test_engine.h"
+#include "sim_event_queue.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1621,6 +1622,74 @@ static void step_node_until(int idx, int64_t target) {
         native_step_until_ns(&nodes[idx].plat.native, target);
 }
 
+/* --- Event-driven scheduling helpers (COOJA model) --- */
+
+/* Tick a single native node at sim_ns. Single tick, no loop.
+ * Matches COOJA's ContikiMote.execute(). */
+static void tick_one_native(int idx, int64_t sim_ns) {
+    native_node_t *nat = &nodes[idx].plat.native;
+    nat->sim_time_ns = sim_ns;
+    *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
+    *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
+
+    /* Deliver pending RX frame before tick (like COOJA's doActionsBeforeTick) */
+    if (*nat->simInSize == 0 && nat->rx_queue.count > 0)
+        native_dequeue_rx_frame(nat);
+
+    nat->cooja_tick();
+    native_check_radio_tx(nat);
+    native_check_log_output(nat);
+}
+
+/* Schedule a native node's next wakeup in the event queue.
+ * Exactly matches COOJA's ContikiClock.doActionsAfterTick(). */
+static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
+    native_node_t *nat = &nodes[idx].plat.native;
+    int64_t now = nat->sim_time_ns;
+
+    /* Always schedule for rtimer if pending (exact µs timing) */
+    if (*nat->simRtimerPending) {
+        int64_t rt = (int64_t)(*nat->simRtimerNextExpirationTime) * 1000LL;
+        sim_eq_schedule_if_earlier(eq, idx, rt);
+    }
+
+    /* processRunValue → +1ms (like COOJA's ContikiClock) */
+    if (*nat->simProcessRunValue) {
+        sim_eq_schedule(eq, idx, now + 1000000LL);
+        return;
+    }
+
+    /* etimer */
+    if (*nat->simEtimerPending) {
+        int64_t et = (int64_t)(*nat->simEtimerNextExpirationTime) * 1000000LL;
+        if (et <= now)
+            sim_eq_schedule(eq, idx, now + 1000000LL);  /* stale → +1ms */
+        else
+            sim_eq_schedule(eq, idx, et);
+    }
+}
+
+/* Schedule an emulated node's next wakeup */
+static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
+    int64_t next;
+    if (nodes[idx].type == NODE_ARM) {
+        arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
+        if (cpu->next_event_cycle <= cpu->cycles)
+            next = cpu->sim_time_ns;
+        else
+            next = cpu->sim_time_ns + arm_cycles_to_ns(
+                cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+    } else {
+        msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
+        if ((int64_t)cpu->next_event_cycle <= (int64_t)cpu->cycles)
+            next = cpu->sim_time_ns;
+        else
+            next = cpu->sim_time_ns + msp430_cycles_to_ns(
+                cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+    }
+    sim_eq_schedule(eq, idx, next);
+}
+
 /* Check if a native node has pending work at the given sim time */
 /* Compute the next time a node needs to wake up (ns).
  * Used by event-driven stepping to skip idle periods. */
@@ -2079,6 +2148,16 @@ sim_restart:
     int64_t ui_interval_ns = 100LL * MS_TO_NS;  /* 100ms sim time between UI updates */
     int64_t next_ui_ns = sim_ns + ui_interval_ns;
 
+    /* Initialize event queue for COOJA-model sequential stepping */
+    sim_event_queue_t sim_eq;
+    sim_eq_init(&sim_eq);
+    if (num_threads == 0) {
+        for (int i = 0; i < node_count; i++) {
+            if (!node_active(i)) continue;
+            sim_eq_schedule(&sim_eq, i, node_start_ns[i]);
+        }
+    }
+
     /* Phase timing accumulators (ms) */
     double time_distribute = 0, time_deliver = 0, time_step = 0;
     double time_flush = 0, time_channel_sync = 0, time_test_ui = 0;
@@ -2098,24 +2177,17 @@ sim_restart:
             goto ui_broadcast;
         }
 
-        /* Adaptive time step: jump to earliest node event.
-         * Cap at 100ms for UI mode (responsiveness), unlimited for headless.
-         * For threaded mode, always use fixed 1ms steps. */
+        /* Advance simulation time.
+         * For threaded mode: fixed 1ms steps.
+         * For sequential mode: jump to next event in queue, capped for UI. */
         if (num_threads > 0) {
             sim_ns += TIME_STEP_NS;
         } else {
-            /* Cap max jump: 100ms for UI, 1s for headless.
-             * Too large a cap misses nodes with no pending timers (freshly booted). */
-            int64_t max_step = ui_server ? 100LL * MS_TO_NS : 1000LL * MS_TO_NS;
-            int64_t earliest = sim_ns + max_step;
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i)) continue;
-                int64_t nw = node_next_wakeup_ns(i);
-                if (nw < earliest) earliest = nw;
-            }
-            /* Ensure we advance by at least 1µs to avoid infinite loops */
-            if (earliest <= sim_ns) earliest = sim_ns + 1000;
-            sim_ns = earliest;
+            int64_t next_event = sim_eq_peek_time(&sim_eq);
+            int64_t max_ns = ui_server ? sim_ns + 100LL * MS_TO_NS : end_ns;
+            if (next_event < max_ns) max_ns = next_event;
+            if (max_ns <= sim_ns) max_ns = sim_ns + 1000;  /* min 1µs advance */
+            sim_ns = max_ns;
         }
         current_sim_ns = sim_ns;
 
@@ -2380,47 +2452,38 @@ sim_restart:
             flush_pending_output();
             time_flush += get_time_ms() - t_phase;
         } else {
-            /* === SEQUENTIAL EVENT-DRIVEN PATH ===
-             * Step each node to sim_ns. After each node steps, if it TX'd
-             * a frame, immediately deliver to receivers and step them so
-             * ACKs arrive within the same simulation time (like COOJA's
-             * requestImmediateWakeup). */
+            /* === SEQUENTIAL EVENT-DRIVEN PATH (COOJA model) ===
+             * Pop events from the event queue, tick one node per event.
+             * After each tick, check for TX and schedule receivers at
+             * the same time (requestImmediateWakeup). Schedule the
+             * ticked node's next wakeup based on timer state. */
 
             t_phase = get_time_ms();
 
-            /* Deliver pending bytes from previous step to native assemblers */
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i) || nodes[i].type != NODE_NATIVE) continue;
-                mixed_deliver_rf_bytes(i);
-                native_dequeue_rx_frame(&nodes[i].plat.native);
-            }
+            /* Process events up to sim_ns */
+            while (!sim_eq_empty(&sim_eq) && sim_eq_peek_time(&sim_eq) <= sim_ns) {
+                sim_event_t ev = sim_eq_pop(&sim_eq);
+                int i = ev.node_idx;
+                if (i < 0 || i >= node_count || !node_active(i))
+                    continue;
 
-            /* Step each node to sim_ns, with synchronous RX delivery */
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i)) continue;
+                int64_t ev_time = ev.time_ns;
 
-                /* Snapshot receiver queues to detect new TX from this node */
-                int rx_counts_before[MAX_NODES];
+                /* Snapshot receiver queues to detect TX */
+                int rx_before[MAX_NODES];
                 for (int r = 0; r < node_count; r++)
-                    rx_counts_before[r] = (nodes[r].type == NODE_NATIVE)
+                    rx_before[r] = (nodes[r].type == NODE_NATIVE)
                         ? nodes[r].plat.native.rx_queue.count : 0;
 
                 if (nodes[i].type == NODE_NATIVE) {
-                    if (!native_has_pending_work(&nodes[i].plat.native, sim_ns)) {
-                        nodes[i].plat.native.sim_time_ns = sim_ns;
-                        continue;
-                    }
-                    step_node_until(i, sim_ns);
-                    /* Process queued frames within this time step */
-                    while (*nodes[i].plat.native.simInSize == 0 &&
-                           nodes[i].plat.native.rx_queue.count > 0 &&
-                           nodes[i].plat.native.sim_time_ns < sim_ns) {
-                        native_dequeue_rx_frame(&nodes[i].plat.native);
-                        step_node_until(i, sim_ns);
-                    }
+                    /* Single tick at event time */
+                    tick_one_native(i, ev_time);
+
+                    /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
+                    schedule_native_wakeup(&sim_eq, i);
                 } else {
-                    /* Emulated nodes step by cycle count */
-                    int64_t delta_ns = sim_ns - node_sim_time_ns(i);
+                    /* Emulated: step to event time */
+                    int64_t delta_ns = ev_time - node_sim_time_ns(i);
                     if (delta_ns > 0) {
                         int64_t target_cycle;
                         if (nodes[i].type == NODE_MSP430)
@@ -2429,34 +2492,31 @@ sim_restart:
                             target_cycle = node_cycles(i) + arm_ns_to_cycles(delta_ns, node_freq(i));
                         step_node_until(i, target_cycle);
                     }
+                    schedule_emulated_wakeup(&sim_eq, i);
                 }
 
-                /* Synchronous RX delivery: if this node TX'd a frame that
-                 * landed in a native receiver's queue, dequeue and step the
-                 * receiver immediately so it can generate an ACK. */
+                /* RF delivery: if this node TX'd, schedule receivers
+                 * at the same time (requestImmediateWakeup) */
                 for (int r = 0; r < node_count; r++) {
                     if (r == i || !node_active(r)) continue;
                     if (nodes[r].type == NODE_NATIVE &&
-                        nodes[r].plat.native.rx_queue.count > rx_counts_before[r]) {
-                        native_dequeue_rx_frame(&nodes[r].plat.native);
-                        step_node_until(r, sim_ns);
-                        /* If receiver TX'd (e.g. ACK), deliver back */
-                        for (int r2 = 0; r2 < node_count; r2++) {
-                            if (r2 == r || !node_active(r2)) continue;
-                            if (nodes[r2].type == NODE_NATIVE &&
-                                nodes[r2].plat.native.rx_queue.count > 0) {
-                                native_dequeue_rx_frame(&nodes[r2].plat.native);
-                                step_node_until(r2, sim_ns);
-                            }
-                        }
+                        nodes[r].plat.native.rx_queue.count > rx_before[r]) {
+                        /* Receiver has a new frame — schedule at same time */
+                        sim_eq_schedule(&sim_eq, r, ev_time);
                     }
                 }
-            }
 
-            /* Drain queued RX frames for emulated nodes */
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i) || nodes[i].type == NODE_NATIVE) continue;
-                emu_rx_queue_drain(i);
+                /* Drain emulated RX queues */
+                for (int r = 0; r < node_count; r++) {
+                    if (!node_active(r) || nodes[r].type == NODE_NATIVE) continue;
+                    emu_rx_queue_drain(r);
+                }
+
+                /* Deliver pending bytes to native assemblers */
+                for (int r = 0; r < node_count; r++) {
+                    if (!node_active(r) || nodes[r].type != NODE_NATIVE) continue;
+                    mixed_deliver_rf_bytes(r);
+                }
             }
 
             time_step += get_time_ms() - t_phase;

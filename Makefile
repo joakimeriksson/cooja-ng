@@ -51,7 +51,8 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/sim_threads.c \
                  $(COMMON_SRC_DIR)/packet_analyzer.c \
                  $(COMMON_SRC_DIR)/timeline.c \
-                 $(COMMON_SRC_DIR)/js_test_engine.c
+                 $(COMMON_SRC_DIR)/js_test_engine.c \
+                 $(COMMON_SRC_DIR)/sim_event_queue.c
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
