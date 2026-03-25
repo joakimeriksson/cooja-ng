@@ -1646,16 +1646,15 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
     *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
 
-    /* Clear simReceiving when frame is ready (signalReceptionEnd).
-     * This allows doInterfaceActionsBeforeTick to poll the radio process. */
-    if (*nat->simInSize > 0 && *nat->simReceiving) {
+    /* Clear simReceiving before tick (signalReceptionEnd).
+     * For CSMA: allows doInterfaceActionsBeforeTick to poll radio process.
+     * For TSCH: allows pending_packet() to return true in busywait. */
+    if (*nat->simReceiving)
         *nat->simReceiving = 0;
-    }
 
     /* Deliver pending RX frame from queue if simInDataBuffer is empty */
-    if (*nat->simInSize == 0 && nat->rx_queue.count > 0) {
+    if (*nat->simInSize == 0 && nat->rx_queue.count > 0)
         native_dequeue_rx_frame(nat);
-    }
 
     nat->cooja_tick();
     native_had_tx[idx] = (*nat->simOutSize > 0);
