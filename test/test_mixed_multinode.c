@@ -1646,9 +1646,14 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
     *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
 
-    /* Deliver pending RX frame before tick (like COOJA's doActionsBeforeTick) */
-    if (*nat->simInSize == 0 && nat->rx_queue.count > 0) {
+    /* Clear simReceiving when frame is ready (signalReceptionEnd).
+     * This allows doInterfaceActionsBeforeTick to poll the radio process. */
+    if (*nat->simInSize > 0 && *nat->simReceiving) {
         *nat->simReceiving = 0;
+    }
+
+    /* Deliver pending RX frame from queue if simInDataBuffer is empty */
+    if (*nat->simInSize == 0 && nat->rx_queue.count > 0) {
         native_dequeue_rx_frame(nat);
     }
 
@@ -2531,6 +2536,14 @@ sim_restart:
 
                 if (nodes[i].type == NODE_NATIVE) {
                     /* Single tick at event time */
+                    if (verbose && (*nodes[i].plat.native.simInSize > 0 ||
+                                    nodes[i].plat.native.rx_queue.count > 0))
+                        fprintf(stderr, "  [EVQ] tick node %d at %lld µs: simInSize=%d rxq=%d radioHWOn=%d simReceiving=%d\n",
+                                nodes[i].id, (long long)(ev_time/1000),
+                                *nodes[i].plat.native.simInSize,
+                                nodes[i].plat.native.rx_queue.count,
+                                *nodes[i].plat.native.simRadioHWOn,
+                                *nodes[i].plat.native.simReceiving);
                     tick_one_native(i, ev_time);
 
                     /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
