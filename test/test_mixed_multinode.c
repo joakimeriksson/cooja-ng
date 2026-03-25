@@ -896,14 +896,22 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         for (int n = 0; n < nl->count; n++) {
             int i = nl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) {
-                /* Only deliver to receivers with radio ON (like COOJA's UDGM). */
-                if (*nodes[i].plat.native.simRadioHWOn &&
+                native_node_t *rcv = &nodes[i].plat.native;
+                /* Like COOJA: only deliver to receivers with radio ON */
+                if (*rcv->simRadioHWOn &&
                     radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
-                    native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-                    if (q->count >= NATIVE_RX_QUEUE_SIZE)
-                        stat_rx_frames_queue_full++;
-                    native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                         current_sim_ns, sender_idx);
+                    /* Direct delivery to simInDataBuffer (like COOJA's
+                     * signalReceptionStart + setReceivedPacket + signalReceptionEnd).
+                     * If simInSize > 0, previous frame not yet consumed — queue instead. */
+                    if (*rcv->simInSize == 0) {
+                        /* Direct delivery */
+                        memcpy(rcv->simInDataBuffer, frame, (size_t)len);
+                        *rcv->simInSize = len;
+                    } else {
+                        /* Previous frame pending — queue for later */
+                        native_deliver_frame(rcv, frame, len,
+                                             current_sim_ns, sender_idx);
+                    }
                     stat_rx_frames_queued++;
                 }
             }
@@ -1628,6 +1636,10 @@ static void step_node_until(int idx, int64_t target) {
 
 /* Tick a single native node at sim_ns. Single tick, no loop.
  * Matches COOJA's ContikiMote.execute(). */
+/* Track whether the last tick had a TX (for distinguishing TX yield
+ * from TSCH busywait in schedule_native_wakeup). */
+static bool native_had_tx[MAX_NODES];
+
 static void tick_one_native(int idx, int64_t sim_ns) {
     native_node_t *nat = &nodes[idx].plat.native;
     nat->sim_time_ns = sim_ns;
@@ -1641,6 +1653,7 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     }
 
     nat->cooja_tick();
+    native_had_tx[idx] = (*nat->simOutSize > 0);
     native_check_radio_tx(nat);
     native_check_log_output(nat);
 
@@ -1655,31 +1668,40 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
     native_node_t *nat = &nodes[idx].plat.native;
     int64_t now = nat->sim_time_ns;
 
-    /* Always schedule for rtimer if pending (exact µs timing) */
+    /* Determine next wakeup time (like ContikiClock.doActionsAfterTick).
+     * Use schedule_if_earlier to avoid overriding a requestImmediateWakeup
+     * that was already scheduled by RF delivery detection. */
+    int64_t next = now + 1000000000LL;  /* 1s max gap */
+
+    /* rtimer has priority (exact µs timing) */
     if (*nat->simRtimerPending) {
         int64_t rt = (int64_t)(*nat->simRtimerNextExpirationTime) * 1000LL;
-        sim_eq_schedule_if_earlier(eq, idx, rt);
+        if (rt < next) next = rt;
     }
 
-    /* processRunValue → +1ms (like COOJA's ContikiClock) */
+    /* processRunValue → timing depends on context:
+     * - After TX: schedule at SAME TIME (firmware is in TX yield,
+     *   needs immediate re-tick to exit and enter ACK busywait)
+     * - Otherwise: +1ms (like COOJA's ContikiClock) */
     if (*nat->simProcessRunValue) {
-        sim_eq_schedule(eq, idx, now + 1000000LL);
-        return;
+        if (native_had_tx[idx]) {
+            /* TX yield — schedule immediately */
+            if (now < next) next = now;
+            native_had_tx[idx] = false;
+        } else {
+            int64_t prv = now + 1000000LL;
+            if (prv < next) next = prv;
+        }
     }
 
     /* etimer */
     if (*nat->simEtimerPending) {
         int64_t et = (int64_t)(*nat->simEtimerNextExpirationTime) * 1000000LL;
-        if (et <= now)
-            sim_eq_schedule(eq, idx, now + 1000000LL);  /* stale → +1ms */
-        else
-            sim_eq_schedule(eq, idx, et);
-        return;
+        if (et <= now) et = now + 1000000LL;  /* stale → +1ms */
+        if (et < next) next = et;
     }
 
-    /* No timers or process work — schedule a check in 1ms.
-     * This ensures nodes don't go silent (TSCH scanning needs periodic ticks). */
-    sim_eq_schedule(eq, idx, now + 1000000LL);
+    sim_eq_schedule_if_earlier(eq, idx, next);
 }
 
 /* Schedule an emulated node's next wakeup */
@@ -2492,11 +2514,20 @@ sim_restart:
 
                 int64_t ev_time = ev.time_ns;
 
-                /* Snapshot receiver queues to detect TX */
+                /* Snapshot ALL nodes' state to detect frame delivery.
+                 * Must be fresh for each event — ACK chains require
+                 * detecting frames delivered during the current event. */
                 int rx_before[MAX_NODES];
-                for (int r = 0; r < node_count; r++)
-                    rx_before[r] = (nodes[r].type == NODE_NATIVE)
-                        ? nodes[r].plat.native.rx_queue.count : 0;
+                int insize_before[MAX_NODES];
+                for (int r = 0; r < node_count; r++) {
+                    if (nodes[r].type == NODE_NATIVE) {
+                        rx_before[r] = nodes[r].plat.native.rx_queue.count;
+                        insize_before[r] = *nodes[r].plat.native.simInSize;
+                    } else {
+                        rx_before[r] = 0;
+                        insize_before[r] = 0;
+                    }
+                }
 
                 if (nodes[i].type == NODE_NATIVE) {
                     /* Single tick at event time */
@@ -2525,10 +2556,16 @@ sim_restart:
                  * Note: radio-off filtering is done in mixed_rf_frame_handler. */
                 for (int r = 0; r < node_count; r++) {
                     if (r == i || !node_active(r)) continue;
-                    if (nodes[r].type == NODE_NATIVE &&
-                        nodes[r].plat.native.rx_queue.count > rx_before[r]) {
-                        *nodes[r].plat.native.simReceiving = 1;
-                        sim_eq_schedule(&sim_eq, r, ev_time);
+                    if (nodes[r].type == NODE_NATIVE) {
+                        /* Check if this node received a new frame
+                         * (either in rx_queue or directly in simInDataBuffer) */
+                        bool got_frame =
+                            nodes[r].plat.native.rx_queue.count > rx_before[r] ||
+                            *nodes[r].plat.native.simInSize > insize_before[r];
+                        if (got_frame) {
+                            *nodes[r].plat.native.simReceiving = 1;
+                            sim_eq_schedule(&sim_eq, r, ev_time);
+                        }
                     }
                 }
 
