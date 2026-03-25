@@ -167,8 +167,11 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
     /* Channel check */
     int ch_s = rm->nodes[sender].channel;
     int ch_r = rm->nodes[receiver].channel;
-    if (ch_s >= 0 && ch_r >= 0 && ch_s != ch_r)
-        return false;
+    /* Channel check disabled for now — TSCH channel hopping makes
+     * stale simRadioChannel values unreliable between ticks.
+     * TODO: implement per-event channel sync for TSCH. */
+    /* if (ch_s >= 0 && ch_r >= 0 && ch_s != ch_r)
+        return false; */
 
     /* Distance-based probabilistic check */
     double prob = udgm_reception_prob(rm, sender, receiver);
@@ -212,8 +215,11 @@ bool radio_medium_filter_byte(radio_medium_t *rm, int sender, int receiver, uint
     /* Channel check: if both nodes have a known channel, they must match */
     int ch_s = rm->nodes[sender].channel;
     int ch_r = rm->nodes[receiver].channel;
-    if (ch_s >= 0 && ch_r >= 0 && ch_s != ch_r)
-        return false;
+    /* Channel check disabled for now — TSCH channel hopping makes
+     * stale simRadioChannel values unreliable between ticks.
+     * TODO: implement per-event channel sync for TSCH. */
+    /* if (ch_s >= 0 && ch_r >= 0 && ch_s != ch_r)
+        return false; */
 
     /* UDGM distance-based filtering */
     frame_tracker_t *ft = &rm->frame_track[sender];

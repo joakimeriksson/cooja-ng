@@ -1645,6 +1645,15 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     }
 
     nat->cooja_tick();
+
+    /* Sync ALL nodes' channels after tick (needed for TSCH channel hopping).
+     * The sender's channel changed during the tick; receivers' channels
+     * need to be current for frame filtering. */
+    for (int n = 0; n < num_nodes; n++) {
+        if (nodes[n].type == NODE_NATIVE && nodes[n].plat.native.simRadioChannel)
+            radio_medium_set_channel(&radio_medium, n, *nodes[n].plat.native.simRadioChannel);
+    }
+
     native_check_radio_tx(nat);
     native_check_log_output(nat);
 }
@@ -2470,6 +2479,12 @@ sim_restart:
 
             /* Process events up to sim_ns */
             while (!sim_eq_empty(&sim_eq) && sim_eq_peek_time(&sim_eq) <= sim_ns) {
+                /* Sync channels before each event (needed for TSCH hopping) */
+                if (channels_dirty) {
+                    sync_node_channels();
+                    channels_dirty = false;
+                }
+
                 sim_event_t ev = sim_eq_pop(&sim_eq);
                 int i = ev.node_idx;
                 if (i < 0 || i >= node_count || !node_active(i))
