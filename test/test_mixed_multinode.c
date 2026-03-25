@@ -1500,11 +1500,11 @@ static void native_yield_callback(void *user_data) {
         void (*saved_cb)(void*) = rcv->yield_callback;
         rcv->yield_callback = NULL;
 
-        /* Tick receiver until it finishes processing.
-         * Track if receiver generates a TX (soft ACK). */
+        /* Tick receiver to process the frame and generate soft ACK.
+         * The first tick wakes the radio process (simInSize > 0 triggers it).
+         * Subsequent ticks only if the firmware has more work (processRunValue). */
         int ack_sent = 0;
-        for (int tick = 0; tick < 20; tick++) {
-            *rcv->simProcessRunValue = 1;
+        for (int tick = 0; tick < 5; tick++) {
             rcv->cooja_tick();
             if (*rcv->simOutSize > 0) {
                 native_check_radio_tx(rcv);
@@ -1654,16 +1654,13 @@ static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
     if (*node->simInSize > 0) return true;  /* frame ready for delivery */
     if (node->rx_queue.count > 0) return true;  /* queued frames waiting */
     if (*node->simProcessRunValue) return true;
-    /* Timer checks: only pending if expiration is AFTER last step time
-     * (node->sim_time_ns) and at or before current sim_ns. An already-
-     * processed timer (expiration <= node->sim_time_ns) is stale. */
     if (*node->simEtimerPending) {
         int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
-        if (et_ns > node->sim_time_ns && et_ns <= sim_ns) return true;
+        if (et_ns <= sim_ns) return true;
     }
     if (*node->simRtimerPending) {
         int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
-        if (rt_ns > node->sim_time_ns && rt_ns <= sim_ns) return true;
+        if (rt_ns <= sim_ns) return true;
     }
     return false;
 }
