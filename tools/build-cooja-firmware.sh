@@ -90,24 +90,14 @@ for n in d.get('nodes', []):
     if target != 'cooja':
         continue
 
-    # For firmware with DEFINES, create a unique name suffix
-    # e.g. intermediate + DEFINES=UIP_MCAST6_CONF_ENGINE=UIP_MCAST6_ENGINE_MPL
-    #   -> intermediate-mpl
+    # out_name is the hashed firmware name from csc2json
+    # src_name is the original source file name (for make)
     out_name = name
-    for arg in make_args:
-        if arg.startswith('DEFINES='):
-            defines = arg[8:]
-            # Extract short suffix from the define value
-            for d in defines.split(','):
-                if '=' in d:
-                    val = d.split('=')[-1]
-                    # UIP_MCAST6_ENGINE_MPL -> mpl
-                    short = val.split('_')[-1].lower() if '_' in val else val.lower()
-                    out_name = f'{name}-{short}'
-                    break
-                else:
-                    short = d.split('_')[-1].lower() if '_' in d else d.lower()
-                    out_name = f'{name}-{short}'
+    # Derive source name by stripping hash suffix
+    src_name = name.rsplit('-', 1)[0] if '-' in name and len(name.rsplit('-', 1)[1]) == 6 else name
+    # Also strip '-classic' suffix
+    if src_name.endswith('-classic'):
+        src_name = src_name[:-8]
 
     key = f'{out_name}|{src_dir}|{make_args_str}'
     if key in seen:
@@ -115,7 +105,7 @@ for n in d.get('nodes', []):
     seen.add(key)
 
     # Tab-separated: output_name, source_name, source_dir, target, make_args
-    print(f'{out_name}\t{name}\t{src_dir}\t{target}\t{make_args_str}')
+    print(f'{out_name}\t{src_name}\t{src_dir}\t{target}\t{make_args_str}')
 " 2>/dev/null >> "$TMP"
 done
 

@@ -169,9 +169,11 @@ static int64_t compute_next_wakeup(const native_node_t *node) {
         if (rt_ns < next_ns) next_ns = rt_ns;
     }
 
-    /* processRunValue forces a tick */
+    /* processRunValue forces a tick — schedule +1ms like COOJA does
+     * (ContikiClock.doActionsAfterTick: currentSimulationTime + MILLISECOND) */
     if (*node->simProcessRunValue) {
-        next_ns = node->sim_time_ns;
+        int64_t prv_ns = node->sim_time_ns + 1000000LL;
+        if (prv_ns < next_ns) next_ns = prv_ns;
     }
 
     return next_ns;
@@ -229,9 +231,11 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
             node->sim_time_ns = next_ns;
 
         /* Stale timer detection: if we're about to tick at the same time
-         * as last iteration, the timer hasn't advanced. Skip ahead by 1ms
-         * (like COOJA's +1ms scheduling for processRunValue). */
-        if (node->sim_time_ns == last_tick_ns) {
+         * as last iteration AND no rtimer/processRun is pending, the etimer
+         * is stale. Skip ahead by 1ms. BUT if rtimer is pending or process
+         * has work, allow same-time ticking (needed for TSCH slot processing). */
+        if (node->sim_time_ns == last_tick_ns &&
+            !*node->simProcessRunValue && !*node->simRtimerPending) {
             node->sim_time_ns += 1000000LL;
             if (node->sim_time_ns > target_ns) {
                 node->sim_time_ns = target_ns;
@@ -246,7 +250,7 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
 
         /* Process ticks. After TX, call yield callback for ACK delivery.
          * For non-TX ticks with processRunValue=1, continue ticking
-         * (firmware has more events to process). */
+         * at same time (needed for CSMA ACK busywait). */
         for (int same_time = 0; same_time < 20; same_time++) {
             node->cooja_tick();
             int had_tx = (*node->simOutSize > 0);
@@ -254,13 +258,11 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
             native_check_log_output(node);
 
             if (had_tx && node->yield_callback) {
-                /* TX detected — deliver to receivers and get ACK */
                 node->yield_callback(node->yield_callback_data);
-                continue;  /* tick again for firmware to process ACK */
+                continue;
             }
 
             if (!*node->simProcessRunValue) break;
-            /* Firmware has more work — deliver any pending frames */
             if (node->yield_callback)
                 node->yield_callback(node->yield_callback_data);
         }

@@ -168,27 +168,28 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
 
         fw_name = source_to_firmware_name(source)
         if fw_name and firmware_dir:
-            # Generate variant name from DEFINES or routing config
+            # Generate a unique variant name from all build flags.
+            # Any difference in make_args or source path produces a different name.
             fw_variant = fw_name
             if build:
-                # Check DEFINES (e.g., "intermediate-mpl")
-                for arg in build.get("make_args", []):
-                    if arg.startswith("DEFINES="):
-                        defines = arg[8:]
-                        for d in defines.split(","):
-                            if "=" in d:
-                                val = d.split("=")[-1]
-                                short = val.split("_")[-1].lower() if "_" in val else val.lower()
-                                fw_variant = f"{fw_name}-{short}"
-                                break
+                make_args = build.get("make_args", [])
+                if make_args:
+                    # Build a short hash suffix from all make args
+                    import hashlib
+                    args_str = " ".join(sorted(make_args))
+                    h = hashlib.md5(args_str.encode()).hexdigest()[:6]
+                    fw_variant = f"{fw_name}-{h}"
                 # Check source path for routing variant (rpl-classic vs rpl-lite)
                 src_path = source or ""
-                if "rpl-classic" in src_path and fw_variant == fw_name:
+                if "rpl-classic" in src_path and not make_args:
                     fw_variant = f"{fw_name}-classic"
 
-            # Auto-detect extension: try variant name first, then base name
+            # When make_args produce a variant name, use ONLY the variant.
+            # Don't fall back to the base name — it's a different build.
+            # When no variant (no make_args), try the base name as usual.
             fw_path = None
-            for name_candidate in ([fw_variant, fw_name] if fw_variant != fw_name else [fw_name]):
+            search_names = [fw_variant] if fw_variant != fw_name else [fw_name]
+            for name_candidate in search_names:
                 if build_target:
                     ext = "." + build_target
                     candidate = os.path.join(firmware_dir, name_candidate + ext)
@@ -203,7 +204,6 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
                 if fw_path:
                     break
             if fw_path is None:
-                # Fall back to variant name with target extension
                 fallback_ext = "." + build_target if build_target else ".cc2538dk"
                 fw_path = os.path.join(firmware_dir, fw_variant + fallback_ext)
         elif fw_name:
