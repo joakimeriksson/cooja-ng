@@ -896,12 +896,19 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         for (int n = 0; n < nl->count; n++) {
             int i = nl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) {
-                /* Always queue to rx_queue. Delivery to simInDataBuffer
-                 * happens in tick_one_native AFTER cooja_tick() runs
-                 * (so the firmware has turned the radio on if needed). */
+                /* Direct delivery to simInDataBuffer if possible.
+                 * Force simRadioHWOn=1 to prevent firmware from dropping.
+                 * Queue to rx_queue as fallback if simInSize > 0. */
                 if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
-                    native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                         current_sim_ns, sender_idx);
+                    native_node_t *rcv = &nodes[i].plat.native;
+                    if (*rcv->simInSize == 0) {
+                        memcpy(rcv->simInDataBuffer, frame, (size_t)len);
+                        *rcv->simInSize = len;
+                        *rcv->simRadioHWOn = 1;
+                    } else {
+                        native_deliver_frame(rcv, frame, len,
+                                             current_sim_ns, sender_idx);
+                    }
                     stat_rx_frames_queued++;
                 }
             }
@@ -1647,10 +1654,20 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     if (*nat->simInSize > 0)
         *nat->simRadioHWOn = 1;
 
+    int pre_insize = *nat->simInSize;
     nat->cooja_tick();
     native_had_tx[idx] = (*nat->simOutSize > 0);
     native_check_radio_tx(nat);
     native_check_log_output(nat);
+
+    /* Reset signal strength when frame is consumed (signalReceptionEnd) */
+    if (pre_insize > 0 && *nat->simInSize == 0) {
+        if (nat->simSignalStrength)
+            *nat->simSignalStrength = -100;
+        if (verbose)
+            fprintf(stderr, "  [CONSUMED] node %d consumed %d-byte frame at %lld ms\n",
+                    nodes[idx].id, pre_insize, (long long)(nat->sim_time_ns / 1000000LL));
+    }
 
     /* Sync this node's channel (for TSCH hopping) */
     if (nat->simRadioChannel)
@@ -2552,15 +2569,12 @@ sim_restart:
                 }
 
                 /* RF delivery: if this node TX'd, schedule receivers
-                 * at the same time (requestImmediateWakeup).
-                 * Set simReceiving=1 on receivers so TSCH knows a frame
-                 * is in the air (like COOJA's signalReceptionStart).
-                 * Note: radio-off filtering is done in mixed_rf_frame_handler. */
+                 * and set signal strength on ALL in-range neighbors
+                 * (like COOJA's signalReceptionStart + createConnections).
+                 * This prevents simultaneous TX via CCA. */
                 for (int r = 0; r < node_count; r++) {
                     if (r == i || !node_active(r)) continue;
                     if (nodes[r].type == NODE_NATIVE) {
-                        /* Check if this node received a new frame
-                         * (either in rx_queue or directly in simInDataBuffer) */
                         bool got_frame =
                             nodes[r].plat.native.rx_queue.count > rx_before[r] ||
                             *nodes[r].plat.native.simInSize > insize_before[r];
@@ -2568,6 +2582,10 @@ sim_restart:
                             *nodes[r].plat.native.simReceiving = 1;
                             sim_eq_schedule(&sim_eq, r, ev_time);
                         }
+                        /* Set signal strength on ALL neighbors so CCA detects
+                         * the channel as busy (prevents simultaneous TX) */
+                        if (native_had_tx[i] && nodes[r].plat.native.simSignalStrength)
+                            *nodes[r].plat.native.simSignalStrength = -60;
                     }
                 }
 
