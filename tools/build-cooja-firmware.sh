@@ -68,8 +68,8 @@ trap "rm -f $TMP" EXIT
 
 for csc in "$CONTIKI_DIR"/tests/$PATTERN/*.csc; do
     [ -f "$csc" ] || continue
-    # Skip TSCH tests
-    echo "$csc" | grep -qiE "tsch|drift|orchestra" && continue
+    # Skip z1-only and drift tests (no z1 platform support)
+    echo "$csc" | grep -qiE "drift|z1" && continue
 
     python3 "$CSC2JSON" "$csc" --firmware-dir "$FW_DIR" --js-native 2>/dev/null | \
     python3 -c "
