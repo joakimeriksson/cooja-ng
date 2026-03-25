@@ -1636,22 +1636,21 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
     *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
 
-    /* Clear simReceiving before tick */
+    /* Deliver queued RX frame BEFORE tick.
+     * Force simReceiving=0 so pending_packet() returns true.
+     * Force simRadioHWOn=1 whenever simInSize > 0 to prevent
+     * doInterfaceActionsBeforeTick from dropping the frame. */
     if (*nat->simReceiving)
         *nat->simReceiving = 0;
+    if (*nat->simInSize == 0 && nat->rx_queue.count > 0)
+        native_dequeue_rx_frame(nat);
+    if (*nat->simInSize > 0)
+        *nat->simRadioHWOn = 1;
 
     nat->cooja_tick();
     native_had_tx[idx] = (*nat->simOutSize > 0);
     native_check_radio_tx(nat);
     native_check_log_output(nat);
-
-    /* AFTER the tick: deliver queued RX frame if radio is now ON.
-     * This ensures the firmware has turned the radio on (e.g., TSCH
-     * scan cycle) before we set simInSize. Otherwise
-     * doInterfaceActionsBeforeTick drops it on the next tick. */
-    if (*nat->simInSize == 0 && nat->rx_queue.count > 0 && *nat->simRadioHWOn) {
-        native_dequeue_rx_frame(nat);
-    }
 
     /* Sync this node's channel (for TSCH hopping) */
     if (nat->simRadioChannel)
@@ -1695,6 +1694,13 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
         int64_t et = (int64_t)(*nat->simEtimerNextExpirationTime) * 1000000LL;
         if (et <= now) et = now + 1000000LL;  /* stale → +1ms */
         if (et < next) next = et;
+    }
+
+    /* If rx_queue has frames, schedule +1ms to ensure TSCH slot
+     * operation gets a chance to find the frame via pending_packet(). */
+    if (nat->rx_queue.count > 0 || *nat->simInSize > 0) {
+        int64_t rx_next = now + 1000000LL;
+        if (rx_next < next) next = rx_next;
     }
 
     sim_eq_schedule_if_earlier(eq, idx, next);
@@ -2527,14 +2533,6 @@ sim_restart:
 
                 if (nodes[i].type == NODE_NATIVE) {
                     /* Single tick at event time */
-                    if (verbose && (*nodes[i].plat.native.simInSize > 0 ||
-                                    nodes[i].plat.native.rx_queue.count > 0))
-                        fprintf(stderr, "  [EVQ] tick node %d at %lld µs: simInSize=%d rxq=%d radioHWOn=%d simReceiving=%d\n",
-                                nodes[i].id, (long long)(ev_time/1000),
-                                *nodes[i].plat.native.simInSize,
-                                nodes[i].plat.native.rx_queue.count,
-                                *nodes[i].plat.native.simRadioHWOn,
-                                *nodes[i].plat.native.simReceiving);
                     tick_one_native(i, ev_time);
 
                     /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
