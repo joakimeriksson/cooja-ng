@@ -896,22 +896,12 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         for (int n = 0; n < nl->count; n++) {
             int i = nl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) {
-                native_node_t *rcv = &nodes[i].plat.native;
-                /* Like COOJA: only deliver to receivers with radio ON */
-                if (*rcv->simRadioHWOn &&
-                    radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
-                    /* Direct delivery to simInDataBuffer (like COOJA's
-                     * signalReceptionStart + setReceivedPacket + signalReceptionEnd).
-                     * If simInSize > 0, previous frame not yet consumed — queue instead. */
-                    if (*rcv->simInSize == 0) {
-                        /* Direct delivery */
-                        memcpy(rcv->simInDataBuffer, frame, (size_t)len);
-                        *rcv->simInSize = len;
-                    } else {
-                        /* Previous frame pending — queue for later */
-                        native_deliver_frame(rcv, frame, len,
-                                             current_sim_ns, sender_idx);
-                    }
+                /* Always queue to rx_queue. Delivery to simInDataBuffer
+                 * happens in tick_one_native AFTER cooja_tick() runs
+                 * (so the firmware has turned the radio on if needed). */
+                if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
+                    native_deliver_frame(&nodes[i].plat.native, frame, len,
+                                         current_sim_ns, sender_idx);
                     stat_rx_frames_queued++;
                 }
             }
@@ -1646,20 +1636,22 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
     *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
 
-    /* Clear simReceiving before tick (signalReceptionEnd).
-     * For CSMA: allows doInterfaceActionsBeforeTick to poll radio process.
-     * For TSCH: allows pending_packet() to return true in busywait. */
+    /* Clear simReceiving before tick */
     if (*nat->simReceiving)
         *nat->simReceiving = 0;
-
-    /* Deliver pending RX frame from queue if simInDataBuffer is empty */
-    if (*nat->simInSize == 0 && nat->rx_queue.count > 0)
-        native_dequeue_rx_frame(nat);
 
     nat->cooja_tick();
     native_had_tx[idx] = (*nat->simOutSize > 0);
     native_check_radio_tx(nat);
     native_check_log_output(nat);
+
+    /* AFTER the tick: deliver queued RX frame if radio is now ON.
+     * This ensures the firmware has turned the radio on (e.g., TSCH
+     * scan cycle) before we set simInSize. Otherwise
+     * doInterfaceActionsBeforeTick drops it on the next tick. */
+    if (*nat->simInSize == 0 && nat->rx_queue.count > 0 && *nat->simRadioHWOn) {
+        native_dequeue_rx_frame(nat);
+    }
 
     /* Sync this node's channel (for TSCH hopping) */
     if (nat->simRadioChannel)
