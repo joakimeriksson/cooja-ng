@@ -84,6 +84,7 @@ typedef struct native_node {
     char     *simMoteIDChanged;
     int      *simRandomSeed;
     int      *simSignalStrength;          /* received signal strength */
+    uint64_t *simLastPacketTimestamp;    /* rtimer timestamp of last received packet */
     char     *simSerialReceivingData;     /* serial input buffer [2048] */
     int      *simSerialReceivingLength;
     char     *simSerialReceivingFlag;

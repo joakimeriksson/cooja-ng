@@ -905,6 +905,10 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                         memcpy(rcv->simInDataBuffer, frame, (size_t)len);
                         *rcv->simInSize = len;
                         *rcv->simRadioHWOn = 1;
+                        /* Set packet timestamp (TSCH uses this for sync) */
+                        if (rcv->simLastPacketTimestamp)
+                            *rcv->simLastPacketTimestamp =
+                                (uint64_t)(current_sim_ns / 1000LL);
                     } else {
                         native_deliver_frame(rcv, frame, len,
                                              current_sim_ns, sender_idx);

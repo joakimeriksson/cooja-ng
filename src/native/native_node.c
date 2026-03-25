@@ -96,6 +96,7 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
     RESOLVE_SYM(node, simRadioChannel, int *);
     RESOLVE_SYM(node, simReceiving, char *);
     RESOLVE_SYM(node, simSignalStrength, int *);
+    RESOLVE_SYM(node, simLastPacketTimestamp, uint64_t *);
     RESOLVE_SYM(node, simLoggedData, char *);
     RESOLVE_SYM(node, simLoggedLength, int *);
     RESOLVE_SYM(node, simLoggedFlag, char *);
