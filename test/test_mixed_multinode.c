@@ -2046,11 +2046,21 @@ sim_restart:
                 active_js_engine = &js_engine;
                 /* Use timeout from JS TIMEOUT() call if set, else from config.
                  * Add margin so the sim loop runs past the timeout point,
-                 * allowing js_test_check_timeout to fire the callback. */
-                if (js_engine.timeout_us > 0)
+                 * allowing js_test_check_timeout to fire the callback.
+                 * If no TIMEOUT but GENERATE_MSG is used, compute duration
+                 * from the last scheduled message + margin. */
+                if (js_engine.timeout_us > 0) {
                     total_ns = js_engine.timeout_us * 1000LL + 10 * MS_TO_NS;
+                } else if (js_engine.gen_msg_count > 0) {
+                    /* No TIMEOUT — use last GENERATE_MSG time + 60s margin */
+                    int64_t last_gen = 0;
+                    for (int g = 0; g < js_engine.gen_msg_count; g++)
+                        if (js_engine.gen_msgs[g].at_us > last_gen)
+                            last_gen = js_engine.gen_msgs[g].at_us;
+                    total_ns = last_gen * 1000LL + 60000LL * MS_TO_NS;
+                }
                 printf("Test: JavaScript engine (timeout=%lld ms)\n",
-                       (long long)(js_engine.timeout_us / 1000));
+                       (long long)(total_ns / MS_TO_NS));
             } else {
                 fprintf(stderr, "Failed to initialize JS test engine\n");
                 return 1;
