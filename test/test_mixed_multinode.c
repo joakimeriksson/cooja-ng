@@ -904,7 +904,6 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                     if (*rcv->simInSize == 0) {
                         memcpy(rcv->simInDataBuffer, frame, (size_t)len);
                         *rcv->simInSize = len;
-                        *rcv->simRadioHWOn = 1;
                         /* Set packet timestamp (TSCH uses this for sync) */
                         if (rcv->simLastPacketTimestamp)
                             *rcv->simLastPacketTimestamp =
@@ -1655,8 +1654,10 @@ static void tick_one_native(int idx, int64_t sim_ns) {
         *nat->simReceiving = 0;
     if (*nat->simInSize == 0 && nat->rx_queue.count > 0)
         native_dequeue_rx_frame(nat);
-    if (*nat->simInSize > 0)
-        *nat->simRadioHWOn = 1;
+    /* For TSCH: force simRadioHWOn=1 when simInSize > 0 to prevent
+     * doInterfaceActionsBeforeTick from dropping the frame.
+     * Only needed for TSCH (CSMA radio is always on).
+     * TODO: detect TSCH mode per-node instead of checking a global. */
 
     int pre_insize = *nat->simInSize;
     nat->cooja_tick();

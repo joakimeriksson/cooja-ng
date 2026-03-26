@@ -6,6 +6,7 @@
  */
 #include "sim_event_queue.h"
 #include <string.h>
+#include <stdio.h>
 
 /* Compare two events: returns true if a should come before b */
 static inline bool ev_less(const sim_event_t *a, const sim_event_t *b) {
@@ -56,8 +57,11 @@ void sim_eq_init(sim_event_queue_t *q) {
 }
 
 void sim_eq_schedule(sim_event_queue_t *q, int node_idx, int64_t time_ns) {
-    if (q->count >= SIM_EQ_MAX_EVENTS)
-        return;  /* queue full — drop event */
+    if (q->count >= SIM_EQ_MAX_EVENTS) {
+        fprintf(stderr, "WARNING: event queue full (%d events), dropping event for node %d\n",
+                q->count, node_idx);
+        return;
+    }
     int i = q->count++;
     q->heap[i].node_idx = node_idx;
     q->heap[i].time_ns = time_ns;

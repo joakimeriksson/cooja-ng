@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define SIM_EQ_MAX_EVENTS 2048
+#define SIM_EQ_MAX_EVENTS 16384
 
 typedef struct {
     int node_idx;       /* which node to tick (-1 = unused) */
