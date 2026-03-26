@@ -89,8 +89,8 @@ echo "  Firmware target: $FIRMWARE_TARGET"
 echo "  Firmware dir: $FIRMWARE_DIR"
 echo ""
 
-# Skip patterns: TSCH tests, border-router
-SKIP_PATTERNS="tsch|border-router|br-|TSCH"
+# Skip patterns: border-router (requires TUN interface)
+SKIP_PATTERNS="border-router|br-"
 
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT

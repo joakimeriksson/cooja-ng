@@ -1664,7 +1664,6 @@ static void tick_one_native(int idx, int64_t sim_ns) {
     native_had_tx[idx] = (*nat->simOutSize > 0);
     native_check_radio_tx(nat);
     native_check_log_output(nat);
-
     /* Reset signal strength when frame is consumed (signalReceptionEnd) */
     if (pre_insize > 0 && *nat->simInSize == 0) {
         if (nat->simSignalStrength)
@@ -1696,19 +1695,19 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
         if (rt < next) next = rt;
     }
 
-    /* processRunValue → timing depends on context:
-     * - After TX: schedule at SAME TIME (firmware is in TX yield,
-     *   needs immediate re-tick to exit and enter ACK busywait)
-     * - Otherwise: +1ms (like COOJA's ContikiClock) */
+    /* TX yield: firmware is suspended inside radio_send()'s
+     * while(simOutSize > 0) yield. Needs a +1ms tick to resume,
+     * matching COOJA's ContikiClock scheduling. */
+    if (native_had_tx[idx]) {
+        int64_t tx_next = now + 1000000LL;
+        if (tx_next < next) next = tx_next;
+        native_had_tx[idx] = false;
+    }
+
+    /* processRunValue → +1ms (like COOJA's ContikiClock.doActionsAfterTick) */
     if (*nat->simProcessRunValue) {
-        if (native_had_tx[idx]) {
-            /* TX yield — schedule immediately */
-            if (now < next) next = now;
-            native_had_tx[idx] = false;
-        } else {
-            int64_t prv = now + 1000000LL;
-            if (prv < next) next = prv;
-        }
+        int64_t prv = now + 1000000LL;
+        if (prv < next) next = prv;
     }
 
     /* etimer */
@@ -2553,9 +2552,11 @@ sim_restart:
                     }
                 }
 
+                bool sender_had_tx = false;
                 if (nodes[i].type == NODE_NATIVE) {
                     /* Single tick at event time */
                     tick_one_native(i, ev_time);
+                    sender_had_tx = native_had_tx[i];
 
                     /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
                     schedule_native_wakeup(&sim_eq, i);
@@ -2589,7 +2590,7 @@ sim_restart:
                         }
                         /* Set signal strength on ALL neighbors so CCA detects
                          * the channel as busy (prevents simultaneous TX) */
-                        if (native_had_tx[i] && nodes[r].plat.native.simSignalStrength)
+                        if (sender_had_tx && nodes[r].plat.native.simSignalStrength)
                             *nodes[r].plat.native.simSignalStrength = -60;
                     }
                 }
