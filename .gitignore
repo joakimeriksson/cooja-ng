@@ -14,6 +14,12 @@ build/
 .vscode/
 .idea/
 
+# Cooja firmware (platform-specific shared libraries, rebuild with build-cooja-firmware.sh)
+firmware/cooja/
+
+# Python cache
+__pycache__/
+
 # Local config
 csim.conf
 
