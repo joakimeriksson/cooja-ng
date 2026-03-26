@@ -2598,9 +2598,13 @@ sim_restart:
                             *nodes[r].plat.native.simReceiving = 1;
                             sim_eq_schedule(&sim_eq, r, ev_time);
                         }
-                        /* Set signal strength on ALL neighbors so CCA detects
-                         * the channel as busy (prevents simultaneous TX) */
-                        if (sender_had_tx && nodes[r].plat.native.simSignalStrength)
+                        /* Set signal strength on in-range neighbors so CCA
+                         * detects the channel as busy. Only for nodes within
+                         * interference range (matching COOJA's signalReceptionStart).
+                         * Setting on ALL nodes causes CCA poisoning where out-of-range
+                         * nodes permanently see channel busy, breaking SMRF/ESMRF. */
+                        if (sender_had_tx && got_frame &&
+                            nodes[r].plat.native.simSignalStrength)
                             *nodes[r].plat.native.simSignalStrength = -60;
                     }
                 }
