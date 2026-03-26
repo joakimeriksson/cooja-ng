@@ -571,13 +571,40 @@ static JSValue js_sim_get_mote_types(JSContext *ctx, JSValueConst this_val,
     return arr;
 }
 
-/* ---- String polyfills for Java-style methods ---- */
+/* ---- sim.getRandomSeed() ---- */
+
+static JSValue js_sim_get_random_seed(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    js_test_engine_t *e = get_engine(ctx);
+    /* Use a deterministic seed based on node count (matches COOJA's default) */
+    return JS_NewInt32(ctx, 123456 + e->node_count);
+}
+
+/* ---- String + Java polyfills ---- */
 
 static const char *js_string_polyfills =
     "if(!String.prototype.contains)"
     "  String.prototype.contains=function(s){return this.indexOf(s)!==-1};\n"
     "if(!String.prototype.equals)"
     "  String.prototype.equals=function(s){return this.valueOf()===s};\n";
+
+/* java.util.Random polyfill — seeded Linear Congruential Generator
+ * matching java.util.Random's algorithm (multiplier=25214903917, mod=2^48) */
+static const char *js_java_polyfills =
+    "var java = { util: { Random: function(seed) {\n"
+    "  this._seed = BigInt(seed) & 0xFFFFFFFFFFFFn;\n"
+    "  this._next = function(bits) {\n"
+    "    this._seed = (this._seed * 25214903917n + 11n) & 0xFFFFFFFFFFFFn;\n"
+    "    return Number(this._seed >> BigInt(48 - bits));\n"
+    "  };\n"
+    "  this.nextFloat = function() {\n"
+    "    return this._next(24) / 16777216.0;\n"
+    "  };\n"
+    "  this.nextInt = function(bound) {\n"
+    "    if (bound === undefined) return this._next(32);\n"
+    "    return Math.abs(this._next(31)) % bound;\n"
+    "  };\n"
+    "}}};\n";
 
 /* ---- Setup global objects ---- */
 
@@ -622,6 +649,8 @@ static void setup_globals(JSContext *ctx, js_test_engine_t *e) {
         JS_NewCFunction(ctx, js_sim_add_mote, "addMote", 1));
     JS_SetPropertyStr(ctx, sim_obj, "getMoteTypes",
         JS_NewCFunction(ctx, js_sim_get_mote_types, "getMoteTypes", 0));
+    JS_SetPropertyStr(ctx, sim_obj, "getRandomSeed",
+        JS_NewCFunction(ctx, js_sim_get_random_seed, "getRandomSeed", 0));
     JS_SetPropertyStr(ctx, global, "sim", sim_obj);
 
     /* Initial globals: msg, id, time, mote */
@@ -635,6 +664,9 @@ static void setup_globals(JSContext *ctx, js_test_engine_t *e) {
     /* Install String polyfills */
     JS_Eval(ctx, js_string_polyfills, strlen(js_string_polyfills),
             "<polyfills>", JS_EVAL_TYPE_GLOBAL);
+    /* Install Java polyfills (java.util.Random) */
+    JS_Eval(ctx, js_java_polyfills, strlen(js_java_polyfills),
+            "<java-polyfills>", JS_EVAL_TYPE_GLOBAL);
 }
 
 /* ---- Update globals before each YIELD resume ---- */

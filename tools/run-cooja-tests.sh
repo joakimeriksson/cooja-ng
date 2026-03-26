@@ -90,7 +90,7 @@ echo "  Firmware dir: $FIRMWARE_DIR"
 echo ""
 
 # Skip patterns: border-router (requires TUN interface)
-SKIP_PATTERNS="border-router|br-"
+SKIP_PATTERNS="border-router|tun-rpl-br"
 
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
@@ -158,9 +158,9 @@ for csc_file in "$CONTIKI_DIR"/tests/$TEST_PATTERN/*.csc; do
         continue
     fi
 
-    # Convert .csc to JSON
+    # Convert .csc to JSON with native JS execution
     json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
-    if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" -o "$json_file" 2>/dev/null; then
+    if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
         echo "  ERROR $test_name (conversion failed)"
         errors=$((errors + 1))
         continue
@@ -175,7 +175,8 @@ t = d.get('test', {})
 has_steps = len(t.get('steps', [])) > 0
 has_fail_on = len(t.get('fail_on', [])) > 0
 has_tis = t.get('timeout_is_success', False)
-if has_steps or has_fail_on or has_tis:
+has_js = 'js_script_inline' in t
+if has_steps or has_fail_on or has_tis or has_js:
     print('yes')
 " 2>/dev/null || true)
 
@@ -252,7 +253,7 @@ if [ "$need_rebuild_count" -gt 0 ]; then
         [ -f "$csc_file" ] || continue
 
         json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
-        if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" -o "$json_file" 2>/dev/null; then
+        if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
             echo "  ERROR $test_name (conversion failed)"
             errors=$((errors + 1))
             continue
