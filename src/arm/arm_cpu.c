@@ -4,6 +4,7 @@
 #include "arm_cpu.h"
 #include "arm_config.h"
 #include "arm_nvic.h"
+#include "gdb_stub.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -275,6 +276,7 @@ static inline uint16_t fetch16(arm_cpu_t *cpu, uint32_t addr) {
 void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->config = config;
+    cpu->gdb_stub = NULL;
 
     cpu->rom   = (uint8_t *)calloc(ARM_ROM_SIZE, 1);
     cpu->flash = (uint8_t *)calloc(ARM_FLASH_SIZE, 1);
@@ -676,6 +678,22 @@ int arm_step(arm_cpu_t *cpu, int count) {
     int remaining = count;
 
     while (remaining > 0 && !cpu->stopping) {
+        /* GDB stub: check breakpoint at current PC, then poll for halt
+         * commands. If halted, stop the inner loop so the multinode
+         * driver can pump the stub's command processor. */
+        if (cpu->gdb_stub) {
+            gdb_stub_t *g = (gdb_stub_t *)cpu->gdb_stub;
+            uint32_t pc_check = cpu->reg[ARM_PC] & ~1u;
+            if (gdb_stub_check_breakpoint(g, pc_check)) {
+                cpu->stopping = true;
+                break;
+            }
+            if (g->halted) {
+                cpu->stopping = true;
+                break;
+            }
+        }
+
         /* Check events */
         if (cpu->cycles >= cpu->next_event_cycle)
             execute_events(cpu);

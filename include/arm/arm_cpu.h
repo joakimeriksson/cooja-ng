@@ -165,6 +165,12 @@ typedef struct arm_cpu {
     /* PC trace callback: called after each instruction if non-NULL */
     void    (*pc_callback)(void *user_data, uint32_t pc);
     void     *pc_callback_data;
+
+    /* Optional GDB stub (gdb_stub_t *) attached via arm_attach_gdb.
+     * When non-NULL, arm_step checks for breakpoints and halt requests
+     * before each instruction. Untyped here so the header doesn't need
+     * to pull in gdb_stub.h for non-debug builds. */
+    void     *gdb_stub;
 } arm_cpu_t;
 
 /* --- Public API --- */

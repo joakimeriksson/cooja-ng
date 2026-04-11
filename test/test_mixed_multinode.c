@@ -28,6 +28,8 @@
 #include "cJSON.h"
 #include "js_test_engine.h"
 #include "sim_event_queue.h"
+#include "gdb_stub.h"
+#include "arm_gdb.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2989,6 +2991,10 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int sim_ms_set = 0;  /* track if -t was given (overrides config) */
     int ui_enabled = 0;
     int ui_port = 8080;
+    /* GDB stub: optional debugger attachment per node.
+     * gdb_node[i] is the TCP port to bind for node i, or 0 = no stub. */
+    int gdb_node[MAX_NODES] = { 0 };
+    int gdb_wait = 0;  /* if true, block on first connect before starting sim */
     sim_config_t config;
     int config_loaded = 0;
 
@@ -2999,6 +3005,29 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 ui_port = atoi(argv[++i]);
                 if (ui_port <= 0) ui_port = 8080;
             }
+        }
+        else if (strcmp(argv[i], "--gdb") == 0 && i + 1 < argc) {
+            /* Forms accepted:
+             *   --gdb 3333          attach node 0 (1-indexed: node 1) to port 3333
+             *   --gdb 1:3333        attach node N=1 to port 3333
+             *   --gdb 2:3334        attach node N=2 to port 3334  (can repeat) */
+            const char *spec = argv[++i];
+            int node = 1;
+            int port;
+            const char *colon = strchr(spec, ':');
+            if (colon) {
+                node = atoi(spec);
+                port = atoi(colon + 1);
+            } else {
+                port = atoi(spec);
+            }
+            if (node >= 1 && node <= MAX_NODES && port > 0)
+                gdb_node[node - 1] = port;
+            else
+                fprintf(stderr, "--gdb: bad spec '%s' (use [node:]port)\n", spec);
+        }
+        else if (strcmp(argv[i], "--gdb-wait") == 0) {
+            gdb_wait = 1;
         }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-q") == 0) verbose = 0;
@@ -3089,6 +3118,40 @@ sim_restart:
         nodes[i].last_execute_ns = 0;
         if (nodes[i].clock_deviation != 1.0)
             printf("  Node %d: clock deviation=%.10f\n", nodes[i].id, nodes[i].clock_deviation);
+    }
+
+    /* GDB stubs: bind one TCP listener per --gdb-tagged node, attach the
+     * arch vtable, and optionally block until a client connects. */
+    static gdb_stub_t gdb_stubs[MAX_NODES];
+    bool any_gdb = false;
+    for (int i = 0; i < node_count; i++) {
+        if (gdb_node[i] == 0) continue;
+        if (nodes[i].type != NODE_ARM) {
+            fprintf(stderr, "  Node %d: --gdb only supports ARM nodes for now (skipped)\n",
+                    nodes[i].id);
+            gdb_node[i] = 0;
+            continue;
+        }
+        if (gdb_stub_init(&gdb_stubs[i], gdb_node[i]) != 0) {
+            fprintf(stderr, "  Node %d: failed to bind GDB stub on port %d\n",
+                    nodes[i].id, gdb_node[i]);
+            gdb_node[i] = 0;
+            continue;
+        }
+        gdb_stub_attach(&gdb_stubs[i], &nodes[i].plat.arm.cpu, &arm_gdb_ops);
+        nodes[i].plat.arm.cpu.gdb_stub = &gdb_stubs[i];
+        any_gdb = true;
+        printf("  Node %d: GDB stub on port %d (connect with: target remote :%d)\n",
+               nodes[i].id, gdb_node[i], gdb_node[i]);
+    }
+    if (any_gdb && gdb_wait) {
+        for (int i = 0; i < node_count; i++) {
+            if (gdb_node[i] == 0) continue;
+            printf("  Node %d: waiting for GDB on port %d ...\n",
+                   nodes[i].id, gdb_node[i]);
+            if (gdb_stub_wait_for_client(&gdb_stubs[i]) != 0)
+                fprintf(stderr, "  Node %d: GDB wait failed\n", nodes[i].id);
+        }
     }
 
     /* Initialize radio medium */
@@ -3887,13 +3950,41 @@ sim_restart:
                      * so peripheral events are anchored to the scheduler's
                      * event time and the CPU accumulates cycle time with the
                      * MSPSim stepMicros accuracy bound. */
+
+                    /* GDB stub: poll for incoming commands; if the CPU is
+                     * halted at a breakpoint, skip the tick and reschedule
+                     * a wakeup so we keep checking the stub at sim_ns time. */
+                    if (gdb_node[i] != 0) {
+                        gdb_stub_poll(&gdb_stubs[i]);
+                        if (gdb_stubs[i].halted) {
+                            nodes[i].plat.arm.cpu.stopping = false;
+                            sim_eq_schedule_if_earlier(&sim_eq, i, ev_time + 1000LL);
+                            /* Continue to RF delivery / next event */
+                            goto arm_tick_done;
+                        }
+                    }
+
                     ticking_node_idx = i;
                     int64_t returned_us = tick_one_arm(i, ev_time);
                     ticking_node_idx = -1;
+
+                    /* GDB stub: a breakpoint may have fired during the tick.
+                     * Clear the cpu->stopping flag set by gdb_stub_check_breakpoint
+                     * so subsequent ticks (after `continue`) can run again. */
+                    if (gdb_node[i] != 0) {
+                        nodes[i].plat.arm.cpu.stopping = false;
+                        if (gdb_stubs[i].halted) {
+                            /* Reschedule sooner so we poll the stub again. */
+                            sim_eq_schedule_if_earlier(&sim_eq, i, ev_time + 1000LL);
+                            goto arm_tick_done;
+                        }
+                    }
+
                     /* Match MspMote.execute(t, 1): schedule the next normal
                      * wakeup based on the step_micros lead hint. */
                     int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
                     sim_eq_schedule_if_earlier(&sim_eq, i, next_ns);
+                    arm_tick_done: ;
                 }
 
                 /* RF delivery: if this node TX'd, schedule receivers
