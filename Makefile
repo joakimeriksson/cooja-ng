@@ -37,6 +37,7 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/arm_nvic.c \
               $(ARM_SRC_DIR)/arm_systick.c \
               $(ARM_SRC_DIR)/arm_elf.c \
+              $(ARM_SRC_DIR)/arm_gdb.c \
               $(ARM_SRC_DIR)/arm_platform.c \
               $(ARM_SRC_DIR)/cc2538_uart.c \
               $(ARM_SRC_DIR)/cc2538_gpio.c \
@@ -52,7 +53,8 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/packet_analyzer.c \
                  $(COMMON_SRC_DIR)/timeline.c \
                  $(COMMON_SRC_DIR)/js_test_engine.c \
-                 $(COMMON_SRC_DIR)/sim_event_queue.c
+                 $(COMMON_SRC_DIR)/sim_event_queue.c \
+                 $(COMMON_SRC_DIR)/gdb_stub.c
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
