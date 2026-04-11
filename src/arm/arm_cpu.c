@@ -282,6 +282,11 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
 
     cpu->next_event_cycle = INT64_MAX;
     cpu->cycle_limit = INT64_MAX;
+    cpu->last_execute_us = -1;
+    cpu->last_micros_cycles = 0;
+    cpu->last_micros_delta = 0;
+    cpu->micro_clock_ready = false;
+    cpu->step_cycle_remainder = 0.0;
     cpu->cpu_freq_hz = config->default_cpu_freq;
     cpu->interrupts_enabled = true;
 
@@ -334,6 +339,11 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
 
     cpu->event_queue = NULL;
     cpu->next_event_cycle = INT64_MAX;
+    cpu->last_execute_us = -1;
+    cpu->last_micros_cycles = 0;
+    cpu->last_micros_delta = 0;
+    cpu->micro_clock_ready = false;
+    cpu->step_cycle_remainder = 0.0;
 
     /* Find vector table via CC2538 CCA (Customer Configuration Area).
      * CCA is at flash end - 0x2C (0x0027FFD4 for 512KB flash).
@@ -2316,6 +2326,11 @@ void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
         int steps;
         if (remaining > 50000) {
             steps = 10000;
+        } else if (remaining <= 10) {
+            /* Single-step near target to match MSPSim's per-instruction
+             * cycle check. Prevents LPM→event→ISR overshoot that would
+             * cause TSCH desync when ported to future ARM TSCH firmware. */
+            steps = 1;
         } else {
             steps = (int)(remaining / 2);
             if (steps < 1) steps = 1;
@@ -2325,7 +2340,58 @@ void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
         arm_step(cpu, steps);
         cpu->stopping = false;
     }
+    /* Drain events that became due at the boundary.  Without this, a
+     * pending event at exactly cycle_limit stays queued until the next
+     * arm_step call, introducing one tick of latency per boundary event.
+     * Matches msp430_step_until's drain loop. */
+    while (cpu->cycles >= cpu->next_event_cycle)
+        execute_events(cpu);
+
     cpu->cycle_limit = INT64_MAX;
     if (cpu->cpu_freq_hz > 0)
         cpu->sim_time_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+}
+
+int64_t arm_step_micros(arm_cpu_t *cpu, int64_t jump_us, int64_t execute_us) {
+    if (jump_us < 0) jump_us = 0;
+    if (execute_us < 0) execute_us = 0;
+
+    /* Direct port of msp430_step_micros — exact MSPSim stepMicros replication:
+     * - last_micros_delta accumulates ALL jump values (never reset)
+     * - last_micros_cycles is set ONCE (first call) and NEVER changes
+     * - maxCycles = last_micros_cycles + ((last_micros_delta + execute_us) * freq) / 1e6
+     * This does ONE integer division for the total accumulated time,
+     * bounding truncation error to 1 cycle total (not 1 per tick).
+     *
+     * Returns an µs hint to the next natural wakeup — the caller uses
+     * this to schedule its next tick. Returns 0 if the CPU has pending
+     * work (interrupts, events already due, or not in WFI). */
+
+    /* Initialize on first call */
+    if (!cpu->micro_clock_ready) {
+        cpu->last_micros_cycles = cpu->cycles;
+        cpu->last_micros_delta = 0;
+        cpu->micro_clock_ready = true;
+    }
+
+    /* Accumulate jump (matches: last_micros_delta += jump_us) */
+    cpu->last_micros_delta += jump_us;
+
+    /* Compute target from ORIGINAL base + TOTAL accumulated delta */
+    int64_t target_cycle = cpu->last_micros_cycles +
+        ((cpu->last_micros_delta + execute_us) * (int64_t)cpu->cpu_freq_hz) / 1000000LL;
+
+    if (target_cycle > cpu->cycles)
+        arm_step_until(cpu, target_cycle);
+
+    /* If the CPU is in WFI with no pending NVIC interrupts and the next
+     * scheduled event is in the future, hint how long the caller can sleep. */
+    bool nvic_has_pending = cpu->nvic && ((arm_nvic_t *)cpu->nvic)->has_pending;
+    if (cpu->cpu_off && !nvic_has_pending &&
+        cpu->cpu_freq_hz > 0 &&
+        cpu->next_event_cycle > cpu->cycles) {
+        return ((cpu->next_event_cycle - cpu->cycles) * 1000000LL) /
+               cpu->cpu_freq_hz;
+    }
+    return 0;
 }

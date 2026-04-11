@@ -131,6 +131,11 @@ typedef struct arm_cpu {
     arm_event_t *event_queue;
     int64_t      next_event_cycle;
     int64_t      cycle_limit;
+    int64_t      last_execute_us;    /* last Cooja-style execute() timestamp */
+    int64_t      last_micros_cycles; /* MSPSim: cycle base for stepMicros (set once) */
+    int64_t      last_micros_delta;  /* MSPSim: accumulated µs across all stepMicros calls */
+    bool         micro_clock_ready;  /* MSPSim: first stepMicros call done */
+    double       step_cycle_remainder; /* fractional µs for clock deviation */
 
     /* Nanosecond simulation time */
     int64_t      sim_time_ns;
@@ -172,6 +177,7 @@ void arm_cpu_reset(arm_cpu_t *cpu);
 /* Execution */
 int  arm_step(arm_cpu_t *cpu, int count);
 void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle);
+int64_t arm_step_micros(arm_cpu_t *cpu, int64_t jump_us, int64_t execute_us);
 void arm_stop(arm_cpu_t *cpu);
 
 /* IO region registration */
