@@ -94,6 +94,9 @@ typedef struct native_node {
     int      node_id;
 
     /* Radio state */
+    bool     radio_is_transmitting;
+    bool     radio_tx_finished;
+    int64_t  radio_tx_end_ns;
     native_rx_queue_t      rx_queue;           /* queued frames for delivery */
     native_rx_assembler_t  rx_asm;             /* byte-stream reassembler */
 

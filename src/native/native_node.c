@@ -67,8 +67,11 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
         return -1;
     }
 
-    /* dlopen with RTLD_NOW | RTLD_LOCAL for independent symbol spaces */
-    node->dl_handle = dlopen(node->dl_path, RTLD_NOW | RTLD_LOCAL);
+    /* dlopen with RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND for independent
+     * symbol spaces.  DEEPBIND ensures the .cooja library's --wrap=printf
+     * symbol does not shadow the host process's printf (which would deadlock
+     * any printf call from the JS test-engine pthread). */
+    node->dl_handle = dlopen(node->dl_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     if (!node->dl_handle) {
         fprintf(stderr, "native_node: dlopen(%s) failed: %s\n",
                 node->dl_path, dlerror());
@@ -159,6 +162,10 @@ void native_node_destroy(native_node_t *node) {
 static int64_t compute_next_wakeup(const native_node_t *node) {
     int64_t next_ns = INT64_MAX;
 
+    if (node->radio_tx_finished) {
+        return node->sim_time_ns;
+    }
+
     /* Etimer: expiration time is in ms */
     if (*node->simEtimerPending) {
         int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
@@ -176,6 +183,10 @@ static int64_t compute_next_wakeup(const native_node_t *node) {
     if (*node->simProcessRunValue) {
         int64_t prv_ns = node->sim_time_ns + 1000000LL;
         if (prv_ns < next_ns) next_ns = prv_ns;
+    }
+
+    if (node->radio_is_transmitting && node->radio_tx_end_ns < next_ns) {
+        next_ns = node->radio_tx_end_ns;
     }
 
     return next_ns;
@@ -291,7 +302,7 @@ void native_check_log_output(native_node_t *node) {
 }
 
 void native_check_radio_tx(native_node_t *node) {
-    if (*node->simOutSize <= 0) return;
+    if (node->radio_is_transmitting || *node->simOutSize <= 0) return;
 
     int frame_len = *node->simOutSize;
     uint8_t *frame = (uint8_t *)node->simOutDataBuffer;
@@ -309,8 +320,16 @@ void native_check_radio_tx(native_node_t *node) {
             node->rf_tx_callback(node->rf_tx_callback_data, byte_buf[i]);
         }
     }
-
-    *node->simOutSize = 0;
+    /* Match COOJA ContikiRadio: once simOutSize becomes non-zero, the
+     * packet is delivered to the medium immediately, but the mote stays
+     * in a transmitting state until the on-air duration has elapsed.
+     * simOutSize is only cleared when transmission finishes. */
+    node->radio_is_transmitting = true;
+    node->radio_tx_finished = false;
+    node->radio_tx_end_ns = node->sim_time_ns + ((int64_t)frame_len * 32000LL);
+    if (node->radio_tx_end_ns <= node->sim_time_ns) {
+        node->radio_tx_end_ns = node->sim_time_ns + 1000LL;
+    }
 }
 
 void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
