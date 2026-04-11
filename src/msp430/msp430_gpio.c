@@ -6,6 +6,7 @@
  */
 #include "msp430_gpio.h"
 #include <string.h>
+#include <stdio.h>
 
 /* Interrupt-capable port register offsets (P1, P2) */
 #define INT_OFF_IN   0
@@ -80,14 +81,14 @@ static void gpio_int_write(void *user_data, uint32_t addr, int value, bool word,
                 break;
             case INT_OFF_IFG:
                 port->ifg = (uint8_t)value;
-                update_interrupt(gpio, p);
+                msp430_gpio_update_interrupt(gpio, p);
                 break;
             case INT_OFF_IES:
                 port->ies = (uint8_t)value;
                 break;
             case INT_OFF_IE:
                 port->ie = (uint8_t)value;
-                update_interrupt(gpio, p);
+                msp430_gpio_update_interrupt(gpio, p);
                 break;
             case INT_OFF_SEL:
                 port->sel = (uint8_t)value;
@@ -160,31 +161,31 @@ static void gpio_write(void *user_data, uint32_t addr, int value, bool word, int
  * ================================================================ */
 
 /* Update port interrupt state: flag or unflag with CPU */
-static void update_interrupt(msp430_gpio_t *gpio, int port_idx) {
+void msp430_gpio_update_interrupt(msp430_gpio_t *gpio, int port_idx) {
     msp430_gpio_port_t *port = &gpio->ports[port_idx];
     if (!port->has_interrupt) return;
 
     bool pending = (port->ifg & port->ie) != 0;
+
     msp430_flag_interrupt(gpio->cpu, port->interrupt_vector, gpio,
                           pending ? gpio_interrupt_handler : NULL, pending);
 }
 
 /* Called when CPU services the port interrupt — auto-clear highest-priority IFG */
+static int gpio_isr_count;
 static void gpio_interrupt_handler(void *user_data, int vector) {
     msp430_gpio_t *gpio = (msp430_gpio_t *)user_data;
+    gpio_isr_count++;
 
     /* Find the port for this vector */
     for (int p = 0; p < gpio->num_ports; p++) {
         msp430_gpio_port_t *port = &gpio->ports[p];
         if (!port->has_interrupt) continue;
         if (port->interrupt_vector == vector) {
-            /* Clear highest-priority pending IFG bit (lowest pin number) */
-            uint8_t ie_ifg = port->ifg & port->ie;
-            if (ie_ifg) {
-                int bit = ie_ifg & (-ie_ifg);  /* lowest set bit */
-                port->ifg &= ~bit;
-            }
-            update_interrupt(gpio, p);
+            /* Do NOT auto-clear IFG. MSP430 Port 1/2 IFG flags must be
+             * cleared by firmware (unlike Timer IV). MSPSim's
+             * IOPort.interruptServiced() is empty — no auto-clear. */
+            msp430_gpio_update_interrupt(gpio, p);
             return;
         }
     }
@@ -193,6 +194,8 @@ static void gpio_interrupt_handler(void *user_data, int vector) {
 /* ================================================================
  * Initialization
  * ================================================================ */
+
+int msp430_gpio_get_isr_count(void) { return gpio_isr_count; }
 
 void msp430_gpio_init(msp430_gpio_t *gpio, msp430_cpu_t *cpu) {
     memset(gpio, 0, sizeof(*gpio));
@@ -256,13 +259,13 @@ void msp430_gpio_set_input_pin(msp430_gpio_t *gpio, int port, int pin, bool valu
             /* IES=0: rising edge (low → high) */
             if (value) {
                 p->ifg |= bit;
-                update_interrupt(gpio, idx);
+                msp430_gpio_update_interrupt(gpio, idx);
             }
         } else {
             /* IES=1: falling edge (high → low) */
             if (!value) {
                 p->ifg |= bit;
-                update_interrupt(gpio, idx);
+                msp430_gpio_update_interrupt(gpio, idx);
             }
         }
     }

@@ -55,10 +55,32 @@ typedef struct msp430_platform {
     uint8_t         sfr_regs[8];
     /* Hardware multiplier state */
     uint16_t        mpy_op1;      /* MPY/MPYS/MAC/MACS operand 1 */
+    uint16_t        mpy_op2;      /* OP2 (last written value, readable) */
     uint8_t         mpy_mode;     /* 0=MPY, 1=MPYS, 2=MAC, 3=MACS */
     uint16_t        mpy_reslo;    /* RESLO */
     uint16_t        mpy_reshi;    /* RESHI */
     uint16_t        mpy_sumext;   /* SUMEXT */
+    /* M25P16 SPI flash (Z1 external memory) */
+    struct {
+        int      state;       /* current SPI command being processed */
+        int      pos;         /* byte position within command */
+        int      address;     /* 3-byte address accumulator */
+        bool     chip_select; /* CS active (active low) */
+        bool     write_enable;
+        uint8_t  status;
+    } flash;
+    /* DMA controller (minimal: DMA0 only, for USART1 RX trigger) */
+    struct {
+        uint16_t  dmactl0;      /* DMACTL0 (0x0122): trigger select */
+        uint16_t  ctl;          /* DMA0CTL (0x01E0): control register */
+        uint16_t  sa;           /* DMA0SA  (0x01E2): source address */
+        uint16_t  da;           /* DMA0DA  (0x01E4): destination address */
+        uint16_t  sz;           /* DMA0SZ  (0x01E6): transfer size (current) */
+        uint16_t  da_saved;     /* Initial DA (for repeated mode reload) */
+        uint16_t  sz_saved;     /* Initial SZ (for repeated mode reload) */
+    } dma0;
+    /* Stub IO buffer for unmodeled peripherals (USCI A1/B1, ADC12, etc.) */
+    uint8_t         stub_io[256];
     const msp430_platform_config_t *config;
 } msp430_platform_t;
 
@@ -75,5 +97,9 @@ void msp430_platform_set_console(msp430_platform_t *plat,
 
 /* Lookup platform by name (case-insensitive), returns NULL if not found */
 const msp430_platform_config_t *msp430_platform_find(const char *name);
+
+/* Try to fire DMA0 if it is configured for the given trigger source.
+ * Called from USART when RXIFG is set (trigger source 9 = USART1 RX). */
+void msp430_platform_dma0_trigger(msp430_platform_t *plat, int trigger_source);
 
 #endif /* MSP430_PLATFORM_H */
