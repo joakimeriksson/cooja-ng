@@ -142,6 +142,10 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
             cfg->nodes[count].has_position = 1;
         }
 
+        /* Optional clock deviation (Cooja MspClock deviation) */
+        cJSON *dev = cJSON_GetObjectItemCaseSensitive(node_item, "clock_deviation");
+        cfg->nodes[count].clock_deviation = cJSON_IsNumber(dev) ? dev->valuedouble : 1.0;
+
         count++;
     }
     cfg->node_count = count;
@@ -317,6 +321,41 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
         }
     }
 
+    /* Parse mote_types array (for dynamic node creation) */
+    cJSON *mt_arr = cJSON_GetObjectItem(root, "mote_types");
+    if (cJSON_IsArray(mt_arr)) {
+        int ti = 0;
+        cJSON *mt_item;
+        cJSON_ArrayForEach(mt_item, mt_arr) {
+            if (ti >= 8) break;
+            cJSON *fw = cJSON_GetObjectItem(mt_item, "firmware");
+            if (cJSON_IsString(fw) && fw->valuestring)
+                strncpy(cfg->mote_type_firmware[ti], fw->valuestring, 255);
+            ti++;
+        }
+        cfg->mote_type_count = ti;
+    }
+
+    /* Parse serial_socket config */
+    cJSON *ss = cJSON_GetObjectItem(root, "serial_socket");
+    if (cJSON_IsObject(ss)) {
+        cfg->has_serial_socket = 1;
+        cfg->serial_socket_port = 60001;  /* default */
+
+        cJSON *ss_port = cJSON_GetObjectItem(ss, "port");
+        if (cJSON_IsNumber(ss_port))
+            cfg->serial_socket_port = ss_port->valueint;
+
+        cJSON *ss_node = cJSON_GetObjectItem(ss, "node");
+        if (cJSON_IsNumber(ss_node))
+            cfg->serial_socket_node = ss_node->valueint;
+
+        cJSON *ss_cmd = cJSON_GetObjectItem(ss, "command");
+        if (cJSON_IsString(ss_cmd) && ss_cmd->valuestring)
+            snprintf(cfg->serial_socket_command, sizeof(cfg->serial_socket_command),
+                     "%s", ss_cmd->valuestring);
+    }
+
     cJSON_Delete(root);
 
     /* Auto-assign IDs for nodes without explicit id */
@@ -411,5 +450,11 @@ void sim_config_print(const sim_config_t *cfg) {
                            i, (long long)a->at_ms, a->data);
             }
         }
+    }
+    if (cfg->has_serial_socket) {
+        printf("  serial_socket: port=%d node=%d\n",
+               cfg->serial_socket_port, cfg->serial_socket_node);
+        if (cfg->serial_socket_command[0])
+            printf("    command: %s\n", cfg->serial_socket_command);
     }
 }

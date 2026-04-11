@@ -50,6 +50,7 @@ typedef struct {
     test_action_type_t type;
     int64_t at_ms;
     int     node;       /* node ID */
+    int     mote_type;  /* mote type index (for generateMote) */
     double  x, y;       /* for move */
     char    data[256];  /* for send */
 } sim_test_action_t;
@@ -79,6 +80,7 @@ typedef struct {
     int  id;         /* 0 = auto-assign */
     double x, y;     /* position in meters */
     int  has_position; /* true if x,y specified in JSON */
+    double clock_deviation; /* 1.0 = normal, <1.0 = slower (Cooja MspClock deviation) */
 } sim_node_config_t;
 
 typedef struct {
@@ -109,6 +111,16 @@ typedef struct {
     int has_js_script;
     char js_script_path[512];       /* path to .js file */
     char *js_script_inline;         /* inline script (malloc'd, or NULL) */
+
+    /* Mote types (for getMoteTypes()[index] mapping) */
+    int mote_type_count;
+    char mote_type_firmware[8][256]; /* firmware path per type index */
+
+    /* Serial socket server (for border-router tests) */
+    int  has_serial_socket;
+    int  serial_socket_port;        /* TCP port (default 60001) */
+    int  serial_socket_node;        /* node ID to bridge serial to */
+    char serial_socket_command[1024]; /* external command to run after socket ready */
 } sim_config_t;
 
 /* Load a JSON config file. Returns 0 on success, -1 on error. */
