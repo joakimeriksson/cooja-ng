@@ -89,11 +89,11 @@ struct basic_block;
 #define ADDA_REG          0x00e0
 #define SUBA_REG          0x00f0
 
-#define RRMASK            0x0300
-#define RRCM_OP           0x0000
-#define RRAM_OP           0x0100
-#define RLAM_OP           0x0200
-#define RRUM_OP           0x0300
+#define RRMASK            0x0300  /* variant in bits 9:8 (matches MSPSim) */
+#define RRCM_OP           0x0000  /* bits 9:8 = 00 */
+#define RRAM_OP           0x0100  /* bits 9:8 = 01 */
+#define RLAM_OP           0x0200  /* bits 9:8 = 10 */
+#define RRUM_OP           0x0300  /* bits 9:8 = 11 */
 
 #define CALLA_REG         0x1340
 #define CALLA_INDEX       0x1350
@@ -164,6 +164,11 @@ typedef struct msp430_cpu {
     msp430_event_t *event_queue;
     int64_t         next_event_cycle;
     int64_t         cycle_limit;       /* max cycle for step_until (INT64_MAX = no limit) */
+    int64_t         last_execute_us;   /* last Cooja-style execute() timestamp */
+    int64_t         last_micros_cycles;   /* MSPSim: cycle base for stepMicros (set once) */
+    int64_t         last_micros_delta;    /* MSPSim: accumulated µs across all stepMicros calls */
+    bool            micro_clock_ready;    /* MSPSim: first stepMicros call done */
+    double          step_cycle_remainder; /* fractional µs for clock deviation */
 
     /* Nanosecond simulation time */
     int64_t         sim_time_ns;       /* current simulation time in nanoseconds */
@@ -175,6 +180,7 @@ typedef struct msp430_cpu {
     int      max_interrupt;
 
     /* Instruction state (for debugging/tracing) */
+    uint32_t  last_pc;
     uint16_t  last_instruction;
     int       ext_word;
 
@@ -187,6 +193,10 @@ typedef struct msp430_cpu {
     int        jit_threshold;    /* default: 100 */
     int        jit_inblock_checks; /* emit interrupt checks inside JIT blocks */
 #endif
+    /* Debug: PC-range trace callback (set externally, fires every instruction in range) */
+    void (*pc_trace_fn)(void *data, uint32_t pc, uint32_t *reg, uint8_t *memory);
+    void *pc_trace_data;
+    uint32_t pc_trace_lo, pc_trace_hi;  /* PC range [lo, hi) */
 } msp430_cpu_t;
 
 /* --- Public API --- */
@@ -199,6 +209,7 @@ void msp430_cpu_reset(msp430_cpu_t *cpu);
 /* Execution — returns number of instructions remaining (0 = all executed) */
 int  msp430_step(msp430_cpu_t *cpu, int count);
 void msp430_step_until(msp430_cpu_t *cpu, int64_t target_cycle);
+int64_t msp430_step_micros(msp430_cpu_t *cpu, int64_t jump_us, int64_t execute_us);
 void msp430_stop(msp430_cpu_t *cpu);
 
 /* IO */

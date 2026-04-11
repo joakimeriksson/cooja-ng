@@ -45,11 +45,23 @@ static inline void write_word20(msp430_cpu_t *cpu, uint32_t addr, uint32_t val) 
     cpu->memory[addr + 3] = 0;
 }
 
+/* Resolve RAM mirror addresses (e.g., F2617: 0x200-0x9FF -> 0x1100-0x18FF) */
+static inline uint32_t resolve_mirror(const msp430_cpu_t *cpu, uint32_t addr) {
+    const msp430_config_t *cfg = cpu->config;
+    if (cfg->ram_mirror_size &&
+        addr >= cfg->ram_mirror_start &&
+        addr < cfg->ram_mirror_start + cfg->ram_mirror_size) {
+        return cfg->ram_start + (addr - cfg->ram_mirror_start);
+    }
+    return addr;
+}
+
 /* Memory read with IO dispatch */
 static inline int mem_read(msp430_cpu_t *cpu, uint32_t addr, bool word) {
     if (addr < cpu->max_mem_io && cpu->io_read[addr]) {
         return cpu->io_read[addr](cpu->io_user_data[addr], addr, word, cpu->cycles);
     }
+    addr = resolve_mirror(cpu, addr);
     if (addr >= cpu->max_mem) return 0;
     if (word) {
         return read_word(cpu, addr);
@@ -86,7 +98,9 @@ static inline void mem_write(msp430_cpu_t *cpu, uint32_t addr, int val, bool wor
         cpu->io_write[addr](cpu->io_user_data[addr], addr, val, word, cpu->cycles);
         return;
     }
+    addr = resolve_mirror(cpu, addr);
     if (addr >= cpu->max_mem) return;
+    /* no debug */
     if (word) {
         write_word(cpu, addr, (uint16_t)val);
     } else {
@@ -158,14 +172,25 @@ void msp430_cpu_init(msp430_cpu_t *cpu, const msp430_config_t *config) {
 
     cpu->next_event_cycle = INT64_MAX;
     cpu->cycle_limit = INT64_MAX;
+    cpu->last_execute_us = -1;
 
     /* JIT cache */
     cpu->cache_size = cpu->max_mem >> 1;
 #ifdef HAVE_LIGHTNING
     cpu->compiled_cache = (void **)calloc(cpu->cache_size, sizeof(void *));
     cpu->block_exec_count = (int32_t *)calloc(cpu->cache_size, sizeof(int32_t));
+    if (config->is_msp430x) {
+        /* Disable JIT for MSP430X — the 0x1xxx opcode range overlaps
+         * between single-op, CALLA, PUSHM/POPM, and extension words.
+         * The JIT decoder can't reliably distinguish these, causing
+         * data words to be compiled as RRXX instructions. */
+        free(cpu->compiled_cache);
+        cpu->compiled_cache = NULL;
+        free(cpu->block_exec_count);
+        cpu->block_exec_count = NULL;
+    }
     cpu->jit_threshold = 100;
-    cpu->jit_inblock_checks = 0;  /* default: off (faster) */
+    cpu->jit_inblock_checks = 1;  /* default: on (needed for timer events in loops) */
     /* Check environment for overrides */
     {
         const char *env = getenv("MSPSIM_JIT_THRESHOLD");
@@ -256,6 +281,7 @@ void msp430_cpu_reset(msp430_cpu_t *cpu) {
     /* Clear events */
     cpu->event_queue = NULL;
     cpu->next_event_cycle = INT64_MAX;
+    cpu->last_execute_us = -1;
 
     cpu->ext_word = 0;
 
@@ -529,7 +555,9 @@ static int execute_decoded(msp430_cpu_t *cpu, const decoded_insn_t *di, uint32_t
             break;
         }
         case OP_SUB: {
-            src = (~src) & mask;
+            /* Match MSPSim: 16-bit complement even for byte mode.
+             * This affects carry flag for SUB.B when src > dst. */
+            src = (src ^ 0xffff) & 0xffff;
             sr &= ~(SR_V | SR_C);
             uint32_t tmp = (src ^ dst) & msb_bit;
             dst = dst + src + 1;
@@ -541,7 +569,7 @@ static int execute_decoded(msp430_cpu_t *cpu, const decoded_insn_t *di, uint32_t
         }
         case OP_SUBC: {
             int carry = (sr & SR_C) ? 1 : 0;
-            src = (~src) & mask;
+            src = (src ^ 0xffff) & 0xffff;
             sr &= ~(SR_V | SR_C);
             uint32_t tmp = (src ^ dst) & msb_bit;
             dst = dst + src + carry;
@@ -608,7 +636,7 @@ static int execute_decoded(msp430_cpu_t *cpu, const decoded_insn_t *di, uint32_t
                 if (di->dst_reg == MSP430_SR) {
                     write_sr(cpu, dst);
                 } else {
-                    reg[di->dst_reg] = dst;
+                    reg[di->dst_reg] = dst & 0xfffff;
                 }
             } else {
                 mem_write(cpu, dst_address, dst, !bw);
@@ -842,19 +870,73 @@ void msp430_step_until(msp430_cpu_t *cpu, int64_t target_cycle) {
         int64_t remaining = target_cycle - cpu->cycles;
         int steps;
         if (remaining > 50000) {
-            steps = 10000;  /* large batch for long distances */
+            steps = 10000;
+        } else if (remaining <= 10) {
+            /* Single-step near target to match MSPSim's per-instruction
+             * cycle check. Prevents LPM→event→ISR overshoot that causes
+             * 29+ tick Timer B outliers and TSCH desync. */
+            steps = 1;
         } else {
-            steps = (int)(remaining / 2);
+            steps = (int)(remaining / 3);
             if (steps < 1) steps = 1;
             if (steps > 10000) steps = 10000;
         }
         msp430_step(cpu, steps);
     }
+    /* Process events that became due at the boundary.  The LPM handler
+     * fast-forwards cycles to min(next_event_cycle, cycle_limit).  When
+     * next_event_cycle == cycle_limit the loop exits before the top-of-
+     * loop event check runs, leaving the timer interrupt unfired.
+     * MSPSim fires events after every instruction — we must match that. */
+    while (cpu->cycles >= cpu->next_event_cycle)
+        execute_events(cpu);
+
     cpu->cycle_limit = INT64_MAX;
     /* Keep sim_time_ns synchronized with cycles */
     if (cpu->cpu_freq_hz > 0) {
         cpu->sim_time_ns = msp430_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
     }
+}
+
+int64_t msp430_step_micros(msp430_cpu_t *cpu, int64_t jump_us, int64_t execute_us) {
+    if (jump_us < 0) jump_us = 0;
+    if (execute_us < 0) execute_us = 0;
+
+    /* Exact MSPSim stepMicros replication:
+     * - lastMicrosDelta accumulates ALL jump values (never reset)
+     * - lastMicrosCycles is set ONCE (first call) and NEVER changes
+     * - maxCycles = lastMicrosCycles + ((lastMicrosDelta + executeMicros) * dcoFrq) / 1e6
+     * This does ONE integer division for the total accumulated time,
+     * bounding truncation error to 1 cycle total (not 1 per tick). */
+
+    /* Initialize on first call */
+    if (!cpu->micro_clock_ready) {
+        cpu->last_micros_cycles = cpu->cycles;
+        cpu->last_micros_delta = 0;
+        cpu->micro_clock_ready = true;
+    }
+
+    /* Accumulate jump (matches: lastMicrosDelta += jumpMicros) */
+    cpu->last_micros_delta += jump_us;
+
+    /* Compute target from ORIGINAL base + TOTAL accumulated delta
+     * (matches: maxCycles = lastMicrosCycles + ((lastMicrosDelta + executeMicros) * dcoFrq) / 1e6) */
+    int64_t target_cycle = cpu->last_micros_cycles +
+        ((cpu->last_micros_delta + execute_us) * (int64_t)cpu->cpu_freq_hz) / 1000000LL;
+
+    if (target_cycle > cpu->cycles)
+        msp430_step_until(cpu, target_cycle);
+
+    if (cpu->cpu_off &&
+        !(cpu->interrupts_enabled &&
+          cpu->serviced_interrupt == -1 &&
+          cpu->interrupt_max >= 0) &&
+        cpu->cpu_freq_hz > 0 &&
+        cpu->next_event_cycle > cpu->cycles) {
+        return ((cpu->next_event_cycle - cpu->cycles) * 1000000LL) /
+               cpu->cpu_freq_hz;
+    }
+    return 0;
 }
 
 /* ===================================================================
@@ -882,28 +964,37 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
 #endif
 
     while (count > 0) {
-        /* Check for events */
-        if (cpu->cycles >= cpu->next_event_cycle) {
-            execute_events(cpu);
-        }
+        /* Match MSPSim execution order: INTERRUPTS → LPM → INSTRUCTION → EVENTS.
+         * MSPSim fires events AFTER instruction execution (emulateOP line 2080),
+         * while interrupts are checked BEFORE (line 913). This ensures that
+         * after RETI, the interrupted context executes at least one instruction
+         * before newly-fired timer events trigger the next ISR. */
 
-        /* Interrupt processing */
+        /* Interrupt processing (BEFORE instruction, matching MSPSim line 913) */
         if (cpu->interrupts_enabled && cpu->serviced_interrupt == -1
                 && cpu->interrupt_max >= 0) {
             int pc = reg[MSP430_PC];
             pc = service_interrupt(cpu, pc);
-            /* After reset interrupt, the PC is set; continue normally */
+            /* If interrupt entry pushed us past cycle_limit, stop.
+             * This prevents overshoot when LPM wake → event → ISR
+             * happens within a single step iteration. */
+            if (cpu->cycles >= cpu->cycle_limit) {
+                return count - 1;
+            }
         }
 
         /* LPM check */
         if (cpu->cpu_off) {
             /* In low-power mode, advance to next event (capped by cycle_limit) */
-            if (cpu->interrupts_enabled && cpu->interrupt_max > 0) {
+            if (cpu->interrupts_enabled && cpu->interrupt_max >= 0) {
                 /* Will service interrupt next iteration */
             } else {
                 int64_t target = cpu->next_event_cycle;
                 if (target > cpu->cycle_limit) target = cpu->cycle_limit;
                 cpu->cycles = target;
+                /* Process events that became due during LPM fast-forward */
+                if (cpu->cycles >= cpu->next_event_cycle)
+                    execute_events(cpu);
                 if (cpu->cycles >= cpu->cycle_limit) {
                     return count - 1;  /* ran this "instruction" (LPM tick) */
                 }
@@ -926,6 +1017,14 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
         }
 
         uint16_t instr = memory[pc] | (memory[pc + 1] << 8);
+        cpu->last_pc = pc;
+
+        /* PC-range trace hook (for debugging specific firmware functions) */
+        if (cpu->pc_trace_fn && pc >= cpu->pc_trace_lo && pc < cpu->pc_trace_hi)
+            cpu->pc_trace_fn(cpu->pc_trace_data, pc, reg, memory);
+
+
+
 
         int op = (instr >> 12) & 0xf;
 
@@ -950,12 +1049,17 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 cpu->last_instruction = instr;
                 op = (instr >> 12) & 0xf;
 
-                /* The extended instruction is a normal two-op or single-op
-                   with 20-bit addressing. For now, handle via normal paths
-                   with extWord set. pc points at the actual instruction;
-                   the two-op/single-op path will advance past it. */
-                /* TODO: full extension word handling for repeat, ZC, 20-bit */
-                goto extended_twoop;
+                /* Dispatch the extended instruction.
+                 * Two-op (opcodes 4-15): use extended two-op path.
+                 * Single-op (opcode 1): use single-op path (which handles ext_word).
+                 * Jump (opcodes 2-3): rare with extension; route to single-op. */
+                if (op >= 4) {
+                    goto extended_twoop;
+                } else {
+                    /* Single-op with extension word — route to op_single.
+                     * op_single will check ext_word for 20-bit operand handling. */
+                    goto op_single;
+                }
             }
 
             /* MSP430X native instructions (0x0000-0x0FFF, 0x1000-0x17FF) */
@@ -971,8 +1075,12 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 goto pushm_popm_dispatch;
             }
 
-            /* RRXX: 0x0040-0x004F with upper bits indicating type */
-            if ((instr & 0xf000) == 0x0000 && (instr & 0x0c00) != 0) {
+            /* RRXX: RRCM/RRAM/RLAM/RRUM — 0000 nntt 01bb dddd
+             * bits 7-6 must be 01, bits 5-4 select variant.
+             * Exclude dst=R3 (CG2) and dst=R2 (SR) as these are never
+             * valid targets and typically indicate data misinterpreted
+             * as instructions. */
+            if ((instr & 0xf0e0) == 0x0040 && (instr & 0xf) > 3) {
                 goto rrxx_dispatch;
             }
 
@@ -986,11 +1094,11 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 uint32_t addr = reg[src_reg];
                 reg[dst_reg] = mem_read_mode(cpu, addr, 2) & 0xfffff;
                 cpu->cycles += 3;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             }
             case MOVA_IND_AUTOINC: {
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 uint32_t addr = reg[src_reg];
                 uint32_t val = mem_read_mode(cpu, addr, 2) & 0xfffff;
                 reg[src_reg] = (addr + 4) & 0xfffff;
@@ -1004,7 +1112,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 uint32_t addr = lo | ((uint32_t)src_reg << 16);
                 reg[dst_reg] = mem_read_mode(cpu, addr, 2) & 0xfffff;
                 cpu->cycles += 4;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             }
             case MOVA_INDX2REG: {
@@ -1015,7 +1123,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 uint32_t addr = (base + index) & 0xfffff;
                 reg[dst_reg] = mem_read_mode(cpu, addr, 2) & 0xfffff;
                 cpu->cycles += 4;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             }
             case MOVA_REG2ABS: {
@@ -1044,7 +1152,8 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 uint32_t val = lo | ((uint32_t)src_reg << 16);
                 reg[dst_reg] = val & 0xfffff;
                 cpu->cycles += 2;
-                reg[MSP430_PC] = pc;
+                /* Don't clobber PC if destination IS PC (e.g., BRA #addr) */
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             }
             case CMPA_IMM: {
@@ -1083,7 +1192,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 write_sr_flags(cpu, sr);
                 reg[dst_reg] = result & 0xfffff;
                 cpu->cycles += 3;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             }
             case SUBA_IMM: {
@@ -1092,13 +1201,13 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 uint32_t imm = lo | ((uint32_t)src_reg << 16);
                 reg[dst_reg] = (reg[dst_reg] - imm) & 0xfffff;
                 cpu->cycles += 3;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             }
             case MOVA_REG:
                 reg[dst_reg] = reg[src_reg];
                 cpu->cycles += 1;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             case CMPA_REG: {
                 uint32_t src = reg[src_reg];
@@ -1130,13 +1239,13 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 write_sr_flags(cpu, sr);
                 reg[dst_reg] = result & 0xfffff;
                 cpu->cycles += 1;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             }
             case SUBA_REG:
                 reg[dst_reg] = (reg[dst_reg] - reg[src_reg]) & 0xfffff;
                 cpu->cycles += 1;
-                reg[MSP430_PC] = pc;
+                if (dst_reg != MSP430_PC) reg[MSP430_PC] = pc;
                 break;
             default:
                 fprintf(stderr, "Unsupported MSP430X instruction: 0x%04x op=0x%04x at PC=0x%05x\n",
@@ -1146,14 +1255,14 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 break;
             }
             count--;
-            continue;
+            goto post_instruction_events;
 
         rrxx_dispatch: {
             /* RRCM/RRAM/RLAM/RRUM */
             int rr_count = ((instr >> 10) & 0x3) + 1;
             int rr_dst = instr & 0xf;
             int rr_type = instr & RRMASK;
-            bool rr_word = (instr & 0x0010) == 0; /* bit 4: 0=word, 1=addr */
+            bool rr_word = (instr & 0x0010) != 0; /* bit 4: 0=.A(20-bit), 1=.W(16-bit) per MSPSim */
             uint32_t dst = reg[rr_dst];
             uint32_t sr = reg[MSP430_SR];
             uint32_t carry = (sr & SR_C) ? 1 : 0;
@@ -1198,11 +1307,19 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 break;
             }
 
-            write_sr_flags(cpu, (sr & ~(SR_C | SR_V)) | nxt_carry);
+            /* Update Z, N, C flags (matches MSPSim RRXX behavior) */
+            {
+                uint32_t result = dst & (rr_word ? 0xffff : 0xfffff);
+                uint32_t msb = rr_word ? 0x8000 : 0x80000;
+                sr = (sr & ~(SR_C | SR_V | SR_Z | SR_N)) | nxt_carry |
+                     (result == 0 ? SR_Z : 0) |
+                     (result & msb ? SR_N : 0);
+                write_sr_flags(cpu, sr);
+            }
             reg[rr_dst] = dst & (rr_word ? 0xffff : 0xfffff);
             reg[MSP430_PC] = pc;
             count--;
-            continue;
+            goto post_instruction_events;
         }
 
         calla_dispatch: {
@@ -1261,7 +1378,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 fprintf(stderr, "Unsupported CALLA mode: 0x%04x\n", instr);
                 reg[MSP430_PC] = pc;
                 count--;
-                continue;
+                goto post_instruction_events;
             }
 
             if (dst != -1) {
@@ -1275,7 +1392,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 reg[MSP430_PC] = pc;
             }
             count--;
-            continue;
+            goto post_instruction_events;
         }
 
         pushm_popm_dispatch: {
@@ -1299,7 +1416,10 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 }
                 reg[MSP430_SP] = sp;
             } else {
-                /* POPM */
+                /* POPM: Rdst is the LOWEST register. Pop n registers
+                 * upward from Rdst to Rdst+n-1.
+                 * PUSHM #n, Rhigh pushes Rhigh..Rlow (highest first).
+                 * POPM #n, Rlow pops Rlow..Rhigh (lowest first). */
                 if (is_addr) cpu->cycles += 2;
                 for (int i = 0; i < n; i++) {
                     cpu->cycles += 2;
@@ -1312,7 +1432,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             }
             reg[MSP430_PC] = pc;
             count--;
-            continue;
+            goto post_instruction_events;
         }
         } /* end op_msp430x */
 
@@ -1320,10 +1440,37 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
          * Single-operand instructions (opcode 1: 0x1000-0x1FFF)
          * =================================================================== */
         OP_LABEL(op_single): {
+            /* MSP430X instructions in the 0x1xxx range overlap with
+             * single-op opcodes.  Redirect to op_msp430x for:
+             *   0x1800-0x1FFF: extension words (20-bit operand prefix)
+             *   0x1300 with bits[7:4]>=4: CALLA variants
+             *   0x1400-0x17FF: PUSHM/POPM */
+            if (cpu->is_msp430x) {
+                if ((instr & 0xf800) == 0x1800)
+                    goto op_msp430x;
+                if ((instr & 0xff00) == 0x1300 && (instr & 0x00f0) >= 0x0040)
+                    goto op_msp430x;
+                if ((instr & 0xfc00) >= 0x1400 && (instr & 0xfc00) <= 0x1700)
+                    goto op_msp430x;
+            }
+
             int single_op = instr & 0x1380; /* mask to get operation */
             int dst_register = instr & 0xf;
             int ad = (instr >> 4) & 0x3;
             bool bw = (instr & 0x0040) != 0;
+
+            /* Extension word handling for single-op */
+            int sext = cpu->ext_word;
+            uint32_t sext_dst_hi = 0;
+            if (sext) {
+                sext_dst_hi = (sext >> 7) & 0xf;  /* bits 10:7: src/dst 19:16 per MSPSim */
+                /* A/L and BW interaction same as two-op */
+                bool al = (sext >> 6) & 1;  /* bit 6: A/L per MSPSim */
+                if (!al) {
+                    bw = false;  /* A/L=0: .A mode (20-bit) per MSPSim */
+                }
+            }
+
             uint32_t mask = bw ? 0xff : 0xffff;
             uint32_t msb = bw ? 0x80 : 0x8000;
             int mode_bytes = bw ? 1 : 2;
@@ -1354,17 +1501,24 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                     cpu->cycles += 1;
                     break;
                 case AM_INDEX: {
-                    int32_t idx = sign_extend_16(memory[pc] | (memory[pc + 1] << 8));
+                    uint16_t idx16 = memory[pc] | (memory[pc + 1] << 8);
                     pc += 2;
                     if (dst_register == MSP430_SR) {
                         /* Absolute addressing mode */
-                        dst_address = (uint32_t)(uint16_t)idx;
+                        dst_address = sext ? ((sext_dst_hi << 16) | idx16) & 0xfffff
+                                           : (uint32_t)idx16;
                     } else {
                         uint32_t rval = reg[dst_register];
-                        if (rval <= 0xffff) {
-                            dst_address = (rval + idx) & 0xffff;
+                        if (sext) {
+                            uint32_t idx20 = ((sext_dst_hi << 16) | idx16) & 0xfffff;
+                            dst_address = (rval + idx20) & 0xfffff;
                         } else {
-                            dst_address = (rval + idx) & 0xfffff;
+                            int32_t idx = sign_extend_16(idx16);
+                            if (rval <= 0xffff) {
+                                dst_address = (rval + idx) & 0xffff;
+                            } else {
+                                dst_address = (rval + idx) & 0xfffff;
+                            }
                         }
                     }
                     cpu->cycles += 4;
@@ -1378,6 +1532,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                     if (dst_register == MSP430_PC) {
                         /* Immediate mode */
                         dst = memory[pc] | (memory[pc + 1] << 8);
+                        if (sext) dst = ((sext_dst_hi << 16) | dst) & 0xfffff;
                         pc += 2;
                         dst_address = -1;
                     } else {
@@ -1500,8 +1655,9 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             if (single_op != OP_CALL && single_op != OP_RETI) {
                 reg[MSP430_PC] = pc;
             }
+            cpu->ext_word = 0;
             count--;
-            continue;
+            goto post_instruction_events;
         }
 
         /* ===================================================================
@@ -1537,7 +1693,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             }
             reg[MSP430_PC] = pc;
             count--;
-            continue;
+            goto post_instruction_events;
         }
 
         /* ===================================================================
@@ -1572,9 +1728,31 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             bool bw = (instr & 0x0040) != 0;
             int as = (instr >> 4) & 0x3;
 
-            uint32_t mask = bw ? 0xff : 0xffff;
-            uint32_t msb_bit = bw ? 0x80 : 0x8000;
-            int mode_bytes = bw ? 1 : 2;
+            /* Extension word: determine actual operand width.
+             * A/L=0, BW=0: .W (word 16-bit)
+             * A/L=0, BW=1: .A (address 20-bit)
+             * A/L=1, BW=0: reserved (treat as .W)
+             * A/L=1, BW=1: .B (byte 8-bit) */
+            int ext = cpu->ext_word;
+            bool is_addr_mode = false;  /* .A (20-bit) mode */
+            uint32_t ext_src_hi = 0;    /* source bits 19:16 */
+            uint32_t ext_dst_hi = 0;    /* destination bits 19:16 */
+            if (ext) {
+                bool al = (ext >> 6) & 1;  /* bit 6: A/L per MSPSim (0=.A, 1=.W/.B) */
+                ext_src_hi = (ext >> 7) & 0xf;  /* bits 10:7: src 19:16 per MSPSim */
+                ext_dst_hi = ext & 0xf;  /* bits 3:0: dst 19:16 */
+                if (!al) {
+                    /* A/L=0: .A mode (20-bit) regardless of BW — per MSPSim wordx20 */
+                    is_addr_mode = true;
+                    bw = false;
+                }
+                /* A/L=1: follow instruction BW bit (0=.W, 1=.B) — no change needed */
+            }
+
+            uint32_t mask = is_addr_mode ? 0xfffff : (bw ? 0xff : 0xffff);
+            uint32_t msb_bit = is_addr_mode ? 0x80000 : (bw ? 0x80 : 0x8000);
+            int mode_bytes = is_addr_mode ? 4 : (bw ? 1 : 2);
+            int mem_mode = is_addr_mode ? 2 : (bw ? 0 : 1);  /* for mem_read_mode */
             bool dst_reg_mode = (ad == 0);
 
             int src = 0;
@@ -1625,40 +1803,58 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                     if (dst_register == MSP430_PC) cpu->cycles += 1;
                     break;
                 case AM_INDEX: {
-                    int32_t idx = sign_extend_16(memory[pc] | (memory[pc + 1] << 8));
+                    uint16_t idx16 = memory[pc] | (memory[pc + 1] << 8);
                     pc += 2;
                     uint32_t addr;
                     if (src_register == MSP430_SR) {
-                        /* Absolute addressing mode: address is just the index word */
-                        addr = (uint32_t)(uint16_t)idx;
+                        /* Absolute addressing mode: address is just the index word.
+                         * With extension word, upper bits extend to 20-bit. */
+                        addr = ext ? ((ext_src_hi << 16) | idx16) & 0xfffff
+                                   : (uint32_t)idx16;
                     } else {
                         uint32_t rval = reg[src_register];
-                        if (rval <= 0xffff) {
-                            addr = (rval + idx) & 0xffff;
+                        if (ext) {
+                            /* Extension word: index is 20-bit unsigned,
+                             * formed from ext upper bits + 16-bit index */
+                            uint32_t idx20 = ((ext_src_hi << 16) | idx16) & 0xfffff;
+                            addr = (rval + idx20) & 0xfffff;
                         } else {
-                            addr = (rval + idx) & 0xfffff;
+                            int32_t idx = sign_extend_16(idx16);
+                            if (rval <= 0xffff) {
+                                addr = (rval + idx) & 0xffff;
+                            } else {
+                                addr = (rval + idx) & 0xfffff;
+                            }
                         }
                     }
-                    src = mem_read(cpu, addr, !bw);
+                    src = is_addr_mode ? mem_read_mode(cpu, addr, 2)
+                                       : mem_read(cpu, addr, !bw);
                     if (bw) src &= 0xff;
+                    if (is_addr_mode) src &= 0xfffff;
                     cpu->cycles += dst_reg_mode ? 3 : 6;
                     break;
                 }
                 case AM_IND_REG:
-                    src = mem_read(cpu, reg[src_register], !bw);
+                    src = is_addr_mode ? mem_read_mode(cpu, reg[src_register], 2)
+                                       : mem_read(cpu, reg[src_register], !bw);
                     if (bw) src &= 0xff;
+                    if (is_addr_mode) src &= 0xfffff;
                     cpu->cycles += dst_reg_mode ? 2 : 5;
                     break;
                 case AM_IND_AUTOINC:
                     if (src_register == MSP430_PC) {
-                        /* Immediate mode: word follows instruction */
+                        /* Immediate mode: word follows instruction.
+                         * With extension word, upper bits extend to 20-bit. */
                         src = memory[pc] | (memory[pc + 1] << 8);
+                        if (ext) src = ((ext_src_hi << 16) | src) & 0xfffff;
                         if (bw) src &= 0xff;
                         pc += 2;
                     } else {
                         uint32_t addr = reg[src_register];
-                        src = mem_read(cpu, addr, !bw);
+                        src = is_addr_mode ? mem_read_mode(cpu, addr, 2)
+                                           : mem_read(cpu, addr, !bw);
                         if (bw) src &= 0xff;
+                        if (is_addr_mode) src &= 0xfffff;
                         reg[src_register] = addr + mode_bytes;
                     }
                     cpu->cycles += dst_reg_mode ? 2 : 5;
@@ -1675,30 +1871,67 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             } else {
                 /* Indexed destination */
                 if (dst_register == MSP430_SR) {
-                    /* Absolute addressing mode */
-                    dst_address = memory[pc] | (memory[pc + 1] << 8);
+                    /* Absolute addressing mode.
+                     * With extension word, upper bits extend to 20-bit. */
+                    uint16_t addr16 = memory[pc] | (memory[pc + 1] << 8);
+                    dst_address = ext ? ((ext_dst_hi << 16) | addr16) & 0xfffff
+                                      : addr16;
                     pc += 2;
                 } else {
                     uint32_t rval = reg[dst_register];
-                    int32_t idx = sign_extend_16(memory[pc] | (memory[pc + 1] << 8));
+                    uint16_t idx16 = memory[pc] | (memory[pc + 1] << 8);
                     pc += 2;
-                    if (rval <= 0xffff) {
-                        dst_address = (rval + idx) & 0xffff;
+                    if (ext) {
+                        uint32_t idx20 = ((ext_dst_hi << 16) | idx16) & 0xfffff;
+                        dst_address = (rval + idx20) & 0xfffff;
                     } else {
-                        dst_address = (rval + idx) & 0xfffff;
+                        int32_t idx = sign_extend_16(idx16);
+                        if (rval <= 0xffff) {
+                            dst_address = (rval + idx) & 0xffff;
+                        } else {
+                            dst_address = (rval + idx) & 0xfffff;
+                        }
                     }
                 }
                 if (op != OP_MOV) {
-                    dst = mem_read(cpu, dst_address, !bw);
+                    dst = is_addr_mode ? mem_read_mode(cpu, dst_address, 2)
+                                       : mem_read(cpu, dst_address, !bw);
                     if (bw) dst &= 0xff;
+                    if (is_addr_mode) dst &= 0xfffff;
                 }
             }
 
-            /* --- Execute ALU operation --- */
+            /* --- Repeat count from extension word --- */
+            int repeats = 1;
+            bool zero_carry = false;
+            if (ext && dst_reg_mode) {
+                bool rep_in_reg = (ext >> 7) & 1;  /* bit 7: repeat count in register */
+                int ext3_0 = ext & 0xf;
+                if (rep_in_reg) {
+                    repeats = 1 + (reg[ext3_0] & 0xf);
+                } else {
+                    repeats = 1 + ext3_0;
+                }
+                zero_carry = (ext & 0x20) != 0;  /* bit 5: ZC (zero carry) */
+            }
+
+            /* --- Execute ALU operation (with repeat loop) --- */
             twoop_alu: ;
             bool write_result = false;
             bool update_status = true;
             uint32_t sr = reg[MSP430_SR];
+
+            for (int rep = 0; rep < repeats; rep++) {
+            /* For repeats > 1, re-read sr and optionally clear carry */
+            if (rep > 0) {
+                sr = reg[MSP430_SR];
+                if (zero_carry) sr &= ~SR_C;
+                /* Re-read dst from register for repeated operations */
+                if (dst_reg_mode && op != OP_MOV)
+                    dst = reg[dst_register] & mask;
+            }
+            write_result = false;
+            update_status = true;
 
             switch (op) {
             case OP_MOV:
@@ -1731,7 +1964,8 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             }
 
             case OP_SUB: {
-                src = (~src) & mask;
+                /* Match MSPSim: 16-bit complement even for byte mode */
+                src = (src ^ 0xffff) & 0xffff;
                 sr &= ~(SR_V | SR_C);
                 uint32_t tmp = (src ^ dst) & msb_bit;
                 dst = dst + src + 1;
@@ -1744,7 +1978,7 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
 
             case OP_SUBC: {
                 int carry = (sr & SR_C) ? 1 : 0;
-                src = (~src) & mask;
+                src = (src ^ 0xffff) & 0xffff;
                 sr &= ~(SR_V | SR_C);
                 uint32_t tmp = (src ^ dst) & msb_bit;
                 dst = dst + src + carry;
@@ -1816,16 +2050,21 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             /* Mask result */
             dst &= mask;
 
-            /* Write back */
+            /* Write back — also mask to 20 bits for MSP430X register writes
+             * (MSPSim writeRegister always does value &= 0xfffff) */
             if (write_result) {
                 if (dst_reg_mode) {
                     if (dst_register == MSP430_SR) {
                         write_sr(cpu, dst);
                     } else {
-                        reg[dst_register] = dst;
+                        reg[dst_register] = dst & 0xfffff;
                     }
                 } else {
-                    mem_write(cpu, dst_address, dst, !bw);
+                    if (is_addr_mode) {
+                        mem_write_mode(cpu, dst_address, dst, 2);
+                    } else {
+                        mem_write(cpu, dst_address, dst, !bw);
+                    }
                 }
             }
 
@@ -1838,13 +2077,25 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 write_sr_flags(cpu, sr);
             }
 
+            } /* end repeat loop */
+
             /* Don't overwrite PC if the instruction already wrote to it */
             if (!(dst_reg_mode && dst_register == MSP430_PC && write_result)) {
                 reg[MSP430_PC] = pc;
             }
             cpu->ext_word = 0;
             count--;
-            continue;
+            goto post_instruction_events;
+        }
+
+        /* Process events AFTER instruction execution (matching MSPSim line 2080).
+         * This ensures timer events fire after the instruction that crossed
+         * the event cycle, not before the next instruction. Critical for
+         * TSCH: after RETI, the interrupted context executes one instruction
+         * before timer events trigger the next ISR. */
+        post_instruction_events:
+        if (cpu->cycles >= cpu->next_event_cycle) {
+            execute_events(cpu);
         }
 
 #if !defined(__GNUC__) && !defined(__clang__)
