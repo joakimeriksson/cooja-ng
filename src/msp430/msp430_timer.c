@@ -40,68 +40,92 @@ static int overflow_tiv(const msp430_timer_t *timer) {
 
 /* ---------- Counter computation ---------- */
 
+/* Match MSPSim Timer.updateCounter() exactly:
+ * Computes counter ABSOLUTELY from (cycles - counterStart) / divider + counterAcc.
+ * No incremental accumulation → no drift from repeated syncs. */
 static void sync_counter(msp430_timer_t *timer) {
     if (timer->mode == TIMER_MC_STOP || timer->cycles_per_tick <= 0) {
         return;
     }
 
-    int64_t elapsed = timer->cpu->cycles - timer->counter_start;
-    if (elapsed < 0) elapsed = 0;
-    int64_t ticks = elapsed / timer->cycles_per_tick;
+    int64_t cycctr = timer->cpu->cycles - timer->counter_start;
+    if (cycctr < 0) cycctr = 0;
+    double tick = (double)cycctr / timer->cycles_per_tick;
+    int64_t tick_long = (int64_t)tick;
+    timer->counter_passed = (int)(timer->cycles_per_tick * (tick - (double)tick_long));
+    int64_t big_counter = tick_long + timer->counter_acc;
 
     switch (timer->mode) {
     case TIMER_MC_CONT:
-        timer->counter = (timer->counter + (uint16_t)ticks) & 0xFFFF;
+        timer->counter = (uint16_t)(big_counter & 0xFFFF);
         break;
     case TIMER_MC_UP:
         if (timer->ccr[0] > 0) {
-            uint32_t pos = timer->counter + (uint32_t)ticks;
-            timer->counter = (uint16_t)(pos % (timer->ccr[0] + 1));
+            timer->counter = (uint16_t)(big_counter % (timer->ccr[0] + 1));
+        } else {
+            timer->counter = 0;
         }
         break;
     case TIMER_MC_UPDOWN:
         if (timer->ccr[0] > 0) {
-            uint32_t period = timer->ccr[0] * 2;
-            uint32_t pos = timer->counter + (uint32_t)ticks;
-            pos = pos % period;
-            if (pos > timer->ccr[0]) {
+            int64_t period = timer->ccr[0] * 2;
+            int64_t pos = big_counter % period;
+            if (pos > timer->ccr[0])
                 timer->counter = (uint16_t)(period - pos);
-            } else {
+            else
                 timer->counter = (uint16_t)pos;
-            }
+        } else {
+            timer->counter = 0;
         }
         break;
     }
+}
 
-    /* Advance counter_start by consumed ticks only, preserving sub-tick remainder.
-     * Using cpu->cycles would discard fractional progress, causing the counter
-     * to stall when read more frequently than cycles_per_tick. */
-    timer->counter_start += ticks * timer->cycles_per_tick;
+/* Match MSPSim Timer.resetCounter(): snapshot counterAcc and counterStart.
+ * Called after counter writes, mode changes, or frequency changes. */
+static void reset_counter(msp430_timer_t *timer) {
+    int64_t cycctr = timer->cpu->cycles - timer->counter_start;
+    if (cycctr < 0) cycctr = 0;
+    double tick = (double)cycctr / timer->cycles_per_tick;
+    timer->counter_passed = (int)(timer->cycles_per_tick * (tick - (double)(int64_t)tick));
+    timer->counter_start = timer->cpu->cycles - timer->counter_passed;
+    timer->counter_acc = timer->counter;
 }
 
 static void update_cycles_per_tick(msp430_timer_t *timer) {
+    /* Match MSPSim's updateCyclesMultiplicator():
+     *   cyclesMultiplicator = inputDivider;
+     *   if (clockSource == SRC_ACLK)
+     *       cyclesMultiplicator = (cyclesMultiplicator * cpu.smclkFrq) / cpu.aclkFrq; */
     uint32_t aclk_freq = msp430_clock_get_aclk_freq(timer->clock);
     uint32_t smclk_freq = msp430_clock_get_smclk_freq(timer->clock);
+    /* ACLK is always 32768 Hz (crystal), even before clock module init */
+    if (aclk_freq == 0) aclk_freq = 32768;
+    /* SMCLK defaults to DCO; use cpu_freq_hz if clock module not ready */
+    if (smclk_freq == 0 && timer->cpu) smclk_freq = timer->cpu->cpu_freq_hz;
 
-    switch (timer->clock_source) {
-    case TIMER_SRC_ACLK:
-        /* cycles_per_tick = (cpu_freq / aclk_freq) * input_divider */
-        if (aclk_freq > 0) {
-            timer->cycles_per_tick = (int)((smclk_freq / aclk_freq) * timer->input_divider);
-        }
-        break;
-    case TIMER_SRC_SMCLK:
-        timer->cycles_per_tick = timer->input_divider;
-        break;
-    default:
-        /* TCLK, INCLK — treat as SMCLK for now */
-        timer->cycles_per_tick = timer->input_divider;
-        break;
+    double new_cpt = timer->input_divider;
+    if (timer->clock_source == TIMER_SRC_ACLK && aclk_freq > 0 && smclk_freq > 0) {
+        new_cpt = (new_cpt * (double)smclk_freq) / aclk_freq;
     }
-    if (timer->cycles_per_tick < 1) timer->cycles_per_tick = 1;
+    if (new_cpt < 1.0) new_cpt = 1.0;
+
+    /* When cpt changes, sync counter with OLD cpt first (to get correct
+     * current counter value), then update cpt, then reset counter base.
+     * Without this, counter_acc from cpt=1.0 era corrupts the absolute formula. */
+    if (new_cpt != timer->cycles_per_tick && timer->cycles_per_tick > 0 &&
+        timer->mode != TIMER_MC_STOP) {
+        sync_counter(timer);     /* sync with OLD cpt → correct counter value */
+        timer->cycles_per_tick = new_cpt;
+        reset_counter(timer);    /* reset counter_acc/start with NEW cpt */
+    } else {
+        timer->cycles_per_tick = new_cpt;
+    }
 }
 
 /* ---------- Event callbacks ---------- */
+
+static int ccr_fire_count[2][8]; /* [timer_a=0/timer_b=1][ccr_idx] */
 
 static void ccr_event_callback(void *user_data, msp430_event_t *event) {
     msp430_timer_t *timer = (msp430_timer_t *)user_data;
@@ -110,11 +134,19 @@ static void ccr_event_callback(void *user_data, msp430_event_t *event) {
     int idx = (int)(event - timer->ccr_event);
     if (idx < 0 || idx >= timer->num_ccr) return;
 
+    /* Debug counter */
+    int timer_idx = (timer->base_addr == 0x160) ? 0 : 1;
+    ccr_fire_count[timer_idx][idx]++;
+
+    /* Debug: count Timer A CCR1 fires (clock tick) */
+
     sync_counter(timer);
 
+
     if (timer->cctl[idx] & TIMER_CAP) {
-        /* Capture mode: write pre-computed expected value to CCR
-         * (matches Java MSPSim's expCompare approach) */
+        /* Capture mode: matches MSPSim's CCR.execute() for captures.
+         * Write pre-computed expected value to CCR, advance for next capture,
+         * and reschedule incrementally (not from scratch). */
         if (timer->cctl[idx] & TIMER_CCIFG) {
             /* Previous capture not read yet — set overflow flag */
             timer->cctl[idx] |= TIMER_COV;
@@ -122,6 +154,24 @@ static void ccr_event_callback(void *user_data, msp430_event_t *event) {
         timer->ccr[idx] = timer->exp_compare[idx];
         /* Advance expCompare for next capture */
         timer->exp_compare[idx] = (timer->exp_compare[idx] + timer->exp_cap_interval[idx]) & 0xFFFF;
+
+        /* Set CCIFG and trigger interrupt */
+        timer->cctl[idx] |= TIMER_CCIFG;
+        trigger_ccr_interrupt(timer, idx);
+
+        /* MSPSim: expCaptureTime += expCapInterval * cyclesMultiplicator
+         * Schedule next capture incrementally from current fire time.
+         * Throttle non-interrupt captures (e.g., Timer B CCR6 SFD timestamps)
+         * to prevent event queue starvation. ACLK-rate captures at 32K/s
+         * create 62M events in 600s. Limit to ~100/s when CCIE is not set. */
+        int64_t interval = (int64_t)(timer->exp_cap_interval[idx] * timer->cycles_per_tick);
+        if (!(timer->cctl[idx] & TIMER_CCIE)) {
+            int64_t min_interval = timer->cpu->cpu_freq_hz / 100;  /* 100/s */
+            if (interval < min_interval) interval = min_interval;
+        }
+        int64_t next_fire = event->fire_cycle + interval;
+        msp430_schedule_event(timer->cpu, &timer->ccr_event[idx], next_fire);
+        return;
     }
 
     /* Set CCIFG */
@@ -130,8 +180,16 @@ static void ccr_event_callback(void *user_data, msp430_event_t *event) {
     /* Trigger interrupt */
     trigger_ccr_interrupt(timer, idx);
 
-    /* Reschedule for next event */
-    schedule_ccr_event(timer, idx);
+    /* Reschedule for next wrap from THIS fire time.
+     * Using event->fire_cycle as base (not recalculating from counter)
+     * avoids the rounding issue where ccr_val ≈ counter causes a full
+     * 65536-tick wrap-around instead of the correct next-wrap schedule.
+     * The firmware ISR writes new TACCR value, which re-schedules earlier. */
+    {
+        int64_t wrap_cycles = (int64_t)(0x10000 * timer->cycles_per_tick);
+        int64_t next_fire = event->fire_cycle + wrap_cycles;
+        msp430_schedule_event(timer->cpu, &timer->ccr_event[idx], next_fire);
+    }
 }
 
 static void overflow_event_callback(void *user_data, msp430_event_t *event) {
@@ -164,50 +222,68 @@ static void schedule_ccr_event(msp430_timer_t *timer, int ccr_idx) {
 
     uint16_t cctl = timer->cctl[ccr_idx];
 
-    /* Capture mode: schedule based on capture input source frequency.
-     * Matches Java MSPSim's updateCaptures/expCompare approach:
-     * - exp_cap_interval = timer_clock_freq / capture_input_freq (in timer ticks)
-     * - exp_compare = previous CCR + exp_cap_interval (pre-computed capture value)
-     * - Event scheduled at current + exp_cap_interval * cycles_per_tick CPU cycles
-     * - This is called on CCTL writes (including firmware clearing CCIFG),
-     *   which recalculates exp_cap_interval with the current clock frequencies. */
+    /* Capture mode: matches MSPSim's CCR.updateCaptures() exactly.
+     *
+     * MSPSim computes:
+     *   frqClk = (clockSource==SMCLK) ? smclkFrq/inputDivider
+     *          : (clockSource==ACLK)  ? aclkFrq/inputDivider : 1
+     *   divisor = (inputSrc==ACLK) ? aclkFrq : 1
+     *   expCapInterval = frqClk / divisor   (timer ticks between captures)
+     *   if clkSource: expCompare = (tccr + expCapInterval) & 0xffff
+     *   else:         expCompare = (counter + expCapInterval) & 0xffff
+     *   expCaptureTime = cycles + expCapInterval * cyclesMultiplicator
+     */
     if (cctl & TIMER_CAP) {
         int cm = (cctl & TIMER_CM_MASK) >> TIMER_CM_SHIFT;
         if (cm == 0) return;  /* No capture (disabled) */
 
         int ccis = (cctl & TIMER_CCIS_MASK) >> TIMER_CCIS_SHIFT;
-        int cap_interval;
 
+        /* Determine capture input source.  CCIS=1 => ACLK for most configs. */
+        bool clk_source = false;  /* true when capture source is a clock (ACLK) */
+        int divisor = 1;
         if (ccis == 1) {
-            /* CCIS=01: CCI_B input, typically ACLK */
+            /* CCI_B input, typically ACLK */
             uint32_t aclk_freq = msp430_clock_get_aclk_freq(timer->clock);
-            uint32_t smclk_freq = msp430_clock_get_smclk_freq(timer->clock);
             if (aclk_freq == 0) return;
-            /* Timer ticks between ACLK edges */
-            if (timer->clock_source == TIMER_SRC_SMCLK) {
-                cap_interval = (int)(smclk_freq / aclk_freq);
-            } else if (timer->clock_source == TIMER_SRC_ACLK) {
-                /* Timer clocked by ACLK, capturing ACLK — each tick is a capture */
-                cap_interval = 1;
-            } else {
-                cap_interval = (int)(smclk_freq / aclk_freq);
-            }
+            divisor = (int)aclk_freq;
+            clk_source = true;
         } else if (ccis == 0) {
-            /* CCIS=00: CCI_A input (external pin) — not connected, use large period */
-            cap_interval = 100000;
+            /* CCI_A input (external pin) — not connected, use large period */
+            divisor = 1;
+            clk_source = false;
         } else {
             /* CCIS=10: GND, CCIS=11: VCC — no capture events */
             return;
         }
+
+        /* Compute frqClk = timer clock frequency after input divider */
+        uint32_t smclk_freq = msp430_clock_get_smclk_freq(timer->clock);
+        uint32_t aclk_freq = msp430_clock_get_aclk_freq(timer->clock);
+        int frq_clk = 1;
+        if (timer->clock_source == TIMER_SRC_SMCLK) {
+            frq_clk = (int)(smclk_freq / timer->input_divider);
+        } else if (timer->clock_source == TIMER_SRC_ACLK) {
+            frq_clk = (int)(aclk_freq / timer->input_divider);
+        }
+
+        int cap_interval = frq_clk / divisor;
         if (cap_interval < 1) cap_interval = 1;
 
-        /* Update expected capture interval and compute next expected value */
+        /* Update expected capture interval and compute next expected value.
+         * When capture source is a clock (ACLK), use tccr as base (MSPSim).
+         * Otherwise use current counter value. */
         timer->exp_cap_interval[ccr_idx] = cap_interval;
-        timer->exp_compare[ccr_idx] = (timer->ccr[ccr_idx] + cap_interval) & 0xFFFF;
+        if (clk_source) {
+            timer->exp_compare[ccr_idx] = (timer->ccr[ccr_idx] + cap_interval) & 0xFFFF;
+        } else {
+            timer->exp_compare[ccr_idx] = (timer->counter + cap_interval) & 0xFFFF;
+        }
 
-        /* Schedule event: cap_interval timer ticks from counter_start.
-         * Use counter_start (not cpu->cycles) so sub-tick remainder is preserved. */
-        int64_t fire_cycle = timer->counter_start + (int64_t)cap_interval * timer->cycles_per_tick;
+        /* Schedule event: cap_interval timer ticks from now, using double
+         * cyclesMultiplicator matching MSPSim's:
+         *   expCaptureTime = cycles + (long)(expCapInterval * cyclesMultiplicator) */
+        int64_t fire_cycle = timer->cpu->cycles + (int64_t)(cap_interval * timer->cycles_per_tick);
         msp430_schedule_event(timer->cpu, &timer->ccr_event[ccr_idx], fire_cycle);
         return;
     }
@@ -255,8 +331,15 @@ static void schedule_ccr_event(msp430_timer_t *timer, int ccr_idx) {
         return;
     }
 
-    /* Use counter_start (not cpu->cycles) so sub-tick remainder is preserved. */
-    int64_t fire_cycle = timer->counter_start + ticks_to_match * timer->cycles_per_tick;
+    /* Schedule based on counter_start. The absolute counter formula means:
+     * counter = (cycles - counter_start) / cpt + counter_acc
+     * We want counter to reach ccr_val, which is counter_acc + total_ticks.
+     * So: total_ticks = ccr_val - counter_acc (mod 0x10000)
+     * fire_cycle = counter_start + total_ticks * cpt
+     * But simpler: ticks_to_match from current counter, use cpu->cycles as base. */
+    int64_t fire_cycle = timer->cpu->cycles - timer->counter_passed +
+        (int64_t)(ticks_to_match * timer->cycles_per_tick + 1);
+
     msp430_schedule_event(timer->cpu, &timer->ccr_event[ccr_idx], fire_cycle);
 }
 
@@ -283,8 +366,8 @@ static void schedule_overflow_event(msp430_timer_t *timer) {
         return;
     }
 
-    /* Use counter_start (not cpu->cycles) so sub-tick remainder is preserved. */
-    int64_t fire_cycle = timer->counter_start + ticks_to_overflow * timer->cycles_per_tick;
+    int64_t fire_cycle = timer->cpu->cycles - timer->counter_passed +
+        (int64_t)(ticks_to_overflow * timer->cycles_per_tick + 1);
     msp430_schedule_event(timer->cpu, &timer->overflow_event, fire_cycle);
 }
 
@@ -447,7 +530,9 @@ static void timer_write(void *user_data, uint32_t addr, int value, bool word, in
         /* Clear counter if TCLR bit set */
         if (timer->ctl & TIMER_TCLR) {
             timer->counter = 0;
+            timer->counter_acc = 0;
             timer->counter_start = timer->cpu->cycles;
+            timer->counter_passed = 0;
             timer->ctl &= ~TIMER_TCLR;
         }
 
@@ -457,8 +542,8 @@ static void timer_write(void *user_data, uint32_t addr, int value, bool word, in
         timer->mode = new_mode;
 
         if (new_mode != TIMER_MC_STOP && old_mode == TIMER_MC_STOP) {
-            /* Timer started — schedule events */
-            timer->counter_start = timer->cpu->cycles;
+            /* Timer started — reset and schedule events */
+            reset_counter(timer);
             schedule_all_events(timer);
         } else if (new_mode == TIMER_MC_STOP) {
             cancel_all_events(timer);
@@ -477,7 +562,8 @@ static void timer_write(void *user_data, uint32_t addr, int value, bool word, in
         } else {
             timer->counter = (timer->counter & 0x00FF) | ((value & 0xFF) << 8);
         }
-        timer->counter_start = timer->cpu->cycles;
+        /* Reset the absolute counter base (like MSPSim resetCounter) */
+        reset_counter(timer);
         if (timer->mode != TIMER_MC_STOP) {
             schedule_all_events(timer);
         }
@@ -519,6 +605,7 @@ static void timer_write(void *user_data, uint32_t addr, int value, bool word, in
     /* TxCCRn */
     if (offset >= OFF_CCR0 && offset < OFF_CCR0 + timer->num_ccr * 2) {
         int idx = (offset - OFF_CCR0) / 2;
+
 
         sync_counter(timer);
 
@@ -562,6 +649,7 @@ void msp430_timer_clock_changed(msp430_timer_t *timer) {
     if (timer->mode == TIMER_MC_STOP) return;
 
     sync_counter(timer);
+    reset_counter(timer);
     update_cycles_per_tick(timer);
 
     /* Reschedule compare events and overflow with updated frequencies.
@@ -574,6 +662,68 @@ void msp430_timer_clock_changed(msp430_timer_t *timer) {
         }
     }
     schedule_overflow_event(timer);
+}
+
+/* External capture input: capture timer counter into CCR when pin changes.
+ * Matches MSPSim Timer.java capture behavior for SFD timestamping.
+ * The firmware configures CCRn in capture mode (CAP=1, CM=both edges).
+ * When the external input (SFD pin) changes, the current counter value
+ * is latched into CCRn, CCIFG is set, and an interrupt is generated. */
+void msp430_timer_capture_input(msp430_timer_t *timer, int ccr_idx, bool value) {
+    if (!timer || !timer->cpu) return;
+    if (ccr_idx < 0 || ccr_idx >= timer->num_ccr) return;
+    if (timer->mode == TIMER_MC_STOP) return;
+    uint16_t cctl = timer->cctl[ccr_idx];
+    if (!(cctl & TIMER_CAP)) return; /* Not in capture mode */
+
+    /* Check capture mode (CM): 01=rising, 10=falling, 11=both */
+    int cm = (cctl >> 14) & 3;
+    if (cm == 0) return;
+    if (cm == 1 && !value) return;
+    if (cm == 2 && value) return;
+
+    /* Sync counter using the proper sync_counter (preserves sub-tick remainder) */
+    sync_counter(timer);
+
+    /* Latch counter into CCR, set CCIFG. If CCIFG is already set
+     * (previous capture not yet read), set COV and do NOT overwrite CCR.
+     * This matches MSP430 hardware: capture overflow preserves the first value. */
+    if (cctl & TIMER_CCIFG) {
+        timer->cctl[ccr_idx] |= TIMER_COV;
+        /* Don't overwrite CCR — preserve first capture value */
+    } else {
+        timer->ccr[ccr_idx] = timer->counter;
+        timer->cctl[ccr_idx] |= TIMER_CCIFG;
+    }
+
+    /* Set CCI bit */
+    if (value) timer->cctl[ccr_idx] |= (1 << 3);
+    else timer->cctl[ccr_idx] &= ~(1 << 3);
+
+    /* Flag interrupt if CCIE enabled */
+    if (timer->cctl[ccr_idx] & TIMER_CCIE) {
+        if (ccr_idx == 0) {
+            msp430_flag_interrupt(timer->cpu, timer->ccr0_vector, timer,
+                                  timer_interrupt_handler, true);
+        } else {
+            int tiv_val = ccr_idx * 2;
+            if (timer->last_tiv == 0 || tiv_val < timer->last_tiv)
+                timer->last_tiv = tiv_val;
+            msp430_flag_interrupt(timer->cpu, timer->ccr1_vector, timer,
+                                  timer_interrupt_handler, true);
+        }
+    }
+}
+
+/* Debug: report CCR fire counts */
+void msp430_timer_dump_ccr_counts(void) {
+    fprintf(stderr, "  Timer A CCR fires:");
+    for (int i = 0; i < 8; i++)
+        if (ccr_fire_count[0][i]) fprintf(stderr, " CCR%d=%d", i, ccr_fire_count[0][i]);
+    fprintf(stderr, "\n  Timer B CCR fires:");
+    for (int i = 0; i < 8; i++)
+        if (ccr_fire_count[1][i]) fprintf(stderr, " CCR%d=%d", i, ccr_fire_count[1][i]);
+    fprintf(stderr, "\n");
 }
 
 /* ---------- Initialization ---------- */

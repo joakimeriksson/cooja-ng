@@ -68,9 +68,11 @@ typedef struct msp430_timer {
     uint16_t  ccr[TIMER_MAX_CCR];   /* TxCCRn: compare/capture values */
     uint16_t  cctl[TIMER_MAX_CCR];  /* TxCCTLn: compare/capture control */
 
-    /* Timing */
-    int64_t   counter_start;   /* CPU cycle when counter was last synced */
-    int       cycles_per_tick; /* CPU cycles per timer tick */
+    /* Timing (matches MSPSim's Timer.java fields) */
+    int64_t   counter_start;   /* CPU cycle at last resetCounter (MSPSim: counterStart) */
+    int64_t   counter_acc;     /* Counter value at last reset (MSPSim: counterAcc) */
+    int       counter_passed;  /* Sub-tick cycle remainder (MSPSim: counterPassed) */
+    double    cycles_per_tick; /* CPU cycles per timer tick (MSPSim: cyclesMultiplicator) */
     int       input_divider;   /* 1, 2, 4, or 8 */
     int       clock_source;    /* TIMER_SRC_xxx */
     int       mode;            /* TIMER_MC_xxx */
@@ -94,5 +96,9 @@ void msp430_timer_init(msp430_timer_t *timer, msp430_cpu_t *cpu,
 
 /* Called by clock module when frequencies change */
 void msp430_timer_clock_changed(msp430_timer_t *timer);
+
+/* Trigger external capture input on a CCR channel.
+ * Used for SFD pin → Timer B CCR1 capture on Z1/Sky. */
+void msp430_timer_capture_input(msp430_timer_t *timer, int ccr_idx, bool value);
 
 #endif /* MSP430_TIMER_H */
