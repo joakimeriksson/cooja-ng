@@ -23,5 +23,9 @@ __pycache__/
 # Local config
 csim.conf
 
+# Test logs
+*.testlog
+cooja-tests*.log
+
 # OS files
 .DS_Store
