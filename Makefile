@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto
 LDFLAGS = -lm -lpthread -flto
 
 # Auto-detect GNU Lightning
@@ -153,7 +153,7 @@ $(LIB_BUILD_DIR)/%.o: $(LIB_SRC_DIR)/%.c | $(LIB_BUILD_DIR)
 
 # QuickJS needs relaxed warnings (upstream code)
 $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
-	$(CC) -O2 -std=c11 -I lib/quickjs -DCONFIG_VERSION=\"2024-01-13\" -Wno-everything -c $< -o $@
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I lib/quickjs -DCONFIG_VERSION=\"2024-01-13\" -w -c $< -o $@
 
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
