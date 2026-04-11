@@ -12,6 +12,7 @@
 #include <stdbool.h>
 
 #define SIM_EQ_MAX_EVENTS 16384
+#define SIM_EQ_MAX_NODES 128
 
 typedef struct {
     int node_idx;       /* which node to tick (-1 = unused) */
@@ -21,6 +22,7 @@ typedef struct {
 
 typedef struct {
     sim_event_t heap[SIM_EQ_MAX_EVENTS];
+    int node_heap_idx[SIM_EQ_MAX_NODES];
     int count;
     uint64_t next_seq;
 } sim_event_queue_t;
@@ -28,8 +30,8 @@ typedef struct {
 /* Initialize an empty event queue */
 void sim_eq_init(sim_event_queue_t *q);
 
-/* Schedule a node to wake at time_ns. Multiple events for the same node
- * are allowed — the earliest will fire first. */
+/* Schedule a node to wake at time_ns. The queue tracks a single pending
+ * wakeup per node, matching COOJA's executeMoteEvent model. */
 void sim_eq_schedule(sim_event_queue_t *q, int node_idx, int64_t time_ns);
 
 /* Schedule a node, but only if the new time is EARLIER than any existing
@@ -41,6 +43,9 @@ sim_event_t sim_eq_pop(sim_event_queue_t *q);
 
 /* Peek at the earliest event time without removing. Returns INT64_MAX if empty. */
 int64_t sim_eq_peek_time(const sim_event_queue_t *q);
+
+/* Peek at the earliest event without removing. Returns node_idx=-1 if empty. */
+sim_event_t sim_eq_peek(const sim_event_queue_t *q);
 
 /* Check if queue is empty */
 bool sim_eq_empty(const sim_event_queue_t *q);

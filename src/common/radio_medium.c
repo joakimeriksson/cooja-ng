@@ -31,7 +31,7 @@ static double udgm_reception_prob(const radio_medium_t *rm, int sender, int rece
 
     if (range_sq <= 0.0)
         return 0.0;
-    if (dist_sq >= range_sq)
+    if (dist_sq > range_sq)
         return 0.0;
 
     /* Cooja UDGM formula:
@@ -149,9 +149,9 @@ void radio_medium_compute_neighbors(radio_medium_t *rm) {
             double dx = rm->nodes[i].x - rm->nodes[j].x;
             double dy = rm->nodes[i].y - rm->nodes[j].y;
             double dist_sq = dx * dx + dy * dy;
-            if (dist_sq < tx_range_sq) {
+            if (dist_sq <= tx_range_sq) {
                 rm->neighbors[i].neighbors[rm->neighbors[i].count++] = j;
-            } else if (dist_sq < int_range_sq) {
+            } else if (dist_sq <= int_range_sq) {
                 /* Within interference range but outside TX range */
                 rm->interference_neighbors[i].neighbors[
                     rm->interference_neighbors[i].count++] = j;

@@ -454,9 +454,16 @@ static JSValue js_sim_add_mote(JSContext *ctx, JSValueConst this_val,
     for (int i = 0; i < e->node_count; i++)
         if (e->node_ids[i] == node_id) { e->node_removed[i] = false; break; }
 
+    /* Get mote type index from the mote object */
+    JSValue type_val = JS_GetPropertyStr(ctx, argv[0], "_typeIndex");
+    int32_t mote_type = 0;
+    JS_ToInt32(ctx, &mote_type, type_val);
+    JS_FreeValue(ctx, type_val);
+
     sim_test_action_t act = {0};
     act.type = TEST_ACTION_ADD;
     act.node = node_id;
+    act.mote_type = mote_type;
     act.at_ms = e->time_us / 1000;
     pthread_mutex_lock(&e->mutex);
     queue_action(e, &act);
@@ -550,6 +557,10 @@ static JSValue js_generate_mote(JSContext *ctx, JSValueConst this_val,
     /* Returns a new mote proxy object (ID will be set later via setMoteID) */
     JSValue mote = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, mote, "id", JS_NewInt32(ctx, 0));
+    /* Store the mote type index from the parent moteType object */
+    JSValue type_idx = JS_GetPropertyStr(ctx, this_val, "_typeIndex");
+    JS_SetPropertyStr(ctx, mote, "_typeIndex", JS_IsUndefined(type_idx) ? JS_NewInt32(ctx, 0) : type_idx);
+    JS_FreeValue(ctx, type_idx);
     JS_SetPropertyStr(ctx, mote, "getID",
         JS_NewCFunction(ctx, js_mote_get_id, "getID", 0));
     JS_SetPropertyStr(ctx, mote, "getInterfaces",
@@ -561,9 +572,10 @@ static JSValue js_sim_get_mote_types(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv) {
     /* Return array of mote type objects, each with generateMote() */
     JSValue arr = JS_NewArray(ctx);
-    /* All types are equivalent for our purposes */
+    /* Create one type per unique firmware in the node list */
     for (int i = 0; i < 3; i++) {
         JSValue mt = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, mt, "_typeIndex", JS_NewInt32(ctx, i));
         JS_SetPropertyStr(ctx, mt, "generateMote",
             JS_NewCFunction(ctx, js_generate_mote, "generateMote", 1));
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, mt);
@@ -578,6 +590,14 @@ static JSValue js_sim_get_random_seed(JSContext *ctx, JSValueConst this_val,
     js_test_engine_t *e = get_engine(ctx);
     /* Use a deterministic seed based on node count (matches COOJA's default) */
     return JS_NewInt32(ctx, 123456 + e->node_count);
+}
+
+/* ---- sim.setSpeedLimit(speed) — no-op stub for Cooja compat ---- */
+
+static JSValue js_sim_set_speed_limit(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_UNDEFINED;
 }
 
 /* ---- String + Java polyfills ---- */
@@ -651,6 +671,8 @@ static void setup_globals(JSContext *ctx, js_test_engine_t *e) {
         JS_NewCFunction(ctx, js_sim_get_mote_types, "getMoteTypes", 0));
     JS_SetPropertyStr(ctx, sim_obj, "getRandomSeed",
         JS_NewCFunction(ctx, js_sim_get_random_seed, "getRandomSeed", 0));
+    JS_SetPropertyStr(ctx, sim_obj, "setSpeedLimit",
+        JS_NewCFunction(ctx, js_sim_set_speed_limit, "setSpeedLimit", 1));
     JS_SetPropertyStr(ctx, global, "sim", sim_obj);
 
     /* Initial globals: msg, id, time, mote */
@@ -684,7 +706,37 @@ static void update_globals(JSContext *ctx, js_test_engine_t *e) {
 
 static void *js_thread_func(void *arg) {
     js_test_engine_t *e = (js_test_engine_t *)arg;
-    JSContext *ctx = (JSContext *)e->ctx;
+
+    /* Create JSRuntime/JSContext in this thread — QuickJS is not
+     * thread-safe across threads on Linux (works on macOS by accident). */
+    JSRuntime *rt = JS_NewRuntime();
+    if (!rt) {
+        pthread_mutex_lock(&e->mutex);
+        e->finished = -1;
+        snprintf(e->fail_reason, sizeof(e->fail_reason), "JS_NewRuntime failed");
+        e->js_waiting = true;
+        pthread_cond_signal(&e->line_done);
+        pthread_mutex_unlock(&e->mutex);
+        return NULL;
+    }
+    JS_SetMemoryLimit(rt, 32 * 1024 * 1024);
+
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) {
+        JS_FreeRuntime(rt);
+        pthread_mutex_lock(&e->mutex);
+        e->finished = -1;
+        snprintf(e->fail_reason, sizeof(e->fail_reason), "JS_NewContext failed");
+        e->js_waiting = true;
+        pthread_cond_signal(&e->line_done);
+        pthread_mutex_unlock(&e->mutex);
+        return NULL;
+    }
+    JS_SetContextOpaque(ctx, e);
+    e->rt = rt;
+    e->ctx = ctx;
+
+    setup_globals(ctx, e);
 
     /* Pick up script from static storage */
     char *script = s_pending_script;
@@ -740,32 +792,18 @@ int js_test_init(js_test_engine_t *e, const char *script,
     pthread_cond_init(&e->line_ready, NULL);
     pthread_cond_init(&e->line_done, NULL);
 
-    JSRuntime *rt = JS_NewRuntime();
-    if (!rt) return -1;
-    JS_SetMemoryLimit(rt, 32 * 1024 * 1024);
-
-    JSContext *ctx = JS_NewContext(rt);
-    if (!ctx) { JS_FreeRuntime(rt); return -1; }
-    JS_SetContextOpaque(ctx, e);
-
-    e->rt = rt;
-    e->ctx = ctx;
-
-    setup_globals(ctx, e);
-
-    /* Preprocess and store script for thread pickup */
+    /* Preprocess and store script for thread pickup.
+     * JSRuntime/JSContext are created inside the JS thread because
+     * QuickJS requires all JS operations on a given context to happen
+     * from the same thread. */
     s_pending_script = preprocess_script(script);
     if (!s_pending_script) {
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
         return -1;
     }
 
     if (pthread_create(&e->thread, NULL, js_thread_func, e) != 0) {
         free(s_pending_script);
         s_pending_script = NULL;
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
         return -1;
     }
 
