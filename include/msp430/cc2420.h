@@ -237,9 +237,32 @@ typedef struct cc2420 {
     /* RSSI value set by radio medium for current RX frame */
     int8_t rx_rssi;
 
+    /* Per-instance stats (for multi-node diagnostics) */
+    int stat_rx_started;
+    int stat_rx_completed;
+    int stat_rx_ack_completed;
+    int stat_rx_rejected;
+    int stat_rx_overflow;
+    int stat_crc_ok;
+    int stat_crc_fail;
+    int stat_auto_ack;
+    int stat_rx_buffered;    /* bytes buffered in rx_incoming */
+    int stat_rx_replayed;    /* bytes replayed from rx_incoming */
+    int stat_rx_dropped;     /* bytes dropped (rx_incoming full or bad state) */
+    int stat_spi_count;      /* total SPI exchanges */
+    int stat_strobe_stxon;   /* STXON strobe count */
+    int stat_strobe_srxon;   /* SRXON strobe count */
+    int stat_strobe_srfoff;  /* SRFOFF strobe count */
+    int stat_strobe_stxoncca;/* STXONCCA strobe count */
+    int stat_tx_calibrate;   /* entered TX_CALIBRATE */
+
     /* RF listener */
     cc2420_rf_callback_fn rf_tx_callback;
     void *rf_tx_data;
+
+    /* SFD pin change callback (for Timer B capture) */
+    void (*sfd_callback)(void *data, bool value);
+    void *sfd_callback_data;
 } cc2420_t;
 
 /* --- Public API --- */
