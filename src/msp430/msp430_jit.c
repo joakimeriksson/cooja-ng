@@ -149,9 +149,10 @@ static int emit_alu_and_flags(jit_state_t *_jit, const decoded_insn_t *di) {
 
     case OP_SUB:
     case OP_CMP: {
-        /* SUB/CMP: src = ~src & mask, then dst = dst + src + 1 */
-        jit_comr(JIT_R0, JIT_R0);
-        jit_andi(JIT_R0, JIT_R0, mask);
+        /* SUB/CMP: src = (src ^ 0xFFFF) & 0xFFFF, then dst = dst + src + 1
+         * Match MSPSim: 16-bit complement even for byte mode (affects carry) */
+        jit_xori(JIT_R0, JIT_R0, 0xFFFF);
+        jit_andi(JIT_R0, JIT_R0, 0xFFFF);
         jit_andi(JIT_R2, JIT_R2, ~(SR_V | SR_C));
         /* V flag: save (src_inv ^ dst) before add */
         jit_xorr(JIT_V2, JIT_R0, JIT_R1);  /* V2 = src_inv ^ dst */
