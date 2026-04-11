@@ -988,9 +988,44 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
             sim_eq_schedule_if_earlier(&sim_eq, idx, last_byte_ns);
         }
     } else if (nodes[idx].type == NODE_ARM) {
+        /* Mirror the MSP430 RX path: pre-sync the receiver to the byte's
+         * air time for each byte, deliver the byte, then request an
+         * immediate wakeup so the RF Core ISR runs before the next slice.
+         * Guarded against re-entry for the currently-ticking node. */
         nodes[idx].plat.arm.rfcore.rx_rssi = rssi;
-        for (int j = 0; j < len; j++)
-            cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
+        int64_t last_byte_ns = air_time_ns;
+        if (idx == ticking_node_idx) {
+            /* Deliver in place — we're already inside this node's tick,
+             * so full sync would recurse.  Drop bytes straight into the
+             * RF Core; the current tick's remaining budget lets the CPU
+             * process them before returning to the scheduler. */
+            for (int j = 0; j < len; j++)
+                cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
+        } else {
+            for (int j = 0; j < len; j++) {
+                int64_t byte_time_ns = air_time_ns + (int64_t)j * IEEE802154_BYTE_NS;
+                /* Advance the receiver's clock to this byte's air time so
+                 * the RF Core ISR observes the correct simulated time when
+                 * it fires (matches the MSP430 sync_msp430_to_time path). */
+                int64_t t_us = byte_time_ns / 1000LL;
+                arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
+                int64_t jump_us = 0;
+                if (cpu->last_execute_us >= 0) {
+                    jump_us = t_us - cpu->last_execute_us;
+                    if (jump_us < 0) jump_us = 0;
+                }
+                cpu->sim_time_ns = byte_time_ns;
+                arm_step_micros(cpu, jump_us, 0);
+                cpu->sim_time_ns = byte_time_ns;
+                cpu->last_execute_us = t_us;
+                cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
+                last_byte_ns = byte_time_ns;
+            }
+        }
+
+        if (num_threads == 0) {
+            sim_eq_schedule_if_earlier(&sim_eq, idx, last_byte_ns);
+        }
     }
 }
 
@@ -2419,8 +2454,30 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         printf("  Node %d [ARM]: 'main' symbol not found, skipping crt0 run\n", node_id);
     }
 
-    printf("  Node %d [ARM] initialized: PC=0x%08x SP=0x%08x\n",
-           node_id, plat->cpu.reg[ARM_PC], plat->cpu.reg[ARM_SP]);
+    /* Run past Contiki main() and platform peripheral setup until at least
+     * one event is scheduled (SysTick, sleep timer, or GPTimer).  Without
+     * this, the multinode event loop wakes the ARM at node_start_ns, runs
+     * a handful of instructions, then asks "next_event_cycle?" — which is
+     * still INT64_MAX because the firmware hasn't finished configuring its
+     * timer peripherals yet — and schedules the next wakeup for infinity.
+     * That's the root cause of the arm-multinode silent no-op bug.
+     *
+     * Mirror init_msp430_node's pattern (lines above): run in 10k-cycle
+     * batches up to an 8M-cycle budget, break as soon as event_queue has
+     * something in it. */
+    {
+        int64_t limit = plat->cpu.cycles + 8000000;
+        while ((int64_t)plat->cpu.cycles < limit) {
+            arm_step_until(&plat->cpu, plat->cpu.cycles + 10000);
+            if (plat->cpu.event_queue != NULL) break;
+        }
+    }
+
+    printf("  Node %d [ARM] initialized: PC=0x%08x SP=0x%08x cycles=%lld eq=%s next_ev=%lld\n",
+           node_id, plat->cpu.reg[ARM_PC], plat->cpu.reg[ARM_SP],
+           (long long)plat->cpu.cycles,
+           plat->cpu.event_queue ? "yes" : "nil",
+           (long long)plat->cpu.next_event_cycle);
     return 0;
 }
 
@@ -2614,6 +2671,46 @@ static int64_t tick_one_msp430(int idx, int64_t sim_ns) {
      * Keep the CPU's event-time view pinned to sim_ns across the slice. */
     cpu->sim_time_ns = sim_ns;
     int64_t returned_us = msp430_step_micros(cpu, jump_us, 1);
+    cpu->sim_time_ns = sim_ns;
+
+    if (deviation != 1.0 && returned_us > 0)
+        returned_us = (int64_t)((double)returned_us / deviation);
+
+    cpu->last_execute_us = t_us;
+    return returned_us;
+}
+
+/* Mirror of tick_one_msp430 for ARM/CC2538 nodes.  Applies the same
+ * Cooja MspClock-style per-node clock deviation, pins sim_time_ns across
+ * the slice, uses arm_step_micros for cycle-accurate accumulation, and
+ * returns the next-event lead time so the caller can self-schedule. */
+static int64_t tick_one_arm(int idx, int64_t sim_ns) {
+    arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
+    int64_t t_us = sim_ns / 1000LL;
+    int64_t jump_us = 0;
+
+    if (cpu->last_execute_us >= 0) {
+        jump_us = t_us - cpu->last_execute_us;
+        if (jump_us < 0) jump_us = 0;
+    }
+
+    /* Apply clock deviation (Cooja MspClock drift simulation) */
+    double deviation = nodes[idx].clock_deviation;
+    if (deviation != 1.0 && jump_us > 0) {
+        double exact = (double)jump_us * deviation;
+        jump_us = (int64_t)exact;
+        cpu->step_cycle_remainder += exact - (double)jump_us;
+        if (cpu->step_cycle_remainder > 1.0) {
+            jump_us++;
+            cpu->step_cycle_remainder -= 1.0;
+        }
+    }
+
+    /* Match Cooja's execute(t, duration): peripheral events raised during
+     * this slice should be scheduled relative to the scheduler's time t,
+     * not a cycle-derived local time.  Pin sim_time_ns before and after. */
+    cpu->sim_time_ns = sim_ns;
+    int64_t returned_us = arm_step_micros(cpu, jump_us, 1);
     cpu->sim_time_ns = sim_ns;
 
     if (deviation != 1.0 && returned_us > 0)
@@ -3786,17 +3883,17 @@ sim_restart:
                     int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
                     sim_eq_schedule_if_earlier(&sim_eq, i, next_ns);
                 } else {
-                    /* Emulated ARM: step to event time, then self-schedule. */
+                    /* Emulated ARM: use the same Cooja-style tick as MSP430
+                     * so peripheral events are anchored to the scheduler's
+                     * event time and the CPU accumulates cycle time with the
+                     * MSPSim stepMicros accuracy bound. */
                     ticking_node_idx = i;
-                    int64_t delta_ns = ev_time - node_sim_time_ns(i);
-                    if (delta_ns < 1000) delta_ns = 1000;  /* min 1µs */
-                    int64_t target_cycle;
-                    target_cycle = node_cycles(i) + arm_ns_to_cycles(delta_ns, node_freq(i));
-                    if (target_cycle <= node_cycles(i))
-                        target_cycle = node_cycles(i) + 1;
-                    step_node_until(i, target_cycle);
+                    int64_t returned_us = tick_one_arm(i, ev_time);
                     ticking_node_idx = -1;
-                    schedule_emulated_wakeup(&sim_eq, i);
+                    /* Match MspMote.execute(t, 1): schedule the next normal
+                     * wakeup based on the step_micros lead hint. */
+                    int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
+                    sim_eq_schedule_if_earlier(&sim_eq, i, next_ns);
                 }
 
                 /* RF delivery: if this node TX'd, schedule receivers
