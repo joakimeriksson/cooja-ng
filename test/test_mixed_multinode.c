@@ -30,6 +30,7 @@
 #include "sim_event_queue.h"
 #include "gdb_stub.h"
 #include "arm_gdb.h"
+#include "pcap_writer.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -211,6 +212,10 @@ static sim_event_queue_t sim_eq;              /* event queue (used by emu_delive
 static int uart_byte_count = 0;
 static radio_medium_t radio_medium;
 static int64_t current_sim_ns = 0;
+
+/* Optional pcap writer — opened by --pcap PATH, captures every TX frame
+ * once at the on-air timestamp. */
+static pcap_writer_t pcap_writer = { 0 };
 
 /* Statistics counters */
 static int stat_rf_frames = 0;       /* total TX frames (all node types) */
@@ -1168,8 +1173,11 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         node_states[sender_idx].radio_state = SIM_RADIO_ON;
     }
 
-    /* Packet analysis: decode and log frame contents */
-    if (ui_server || verbose) {
+    /* Packet analysis: decode and log frame contents.  Also feed the
+     * pcap writer if --pcap is active.  pcap_writer_is_open() is the
+     * cheap fast-path check; we still need to find the SFD/length to
+     * extract the on-air MAC frame. */
+    if (ui_server || verbose || pcap_writer_is_open(&pcap_writer)) {
         uint8_t *buf = tx_cap[sender_idx].bytes;
         int buf_len = tx_cap[sender_idx].len;
         int fstart = -1;
@@ -1180,6 +1188,15 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
             }
         }
         if (fstart >= 0 && fstart < buf_len) {
+            /* fstart points at the length byte; the MAC frame (FCF onwards,
+             * including the 2-byte FCS at the end) starts one byte later.
+             * Wireshark expects link type 195 to start at the FCF. */
+            int mac_off = fstart + 1;
+            int mac_len = buf_len - mac_off;
+            if (pcap_writer_is_open(&pcap_writer) && mac_len > 0) {
+                pcap_writer_packet(&pcap_writer, accurate_tx_start,
+                                   buf + mac_off, mac_len);
+            }
             pkt_info_t pinfo;
             int frame_len = buf_len - fstart;
             pkt_analyze(buf + fstart, frame_len, &pinfo);
@@ -2995,6 +3012,8 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * gdb_node[i] is the TCP port to bind for node i, or 0 = no stub. */
     int gdb_node[MAX_NODES] = { 0 };
     int gdb_wait = 0;  /* if true, block on first connect before starting sim */
+    /* Optional pcap output path (--pcap PATH) */
+    const char *pcap_path = NULL;
     sim_config_t config;
     int config_loaded = 0;
 
@@ -3028,6 +3047,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--gdb-wait") == 0) {
             gdb_wait = 1;
+        }
+        else if (strcmp(argv[i], "--pcap") == 0 && i + 1 < argc) {
+            pcap_path = argv[++i];
+        }
+        else if (strncmp(argv[i], "--pcap=", 7) == 0) {
+            pcap_path = argv[i] + 7;
         }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-q") == 0) verbose = 0;
@@ -3151,6 +3176,19 @@ sim_restart:
                    nodes[i].id, gdb_node[i]);
             if (gdb_stub_wait_for_client(&gdb_stubs[i]) != 0)
                 fprintf(stderr, "  Node %d: GDB wait failed\n", nodes[i].id);
+        }
+    }
+
+    /* PCAP capture: open the file and arm the TX hook in the frame
+     * delivery path.  All frame transmissions will be captured at the
+     * sender's on-air timestamp until the writer is closed at end. */
+    if (pcap_path) {
+        if (pcap_writer_open(&pcap_writer, pcap_path,
+                             PCAP_LINKTYPE_IEEE802_15_4_WITHFCS) == 0) {
+            printf("  PCAP: writing 802.15.4 capture to %s\n", pcap_path);
+        } else {
+            fprintf(stderr, "  PCAP: failed to open %s for writing\n", pcap_path);
+            pcap_path = NULL;
         }
     }
 
@@ -4381,6 +4419,11 @@ sim_restart:
     }
 
     printf("\n--- Simulation complete ---\n");
+    if (pcap_writer_is_open(&pcap_writer)) {
+        printf("  PCAP: wrote %lld frames to %s\n",
+               (long long)pcap_writer.packet_count, pcap_path);
+        pcap_writer_close(&pcap_writer);
+    }
     extern void msp430_timer_dump_ccr_counts(void);
     msp430_timer_dump_ccr_counts();
     extern int msp430_gpio_get_isr_count(void);
