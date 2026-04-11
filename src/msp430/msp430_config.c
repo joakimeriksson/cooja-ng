@@ -107,12 +107,12 @@ const msp430_config_t msp430f2617_config = {
     .is_msp430x       = true,
     .max_mem          = 0x100000,    /* 1MB */
     .max_mem_io       = 0x200,       /* IO space 0x0000-0x01FF */
-    .max_interrupt    = 31,
+    .max_interrupt    = 31,          /* MSP430X: 32 vectors */
 
     .ram_start        = 0x1100,
     .ram_size         = 8 * 1024,    /* 8KB */
-    .ram_mirror_start = 0,
-    .ram_mirror_size  = 0,
+    .ram_mirror_start = 0x0200,
+    .ram_mirror_size  = 2 * 1024,    /* 2KB mirror of 0x1100-0x18FF */
 
     .main_flash_start = 0x3100,
     .main_flash_size  = 92 * 1024,   /* 92KB */
@@ -126,22 +126,22 @@ const msp430_config_t msp430f2617_config = {
     .timer_a_base     = 0x160,
     .timer_a_iv       = 0x12E,
     .timer_a_num_ccr  = 3,
-    .timer_a_ccr0_vec = 6,
-    .timer_a_ccr1_vec = 5,
+    .timer_a_ccr0_vec = 25,          /* __isr_25: timera0 (CCR0) */
+    .timer_a_ccr1_vec = 24,          /* __isr_24: timera1 (CCR1+, overflow) */
 
     .timer_b_base     = 0x180,
     .timer_b_iv       = 0x11E,
     .timer_b_num_ccr  = 7,
-    .timer_b_ccr0_vec = 13,
-    .timer_b_ccr1_vec = 12,
+    .timer_b_ccr0_vec = 29,          /* __isr_29: Timer_B CCR0 */
+    .timer_b_ccr1_vec = 28,          /* __isr_28: cc2420_timerb1 (CCR1+) */
 
     .bcs_base         = 0x56,
-    .max_dco_freq     = 16000000,
+    .max_dco_freq     = 9000000,       /* matches MSPSim getMaxClockSpeed() */
 
     .gpio_num_ports   = 8,
     .gpio_ports       = {
-        { .base_addr = 0x20, .interrupt_vector = 4 },   /* P1 */
-        { .base_addr = 0x28, .interrupt_vector = 1 },   /* P2 */
+        { .base_addr = 0x20, .interrupt_vector = 18 },  /* P1: __isr_18 (port1_isr) */
+        { .base_addr = 0x28, .interrupt_vector = 19 },  /* P2: __isr_19 (irq_p2) */
         { .base_addr = 0x18, .interrupt_vector = -1 },  /* P3 */
         { .base_addr = 0x1C, .interrupt_vector = -1 },  /* P4 */
         { .base_addr = 0x30, .interrupt_vector = -1 },  /* P5 */

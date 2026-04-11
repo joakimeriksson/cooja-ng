@@ -65,7 +65,8 @@ static void clock_write(void *user_data, uint32_t addr, int value, bool word, in
         break;
     case 2:
         clk->bcsctl2 = (uint8_t)value;
-        clk->div_smclk = 1 << ((value >> 1) & 3);
+        /* Match MSPSim: divSMclk = 1 << ((data >> 2) & 3) */
+        clk->div_smclk = 1 << ((value >> 2) & 3);
         recalculate_dco(clk);
         notify_timers(clk);
         break;
