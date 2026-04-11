@@ -8,6 +8,42 @@
 #include "cc2420.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+static int trace_tsch_ack = -1;
+static int trace_tsch_ack_lines = 0;
+#define TRACE_TSCH_ACK_START_NS 12000000000LL
+#define TRACE_TSCH_ACK_END_NS   16000000000LL
+#define TRACE_TSCH_ACK_MAX_LINES 2000
+
+static bool trace_tsch_ack_enabled(void) {
+    if (trace_tsch_ack < 0) {
+        const char *env = getenv("CSIM_TRACE_TSCH_ACK");
+        trace_tsch_ack = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return trace_tsch_ack != 0;
+}
+
+static const char *cc2420_state_str(cc2420_radio_state_t s) {
+    switch (s) {
+    case CC2420_VREG_OFF: return "VREG_OFF";
+    case CC2420_POWER_DOWN: return "POWER_DOWN";
+    case CC2420_IDLE: return "IDLE";
+    case CC2420_RX_CALIBRATE: return "RX_CAL";
+    case CC2420_RX_SFD_SEARCH: return "RX_SFD";
+    case CC2420_RX_WAIT: return "RX_WAIT";
+    case CC2420_RX_FRAME: return "RX_FRAME";
+    case CC2420_RX_OVERFLOW: return "RX_OVERFLOW";
+    case CC2420_TX_CALIBRATE: return "TX_CAL";
+    case CC2420_TX_PREAMBLE: return "TX_PREAMBLE";
+    case CC2420_TX_FRAME: return "TX_FRAME";
+    case CC2420_TX_ACK_CALIBRATE: return "TX_ACK_CAL";
+    case CC2420_TX_ACK_PREAMBLE: return "TX_ACK_PREAMBLE";
+    case CC2420_TX_ACK: return "TX_ACK";
+    case CC2420_TX_UNDERFLOW: return "TX_UNDERFLOW";
+    default: return "UNKNOWN";
+    }
+}
 
 /* SHR (Synchronization Header): 4 preamble bytes + SFD */
 static const uint8_t SHR[5] = { 0x00, 0x00, 0x00, 0x00, 0x7A };
@@ -122,6 +158,30 @@ static void set_fifop(cc2420_t *r, bool val) {
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_FIFOP_POLARITY)
         pin_val = !pin_val;
     msp430_gpio_set_input_pin(r->gpio, r->fifop_port, r->fifop_pin, pin_val);
+
+    /* For Cooja-built firmware: ensure FIFOP interrupt fires reliably.
+     * MSPSim's CC2420 calls IOPort.setPinState() which directly updates
+     * IFG on rising edge and calls updateIV(). We emulate this by:
+     * 1. Auto-enable P1IE for the FIFOP pin
+     * 2. Force IFG set on FIFOP rising edge (frame available)
+     * 3. Clear IFG on FIFOP falling edge (frame read / RXFIFO flushed)
+     *    Without clearing, the Z1 shared port1_isr loops infinitely
+     *    because the CC2420 code path doesn't clear P1IFG. */
+    if (r->fifop_port >= 1 && r->fifop_port <= r->gpio->num_ports) {
+        int idx = r->fifop_port - 1;
+        msp430_gpio_port_t *port = &r->gpio->ports[idx];
+        if (port->has_interrupt) {
+            uint8_t bit = (1 << r->fifop_pin);
+            port->ie |= bit;
+            if (val) {
+                port->ifg |= bit;   /* Rising edge: set IFG */
+            } else {
+                port->ifg &= ~bit;  /* Falling edge: clear IFG */
+            }
+            extern void msp430_gpio_update_interrupt(msp430_gpio_t *gpio, int port_idx);
+            msp430_gpio_update_interrupt(r->gpio, idx);
+        }
+    }
 }
 
 static void set_fifo(cc2420_t *r, bool val) {
@@ -139,6 +199,9 @@ static void set_sfd(cc2420_t *r, bool val) {
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_SFD_POLARITY)
         pin_val = !pin_val;
     msp430_gpio_set_input_pin(r->gpio, r->sfd_port, r->sfd_pin, pin_val);
+    /* Notify Timer B capture (SFD timestamping for TSCH) */
+    if (r->sfd_callback)
+        r->sfd_callback(r->sfd_callback_data, pin_val);
 }
 
 static void set_cca(cc2420_t *r, bool val) {
@@ -170,6 +233,8 @@ static void update_cca(cc2420_t *r) {
  * State transitions
  * ================================================================ */
 
+static void set_state(cc2420_t *r, cc2420_radio_state_t new_state);
+
 static void flush_rx(cc2420_t *r) {
     r->rx_fifo_write_pos = 0;
     r->rx_fifo_read_pos = 0;
@@ -184,6 +249,17 @@ static void flush_rx(cc2420_t *r) {
     set_fifo(r, false);
     set_fifop(r, false);
     set_sfd(r, false);
+    /* Match MSPSim: transition back to RX_SFD_SEARCH if in any RX state.
+     * Without this, the radio stays stuck in RX_FRAME/RX_OVERFLOW after
+     * SFLUSHRX and can never receive new frames. */
+    if (r->state == CC2420_RX_CALIBRATE ||
+        r->state == CC2420_RX_SFD_SEARCH ||
+        r->state == CC2420_RX_FRAME ||
+        r->state == CC2420_RX_OVERFLOW ||
+        r->state == CC2420_RX_WAIT) {
+        msp430_cancel_event(r->cpu, &r->symbol_event);
+        set_state(r, CC2420_RX_SFD_SEARCH);
+    }
 }
 
 static void flush_tx(cc2420_t *r) {
@@ -223,8 +299,6 @@ static void sfd_clear_callback(void *user_data, msp430_event_t *event) {
 static void shr_next(cc2420_t *r);
 static void tx_next(cc2420_t *r);
 static void ack_next(cc2420_t *r);
-
-static void set_state(cc2420_t *r, cc2420_radio_state_t new_state);
 
 static void symbol_event_callback(void *user_data, msp430_event_t *event) {
     cc2420_t *r = (cc2420_t *)user_data;
@@ -273,7 +347,19 @@ static void schedule_symbols(cc2420_t *r, int symbols) {
 }
 
 static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
+    cc2420_radio_state_t old_state = r->state;
     r->state = new_state;
+
+    if (trace_tsch_ack_enabled() && trace_tsch_ack_lines < TRACE_TSCH_ACK_MAX_LINES &&
+        r->node_id > 0 && r->node_id <= 2 &&
+        old_state != new_state &&
+        r->cpu->sim_time_ns >= TRACE_TSCH_ACK_START_NS &&
+        r->cpu->sim_time_ns <= TRACE_TSCH_ACK_END_NS) {
+        fprintf(stderr, "  [TRACE] %7.3f cc2420 node=%d state %s -> %s\n",
+                (double)r->cpu->sim_time_ns / 1e9, r->node_id,
+                cc2420_state_str(old_state), cc2420_state_str(new_state));
+        trace_tsch_ack_lines++;
+    }
 
     switch (new_state) {
     case CC2420_VREG_OFF:
@@ -311,6 +397,7 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
             int count = r->rx_incoming_count;
             r->rx_incoming_count = 0;
             rx_bytes_replayed += count;
+            r->stat_rx_replayed += count;
             for (int i = 0; i < count; i++)
                 cc2420_receive_byte(r, r->rx_incoming[i]);
         }
@@ -320,6 +407,8 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
         r->rxread = 0;
         r->rxlen = 0;
         r->frame_rejected = false;
+        r->should_ack = false;
+        r->crc_ok = false;
         rxfifo_mark(r);
         break;
 
@@ -343,7 +432,10 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
     case CC2420_TX_FRAME:
         r->tx_fifo_pos = 0;
         r->crc_ok = false;
-        tx_next(r);
+        /* Match MSPSim's event ordering: once SHR completes, the first
+         * frame byte is emitted on the next radio byte event, not at the
+         * same instant as SFD. */
+        schedule_symbols(r, 2);
         break;
 
     case CC2420_TX_ACK_CALIBRATE:
@@ -351,8 +443,8 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
         msp430_cancel_event(r->cpu, &r->sfd_clear_event);
         set_sfd(r, false);  /* clear SFD from received frame before ACK TX */
         r->status |= CC2420_STATUS_TX_ACTIVE;
-        /* aTurnaroundTime = 12 symbols per 802.15.4 spec */
-        schedule_symbols(r, 12);
+        /* Match MSPSim: 12 turnaround + 2 extra + 2 extra. */
+        schedule_symbols(r, 16);
         break;
 
     case CC2420_TX_ACK_PREAMBLE:
@@ -362,7 +454,10 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
         break;
 
     case CC2420_TX_ACK:
-        ack_next(r);
+        /* Same ordering as normal TX: after SFD, emit the first ACK byte
+         * on the next byte event so receivers observe a distinct length
+         * byte after the SHR. */
+        schedule_symbols(r, 2);
         break;
 
     default:
@@ -477,20 +572,26 @@ void cc2420_get_rx_stats(int *started, int *completed, int *rejected,
     *dropped = rx_bytes_dropped;
 }
 
+int cc2420_get_auto_ack_count(void) { return auto_ack_count; }
+
 void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
     cc2420_t *r = radio;
 
     if (r->state != CC2420_RX_SFD_SEARCH && r->state != CC2420_RX_FRAME) {
-        /* Buffer bytes in any non-RX state — they'll be processed when the
-         * radio transitions to RX_SFD_SEARCH.  In our batch-delivery
-         * simulation model, bytes may arrive when the radio is briefly in
-         * IDLE, TX, or other transient states. */
-        if (r->rx_incoming_count < 256) {
-            r->rx_incoming[r->rx_incoming_count++] = data;
-            rx_bytes_buffered++;
-            return;
+        /* Match MSPSim CC2420.receivedByte(): bytes that arrive while the
+         * radio is not actively searching for SFD / receiving a frame are
+         * ignored, not replayed later from a side buffer. */
+        if (trace_tsch_ack_enabled() && trace_tsch_ack_lines < TRACE_TSCH_ACK_MAX_LINES &&
+            r->node_id > 0 && r->node_id <= 2 &&
+            r->cpu->sim_time_ns >= TRACE_TSCH_ACK_START_NS &&
+            r->cpu->sim_time_ns <= TRACE_TSCH_ACK_END_NS) {
+            fprintf(stderr, "  [TRACE] %7.3f cc2420 node=%d drop byte=%02x state=%s\n",
+                    (double)r->cpu->sim_time_ns / 1e9, r->node_id, data,
+                    cc2420_state_str(r->state));
+            trace_tsch_ack_lines++;
         }
         rx_bytes_dropped++;
+        r->stat_rx_dropped++;
         return;
     }
 
@@ -502,15 +603,17 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
         } else if (r->zero_symbols >= 4 && data == 0x7A) {
             /* Preamble + SFD detected */
             rx_frames_started++;
+            r->stat_rx_started++;
             set_sfd(r, true);
             set_state(r, CC2420_RX_FRAME);
         } else {
             r->zero_symbols = 0;
         }
     } else if (r->state == CC2420_RX_FRAME) {
-        if (r->overflow) { rx_bytes_dropped++; return; }
+        if (r->overflow) { rx_bytes_dropped++; r->stat_rx_dropped++; return; }
         if (rxfifo_full(r)) {
             rx_frames_overflow++;
+            r->stat_rx_overflow++;
             set_rx_overflow(r);
             return;
         }
@@ -593,6 +696,7 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
             /* End of frame */
             if (r->frame_rejected) {
                 rx_frames_rejected++;
+                r->stat_rx_rejected++;
                 set_sfd(r, false);
                 set_state(r, CC2420_RX_WAIT);
                 return;
@@ -615,8 +719,13 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
             uint16_t calc_crc_hi = bitrev((rx_crc >> 8) & 0xFF);
             uint16_t calc_crc_bitrev = calc_crc_lo | (calc_crc_hi << 8);
             r->crc_ok = (recv_crc == calc_crc_bitrev);
-            if (r->crc_ok) rx_crc_ok++; else rx_crc_fail++;
+            if (r->crc_ok) { rx_crc_ok++; r->stat_crc_ok++; }
+            else { rx_crc_fail++; r->stat_crc_fail++; }
             rx_frames_completed++;
+            r->stat_rx_completed++;
+            if (r->frame_type == CC2420_FRAME_TYPE_ACK) {
+                r->stat_rx_ack_completed++;
+            }
 
             /* Replace last 2 bytes with RSSI + (corrval | crc_ok<<7) */
             uint8_t rssi_val = (uint8_t)(int8_t)r->rx_rssi;
@@ -641,38 +750,14 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
                 msp430_schedule_event_ns(r->cpu, &r->sfd_clear_event, fire_ns);
             }
 
-            /* Auto-ACK: emit bytes immediately so that in the time-stepped
-             * simulation the ACK is available during the same delivery pass.
-             * Without this, the event-driven TX_ACK state machine would only
-             * emit bytes during CPU stepping, adding 1+ time steps of latency
-             * (~750 us) which exceeds the CSMA ACK timeout (~400 us).
-             * This matches the CC2538 RF Core approach (cc2538_rfcore.c:576). */
+            /* Match MSPSim: a good ACK-requesting frame transitions the
+             * receiver radio state machine into TX_ACK_CALIBRATE. ACK bytes
+             * are emitted by ack_next() during subsequent CPU stepping, not
+             * synthesized inline here. */
             if (((r->auto_ack && r->ack_request) || r->should_ack) && r->crc_ok) {
                 auto_ack_count++;
-                if (r->rf_tx_callback) {
-                    /* SHR: 4 preamble bytes + SFD */
-                    static const uint8_t SHR_SEQ[] = {0x00, 0x00, 0x00, 0x00, 0x7A};
-                    for (int k = 0; k < 5; k++)
-                        r->rf_tx_callback(r->rf_tx_data, SHR_SEQ[k]);
-
-                    /* ACK frame: length(1) + FCF(2) + DSN(1) + CRC(2) */
-                    uint8_t ack[6];
-                    ack[0] = 5;    /* length */
-                    ack[1] = 0x02; /* FCF low: ACK frame type */
-                    ack[2] = 0x00; /* FCF high */
-                    if (r->ack_frame_pending)
-                        ack[1] |= 0x10;
-                    ack[3] = (uint8_t)r->dsn;
-                    uint16_t crc = 0;
-                    for (int k = 1; k <= 3; k++)
-                        crc = crc_add_bitrev(crc, ack[k]);
-                    ack[4] = bitrev((crc >> 8) & 0xFF);
-                    ack[5] = bitrev(crc & 0xFF);
-                    for (int k = 0; k < 6; k++)
-                        r->rf_tx_callback(r->rf_tx_data, ack[k]);
-                }
-                r->ack_frame_pending = false;
-                set_state(r, CC2420_RX_CALIBRATE);
+                r->stat_auto_ack++;
+                set_state(r, CC2420_TX_ACK_CALIBRATE);
             } else {
                 set_state(r, CC2420_RX_WAIT);
             }
@@ -728,6 +813,7 @@ static void set_reg(cc2420_t *r, int addr, uint16_t value) {
 static void start_oscillator(cc2420_t *r);
 static void stop_oscillator(cc2420_t *r);
 
+
 static void strobe(cc2420_t *r, int cmd) {
     /* In POWER_DOWN, only SXOSCON is accepted */
     if (r->state == CC2420_POWER_DOWN && cmd != CC2420_REG_SXOSCON)
@@ -742,11 +828,13 @@ static void strobe(cc2420_t *r, int cmd) {
         break;
 
     case CC2420_REG_SRXON:
+        r->stat_strobe_srxon++;
         if (r->state == CC2420_IDLE)
             set_state(r, CC2420_RX_CALIBRATE);
         break;
 
     case CC2420_REG_STXON:
+        r->stat_strobe_stxon++;
         if (r->state == CC2420_IDLE ||
             r->state == CC2420_RX_CALIBRATE ||
             r->state == CC2420_RX_SFD_SEARCH ||
@@ -754,11 +842,13 @@ static void strobe(cc2420_t *r, int cmd) {
             r->state == CC2420_RX_OVERFLOW ||
             r->state == CC2420_RX_WAIT) {
             r->status |= CC2420_STATUS_TX_ACTIVE;
+            r->stat_tx_calibrate++;
             set_state(r, CC2420_TX_CALIBRATE);
         }
         break;
 
     case CC2420_REG_STXONCCA:
+        r->stat_strobe_stxoncca++;
         if (r->state == CC2420_RX_CALIBRATE ||
             r->state == CC2420_RX_SFD_SEARCH ||
             r->state == CC2420_RX_FRAME ||
@@ -766,12 +856,14 @@ static void strobe(cc2420_t *r, int cmd) {
             r->state == CC2420_RX_WAIT) {
             if (r->current_cca) {
                 r->status |= CC2420_STATUS_TX_ACTIVE;
+                r->stat_tx_calibrate++;
                 set_state(r, CC2420_TX_CALIBRATE);
             }
         }
         break;
 
     case CC2420_REG_SRFOFF:
+        r->stat_strobe_srfoff++;
         set_state(r, CC2420_IDLE);
         break;
 
@@ -879,6 +971,7 @@ uint8_t cc2420_spi_exchange(cc2420_t *radio, uint8_t data) {
     uint8_t old_status = r->status;
 
     spi_exchange_count++;
+    r->stat_spi_count++;
     if (!r->chip_select) return 0;
     if (r->state == CC2420_VREG_OFF) return 0;
 
@@ -1011,9 +1104,14 @@ uint8_t cc2420_spi_exchange(cc2420_t *radio, uint8_t data) {
 
 static void cc2420_reset(cc2420_t *r) {
     memset(r->registers, 0, sizeof(r->registers));
-    r->registers[CC2420_REG_TXCTRL] = 0xA0FF;
+    /* CC2420 datasheet register defaults */
     set_reg(r, CC2420_REG_MDMCTRL0, 0x0AE2);
-    r->registers[CC2420_REG_RSSI] = 0xE080;  /* threshold=0xE0, value=0x80 */
+    r->registers[CC2420_REG_RSSI] = 0xE080;
+    r->registers[CC2420_REG_TXCTRL] = 0xA0FF;
+    r->registers[CC2420_REG_FSCTRL] = 0x4165;  /* channel 26 */
+    r->registers[CC2420_REG_IOCFG0] = 0x0040;  /* FIFOP threshold */
+    r->registers[CC2420_REG_MANFIDL] = 0x233D;  /* manufacturer ID */
+    r->registers[CC2420_REG_MANFIDH] = 0x2000;
 
     r->status = 0;
     r->spi_state = CC2420_SPI_WAITING;
