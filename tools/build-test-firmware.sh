@@ -35,6 +35,13 @@ resolve_contiki_dir() {
     CONTIKI_DIR="$(cd "$CONTIKI_DIR" && pwd)"
 }
 
+# Strip variant suffix from firmware name to find the source .c file.
+# Handles hash suffixes (node-378324 -> node) and routing-variant
+# suffixes (receiver-node-classic -> receiver-node).
+strip_variant_suffix() {
+    echo "$1" | sed -E 's/-(classic|storing|non-storing)$//; s/-[0-9a-f]{6}$//'
+}
+
 # Build a single firmware
 # Args: fw_name src_dir target_ext output_file extra_make_args...
 build_one() {
@@ -51,10 +58,21 @@ build_one() {
         return
     fi
 
-    if [ -z "$src_dir" ] || [ ! -f "$src_dir/$fw.c" ]; then
+    # The firmware name may have a hash suffix (e.g., node-378324) derived
+    # from make_args.  The actual source file uses the base name (node.c).
+    local fw_base
+    fw_base="$(strip_variant_suffix "$fw")"
+
+    if [ -z "$src_dir" ] || { [ ! -f "$src_dir/$fw.c" ] && [ ! -f "$src_dir/$fw_base.c" ]; }; then
         echo "  MISS $fw (source not found: $src_dir)"
         echo "fail" >> "$RESULTS_FILE"
         return
+    fi
+
+    # Determine which source name to build
+    local build_name="$fw"
+    if [ ! -f "$src_dir/$fw.c" ] && [ -f "$src_dir/$fw_base.c" ]; then
+        build_name="$fw_base"
     fi
 
     local extra_info=""
@@ -66,15 +84,17 @@ build_one() {
     (
         cd "$src_dir"
         make TARGET="$target" clean >/dev/null 2>&1 || true
-        if make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" TARGET="$target" "$fw.$target" \
-            WERROR=0 CONTIKI="$CONTIKI_DIR" $extra_args >/dev/null 2>&1; then
+        if make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" TARGET="$target" "$build_name.$target" \
+            WERROR=0 CONTIKI="$CONTIKI_DIR" COOJA_CI=1 $extra_args >/dev/null 2>&1; then
             # Contiki-NG may place output in build/<target>/ or current dir
-            if [ -f "$fw.$target" ]; then
-                cp "$fw.$target" "$target_file"
-            elif [ -f "build/$target/$fw.$target" ]; then
-                cp "build/$target/$fw.$target" "$target_file"
+            local built_file=""
+            if [ -f "$build_name.$target" ]; then
+                built_file="$build_name.$target"
+            elif [ -f "build/$target/$build_name.$target" ]; then
+                built_file="build/$target/$build_name.$target"
             fi
-            if [ -f "$target_file" ]; then
+            if [ -n "$built_file" ]; then
+                cp "$built_file" "$target_file"
                 echo "    -> $target_file"
             else
                 echo "    FAILED: output not found"

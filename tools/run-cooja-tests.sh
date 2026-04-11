@@ -22,6 +22,7 @@ TEST_RUNNER="$CSIM_DIR/build/test_runner"
 TEST_PATTERN="*"
 VERBOSE=""
 AUTO_BUILD=1
+WITH_TUN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -31,11 +32,15 @@ while [ $# -gt 0 ]; do
         --no-build)
             AUTO_BUILD=0
             ;;
+        --with-tun)
+            WITH_TUN=1
+            ;;
         -h|--help)
-            echo "Usage: $0 [test-dir-pattern] [-v] [--no-build]"
+            echo "Usage: $0 [test-dir-pattern] [-v] [--no-build] [--with-tun]"
             echo "  test-dir-pattern: glob to filter test dirs (e.g. '07-*' or '14-rpl-lite')"
             echo "  -v, --verbose: show test output"
             echo "  --no-build: skip auto-building missing firmware"
+            echo "  --with-tun: include border-router tests (requires sudo for TUN)"
             echo ""
             echo "CONTIKI_DIR resolution: env variable -> csim.conf -> ../contiki-ng"
             exit 0
@@ -89,8 +94,12 @@ echo "  Firmware target: $FIRMWARE_TARGET"
 echo "  Firmware dir: $FIRMWARE_DIR"
 echo ""
 
-# Skip patterns: border-router (requires TUN interface)
-SKIP_PATTERNS="border-router|tun-rpl-br"
+# Skip patterns: border-router tests require TUN (sudo)
+if [ "$WITH_TUN" -eq 0 ]; then
+    SKIP_PATTERNS="border-router|tun-rpl-br"
+else
+    SKIP_PATTERNS=""
+fi
 
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
@@ -117,8 +126,18 @@ run_test() {
     log_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').log"
     printf "  RUN   %-60s" "$test_name"
 
+    # Per-test wall-clock timeout (5 minutes default, longer for some tests)
+    local wall_timeout=300
+    if grep -q serial_socket "$json_file" 2>/dev/null; then
+        wall_timeout=600
+    fi
+    # TSCH drift test simulates 600s at ~2x speed, needs longer wall time
+    if echo "$test_name" | grep -q "tsch-drift"; then
+        wall_timeout=600
+    fi
+
     start_time=$(date +%s)
-    if "$TEST_RUNNER" mixed-multinode "$json_file" $VERBOSE > "$log_file" 2>&1; then
+    if timeout "$wall_timeout" "$TEST_RUNNER" mixed-multinode "$json_file" $VERBOSE > "$log_file" 2>&1; then
         exit_code=0
     else
         exit_code=$?
@@ -142,14 +161,21 @@ run_test() {
     fi
 }
 
-for csc_file in "$CONTIKI_DIR"/tests/$TEST_PATTERN/*.csc; do
+# Support both directory patterns (17-tun-rpl-br) and specific tests
+# (17-tun-rpl-br/03-border-router-sky)
+if [ -f "$CONTIKI_DIR/tests/$TEST_PATTERN.csc" ]; then
+    csc_files="$CONTIKI_DIR/tests/$TEST_PATTERN.csc"
+else
+    csc_files="$CONTIKI_DIR/tests/$TEST_PATTERN/*.csc"
+fi
+for csc_file in $csc_files; do
     [ -f "$csc_file" ] || continue
     total=$((total + 1))
 
     test_name="$(basename "$(dirname "$csc_file")")/$(basename "$csc_file" .csc)"
 
-    # Skip TSCH and known-unsupported tests
-    if echo "$test_name" | grep -qiE "$SKIP_PATTERNS"; then
+    # Skip known-unsupported tests
+    if [ -n "$SKIP_PATTERNS" ] && echo "$test_name" | grep -qiE "$SKIP_PATTERNS"; then
         echo "  SKIP  $test_name (filtered)"
         SKIPPED_TESTS="$SKIPPED_TESTS
   - $test_name (filtered)"
@@ -160,7 +186,7 @@ for csc_file in "$CONTIKI_DIR"/tests/$TEST_PATTERN/*.csc; do
 
     # Convert .csc to JSON with native JS execution
     json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
-    if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
+    if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
         echo "  ERROR $test_name (conversion failed)"
         errors=$((errors + 1))
         continue
@@ -176,7 +202,8 @@ has_steps = len(t.get('steps', [])) > 0
 has_fail_on = len(t.get('fail_on', [])) > 0
 has_tis = t.get('timeout_is_success', False)
 has_js = 'js_script_inline' in t
-if has_steps or has_fail_on or has_tis or has_js:
+has_ss = 'serial_socket' in d
+if has_steps or has_fail_on or has_tis or has_js or has_ss:
     print('yes')
 " 2>/dev/null || true)
 
@@ -253,7 +280,7 @@ if [ "$need_rebuild_count" -gt 0 ]; then
         [ -f "$csc_file" ] || continue
 
         json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
-        if ! python3 "$CSC2JSON" "$csc_file" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
+        if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
             echo "  ERROR $test_name (conversion failed)"
             errors=$((errors + 1))
             continue

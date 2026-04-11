@@ -84,6 +84,10 @@ def extract_mote_types(sim_elem, csc_dir):
                     id_elem = ic.find("id")
                     if id_elem is not None and id_elem.text:
                         mote_info["id"] = int(id_elem.text.strip())
+                elif "Clock" in ic_text:
+                    dev_elem = ic.find("deviation")
+                    if dev_elem is not None and dev_elem.text:
+                        mote_info["clock_deviation"] = float(dev_elem.text.strip())
             motes.append(mote_info)
 
         if desc:
@@ -233,6 +237,11 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
                     id_elem = ic.find("id")
                     if id_elem is not None and id_elem.text:
                         node["id"] = int(id_elem.text.strip())
+                elif "Clock" in ic_text:
+                    dev_elem = ic.find("deviation")
+                    if dev_elem is not None and dev_elem.text:
+                        node["clock_deviation"] = float(dev_elem.text.strip())
+            node["_mote_type_desc"] = desc
             nodes.append(node)
 
     # Sort by ID if all have IDs
@@ -287,6 +296,130 @@ def extract_script(root, csc_dir):
             else:
                 print(f"WARNING: script file not found: {sf_path}", file=sys.stderr)
                 return None
+
+    return None
+
+
+def extract_mobility(root, csc_dir, nodes):
+    """Extract move actions from the Mobility plugin.
+
+    The Cooja Mobility plugin reads a text file where each line is:
+        mote_index  time_seconds  x  y
+    mote_index is 0-based into the simulation mote list.
+    Returns a list of action dicts compatible with the test actions format.
+    """
+    for plugin in root.findall("plugin"):
+        plugin_text = (plugin.text or "").strip()
+        if "Mobility" not in plugin_text:
+            continue
+
+        pc = plugin.find("plugin_config")
+        if pc is None:
+            continue
+
+        pos_elem = pc.find("positions")
+        if pos_elem is None or not pos_elem.text:
+            continue
+
+        dat_path = pos_elem.text.strip()
+        dat_path = dat_path.replace("[CONFIG_DIR]", csc_dir)
+        if not os.path.exists(dat_path):
+            print(f"WARNING: mobility file not found: {dat_path}",
+                  file=sys.stderr)
+            return []
+
+        # Build mote_index -> node_id map from the nodes list
+        index_to_id = {}
+        for i, n in enumerate(nodes):
+            index_to_id[i] = n.get("id", i + 1)
+
+        actions = []
+        with open(dat_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                mote_idx = int(parts[0])
+                time_sec = float(parts[1])
+                x = float(parts[2])
+                y = float(parts[3])
+
+                node_id = index_to_id.get(mote_idx)
+                if node_id is None:
+                    continue  # mote index out of range
+
+                actions.append({
+                    "type": "move",
+                    "at_ms": int(time_sec * 1000),
+                    "node": node_id,
+                    "x": x,
+                    "y": y,
+                })
+
+        return actions
+
+    return []
+
+
+def extract_serial_socket(root, csc_dir, contiki_dir, nodes):
+    """Extract SerialSocketServer plugin config.
+
+    Returns a dict with port, node (ID), and command, or None.
+    """
+    for plugin in root.findall("plugin"):
+        plugin_text = (plugin.text or "").strip()
+        if "SerialSocketServer" not in plugin_text:
+            continue
+
+        # mote_arg is the mote INDEX (0-based)
+        mote_arg_elem = plugin.find("mote_arg")
+        mote_idx = 0
+        if mote_arg_elem is not None and mote_arg_elem.text:
+            mote_idx = int(mote_arg_elem.text.strip())
+
+        # Map mote index to node ID
+        node_id = mote_idx + 1  # default
+        if mote_idx < len(nodes):
+            node_id = nodes[mote_idx].get("id", mote_idx + 1)
+
+        pc = plugin.find("plugin_config")
+        if pc is None:
+            continue
+
+        port = 60001
+        port_elem = pc.find("port")
+        if port_elem is not None and port_elem.text:
+            port = int(port_elem.text.strip())
+
+        command = ""
+        cmd_elem = pc.find("commands")
+        if cmd_elem is not None and cmd_elem.text:
+            raw_cmd = cmd_elem.text.strip()
+            # Replace placeholders
+            raw_cmd = raw_cmd.replace("[CONFIG_DIR]", csc_dir)
+            if contiki_dir:
+                raw_cmd = raw_cmd.replace("[CONTIKI_DIR]", contiki_dir)
+
+            # Rewrite to use csim's test-border-router.sh wrapper instead of
+            # Contiki-NG's script (which uses make + requires cross-compiler).
+            # Extract args: test-border-router.sh CONTIKI BASENAME IPADDR WAIT [SIZE] [DELAY]
+            # or: test-native-border-router.sh CONTIKI BASENAME IPADDR WAIT [SIZE] [DELAY]
+            csim_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            csim_wrapper = os.path.join(csim_dir, "tools", "test-border-router.sh")
+            parts = raw_cmd.split()
+            # Find the original script and extract its args
+            for i, p in enumerate(parts):
+                if "test-border-router.sh" in p or "test-native-border-router.sh" in p:
+                    args = parts[i + 1:]  # everything after the script name
+                    command = " ".join([csim_wrapper] + args)
+                    break
+            if not command:
+                command = raw_cmd  # fallback to original
+
+        return {"port": port, "node": node_id, "command": command}
 
     return None
 
@@ -1017,6 +1150,21 @@ def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False):
     if nodes:
         config["nodes"] = nodes
 
+    # Mote types (ordered list for getMoteTypes()[index] references)
+    mote_type_list = []
+    for mt in sim.findall("motetype"):
+        desc_elem = mt.find("description")
+        desc = desc_elem.text.strip() if desc_elem is not None and desc_elem.text else ""
+        # Find the firmware path for this type from the first node of this type
+        fw = None
+        for n in nodes:
+            if n.get("_mote_type_desc") == desc:
+                fw = n["firmware"]
+                break
+        mote_type_list.append({"description": desc, "firmware": fw})
+    if mote_type_list:
+        config["mote_types"] = mote_type_list
+
     # Test script
     script = extract_script(root, csc_dir)
     if script:
@@ -1039,6 +1187,48 @@ def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False):
                 config["test"] = test_config
     else:
         warnings.append("No test script found in .csc file")
+
+    # Mobility plugin -> move actions
+    mobility_actions = extract_mobility(root, csc_dir, nodes)
+    if mobility_actions:
+        if "test" not in config:
+            config["test"] = {}
+        existing = config["test"].get("actions", [])
+        merged = existing + mobility_actions
+        merged.sort(key=lambda a: a.get("at_ms", 0))
+        config["test"]["actions"] = merged
+
+    # SerialSocketServer plugin -> serial_socket config
+    ss = extract_serial_socket(root, csc_dir, contiki_dir, nodes)
+    if ss:
+        config["serial_socket"] = ss
+        # Speed=1.0: sim time must match wall time because the external
+        # command (tunslip6 + sleep + ping) runs in wall-clock time.
+        # Without speed limit, the sim exhausts its timeout before the
+        # external command's convergence wait finishes.
+        config["speed"] = 1.0
+        # Override huge JS timeouts — the test is driven by the external command.
+        # Parse wait_time from command args and add margin for ping/setup.
+        cmd = ss.get("command", "")
+        wait_time = 120  # default 120 seconds
+        parts = cmd.split()
+        # Commands are: test-border-router.sh CONTIKI TEST ADDR WAIT [SIZE] [DELAY]
+        for i, p in enumerate(parts):
+            if p.isdigit() and i >= 3:
+                wait_time = int(p)
+                break
+        # Add 30s to convergence time for MSP430 emulation overhead
+        wait_time += 30
+        # Rewrite command with increased wait time
+        for i, p in enumerate(parts):
+            if p.isdigit() and i >= 3:
+                parts[i] = str(wait_time)
+                break
+        ss["command"] = " ".join(parts)
+        # timeout = wait_time + 30s margin for ping + cleanup
+        config["timeout_ms"] = (wait_time + 30) * 1000
+        # Replace the infinite JS loop with a simple timeout_is_success
+        config["test"] = {"timeout_is_success": True}
 
     return config, warnings
 
