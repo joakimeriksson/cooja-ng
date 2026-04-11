@@ -1,105 +1,107 @@
-# ARM Multinode RF Plan (Merged)
+# Status: Non-TUN Cooja Suite Green; TSCH Drift and Native TSCH Regressions Fixed
 
-## Goal
-Upgrade `arm-multinode` from byte-forwarding to a minimal but firmware-viable CC2538 802.15.4 radio model with explicit packet boundaries, realistic interrupts, and deterministic timing. Keep it simple, but correct enough for real stacks.
+## Current State (2026-04-10)
 
-## Current State
-- `arm-multinode` runs multiple CC2538 nodes and forwards RF bytes immediately.
-- RF core has basic FIFOs, strobes, and a few status registers.
-- No frame parsing, CRC, interrupts, CCA, collisions, or timing.
+The current worktree now passes the full non-TUN Cooja wrapper suite:
 
-## Desired Capabilities (Minimal-Useful)
-- Packet boundaries with `SFD` → byte stream → `RXPKTDONE`.
-- Deterministic timing and delivery of RF bytes based on simulation time.
-- Correct RF core interrupts and FIFO thresholds.
-- CRC handling and RX status byte (CRC_OK) as CC2538 expects.
-- Basic CCA and collision behavior sufficient for real firmware drivers.
+- `tools/run-cooja-tests.sh`
+- Result: `Total 88 / Passed 81 / Failed 0 / Skipped 7 / Errors 0`
+- The 7 skipped tests are the `17-tun-rpl-br/...` border-router cases filtered
+  by the wrapper when `--with-tun` is not used.
 
-## Plan
+That includes both of the previously important failure groups:
 
-1. **Target Firmware Expectations**
-   - Choose target firmware(s) for multinode validation (e.g., Contiki-NG nullnet-broadcast for CC2538DK).
-   - Document required RF features from those stacks: SFD/FIFOP/RXPKTDONE use, AUTOCRC, AUTOACK, CCA.
+- `07-simulation-base/26-tsch-drift-z1`
+- the native/cooja TSCH/RPL block:
+  - `19-cooja-rpl-tsch`
+  - `20-cooja-rpl-tsch-orchestra`
+  - `21-cooja-rpl-tsch-security`
+  - `23-rpl-tsch-z1`
+  - `24-cooja-rpl-tsch-orchestra-storing`
+  - `25-cooja-rpl-tsch-orchestra-link-based`
+  - `26-cooja-rpl-tsch-orchestra-perfect-link`
+  - `27-cooja-rpl-tsch-orchestra-root-rule-storing`
+  - `28-cooja-rpl-tsch-orchestra-root-rule-ns`
 
-2. **Frame Delivery First, Then Medium Model**
-   - **Phase A: Frame-based delivery using existing byte forwarding**
-     - Implement frame parsing in the RF core while keeping the current direct byte-delivery path.
-     - This proves SFD/length parsing and interrupt behavior before introducing the medium model.
-   - **Phase B: Deterministic RF medium model**
-     - Replace direct forwarding with a shared medium queue:
-       - TX enqueues a frame with start time, duration, channel, and node id.
-       - RX nodes consume frames based on simulation time.
-     - Add collision/CCA logic:
-       - Overlapping TX on same channel corrupts frame or marks CRC bad.
-       - CCA reports busy if any overlapping transmission in window.
+## What Fixed `26-tsch-drift-z1`
 
-3. **Frame-Based RX/TX in RF Core (Details)**
-   - Interpret TXFIFO as 802.15.4 frame: length byte + payload + FCS.
-   - **SFD/Length parsing state machine**
-     - Count preamble bytes (0x00). When `zero_symbols >= 4` and byte == `0x7A`, raise `SFD`.
-     - Next byte is `length`, then `length` bytes of payload (including FCS).
-     - Extract `FCF0`, `FCF1`, `DSN` at bytes 0/1/2 of payload for ACK logic.
-   - On TX start, emit SFD, then stream bytes with timing.
-   - On RX, parse SFD and length, fill RXFIFO, then set RXPKTDONE.
+The decisive MSP430/MSPSim-aligned fixes were:
 
-4. **Interrupt Masks and NVIC Wiring**
-   - Add `rfirqm0`, `rfirqm1`, `rferrm` handling with register offsets:
-     - `RFIRQM0 = 0x08C`, `RFIRQM1 = 0x090`, `RFERRM = 0x094`.
-   - Pend RFCORE IRQs through NVIC when masked flags set.
-   - Re-check interrupts when flags are cleared (W1C).
-   - **NVIC plumbing prerequisite**:
-     - Add `arm_nvic_t *nvic` to `cc2538_rfcore_t`.
-     - Update `cc2538_rfcore_init()` signature.
-     - Pass `&plat->nvic` from `arm_platform.c`.
+1. `src/msp430/msp430_cpu.c`
+   - `msp430_step_micros()` no longer forces an extra CPU cycle for
+     zero-duration `execute(t, 0)` slices.
 
-5. **CRC + RX Status Byte**
-   - Implement CCITT CRC-16 with bit-reversal (same as CC2420).
-   - On TX: if AUTOCRC enabled, compute and append FCS.
-   - On RX: verify CRC, replace last 2 bytes with RSSI + CRC_OK byte.
+2. `test/test_mixed_multinode.c`
+   - MSP430 RX byte delivery now uses the sender's actual event time.
+   - `current_sim_ns` is pinned to the exact event-loop time before dispatch.
+   - MSP430 byte delivery remains per-byte in the event loop with same-time
+     wakeup requests.
 
-6. **Basic Auto-ACK (Optional but Useful)**
-   - If AUTOACK enabled and RX frame requests ACK and CRC OK:
-     - Emit minimal ACK frame (length=5, FCF=0x0002, DSN).
-     - Set TXACKDONE interrupt.
+3. `src/common/sim_event_queue.c`
+   - rescheduling a queued node event now removes and reinserts it, refreshing
+     same-time FIFO ordering.
 
-7. **Timed State Transitions**
-   - Model RX calibration delay for `ISRXON` (e.g., 12 symbols).
-   - Keep TX timing simple for now unless firmware needs accurate delays.
+4. `src/msp430/cc2420.c`
+   - bytes outside active RX states are ignored instead of replayed later.
+   - ACK RX completion is counted explicitly.
 
-8. **Multi-Node Uniqueness**
-   - Ensure each node has a unique IEEE address.
-   - Patch `linkaddr_node_addr` or RF core EXT_ADDR registers after ELF load.
+Verified:
+- Direct runner:
+  `build/test_runner mixed-multinode /tmp/tsch-drift-VICa2P.json -q`
+  -> `TEST PASSED (514482 ms simulated)`
+- Wrapper:
+  `tools/run-cooja-tests.sh 07-simulation-base/26-tsch-drift-z1 -v`
+  -> `PASS`
 
-9. **Tests and Verification**
-   - Unit tests for RF core:
-     - TX→RX frame delivery
-     - CCA busy detection
-     - Collision CRC bad
-     - Auto-ACK path
-   - Integration test:
-     - `arm-multinode` with nullnet-broadcast should show send/receive on both nodes.
+## What Fixed the Native TSCH/RPL Regressions
 
-## Milestones
+The native/cooja regressions were not another RF-geometry or JSON-conversion
+ problem. They were a wakeup-scheduling mismatch.
 
-Milestones are ordered so each one can be tested and stabilized independently before adding the next layer. Each milestone produces a working system — never a half-broken intermediate state.
+Observed failure signature before the fix:
+- Node 1 became coordinator and enqueued an EB.
+- The other nodes scanned forever.
+- `Routing links` stayed `0`.
+- `Total RF bytes` stayed `0`.
 
-- **M1**: Frame parsing + interrupts using existing byte forwarding (steps 2A, 3, 4).
-  - *Why first:* Frame parsing and interrupt generation are the foundation everything else depends on. The simple byte-forwarding path is already working, so we can validate SFD detection, RXPKTDONE, FIFOP threshold, and NVIC interrupt delivery in isolation — without any medium model complexity. If the interrupt wiring or frame state machine has bugs, they're easy to diagnose here because the delivery path is trivial.
+Root cause:
+- In the native/cooja path, stale `simRtimerNextExpirationTime` values could be
+  left behind after startup and then scheduled literally in the past.
+- That let the root miss its first real TSCH slot scheduling window, so the
+  queued EB never reached RF transmit.
 
-- **M2**: RF medium model + CCA + collisions (step 2B).
-  - *Why second:* With frame parsing proven correct in M1, we can swap out the delivery layer and know that any new failures come from the medium model, not the parser. CCA and collision logic are only meaningful once frames have explicit boundaries and timing — both established in M1.
+Fixes:
 
-- **M3**: CRC + RX status byte + optional auto-ACK + timed transitions (steps 5-7).
-  - *Why third:* CRC and auto-ACK are correctness features that sit on top of frame parsing (M1) and realistic delivery (M2). Adding them earlier would make M1/M2 debugging harder because CRC failures mask frame parsing bugs and auto-ACK generates additional RF traffic that complicates medium model validation. Timed state transitions (RX calibration delay) belong here because they affect event ordering — safer to add once the event-driven interrupt path is stable.
+1. `test/test_mixed_multinode.c`
+   - native wakeup scheduling now clamps stale native rtimer deadlines to
+     `now` instead of scheduling a wakeup into the past.
 
-- **M4**: Multi-node uniqueness + test firmware + verification (steps 8-9).
-  - *Why last:* MAC address patching and integration tests exercise the full stack. They can only validate correctly once all lower layers (parsing, delivery, CRC, interrupts) are solid. Running integration tests against a broken stack wastes time chasing symptoms instead of root causes.
+2. `include/native/native_node.h`
+   - explicit native radio transmission state was added:
+     `radio_is_transmitting`, `radio_tx_finished`, `radio_tx_end_ns`
 
-## Risks / Open Questions
-- Which firmware stacks are the priority targets?
-- Required fidelity for PHY timing and CRC details.
-- Performance impact of detailed RF modeling.
+3. `src/native/native_node.c`
+   - native radio transmission now keeps a transmission-active interval instead
+     of clearing `simOutSize` immediately.
 
-## Next Step (if approved)
-- Confirm target firmware(s) and required RF features.
-- Implement M1 first to validate frame parsing and interrupt correctness.
+4. `test/test_mixed_multinode.c`
+   - native event scheduling now honors exact transmission-end wakeups in the
+     same spirit as Cooja's `ContikiRadio.doActionsAfterTick()`.
+
+Representative verification:
+- `build/test_runner mixed-multinode /tmp/23-rpl-tsch-z1.json -v`
+  -> `PASS`
+- `build/test_runner mixed-multinode /tmp/19-cooja-rpl-tsch.json -v`
+  -> `PASS`
+- `tools/run-cooja-tests.sh 07-simulation-base`
+  -> `PASS`
+
+## Remaining Work
+
+The remaining unverified scope is the TUN/border-router block that the default
+wrapper skips:
+
+- `tools/run-cooja-tests.sh --with-tun`
+
+That still needs a dedicated rerun before claiming a fully verified
+`88/88 including TUN` result for the current tree.
