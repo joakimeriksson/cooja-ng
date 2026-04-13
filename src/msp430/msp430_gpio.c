@@ -27,7 +27,7 @@
 
 /* Forward declarations */
 static void gpio_interrupt_handler(void *user_data, int vector);
-static void update_interrupt(msp430_gpio_t *gpio, int port_idx);
+void msp430_gpio_update_interrupt(msp430_gpio_t *gpio, int port_idx);
 
 /* ================================================================
  * IO read/write handlers for interrupt-capable ports (P1, P2)
