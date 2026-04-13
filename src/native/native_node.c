@@ -71,7 +71,11 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
      * symbol spaces.  DEEPBIND ensures the .cooja library's --wrap=printf
      * symbol does not shadow the host process's printf (which would deadlock
      * any printf call from the JS test-engine pthread). */
+#ifdef RTLD_DEEPBIND
     node->dl_handle = dlopen(node->dl_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+#else
+    node->dl_handle = dlopen(node->dl_path, RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!node->dl_handle) {
         fprintf(stderr, "native_node: dlopen(%s) failed: %s\n",
                 node->dl_path, dlerror());

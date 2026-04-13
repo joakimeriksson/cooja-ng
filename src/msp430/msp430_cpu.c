@@ -1917,6 +1917,13 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
 
             /* --- Execute ALU operation (with repeat loop) --- */
             twoop_alu: ;
+            /* Re-initialize repeats/zero_carry here because the fast path
+             * jumps to twoop_alu via goto, skipping the initialization
+             * at the declaration site (undefined behavior in C). */
+            if (cpu->ext_word == 0) {
+                repeats = 1;
+                zero_carry = false;
+            }
             bool write_result = false;
             bool update_status = true;
             uint32_t sr = reg[MSP430_SR];
