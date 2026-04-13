@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I include/cosim -I lib -I lib/quickjs -march=native -flto
 LDFLAGS = -lm -lpthread -flto
 
 # Auto-detect GNU Lightning
@@ -10,6 +10,7 @@ COMMON_SRC_DIR = src/common
 MSP430_SRC_DIR = src/msp430
 ARM_SRC_DIR = src/arm
 NATIVE_SRC_DIR = src/native
+COSIM_SRC_DIR = src/cosim
 UI_SRC_DIR = src/ui
 LIB_SRC_DIR = lib
 TEST_DIR = test
@@ -18,6 +19,7 @@ COMMON_BUILD_DIR = build/common
 MSP430_BUILD_DIR = build/msp430
 ARM_BUILD_DIR = build/arm
 NATIVE_BUILD_DIR = build/native
+COSIM_BUILD_DIR = build/cosim
 UI_BUILD_DIR = build/ui
 LIB_BUILD_DIR = build/lib
 
@@ -62,6 +64,8 @@ NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/sim_config.c \
                  $(NATIVE_SRC_DIR)/js_node.c
 
+COSIM_SOURCES = $(COSIM_SRC_DIR)/cosim.c
+
 UI_SOURCES = $(UI_SRC_DIR)/ws_server.c \
              $(UI_SRC_DIR)/sim_state.c
 
@@ -89,6 +93,7 @@ COMMON_OBJECTS = $(patsubst $(COMMON_SRC_DIR)/%.c, $(COMMON_BUILD_DIR)/%.o, $(CO
 OBJECTS = $(patsubst $(MSP430_SRC_DIR)/%.c, $(MSP430_BUILD_DIR)/%.o, $(SOURCES))
 ARM_OBJECTS = $(patsubst $(ARM_SRC_DIR)/%.c, $(ARM_BUILD_DIR)/%.o, $(ARM_SOURCES))
 NATIVE_OBJECTS = $(patsubst $(NATIVE_SRC_DIR)/%.c, $(NATIVE_BUILD_DIR)/%.o, $(NATIVE_SOURCES))
+COSIM_OBJECTS = $(patsubst $(COSIM_SRC_DIR)/%.c, $(COSIM_BUILD_DIR)/%.o, $(COSIM_SOURCES))
 UI_OBJECTS = $(patsubst $(UI_SRC_DIR)/%.c, $(UI_BUILD_DIR)/%.o, $(UI_SOURCES))
 LIB_OBJECTS = $(patsubst $(LIB_SRC_DIR)/%.c, $(LIB_BUILD_DIR)/%.o, $(LIB_SOURCES))
 
@@ -125,6 +130,9 @@ $(ARM_BUILD_DIR):
 $(NATIVE_BUILD_DIR):
 	mkdir -p $(NATIVE_BUILD_DIR)
 
+$(COSIM_BUILD_DIR):
+	mkdir -p $(COSIM_BUILD_DIR)
+
 $(UI_BUILD_DIR):
 	mkdir -p $(UI_BUILD_DIR)
 
@@ -149,6 +157,9 @@ $(ARM_BUILD_DIR)/%.o: $(ARM_SRC_DIR)/%.c | $(ARM_BUILD_DIR)
 $(NATIVE_BUILD_DIR)/%.o: $(NATIVE_SRC_DIR)/%.c | $(NATIVE_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(COSIM_BUILD_DIR)/%.o: $(COSIM_SRC_DIR)/%.c | $(COSIM_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(UI_BUILD_DIR)/%.o: $(UI_SRC_DIR)/%.c | $(UI_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -162,7 +173,7 @@ $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(COSIM_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 test: $(BUILD_DIR)/test_runner
@@ -194,12 +205,12 @@ configure:
 	@echo "Wrote csim.conf: CONTIKI_DIR=$(CONTIKI_DIR)"
 
 # Debug build
-debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -DDEBUG
+debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I include/cosim -I lib -I lib/quickjs -DDEBUG
 debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
 # Profile-guided optimization (Apple Clang)
-PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native
+PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I include/cosim -I lib -I lib/quickjs -march=native
 PGO_LDFLAGS = -lm -lpthread
 ifneq ($(LIGHTNING_LIBS),)
   PGO_CFLAGS += $(LIGHTNING_CFLAGS) -DHAVE_LIGHTNING
@@ -211,12 +222,12 @@ pgo:
 	rm -rf $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(PGO_CFLAGS) -fprofile-instr-generate \
-		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(PGO_LDFLAGS)
+		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(NATIVE_SOURCES) $(COSIM_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(PGO_LDFLAGS)
 	@echo "=== PGO Step 2: Collecting profile data ==="
 	LLVM_PROFILE_FILE="$(BUILD_DIR)/default.profraw" ./$(BUILD_DIR)/test_runner bench
 	LLVM_PROFILE_FILE="$(BUILD_DIR)/default.profraw" ./$(BUILD_DIR)/test_runner correctness
 	xcrun llvm-profdata merge -output=$(BUILD_DIR)/default.profdata $(BUILD_DIR)/default.profraw
 	@echo "=== PGO Step 3: Optimized build ==="
 	$(CC) $(CFLAGS) -fprofile-instr-use=$(BUILD_DIR)/default.profdata \
-		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(LDFLAGS)
+		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(NATIVE_SOURCES) $(COSIM_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(LDFLAGS)
 	@echo "=== PGO build complete ==="

@@ -291,5 +291,6 @@ void cc2420_set_rf_listener(cc2420_t *radio, cc2420_rf_callback_fn cb, void *dat
 void cc2420_get_rx_stats(int *started, int *completed, int *rejected,
                           int *overflowed, int *crc_good, int *crc_bad,
                           int *dropped);
+int cc2420_get_auto_ack_count(void);
 
 #endif /* CC2420_H */
