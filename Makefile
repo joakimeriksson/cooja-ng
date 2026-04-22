@@ -59,7 +59,8 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
-                 $(NATIVE_SRC_DIR)/sim_config.c
+                 $(NATIVE_SRC_DIR)/sim_config.c \
+                 $(NATIVE_SRC_DIR)/js_node.c
 
 UI_SOURCES = $(UI_SRC_DIR)/ws_server.c \
              $(UI_SRC_DIR)/sim_state.c
