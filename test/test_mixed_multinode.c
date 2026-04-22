@@ -1,15 +1,17 @@
 /*
  * Mixed-platform multi-node simulation test
  *
- * Runs MSP430 (Tmote Sky / CC2420), ARM (CC2538DK / RF Core), and native
- * Cooja motes in the same simulation. All radios use wire-compatible
- * 802.15.4 frames (4x0x00 preamble + 0x7A SFD + length + payload),
- * enabling cross-platform Contiki-NG networking (RPL, nullnet, etc.).
+ * Runs MSP430 (Tmote Sky / CC2420), ARM (CC2538DK / RF Core), native
+ * Cooja motes, and JavaScript application motes in the same simulation.
+ * All radios use wire-compatible 802.15.4 frames (4x0x00 preamble + 0x7A
+ * SFD + length + payload), enabling cross-platform Contiki-NG networking
+ * (RPL, nullnet, etc.).
  *
  * Node type is auto-detected from firmware file extension:
  *   .sky      -> MSP430 (Tmote Sky)
  *   .cc2538dk -> ARM (CC2538DK)
  *   .cooja    -> Native (Cooja mote via dlopen)
+ *   .js       -> JavaScript application mote (QuickJS)
  */
 #include "msp430_platform.h"
 #include "msp430_elf.h"
@@ -18,6 +20,7 @@
 #include "arm_systick.h"
 #include "arm_elf.h"
 #include "native_node.h"
+#include "js_node.h"
 #include "sim_config.h"
 #include "radio_medium.h"
 #include "ws_server.h"
@@ -52,7 +55,7 @@
 #define DEFAULT_SIM_MS    20000      /* 20 seconds of simulated time */
 #define MS_TO_NS          1000000LL
 
-typedef enum { NODE_MSP430, NODE_ARM, NODE_NATIVE } node_type_t;
+typedef enum { NODE_MSP430, NODE_ARM, NODE_NATIVE, NODE_JS } node_type_t;
 
 typedef struct {
     node_type_t type;
@@ -67,6 +70,7 @@ typedef struct {
         msp430_platform_t msp;
         arm_platform_t arm;
         native_node_t native;
+        js_node_t js;
     } plat;
 } mixed_node_t;
 
@@ -648,6 +652,8 @@ static int64_t node_sim_time_ns(int idx) {
         return nodes[idx].plat.msp.cpu.sim_time_ns;
     else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.sim_time_ns;
+    else if (nodes[idx].type == NODE_JS)
+        return nodes[idx].plat.js.sim_time_ns;
     else
         return nodes[idx].plat.native.sim_time_ns;
 }
@@ -657,6 +663,8 @@ static int64_t node_cycles(int idx) {
         return nodes[idx].plat.msp.cpu.cycles;
     else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.cycles;
+    else if (nodes[idx].type == NODE_JS)
+        return nodes[idx].plat.js.sim_time_ns / 1000LL; /* pseudo-cycles: us */
     else
         return nodes[idx].plat.native.sim_time_ns / 1000LL; /* pseudo-cycles: us */
 }
@@ -667,7 +675,7 @@ static uint32_t node_freq(int idx) {
     else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.cpu_freq_hz;
     else
-        return 1000000; /* native: 1 MHz pseudo-freq (1 cycle = 1 us) */
+        return 1000000; /* native/js: 1 MHz pseudo-freq (1 cycle = 1 us) */
 }
 
 static int64_t node_instructions(int idx) {
@@ -676,12 +684,13 @@ static int64_t node_instructions(int idx) {
     else if (nodes[idx].type == NODE_ARM)
         return nodes[idx].plat.arm.cpu.instructions;
     else
-        return 0; /* native: not tracked */
+        return 0; /* native/js: not tracked */
 }
 
 static const char *node_type_str(int idx) {
     if (nodes[idx].type == NODE_MSP430) return "MSP430";
     if (nodes[idx].type == NODE_ARM) return "ARM";
+    if (nodes[idx].type == NODE_JS) return "JS";
     return "NATIVE";
 }
 
@@ -1466,8 +1475,15 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                     }
                     stat_rx_frames_queued++;
                 }
+            } else if (nodes[i].type == NODE_JS) {
+                if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
+                    js_node_deliver_frame(&nodes[i].plat.js, frame, len,
+                                          current_sim_ns);
+                    sim_eq_schedule_if_earlier(&sim_eq, i, current_sim_ns);
+                    stat_rx_frames_queued++;
+                }
             }
-            /* Native-to-emulated: handled via rf_tx_callback (byte stream) */
+            /* Native/JS-to-emulated: handled via rf_tx_callback (byte stream) */
         }
 
         /* Interference-range neighbors: mark overlapping frames as collided */
@@ -1504,12 +1520,18 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
     } else {
         /* NONE: deliver to all other nodes */
         for (int i = 0; i < num_nodes; i++) {
-            if (&nodes[i] != sender && nodes[i].type == NODE_NATIVE) {
+            if (&nodes[i] == sender) continue;
+            if (nodes[i].type == NODE_NATIVE) {
                 native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
                 if (q->count >= NATIVE_RX_QUEUE_SIZE)
                     stat_rx_frames_queue_full++;
                 native_deliver_frame(&nodes[i].plat.native, frame, len,
                                      current_sim_ns, sender_idx);
+                stat_rx_frames_queued++;
+            } else if (nodes[i].type == NODE_JS) {
+                js_node_deliver_frame(&nodes[i].plat.js, frame, len,
+                                      current_sim_ns);
+                sim_eq_schedule_if_earlier(&sim_eq, i, current_sim_ns);
                 stat_rx_frames_queued++;
             }
         }
@@ -2163,6 +2185,8 @@ static node_type_t detect_node_type(const char *path) {
         return NODE_ARM;
     if (dot && strcmp(dot, ".cooja") == 0)
         return NODE_NATIVE;
+    if (dot && strcmp(dot, ".js") == 0)
+        return NODE_JS;
     return NODE_MSP430;  /* default to MSP430 (.sky or other) */
 }
 
@@ -2591,6 +2615,42 @@ static int init_native_node(int idx, const char *firmware_path, int node_id) {
     return 0;
 }
 
+/* JS node TX handler: when mote.send(bytes) fires, bridge the frame to
+ * both native receivers (frame-level) and emulated receivers (byte-stream
+ * via mixed_rf_tx_handler with PHY wrapping). */
+static void mixed_js_rf_handler(void *user_data, const uint8_t *frame, int len) {
+    mixed_node_t *sender = (mixed_node_t *)user_data;
+
+    /* Frame-level delivery to native receivers */
+    mixed_rf_frame_handler(user_data, frame, len);
+
+    /* Byte-stream delivery to emulated receivers: wrap with PHY
+     * (4x0x00 preamble + 0x7A SFD + length) and feed mixed_rf_tx_handler. */
+    uint8_t bytes[160];
+    int n = native_frame_to_bytes(frame, len, bytes, (int)sizeof(bytes));
+    for (int i = 0; i < n; i++)
+        mixed_rf_tx_handler(sender, bytes[i]);
+}
+
+static int init_js_node_wrapper(int idx, const char *script_path, int node_id) {
+    mixed_node_t *node = &nodes[idx];
+    js_node_t *jn = &node->plat.js;
+
+    if (js_node_init(jn, script_path, node_id) != 0)
+        return -1;
+
+    jn->log_callback        = mixed_uart_callback;
+    jn->log_callback_data   = node;
+    jn->rf_frame_callback   = mixed_js_rf_handler;
+    jn->rf_frame_callback_data = node;
+
+    /* Now safe to run init() — log/RF callbacks are wired. */
+    js_node_start(jn);
+
+    printf("  Node %d [JS] initialized\n", node_id);
+    return 0;
+}
+
 /* --- Top-level node init (dispatches by type) --- */
 
 static int init_node(int idx, const char *firmware_path, int node_id) {
@@ -2608,12 +2668,15 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
 
     printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
            node->type == NODE_MSP430 ? "MSP430/Sky" :
-           node->type == NODE_ARM ? "ARM/CC2538DK" : "Native/Cooja");
+           node->type == NODE_ARM ? "ARM/CC2538DK" :
+           node->type == NODE_JS ? "JS/QuickJS" : "Native/Cooja");
 
     if (node->type == NODE_MSP430)
         return init_msp430_node(idx, firmware_path, node_id);
     else if (node->type == NODE_ARM)
         return init_arm_node(idx, firmware_path, node_id);
+    else if (node->type == NODE_JS)
+        return init_js_node_wrapper(idx, firmware_path, node_id);
     else
         return init_native_node(idx, firmware_path, node_id);
 }
@@ -2625,6 +2688,8 @@ static void destroy_node(int idx) {
         msp430_platform_destroy(&nodes[idx].plat.msp);
     else if (nodes[idx].type == NODE_ARM)
         arm_platform_destroy(&nodes[idx].plat.arm);
+    else if (nodes[idx].type == NODE_JS)
+        js_node_destroy(&nodes[idx].plat.js);
     else
         native_node_destroy(&nodes[idx].plat.native);
 }
@@ -2657,6 +2722,8 @@ static void step_node_until(int idx, int64_t target) {
         msp430_step_until(&nodes[idx].plat.msp.cpu, target);
     else if (nodes[idx].type == NODE_ARM)
         arm_step_until(&nodes[idx].plat.arm.cpu, target);
+    else if (nodes[idx].type == NODE_JS)
+        js_node_step_until_ns(&nodes[idx].plat.js, target);
     else
         native_step_until_ns(&nodes[idx].plat.native, target);
 }
@@ -2890,7 +2957,9 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
  * Used by event-driven stepping to skip idle periods. */
 static int64_t node_next_wakeup_ns(int idx) {
     if (!node_active(idx)) return INT64_MAX;
-    if (nodes[idx].type == NODE_NATIVE) {
+    if (nodes[idx].type == NODE_JS) {
+        return js_node_next_wakeup_ns(&nodes[idx].plat.js);
+    } else if (nodes[idx].type == NODE_NATIVE) {
         native_node_t *nat = &nodes[idx].plat.native;
         /* Check immediate work first */
         if (*nat->simInSize > 0 || nat->rx_queue.count > 0 ||
@@ -3106,6 +3175,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
         printf("    .sky      -> MSP430 (Tmote Sky)\n");
         printf("    .cc2538dk -> ARM (CC2538DK)\n");
         printf("    .cooja    -> Native (Cooja mote)\n");
+        printf("    .js       -> JavaScript application mote\n");
         printf("Example:\n");
         printf("  test_runner mixed-multinode firmware/sky/udp-server.sky firmware/cooja/udp-client.cooja -t 60000\n");
         printf("  test_runner mixed-multinode configs/rpl-udp-native.json -v\n");
@@ -3962,7 +4032,14 @@ sim_restart:
                 }
 
                 bool sender_had_tx = false;
-                if (nodes[i].type == NODE_NATIVE) {
+                if (nodes[i].type == NODE_JS) {
+                    /* Run the JS node up to event time; this fires execute()
+                     * and dispatches any RX frames scheduled at <= ev_time. */
+                    js_node_step_until_ns(&nodes[i].plat.js, ev_time);
+                    int64_t nxt = js_node_next_wakeup_ns(&nodes[i].plat.js);
+                    if (nxt < INT64_MAX)
+                        sim_eq_schedule_if_earlier(&sim_eq, i, nxt);
+                } else if (nodes[i].type == NODE_NATIVE) {
                     /* Single tick at event time */
                     tick_one_native(i, ev_time);
                     sender_had_tx = native_had_tx[i];
