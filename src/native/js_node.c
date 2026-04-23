@@ -13,8 +13,6 @@
 #include <string.h>
 #include <stdint.h>
 
-#define NODE_OPAQUE_TAG ((void *)(uintptr_t)0x6A734E6F /* 'jsNo' */)
-
 /* Retrieve js_node_t* from a JSContext (set via JS_SetContextOpaque). */
 static js_node_t *node_from_ctx(JSContext *ctx) {
     return (js_node_t *)JS_GetContextOpaque(ctx);
@@ -68,7 +66,7 @@ static JSValue js_mote_send(JSContext *ctx, JSValueConst this_val,
         JSValue lenv = JS_GetPropertyStr(ctx, argv[0], "length");
         int32_t n = 0;
         if (JS_ToInt32(ctx, &n, lenv) == 0 && n >= 0 && n < JS_NODE_FRAME_MAX) {
-            static uint8_t scratch[JS_NODE_FRAME_MAX];
+            uint8_t scratch[JS_NODE_FRAME_MAX];
             for (int32_t i = 0; i < n; i++) {
                 JSValue v = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
                 int32_t b = 0;
@@ -189,7 +187,6 @@ int js_node_init(js_node_t *node, const char *script_path, int node_id) {
         return -1;
     }
     JS_SetContextOpaque(node->ctx, node);
-    (void)NODE_OPAQUE_TAG;
 
     install_mote_global(node);
 

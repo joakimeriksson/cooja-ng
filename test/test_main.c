@@ -28,8 +28,18 @@ extern int run_arm_firmware_tests(int verbose);
 /* Mixed-platform test (handles MSP430, ARM, and native nodes) */
 extern int run_mixed_multinode_test(int argc, char **argv);
 
+/* Co-simulation mode: --cosim <addr:port> passes remaining args
+ * to run_mixed_multinode_test which initializes nodes, then hands control
+ * to run_cosim() for externally-controlled time stepping. */
+
 /* Timeline unit tests */
 extern int run_timeline_tests(int verbose);
+
+/* JS node unit tests */
+extern int run_js_node_tests(int verbose);
+
+/* Cosim protocol loopback tests */
+extern int run_cosim_tests(int verbose);
 
 int main(int argc, char **argv) {
     int verbose = 0;
@@ -47,6 +57,9 @@ int main(int argc, char **argv) {
         printf("ARM modes:    arm-correctness, arm-firmware, arm-multinode\n");
         printf("Mixed:        mixed-multinode\n");
         printf("Test:         test <config.json> [-v] [-t ms]\n");
+        printf("JS:           js-node, js-multinode\n");
+        printf("Co-sim:       cosim --cosim <addr:port> <config.json>\n");
+        printf("              cosim-loopback\n");
         printf("Combined:     all\n");
         return 1;
     }
@@ -121,9 +134,38 @@ int main(int argc, char **argv) {
         failures += run_mixed_multinode_test(argc - 2, argv + 2);
     }
 
+    /* Co-simulation mode: initialize nodes via mixed-multinode, then hand
+     * control to the external co-simulation loop. The --cosim
+     * flag is parsed by run_mixed_multinode_test's argv processing. */
+    if (strcmp(mode, "cosim") == 0) {
+        failures += run_mixed_multinode_test(argc - 2, argv + 2);
+    }
+
     /* Timeline unit tests */
     if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {
         failures += run_timeline_tests(verbose);
+    }
+
+    /* JS node unit tests */
+    if (strcmp(mode, "js-node") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_js_node_tests(verbose);
+    }
+
+    /* JS multinode integration test (2-node broadcast, 5s sim) */
+    if (strcmp(mode, "js-multinode") == 0) {
+        char *mn_argv[] = {
+            (char *)"firmware/js/broadcast.js",
+            (char *)"firmware/js/broadcast.js",
+            (char *)"-t", (char *)"5000",
+            verbose ? (char *)"-v" : (char *)"-q",
+            NULL
+        };
+        failures += run_mixed_multinode_test(5, mn_argv);
+    }
+
+    /* Cosim protocol loopback test */
+    if (strcmp(mode, "cosim-loopback") == 0) {
+        failures += run_cosim_tests(verbose);
     }
 
     return failures > 0 ? 1 : 0;

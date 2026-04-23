@@ -34,6 +34,7 @@
 #include "gdb_stub.h"
 #include "arm_gdb.h"
 #include "pcap_writer.h"
+#include "cosim.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -3060,6 +3061,633 @@ static void sync_node_channels(void) {
     }
 }
 
+/* ===================================================================
+ * Co-simulation Mode
+ *
+ * When --cosim <addr:port> is passed, all radio traffic is routed
+ * through an external coordinator instead of the built-in radio
+ * medium. The coordinator controls time advancement and packet
+ * routing via a JSON-over-TCP protocol.
+ * =================================================================== */
+
+/* Bridge state — node IDs and TX frame assembler */
+static char cosim_node_ids[MAX_NODES][COSIM_NODE_ID_LEN];
+static int cosim_tx_occurred = 0;     /* flag: TX happened during sub-step */
+
+/* Per-node boot offset: sim_time_ns accumulated during init (~200ms on Sky).
+ * The cosim time base starts at 0, so node-internal times equal
+ * cosim_time + boot_offset.  Initialized at the start of run_cosim(). */
+static int64_t cosim_boot_offset_ns[MAX_NODES] = {0};
+
+/* Per-node guard flag to prevent re-entrant stepping inside cosim_inject_rx.
+ * Set to 1 while we're stepping the CPU to deliver RX bytes; if a TX fires
+ * during that step, cosim_rf_tx_handler -> cosim_inject_rx (for local ACK)
+ * would otherwise call msp430_step_until on the already-executing CPU. */
+static int cosim_inject_rx_active[MAX_NODES] = {0};
+
+/* TX frame assembler: detects 802.15.4 frames in byte stream from emulated nodes */
+#define COSIM_TX_ASM_PREAMBLE  0
+#define COSIM_TX_ASM_LENGTH    1
+#define COSIM_TX_ASM_PAYLOAD   2
+
+typedef struct {
+    int state;
+    int zero_count;
+    int expected_len;
+    int payload_count;
+    uint8_t frame[COSIM_MAX_FRAME_LEN];
+    int frame_len;
+} cosim_tx_asm_t;
+
+static cosim_tx_asm_t cosim_tx_asm[MAX_NODES];
+
+static void cosim_tx_asm_reset(cosim_tx_asm_t *a) {
+    a->state = COSIM_TX_ASM_PREAMBLE;
+    a->zero_count = 0;
+    a->expected_len = 0;
+    a->payload_count = 0;
+    a->frame_len = 0;
+}
+
+/* Get the radio channel for a node from its peripheral state */
+static int cosim_get_channel(int idx) {
+    if (nodes[idx].type == NODE_MSP430) {
+        uint16_t fsctrl = nodes[idx].plat.msp.cc2420.registers[CC2420_REG_FSCTRL];
+        int freq = fsctrl & 0x3FF;
+        return (freq >= 357) ? (freq - 357) / 5 + 11 : 26;
+    } else if (nodes[idx].type == NODE_ARM) {
+        return nodes[idx].plat.arm.rfcore.channel;
+    } else {
+        if (nodes[idx].plat.native.simRadioChannel)
+            return *nodes[idx].plat.native.simRadioChannel;
+        return 26;
+    }
+}
+
+/* Get the TX power for a node from its peripheral state (dBm) */
+static int cosim_get_tx_power(int idx) {
+    if (nodes[idx].type == NODE_ARM) {
+        return (int)nodes[idx].plat.arm.rfcore.txpower;
+    }
+    /* CC2420 TX power is in TXCTRL register bits [4:0] as a PA level,
+     * not directly in dBm. Default to 0 dBm for simplicity.
+     * Native nodes don't expose TX power. */
+    return 0;
+}
+
+/*
+ * Inject an RX packet into a node's radio.
+ * payload format: [length_byte][MAC frame] (802.15.4 without preamble/SFD).
+ *
+ * For emulated nodes, we prepend preamble+SFD and feed byte-by-byte with
+ * per-byte CPU synchronization so the radio state machine has time to
+ * process events (RX_CALIBRATE → RX_SFD_SEARCH transitions, preamble
+ * detection, FIFOP generation).  Without this, bytes arriving while the
+ * radio is in a transient state are silently dropped by
+ * cc2420_receive_byte (line 580 in cc2420.c), and the firmware never
+ * sees the frame even though the coordinator injected it.
+ *
+ * This mirrors the per-byte sync_msp430_to_time pattern used in the
+ * standalone multinode scheduler (mixed_deliver_rf_bytes), but works in
+ * the cosim time frame (cosim_ns → cosim_ns + cosim_boot_offset_ns).
+ *
+ * For native nodes, we deliver as a complete frame (no byte-level timing
+ * needed — native mode has frame-level callbacks).
+ */
+static void cosim_inject_rx(int node_idx, const uint8_t *payload, int len,
+                             int8_t rssi) {
+    if (node_idx < 0 || node_idx >= num_nodes) return;
+
+    if (nodes[node_idx].type == NODE_NATIVE) {
+        native_deliver_frame(&nodes[node_idx].plat.native,
+                             payload, len, current_sim_ns, -1);
+        return;
+    }
+
+    static const uint8_t preamble_sfd[] = {0x00, 0x00, 0x00, 0x00, 0x7A};
+    const int total_bytes = 5 + len;
+
+    /* Air time in the receiver's internal sim_time_ns frame: bytes arrive
+     * starting at the current cosim time (the sub-step boundary where TX
+     * completed), translated into the node's time frame. */
+    int64_t air_time_ns = current_sim_ns + cosim_boot_offset_ns[node_idx];
+
+    /* Re-entrance guard: if the caller is cosim_rf_tx_handler invoking
+     * local-ACK delivery into the sender mid-step, skip the step_until
+     * calls — we're already inside msp430_step_until() driving the same
+     * CPU.  The ongoing outer step will give the radio state machine
+     * enough cycles to handle the injected ACK.  The flag is set by
+     * cosim_rf_tx_handler around the local-ACK call. */
+    int can_step = !cosim_inject_rx_active[node_idx];
+
+    if (nodes[node_idx].type == NODE_MSP430) {
+        msp430_cpu_t *cpu = &nodes[node_idx].plat.msp.cpu;
+        cc2420_t *radio = &nodes[node_idx].plat.msp.cc2420;
+        uint32_t freq = cpu->cpu_freq_hz;
+
+        radio->rx_rssi = rssi;
+
+        /* Pre-delivery radio-state wait.  If the radio is in TX_FRAME or
+         * any *_CALIBRATE state (e.g. because this node just finished its
+         * own TX and is transitioning back to RX, or because the firmware
+         * hasn't strobed SRXON yet), cc2420_receive_byte would silently
+         * drop every byte.  Step the CPU up to 300µs waiting for the
+         * radio to reach RX_SFD_SEARCH (full TX→RX transition takes 224µs
+         * = 32µs symbol wait + 192µs RX_CALIBRATE). */
+        if (can_step && freq > 0 &&
+            radio->state != CC2420_RX_SFD_SEARCH &&
+            radio->state != CC2420_RX_FRAME) {
+            int64_t deadline = cpu->cycles +
+                msp430_ns_to_cycles(300000LL, freq);
+            while (cpu->cycles < deadline &&
+                   radio->state != CC2420_RX_SFD_SEARCH &&
+                   radio->state != CC2420_RX_FRAME) {
+                /* Small steps so the radio's symbol_event fires promptly
+                 * and we exit the loop as soon as the transition happens. */
+                int64_t chunk = cpu->cycles + 500;
+                if (chunk > deadline) chunk = deadline;
+                msp430_step_until(cpu, chunk);
+            }
+        }
+
+        for (int j = 0; j < total_bytes; j++) {
+            int64_t byte_time_ns = air_time_ns +
+                (int64_t)j * IEEE802154_BYTE_NS;
+
+            /* Advance CPU to byte arrival time, firing pending events. */
+            if (can_step && freq > 0) {
+                int64_t delta_ns = byte_time_ns - cpu->sim_time_ns;
+                if (delta_ns > 0) {
+                    int64_t target_cycle = cpu->cycles +
+                        msp430_ns_to_cycles(delta_ns, freq);
+                    msp430_step_until(cpu, target_cycle);
+                }
+            }
+
+            uint8_t b = (j < 5) ? preamble_sfd[j] : payload[j - 5];
+            cc2420_receive_byte(radio, b);
+        }
+
+        /* Grant the receiver a small extra budget to process the FIFOP
+         * interrupt and run through MAC input + RPL before the next
+         * sub-step.  This over-advances the receiver relative to
+         * current_sim_ns, which is harmless: the next sub-step's
+         * delta_ns will be negative for this node and step_node_until
+         * becomes a no-op until cosim time catches up. */
+        if (can_step && freq > 0) {
+            int64_t budget_cycles = (int64_t)freq / 500;  /* 2ms */
+            msp430_step_until(cpu, cpu->cycles + budget_cycles);
+        }
+    } else if (nodes[node_idx].type == NODE_ARM) {
+        arm_cpu_t *cpu = &nodes[node_idx].plat.arm.cpu;
+        cc2538_rfcore_t *rfcore = &nodes[node_idx].plat.arm.rfcore;
+        uint32_t freq = cpu->cpu_freq_hz;
+
+        rfcore->rx_rssi = rssi;
+
+        /* Pre-delivery state wait — mirror of the MSP430 path above.
+         * CC2538 equivalents: RF_STATE_SFD_WAIT = RX_SFD_SEARCH,
+         * RF_STATE_RX = RX_FRAME. */
+        if (can_step && freq > 0 &&
+            rfcore->state != RF_STATE_SFD_WAIT &&
+            rfcore->state != RF_STATE_RX) {
+            int64_t deadline = cpu->cycles +
+                arm_ns_to_cycles(300000LL, freq);
+            while (cpu->cycles < deadline &&
+                   rfcore->state != RF_STATE_SFD_WAIT &&
+                   rfcore->state != RF_STATE_RX) {
+                int64_t chunk = cpu->cycles + 500;
+                if (chunk > deadline) chunk = deadline;
+                arm_step_until(cpu, chunk);
+            }
+        }
+
+        for (int j = 0; j < total_bytes; j++) {
+            int64_t byte_time_ns = air_time_ns +
+                (int64_t)j * IEEE802154_BYTE_NS;
+
+            if (can_step && freq > 0) {
+                int64_t delta_ns = byte_time_ns - cpu->sim_time_ns;
+                if (delta_ns > 0) {
+                    int64_t target_cycle = cpu->cycles +
+                        arm_ns_to_cycles(delta_ns, freq);
+                    arm_step_until(cpu, target_cycle);
+                }
+            }
+
+            uint8_t b = (j < 5) ? preamble_sfd[j] : payload[j - 5];
+            cc2538_rfcore_receive_byte(rfcore, b);
+        }
+
+        if (can_step && freq > 0) {
+            int64_t budget_cycles = (int64_t)freq / 500;  /* 2ms */
+            arm_step_until(cpu, cpu->cycles + budget_cycles);
+        }
+    }
+}
+
+/*
+ * Bridge TX handler for emulated nodes (MSP430/ARM byte stream).
+ * Assembles 802.15.4 frames from the preamble+SFD+length+payload stream,
+ * generates local ACKs for unicast frames, and sends to coordinator.
+ */
+static void cosim_rf_tx_handler(void *user_data, uint8_t byte) {
+    mixed_node_t *sender = (mixed_node_t *)user_data;
+    int sender_idx = (int)(sender - nodes);
+    cosim_tx_asm_t *a = &cosim_tx_asm[sender_idx];
+
+    switch (a->state) {
+    case COSIM_TX_ASM_PREAMBLE:
+        if (byte == 0x00) {
+            a->zero_count++;
+        } else if (a->zero_count >= 4 && byte == 0x7A) {
+            a->state = COSIM_TX_ASM_LENGTH;
+            a->frame_len = 0;
+        } else {
+            a->zero_count = 0;
+        }
+        return;
+
+    case COSIM_TX_ASM_LENGTH:
+        a->expected_len = byte;
+        if (byte < 3 || byte > 127) {
+            cosim_tx_asm_reset(a);
+            return;
+        }
+        a->state = COSIM_TX_ASM_PAYLOAD;
+        a->payload_count = 0;
+        a->frame[0] = byte;
+        a->frame_len = 1;
+        return;
+
+    case COSIM_TX_ASM_PAYLOAD:
+        if (a->frame_len < COSIM_MAX_FRAME_LEN)
+            a->frame[a->frame_len++] = byte;
+        a->payload_count++;
+        if (a->payload_count >= a->expected_len) {
+            /* All frame types (including auto-generated ACKs from the
+             * CC2420 state machine) flow through to cosim_send_tx and
+             * are routed by the coordinator to their intended recipients,
+             * so the sender receives real ACKs through the same path
+             * as any other packet. */
+
+            /* Real auto-ACKs flow through the receiver's CC2420 state
+             * machine (TX_ACK_CALIBRATE/PREAMBLE/ACK) during cosim_inject_rx
+             * and come out via cosim_rf_tx_handler like any other TX.
+             * The cosim_wait_command cascade loop routes them back to the
+             * original sender through the coordinator. */
+
+            cosim_send_tx(sender_idx, cosim_node_ids[sender_idx],
+                a->frame, a->frame_len,
+                cosim_get_tx_power(sender_idx),
+                cosim_get_channel(sender_idx),
+                (uint64_t)node_sim_time_ns(sender_idx));
+            cosim_tx_occurred = 1;
+            cosim_tx_asm_reset(a);
+        }
+        return;
+    }
+}
+
+/*
+ * Bridge TX handler for native nodes (complete frame callback).
+ */
+static void cosim_rf_frame_handler(void *user_data, const uint8_t *frame,
+                                    int len) {
+    mixed_node_t *sender = (mixed_node_t *)user_data;
+    int sender_idx = (int)(sender - nodes);
+
+    cosim_send_tx(sender_idx, cosim_node_ids[sender_idx],
+        frame, len,
+        cosim_get_tx_power(sender_idx),
+        cosim_get_channel(sender_idx),
+        (uint64_t)node_sim_time_ns(sender_idx));
+    cosim_tx_occurred = 1;
+}
+
+/*
+ * Bridge UART handler: sends console output lines to coordinator.
+ */
+static void cosim_uart_callback(void *user_data, uint8_t byte) {
+    mixed_node_t *node = (mixed_node_t *)user_data;
+    int idx = (int)(node - nodes);
+
+    if (byte == '\n') {
+        node->line_buf[node->line_pos] = '\0';
+        printf("  [Node %d/%s] %s\n", node->id, node_type_str(idx),
+               node->line_buf);
+        cosim_send_console(cosim_node_ids[idx],
+            node->line_buf, (uint64_t)current_sim_ns);
+        node->line_pos = 0;
+    } else if (byte == '\r') {
+        /* ignore */
+    } else if (node->line_pos < (int)sizeof(node->line_buf) - 1) {
+        node->line_buf[node->line_pos++] = (char)byte;
+    }
+}
+
+/*
+ * Collect next scheduled timer times for a node (for DES idle reports).
+ * Native nodes expose etimer/rtimer state; emulated nodes don't, so
+ * they report no timers (their CPU handles timers internally).
+ */
+static int cosim_collect_timers(int idx, uint64_t *out, int max) {
+    int count = 0;
+    if (nodes[idx].type == NODE_NATIVE) {
+        native_node_t *nat = &nodes[idx].plat.native;
+        if (*nat->simEtimerPending && count < max) {
+            /* etimer expiration is in clock ticks (ms) — convert to ns */
+            out[count++] = (*nat->simEtimerNextExpirationTime) * 1000000ULL;
+        }
+        if (*nat->simRtimerPending && count < max) {
+            /* rtimer expiration is in us ticks — convert to ns */
+            out[count++] = (*nat->simRtimerNextExpirationTime) * 1000ULL;
+        }
+    }
+    return count;
+}
+
+/*
+ * Send node_idle reports for all nodes with timer schedule info.
+ */
+static void cosim_send_all_node_idle(void) {
+    for (int i = 0; i < num_nodes; i++) {
+        uint64_t timers[COSIM_MAX_TIMERS];
+        int count = cosim_collect_timers(i, timers, COSIM_MAX_TIMERS);
+        cosim_send_node_idle(cosim_node_ids[i],
+                              count > 0 ? timers : NULL, count);
+    }
+}
+
+/*
+ * Step a single node to cosim target_ns (adding boot offset).
+ * For native nodes in TIME_ADVANCE/RUN_UNTIL mode, skip stepping if
+ * the node has no pending work (skip_idle_native=true).
+ * For STEP_TO (DES) mode, always step (skip_idle_native=false).
+ */
+static void cosim_step_node(int i, int64_t target_ns, bool skip_idle_native) {
+    int64_t node_target = target_ns + cosim_boot_offset_ns[i];
+    if (nodes[i].type == NODE_NATIVE) {
+        if (skip_idle_native &&
+            !native_has_pending_work(&nodes[i].plat.native, node_target) &&
+            *nodes[i].plat.native.simInSize == 0) {
+            nodes[i].plat.native.sim_time_ns = node_target;
+        } else {
+            step_node_until(i, node_target);
+        }
+    } else {
+        int64_t delta_ns = node_target - node_sim_time_ns(i);
+        if (delta_ns > 0) {
+            int64_t target_cycle;
+            if (nodes[i].type == NODE_MSP430)
+                target_cycle = node_cycles(i) +
+                    msp430_ns_to_cycles(delta_ns, node_freq(i));
+            else
+                target_cycle = node_cycles(i) +
+                    arm_ns_to_cycles(delta_ns, node_freq(i));
+            step_node_until(i, target_cycle);
+        }
+    }
+}
+
+/* Step all nodes to cosim target_ns. */
+static void cosim_step_all_nodes(int64_t target_ns, bool skip_idle_native) {
+    for (int i = 0; i < num_nodes; i++)
+        cosim_step_node(i, target_ns, skip_idle_native);
+}
+
+/*
+ * Co-simulation loop, called from run_mixed_multinode_test() when
+ * --cosim is specified. All nodes are already initialized.
+ */
+int run_cosim(const char *cosim_addr, int cosim_port,
+                   char **node_id_list, int node_id_count) {
+    printf("\n=== External Bridge Mode ===\n");
+    printf("  Bridge: %s:%d\n", cosim_addr, cosim_port);
+    printf("  Nodes: %d\n", num_nodes);
+
+    /* Set node ID strings */
+    for (int i = 0; i < num_nodes; i++) {
+        if (i < node_id_count && node_id_list[i]) {
+            strncpy(cosim_node_ids[i], node_id_list[i],
+                    COSIM_NODE_ID_LEN - 1);
+        } else {
+            snprintf(cosim_node_ids[i], COSIM_NODE_ID_LEN,
+                     "node-%d", nodes[i].id);
+        }
+        cosim_node_ids[i][COSIM_NODE_ID_LEN - 1] = '\0';
+        printf("  Node %d: id=%s type=%s\n", i, cosim_node_ids[i],
+               node_type_str(i));
+    }
+
+    /* Initialize TX frame assemblers */
+    for (int i = 0; i < num_nodes; i++)
+        cosim_tx_asm_reset(&cosim_tx_asm[i]);
+
+    /* Replace RF and UART callbacks with co-simulation versions */
+    for (int i = 0; i < num_nodes; i++) {
+        if (nodes[i].type == NODE_MSP430) {
+            msp430_platform_set_console(&nodes[i].plat.msp,
+                cosim_uart_callback, &nodes[i]);
+            cc2420_set_rf_listener(&nodes[i].plat.msp.cc2420,
+                cosim_rf_tx_handler, &nodes[i]);
+        } else if (nodes[i].type == NODE_ARM) {
+            arm_platform_set_console(&nodes[i].plat.arm,
+                cosim_uart_callback, &nodes[i]);
+            cc2538_rfcore_set_tx_callback(&nodes[i].plat.arm.rfcore,
+                cosim_rf_tx_handler, &nodes[i]);
+        } else {
+            nodes[i].plat.native.log_callback = cosim_uart_callback;
+            nodes[i].plat.native.log_callback_data = &nodes[i];
+            nodes[i].plat.native.rf_tx_callback = cosim_rf_tx_handler;
+            nodes[i].plat.native.rf_tx_callback_data = &nodes[i];
+            nodes[i].plat.native.rf_frame_callback = cosim_rf_frame_handler;
+            nodes[i].plat.native.rf_frame_callback_data = &nodes[i];
+        }
+    }
+
+    /* Connect to coordinator */
+    if (cosim_init(cosim_addr, cosim_port) != 0) {
+        fprintf(stderr, "cosim: failed to connect to coordinator\n");
+        return 1;
+    }
+
+    /* Send init handshake */
+    cosim_node_info_t node_info[MAX_NODES];
+    for (int i = 0; i < num_nodes; i++) {
+        snprintf(node_info[i].node_id, COSIM_NODE_ID_LEN, "%s",
+                 cosim_node_ids[i]);
+        node_info[i].node_index = i;
+    }
+    if (cosim_send_init(node_info, num_nodes) != 0) {
+        fprintf(stderr, "cosim: failed to send init\n");
+        cosim_close();
+        return 1;
+    }
+
+    printf("  Bridge connected and initialized\n\n");
+
+    /* Record each emulated node's boot offset.  During init, the CPU ran
+     * millions of cycles to get past crt0/main, leaving sim_time_ns at a
+     * large value (~200ms).  The cosim time base starts at 0ns, so we must
+     * offset target times by the boot time.  Using offsets (rather than
+     * resetting sim_time_ns to 0) avoids invalidating fire_cycle values
+     * of already-queued events and avoids being overwritten by the
+     * cycles_to_ns sync at the end of each msp430_step_until().
+     *
+     * Stored in a file-scope array so cosim_inject_rx() can translate
+     * cosim-frame times into the receiver's internal sim_time_ns frame. */
+    for (int i = 0; i < num_nodes; i++) {
+        cosim_boot_offset_ns[i] = node_sim_time_ns(i);
+        printf("  Node %d boot offset: %lld ns\n", i,
+               (long long)cosim_boot_offset_ns[i]);
+    }
+
+    /* Main co-simulation loop */
+    cosim_time_cmd_t cmd;
+    cosim_rx_inject_t rx_queue[COSIM_MAX_RX_QUEUE];
+    int running = 1;
+
+    while (running) {
+        int rx_count = cosim_wait_command(&cmd, rx_queue,
+                                           COSIM_MAX_RX_QUEUE);
+        if (rx_count < 0) {
+            fprintf(stderr, "cosim: connection lost\n");
+            break;
+        }
+
+        /* Inject any RX packets from coordinator */
+        for (int r = 0; r < rx_count; r++) {
+            cosim_inject_rx(rx_queue[r].node_index,
+                             rx_queue[r].payload, rx_queue[r].payload_len,
+                             rx_queue[r].rssi_dbm);
+        }
+
+        switch (cmd.type) {
+        case COSIM_CMD_TIME_ADVANCE: {
+            /* Deterministic mode: step all nodes to target time.
+             * Add each node's boot offset so cosim time (starts at 0) maps
+             * to the node's internal sim_time_ns (starts at boot time). */
+            int64_t target_ns = cmd.target_time_ns;
+            cosim_step_all_nodes(target_ns, true);
+            current_sim_ns = target_ns;
+            if (cosim_send_time_ack(target_ns) < 0) {
+                fprintf(stderr, "cosim: send time_ack failed\n");
+                running = 0;
+            }
+            break;
+        }
+
+        case COSIM_CMD_STEP_TO: {
+            /* DES mode: step all nodes to target time (with boot offset) */
+            int64_t target_ns = cmd.target_time_ns;
+            cosim_step_all_nodes(target_ns, false);
+            current_sim_ns = target_ns;
+
+            cosim_send_all_node_idle();
+            if (cosim_send_time_ack(target_ns) < 0) {
+                fprintf(stderr, "cosim: send time_ack failed\n");
+                running = 0;
+            }
+            break;
+        }
+
+        case COSIM_CMD_RUN_UNTIL: {
+            /* Run at full speed until target, pausing on TX for
+             * RX injections. Sub-steps in 100us increments. */
+            int64_t max_time = cmd.target_time_ns;
+            int64_t sub_step = 100000; /* 100us in ns */
+
+            while (current_sim_ns < max_time) {
+                int64_t step_target = current_sim_ns + sub_step;
+                if (step_target > max_time) step_target = max_time;
+                cosim_tx_occurred = 0;
+
+                cosim_step_all_nodes(step_target, true);
+                current_sim_ns = step_target;
+
+                if (cosim_tx_occurred) {
+                    if (cosim_send_tx_done(current_sim_ns) < 0) {
+                        running = 0; goto done;
+                    }
+                    cosim_tx_occurred = 0;
+                    /* Wait for RX injections + continue.  Processing an
+                     * RX injection can itself trigger a TX on the receiver
+                     * (e.g. CC2420 auto-ACK for a unicast with ACK_REQUEST).
+                     * If that happens, send another tx_done so the coordinator
+                     * drains the new TX and routes the ACK back before we
+                     * accept CONTINUE.  Cap the cascade depth to defend
+                     * against pathological loops. */
+                    cosim_time_cmd_t cmd2;
+                    cosim_rx_inject_t rx2[COSIM_MAX_RX_QUEUE];
+                    int cascade_depth = 0;
+                    const int max_cascade = 10;
+                    while (1) {
+                        int rc = cosim_wait_command(&cmd2, rx2,
+                                                     COSIM_MAX_RX_QUEUE);
+                        if (rc < 0) { running = 0; goto done; }
+                        for (int r = 0; r < rc; r++) {
+                            cosim_inject_rx(rx2[r].node_index,
+                                             rx2[r].payload,
+                                             rx2[r].payload_len,
+                                             rx2[r].rssi_dbm);
+                        }
+                        if (cosim_tx_occurred && cascade_depth < max_cascade) {
+                            /* Receiver's auto-ACK (or similar) — drain. */
+                            if (cosim_send_tx_done(current_sim_ns) < 0) {
+                                running = 0; goto done;
+                            }
+                            cosim_tx_occurred = 0;
+                            cascade_depth++;
+                            continue;
+                        }
+                        if (cmd2.type == COSIM_CMD_CONTINUE) break;
+                    }
+                }
+            }
+
+            cosim_send_all_node_idle();
+            if (cosim_send_time_ack(max_time) < 0) {
+                fprintf(stderr, "cosim: send time_ack failed\n");
+                running = 0;
+            }
+            break;
+        }
+
+        case COSIM_CMD_STOP:
+            printf("cosim: received stop command\n");
+            running = 0;
+            break;
+
+        case COSIM_CMD_NONE:
+        case COSIM_CMD_CONTINUE:
+            break;
+        }
+    }
+done:
+
+    printf("\n--- Bridge Simulation Complete ---\n");
+    printf("  Final sim time: %lld ns (%lld ms)\n",
+           (long long)current_sim_ns,
+           (long long)(current_sim_ns / MS_TO_NS));
+    {
+        int s, c, rej, ov, cg, cb, dr;
+        cc2420_get_rx_stats(&s, &c, &rej, &ov, &cg, &cb, &dr);
+        printf("  CC2420 RX stats: started=%d completed=%d rejected=%d "
+               "overflow=%d crc_ok=%d crc_bad=%d dropped=%d auto_ack=%d\n",
+               s, c, rej, ov, cg, cb, dr, cc2420_get_auto_ack_count());
+    }
+    for (int i = 0; i < num_nodes; i++) {
+        printf("  Node %d [%s]: %lld cycles, %lld instructions\n",
+               nodes[i].id, node_type_str(i),
+               (long long)node_cycles(i), (long long)node_instructions(i));
+        destroy_node(i);
+    }
+
+    cosim_close();
+    return 0;
+}
+
 /* --- Main entry point --- */
 
 /* Check if path ends with .json */
@@ -3083,6 +3711,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int gdb_wait = 0;  /* if true, block on first connect before starting sim */
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
+    /* Bridge mode */
+    int cosim_enabled = 0;
+    char cosim_addr[128] = "127.0.0.1";
+    int cosim_port = 9010;
+    char *cosim_node_id_args[MAX_NODES] = { NULL };
+    int cosim_node_id_count = 0;
     sim_config_t config;
     int config_loaded = 0;
 
@@ -3134,6 +3768,21 @@ int run_mixed_multinode_test(int argc, char **argv) {
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
             if (num_threads < 0) num_threads = 0;
+        } else if (strcmp(argv[i], "--cosim") == 0 && i + 1 < argc) {
+            cosim_enabled = 1;
+            const char *ap = argv[++i];
+            const char *colon = strrchr(ap, ':');
+            if (colon) {
+                int addr_len = (int)(colon - ap);
+                if (addr_len > 0 && addr_len < (int)sizeof(cosim_addr)) {
+                    memcpy(cosim_addr, ap, (size_t)addr_len);
+                    cosim_addr[addr_len] = '\0';
+                }
+                cosim_port = atoi(colon + 1);
+            }
+        } else if (strcmp(argv[i], "--cosim-node-id") == 0 && i + 1 < argc) {
+            if (cosim_node_id_count < MAX_NODES)
+                cosim_node_id_args[cosim_node_id_count++] = argv[++i];
         } else if (argv[i][0] != '-') {
             if (is_json_file(argv[i])) {
                 /* Load JSON config */
@@ -3537,6 +4186,12 @@ sim_restart:
             }
         }
         printf("Thread pool: %d threads\n", num_threads);
+    }
+
+    /* Co-simulation mode: hand control to external coordinator */
+    if (cosim_enabled) {
+        return run_cosim(cosim_addr, cosim_port,
+                              cosim_node_id_args, cosim_node_id_count);
     }
 
     /* Track action execution index */
@@ -4578,7 +5233,6 @@ sim_restart:
     printf("  CC2538 RXFIFO overflows: %d\n", cc2538_rfcore_get_rxfifo_overflows());
     { int s,c,rej,ov,cg,cb,dr;
       cc2420_get_rx_stats(&s,&c,&rej,&ov,&cg,&cb,&dr);
-      extern int cc2420_get_auto_ack_count(void);
       printf("  CC2420 RX: started=%d completed=%d rejected=%d overflow=%d crc_ok=%d crc_fail=%d dropped=%d auto_ack=%d\n",
              s,c,rej,ov,cg,cb,dr, cc2420_get_auto_ack_count());
     }
