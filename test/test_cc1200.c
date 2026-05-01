@@ -221,6 +221,11 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     /* IOCFG0 = PKT_SYNC_RXTX (default after init, but be explicit) */
     spi_single_write(&chip, CC1200_REG_IOCFG0, CC1200_IOCFG_PKT_SYNC_RXTX);
 
+    /* Force 802.15.4g mode (FG_MODE = PKT_CFG2 bit 5) so the air decoder
+     * expects a 2-byte PHR — that's what the test below feeds. */
+    spi_single_write(&chip, CC1200_REG_PKT_CFG2,
+                      CC1200_PKT_CFG2_FG_MODE_802154G);
+
     /* Enter RX so receive_byte will run the air decoder. */
     spi_strobe(&chip, CC1200_STROBE_SRX);
     ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_RX, "SRX → RX before injecting bytes");
@@ -243,25 +248,29 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     ASSERT_EQ(mock.last_force_irq.pin,  4, "GDO0 pin = 4");
     ASSERT(mock.last_force_irq.rising, "GDO0 rising on SFD");
 
-    /* PHR (length 5) + 5 bytes payload, ending with 2-byte CRC slot.
-     * Chip rewrites the last 2 bytes as (RSSI, 0x80) so the driver sees CRC OK. */
+    /* On-air after sync: PHR(2) + payload(5) + auto-CRC(2). The chip
+     * pushes PHR + payload to the RX FIFO, consumes the 2 CRC bytes
+     * silently (medium owns loss), then appends 2 status bytes
+     * (RSSI, CRC_OK | LQI) per APPEND_STATUS=1 semantics. */
     cc1200_receive_byte(&chip, 0x00);  /* phra: upper bits of length, no CRC flag */
     cc1200_receive_byte(&chip, 0x05);  /* phrb: payload length = 5 */
     cc1200_receive_byte(&chip, 0xAA);
     cc1200_receive_byte(&chip, 0xBB);
     cc1200_receive_byte(&chip, 0xCC);
-    cc1200_receive_byte(&chip, 0xDD);  /* CRC byte 1 (will be overwritten) */
-    cc1200_receive_byte(&chip, 0xEE);  /* CRC byte 2 (will be overwritten) */
+    cc1200_receive_byte(&chip, 0xDD);
+    cc1200_receive_byte(&chip, 0xEE);
+    cc1200_receive_byte(&chip, 0x12);  /* on-air CRC byte 1 (consumed, not stored) */
+    cc1200_receive_byte(&chip, 0x34);  /* on-air CRC byte 2 (consumed, not stored) */
 
     /* GDO0 should now be falling (packet end). */
     ASSERT(!mock.last_force_irq.rising, "GDO0 falling on packet end");
 
-    /* RX FIFO should now contain PHR(2) + payload(5) = 7 bytes. */
-    ASSERT_EQ(cc1200_rxfifo_count(&chip), 7, "rx fifo = PHR+payload");
+    /* RX FIFO should now contain PHR(2) + payload(5) + appendix(2) = 9 bytes. */
+    ASSERT_EQ(cc1200_rxfifo_count(&chip), 9, "rx fifo = PHR+payload+appendix");
 
     /* NUM_RXBYTES (0x2FD7) should match. */
     uint8_t num_rx = spi_single_read(&chip, CC1200_EXT_NUM_RXBYTES);
-    ASSERT_EQ(num_rx, 7, "NUM_RXBYTES register");
+    ASSERT_EQ(num_rx, 9, "NUM_RXBYTES register");
 
     /* Read PHR via RX FIFO direct address (0x3F). */
     uint8_t phr[2];
@@ -269,14 +278,20 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     ASSERT_EQ(phr[0] & 0x07, 0, "PHR phra upper bits");
     ASSERT_EQ(phr[1], 0x05, "PHR phrb lower bits");
 
-    /* Read payload — last 2 bytes should be (RSSI, 0x80) per APPEND_STATUS */
+    /* Read payload (5 bytes — the actual MAC bytes are intact). */
     uint8_t pl[5];
     spi_burst_read(&chip, CC1200_DIRECT_FIFO, pl, 5);
     ASSERT_EQ(pl[0], 0xAA, "payload[0]");
     ASSERT_EQ(pl[1], 0xBB, "payload[1]");
     ASSERT_EQ(pl[2], 0xCC, "payload[2]");
-    /* pl[3] = RSSI byte (whatever rx_rssi was). pl[4] = 0x80 (CRC OK). */
-    ASSERT_EQ(pl[4] & 0x80, 0x80, "CRC OK bit");
+    ASSERT_EQ(pl[3], 0xDD, "payload[3]");
+    ASSERT_EQ(pl[4], 0xEE, "payload[4]");
+
+    /* Read appendix — RSSI byte then (CRC_OK | LQI). */
+    uint8_t app[2];
+    spi_burst_read(&chip, CC1200_DIRECT_FIFO, app, 2);
+    /* app[0] = chip's rx_rssi (whatever default we initialised). */
+    ASSERT_EQ(app[1] & 0x80, 0x80, "CRC OK bit in appendix");
 }
 
 /* ====================================================================
