@@ -137,19 +137,9 @@ static void soc_adc_write(void *user_data, uint32_t addr, uint32_t value) {
     (void)user_data; (void)addr; (void)value;
 }
 
-/* SSI (SPI) stub */
+/* SSI base addresses (peripheral implementation lives in cc2538_ssi.c) */
 #define SSI0_BASE 0x40008000
 #define SSI1_BASE 0x40009000
-#define SSI_SIZE  0x1000
-
-static int ssi_read(void *user_data, uint32_t addr) {
-    (void)user_data; (void)addr;
-    return 0x2; /* SR: TNF=1 (TX not full) */
-}
-
-static void ssi_write(void *user_data, uint32_t addr, uint32_t value) {
-    (void)user_data; (void)addr; (void)value;
-}
 
 /* I2C stub */
 #define I2CM_BASE 0x40020000
@@ -345,8 +335,10 @@ void arm_platform_init(arm_platform_t *plat, const arm_platform_config_t *config
     cc2538_sleeptimer_init(&plat->sleeptimer, &plat->cpu, &plat->nvic, 145);
     arm_register_io(&plat->cpu, ANA_REGS_BASE, ANA_REGS_SIZE, ana_read, ana_write, plat);
     arm_register_io(&plat->cpu, SOC_ADC_BASE, SOC_ADC_SIZE, soc_adc_read, soc_adc_write, plat);
-    arm_register_io(&plat->cpu, SSI0_BASE, SSI_SIZE, ssi_read, ssi_write, plat);
-    arm_register_io(&plat->cpu, SSI1_BASE, SSI_SIZE, ssi_read, ssi_write, plat);
+    /* SSI controllers: real peripheral with exchange callback hook used
+     * by platforms that wire an off-SoC SPI chip (Firefly → CC1200). */
+    cc2538_ssi_init(&plat->ssi0, &plat->cpu, SSI0_BASE, CC2538_SSI_BUS_0);
+    cc2538_ssi_init(&plat->ssi1, &plat->cpu, SSI1_BASE, CC2538_SSI_BUS_1);
     arm_register_io(&plat->cpu, I2CM_BASE, I2CM_SIZE, i2c_read, i2c_write, plat);
     /* uDMA */
     {
