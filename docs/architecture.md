@@ -268,7 +268,7 @@ Boards differ in *which* chips sit outside the SoC and *how* they connect. csim 
 | **wismote / exp5438 / cc430** | F5437 / CC430F5137 | None | — | —                                                                |
 | **cc2538dk** | CC2538 (Cortex-M3) | RF Core *on-chip* | —          | Memory-mapped at `0x40088000` + FFSM regs; NVIC IRQ direct              |
 | **openmote** | CC2538 (Cortex-M3) | RF Core *on-chip* | —          | Same as cc2538dk; only board glue (LEDs / button) differs               |
-| **zoul-firefly** | CC2538 (Cortex-M3) | RF Core *on-chip*; CC1200 *off* (sub-GHz) | — | RF Core same as cc2538dk. CC1200 over SSI0 with CSn=PB5, RESET=PC7, GDO0=PB4, GDO2=PB0 — driver + SSI controller still TODO (Phase B). |
+| **zoul-firefly** | CC2538 (Cortex-M3) | RF Core *on-chip*; CC1200 *off* (sub-GHz) | — | RF Core same as cc2538dk. CC1200 driver (`src/arm/cc1200.c`, `sim_host_t`-only) over SSI0 (`src/arm/cc2538_ssi.c`) with CSn=PB5, RESET=PC7, GDO0=PB4, GDO2=PB0. Per-node radio fan-out in `test_mixed_multinode.c` feeds delivered bytes to both chips; `radio_medium`'s reserved sub-GHz channel range (≥`RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE`) plus a `cross_band_drop()` filter keeps the two bands isolated without a true dual-radio refactor. |
 
 ### Five bridge APIs that wire any off-SoC chip
 
