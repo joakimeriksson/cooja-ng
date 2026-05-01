@@ -2183,6 +2183,9 @@ static node_type_t detect_node_type(const char *path) {
     const char *dot = strrchr(path, '.');
     if (dot && strcmp(dot, ".cc2538dk") == 0)
         return NODE_ARM;
+    /* Zolertia Firefly: same CC2538 SoC as cc2538dk, different board glue. */
+    if (dot && strcmp(dot, ".zoul-firefly") == 0)
+        return NODE_ARM;
     if (dot && strcmp(dot, ".cooja") == 0)
         return NODE_NATIVE;
     if (dot && strcmp(dot, ".js") == 0)
@@ -2418,8 +2421,16 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     arm_platform_t *plat = &node->plat.arm;
 
-    const arm_platform_config_t *pcfg = arm_platform_find("cc2538dk");
-    if (!pcfg) { fprintf(stderr, "Platform 'cc2538dk' not found\n"); return -1; }
+    /* Derive ARM platform from firmware extension: .cc2538dk -> cc2538dk,
+     * .zoul-firefly -> zoul-firefly. Both reuse the same CC2538 SoC; the
+     * difference is board wiring (LEDs, button, off-SoC chips). */
+    const char *dot = strrchr(firmware_path, '.');
+    const char *plat_name = "cc2538dk";
+    if (dot && strcmp(dot, ".zoul-firefly") == 0)
+        plat_name = "zoul-firefly";
+
+    const arm_platform_config_t *pcfg = arm_platform_find(plat_name);
+    if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }
 
     arm_platform_init(plat, pcfg);
     if (arm_load_elf(&plat->cpu, firmware_path) != 0) {
