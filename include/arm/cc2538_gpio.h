@@ -65,4 +65,11 @@ void cc2538_gpio_set_output_callback(cc2538_gpio_t *gpio,
 /* Set input pin value (for external devices driving GPIO) */
 void cc2538_gpio_set_input(cc2538_gpio_t *gpio, int port, int pin, bool value);
 
+/* Force-enable IE and pulse RIS on a pin, then pend the port's NVIC IRQ.
+ * Mirrors msp430_gpio_force_irq_edge(): used by off-SoC chip drivers that
+ * need a GPIO edge interrupt to fire reliably regardless of how the
+ * firmware configured IS/IBE/IEV. Rising=true sets RIS, rising=false
+ * clears RIS for the bit. */
+void cc2538_gpio_force_irq_edge(cc2538_gpio_t *gpio, int port, int pin, bool rising);
+
 #endif /* CC2538_GPIO_H */

@@ -2,6 +2,7 @@
  * CC2538 GPIO peripheral (Ports A-D)
  */
 #include "cc2538_gpio.h"
+#include "arm_nvic.h"
 #include <string.h>
 
 #define GPIO_PORT_SIZE  0x1000
@@ -115,5 +116,22 @@ void cc2538_gpio_set_input(cc2538_gpio_t *gpio, int port, int pin, bool value) {
             p->data |= mask;
         else
             p->data &= ~mask;
+    }
+}
+
+void cc2538_gpio_force_irq_edge(cc2538_gpio_t *gpio, int port, int pin, bool rising) {
+    if (port < 0 || port >= CC2538_GPIO_NUM_PORTS) return;
+    if (pin < 0 || pin > 7) return;
+
+    cc2538_gpio_port_t *p = &gpio->ports[port];
+    uint8_t mask = (uint8_t)(1u << pin);
+
+    p->ie |= mask;
+    if (rising) p->ris |=  mask;
+    else        p->ris &= ~mask;
+
+    /* Pend the port's NVIC IRQ if any RIS bit is now masked-in. */
+    if ((p->ris & p->ie) && gpio->cpu && gpio->cpu->nvic && gpio->irq_nums[port] >= 0) {
+        arm_nvic_set_pending((arm_nvic_t *)gpio->cpu->nvic, gpio->irq_nums[port]);
     }
 }
