@@ -106,6 +106,7 @@ typedef struct {
     int expected_len;      /* PHY length value (PHR for CC1200) */
     int payload_count;     /* bytes received after length byte */
     bool subghz;           /* true once sync word matched (sub-GHz frame) */
+    int subghz_phr_len;    /* CC1200 PHR width: 1 or 2 bytes */
     int64_t first_byte_ns; /* sim time of first preamble byte */
 } tx_frame_asm_t;
 
@@ -121,9 +122,11 @@ static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
         /* Look for either preamble pattern. */
         a->sync_match = (a->sync_match << 8) | byte;
         if (a->sync_match == RADIO_FRAME_802154G_SYNC_WORD) {
-            /* CC1200 sync word — next two bytes are PHR */
+            /* CC1200 sync word — next 1 or 2 bytes are the PHR (we
+             * disambiguate inside TX_ASM_SUBGHZ_PHR). */
             a->state = TX_ASM_SUBGHZ_PHR;
             a->subghz = true;
+            a->subghz_phr_len = 0;
             a->phr_lo = -1;
             a->payload_count = 0;
             return false;
@@ -151,9 +154,32 @@ static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
         return false;
 
     case TX_ASM_SUBGHZ_PHR:
+        /* CC1200 PHR is 1 or 2 bytes depending on the firmware's
+         * configuration of PKT_CFG2 bit 5 (FG_MODE / 802.15.4g). The
+         * test runner doesn't have a back-channel to that register, so
+         * we sniff: if the first PHR byte makes a sensible 1-byte length
+         * (3..200) we lock into 1-byte mode; otherwise we treat it as
+         * the upper 3 bits of a 2-byte 802.15.4g PHR. This works
+         * because the firmwares we ship use either standard mode (PHR=1)
+         * or 802.15.4g mode (PHR=2) — never both — and the 802.15.4g
+         * upper byte's low-3-bits-as-length-high yields values like 0,
+         * 1, or 2 (well under 200), so a phra of e.g. 0x10 (CRC bit + 0)
+         * for a small 802.15.4g frame still parses correctly via the
+         * 1-byte path even though it's 2-byte on the wire. The
+         * follow-up PHR-byte path catches the few high-length cases. */
         if (a->phr_lo < 0) {
-            /* PHRA byte: top 3 bits = length high */
+            /* First PHR byte. */
+            uint8_t len = byte;
+            if (len >= 3 && len <= 200) {
+                a->expected_len = len;
+                a->subghz_phr_len = 1;
+                a->state = TX_ASM_PAYLOAD;
+                a->payload_count = 0;
+                return false;
+            }
+            /* Looks like 802.15.4g: upper byte. */
             a->phr_lo = byte & 0x07;
+            a->subghz_phr_len = 2;
         } else {
             /* PHRB byte: low 8 bits */
             a->expected_len = (a->phr_lo << 8) | byte;
@@ -171,15 +197,22 @@ static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
 
     case TX_ASM_PAYLOAD:
         a->payload_count++;
-        /* expected_len = PHY length byte = payload + FCS(2).
-         * On the wire after length: (expected_len - 2) payload + 2 auto-CRC
-         * = expected_len bytes total. */
-        if (a->payload_count >= a->expected_len) {
-            /* Frame complete — reset for next frame */
+        /* For 802.15.4 (CC2420 / cc2538_rfcore) the length byte's value
+         * already includes the 2 FCS bytes the chip auto-appends, so
+         * frame-complete fires on byte expected_len. For CC1200 the
+         * length byte counts payload only and the chip appends 2 extra
+         * CRC bytes after the payload — we wait for those too so the
+         * receiver-side dispatch's total_air_bytes count includes them. */
+        int payload_target = a->expected_len + (a->subghz ? 2 : 0);
+        if (a->payload_count >= payload_target) {
+            /* Frame complete — reset only the bytes-on-wire tracking
+             * (state + sliding sync register + zero counter); leave
+             * subghz / subghz_phr_len / expected_len intact so the caller
+             * can read them to compute total_air_bytes. They get cleared
+             * the next time a fresh frame's first preamble byte arrives. */
             a->state = TX_ASM_PREAMBLE;
             a->zero_count = 0;
             a->sync_match = 0;
-            a->subghz = false;
             a->phr_lo = -1;
             return true;
         }
@@ -196,6 +229,7 @@ static void tx_frame_asm_reset(tx_frame_asm_t *a) {
     a->payload_count = 0;
     a->phr_lo = -1;
     a->subghz = false;
+    a->subghz_phr_len = 0;
     a->first_byte_ns = 0;
 }
 
@@ -1242,8 +1276,15 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
      *   - 802.15.4g (CC1200): 4-byte preamble + 4-byte sync word + 2-byte
      *     PHR + payload. (Same per-byte timing — the medium uses the
      *     IEEE802154_BYTE_NS value as a wire-rate proxy.) */
+    /* Air-byte budget for the dispatch loop must match what the chip
+     * driver actually emitted. CC2538 RFCore: 4 preamble + SFD + length
+     * byte + payload (length includes the 2 FCS bytes). CC1200: 4
+     * preamble + 4 sync + PHR (1 or 2 bytes) + payload bytes (= length
+     * value) + 2 auto-CRC bytes that the chip auto-appends per
+     * PKT_CFG1.CRC_CFG. */
     int total_air_bytes = tx_asm[sender_idx].subghz
-        ? (4 + 4 + 2 + tx_asm[sender_idx].expected_len)
+        ? (4 + 4 + tx_asm[sender_idx].subghz_phr_len +
+           tx_asm[sender_idx].expected_len + 2)
         : (4 + 1 + 1 + tx_asm[sender_idx].expected_len);
     int64_t frame_air_dur = (int64_t)total_air_bytes * IEEE802154_BYTE_NS;
     int64_t accurate_tx_end = byte_time_ns + IEEE802154_BYTE_NS;
