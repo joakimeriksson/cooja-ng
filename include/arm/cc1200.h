@@ -30,7 +30,11 @@
 #include "sim_host.h"
 
 /* --- Public register address space (matches cc1200-const.h) --- */
-#define CC1200_REG_SPACE_SIZE   0x1000   /* covers regular + 0x2F00 ext */
+/* Regular range: 0x00..0x2E (47 regs). Extended range: 0x2F00..0x2FFF
+ * (256 regs). We allocate the full 0x3000 bytes so the extended-address
+ * registers can be addressed by their natural 16-bit address inside the
+ * driver. Sparse — most stay zero. */
+#define CC1200_REG_SPACE_SIZE   0x3000
 
 /* Strobes (bit 7=1, bits 6:0 = strobe code) */
 #define CC1200_STROBE_SRES      0x30
