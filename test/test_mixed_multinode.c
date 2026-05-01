@@ -2866,7 +2866,16 @@ static int reboot_node(int idx) {
     return init_node(idx, fw, node_id);
 }
 
-/* --- Simulation step for one node --- */
+/* --- Simulation step for one node ---
+ *
+ * Used by the main time-stepping loop and threaded-mode driver to
+ * advance a node's CPU. Do NOT call this from chip-driver code or the
+ * per-byte RX delivery path — that's a code smell indicating the chip
+ * driver is missing a host->schedule_ns() call. The simulator is
+ * event-driven: chip drivers must put state-change side effects on
+ * sim_eq so the main loop steps the receiver CPU forward naturally.
+ * See docs/porting-a-device.md §8 ("Synchronous side effects in
+ * chip-driver byte handlers"). */
 
 static void step_node_until(int idx, int64_t target) {
     if (nodes[idx].type == NODE_MSP430)
