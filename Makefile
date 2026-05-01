@@ -45,7 +45,8 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/cc2538_sys_ctrl.c \
               $(ARM_SRC_DIR)/cc2538_ioc.c \
               $(ARM_SRC_DIR)/cc2538_rfcore.c \
-              $(ARM_SRC_DIR)/cc2538_sleeptimer.c
+              $(ARM_SRC_DIR)/cc2538_sleeptimer.c \
+              $(ARM_SRC_DIR)/cc2538_ssi.c
 
 COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/radio_medium.c \

@@ -15,6 +15,7 @@
 #include "cc2538_ioc.h"
 #include "cc2538_rfcore.h"
 #include "cc2538_sleeptimer.h"
+#include "cc2538_ssi.h"
 #include "sim_host.h"
 
 /* UART TX callback */
@@ -57,6 +58,8 @@ typedef struct arm_platform {
     cc2538_ioc_t      ioc;
     cc2538_rfcore_t   rfcore;
     cc2538_sleeptimer_t sleeptimer;
+    cc2538_ssi_t      ssi0;
+    cc2538_ssi_t      ssi1;
     /* uDMA state (opaque, allocated by platform init) */
     void *udma;
     /* USB state (opaque, allocated by platform init) */
