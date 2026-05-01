@@ -13,6 +13,10 @@ typedef struct {
     int  test_passed;
     int  verbose;
     arm_cpu_t *cpu;
+    /* Optional banner assertion: stop+pass when this substring appears
+     * on any UART line. NULL means "wait for EXIT/FAIL marker only". */
+    const char *expect_banner;
+    int  banner_seen;
 } arm_fw_test_state_t;
 
 static void arm_fw_tx_callback(void *user_data, uint8_t byte) {
@@ -31,6 +35,12 @@ static void arm_fw_tx_callback(void *user_data, uint8_t byte) {
             state->test_finished = 1;
             state->test_passed = 1;
             arm_stop(state->cpu);
+        } else if (state->expect_banner &&
+                   strstr(state->line_buffer, state->expect_banner)) {
+            state->banner_seen = 1;
+            state->test_finished = 1;
+            state->test_passed = 1;
+            arm_stop(state->cpu);
         }
         state->line_pos = 0;
     } else if (state->line_pos < (int)sizeof(state->line_buffer) - 1) {
@@ -41,6 +51,11 @@ static void arm_fw_tx_callback(void *user_data, uint8_t byte) {
 typedef struct {
     const char *path;
     const char *platform;
+    /* If non-NULL, the firmware test passes as soon as this substring
+     * appears on a UART line. Used for boards whose Contiki bring-up
+     * never prints "EXIT" (i.e. real hello-world prints a banner and
+     * loops forever). */
+    const char *expect_banner;
 } arm_firmware_test_entry_t;
 
 int run_arm_firmware_test(const arm_firmware_test_entry_t *entry, int max_instructions, int verbose) {
@@ -65,6 +80,7 @@ int run_arm_firmware_test(const arm_firmware_test_entry_t *entry, int max_instru
     memset(&state, 0, sizeof(state));
     state.cpu = &plat.cpu;
     state.verbose = verbose;
+    state.expect_banner = entry->expect_banner;
 
     arm_platform_set_console(&plat, arm_fw_tx_callback, &state);
 
@@ -74,12 +90,23 @@ int run_arm_firmware_test(const arm_firmware_test_entry_t *entry, int max_instru
     int ret;
     if (state.test_finished) {
         if (state.test_passed) {
-            printf("  PASS: Firmware test completed successfully\n");
+            if (state.banner_seen)
+                printf("  PASS: Firmware printed expected banner '%s'\n",
+                       entry->expect_banner);
+            else
+                printf("  PASS: Firmware test completed successfully\n");
             ret = 0;
         } else {
             printf("  FAIL: Firmware reported failure\n");
             ret = 1;
         }
+    } else if (entry->expect_banner) {
+        printf("  FAIL: Banner '%s' not seen within %d instructions\n",
+               entry->expect_banner, max_instructions);
+        printf("  DEBUG: PC=0x%08x LR=0x%08x SP=0x%08x xpsr=0x%08x cycles=%lld\n",
+               plat.cpu.reg[15], plat.cpu.reg[14], plat.cpu.reg[13],
+               plat.cpu.xpsr, (long long)plat.cpu.cycles);
+        ret = 1;
     } else {
         printf("  INFO: Firmware did not complete within %d instructions\n", max_instructions);
         printf("  DEBUG: PC=0x%08x LR=0x%08x SP=0x%08x xpsr=0x%08x cycles=%lld\n",
@@ -100,8 +127,13 @@ int run_arm_firmware_tests(int verbose) {
 
     int failures = 0;
     const arm_firmware_test_entry_t firmware_tests[] = {
-        { "firmware/cc2538dk/hello-world.cc2538dk",  "cc2538dk" },
-        { NULL, NULL }
+        { "firmware/cc2538dk/hello-world.cc2538dk",      "cc2538dk",     NULL },
+        /* Phase A bring-up for the Zolertia Firefly: assert the BOARD_STRING
+         * banner from arch/platform/zoul/firefly/board.h appears on UART0.
+         * Covers L0 (ELF loads) through L4 (Contiki init reaches platform_init
+         * which prints the banner). */
+        { "firmware/zoul-firefly/bringup.zoul-firefly",  "zoul-firefly", "Zolertia Firefly platform" },
+        { NULL, NULL, NULL }
     };
 
     for (int i = 0; firmware_tests[i].path; i++) {
