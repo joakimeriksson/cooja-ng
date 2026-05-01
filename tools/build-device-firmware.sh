@@ -17,6 +17,9 @@
 #                         contiker/contiki-ng Docker image.
 #   --make-args "..."     Extra arguments passed verbatim to make
 #                         (e.g. "MAKE_MAC=MAKE_MAC_TSCH WERROR=0").
+#   --source-file NAME    Pick a specific .c file inside the example
+#                         dir (e.g. udp-client.c). Default: first .c
+#                         file with a main() or PROCESS_THREAD.
 #   --no-provenance       Skip writing PROVENANCE.md (rare; CI may want it
 #                         off when stamping in a separate step).
 #
@@ -40,6 +43,7 @@ USE_DOCKER=1
 EXTRA_MAKE_ARGS=""
 WRITE_PROVENANCE=1
 DOCKER_IMAGE="contiker/contiki-ng:latest"
+SRC_FILE_ARG=""
 
 # ---- args ----
 while [ $# -gt 0 ]; do
@@ -47,6 +51,7 @@ while [ $# -gt 0 ]; do
         --target)         TARGET="$2"; shift 2 ;;
         --board)          BOARD="$2"; shift 2 ;;
         --example)        EXAMPLE="$2"; shift 2 ;;
+        --source-file)    SRC_FILE_ARG="$2"; shift 2 ;;
         --output)         OUTPUT="$2"; shift 2 ;;
         --contiki-dir)    CONTIKI_DIR="$2"; shift 2 ;;
         --local)          USE_DOCKER=0; shift ;;
@@ -87,16 +92,26 @@ else
     exit 1
 fi
 
-# Determine the source name (first .c file with a `main`/`PROCESS_THREAD`
-# in the source dir — Contiki uses `<name>.c` -> `<name>.<target>`).
+# Determine the source name. If --source-file was passed, use it directly
+# (with or without the .c suffix). Otherwise pick the first .c file with
+# a `main`/`PROCESS_THREAD` in the source dir.
+# Contiki uses `<name>.c` -> `<name>.<target>`.
 SRC_NAME=""
-for f in "$SRC_DIR"/*.c; do
-    [ -f "$f" ] || continue
-    if grep -qE 'PROCESS_THREAD|int +main *\(' "$f"; then
-        SRC_NAME="$(basename "$f" .c)"
-        break
-    fi
-done
+if [ -n "$SRC_FILE_ARG" ]; then
+    SRC_NAME="${SRC_FILE_ARG%.c}"
+    [ -f "$SRC_DIR/$SRC_NAME.c" ] || {
+        echo "Error: --source-file '$SRC_NAME.c' not found in $SRC_DIR" >&2
+        exit 1
+    }
+else
+    for f in "$SRC_DIR"/*.c; do
+        [ -f "$f" ] || continue
+        if grep -qE 'PROCESS_THREAD|int +main *\(' "$f"; then
+            SRC_NAME="$(basename "$f" .c)"
+            break
+        fi
+    done
+fi
 [ -n "$SRC_NAME" ] || { echo "Error: no main/PROCESS in $SRC_DIR/*.c" >&2; exit 1; }
 
 # ---- build ----
@@ -157,6 +172,7 @@ if [ $WRITE_PROVENANCE -eq 1 ]; then
     PROV_PATH="$(dirname "$OUTPUT_ABS")/PROVENANCE.md"
     COMMIT="$(git -C "$CONTIKI_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
     BUILD_CMD="tools/build-device-firmware.sh --target $TARGET${BOARD:+ --board $BOARD} --example $EXAMPLE --output $OUTPUT"
+    [ -n "$SRC_FILE_ARG" ]   && BUILD_CMD="$BUILD_CMD --source-file $SRC_FILE_ARG"
     [ -n "$EXTRA_MAKE_ARGS" ] && BUILD_CMD="$BUILD_CMD --make-args \"$EXTRA_MAKE_ARGS\""
     DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     BUILDER="$(git config user.name 2>/dev/null || whoami)"
