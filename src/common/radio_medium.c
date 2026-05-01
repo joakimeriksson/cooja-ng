@@ -12,6 +12,19 @@
 /* IEEE 802.15.4g (CC1200 50 kbps) sync word — see radio_medium.h. */
 #define SUBGHZ_SYNC_WORD  RADIO_FRAME_802154G_SYNC_WORD
 
+/* Cross-band check: drop bytes between sub-GHz and 2.4 GHz nodes. The
+ * within-band channel check stays disabled (TSCH hopping makes stale
+ * channel values unreliable between ticks), but the cross-band check
+ * is needed for dual-radio Firefly fan-out — it isolates CC1200 chatter
+ * from cc2538 RF Core nodes (and vice versa) without a real dual-radio
+ * refactor. See devices/zoul-firefly/SPEC.md "Radio medium strategy". */
+static inline bool cross_band_drop(int ch_s, int ch_r) {
+    if (ch_s < 0 || ch_r < 0) return false;
+    bool s_sub = (ch_s >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
+    bool r_sub = (ch_r >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
+    return s_sub != r_sub;
+}
+
 /* --- xorshift32 PRNG --- */
 
 static double rng_next(radio_medium_t *rm) {
@@ -230,14 +243,12 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
     if (rm->type == RADIO_MEDIUM_NONE)
         return true;
 
-    /* Channel check */
+    /* Cross-band check: same as filter_byte — 2.4 GHz never reaches sub-GHz. */
     int ch_s = rm->nodes[sender].channel;
     int ch_r = rm->nodes[receiver].channel;
-    /* Channel check disabled for now — TSCH channel hopping makes
-     * stale simRadioChannel values unreliable between ticks.
-     * TODO: implement per-event channel sync for TSCH. */
-    /* if (ch_s >= 0 && ch_r >= 0 && ch_s != ch_r)
-        return false; */
+    if (cross_band_drop(ch_s, ch_r))
+        return false;
+    /* Within-band channel check disabled — see filter_byte. */
 
     /* Distance-based probabilistic check */
     double prob = udgm_reception_prob(rm, sender, receiver);
@@ -278,14 +289,14 @@ bool radio_medium_filter_byte(radio_medium_t *rm, int sender, int receiver, uint
     /* Track frame boundaries for this sender */
     track_byte(rm, sender, byte);
 
-    /* Channel check: if both nodes have a known channel, they must match */
+    /* Cross-band check: 2.4 GHz <-> sub-GHz never overhear each other. */
     int ch_s = rm->nodes[sender].channel;
     int ch_r = rm->nodes[receiver].channel;
-    /* Channel check disabled for now — TSCH channel hopping makes
-     * stale simRadioChannel values unreliable between ticks.
+    if (cross_band_drop(ch_s, ch_r))
+        return false;
+    /* Within-band channel check disabled for now — TSCH channel hopping
+     * makes stale simRadioChannel values unreliable between ticks.
      * TODO: implement per-event channel sync for TSCH. */
-    /* if (ch_s >= 0 && ch_r >= 0 && ch_s != ch_r)
-        return false; */
 
     /* UDGM distance-based filtering */
     frame_tracker_t *ft = &rm->frame_track[sender];
