@@ -83,8 +83,13 @@
 #define CC1200_REG_SYNC2             0x0005
 #define CC1200_REG_SYNC1             0x0006
 #define CC1200_REG_SYNC0             0x0007
+#define CC1200_REG_PKT_CFG2          0x0026
 #define CC1200_REG_PKT_CFG0          0x0028
 #define CC1200_REG_PKT_LEN           0x002E
+
+/* PKT_CFG2 bits relevant to framing */
+#define CC1200_PKT_CFG2_FG_MODE_802154G  (1u << 5)  /* "FG_MODE" — bit5 enables
+                                                       802.15.4g 2-byte PHR */
 #define CC1200_EXT_RSSI1             0x2F71
 #define CC1200_EXT_MARCSTATE         0x2F73
 #define CC1200_EXT_NUM_TXBYTES       0x2FD6
@@ -166,6 +171,7 @@ typedef struct cc1200 {
     int      air_phr_count;
     int      air_payload_remaining;
     int      air_payload_total;
+    int      air_crc_remaining;   /* on-air auto-CRC bytes still to consume */
 
     /* TX byte-emission state */
     int      tx_emit_index;   /* index into tx_fifo+headers being emitted */
