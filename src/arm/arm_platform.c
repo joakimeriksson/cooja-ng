@@ -35,6 +35,51 @@ static void arm_host_force_irq_edge(void *gpio, int port, int pin, bool rising) 
     cc2538_gpio_force_irq_edge((cc2538_gpio_t *)gpio, port, pin, rising);
 }
 
+/* ============================================================
+ * CC1200 wiring shims (Firefly only — other platforms set
+ * has_cc1200 = false and these are not installed).
+ * ============================================================ */
+
+/* SSI exchange callback: forward every byte to the CC1200 driver. The
+ * driver itself ignores bytes when CSn is high, so even if firmware
+ * accidentally drives the bus without selecting the chip, nothing
+ * goes wrong. */
+static uint8_t arm_cc1200_ssi_exchange(void *user_data, uint8_t mosi) {
+    arm_platform_t *plat = (arm_platform_t *)user_data;
+    return cc1200_spi_exchange(&plat->cc1200, mosi);
+}
+
+/* GPIO output-callback dispatcher: watches the CC1200 control pins
+ * (CSn on PB5, RESET on PC7 by default) and forwards level changes
+ * to the chip driver. Pattern mirrors msp430_platform.c's CC2420
+ * wiring — a single callback fans out to whichever pins matter. */
+static void arm_cc1200_gpio_output(void *user_data, int port,
+                                    uint8_t old_val, uint8_t new_val) {
+    arm_platform_t *plat = (arm_platform_t *)user_data;
+    const arm_platform_config_t *cfg = plat->config;
+    if (!cfg || !cfg->has_cc1200) return;
+
+    /* CSn — active low. Only react if this port owns the CSn pin. */
+    if (cfg->cc1200_csn.port == port) {
+        uint8_t mask = (uint8_t)(1u << cfg->cc1200_csn.pin);
+        bool old_low = (old_val & mask) == 0;
+        bool new_low = (new_val & mask) == 0;
+        if (old_low != new_low) {
+            cc1200_set_csn(&plat->cc1200, new_low);
+        }
+    }
+
+    /* RESET — active low. */
+    if (cfg->cc1200_reset.port == port) {
+        uint8_t mask = (uint8_t)(1u << cfg->cc1200_reset.pin);
+        bool old_low = (old_val & mask) == 0;
+        bool new_low = (new_val & mask) == 0;
+        if (old_low != new_low) {
+            cc1200_set_reset(&plat->cc1200, new_low);
+        }
+    }
+}
+
 /* --- Platform definitions --- */
 
 static const arm_platform_config_t platform_cc2538dk = {
@@ -55,8 +100,11 @@ static const arm_platform_config_t platform_openmote = {
  * USER button = PA3 (active-low, internal pull-up; shared with bootloader).
  * Console = UART0 (PA0=RX, PA1=TX) → CP2104 USB-serial bridge.
  *
- * Off-SoC CC1200 sub-GHz radio is NOT wired in this Phase A entry — that
- * lands with the SSI controller + cc1200.c chip driver in Phase B. */
+ * Off-SoC CC1200 sub-GHz radio over SSI0:
+ *   CSn  = PB5 (active low, driven by firmware as a GPIO, not by SSI's FSS)
+ *   RESET= PC7 (active low, pulsed during cc1200_arch_init())
+ *   GDO0 = PB4 (input to MCU; PKT_SYNC_RXTX edge interrupt)
+ *   GDO2 = PB0 (input to MCU; optional, only if CC1200_USE_GPIO2 set) */
 static const arm_platform_config_t platform_zoul_firefly = {
     .name          = "zoul-firefly",
     .soc           = &cc2538_config,
@@ -67,6 +115,12 @@ static const arm_platform_config_t platform_zoul_firefly = {
         { .port = 3, .pin = 3, .active_low = false },  /* LED3 Blue  PD3 */
     },
     .button = { .port = 0, .pin = 3, .active_low = true },  /* USER PA3 */
+    .has_cc1200    = true,
+    .cc1200_ssi    = 0,                                       /* SSI0 */
+    .cc1200_csn    = { .port = 1, .pin = 5, .active_low = true },  /* PB5 */
+    .cc1200_reset  = { .port = 2, .pin = 7, .active_low = true },  /* PC7 */
+    .cc1200_gdo0   = { .port = 1, .pin = 4, .active_low = false }, /* PB4 */
+    .cc1200_gdo2   = { .port = 1, .pin = 0, .active_low = false }, /* PB0 */
 };
 
 static const arm_platform_config_t *all_arm_platforms[] = {
@@ -353,6 +407,27 @@ void arm_platform_init(arm_platform_t *plat, const arm_platform_config_t *config
         usb_state_t *usb = (usb_state_t *)calloc(1, sizeof(usb_state_t));
         plat->usb = usb;
         arm_register_io(&plat->cpu, USB_BASE, USB_SIZE, usb_read, usb_write, usb);
+    }
+
+    /* Off-SoC CC1200 sub-GHz radio (Firefly only).
+     * Wires the chip driver into the SSI bus + GPIO control pins. The
+     * driver itself takes only the sim_host vtable — no ARM types leak
+     * across the boundary. */
+    if (config->has_cc1200) {
+        cc1200_init(&plat->cc1200, &plat->host);
+        cc1200_set_gdo0_pin(&plat->cc1200,
+                             config->cc1200_gdo0.port,
+                             config->cc1200_gdo0.pin);
+        if (config->cc1200_gdo2.port >= 0) {
+            cc1200_set_gdo2_pin(&plat->cc1200,
+                                 config->cc1200_gdo2.port,
+                                 config->cc1200_gdo2.pin);
+        }
+        /* Route the chosen SSI bus to the CC1200 driver. */
+        cc2538_ssi_t *bus = (config->cc1200_ssi == 1) ? &plat->ssi1 : &plat->ssi0;
+        cc2538_ssi_set_exchange_callback(bus, arm_cc1200_ssi_exchange, plat);
+        /* Tap GPIO output transitions for CSn + RESET. */
+        cc2538_gpio_set_output_callback(&plat->gpio, arm_cc1200_gpio_output, plat);
     }
 }
 
