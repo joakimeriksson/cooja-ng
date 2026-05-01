@@ -1,0 +1,53 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs when a new commit lands on the same PR/branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, label: "ubuntu / gcc" }
+          - { os: macos-latest,  label: "macos / clang" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: MSP430 instruction tests
+        run: ./build/test_runner correctness
+
+      - name: ARM instruction tests
+        run: ./build/test_runner arm-correctness
+
+      - name: Timeline unit tests
+        run: ./build/test_runner timeline
+
+      - name: MSP430 firmware boot tests
+        run: ./build/test_runner firmware
+
+      - name: ARM firmware boot tests
+        run: ./build/test_runner arm-firmware
+
+      - name: MSP430 multinode (2 nodes, 5s sim)
+        run: ./build/test_runner multinode -n 2 -t 5000 -q
+
+      - name: ARM multinode (CC2538 nullnet, 5s sim)
+        run: ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 5000 -q
+
+# TODO: add a third job that builds with GNU Lightning enabled to cover
+# the JIT path in src/msp430/msp430_jit.c. Verify the Ubuntu apt package
+# name first (`apt-cache search lightning` on the runner) — Debian/Ubuntu
+# has historically shipped GNU Lightning under different names.
