@@ -238,6 +238,22 @@ void msp430_gpio_set_output_callback(msp430_gpio_t *gpio,
     gpio->output_callback_data = user_data;
 }
 
+/* Force-enable IE and pulse IFG on a pin (rising sets IFG, falling clears
+ * it). Used by peripherals like CC2420 whose FIFOP signal needs the IFG
+ * to track its level for legacy Cooja firmware that doesn't clear IFG
+ * itself. */
+void msp430_gpio_force_irq_edge(msp430_gpio_t *gpio, int port, int pin, bool rising) {
+    if (port < 1 || port > gpio->num_ports) return;
+    int idx = port - 1;
+    msp430_gpio_port_t *p = &gpio->ports[idx];
+    if (!p->has_interrupt) return;
+    uint8_t bit = (uint8_t)(1u << pin);
+    p->ie |= bit;
+    if (rising) p->ifg |=  bit;
+    else        p->ifg &= ~bit;
+    msp430_gpio_update_interrupt(gpio, idx);
+}
+
 /* Set/clear a single input pin and trigger edge-detect interrupt if applicable.
  * Matches Java MSPSim IOPort.setPinState() behavior. */
 void msp430_gpio_set_input_pin(msp430_gpio_t *gpio, int port, int pin, bool value) {

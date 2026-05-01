@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <limits.h>
 #include "cpu_time.h"
+#include "cpu_event.h"
 
 /* --- Register indices --- */
 #define ARM_R0   0
@@ -76,17 +77,11 @@ typedef struct {
     void           *user_data;
 } arm_io_region_t;
 
-/* --- Event callback --- */
-typedef struct arm_event arm_event_t;
-typedef void (*arm_event_fn)(void *user_data, arm_event_t *event);
-
-struct arm_event {
-    int64_t       fire_cycle;
-    int64_t       fire_ns;       /* wall-clock fire time (0 = cycle-based only) */
-    arm_event_fn  callback;
-    void         *user_data;
-    arm_event_t  *next;
-};
+/* --- Event callback ---
+ * Unified per-CPU event type lives in include/common/cpu_event.h.
+ * Aliases below keep existing ARM-typed call sites compiling. */
+typedef cpu_event_t  arm_event_t;
+typedef cpu_event_fn arm_event_fn;
 
 /* --- Forward declarations --- */
 struct arm_config;

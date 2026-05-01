@@ -53,4 +53,14 @@ void msp430_gpio_set_output_callback(msp430_gpio_t *gpio,
  * Triggers port interrupt if edge matches IES and pin is enabled in IE. */
 void msp430_gpio_set_input_pin(msp430_gpio_t *gpio, int port, int pin, bool value);
 
+/* Update port interrupt status — exposed so peripherals can force an
+ * IFG check after touching IE/IFG directly. */
+void msp430_gpio_update_interrupt(msp430_gpio_t *gpio, int port_idx);
+
+/* Force-enable IE and pulse IFG on a pin to emulate legacy Cooja firmware
+ * behavior for FIFOP (CC2420). Sets IE for the pin and either sets (rising)
+ * or clears (falling) IFG, then re-checks the interrupt. This abstracts
+ * direct port-state pokes that previously lived in chip drivers. */
+void msp430_gpio_force_irq_edge(msp430_gpio_t *gpio, int port, int pin, bool rising);
+
 #endif /* MSP430_GPIO_H */

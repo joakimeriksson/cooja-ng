@@ -58,6 +58,11 @@ typedef enum {
 typedef struct {
     sim_radio_state_t radio_state;
     uint8_t led[SIM_MAX_LEDS];     /* 1=on, 0=off per LED */
+    /* TODO(dual-radio): one `radio_state` per node assumes one radio.
+     * For dual-radio, replace with `radio_state[NUM_RADIOS]` and update
+     * the CBOR delta protocol below — the UI will need to render two
+     * timeline rows per node and the "radio changes" map (key 2) will
+     * need to encode (node_id, radio_idx) pairs. */
 } sim_node_state_t;
 
 /*

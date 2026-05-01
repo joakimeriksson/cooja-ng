@@ -30,6 +30,11 @@ typedef struct {
     uint8_t  value;       /* LED number, radio state, etc. */
     uint8_t  extra_len;   /* Length of extra data (packet summary, log line) */
     char     extra[128];  /* Extra string data */
+    /* TODO(dual-radio): radio events assume one radio per node. To support
+     * a CC2538DK with an external CC2420, add a `radio_idx` byte and key
+     * the UI's per-node row layout on (node_id, radio_idx). The
+     * tl_radio_event/tl_frame_event helpers will need a radio_idx
+     * parameter; default 0 for existing call sites. */
 } tl_event_t;
 
 /* Ring buffer capacity */

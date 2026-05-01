@@ -6,6 +6,31 @@
 #include <ctype.h>
 #include <stdio.h>
 
+/* ============================================================
+ * sim_host_t shims — bind the MSP430 CPU/GPIO into the
+ * CPU-agnostic vtable used by off-SoC chip drivers (CC2420 etc.).
+ * ============================================================ */
+
+static int64_t msp430_host_now_ns(void *cpu) {
+    return ((msp430_cpu_t *)cpu)->sim_time_ns;
+}
+
+static void msp430_host_schedule_ns(void *cpu, cpu_event_t *ev, int64_t fire_ns) {
+    msp430_schedule_event_ns((msp430_cpu_t *)cpu, ev, fire_ns);
+}
+
+static void msp430_host_cancel(void *cpu, cpu_event_t *ev) {
+    msp430_cancel_event((msp430_cpu_t *)cpu, ev);
+}
+
+static void msp430_host_set_input_pin(void *gpio, int port, int pin, bool value) {
+    msp430_gpio_set_input_pin((msp430_gpio_t *)gpio, port, pin, value);
+}
+
+static void msp430_host_force_irq_edge(void *gpio, int port, int pin, bool rising) {
+    msp430_gpio_force_irq_edge((msp430_gpio_t *)gpio, port, pin, rising);
+}
+
 /* SFR IO callbacks (IE1/IE2/IFG1/IFG2 at 0x00-0x07) */
 
 static int sfr_read(void *user_data, uint32_t addr, bool word, int64_t cycles) {
@@ -627,11 +652,20 @@ void msp430_platform_init(msp430_platform_t *plat,
         msp430_register_io(&plat->cpu, 0x1A0, 16, stub_io_read, stub_io_write, plat);
     }
 
+    /* Build the CPU-agnostic host vtable used by off-SoC chip drivers. */
+    plat->host.cpu            = &plat->cpu;
+    plat->host.gpio           = &plat->gpio;
+    plat->host.now_ns         = msp430_host_now_ns;
+    plat->host.schedule_ns    = msp430_host_schedule_ns;
+    plat->host.cancel         = msp430_host_cancel;
+    plat->host.set_input_pin  = msp430_host_set_input_pin;
+    plat->host.force_irq_edge = msp430_host_force_irq_edge;
+
     /* CC2420 radio */
     if (config->cc2420.has_cc2420) {
         const msp430_cc2420_config_t *rc = &config->cc2420;
 
-        cc2420_init(&plat->cc2420, &plat->cpu, &plat->gpio);
+        cc2420_init(&plat->cc2420, &plat->host);
         cc2420_set_pins(&plat->cc2420,
                          rc->fifop_port, rc->fifop_pin,
                          rc->fifo_port, rc->fifo_pin,
