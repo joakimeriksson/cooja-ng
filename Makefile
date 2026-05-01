@@ -55,7 +55,8 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/js_test_engine.c \
                  $(COMMON_SRC_DIR)/sim_event_queue.c \
                  $(COMMON_SRC_DIR)/gdb_stub.c \
-                 $(COMMON_SRC_DIR)/pcap_writer.c
+                 $(COMMON_SRC_DIR)/pcap_writer.c \
+                 $(COMMON_SRC_DIR)/mock_sim_host.c
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
@@ -99,7 +100,8 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_arm_correctness.c \
                $(TEST_DIR)/test_arm_firmware.c \
                $(TEST_DIR)/test_mixed_multinode.c \
-               $(TEST_DIR)/test_timeline.c
+               $(TEST_DIR)/test_timeline.c \
+               $(TEST_DIR)/test_mock_host.c
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 

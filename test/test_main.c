@@ -31,6 +31,9 @@ extern int run_mixed_multinode_test(int argc, char **argv);
 /* Timeline unit tests */
 extern int run_timeline_tests(int verbose);
 
+/* Mock sim_host_t unit tests */
+extern int run_mock_host_tests(int verbose);
+
 int main(int argc, char **argv) {
     int verbose = 0;
 
@@ -122,6 +125,10 @@ int main(int argc, char **argv) {
     }
 
     /* Timeline unit tests */
+    if (strcmp(mode, "mock-host") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_mock_host_tests(verbose);
+    }
+
     if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {
         failures += run_timeline_tests(verbose);
     }
