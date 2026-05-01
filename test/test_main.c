@@ -9,6 +9,9 @@
  *   ./test_runner arm-correctness [-v]     Run ARM correctness tests
  *   ./test_runner arm-firmware [-v]        Run ARM firmware tests
  *   ./test_runner arm-multinode [opts]     Run ARM multi-node radio test
+ *   ./test_runner zoul-firefly-multinode [opts]
+ *                                          Run Zolertia Firefly multi-node test
+ *                                          (CC1200 sub-GHz radio path)
  *   ./test_runner mixed-multinode [opts]   Run mixed MSP430+ARM multi-node test
  *   ./test_runner all [-v]                 Run all (except multinode)
  */
@@ -50,7 +53,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <mode> [-v]\n", argv[0]);
         printf("MSP430 modes: correctness, bench, firmware, multinode\n");
-        printf("ARM modes:    arm-correctness, arm-firmware, arm-multinode\n");
+        printf("ARM modes:    arm-correctness, arm-firmware, arm-multinode,\n");
+        printf("              zoul-firefly-multinode\n");
         printf("Mixed:        mixed-multinode\n");
         printf("Chip drivers: cc1200-mock-host\n");
         printf("Test:         test <config.json> [-v] [-t ms]\n");
@@ -116,6 +120,46 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "arm-multinode") == 0) {
         /* Route to mixed-multinode (ARM firmware auto-detected by extension) */
         failures += run_mixed_multinode_test(argc - 2, argv + 2);
+    }
+
+    /* Zolertia Firefly multinode wrapper.  Behaves exactly like
+     * mixed-multinode (ARM firmware auto-detected via the
+     * .zoul-firefly extension); kept as its own entry point so the
+     * SPEC's Definition-of-Done commands match this binary verbatim
+     * and CI can wire a Firefly-specific job.
+     *
+     * Convenience: if the caller passed exactly one firmware and no
+     * -n flag, default to 2 nodes — Firefly broadcast/UDP tests are
+     * always at least pairs, and the SPEC's example commands omit
+     * the -n flag. The MSP430 `multinode` wrapper does the same. */
+    if (strcmp(mode, "zoul-firefly-multinode") == 0) {
+        int extra_argc = argc - 2;
+        char **extra_argv = argv + 2;
+        int has_n = 0;
+        int firmware_count = 0;
+        for (int i = 0; i < extra_argc; i++) {
+            if ((strcmp(extra_argv[i], "-t") == 0 ||
+                 strcmp(extra_argv[i], "-n") == 0 ||
+                 strcmp(extra_argv[i], "--threads") == 0) &&
+                i + 1 < extra_argc) {
+                if (strcmp(extra_argv[i], "-n") == 0) has_n = 1;
+                i++;  /* skip the value */
+            } else if (extra_argv[i][0] != '-') {
+                firmware_count++;
+            }
+        }
+        if (!has_n && firmware_count == 1) {
+            int new_argc = extra_argc + 2;
+            char **new_argv = malloc((new_argc + 1) * sizeof(char *));
+            for (int i = 0; i < extra_argc; i++) new_argv[i] = extra_argv[i];
+            new_argv[extra_argc]     = (char *)"-n";
+            new_argv[extra_argc + 1] = (char *)"2";
+            new_argv[new_argc] = NULL;
+            failures += run_mixed_multinode_test(new_argc, new_argv);
+            free(new_argv);
+        } else {
+            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+        }
     }
 
     /* Mixed-platform mode */
