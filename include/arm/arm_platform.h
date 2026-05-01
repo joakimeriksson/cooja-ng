@@ -16,6 +16,7 @@
 #include "cc2538_rfcore.h"
 #include "cc2538_sleeptimer.h"
 #include "cc2538_ssi.h"
+#include "cc1200.h"
 #include "sim_host.h"
 
 /* UART TX callback */
@@ -43,6 +44,14 @@ typedef struct arm_platform_config {
      * (e.g. for off-SoC chip control pins). */
     arm_gpio_pin_t       leds[3];        /* up to 3 status LEDs */
     arm_gpio_pin_t       button;         /* user button */
+    /* Off-SoC CC1200 sub-GHz radio wiring. Set has_cc1200=true to enable;
+     * leave zero-initialized to skip CC1200 init entirely. */
+    bool                 has_cc1200;
+    int                  cc1200_ssi;     /* 0 or 1 — which SSI bus  */
+    arm_gpio_pin_t       cc1200_csn;     /* chip-select (active low) */
+    arm_gpio_pin_t       cc1200_reset;   /* reset       (active low) */
+    arm_gpio_pin_t       cc1200_gdo0;    /* GDO0        (input to MCU) */
+    arm_gpio_pin_t       cc1200_gdo2;    /* GDO2        (input to MCU, optional) */
 } arm_platform_config_t;
 
 /* Platform runtime state */
@@ -60,6 +69,10 @@ typedef struct arm_platform {
     cc2538_sleeptimer_t sleeptimer;
     cc2538_ssi_t      ssi0;
     cc2538_ssi_t      ssi1;
+    /* Off-SoC CC1200 sub-GHz radio (Firefly only — other boards leave
+     * it unused). Lives directly in the platform struct so per-node
+     * fan-out can reach it without an extra alloc. */
+    cc1200_t          cc1200;
     /* uDMA state (opaque, allocated by platform init) */
     void *udma;
     /* USB state (opaque, allocated by platform init) */
