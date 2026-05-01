@@ -267,6 +267,8 @@ Boards differ in *which* chips sit outside the SoC and *how* they connect. csim 
 | **esb**    | MSP430F149      | TR1001 (n/m)   | —                | Currently stubbed                                                       |
 | **wismote / exp5438 / cc430** | F5437 / CC430F5137 | None | — | —                                                                |
 | **cc2538dk** | CC2538 (Cortex-M3) | RF Core *on-chip* | —          | Memory-mapped at `0x40088000` + FFSM regs; NVIC IRQ direct              |
+| **openmote** | CC2538 (Cortex-M3) | RF Core *on-chip* | —          | Same as cc2538dk; only board glue (LEDs / button) differs               |
+| **zoul-firefly** | CC2538 (Cortex-M3) | RF Core *on-chip*; CC1200 *off* (sub-GHz) | — | RF Core same as cc2538dk. CC1200 over SSI0 with CSn=PB5, RESET=PC7, GDO0=PB4, GDO2=PB0 — driver + SSI controller still TODO (Phase B). |
 
 ### Five bridge APIs that wire any off-SoC chip
 
