@@ -24,10 +24,37 @@
 
 #define RADIO_MEDIUM_MAX_NODES 128
 
+/* Sub-GHz channel range threshold. Channels >= this value are treated
+ * as 802.15.4g (CC1200), channels below are 2.4 GHz IEEE 802.15.4.
+ *
+ * Per devices/zoul-firefly/SPEC.md "Radio medium strategy": this is the
+ * cheap dual-radio isolation mechanism. The CC1200 driver's set_channel
+ * call ends up here as `100 + cc1200_channel`, so all sub-GHz traffic
+ * stays in a non-overlapping channel range — and the existing channel-
+ * mismatch-drops-bytes filter prevents cross-talk between bands for
+ * free. No radio_medium_t API change required. */
+#define RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE  100
+
 typedef enum {
     RADIO_MEDIUM_NONE = 0,   /* all-to-all, no filtering */
     RADIO_MEDIUM_UDGM = 1,   /* Unit Disk Graph Medium */
 } radio_medium_type_t;
+
+/* Frame format profile — picked per-sender from the sender's currently
+ * tuned channel. Keeps the on-air SFD / sync-word definition next to
+ * the channel that uses it. */
+typedef enum {
+    /* IEEE 802.15.4 OQPSK (CC2420 / CC2538): 4×0x00 preamble + 0x7A SFD. */
+    RADIO_FRAME_PROFILE_IEEE802154 = 0,
+    /* IEEE 802.15.4g MR-FSK (CC1200): variable-length preamble + 32-bit
+     * sync word + 2-byte PHR + payload. Sync word is configurable on
+     * the chip; the medium uses the Contiki 50 kbps default. */
+    RADIO_FRAME_PROFILE_IEEE802154G = 1,
+} radio_frame_profile_t;
+
+/* The CC1200 50 kbps Contiki config sets SYNC3..SYNC0 = 0x6E,0x4E,0x90,0x4E
+ * (see arch/dev/radio/cc1200/cc1200-802154g-863-870-fsk-50kbps.c). */
+#define RADIO_FRAME_802154G_SYNC_WORD  0x6E4E904Eu
 
 typedef struct {
     double tx_range;            /* meters, default 50.0 */
@@ -43,20 +70,27 @@ typedef struct {
      * different channel, or even a different band entirely. */
 } radio_node_state_t;
 
-/* Frame tracker state machine for detecting frame boundaries in byte stream */
+/* Frame tracker state machine for detecting frame boundaries in byte stream.
+ * Profile-aware: the IEEE 802.15.4 path detects SFD = 0x7A after 4×0x00
+ * preamble; the 802.15.4g path detects a 32-bit sync word and consumes a
+ * 2-byte PHR for length (CC1200). */
 typedef enum {
     FRAME_IDLE = 0,
     FRAME_PREAMBLE,
-    FRAME_SFD,
+    FRAME_SFD,        /* IEEE 802.15.4: just past SFD, expecting length byte */
+    FRAME_PHR_LO,     /* 802.15.4g: just past sync word, expecting PHR low byte */
     FRAME_DATA,
 } frame_track_state_t;
 
 typedef struct {
     frame_track_state_t state;
-    int zero_count;     /* consecutive 0x00 preamble bytes */
+    int zero_count;     /* consecutive 0x00 preamble bytes (802.15.4) */
+    uint32_t sync_match;/* sliding 32-bit register for 802.15.4g sync detect */
     int length;         /* frame length from PHY header */
     int byte_count;     /* bytes received in current frame */
     uint32_t frame_id;  /* unique ID for current frame */
+    int phr_hi;         /* 802.15.4g: top 3 bits of 11-bit length */
+    radio_frame_profile_t profile;  /* updated when set_channel changes band */
 } frame_tracker_t;
 
 /* Per-(sender,receiver) frame decision cache */
