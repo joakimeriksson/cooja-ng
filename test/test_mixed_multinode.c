@@ -81,22 +81,36 @@ typedef struct {
     int count;
 } rf_buffer_t;
 
-/* TX frame assembler: detects complete 802.15.4 frames in byte stream.
- * Per-sender state machine: preamble(4×0x00) + SFD(0x7A) + length → complete. */
+/* TX frame assembler: detects complete frame boundaries in a sender's
+ * raw byte stream. Two on-air formats are supported:
+ *
+ *   - 802.15.4 (CC2420 / cc2538_rfcore): 4×0x00 preamble + 0x7A SFD +
+ *     1-byte length (PHY hdr) + payload.
+ *   - 802.15.4g (CC1200): 4×0x55 preamble + 32-bit sync word
+ *     0x6E4E904E + 2-byte PHR (length = (phra & 0x07)<<8 | phrb) +
+ *     payload.
+ *
+ * The state machine sniffs which one it's looking at on the fly, since
+ * the CC2420 callback and the CC1200 callback both feed the same
+ * mixed_rf_tx_handler (per the per-node fan-out). */
 #define TX_ASM_PREAMBLE  0
 #define TX_ASM_LENGTH    1
 #define TX_ASM_PAYLOAD   2
+#define TX_ASM_SUBGHZ_PHR 3   /* CC1200: just past sync word, expecting 2-byte PHR */
 
 typedef struct {
     int state;
-    int zero_count;
-    int expected_len;   /* PHY length byte value */
-    int payload_count;  /* bytes received after length byte */
+    int zero_count;        /* 0x00 preamble bytes (802.15.4) */
+    uint32_t sync_match;   /* sliding 32-bit register for 802.15.4g sync */
+    int phr_lo;            /* CC1200: top 3 bits of length stashed here */
+    int expected_len;      /* PHY length value (PHR for CC1200) */
+    int payload_count;     /* bytes received after length byte */
+    bool subghz;           /* true once sync word matched (sub-GHz frame) */
     int64_t first_byte_ns; /* sim time of first preamble byte */
 } tx_frame_asm_t;
 
 typedef struct {
-    uint8_t bytes[160];
+    uint8_t bytes[256];
     int len;
 } tx_frame_capture_t;
 
@@ -104,10 +118,21 @@ typedef struct {
 static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
     switch (a->state) {
     case TX_ASM_PREAMBLE:
+        /* Look for either preamble pattern. */
+        a->sync_match = (a->sync_match << 8) | byte;
+        if (a->sync_match == RADIO_FRAME_802154G_SYNC_WORD) {
+            /* CC1200 sync word — next two bytes are PHR */
+            a->state = TX_ASM_SUBGHZ_PHR;
+            a->subghz = true;
+            a->phr_lo = -1;
+            a->payload_count = 0;
+            return false;
+        }
         if (byte == 0x00) {
             a->zero_count++;
         } else if (a->zero_count >= 4 && byte == 0x7A) {
             a->state = TX_ASM_LENGTH;
+            a->subghz = false;
         } else {
             a->zero_count = 0;
         }
@@ -125,6 +150,25 @@ static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
         a->payload_count = 0;
         return false;
 
+    case TX_ASM_SUBGHZ_PHR:
+        if (a->phr_lo < 0) {
+            /* PHRA byte: top 3 bits = length high */
+            a->phr_lo = byte & 0x07;
+        } else {
+            /* PHRB byte: low 8 bits */
+            a->expected_len = (a->phr_lo << 8) | byte;
+            if (a->expected_len < 3 || a->expected_len > 200) {
+                a->state = TX_ASM_PREAMBLE;
+                a->zero_count = 0;
+                a->sync_match = 0;
+                a->subghz = false;
+                return false;
+            }
+            a->state = TX_ASM_PAYLOAD;
+            a->payload_count = 0;
+        }
+        return false;
+
     case TX_ASM_PAYLOAD:
         a->payload_count++;
         /* expected_len = PHY length byte = payload + FCS(2).
@@ -134,6 +178,9 @@ static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
             /* Frame complete — reset for next frame */
             a->state = TX_ASM_PREAMBLE;
             a->zero_count = 0;
+            a->sync_match = 0;
+            a->subghz = false;
+            a->phr_lo = -1;
             return true;
         }
         return false;
@@ -144,8 +191,11 @@ static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
 static void tx_frame_asm_reset(tx_frame_asm_t *a) {
     a->state = TX_ASM_PREAMBLE;
     a->zero_count = 0;
+    a->sync_match = 0;
     a->expected_len = 0;
     a->payload_count = 0;
+    a->phr_lo = -1;
+    a->subghz = false;
     a->first_byte_ns = 0;
 }
 
@@ -702,13 +752,21 @@ static void step_node_until(int idx, int64_t target);
 static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx);
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns);
 
-/* Check available RXFIFO space for an emulated node */
+/* Check available RXFIFO space for an emulated node. Firefly nodes have
+ * two radios; we report the more constrained side so back-pressure
+ * still pumps frames in/out correctly. */
 static int emulated_rxfifo_available(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return 128 - nodes[idx].plat.msp.cc2420.rx_fifo_len;
     else if (nodes[idx].type == NODE_ARM) {
         cc2538_rfcore_t *rf = &nodes[idx].plat.arm.rfcore;
-        return RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
+        int avail = RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
+        const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
+        if (pcfg && pcfg->has_cc1200) {
+            int cc1200_avail = 128 - nodes[idx].plat.arm.cc1200.rx_count;
+            if (cc1200_avail < avail) avail = cc1200_avail;
+        }
+        return avail;
     }
     return 0;
 }
@@ -1007,16 +1065,33 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         /* Mirror the MSP430 RX path: pre-sync the receiver to the byte's
          * air time for each byte, deliver the byte, then request an
          * immediate wakeup so the RF Core ISR runs before the next slice.
-         * Guarded against re-entry for the currently-ticking node. */
+         * Guarded against re-entry for the currently-ticking node.
+         *
+         * Per-node radio fan-out (Firefly): each Firefly node owns two
+         * receive endpoints — cc2538_rfcore (2.4 GHz) and cc1200 (sub-GHz).
+         * The cross-band channel filter in radio_medium has already
+         * dropped bytes that crossed bands, so it's safe to feed every
+         * delivered byte to BOTH chips on this node. The chip whose
+         * air-side decoder doesn't recognise the preamble/sync simply
+         * ignores the byte (cc2538_rfcore wants 0x00..0x00 0x7A, cc1200
+         * wants 0x55 then sync word 0x6E4E904E). The firmware sees frames
+         * arrive on the chip its NETSTACK_RADIO points at. */
+        const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
+        bool has_cc1200 = pcfg && pcfg->has_cc1200;
         nodes[idx].plat.arm.rfcore.rx_rssi = rssi;
+        if (has_cc1200) {
+            nodes[idx].plat.arm.cc1200.rx_rssi = rssi;
+        }
         int64_t last_byte_ns = air_time_ns;
         if (idx == ticking_node_idx) {
             /* Deliver in place — we're already inside this node's tick,
              * so full sync would recurse.  Drop bytes straight into the
              * RF Core; the current tick's remaining budget lets the CPU
              * process them before returning to the scheduler. */
-            for (int j = 0; j < len; j++)
+            for (int j = 0; j < len; j++) {
                 cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
+                if (has_cc1200) cc1200_receive_byte(&nodes[idx].plat.arm.cc1200, data[j]);
+            }
         } else {
             for (int j = 0; j < len; j++) {
                 int64_t byte_time_ns = air_time_ns + (int64_t)j * IEEE802154_BYTE_NS;
@@ -1035,6 +1110,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
                 cpu->sim_time_ns = byte_time_ns;
                 cpu->last_execute_us = t_us;
                 cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
+                if (has_cc1200) cc1200_receive_byte(&nodes[idx].plat.arm.cc1200, data[j]);
                 last_byte_ns = byte_time_ns;
             }
         }
@@ -1158,8 +1234,17 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     stat_rf_frames++;
 
     /* Compute TX timestamps for timeline and RX delivery.
-     * Use the sender's own radio time for the byte stream end time. */
-    int total_air_bytes = 4 + 1 + 1 + tx_asm[sender_idx].expected_len;
+     * Use the sender's own radio time for the byte stream end time.
+     *
+     * Air-byte budget depends on the on-air format that the assembler
+     * just locked onto:
+     *   - 802.15.4: 4-byte preamble + 1-byte SFD + 1-byte length + payload.
+     *   - 802.15.4g (CC1200): 4-byte preamble + 4-byte sync word + 2-byte
+     *     PHR + payload. (Same per-byte timing — the medium uses the
+     *     IEEE802154_BYTE_NS value as a wire-rate proxy.) */
+    int total_air_bytes = tx_asm[sender_idx].subghz
+        ? (4 + 4 + 2 + tx_asm[sender_idx].expected_len)
+        : (4 + 1 + 1 + tx_asm[sender_idx].expected_len);
     int64_t frame_air_dur = (int64_t)total_air_bytes * IEEE802154_BYTE_NS;
     int64_t accurate_tx_end = byte_time_ns + IEEE802154_BYTE_NS;
     int64_t accurate_tx_start = accurate_tx_end - frame_air_dur;
@@ -2445,6 +2530,20 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     plat->rfcore.state_callback = mixed_rf_state_handler;
     plat->rfcore.state_user_data = node;
 
+    /* Per-node CC1200 fan-out (Firefly only). The chip TX listener
+     * routes through the same mixed_rf_tx_handler used by cc2538_rfcore
+     * — bytes flow into the medium's normal byte stream and the
+     * receiver-side dispatch (in emu_deliver_bytes) feeds bytes to
+     * whichever chip on each receiver matches the sender's channel.
+     *
+     * Each Firefly node is parked on a sub-GHz channel by default.
+     * The cross-band filter in radio_medium then keeps CC1200 chatter
+     * from leaking onto the cc2538_rfcore RX path of any 2.4 GHz node
+     * sharing the simulation. */
+    if (pcfg->has_cc1200) {
+        cc1200_set_rf_listener(&plat->cc1200, mixed_rf_tx_handler, node);
+    }
+
     /* Seed RFRND and sleep timer uniquely per node.
      * Use bit mixing so close IDs produce divergent sequences. */
     {
@@ -3060,8 +3159,20 @@ static void sync_node_channels(void) {
             if (freq >= 357)
                 ch = (freq - 357) / 5 + 11;
         } else if (nodes[i].type == NODE_ARM) {
-            /* CC2538: channel already computed on FREQCTRL write */
-            ch = nodes[i].plat.arm.rfcore.channel;
+            /* For Firefly nodes (has_cc1200) we always report a sub-GHz
+             * channel — the CC1200 is the primary radio for these. The
+             * cc2538_rfcore is still present but parked (firmware was
+             * built with ZOUL_CONF_USE_CC1200_RADIO=1, so NETSTACK_RADIO
+             * is cc1200_driver). Picking a sub-GHz channel here is what
+             * triggers cross_band_drop in the medium so 2.4 GHz nodes
+             * don't see CC1200 frames and vice versa. */
+            const arm_platform_config_t *pcfg = nodes[i].plat.arm.config;
+            if (pcfg && pcfg->has_cc1200) {
+                ch = RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE;
+            } else {
+                /* CC2538: channel already computed on FREQCTRL write */
+                ch = nodes[i].plat.arm.rfcore.channel;
+            }
         } else {
             /* Native: simRadioChannel pointer */
             if (nodes[i].plat.native.simRadioChannel)
