@@ -5,9 +5,12 @@
 #include <string.h>
 #include <math.h>
 
-/* 802.15.4 PHY constants */
+/* IEEE 802.15.4 (2.4 GHz CC2420/CC2538) PHY constants */
 #define SFD_BYTE        0x7A
 #define MIN_PREAMBLE    4
+
+/* IEEE 802.15.4g (CC1200 50 kbps) sync word — see radio_medium.h. */
+#define SUBGHZ_SYNC_WORD  RADIO_FRAME_802154G_SYNC_WORD
 
 /* --- xorshift32 PRNG --- */
 
@@ -45,9 +48,18 @@ static double udgm_reception_prob(const radio_medium_t *rm, int sender, int rece
 
 /* --- Frame tracking state machine --- */
 
-static void track_byte(radio_medium_t *rm, int sender, uint8_t byte) {
-    frame_tracker_t *ft = &rm->frame_track[sender];
+/* Mark a new frame: bump frame_id and invalidate per-receiver decisions
+ * so each receiver gets a fresh dice roll for this frame. */
+static void start_new_frame(radio_medium_t *rm, int sender, frame_tracker_t *ft) {
+    ft->frame_id = ++rm->next_frame_id;
+    for (int r = 0; r < rm->node_count; r++) {
+        rm->rx_decisions[sender][r].decided = false;
+        rm->rx_decisions[sender][r].frame_id = ft->frame_id;
+    }
+}
 
+static void track_byte_802154(radio_medium_t *rm, int sender, uint8_t byte,
+                               frame_tracker_t *ft) {
     switch (ft->state) {
     case FRAME_IDLE:
         if (byte == 0x00) {
@@ -60,40 +72,79 @@ static void track_byte(radio_medium_t *rm, int sender, uint8_t byte) {
         if (byte == 0x00) {
             ft->zero_count++;
         } else if (byte == SFD_BYTE && ft->zero_count >= MIN_PREAMBLE) {
-            /* SFD detected — new frame starts */
             ft->state = FRAME_SFD;
-            ft->frame_id = ++rm->next_frame_id;
-            /* Invalidate all receiver decisions for this sender */
-            for (int r = 0; r < rm->node_count; r++) {
-                rm->rx_decisions[sender][r].decided = false;
-                rm->rx_decisions[sender][r].frame_id = ft->frame_id;
-            }
+            start_new_frame(rm, sender, ft);
         } else {
-            /* Not a valid preamble sequence — reset */
             ft->state = FRAME_IDLE;
             ft->zero_count = 0;
         }
         break;
 
     case FRAME_SFD:
-        /* This byte is the PHY length field */
         ft->length = byte;
         ft->byte_count = 0;
-        if (ft->length > 0) {
-            ft->state = FRAME_DATA;
-        } else {
-            ft->state = FRAME_IDLE;
-        }
+        ft->state = (ft->length > 0) ? FRAME_DATA : FRAME_IDLE;
         break;
 
     case FRAME_DATA:
         ft->byte_count++;
         if (ft->byte_count >= ft->length) {
-            /* Frame complete */
             ft->state = FRAME_IDLE;
             ft->zero_count = 0;
         }
         break;
+
+    default:
+        ft->state = FRAME_IDLE;
+        break;
+    }
+}
+
+static void track_byte_802154g(radio_medium_t *rm, int sender, uint8_t byte,
+                                frame_tracker_t *ft) {
+    switch (ft->state) {
+    case FRAME_IDLE:
+    case FRAME_PREAMBLE:
+        /* Slide the byte into the sync-word match register. */
+        ft->sync_match = (ft->sync_match << 8) | byte;
+        if (ft->sync_match == SUBGHZ_SYNC_WORD) {
+            ft->state = FRAME_PHR_LO;
+            start_new_frame(rm, sender, ft);
+        } else {
+            ft->state = FRAME_PREAMBLE;  /* keep sliding */
+        }
+        break;
+
+    case FRAME_PHR_LO:
+        /* PHR_HI byte: bits 2:0 = top 3 bits of 11-bit length */
+        ft->phr_hi = byte & 0x07;
+        ft->state = FRAME_SFD;  /* reuse SFD slot for "expecting PHR low" */
+        break;
+
+    case FRAME_SFD:
+        /* PHR_LO byte: lower 8 bits of length */
+        ft->length = (ft->phr_hi << 8) | byte;
+        ft->byte_count = 0;
+        ft->state = (ft->length > 0) ? FRAME_DATA : FRAME_IDLE;
+        break;
+
+    case FRAME_DATA:
+        ft->byte_count++;
+        if (ft->byte_count >= ft->length) {
+            ft->state = FRAME_IDLE;
+            ft->zero_count = 0;
+            ft->sync_match = 0;
+        }
+        break;
+    }
+}
+
+static void track_byte(radio_medium_t *rm, int sender, uint8_t byte) {
+    frame_tracker_t *ft = &rm->frame_track[sender];
+    if (ft->profile == RADIO_FRAME_PROFILE_IEEE802154G) {
+        track_byte_802154g(rm, sender, byte, ft);
+    } else {
+        track_byte_802154(rm, sender, byte, ft);
     }
 }
 
@@ -131,6 +182,21 @@ void radio_medium_set_position(radio_medium_t *rm, int node, double x, double y)
 void radio_medium_set_channel(radio_medium_t *rm, int node, int channel) {
     if (node >= 0 && node < RADIO_MEDIUM_MAX_NODES) {
         rm->nodes[node].channel = channel;
+        /* Pick the on-air frame profile from the channel range. The
+         * sub-GHz CC1200 lives at channels >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE;
+         * everything else is 2.4 GHz IEEE 802.15.4. */
+        radio_frame_profile_t prof =
+            (channel >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE)
+            ? RADIO_FRAME_PROFILE_IEEE802154G
+            : RADIO_FRAME_PROFILE_IEEE802154;
+        if (rm->frame_track[node].profile != prof) {
+            /* Profile changed — reset the frame tracker so we're not
+             * carrying forward state from the old framing. */
+            rm->frame_track[node].profile = prof;
+            rm->frame_track[node].state = FRAME_IDLE;
+            rm->frame_track[node].zero_count = 0;
+            rm->frame_track[node].sync_match = 0;
+        }
     }
 }
 
