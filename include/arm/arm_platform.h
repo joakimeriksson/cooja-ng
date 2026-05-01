@@ -15,6 +15,7 @@
 #include "cc2538_ioc.h"
 #include "cc2538_rfcore.h"
 #include "cc2538_sleeptimer.h"
+#include "sim_host.h"
 
 /* UART TX callback */
 typedef void (*arm_uart_tx_callback)(void *user_data, uint8_t byte);
@@ -43,6 +44,8 @@ typedef struct arm_platform {
     void *udma;
     /* USB state (opaque, allocated by platform init) */
     void *usb;
+    /* CPU-agnostic vtable for off-SoC chip drivers (CC1200, external CC2420, etc.) */
+    sim_host_t      host;
     const arm_platform_config_t *config;
 } arm_platform_t;
 

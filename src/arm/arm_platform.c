@@ -8,6 +8,33 @@
 #include <ctype.h>
 #include <stdio.h>
 
+/* ============================================================
+ * sim_host_t shims — bind the ARM CPU/GPIO into the
+ * CPU-agnostic vtable used by off-SoC chip drivers (CC1200,
+ * external CC2420, etc.). Mirrors the MSP430 host shims in
+ * src/msp430/msp430_platform.c.
+ * ============================================================ */
+
+static int64_t arm_host_now_ns(void *cpu) {
+    return ((arm_cpu_t *)cpu)->sim_time_ns;
+}
+
+static void arm_host_schedule_ns(void *cpu, cpu_event_t *ev, int64_t fire_ns) {
+    arm_schedule_event_ns((arm_cpu_t *)cpu, ev, fire_ns);
+}
+
+static void arm_host_cancel(void *cpu, cpu_event_t *ev) {
+    arm_cancel_event((arm_cpu_t *)cpu, ev);
+}
+
+static void arm_host_set_input_pin(void *gpio, int port, int pin, bool value) {
+    cc2538_gpio_set_input((cc2538_gpio_t *)gpio, port, pin, value);
+}
+
+static void arm_host_force_irq_edge(void *gpio, int port, int pin, bool rising) {
+    cc2538_gpio_force_irq_edge((cc2538_gpio_t *)gpio, port, pin, rising);
+}
+
 /* --- Platform definitions --- */
 
 static const arm_platform_config_t platform_cc2538dk = {
@@ -268,6 +295,15 @@ void arm_platform_init(arm_platform_t *plat, const arm_platform_config_t *config
 
     /* GPIO */
     cc2538_gpio_init(&plat->gpio, &plat->cpu);
+
+    /* Build the CPU-agnostic host vtable used by off-SoC chip drivers. */
+    plat->host.cpu            = &plat->cpu;
+    plat->host.gpio           = &plat->gpio;
+    plat->host.now_ns         = arm_host_now_ns;
+    plat->host.schedule_ns    = arm_host_schedule_ns;
+    plat->host.cancel         = arm_host_cancel;
+    plat->host.set_input_pin  = arm_host_set_input_pin;
+    plat->host.force_irq_edge = arm_host_force_irq_edge;
 
     /* IOC */
     cc2538_ioc_init(&plat->ioc, &plat->cpu);
