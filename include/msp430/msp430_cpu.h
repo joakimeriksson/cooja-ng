@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "cpu_time.h"
+#include "cpu_event.h"
 
 /* Forward declare decoded types */
 struct decoded_insn;
@@ -120,17 +121,11 @@ typedef void (*io_write_fn)(void *user_data, uint32_t addr, int value, bool word
 /* --- Interrupt handler callback --- */
 typedef void (*interrupt_handler_fn)(void *user_data, int vector);
 
-/* --- Event callback --- */
-typedef struct msp430_event msp430_event_t;
-typedef void (*event_fn)(void *user_data, msp430_event_t *event);
-
-struct msp430_event {
-    int64_t          fire_cycle;
-    int64_t          fire_ns;       /* wall-clock fire time (0 = cycle-based only) */
-    event_fn         callback;
-    void            *user_data;
-    msp430_event_t  *next;
-};
+/* --- Event callback ---
+ * Unified per-CPU event type lives in include/common/cpu_event.h.
+ * Aliases below keep existing MSP430-typed call sites compiling. */
+typedef cpu_event_t  msp430_event_t;
+typedef cpu_event_fn event_fn;
 
 /* --- CPU state --- */
 typedef struct msp430_cpu {

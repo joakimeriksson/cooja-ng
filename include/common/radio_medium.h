@@ -8,6 +8,13 @@
  *
  * When type is RADIO_MEDIUM_NONE (default), all bytes pass through
  * unchanged — backward compatible with existing all-to-all behavior.
+ *
+ * TODO(dual-radio): every API and table here keys on a single node
+ * index. For nodes with two radios (e.g. CC2538 RF Core + external
+ * CC2420), the keys must become (node_idx, radio_idx) — `nodes[]`,
+ * `frame_track[]`, `rx_decisions[][]`, `neighbors[]`,
+ * `filter_byte/frame()`, `set_channel()`, `get_rssi()`. Keep the
+ * existing single-radio API as `radio_idx == 0`.
  */
 #ifndef RADIO_MEDIUM_H
 #define RADIO_MEDIUM_H
@@ -32,6 +39,8 @@ typedef struct {
 typedef struct {
     double x, y;   /* position in meters */
     int channel;   /* 802.15.4 channel (11-26), -1 = unknown */
+    /* TODO(dual-radio): per-radio channel — second radio may sit on a
+     * different channel, or even a different band entirely. */
 } radio_node_state_t;
 
 /* Frame tracker state machine for detecting frame boundaries in byte stream */

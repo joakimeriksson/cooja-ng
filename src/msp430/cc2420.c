@@ -10,6 +10,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Convenience accessors for the CPU-agnostic host vtable. The CC2420
+ * driver never touches msp430_cpu_t / msp430_gpio_t directly so the same
+ * driver can sit on a different SoC in the future. */
+#define HOST_NOW_NS(r)             ((r)->host->now_ns((r)->host->cpu))
+#define HOST_SCHEDULE_NS(r, ev, t) ((r)->host->schedule_ns((r)->host->cpu, (ev), (t)))
+#define HOST_CANCEL(r, ev)         ((r)->host->cancel((r)->host->cpu, (ev)))
+#define HOST_SET_PIN(r, p, n, v)   ((r)->host->set_input_pin((r)->host->gpio, (p), (n), (v)))
+#define HOST_FORCE_IRQ(r, p, n, e) ((r)->host->force_irq_edge((r)->host->gpio, (p), (n), (e)))
+
 static int trace_tsch_ack = -1;
 static int trace_tsch_ack_lines = 0;
 #define TRACE_TSCH_ACK_START_NS 12000000000LL
@@ -157,31 +166,15 @@ static void set_fifop(cc2420_t *r, bool val) {
     bool pin_val = val;
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_FIFOP_POLARITY)
         pin_val = !pin_val;
-    msp430_gpio_set_input_pin(r->gpio, r->fifop_port, r->fifop_pin, pin_val);
+    HOST_SET_PIN(r, r->fifop_port, r->fifop_pin, pin_val);
 
     /* For Cooja-built firmware: ensure FIFOP interrupt fires reliably.
      * MSPSim's CC2420 calls IOPort.setPinState() which directly updates
-     * IFG on rising edge and calls updateIV(). We emulate this by:
-     * 1. Auto-enable P1IE for the FIFOP pin
-     * 2. Force IFG set on FIFOP rising edge (frame available)
-     * 3. Clear IFG on FIFOP falling edge (frame read / RXFIFO flushed)
-     *    Without clearing, the Z1 shared port1_isr loops infinitely
-     *    because the CC2420 code path doesn't clear P1IFG. */
-    if (r->fifop_port >= 1 && r->fifop_port <= r->gpio->num_ports) {
-        int idx = r->fifop_port - 1;
-        msp430_gpio_port_t *port = &r->gpio->ports[idx];
-        if (port->has_interrupt) {
-            uint8_t bit = (1 << r->fifop_pin);
-            port->ie |= bit;
-            if (val) {
-                port->ifg |= bit;   /* Rising edge: set IFG */
-            } else {
-                port->ifg &= ~bit;  /* Falling edge: clear IFG */
-            }
-            extern void msp430_gpio_update_interrupt(msp430_gpio_t *gpio, int port_idx);
-            msp430_gpio_update_interrupt(r->gpio, idx);
-        }
-    }
+     * IFG on rising edge and calls updateIV(). We emulate this by force-
+     * enabling IE for the pin and pulsing IFG on rising/falling edges
+     * (clearing on falling avoids an infinite ISR loop on Z1's shared
+     * port1_isr where the CC2420 path doesn't clear P1IFG). */
+    HOST_FORCE_IRQ(r, r->fifop_port, r->fifop_pin, val);
 }
 
 static void set_fifo(cc2420_t *r, bool val) {
@@ -189,7 +182,7 @@ static void set_fifo(cc2420_t *r, bool val) {
     bool pin_val = val;
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_FIFO_POLARITY)
         pin_val = !pin_val;
-    msp430_gpio_set_input_pin(r->gpio, r->fifo_port, r->fifo_pin, pin_val);
+    HOST_SET_PIN(r, r->fifo_port, r->fifo_pin, pin_val);
 }
 
 static void set_sfd(cc2420_t *r, bool val) {
@@ -198,7 +191,7 @@ static void set_sfd(cc2420_t *r, bool val) {
     bool pin_val = val;
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_SFD_POLARITY)
         pin_val = !pin_val;
-    msp430_gpio_set_input_pin(r->gpio, r->sfd_port, r->sfd_pin, pin_val);
+    HOST_SET_PIN(r, r->sfd_port, r->sfd_pin, pin_val);
     /* Notify Timer B capture (SFD timestamping for TSCH) */
     if (r->sfd_callback)
         r->sfd_callback(r->sfd_callback_data, pin_val);
@@ -209,7 +202,7 @@ static void set_cca(cc2420_t *r, bool val) {
     bool pin_val = val;
     if (r->registers[CC2420_REG_IOCFG0] & CC2420_CCA_POLARITY)
         pin_val = !pin_val;
-    msp430_gpio_set_input_pin(r->gpio, r->cca_port, r->cca_pin, pin_val);
+    HOST_SET_PIN(r, r->cca_port, r->cca_pin, pin_val);
 }
 
 static void update_cca(cc2420_t *r) {
@@ -245,7 +238,7 @@ static void flush_rx(cc2420_t *r) {
     r->overflow = false;
     r->frame_rejected = false;
     r->rx_incoming_count = 0;
-    msp430_cancel_event(r->cpu, &r->sfd_clear_event);
+    HOST_CANCEL(r,&r->sfd_clear_event);
     set_fifo(r, false);
     set_fifop(r, false);
     set_sfd(r, false);
@@ -257,7 +250,7 @@ static void flush_rx(cc2420_t *r) {
         r->state == CC2420_RX_FRAME ||
         r->state == CC2420_RX_OVERFLOW ||
         r->state == CC2420_RX_WAIT) {
-        msp430_cancel_event(r->cpu, &r->symbol_event);
+        HOST_CANCEL(r,&r->symbol_event);
         set_state(r, CC2420_RX_SFD_SEARCH);
     }
 }
@@ -288,7 +281,7 @@ static void reject_frame(cc2420_t *r) {
  * In our batch-delivery model, frame bytes are processed atomically before
  * the step, so without this deferral, SFD goes high→low with 0 CPU cycles
  * in between, making ACK reception invisible to CC2420 firmware drivers. */
-static void sfd_clear_callback(void *user_data, msp430_event_t *event) {
+static void sfd_clear_callback(void *user_data, cpu_event_t *event) {
     cc2420_t *r = (cc2420_t *)user_data;
     (void)event;
     if (r->current_sfd)
@@ -300,7 +293,7 @@ static void shr_next(cc2420_t *r);
 static void tx_next(cc2420_t *r);
 static void ack_next(cc2420_t *r);
 
-static void symbol_event_callback(void *user_data, msp430_event_t *event) {
+static void symbol_event_callback(void *user_data, cpu_event_t *event) {
     cc2420_t *r = (cc2420_t *)user_data;
     (void)event;
 
@@ -342,8 +335,8 @@ static void symbol_event_callback(void *user_data, msp430_event_t *event) {
 
 static void schedule_symbols(cc2420_t *r, int symbols) {
     int64_t delay_ns = (int64_t)symbols * CC2420_SYMBOL_PERIOD_NS;
-    int64_t fire_ns = r->cpu->sim_time_ns + delay_ns;
-    msp430_schedule_event_ns(r->cpu, &r->symbol_event, fire_ns);
+    int64_t fire_ns = HOST_NOW_NS(r) + delay_ns;
+    HOST_SCHEDULE_NS(r, &r->symbol_event, fire_ns);
 }
 
 static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
@@ -353,10 +346,10 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
     if (trace_tsch_ack_enabled() && trace_tsch_ack_lines < TRACE_TSCH_ACK_MAX_LINES &&
         r->node_id > 0 && r->node_id <= 2 &&
         old_state != new_state &&
-        r->cpu->sim_time_ns >= TRACE_TSCH_ACK_START_NS &&
-        r->cpu->sim_time_ns <= TRACE_TSCH_ACK_END_NS) {
+        HOST_NOW_NS(r) >= TRACE_TSCH_ACK_START_NS &&
+        HOST_NOW_NS(r) <= TRACE_TSCH_ACK_END_NS) {
         fprintf(stderr, "  [TRACE] %7.3f cc2420 node=%d state %s -> %s\n",
-                (double)r->cpu->sim_time_ns / 1e9, r->node_id,
+                (double)HOST_NOW_NS(r) / 1e9, r->node_id,
                 cc2420_state_str(old_state), cc2420_state_str(new_state));
         trace_tsch_ack_lines++;
     }
@@ -419,7 +412,7 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
 
     case CC2420_TX_CALIBRATE:
         /* Cancel any pending deferred SFD clear from frame RX */
-        msp430_cancel_event(r->cpu, &r->sfd_clear_event);
+        HOST_CANCEL(r,&r->sfd_clear_event);
         /* 14 symbol periods (12 cal + 2 settling) */
         schedule_symbols(r, 14);
         break;
@@ -440,7 +433,7 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
 
     case CC2420_TX_ACK_CALIBRATE:
         /* Cancel any pending deferred SFD clear — ACK TX will manage SFD */
-        msp430_cancel_event(r->cpu, &r->sfd_clear_event);
+        HOST_CANCEL(r,&r->sfd_clear_event);
         set_sfd(r, false);  /* clear SFD from received frame before ACK TX */
         r->status |= CC2420_STATUS_TX_ACTIVE;
         /* Match MSPSim: 12 turnaround + 2 extra + 2 extra. */
@@ -583,10 +576,10 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
          * ignored, not replayed later from a side buffer. */
         if (trace_tsch_ack_enabled() && trace_tsch_ack_lines < TRACE_TSCH_ACK_MAX_LINES &&
             r->node_id > 0 && r->node_id <= 2 &&
-            r->cpu->sim_time_ns >= TRACE_TSCH_ACK_START_NS &&
-            r->cpu->sim_time_ns <= TRACE_TSCH_ACK_END_NS) {
+            HOST_NOW_NS(r) >= TRACE_TSCH_ACK_START_NS &&
+            HOST_NOW_NS(r) <= TRACE_TSCH_ACK_END_NS) {
             fprintf(stderr, "  [TRACE] %7.3f cc2420 node=%d drop byte=%02x state=%s\n",
-                    (double)r->cpu->sim_time_ns / 1e9, r->node_id, data,
+                    (double)HOST_NOW_NS(r) / 1e9, r->node_id, data,
                     cc2420_state_str(r->state));
             trace_tsch_ack_lines++;
         }
@@ -746,8 +739,8 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
              * ACK detection — the CC2420 driver busy-waits for SFD transitions. */
             {
                 sfd_deferred_count++;
-                int64_t fire_ns = r->cpu->sim_time_ns + CC2420_SYMBOL_PERIOD_NS;
-                msp430_schedule_event_ns(r->cpu, &r->sfd_clear_event, fire_ns);
+                int64_t fire_ns = HOST_NOW_NS(r) + CC2420_SYMBOL_PERIOD_NS;
+                HOST_SCHEDULE_NS(r, &r->sfd_clear_event, fire_ns);
             }
 
             /* Match MSPSim: a good ACK-requesting frame transitions the
@@ -898,7 +891,7 @@ static void strobe(cc2420_t *r, int cmd) {
  * Oscillator / VREG control
  * ================================================================ */
 
-static void vreg_event_callback(void *user_data, msp430_event_t *event) {
+static void vreg_event_callback(void *user_data, cpu_event_t *event) {
     cc2420_t *r = (cc2420_t *)user_data;
     (void)event;
     /* VREG startup complete — radio is now in POWER_DOWN */
@@ -906,7 +899,7 @@ static void vreg_event_callback(void *user_data, msp430_event_t *event) {
     set_state(r, CC2420_POWER_DOWN);
 }
 
-static void oscillator_event_callback(void *user_data, msp430_event_t *event) {
+static void oscillator_event_callback(void *user_data, cpu_event_t *event) {
     cc2420_t *r = (cc2420_t *)user_data;
     (void)event;
     /* Oscillator stable — transition to IDLE */
@@ -920,8 +913,8 @@ static void start_oscillator(cc2420_t *r) {
     if (r->status & CC2420_STATUS_XOSC16M_STABLE)
         return;
     /* ~1ms startup delay */
-    int64_t fire_ns = r->cpu->sim_time_ns + 1000000LL;  /* 1ms = 1,000,000 ns */
-    msp430_schedule_event_ns(r->cpu, &r->oscillator_event, fire_ns);
+    int64_t fire_ns = HOST_NOW_NS(r) + 1000000LL;  /* 1ms = 1,000,000 ns */
+    HOST_SCHEDULE_NS(r, &r->oscillator_event, fire_ns);
 }
 
 static void stop_oscillator(cc2420_t *r) {
@@ -940,10 +933,10 @@ void cc2420_set_vreg(cc2420_t *radio, bool on) {
         /* VREG off — immediate */
         radio->on = false;
         radio->status = 0;
-        msp430_cancel_event(radio->cpu, &radio->vreg_event);
-        msp430_cancel_event(radio->cpu, &radio->oscillator_event);
-        msp430_cancel_event(radio->cpu, &radio->symbol_event);
-        msp430_cancel_event(radio->cpu, &radio->sfd_clear_event);
+        HOST_CANCEL(radio, &radio->vreg_event);
+        HOST_CANCEL(radio, &radio->oscillator_event);
+        HOST_CANCEL(radio, &radio->symbol_event);
+        HOST_CANCEL(radio, &radio->sfd_clear_event);
         set_state(radio, CC2420_VREG_OFF);
     }
 }
@@ -1133,10 +1126,9 @@ static void cc2420_reset(cc2420_t *r) {
     r->rx_rssi = -50;   /* default RSSI (backward compatible) */
 }
 
-void cc2420_init(cc2420_t *radio, msp430_cpu_t *cpu, msp430_gpio_t *gpio) {
+void cc2420_init(cc2420_t *radio, const sim_host_t *host) {
     memset(radio, 0, sizeof(*radio));
-    radio->cpu = cpu;
-    radio->gpio = gpio;
+    radio->host = host;
     radio->state = CC2420_VREG_OFF;
 
     /* Setup events */

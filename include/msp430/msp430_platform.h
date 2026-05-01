@@ -10,6 +10,7 @@
 #include "msp430_timer.h"
 #include "msp430_gpio.h"
 #include "msp430_usart.h"
+#include "sim_host.h"
 #include "cc2420.h"
 
 /* LED definition: port number (1-based) and pin (0-7) */
@@ -81,6 +82,8 @@ typedef struct msp430_platform {
     } dma0;
     /* Stub IO buffer for unmodeled peripherals (USCI A1/B1, ADC12, etc.) */
     uint8_t         stub_io[256];
+    /* CPU-agnostic vtable for off-SoC chip drivers (CC2420 etc.) */
+    sim_host_t      host;
     const msp430_platform_config_t *config;
 } msp430_platform_t;
 

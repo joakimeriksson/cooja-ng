@@ -7,8 +7,10 @@
 #ifndef CC2420_H
 #define CC2420_H
 
-#include "msp430_cpu.h"
-#include "msp430_gpio.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include "cpu_event.h"
+#include "sim_host.h"
 
 /* --- Radio states --- */
 typedef enum {
@@ -143,8 +145,11 @@ typedef void (*cc2420_rf_callback_fn)(void *user_data, uint8_t byte);
 
 /* --- CC2420 state --- */
 typedef struct cc2420 {
-    msp430_cpu_t  *cpu;
-    msp430_gpio_t *gpio;
+    /* CPU/GPIO bridge — built once by the platform. The CC2420 driver is
+     * deliberately CPU-agnostic so the same chip can sit on an MSP430 (Sky)
+     * or, in the future, alongside an ARM-based SoC (CC2538DK + external
+     * CC2420). All CPU/GPIO interaction goes through this vtable. */
+    const sim_host_t *host;
 
     /* Radio state */
     cc2420_radio_state_t state;
@@ -217,10 +222,10 @@ typedef struct cc2420 {
     bool decode_address;
 
     /* Events */
-    msp430_event_t vreg_event;
-    msp430_event_t oscillator_event;
-    msp430_event_t symbol_event;
-    msp430_event_t sfd_clear_event;  /* deferred SFD pin clear after frame RX */
+    cpu_event_t vreg_event;
+    cpu_event_t oscillator_event;
+    cpu_event_t symbol_event;
+    cpu_event_t sfd_clear_event;  /* deferred SFD pin clear after frame RX */
 
     /* ACK state */
     uint8_t ack_buf[6];
@@ -267,7 +272,7 @@ typedef struct cc2420 {
 
 /* --- Public API --- */
 
-void cc2420_init(cc2420_t *radio, msp430_cpu_t *cpu, msp430_gpio_t *gpio);
+void cc2420_init(cc2420_t *radio, const sim_host_t *host);
 
 void cc2420_set_pins(cc2420_t *radio,
                       int fifop_port, int fifop_pin,
