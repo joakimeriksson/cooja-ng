@@ -33,6 +33,17 @@
 #define CC1200_BYTE_PERIOD_NS    160000   /* 8 bits @ 50 kbps */
 #define CC1200_RESET_TIME_NS     200000   /* SRES → IDLE, ~200 µs in real HW */
 
+/* Defer end-of-frame GDO0 fall by one byte-period. The chip's
+ * PKT_SYNC_RXTX falling edge marks the end of a received packet —
+ * firmware ISR reads the FIFO + appendix on this edge. Real chip
+ * timing has the edge fire about one symbol after the last on-air
+ * byte; one byte-period (8 symbols at 50 kbps) is well within that
+ * envelope and matches the CC2420 SFD-clear pattern (one symbol).
+ * Critically, scheduling this on sim_eq forces the simulator's main
+ * loop to advance the receiver CPU to the event time so the IRQ
+ * actually runs before the sender's ACK_WAIT timer expires. */
+#define CC1200_FRAME_DONE_NS     CC1200_BYTE_PERIOD_NS
+
 /* ------------------------------------------------------------------ */
 /* Status byte / MARCSTATE helpers                                      */
 /* ------------------------------------------------------------------ */
@@ -129,6 +140,24 @@ static uint8_t fifo_pop_tx(cc1200_t *c) {
 }
 
 /* ------------------------------------------------------------------ */
+/* End-of-frame deferred event                                          */
+/* ------------------------------------------------------------------ */
+
+/* Drop GDO0/GDO2 to mark the firmware-visible "packet complete" edge.
+ * Scheduled one byte-period after the last on-air CRC byte arrives so
+ * the sim_eq main loop advances the receiver CPU to this point (and
+ * thus runs the IRQ handler) before returning to the sender. Doing
+ * this synchronously inside cc1200_receive_byte() would pend an IRQ
+ * the receiver can't service until its next periodic wakeup, by which
+ * time the sender's MAC ACK_WAIT timer has often already expired. */
+static void frame_done_event_cb(void *user_data, cpu_event_t *ev) {
+    (void)ev;
+    cc1200_t *c = (cc1200_t *)user_data;
+    drive_gdo0(c, false);
+    drive_gdo2(c, false);
+}
+
+/* ------------------------------------------------------------------ */
 /* Air decoder                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -179,7 +208,11 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
         if (!fifo_push_rx(c, byte)) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
-            drive_gdo0(c, false);
+            /* Defer GDO0 drop — same reasoning as the normal end-of-frame
+             * path: the receiver firmware needs CPU time to react to the
+             * falling edge, which only happens if the drop is on sim_eq. */
+            int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
+            HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
             return;
         }
         bool fg_mode = (c->regs[CC1200_REG_PKT_CFG2] &
@@ -204,7 +237,8 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             c->air_payload_total > CC1200_FIFO_SIZE - (fg_mode ? 4 : 3)) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
-            drive_gdo0(c, false);
+            int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
+            HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
             return;
         }
         c->air_payload_remaining = c->air_payload_total;
@@ -217,7 +251,8 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             if (!fifo_push_rx(c, byte)) {
                 c->marcstate = CC1200_MARC_RX_FIFO_ERR;
                 air_reset(c);
-                drive_gdo0(c, false);
+                int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
+                HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
                 return;
             }
             c->air_payload_remaining--;
@@ -242,8 +277,14 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
                 }
                 c->stat_rx_packets++;
                 air_reset(c);
-                drive_gdo0(c, false);
-                drive_gdo2(c, false);
+                /* Defer the GDO0/GDO2 falling edge: the firmware's
+                 * end-of-packet ISR triggers off this edge and needs
+                 * to actually run before the sender's MAC ACK_WAIT
+                 * fires. Scheduling the drop on sim_eq forces the
+                 * main loop to step the receiver CPU forward to this
+                 * time. See docs/porting-a-device.md §8. */
+                int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
+                HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
             }
         }
         break;
@@ -388,6 +429,7 @@ static void chip_reset(cc1200_t *c) {
 
     HOST_CANCEL(c, &c->tx_byte_event);
     HOST_CANCEL(c, &c->reset_done_event);
+    HOST_CANCEL(c, &c->frame_done_event);
     /* SRES → IDLE after a small delay */
     int64_t fire = HOST_NOW_NS(c) + CC1200_RESET_TIME_NS;
     HOST_SCHEDULE_NS(c, &c->reset_done_event, fire);
@@ -405,6 +447,7 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
     case CC1200_STROBE_SIDLE:
         c->tx_active = false;
         HOST_CANCEL(c, &c->tx_byte_event);
+        HOST_CANCEL(c, &c->frame_done_event);
         c->marcstate = CC1200_MARC_IDLE;
         air_reset(c);
         drive_gdo0(c, false);
@@ -597,6 +640,7 @@ void cc1200_set_reset(cc1200_t *c, bool low) {
         c->tx_active = false;
         HOST_CANCEL(c, &c->tx_byte_event);
         HOST_CANCEL(c, &c->reset_done_event);
+        HOST_CANCEL(c, &c->frame_done_event);
         air_reset(c);
         drive_gdo0(c, false);
         drive_gdo2(c, false);
@@ -619,6 +663,8 @@ void cc1200_init(cc1200_t *c, const sim_host_t *host) {
     c->tx_byte_event.user_data = c;
     c->reset_done_event.callback = reset_done_event_cb;
     c->reset_done_event.user_data = c;
+    c->frame_done_event.callback = frame_done_event_cb;
+    c->frame_done_event.user_data = c;
 
     c->csn_low = false;
     c->reset_low = false;

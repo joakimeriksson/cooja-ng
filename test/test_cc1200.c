@@ -262,7 +262,13 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     cc1200_receive_byte(&chip, 0x12);  /* on-air CRC byte 1 (consumed, not stored) */
     cc1200_receive_byte(&chip, 0x34);  /* on-air CRC byte 2 (consumed, not stored) */
 
-    /* GDO0 should now be falling (packet end). */
+    /* End-of-frame is now event-driven: the chip schedules the GDO0
+     * falling edge one byte-period (~160 µs) after the last on-air CRC
+     * byte. This is what guarantees the simulator's main loop steps
+     * the receiver CPU forward in time so its IRQ runs — see
+     * docs/porting-a-device.md §8. Advance virtual time enough to
+     * drain the deferred event before asserting the edge. */
+    mock_sim_host_advance_ns(&mock, 1000000);  /* 1 ms */
     ASSERT(!mock.last_force_irq.rising, "GDO0 falling on packet end");
 
     /* RX FIFO should now contain PHR(2) + payload(5) + appendix(2) = 9 bytes. */
