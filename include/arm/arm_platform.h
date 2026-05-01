@@ -20,11 +20,28 @@
 /* UART TX callback */
 typedef void (*arm_uart_tx_callback)(void *user_data, uint8_t byte);
 
+/* Optional GPIO pin descriptor (port 0..3 = A..D, pin 0..7).
+ * Used by platform configs to document board wiring (LEDs, buttons,
+ * off-SoC chip control pins). port < 0 means "unused/not present". */
+typedef struct arm_gpio_pin {
+    int8_t  port;         /* 0=A, 1=B, 2=C, 3=D, -1=unused */
+    int8_t  pin;          /* 0..7 */
+    bool    active_low;   /* true if asserted = drive low */
+} arm_gpio_pin_t;
+
 /* Static platform configuration */
 typedef struct arm_platform_config {
     const char          *name;
     const arm_config_t  *soc;
     int                  console_uart;   /* 0 or 1 */
+    /* Board wiring metadata. Optional — zero-initialized entries are
+     * treated as "not described". Currently informational only; the
+     * underlying CC2538 GPIO peripheral is wired identically for all
+     * boards. Fields populated here become useful once a board needs
+     * platform-managed LED state or output-pin callback fan-out
+     * (e.g. for off-SoC chip control pins). */
+    arm_gpio_pin_t       leds[3];        /* up to 3 status LEDs */
+    arm_gpio_pin_t       button;         /* user button */
 } arm_platform_config_t;
 
 /* Platform runtime state */

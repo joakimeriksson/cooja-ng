@@ -49,9 +49,30 @@ static const arm_platform_config_t platform_openmote = {
     .console_uart  = 0,
 };
 
+/* Zolertia Firefly (TARGET=zoul, BOARD=firefly).
+ * Same CC2538 SoC as cc2538dk/openmote — only the board wiring differs.
+ * LED1 Red   = PD5, LED2 Green = PD4, LED3 Blue  = PD3 (all active-high).
+ * USER button = PA3 (active-low, internal pull-up; shared with bootloader).
+ * Console = UART0 (PA0=RX, PA1=TX) → CP2104 USB-serial bridge.
+ *
+ * Off-SoC CC1200 sub-GHz radio is NOT wired in this Phase A entry — that
+ * lands with the SSI controller + cc1200.c chip driver in Phase B. */
+static const arm_platform_config_t platform_zoul_firefly = {
+    .name          = "zoul-firefly",
+    .soc           = &cc2538_config,
+    .console_uart  = 0,
+    .leds = {
+        { .port = 3, .pin = 5, .active_low = false },  /* LED1 Red   PD5 */
+        { .port = 3, .pin = 4, .active_low = false },  /* LED2 Green PD4 */
+        { .port = 3, .pin = 3, .active_low = false },  /* LED3 Blue  PD3 */
+    },
+    .button = { .port = 0, .pin = 3, .active_low = true },  /* USER PA3 */
+};
+
 static const arm_platform_config_t *all_arm_platforms[] = {
     &platform_cc2538dk,
     &platform_openmote,
+    &platform_zoul_firefly,
     NULL
 };
 
