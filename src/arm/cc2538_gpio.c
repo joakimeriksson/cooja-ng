@@ -126,11 +126,24 @@ void cc2538_gpio_force_irq_edge(cc2538_gpio_t *gpio, int port, int pin, bool ris
     cc2538_gpio_port_t *p = &gpio->ports[port];
     uint8_t mask = (uint8_t)(1u << pin);
 
-    p->ie |= mask;
-    if (rising) p->ris |=  mask;
-    else        p->ris &= ~mask;
+    /* Honour the firmware's interrupt configuration:
+     *   IS=0 (edge), IBE=1 (both edges) → fire on every edge.
+     *   IS=0, IBE=0 → fire only when edge polarity matches IEV
+     *                 (IEV=1 = rising, IEV=0 = falling).
+     *   IS=1 → level-triggered, not modelled here (chip drivers all use
+     *          edge-triggered GDO pins, so we'd never reach this path
+     *          from a chip driver in practice).
+     *
+     * If the firmware hasn't enabled the IRQ yet (IE bit clear), the
+     * sticky RIS still latches but no NVIC pend happens — that mirrors
+     * real silicon: the next time firmware runs IE high, the prior edge
+     * is acked via ICR write or fires the ISR immediately. */
+    if (p->is & mask) return;          /* level-triggered: ignore */
+    bool both = (p->ibe & mask) != 0;
+    bool rise_cfg = (p->iev & mask) != 0;
+    if (!both && (rise_cfg != rising)) return; /* wrong edge polarity */
 
-    /* Pend the port's NVIC IRQ if any RIS bit is now masked-in. */
+    p->ris |= mask;
     if ((p->ris & p->ie) && gpio->cpu && gpio->cpu->nvic && gpio->irq_nums[port] >= 0) {
         arm_nvic_set_pending((arm_nvic_t *)gpio->cpu->nvic, gpio->irq_nums[port]);
     }
