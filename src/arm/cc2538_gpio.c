@@ -70,7 +70,18 @@ static void gpio_write(void *user_data, uint32_t addr, uint32_t value) {
                 case GPIO_IS:      port->is = value & 0xFF; break;
                 case GPIO_IBE:     port->ibe = value & 0xFF; break;
                 case GPIO_IEV:     port->iev = value & 0xFF; break;
-                case GPIO_IE:      port->ie = value & 0xFF; break;
+                case GPIO_IE: {
+                    uint8_t old_ie = port->ie;
+                    port->ie = value & 0xFF;
+                    uint8_t newly_enabled = port->ie & ~old_ie;
+                    if ((newly_enabled & port->ris) &&
+                        gpio->cpu && gpio->cpu->nvic &&
+                        gpio->irq_nums[p] >= 0) {
+                        arm_nvic_set_pending((arm_nvic_t *)gpio->cpu->nvic,
+                                             gpio->irq_nums[p]);
+                    }
+                    break;
+                }
                 case GPIO_ICR:     port->ris &= ~(value & 0xFF); break;
                 case GPIO_AFSEL:   port->afsel = value & 0xFF; break;
                 case GPIO_GPIOLOCK: port->gpiolock = value; break;
