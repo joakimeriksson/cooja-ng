@@ -238,7 +238,8 @@ Two pieces:
 | `fc78288` | `cc2538_gpio` IE 0→1 re-pend with sticky RIS | ✓ matches "MIS = RIS & IE" + sticky-RIS semantics |
 | `739cbef` | CC1200 event-driven MARCSTATE strobe transitions | ✓ matches state-machine model on pages 62-66; specific delay values worth validating |
 | `076402a` | CC1200 CCA via RSSI0/CARRIER_SENSE | ✓ direction; needs settling-time + medium-busy fix |
-| `1a694cd` | CC1200 always-drive GDO0 on sync match regardless of IOCFG0 | ✗ **WRONG per page 18-19**; revert when proper IOCFG multiplexing lands |
+| `1a694cd` | CC1200 always-drive GDO0 on sync match regardless of IOCFG0 | ✗ **WRONG per page 18-19**; ~~revert when proper IOCFG multiplexing lands~~ **reverted** as part of the IOCFG multiplexing landing — sync match now sets `sig_pkt_sync_rxtx`, `propagate_signals()` drives only the GDO pins whose IOCFG selects signal 6 |
+| _(this commit)_ | CC1200 IOCFG/GDO multiplexing model + signal tracking | ✓ matches §1 above. GDOx pin level recomputed on every IOCFGx write and on every internal-signal change; modeled signals are 6 PKT_SYNC_RXTX, 13 RSSI_VALID, 16 CARRIER_SENSE_VALID, 17 CARRIER_SENSE, 37/38 MARC_2PIN_STATUS_1/0; GPIOx_INV bit honoured. L5 still green (16 direct RX); L6 RF byte volume jumps from 1581 → 55821 over 60 s, but DAG convergence still blocked — see `DATASHEET-FINDINGS.md` §6 fix #2 (receiver-side time-warp). |
 
 ## 6. The path to L6 convergence — datasheet-grounded
 
