@@ -245,8 +245,14 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     uint8_t sync[4] = { 0x6E, 0x4E, 0x90, 0x4E };
     spi_burst_write(&chip, 0x04, sync, 4);
 
-    /* IOCFG0 = PKT_SYNC_RXTX (default after init, but be explicit) */
+    /* IOCFG0 = PKT_SYNC_RXTX (default after init, but be explicit). */
     spi_single_write(&chip, CC1200_REG_IOCFG0, CC1200_IOCFG_PKT_SYNC_RXTX);
+    /* IOCFG2 explicitly pointed at an unmodeled signal so it does NOT
+     * fire on sync match.  After the IOCFG-multiplexing rework, only
+     * GDO pins whose IOCFG selects PKT_SYNC_RXTX (signal 6) see the
+     * sync-match rising edge — which is the datasheet-correct
+     * behaviour.  See devices/zoul-firefly/DATASHEET-FINDINGS.md §1. */
+    spi_single_write(&chip, CC1200_REG_IOCFG2, CC1200_IOCFG_HIGHZ);
 
     /* Force 802.15.4g mode (FG_MODE = PKT_CFG2 bit 5) so the air decoder
      * expects a 2-byte PHR — that's what the test below feeds. */
@@ -267,23 +273,20 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     ASSERT_EQ(mock.force_irq_edge_calls, prior, "no GDO0 edge during preamble");
 
     /* Inject the 4-byte sync word — chip should fire GDO0 rising on the
-     * last byte (PKT_SYNC_RXTX rising edge = SFD detected). */
+     * last byte (PKT_SYNC_RXTX rising edge = SFD detected).  GDO2
+     * stays silent because IOCFG2 selects HIGHZ. */
     cc1200_receive_byte(&chip, sync[0]);
     cc1200_receive_byte(&chip, sync[1]);
     cc1200_receive_byte(&chip, sync[2]);
     cc1200_receive_byte(&chip, sync[3]);
 
-    /* Sync detection now fires GDO0 AND GDO2 unconditionally (both
-     * pins are wired in this fixture). The chip used to gate each on
-     * IOCFG[02] == PKT_SYNC_RXTX, but Contiki's transmit() reconfigures
-     * IOCFG0 to MARC_2PIN_STATUS_0 mid-flight — frames arriving in that
-     * window must still drive RX-completion edges so the GPIO RIS bit
-     * latches; the cc2538_gpio.c IE 0→1 re-pend handles the IRQ once
-     * Contiki re-enables GPIO interrupts. See cc1200.c sync-match path. */
-    ASSERT_EQ(mock.force_irq_edge_calls - prior, 2, "GDO0 + GDO2 edges fired on SFD");
-    ASSERT_EQ(mock.last_force_irq.port, 1, "GDO2 port = B (last call)");
-    ASSERT_EQ(mock.last_force_irq.pin,  0, "GDO2 pin = 0 (last call)");
-    ASSERT(mock.last_force_irq.rising, "GDO2 rising on SFD");
+    /* Datasheet-correct: only GDO0 fires on sync (its IOCFG selects
+     * PKT_SYNC_RXTX); GDO2 is unaffected (its IOCFG selects an
+     * unmodeled signal). */
+    ASSERT_EQ(mock.force_irq_edge_calls - prior, 1, "only GDO0 edge fired on SFD");
+    ASSERT_EQ(mock.last_force_irq.port, 1, "GDO0 port = B");
+    ASSERT_EQ(mock.last_force_irq.pin,  4, "GDO0 pin = 4");
+    ASSERT(mock.last_force_irq.rising, "GDO0 rising on SFD");
 
     /* On-air after sync: PHR(2) + payload(5) + auto-CRC(2). The chip
      * pushes PHR + payload to the RX FIFO, consumes the 2 CRC bytes
@@ -433,6 +436,184 @@ static void test_flush_strobes(void) {
     ASSERT_EQ(cc1200_rxfifo_count(&chip), 0, "SFRX kept RX FIFO empty");
 }
 
+/* ====================================================================
+ * IOCFG multiplexing — pin-routing tests
+ *
+ * Pins each map IOCFGx → one of the chip's internal signals.  The mock
+ * harness' force_irq_edge_calls counter records every level change
+ * driven onto a GDO pin; rising/falling polarity is in last_force_irq.
+ *
+ * These tests pin the L6 architectural fix described in
+ * devices/zoul-firefly/DATASHEET-FINDINGS.md §1 + SWRU346B p.18-19.
+ * ==================================================================== */
+
+/* Helper — bring the chip from SLEEP to IDLE after SRES.  All IOCFG
+ * tests share this preamble. */
+static void prep_idle(mock_sim_host_t *mock, cc1200_t *chip) {
+    spi_strobe(chip, CC1200_STROBE_SRES);
+    mock_sim_host_advance_ns(mock, 1000000);
+}
+
+/* Drive the chip from IDLE to RX (drains the SRX settling event). */
+static void prep_rx(mock_sim_host_t *mock, cc1200_t *chip) {
+    spi_strobe(chip, CC1200_STROBE_SRX);
+    mock_sim_host_advance_ns(mock, 500000);  /* >> 200 µs SRX delay */
+}
+
+/* Drive the chip back to IDLE from RX (drains SIDLE settling). */
+static void prep_idle_from_rx(mock_sim_host_t *mock, cc1200_t *chip) {
+    spi_strobe(chip, CC1200_STROBE_SIDLE);
+    mock_sim_host_advance_ns(mock, 200000);  /* >> 50 µs SIDLE delay */
+}
+
+static void test_iocfg_multiplexing_basic(void) {
+    mock_sim_host_t mock; cc1200_t chip;
+    fixture(&mock, &chip);
+    prep_idle(&mock, &chip);
+
+    /* Route GDO0 to MARC_2PIN_STATUS_0 (signal 38).  Park GDO2 at an
+     * unmodeled signal so it doesn't add edges. */
+    spi_single_write(&chip, CC1200_REG_IOCFG2, CC1200_IOCFG_HIGHZ);
+    spi_single_write(&chip, CC1200_REG_IOCFG0, CC1200_IOCFG_MARC_2PIN_STATUS_0);
+
+    /* Currently IDLE (MARC_2PIN = 10, bit0 = 0) → GDO0 should be low. */
+    int prior = mock.force_irq_edge_calls;
+
+    /* SRX → settling → RX.  MARC[0] flips 0→1 when MARCSTATE arrives at
+     * RX.  GDO0 sees a rising edge driven by the propagate path. */
+    prep_rx(&mock, &chip);
+    ASSERT(mock.force_irq_edge_calls > prior, "GDO0 fired on IDLE→RX");
+    ASSERT_EQ(mock.last_force_irq.port, 1, "edge port = B");
+    ASSERT_EQ(mock.last_force_irq.pin,  4, "edge pin = 4 (GDO0)");
+    ASSERT(mock.last_force_irq.rising, "GDO0 rising on RX entry");
+
+    /* SIDLE → settling → IDLE.  MARC[0] flips 1→0 → GDO0 falling edge. */
+    prior = mock.force_irq_edge_calls;
+    prep_idle_from_rx(&mock, &chip);
+    ASSERT(mock.force_irq_edge_calls > prior, "GDO0 fired on RX→IDLE");
+    ASSERT_EQ(mock.last_force_irq.pin, 4, "edge pin = 4 (GDO0)");
+    ASSERT(!mock.last_force_irq.rising, "GDO0 falling on IDLE entry");
+}
+
+static void test_iocfg_switch_during_rx(void) {
+    mock_sim_host_t mock; cc1200_t chip;
+    fixture(&mock, &chip);
+    prep_idle(&mock, &chip);
+
+    /* Configure sync word + IOCFG0 = PKT_SYNC_RXTX, IOCFG2 = HIGHZ. */
+    uint8_t sync[4] = { 0x6E, 0x4E, 0x90, 0x4E };
+    spi_burst_write(&chip, 0x04, sync, 4);
+    spi_single_write(&chip, CC1200_REG_IOCFG0, CC1200_IOCFG_PKT_SYNC_RXTX);
+    spi_single_write(&chip, CC1200_REG_IOCFG2, CC1200_IOCFG_HIGHZ);
+    spi_single_write(&chip, CC1200_REG_PKT_CFG2,
+                      CC1200_PKT_CFG2_FG_MODE_802154G);
+
+    prep_rx(&mock, &chip);
+
+    int prior = mock.force_irq_edge_calls;
+
+    /* Inject preamble + sync → sig_pkt_sync_rxtx becomes true →
+     * GDO0 rises (IOCFG0 selects signal 6). */
+    for (int i = 0; i < 4; i++) cc1200_receive_byte(&chip, 0x55);
+    for (int i = 0; i < 4; i++) cc1200_receive_byte(&chip, sync[i]);
+    ASSERT(mock.force_irq_edge_calls > prior, "GDO0 rose on sync match");
+    ASSERT(mock.last_force_irq.rising, "GDO0 rising");
+
+    /* Firmware reroutes IOCFG0 to MARC_2PIN_STATUS_0 mid-flight.  The
+     * chip is still in RX (MARC[0]=1), and PKT_SYNC_RXTX is also true,
+     * so the new GDO0 level matches the old → no edge expected. */
+    int after_sync = mock.force_irq_edge_calls;
+    spi_single_write(&chip, CC1200_REG_IOCFG0, CC1200_IOCFG_MARC_2PIN_STATUS_0);
+    ASSERT_EQ(mock.force_irq_edge_calls, after_sync,
+              "no GDO0 edge: sync match level = MARC[0] level");
+
+    /* Firmware reroutes back to PKT_SYNC_RXTX mid-frame.  Both signals
+     * are still high → no edge. */
+    spi_single_write(&chip, CC1200_REG_IOCFG0, CC1200_IOCFG_PKT_SYNC_RXTX);
+    ASSERT_EQ(mock.force_irq_edge_calls, after_sync,
+              "no GDO0 edge: switching IOCFG between two high signals");
+
+    /* Inject the rest of the frame (PHR + payload + on-air CRC) and
+     * advance time to drain the deferred frame_done event.  GDO0 must
+     * fall on packet end. */
+    cc1200_receive_byte(&chip, 0x00);
+    cc1200_receive_byte(&chip, 0x05);
+    for (int i = 0; i < 5; i++) cc1200_receive_byte(&chip, 0xAA + i);
+    cc1200_receive_byte(&chip, 0x12);
+    cc1200_receive_byte(&chip, 0x34);
+
+    mock_sim_host_advance_ns(&mock, 1000000);
+    ASSERT(!mock.last_force_irq.rising, "GDO0 fell on frame_done");
+}
+
+static void test_iocfg_high_z_no_edges(void) {
+    mock_sim_host_t mock; cc1200_t chip;
+    fixture(&mock, &chip);
+    prep_idle(&mock, &chip);
+
+    /* Park BOTH GDO pins at HIGHZ (unmodeled signal).  GDO0 should
+     * stay silent through a complete RX frame. */
+    spi_single_write(&chip, CC1200_REG_IOCFG0, CC1200_IOCFG_HIGHZ);
+    spi_single_write(&chip, CC1200_REG_IOCFG2, CC1200_IOCFG_HIGHZ);
+
+    uint8_t sync[4] = { 0x6E, 0x4E, 0x90, 0x4E };
+    spi_burst_write(&chip, 0x04, sync, 4);
+    spi_single_write(&chip, CC1200_REG_PKT_CFG2,
+                      CC1200_PKT_CFG2_FG_MODE_802154G);
+
+    prep_rx(&mock, &chip);
+    int prior = mock.force_irq_edge_calls;
+
+    for (int i = 0; i < 4; i++) cc1200_receive_byte(&chip, 0x55);
+    for (int i = 0; i < 4; i++) cc1200_receive_byte(&chip, sync[i]);
+    cc1200_receive_byte(&chip, 0x00);
+    cc1200_receive_byte(&chip, 0x05);
+    for (int i = 0; i < 5; i++) cc1200_receive_byte(&chip, 0xAA + i);
+    cc1200_receive_byte(&chip, 0x12);
+    cc1200_receive_byte(&chip, 0x34);
+    mock_sim_host_advance_ns(&mock, 1000000);
+
+    ASSERT_EQ(mock.force_irq_edge_calls - prior, 0,
+              "no GDO0 edges across full frame when IOCFG = HIGHZ");
+}
+
+static void test_iocfg_inv_bit(void) {
+    mock_sim_host_t mock; cc1200_t chip;
+    fixture(&mock, &chip);
+    prep_idle(&mock, &chip);
+
+    /* IOCFG0 = PKT_SYNC_RXTX with the GPIO0_INV bit set.  Logical
+     * "asserted" (sig_pkt_sync_rxtx = true) should drive the pin LOW. */
+    spi_single_write(&chip, CC1200_REG_IOCFG2, CC1200_IOCFG_HIGHZ);
+    spi_single_write(&chip, CC1200_REG_IOCFG0,
+                      CC1200_IOCFG_PKT_SYNC_RXTX | CC1200_IOCFG_GPIO0_INV);
+
+    uint8_t sync[4] = { 0x6E, 0x4E, 0x90, 0x4E };
+    spi_burst_write(&chip, 0x04, sync, 4);
+    spi_single_write(&chip, CC1200_REG_PKT_CFG2,
+                      CC1200_PKT_CFG2_FG_MODE_802154G);
+
+    prep_rx(&mock, &chip);
+    int prior = mock.force_irq_edge_calls;
+
+    /* Sync match → sig_pkt_sync_rxtx=true → inverted → GDO0 falls. */
+    for (int i = 0; i < 4; i++) cc1200_receive_byte(&chip, 0x55);
+    for (int i = 0; i < 4; i++) cc1200_receive_byte(&chip, sync[i]);
+    ASSERT(mock.force_irq_edge_calls > prior, "GDO0 edge on sync (inverted)");
+    ASSERT(!mock.last_force_irq.rising,
+           "GDO0 falling on sync match (INV bit set)");
+
+    /* Frame done → sig_pkt_sync_rxtx=false → inverted → GDO0 rises. */
+    cc1200_receive_byte(&chip, 0x00);
+    cc1200_receive_byte(&chip, 0x05);
+    for (int i = 0; i < 5; i++) cc1200_receive_byte(&chip, 0xAA + i);
+    cc1200_receive_byte(&chip, 0x12);
+    cc1200_receive_byte(&chip, 0x34);
+    mock_sim_host_advance_ns(&mock, 1000000);
+    ASSERT(mock.last_force_irq.rising,
+           "GDO0 rising on frame_done (INV bit set)");
+}
+
 /* ==================================================================== */
 
 int run_cc1200_tests(int verbose) {
@@ -446,6 +627,10 @@ int run_cc1200_tests(int verbose) {
     test_sfd_detect_and_gdo0_edge();
     test_tx_path();
     test_flush_strobes();
+    test_iocfg_multiplexing_basic();
+    test_iocfg_switch_during_rx();
+    test_iocfg_high_z_no_edges();
+    test_iocfg_inv_bit();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;
