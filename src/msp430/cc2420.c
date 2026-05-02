@@ -794,6 +794,23 @@ static void set_reg(cc2420_t *r, int addr, uint16_t value) {
         update_cca(r);
         break;
 
+    case CC2420_REG_FSCTRL: {
+        /* CC2420 FSCTRL[9:0] = FREQ. Channel mapping per datasheet
+         * §13: f_RF = 2048 + FREQ (MHz), and IEEE channel k uses
+         * 2405 + 5*(k-11) MHz, so:
+         *     FREQ = 357 + 5*(k - 11)
+         *     k    = (FREQ - 357) / 5 + 11
+         * Push the channel change to the radio medium so per-radio
+         * routing can gate delivery.  The chip driver itself stays
+         * portable — channel goes out via the sim_host_t vtable. */
+        int freq = value & 0x3FF;
+        int channel = -1;
+        if (freq >= 357) channel = (freq - 357) / 5 + 11;
+        if (r->host && r->host->radio_set_channel)
+            r->host->radio_set_channel(r->host->radio_user_data, 0, channel);
+        break;
+    }
+
     default:
         break;
     }
@@ -1101,7 +1118,9 @@ static void cc2420_reset(cc2420_t *r) {
     set_reg(r, CC2420_REG_MDMCTRL0, 0x0AE2);
     r->registers[CC2420_REG_RSSI] = 0xE080;
     r->registers[CC2420_REG_TXCTRL] = 0xA0FF;
-    r->registers[CC2420_REG_FSCTRL] = 0x4165;  /* channel 26 */
+    /* Use set_reg so the channel-push side effect runs and the medium
+     * sees the chip's default channel (26 = FSCTRL 0x4165) immediately. */
+    set_reg(r, CC2420_REG_FSCTRL, 0x4165);
     r->registers[CC2420_REG_IOCFG0] = 0x0040;  /* FIFOP threshold */
     r->registers[CC2420_REG_MANFIDL] = 0x233D;  /* manufacturer ID */
     r->registers[CC2420_REG_MANFIDH] = 0x2000;
