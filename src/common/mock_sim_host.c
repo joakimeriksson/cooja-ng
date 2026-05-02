@@ -65,17 +65,26 @@ static void mock_force_irq_edge(void *gpio, int port, int pin, bool rising) {
     m->last_force_irq.rising = rising;
 }
 
+static void mock_radio_set_channel(void *user_data, int radio_idx, int channel) {
+    mock_sim_host_t *m = (mock_sim_host_t *)user_data;
+    m->radio_set_channel_calls++;
+    m->last_radio_channel.radio_idx = radio_idx;
+    m->last_radio_channel.channel   = channel;
+}
+
 void mock_sim_host_init(mock_sim_host_t *mock) {
     memset(mock, 0, sizeof(*mock));
-    /* The mock is its own cpu and gpio — both shim families reach the
-     * same struct and inspect/mutate the same state. */
-    mock->host.cpu            = mock;
-    mock->host.gpio           = mock;
-    mock->host.now_ns         = mock_now_ns;
-    mock->host.schedule_ns    = mock_schedule_ns;
-    mock->host.cancel         = mock_cancel;
-    mock->host.set_input_pin  = mock_set_input_pin;
-    mock->host.force_irq_edge = mock_force_irq_edge;
+    /* The mock is its own cpu, gpio, and radio_user_data — every shim
+     * family reaches the same struct and inspects/mutates the same state. */
+    mock->host.cpu              = mock;
+    mock->host.gpio             = mock;
+    mock->host.radio_user_data  = mock;
+    mock->host.now_ns           = mock_now_ns;
+    mock->host.schedule_ns      = mock_schedule_ns;
+    mock->host.cancel           = mock_cancel;
+    mock->host.set_input_pin    = mock_set_input_pin;
+    mock->host.force_irq_edge   = mock_force_irq_edge;
+    mock->host.radio_set_channel = mock_radio_set_channel;
 }
 
 void mock_sim_host_advance_ns(mock_sim_host_t *mock, int64_t delta_ns) {

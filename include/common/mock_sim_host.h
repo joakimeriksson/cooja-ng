@@ -45,6 +45,11 @@ typedef struct {
     bool rising;
 } mock_irq_edge_event_t;
 
+typedef struct {
+    int radio_idx;
+    int channel;
+} mock_radio_channel_event_t;
+
 typedef struct mock_sim_host {
     sim_host_t  host;            /* embedded vtable — pass &mock.host to chip drivers */
 
@@ -62,6 +67,8 @@ typedef struct mock_sim_host {
     mock_irq_edge_event_t last_force_irq;
     int               schedule_calls;
     int               cancel_calls;
+    int               radio_set_channel_calls;
+    mock_radio_channel_event_t last_radio_channel;
 } mock_sim_host_t;
 
 /* Initialize a mock host (zeroes counters, fills the vtable). */
@@ -83,6 +90,7 @@ static inline void mock_sim_host_reset_counters(mock_sim_host_t *mock) {
     mock->force_irq_edge_calls = 0;
     mock->schedule_calls = 0;
     mock->cancel_calls = 0;
+    mock->radio_set_channel_calls = 0;
 }
 
 #endif /* MOCK_SIM_HOST_H */

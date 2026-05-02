@@ -30,6 +30,12 @@ typedef struct sim_host {
     /* Opaque handles bound at platform init */
     void *cpu;
     void *gpio;
+    /* Opaque handle for the simulation harness (medium dispatcher).
+     * The chip driver passes this back through radio_set_channel; the
+     * harness uses it to look up which (node, radio_idx) the call came
+     * from. Optional — leave NULL on platforms that don't model a
+     * radio medium. */
+    void *radio_user_data;
 
     /* Time */
     int64_t (*now_ns)        (void *cpu);
@@ -45,6 +51,15 @@ typedef struct sim_host {
      * Implementations may no-op if the platform's GPIO already does the
      * right thing on edge transitions. */
     void    (*force_irq_edge)(void *gpio, int port, int pin, bool rising);
+
+    /* Radio: push a chip-driver-observed channel change into the
+     * simulation harness so the radio medium can route bytes per-radio.
+     *   radio_idx: which radio slot on this node the chip occupies
+     *              (0 for single-radio platforms; 0/1 on Firefly)
+     *   channel:   band-local channel index (-1 = unknown)
+     * Optional — chip drivers must NULL-check; harnesses that don't
+     * model a medium leave this unwired. */
+    void    (*radio_set_channel)(void *radio_user_data, int radio_idx, int channel);
 } sim_host_t;
 
 #endif /* SIM_HOST_H */
