@@ -3454,6 +3454,14 @@ int run_mixed_multinode_test(int argc, char **argv) {
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
             if (num_threads < 0) num_threads = 0;
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            /* Per-node startup delay spread (ms). Each node gets a
+             * pseudo-random offset in [0, N) ms. Without this, all
+             * nodes execute their boot/timer work on identical
+             * simulated-clock instants, causing CSMA collisions that
+             * never resolve (csim has zero hardware-level XO drift).
+             * 100-1000 ms is a sensible range for RPL/CSMA tests. */
+            config.startup_delay_ms = atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             if (is_json_file(argv[i])) {
                 /* Load JSON config */
@@ -3781,7 +3789,7 @@ sim_restart:
     /* Apply per-node startup delay to desynchronize timers.
      * Each node gets a random start_ns offset. Before its start time,
      * the node is not stepped and does not receive RF. */
-    if (config_loaded && config.startup_delay_ms > 0) {
+    if (config.startup_delay_ms > 0) {
         unsigned int delay_seed = config.seed ? (unsigned int)config.seed : 12345;
         printf("Applying startup delay spread: 0-%d ms\n", config.startup_delay_ms);
         for (int i = 0; i < node_count; i++) {
