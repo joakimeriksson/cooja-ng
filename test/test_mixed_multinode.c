@@ -1219,6 +1219,61 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
 }
 
 /*
+ * Per-radio channel-change adapter — installed as the sim_host_t
+ * radio_set_channel callback for off-SoC chip drivers (CC2420 on
+ * MSP430 platforms, CC1200 on Firefly), and as the
+ * cc2538_rfcore_set_channel_callback observer for the on-SoC RF Core.
+ *
+ * The chip driver passes its (radio_idx, channel) to the harness; we
+ * convert to a global (node_idx, radio_idx) and push into the medium.
+ * Sub-GHz channels are remapped onto the legacy sub-GHz channel base so
+ * the CCA-busy heuristic above (which still keys on the legacy alias)
+ * keeps working until we migrate it.
+ */
+static void mixed_node_radio_set_channel(mixed_node_t *node, int radio_idx,
+                                          int channel) {
+    int idx = (int)(node - nodes);
+    if (idx < 0 || idx >= num_nodes) return;
+    /* Keep slot 0 reserved for the 2.4 GHz primary radio; CC1200 lives
+     * on slot 1 by convention. The chip drivers already call us with
+     * the correct slot, so this is just a defensive sanity guard. */
+    if (radio_idx < 0 || radio_idx >= RADIO_MEDIUM_MAX_RADIOS_PER_NODE) return;
+    radio_medium_set_radio_channel(&radio_medium, idx, radio_idx, channel);
+    /* Legacy alias — the CCA channel-busy query and a couple of older
+     * call sites still read radio_medium.nodes[i].channel directly.
+     * Mirror writes onto the legacy alias so those readers keep
+     * returning the same answer they did before the per-radio refactor:
+     *   - sub-GHz radios (slot 1) appear as RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE
+     *     + their channel (legacy "channel >= base means sub-GHz")
+     *   - 2.4 GHz radios (slot 0) write the raw channel ONLY if slot 1
+     *     is not registered. On dual-radio Firefly nodes the cc1200 is
+     *     the active radio (NETSTACK_RADIO=cc1200_driver), so the
+     *     CCA-busy query keys on its channel. Letting cc2538_rfcore
+     *     (parked) stomp the alias would flip the band gate and kill
+     *     all sub-GHz CCA. */
+    if (radio_idx == 1 && channel >= 0) {
+        radio_medium.nodes[idx].channel =
+            RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE + channel;
+    } else if (radio_idx == 0) {
+        bool slot1_registered =
+            radio_medium.nodes[idx].radios[1].spectrum != RADIO_SPECTRUM_NONE;
+        if (!slot1_registered)
+            radio_medium.nodes[idx].channel = channel;
+    }
+}
+
+/* sim_host_t adapter (off-SoC chip drivers). */
+static void mixed_host_radio_set_channel(void *user_data, int radio_idx,
+                                          int channel) {
+    mixed_node_radio_set_channel((mixed_node_t *)user_data, radio_idx, channel);
+}
+
+/* cc2538_rfcore observer adapter (on-SoC, slot 0 = 2.4 GHz). */
+static void mixed_rfcore_channel_callback(void *user_data, int channel) {
+    mixed_node_radio_set_channel((mixed_node_t *)user_data, /*radio_idx=*/0, channel);
+}
+
+/*
  * CC1200 channel-busy query — called from the chip driver's RSSI0 read
  * path.  Returns true if any neighbor on this node's channel is currently
  * mid-frame transmit (per node_tx_busy_until_ns[]).  This drives the
@@ -2577,6 +2632,10 @@ static int init_msp430_node(int idx, const char *firmware_path, int node_id) {
     msp430_platform_set_console(plat, mixed_uart_callback, node);
     cc2420_set_rf_listener(&plat->cc2420, mixed_rf_tx_handler, node);
     plat->cc2420.node_id = node_id;
+    /* CC2420's FSCTRL writes push channel via the sim_host_t vtable
+     * onto radio slot 0 for this node. Same adapter as the ARM path. */
+    plat->host.radio_user_data  = node;
+    plat->host.radio_set_channel = mixed_host_radio_set_channel;
     msp430_cpu_reset(&plat->cpu);
 
     /* Run past crt0 to main, then patch ds2411_id */
@@ -2764,6 +2823,14 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     plat->rfcore.node_id = node_id;
     plat->rfcore.state_callback = mixed_rf_state_handler;
     plat->rfcore.state_user_data = node;
+    /* Per-radio channel push: the on-SoC RF Core observer reports
+     * FREQCTRL.FREQ writes; the off-SoC sim_host_t adapter reports
+     * CC1200 FREQ writes (slot 1). Both flow through
+     * mixed_node_radio_set_channel and into the radio medium. */
+    cc2538_rfcore_set_channel_callback(&plat->rfcore,
+                                        mixed_rfcore_channel_callback, node);
+    plat->host.radio_user_data  = node;
+    plat->host.radio_set_channel = mixed_host_radio_set_channel;
 
     /* Per-node CC1200 fan-out (Firefly only). The chip TX listener
      * routes through the same mixed_rf_tx_handler used by cc2538_rfcore
@@ -3393,37 +3460,21 @@ static void threaded_step_node(int idx, void *user_data) {
     }
 }
 
-/* --- Channel synchronization --- */
-
+/* --- Channel synchronization ---
+ *
+ * Emulated nodes (MSP430 / ARM) push their channel into the medium
+ * synchronously through the sim_host_t.radio_set_channel adapter (CC2420
+ * FSCTRL writes, CC1200 FREQ writes) and via cc2538_rfcore's
+ * channel_callback observer (FREQCTRL writes). Sync_node_channels only
+ * needs to handle native (Cooja-mote) nodes, which do not run an emulated
+ * chip driver — their `simRadioChannel` pointer is the only source of
+ * truth for the current channel selection. */
 static void sync_node_channels(void) {
     for (int i = 0; i < num_nodes; i++) {
+        if (nodes[i].type != NODE_NATIVE) continue;
         int ch = -1;
-        if (nodes[i].type == NODE_MSP430) {
-            /* CC2420: FSCTRL register (0x18), channel = (FREQ[9:0] - 357) / 5 + 11 */
-            uint16_t fsctrl = nodes[i].plat.msp.cc2420.registers[CC2420_REG_FSCTRL];
-            int freq = fsctrl & 0x3FF;
-            if (freq >= 357)
-                ch = (freq - 357) / 5 + 11;
-        } else if (nodes[i].type == NODE_ARM) {
-            /* For Firefly nodes (has_cc1200) we always report a sub-GHz
-             * channel — the CC1200 is the primary radio for these. The
-             * cc2538_rfcore is still present but parked (firmware was
-             * built with ZOUL_CONF_USE_CC1200_RADIO=1, so NETSTACK_RADIO
-             * is cc1200_driver). Picking a sub-GHz channel here is what
-             * triggers cross_band_drop in the medium so 2.4 GHz nodes
-             * don't see CC1200 frames and vice versa. */
-            const arm_platform_config_t *pcfg = nodes[i].plat.arm.config;
-            if (pcfg && pcfg->has_cc1200) {
-                ch = RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE;
-            } else {
-                /* CC2538: channel already computed on FREQCTRL write */
-                ch = nodes[i].plat.arm.rfcore.channel;
-            }
-        } else {
-            /* Native: simRadioChannel pointer */
-            if (nodes[i].plat.native.simRadioChannel)
-                ch = *nodes[i].plat.native.simRadioChannel;
-        }
+        if (nodes[i].plat.native.simRadioChannel)
+            ch = *nodes[i].plat.native.simRadioChannel;
         radio_medium_set_channel(&radio_medium, i, ch);
     }
 }
