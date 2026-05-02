@@ -40,6 +40,9 @@ extern int run_mock_host_tests(int verbose);
 /* CC1200 chip-driver mock-host unit tests (L−1) */
 extern int run_cc1200_tests(int verbose);
 
+/* radio_medium_t unit tests (pure C, no CPU) */
+extern int run_radio_medium_tests(int verbose);
+
 int main(int argc, char **argv) {
     int verbose = 0;
 
@@ -57,6 +60,7 @@ int main(int argc, char **argv) {
         printf("              zoul-firefly-multinode\n");
         printf("Mixed:        mixed-multinode\n");
         printf("Chip drivers: cc1200-mock-host\n");
+        printf("Radio medium: radio-medium\n");
         printf("Test:         test <config.json> [-v] [-t ms]\n");
         printf("Combined:     all\n");
         return 1;
@@ -180,6 +184,11 @@ int main(int argc, char **argv) {
     /* CC1200 chip-driver unit tests (L−1) */
     if (strcmp(mode, "cc1200-mock-host") == 0 || strcmp(mode, "all") == 0) {
         failures += run_cc1200_tests(verbose);
+    }
+
+    /* radio_medium_t unit tests */
+    if (strcmp(mode, "radio-medium") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_radio_medium_tests(verbose);
     }
 
     if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {
