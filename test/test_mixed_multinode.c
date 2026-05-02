@@ -430,6 +430,12 @@ static node_thread_state_t thread_state[MAX_NODES];
 /* Per-node last TX timestamp for UI communication arrows */
 static int64_t node_last_tx_ns[MAX_NODES];
 
+/* Per-node "TX busy until" timestamp — marked at frame-complete time to
+ * the wall-clock end of the frame (accurate_tx_end).  Read by the CC1200
+ * channel-busy query callback so receivers' CCA reflects in-progress
+ * transmissions on the medium.  See cc1200.c reg_read(RSSI0). */
+static int64_t node_tx_busy_until_ns[MAX_NODES];
+
 /* Per-node start time: node is inactive (no step, no RF) until sim_ns >= start_ns */
 static int64_t node_start_ns[MAX_NODES];  /* 0 = start immediately */
 
@@ -1177,6 +1183,48 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
 }
 
 /*
+ * CC1200 channel-busy query — called from the chip driver's RSSI0 read
+ * path.  Returns true if any neighbor on this node's channel is currently
+ * mid-frame transmit (per node_tx_busy_until_ns[]).  This drives the
+ * CARRIER_SENSE bit so CSMA backs off when another node is on-air,
+ * even before the first preamble byte has reached our chip's air
+ * decoder.  Without this, CCA always saw a clear channel and senders
+ * blasted on top of each other — root cause of L6 RPL non-convergence.
+ */
+static bool mixed_cc1200_channel_busy(void *user_data) {
+    mixed_node_t *node = (mixed_node_t *)user_data;
+    int idx = (int)(node - nodes);
+    int my_ch = radio_medium.nodes[idx].channel;
+    /* Only consider TX-range neighbors — interference-range nodes are too
+     * far for our CCA to detect.  Use the precomputed neighbor list. */
+    neighbor_list_t *nbrs = (radio_medium.type == RADIO_MEDIUM_NONE)
+        ? NULL : &radio_medium.neighbors[idx];
+    int n = nbrs ? nbrs->count : 0;
+    for (int k = 0; k < n; k++) {
+        int j = nbrs->neighbors[k];
+        if (j == idx) continue;
+        if (node_tx_busy_until_ns[j] <= current_sim_ns) continue;
+        /* Cross-band check: 2.4 GHz neighbors don't affect sub-GHz CCA. */
+        int their_ch = radio_medium.nodes[j].channel;
+        if (my_ch >= 0 && their_ch >= 0) {
+            bool my_sub    = (my_ch    >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
+            bool their_sub = (their_ch >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
+            if (my_sub != their_sub) continue;
+        }
+        return true;
+    }
+    /* Fallback (no medium configured / no neighbor list): scan all nodes. */
+    if (!nbrs) {
+        for (int j = 0; j < num_nodes; j++) {
+            if (j == idx) continue;
+            if (node_tx_busy_until_ns[j] > current_sim_ns)
+                return true;
+        }
+    }
+    return false;
+}
+
+/*
  * Byte-level TX handler: called by CC2420 and CC2538 RF when transmitting
  * individual bytes. Also called by native_check_radio_tx() when converting
  * a native frame to byte-stream for emulated receivers.
@@ -1320,6 +1368,13 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     int64_t accurate_tx_end = byte_time_ns + sender_byte_ns;
     int64_t accurate_tx_start = accurate_tx_end - frame_air_dur;
     if (accurate_tx_start < 0) accurate_tx_start = 0;
+
+    /* Mark the medium as TX-busy on this sender's channel until the frame
+     * finishes on the air.  Receiver chips poll this via their channel-busy
+     * query (see cc1200_set_channel_busy_query) so CCA reflects in-progress
+     * transmissions, not just frames already mid-RX. */
+    if (accurate_tx_end > node_tx_busy_until_ns[sender_idx])
+        node_tx_busy_until_ns[sender_idx] = accurate_tx_end;
 
     if (trace_tsch_ack_enabled() && sender->type == NODE_MSP430 &&
         (tx_asm[sender_idx].expected_len == 23 || tx_asm[sender_idx].expected_len == 19 ||
@@ -2629,6 +2684,8 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
      * sharing the simulation. */
     if (pcfg->has_cc1200) {
         cc1200_set_rf_listener(&plat->cc1200, mixed_rf_tx_handler, node);
+        cc1200_set_channel_busy_query(&plat->cc1200,
+                                       mixed_cc1200_channel_busy, node);
     }
 
     /* Seed RFRND and sleep timer uniquely per node.
@@ -4604,6 +4661,7 @@ sim_restart:
         memset(frame_outgoing, 0, sizeof(frame_outgoing));
         memset(thread_state, 0, sizeof(thread_state));
         memset(node_last_tx_ns, 0, sizeof(node_last_tx_ns));
+        memset(node_tx_busy_until_ns, 0, sizeof(node_tx_busy_until_ns));
         memset(node_start_ns, 0, sizeof(node_start_ns));
         memset(ui_console, 0, sizeof(ui_console));
         memset(ui_console_head, 0, sizeof(ui_console_head));

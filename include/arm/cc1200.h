@@ -91,7 +91,20 @@
 #define CC1200_PKT_CFG2_FG_MODE_802154G  (1u << 5)  /* "FG_MODE" — bit5 enables
                                                        802.15.4g 2-byte PHR */
 #define CC1200_EXT_RSSI1             0x2F71
+#define CC1200_EXT_RSSI0             0x2F72
 #define CC1200_EXT_MARCSTATE         0x2F73
+
+/* RSSI0 (0x2F72) bit layout — see CC1200 datasheet SWRS123A §A.2:
+ *   bit 7: RSSI_VALID      — RSSI register has been written by hardware
+ *   bit 1: CARRIER_SENSE_VALID — channel-clear/busy decision is valid
+ *   bit 2: CARRIER_SENSE   — channel currently busy (rising edge of CCA)
+ * The Contiki cc1200 driver busy-waits on CARRIER_SENSE_VALID then
+ * checks CARRIER_SENSE to decide cca().  We drive both bits from
+ * MARCSTATE (RX → valid) and the air decoder (sync-word matched →
+ * carrier sense). */
+#define CC1200_RSSI0_RSSI_VALID            (1u << 7)
+#define CC1200_RSSI0_CARRIER_SENSE_VALID   (1u << 1)
+#define CC1200_RSSI0_CARRIER_SENSE         (1u << 2)
 #define CC1200_EXT_NUM_TXBYTES       0x2FD6
 #define CC1200_EXT_NUM_RXBYTES       0x2FD7
 #define CC1200_EXT_PARTNUMBER        0x2F8F
@@ -104,6 +117,14 @@
 
 /* RF TX listener — invoked once per air byte during TX. */
 typedef void (*cc1200_rf_callback_fn)(void *user_data, uint8_t byte);
+
+/* Channel-busy query — returns true if the medium reports another node
+ * currently transmitting on this chip's channel.  Used to drive the
+ * RSSI0 CARRIER_SENSE bit so CSMA backoff actually serialises senders.
+ * Without this hook the chip only knows "I'm mid-RX of a frame whose
+ * sync word I already saw" — fine after the first 8 air bytes but not
+ * during the preamble window where firmware-level CCA fires. */
+typedef bool (*cc1200_channel_busy_fn)(void *user_data);
 
 /* SPI protocol decoder state */
 typedef enum {
@@ -208,6 +229,12 @@ typedef struct cc1200 {
     cc1200_rf_callback_fn rf_tx_callback;
     void                 *rf_tx_user_data;
 
+    /* Channel-busy query (host-side bridge to radio_medium activity).
+     * Optional — if NULL the chip falls back to "is my air decoder
+     * past the sync word?" which only catches mid-RX frames. */
+    cc1200_channel_busy_fn channel_busy_query;
+    void                  *channel_busy_user_data;
+
     /* RX RSSI for current frame (set by medium / test runner) */
     int8_t   rx_rssi;
 
@@ -242,6 +269,13 @@ void    cc1200_receive_byte(cc1200_t *chip, uint8_t byte);
 void    cc1200_set_rf_listener(cc1200_t *chip,
                                 cc1200_rf_callback_fn cb,
                                 void *user_data);
+
+/* Install channel-busy query.  Called from the RSSI0 register-read
+ * path; cb returns true if the medium has at least one sender mid-TX
+ * on this chip's channel.  Pass NULL to clear. */
+void    cc1200_set_channel_busy_query(cc1200_t *chip,
+                                       cc1200_channel_busy_fn cb,
+                                       void *user_data);
 
 /* Test/inspection helpers (exposed for unit tests) */
 uint8_t cc1200_status(const cc1200_t *chip);
