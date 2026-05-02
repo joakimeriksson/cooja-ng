@@ -104,7 +104,8 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_mixed_multinode.c \
                $(TEST_DIR)/test_timeline.c \
                $(TEST_DIR)/test_mock_host.c \
-               $(TEST_DIR)/test_cc1200.c
+               $(TEST_DIR)/test_cc1200.c \
+               $(TEST_DIR)/test_radio_medium.c
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 
