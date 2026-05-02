@@ -110,8 +110,19 @@
 #define CC1200_EXT_PARTNUMBER        0x2F8F
 #define CC1200_EXT_PARTVERSION       0x2F90
 
-/* GPIOx I/O configuration values (match cc1200-const.h IOCFG_*) */
-#define CC1200_IOCFG_PKT_SYNC_RXTX   6
+/* GPIOx I/O configuration values (match cc1200-const.h IOCFG_*).
+ * The IOCFGx register layout is: bit 6 = GPIOx_INV (invert output),
+ * bits 5:0 = GPIOx_CFG (signal selector). See SWRU346B p.18-19 for the
+ * full signal-number table; csim only models the handful below. */
+#define CC1200_IOCFG_GPIO0_CFG_MASK     0x3F
+#define CC1200_IOCFG_GPIO0_INV          0x40
+#define CC1200_IOCFG_PKT_SYNC_RXTX      6
+#define CC1200_IOCFG_RSSI_VALID         13
+#define CC1200_IOCFG_CARRIER_SENSE_VALID 16
+#define CC1200_IOCFG_CARRIER_SENSE      17
+#define CC1200_IOCFG_MARC_2PIN_STATUS_1 37
+#define CC1200_IOCFG_MARC_2PIN_STATUS_0 38
+#define CC1200_IOCFG_HIGHZ              0x30  /* unmodeled — pin idle low */
 
 #define CC1200_FIFO_SIZE             128
 
@@ -209,9 +220,23 @@ typedef struct cc1200 {
     cc1200_pin_t gdo0;
     cc1200_pin_t gdo2;
 
-    /* Last GDO0 / GDO2 logical levels (true = asserted = "packet sync"). */
+    /* Last GDO0 / GDO2 logical levels driven onto the host pin. The chip
+     * recomputes these by routing the IOCFGx-selected internal signal
+     * through gdo_signal_value() — see propagate_signals(). */
     bool     gdo0_level;
     bool     gdo2_level;
+
+    /* Internal signal values driven by chip state. GDOx pins reflect the
+     * signal selected by their IOCFGx register. See devices/zoul-firefly/
+     * DATASHEET-FINDINGS.md §1 and SWRU346B p.18-19 (signal table).
+     * Anything firmware doesn't poll (csim has no current need for) is
+     * left unmodeled — gdo_signal_value() returns false for those. */
+    bool     sig_pkt_sync_rxtx;     /* signal 6:  high during sync→packet-end */
+    bool     sig_rssi_valid;        /* signal 13: post first RSSI update in RX */
+    bool     sig_cs_valid;          /* signal 16: CARRIER_SENSE_VALID */
+    bool     sig_carrier_sense;     /* signal 17: RSSI > threshold */
+    /* MARC_2PIN_STATUS_0 (signal 38) and _1 (signal 37) are derived from
+     * marcstate via marc_2pin_state(). No explicit cached field needed. */
 
     /* Events */
     cpu_event_t tx_byte_event;
