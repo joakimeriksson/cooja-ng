@@ -298,6 +298,28 @@ Standard L0–L6 for the platform, plus chip-driver checkpoints
       already tests `bringup.zoul-firefly` for the platform.
 - [x] `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/nullnet-broadcast-subghz.zoul-firefly -t 20000 -q` shows ≥1 RX per node (L5) — passing
 - [ ] `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/udp-server-subghz.zoul-firefly firmware/zoul-firefly/udp-client-subghz.zoul-firefly -t 60000` exchanges ≥1 hello/response (L6) — RPL DAG does not converge in a 60 s sim. The architectural fix to event-driven CC1200 MARCSTATE strobes (SIDLE/SRX/STX, see `src/arm/cc1200.c` and `docs/porting-a-device.md` §8) is in place — receiver MARCSTATE now stays at RX for the ~50 µs SIDLE settling window so the air decoder ingests inbound preamble bytes that arrive while the firmware is entering its own CSMA prepare→transmit path.  Bytes do reach the chip's air decoder and the SFD edge fires on GDO0 (PB4); however the chip drives that edge inside the receiver firmware's "GPIO IRQ disabled" window (`DISABLE_GPIO_INTERRUPTS()` at the top of Contiki's `idle()`).  CC2538 GPIO RIS sticky bits do latch but `cc2538_gpio.c` does not re-pend NVIC when the firmware later writes IE 0→1 with RIS already set — this is a pre-existing CC2538 emulator gap orthogonal to the CC1200 port and out of scope for this task.
+
+  Status update (commit 164f6e4 "fix sub-GHz RX FIFO accounting"):
+  the receiver-side FIFO check used `data[5]` (the byte after an
+  IEEE 802.15.4 SFD) to read payload length. For a sub-GHz frame
+  `data[5]` is the second byte of the 32-bit sync word (0x4E for
+  the Contiki 50 kbps config), not the PHR — the check therefore
+  blocked queue drains even when the receiver had FIFO room. After
+  routing the offset through `frame_fifo_bytes()` and bumping
+  `EMU_RX_QUEUE_SIZE` 16→64, L6 stats moved from
+  `5 direct, 16 queued, 0 drained, 893 dropped` to
+  `80 direct, 214 queued, 150 drained, 672 dropped`.
+
+  L6 still does not converge. Root cause is now receiver CPU
+  starvation: in the same 60-s run Node 1 retires only ~50 M
+  instructions vs. ~1.2 G for Node 2 (the sender). The CC1200
+  receiver firmware is barely scheduled, so it doesn't drain the
+  on-chip RX FIFO between back-to-back sub-GHz frames. The deeper
+  problem is in the test runner's per-event scheduling for ARM
+  receivers under sub-GHz load — solving it cleanly without
+  regressing L5 / cc2538dk RPL-UDP requires a redesign of how
+  `tick_one_arm` and `emu_rx_queue_drain` interact when the chip
+  driver schedules its own deferred frame_done events. Punted.
 - [x] `.github/workflows/test.yml` runs the new subcommands on PR
 - [x] CC1200 driver takes `sim_host_t` only — no `arm_cpu_t` /
       `cc2538_gpio_t` types leak in
