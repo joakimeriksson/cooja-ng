@@ -112,8 +112,25 @@ int     cc1200_rxfifo_count(const cc1200_t *c) { return c->rx_count; }
 int     cc1200_txfifo_count(const cc1200_t *c) { return c->tx_count; }
 
 /* ------------------------------------------------------------------ */
-/* GDO0 / GDO2 edge driving                                              */
+/* GDO0 / GDO2 edge driving + IOCFG signal multiplexing                  */
 /* ------------------------------------------------------------------ */
+
+/* Real silicon: each GDOx pin is multiplexed — IOCFGx.GPIOx_CFG selects
+ * which of ~64 internal signals drives the pin in real time.  The pin
+ * level is recomputed whenever either (a) the selected internal signal
+ * changes, or (b) firmware writes IOCFGx (pointing the pin at a
+ * possibly-different signal whose current value drives the pin
+ * instantly — and may produce an edge).  See devices/zoul-firefly/
+ * DATASHEET-FINDINGS.md §1 and SWRU346B p.18-19.
+ *
+ * The csim model:
+ *   - Track each modeled internal signal as a bool field on cc1200_t.
+ *   - gdo_signal_value(c, iocfg) maps IOCFG → current bool level.
+ *   - propagate_signals(c) is called from every site that mutates a
+ *     signal or the IOCFG register; it recomputes both pins and drives
+ *     the host (set_input_pin + force_irq_edge) on changes.
+ *   - drive_gdo() stays as the shared "on edge → bridge to host" path.
+ */
 
 static void drive_gdo(cc1200_t *c, const cc1200_pin_t *pin, bool *cur_level, bool level) {
     if (!pin->enabled) return;
@@ -123,12 +140,56 @@ static void drive_gdo(cc1200_t *c, const cc1200_pin_t *pin, bool *cur_level, boo
     HOST_FORCE_IRQ(c, pin->port, pin->pin, level);
 }
 
-static void drive_gdo0(cc1200_t *c, bool level) {
-    drive_gdo(c, &c->gdo0, &c->gdo0_level, level);
+/* Map the 5-bit MARCSTATE encoding to the 2-bit MARC_2PIN_STATE
+ * encoding (SWRU346B p.106 + DATASHEET-FINDINGS §2).
+ *   00 SETTLING  → all calibration / settling / FIFO-err sub-states
+ *   01 TX        → 0x13 TX, 0x14 TX_END
+ *   10 IDLE      → 0x00 SLEEP, 0x01 IDLE, 0x02 STARTUP (we map SLEEP→IDLE)
+ *   11 RX        → 0x0D RX, 0x0E RX_END, 0x0F RXDCM
+ * Bit 1 → MARC_2PIN_STATUS_1 (signal 37); bit 0 → MARC_2PIN_STATUS_0 (signal 38). */
+static uint8_t marc_2pin_state(uint8_t marcstate) {
+    switch (marcstate) {
+    case CC1200_MARC_SLEEP: case CC1200_MARC_IDLE:
+        return 2;  /* IDLE: bit1=1, bit0=0 */
+    case 0x02:  /* STARTUP */
+        return 2;
+    case 0x0D: case 0x0E: case 0x0F:
+        return 3;  /* RX: bit1=1, bit0=1 */
+    case 0x13: case 0x14:
+        return 1;  /* TX: bit1=0, bit0=1 */
+    default:
+        /* All other sub-states (0x03..0x0C, 0x10, 0x11, 0x12, 0x15, 0x16,
+         * 0x17) are SETTLING per the table: 00. */
+        return 0;
+    }
 }
 
-static void drive_gdo2(cc1200_t *c, bool level) {
-    drive_gdo(c, &c->gdo2, &c->gdo2_level, level);
+/* Map IOCFGx register value to the chip's current internal signal
+ * level.  Returns the boolean that should be driven onto the GDO pin
+ * when this signal is selected.  Bit 6 (GPIOx_INV) inverts the result.
+ * Other bits (drive strength, etc.) are not modeled. */
+static bool gdo_signal_value(const cc1200_t *c, uint8_t iocfg) {
+    bool v;
+    switch (iocfg & CC1200_IOCFG_GPIO0_CFG_MASK) {
+    case CC1200_IOCFG_PKT_SYNC_RXTX:        v = c->sig_pkt_sync_rxtx; break;
+    case CC1200_IOCFG_RSSI_VALID:           v = c->sig_rssi_valid; break;
+    case CC1200_IOCFG_CARRIER_SENSE_VALID:  v = c->sig_cs_valid; break;
+    case CC1200_IOCFG_CARRIER_SENSE:        v = c->sig_carrier_sense; break;
+    case CC1200_IOCFG_MARC_2PIN_STATUS_1:   v = (marc_2pin_state(c->marcstate) & 2) != 0; break;
+    case CC1200_IOCFG_MARC_2PIN_STATUS_0:   v = (marc_2pin_state(c->marcstate) & 1) != 0; break;
+    default:                                v = false; break; /* unmodeled — pin idle low */
+    }
+    if (iocfg & CC1200_IOCFG_GPIO0_INV) v = !v;
+    return v;
+}
+
+/* Recompute both GDO pin levels from the current IOCFGx selectors and
+ * internal signal state, and drive any edges through to the host. */
+static void propagate_signals(cc1200_t *c) {
+    bool gdo0 = gdo_signal_value(c, c->regs[CC1200_REG_IOCFG0]);
+    bool gdo2 = gdo_signal_value(c, c->regs[CC1200_REG_IOCFG2]);
+    drive_gdo(c, &c->gdo0, &c->gdo0_level, gdo0);
+    drive_gdo(c, &c->gdo2, &c->gdo2_level, gdo2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -189,8 +250,11 @@ static uint8_t fifo_pop_tx(cc1200_t *c) {
 static void frame_done_event_cb(void *user_data, cpu_event_t *ev) {
     (void)ev;
     cc1200_t *c = (cc1200_t *)user_data;
-    drive_gdo0(c, false);
-    drive_gdo2(c, false);
+    /* Packet ended — PKT_SYNC_RXTX falls.  Any GDO pin selecting
+     * signal 6 sees the falling edge here.  Pins selecting MARC_2PIN
+     * or other signals are unchanged. */
+    c->sig_pkt_sync_rxtx = false;
+    propagate_signals(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -224,18 +288,17 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
         if (c->sync_match == sync_word_value(c)) {
             c->air_state = CC1200_AIR_PHR;
             c->air_phr_count = 0;
-            /* Always assert GDO0/GDO2 on sync detection regardless of the
-             * current IOCFG selection. Contiki's transmit() reconfigures
-             * IOCFG0 to MARC_2PIN_STATUS_0 (38) for TX-state polling, after
-             * disabling the GDO0 IRQ at the GPIO layer. A frame arriving in
-             * that window must still latch the RX-completion edge so the
-             * GPIO RIS bit is sticky-set; the cc2538_gpio.c IE 0→1 re-pend
-             * then fires the IRQ once Contiki re-enables GPIO interrupts
-             * post-TX, and cc1200_rx_interrupt drains the buffered frame.
-             * Spurious edges during IE-disabled windows are filtered by
-             * IE/IES at the GPIO layer (see cc2538_gpio_force_irq_edge). */
-            drive_gdo0(c, true);
-            drive_gdo2(c, true);
+            /* Sync match → assert PKT_SYNC_RXTX (signal 6).
+             * propagate_signals() drives any GDO pin whose IOCFGx
+             * currently selects signal 6.  Pins pointing at other
+             * signals (e.g. MARC_2PIN_STATUS_0 during the firmware's
+             * transmit() window) are unaffected — datasheet-correct.
+             * The gpio peripheral's sticky RIS + IE 0→1 re-pend
+             * (cc2538_gpio.c) handles the case where firmware
+             * re-routes IOCFG back to PKT_SYNC_RXTX before draining
+             * the in-flight frame. */
+            c->sig_pkt_sync_rxtx = true;
+            propagate_signals(c);
         }
         break;
     }
@@ -249,9 +312,13 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
         if (!fifo_push_rx(c, byte)) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
-            /* Defer GDO0 drop — same reasoning as the normal end-of-frame
-             * path: the receiver firmware needs CPU time to react to the
-             * falling edge, which only happens if the drop is on sim_eq. */
+            /* RX FIFO overflow → MARCSTATE leaves RX (SETTLING/IDLE per
+             * 2-pin map) and PKT_SYNC_RXTX must drop.  propagate_signals
+             * recomputes both pins from the new marcstate; the
+             * frame_done event still defers the PKT_SYNC_RXTX drop by
+             * one byte-period so the receiver CPU has time to run its
+             * end-of-frame ISR (see docs/porting-a-device.md §8). */
+            propagate_signals(c);
             int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
             HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
             return;
@@ -278,6 +345,7 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             c->air_payload_total > CC1200_FIFO_SIZE - (fg_mode ? 4 : 3)) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
+            propagate_signals(c);
             int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
             HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
             return;
@@ -292,6 +360,7 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             if (!fifo_push_rx(c, byte)) {
                 c->marcstate = CC1200_MARC_RX_FIFO_ERR;
                 air_reset(c);
+                propagate_signals(c);
                 int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
                 HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
                 return;
@@ -345,6 +414,7 @@ static void start_tx(cc1200_t *c) {
         /* Nothing to send — TX FIFO underflow */
         c->marcstate = CC1200_MARC_TX_FIFO_ERR;
         refresh_status(c);
+        propagate_signals(c);
         return;
     }
 
@@ -352,14 +422,14 @@ static void start_tx(cc1200_t *c) {
     c->marcstate = CC1200_MARC_TX;
     refresh_status(c);
 
-    /* TX-started → assert PKT_SYNC_RXTX. Real firmware busy-waits for
-     * GDO0 high after STX, so this edge has to fire before we return. */
-    if (c->regs[CC1200_REG_IOCFG0] == CC1200_IOCFG_PKT_SYNC_RXTX) {
-        drive_gdo0(c, true);
-    }
-    if (c->regs[CC1200_REG_IOCFG2] == CC1200_IOCFG_PKT_SYNC_RXTX) {
-        drive_gdo2(c, true);
-    }
+    /* TX-started → assert PKT_SYNC_RXTX (signal 6).  propagate_signals
+     * drives any GDO pin selecting signal 6 to high; pins selecting
+     * MARC_2PIN_STATUS_0 (38) also see an edge here because marcstate
+     * just transitioned IDLE→TX (MARC[0] flips 0→1).  Real firmware
+     * busy-waits on whichever pin is mapped, so the edge has to fire
+     * before we return. */
+    c->sig_pkt_sync_rxtx = true;
+    propagate_signals(c);
 
     /* Emit every air byte synchronously — preamble (4 × 0x55) +
      * sync_word (4 bytes) + payload (TX FIFO contents) + 2 CRC bytes.
@@ -427,11 +497,18 @@ static void tx_byte_event_cb(void *user_data, cpu_event_t *ev) {
      * → start_tx → tx_byte_event_cb sequence is visible to unit tests. */
     c->tx_active = false;
     c->stat_tx_packets++;
-    drive_gdo0(c, false);
-    drive_gdo2(c, false);
+    /* TX done → PKT_SYNC_RXTX falls; MARCSTATE returns to RX (so
+     * MARC_2PIN goes from TX(01) to RX(11) — bit1 rises, bit0 stays
+     * high).  RSSI/CS valid become true on RX entry; we don't model
+     * the AGC settling delay here (immediate on RX entry, matching the
+     * existing CCA approach in reg_read RSSI0). */
+    c->sig_pkt_sync_rxtx = false;
     c->marcstate = CC1200_MARC_RX;
+    c->sig_rssi_valid = true;
+    c->sig_cs_valid = true;
     air_reset(c);
     refresh_status(c);
+    propagate_signals(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -445,6 +522,10 @@ static void reset_done_event_cb(void *user_data, cpu_event_t *ev) {
     c->marc_pending = CC1200_MARC_IDLE;
     c->marc_transit_status = 0xFF;
     refresh_status(c);
+    /* MARC moved SLEEP → IDLE: both still encode 2pin = IDLE(10), so no
+     * MARC_2PIN edge.  But propagate to honour any IOCFG signal that
+     * happens to flip on this transition (e.g. an inverted pin). */
+    propagate_signals(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -461,11 +542,30 @@ static void marcstate_event_cb(void *user_data, cpu_event_t *ev) {
     uint8_t target = c->marc_pending;
     c->marcstate = target;
     c->marc_transit_status = 0xFF;
+
+    /* MARCSTATE-derived signals (MARC_2PIN_STATUS_0/_1) update
+     * implicitly via propagate_signals().  The RSSI/CS_VALID signals
+     * track RX residency: asserted on RX entry, cleared on exit.  We
+     * model "settled immediately" rather than the real ~tens-of-µs
+     * AGC settle delay — same approximation as the existing reg_read
+     * RSSI0 path.  Carrier-sense itself is recomputed live from the
+     * medium on each reg_read; we don't cache it here. */
+    if (target == CC1200_MARC_RX) {
+        c->sig_rssi_valid = true;
+        c->sig_cs_valid   = true;
+    } else {
+        c->sig_rssi_valid = false;
+        c->sig_cs_valid   = false;
+        c->sig_carrier_sense = false;
+    }
+
     refresh_status(c);
+    propagate_signals(c);
 
     /* If the target state is TX, kick off the actual frame emission now
      * that calibration/settling has completed.  Mirrors what real
-     * silicon does at the IDLE→TX transition. */
+     * silicon does at the IDLE→TX transition.  start_tx will assert
+     * sig_pkt_sync_rxtx and call propagate_signals itself. */
     if (target == CC1200_MARC_TX && !c->tx_active) {
         start_tx(c);
     }
@@ -515,12 +615,19 @@ static void chip_reset(cc1200_t *c) {
     fifo_reset_rx(c);
     air_reset(c);
     c->tx_active = false;
-    c->gdo0_level = false;
-    c->gdo2_level = false;
     c->marcstate = CC1200_MARC_SLEEP;
     c->marc_pending = CC1200_MARC_SLEEP;
     c->marc_transit_status = 0xFF;
+    /* Internal signals all cleared on reset.  propagate_signals will
+     * recompute the GDO pins from the freshly-zeroed IOCFG registers
+     * (PKT_SYNC_RXTX after init, see cc1200_init re-set below) and
+     * drive any falling edges. */
+    c->sig_pkt_sync_rxtx = false;
+    c->sig_rssi_valid    = false;
+    c->sig_cs_valid      = false;
+    c->sig_carrier_sense = false;
     refresh_status(c);
+    propagate_signals(c);
 
     HOST_CANCEL(c, &c->tx_byte_event);
     HOST_CANCEL(c, &c->reset_done_event);
@@ -638,6 +745,7 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
         c->marcstate = CC1200_MARC_SLEEP;
         c->marc_pending = CC1200_MARC_SLEEP;
         c->marc_transit_status = 0xFF;
+        c->sig_rssi_valid = c->sig_cs_valid = c->sig_carrier_sense = false;
         break;
     case CC1200_STROBE_SXOFF:
         /* Crystal off → still report IDLE in our model. */
@@ -645,6 +753,7 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
         c->marcstate = CC1200_MARC_IDLE;
         c->marc_pending = CC1200_MARC_IDLE;
         c->marc_transit_status = 0xFF;
+        c->sig_rssi_valid = c->sig_cs_valid = c->sig_carrier_sense = false;
         break;
     case CC1200_STROBE_SFSTXON:
         /* Fast TX-on: settled but not actually transmitting. Same
@@ -654,11 +763,16 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
         c->marcstate = CC1200_MARC_TX;
         c->marc_pending = CC1200_MARC_TX;
         c->marc_transit_status = 0xFF;
+        c->sig_rssi_valid = c->sig_cs_valid = c->sig_carrier_sense = false;
         break;
     default:
         break;
     }
     refresh_status(c);
+    /* Strobe may have changed marcstate (SFRX clearing RX_FIFO_ERR,
+     * SPWD/SXOFF/SFSTXON instant transitions) and therefore the
+     * MARC_2PIN_STATUS_x signals.  Propagate to GDOx pins. */
+    propagate_signals(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -703,6 +817,15 @@ static uint8_t reg_read(cc1200_t *c, uint16_t addr) {
         if (!busy && c->channel_busy_query) {
             busy = c->channel_busy_query(c->channel_busy_user_data);
         }
+        /* Side-effect: cache the carrier-sense value as the internal
+         * signal 17 (CARRIER_SENSE) and propagate to GDOx pins on
+         * change.  Firmware that maps a GDO pin to CARRIER_SENSE will
+         * see edges as the channel state changes — real silicon does
+         * the same since the comparator output is the pin source. */
+        if (busy != c->sig_carrier_sense) {
+            c->sig_carrier_sense = busy;
+            propagate_signals(c);
+        }
         if (busy) v |= CC1200_RSSI0_CARRIER_SENSE;
         return v;
     }
@@ -723,6 +846,18 @@ static void reg_write(cc1200_t *c, uint16_t addr, uint8_t value) {
     default:
         c->regs[addr] = value;
         break;
+    }
+    /* Writing IOCFG0 / IOCFG2 instantly re-routes the corresponding GDO
+     * pin to the newly-selected internal signal — possibly producing an
+     * edge.  This is the L6 architectural fix per
+     * devices/zoul-firefly/DATASHEET-FINDINGS.md §1: Contiki's
+     * transmit() reconfigures IOCFG0 from PKT_SYNC_RXTX (signal 6) to
+     * MARC_2PIN_STATUS_0 (signal 38) so it can poll GDO0 for the
+     * IDLE→TX transition, then writes it back to PKT_SYNC_RXTX after
+     * TX completes.  Both writes must immediately drive whatever level
+     * the now-selected signal currently holds. */
+    if (addr == CC1200_REG_IOCFG0 || addr == CC1200_REG_IOCFG2) {
+        propagate_signals(c);
     }
 }
 
@@ -835,9 +970,15 @@ void cc1200_set_reset(cc1200_t *c, bool low) {
         HOST_CANCEL(c, &c->frame_done_event);
         HOST_CANCEL(c, &c->marcstate_event);
         air_reset(c);
-        drive_gdo0(c, false);
-        drive_gdo2(c, false);
+        /* Reset clears all internal signals → propagate drives both
+         * GDO pins to whatever the (still-default) IOCFG selectors map
+         * to with sig_* all false (typically low). */
+        c->sig_pkt_sync_rxtx = false;
+        c->sig_rssi_valid    = false;
+        c->sig_cs_valid      = false;
+        c->sig_carrier_sense = false;
         refresh_status(c);
+        propagate_signals(c);
     } else {
         /* Released from reset → IDLE after startup delay */
         chip_reset(c);
