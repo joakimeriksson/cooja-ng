@@ -516,6 +516,38 @@ static uint8_t reg_read(cc1200_t *c, uint16_t addr) {
     case CC1200_EXT_NUM_TXBYTES:  return (uint8_t)c->tx_count;
     case CC1200_EXT_PARTNUMBER:   return 0x20;
     case CC1200_EXT_PARTVERSION:  return c->regs[CC1200_EXT_PARTVERSION];
+    case CC1200_EXT_RSSI0: {
+        /* Real-chip behaviour: CARRIER_SENSE_VALID is only asserted once
+         * the front-end has settled in RX (a few hundred µs after SRX).
+         * The Contiki driver busy-waits up to 10 ms on this bit before
+         * giving up.  In our model we report VALID immediately whenever
+         * MARCSTATE == RX, since the rest of the radio model treats RX
+         * entry as instantaneous.  Outside RX we leave VALID=0 so any
+         * stray CCA poll outside an open RX window stays "not yet". */
+        if (c->marcstate != CC1200_MARC_RX)
+            return 0;
+
+        uint8_t v = CC1200_RSSI0_RSSI_VALID | CC1200_RSSI0_CARRIER_SENSE_VALID;
+
+        /* Two carrier-sense sources, OR'd together:
+         *
+         *  (a) Mid-frame: our air decoder is past the sync word and
+         *      consuming PHR/payload.  This catches frames that have
+         *      already been delivered to us but not yet finished.
+         *
+         *  (b) Medium says another node is currently transmitting on a
+         *      matching channel.  This catches the gap between "sender
+         *      kicked off TX" and "first preamble byte arrived at us"
+         *      — the window where naive CSMA on the receiver would
+         *      otherwise see a clear channel and start its own TX,
+         *      hiding the actual collision. */
+        bool busy = (c->air_state != CC1200_AIR_HUNT);
+        if (!busy && c->channel_busy_query) {
+            busy = c->channel_busy_query(c->channel_busy_user_data);
+        }
+        if (busy) v |= CC1200_RSSI0_CARRIER_SENSE;
+        return v;
+    }
     default:                       return c->regs[addr];
     }
 }
@@ -703,4 +735,11 @@ void cc1200_set_rf_listener(cc1200_t *c,
                              void *user_data) {
     c->rf_tx_callback = cb;
     c->rf_tx_user_data = user_data;
+}
+
+void cc1200_set_channel_busy_query(cc1200_t *c,
+                                    cc1200_channel_busy_fn cb,
+                                    void *user_data) {
+    c->channel_busy_query = cb;
+    c->channel_busy_user_data = user_data;
 }
