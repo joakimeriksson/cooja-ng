@@ -1219,6 +1219,28 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
 }
 
 /*
+ * Native (Cooja-mote) channel sync. Emulated nodes push their channel
+ * into the medium synchronously through chip-driver callbacks; native
+ * motes have no such callback, so we read simRadioChannel and push it
+ * into the medium at the moment it matters: just before each byte- or
+ * frame-delivery decision involving a native node. This catches TSCH-
+ * style mid-tick channel hops at the byte boundary where the medium
+ * actually consults the value.
+ *
+ * Cheap inline guard — only does work when the channel actually changed.
+ * Safe to call from the byte-delivery hot path.
+ */
+static inline void sync_native_node_channel(int idx) {
+    if (idx < 0 || idx >= num_nodes) return;
+    if (nodes[idx].type != NODE_NATIVE) return;
+    int *p = nodes[idx].plat.native.simRadioChannel;
+    if (!p) return;
+    int ch = *p;
+    if (radio_medium.nodes[idx].radios[0].channel == ch) return;
+    radio_medium_set_channel(&radio_medium, idx, ch);
+}
+
+/*
  * Per-radio channel-change adapter — installed as the sim_host_t
  * radio_set_channel callback for off-SoC chip drivers (CC2420 on
  * MSP430 platforms, CC1200 on Firefly), and as the
@@ -1336,6 +1358,10 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     int sender_idx = (int)(sender - nodes);
     rf_byte_count++;
     channels_dirty = true;
+    /* Native sender: pull channel into the medium right now. Chip-emulated
+     * senders push synchronously through their FSCTRL/FREQ callbacks, so
+     * this only matters for native (Cooja) motes. */
+    sync_native_node_channel(sender_idx);
     /* Record first byte time for accurate TX start computation and track
      * subsequent bytes on the sender's on-air byte clock.
      *
@@ -1385,6 +1411,8 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
             if (!node_active(i)) continue;
             if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
                 continue;
+            /* Native receiver: pull current channel before the medium decides. */
+            sync_native_node_channel(i);
             if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
                 continue;
             if (nodes[i].type == NODE_NATIVE) {
@@ -1420,6 +1448,8 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         if (!node_active(i)) continue;
         if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
             continue;
+        /* Native receiver: pull current channel before the medium decides. */
+        sync_native_node_channel(i);
         if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
             continue;
         if (nodes[i].type == NODE_NATIVE) {
@@ -1815,6 +1845,9 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
     stat_rf_frames++;
     channels_dirty = true;  /* TX happened, channels may have changed */
     node_last_tx_ns[sender_idx] = current_sim_ns;
+    /* Native sender: snap current channel into the medium before the
+     * neighbour-loop filter calls. */
+    sync_native_node_channel(sender_idx);
 
     if (radio_medium.type != RADIO_MEDIUM_NONE) {
         /* UDGM: iterate precomputed TX-range neighbors */
@@ -1822,6 +1855,8 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         for (int n = 0; n < nl->count; n++) {
             int i = nl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) {
+                /* Native receiver: snap channel before filter consults it. */
+                sync_native_node_channel(i);
                 /* Direct delivery to simInDataBuffer if possible.
                  * Force simRadioHWOn=1 to prevent firmware from dropping.
                  * Queue to rx_queue as fallback if simInSize > 0. */
@@ -2345,6 +2380,8 @@ static void distribute_rf_outgoing(void) {
         /* Distribute byte-stream RF with frame assembly */
         rf_outgoing_t *out = &rf_outgoing[sender];
         if (out->count > 0) {
+            /* Native sender: pull channel once per sender before this batch. */
+            sync_native_node_channel(sender);
             /* NOTE: do NOT reset tx_asm[sender] here — frame assembly state
              * must persist across time steps since frames may span multiple
              * steps (at 250kbps, a 100-byte frame takes ~3.2ms > 1ms step). */
@@ -2355,6 +2392,8 @@ static void distribute_rf_outgoing(void) {
                     if (!node_active(i)) continue;
                     if (nodes[sender].type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
                         continue;
+                    /* Native receiver: pull current channel inline. */
+                    sync_native_node_channel(i);
                     if (!radio_medium_filter_byte(&radio_medium, sender, i, byte))
                         continue;
                     if (nodes[i].type == NODE_NATIVE) {
@@ -2449,6 +2488,8 @@ static void distribute_rf_outgoing(void) {
 
         /* Distribute complete frames (native TX) */
         frame_outgoing_t *fout = &frame_outgoing[sender];
+        if (fout->count > 0)
+            sync_native_node_channel(sender);
         for (int f = 0; f < fout->count; f++) {
             uint8_t *frame = fout->data[f];
             int len = fout->lengths[f];
@@ -2458,6 +2499,7 @@ static void distribute_rf_outgoing(void) {
                 for (int n = 0; n < nl->count; n++) {
                     int i = nl->neighbors[n];
                     if (nodes[i].type == NODE_NATIVE) {
+                        sync_native_node_channel(i);
                         if (radio_medium_filter_frame(&radio_medium, sender, i)) {
                             native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
                             if (q->count >= NATIVE_RX_QUEUE_SIZE)
@@ -3735,6 +3777,13 @@ sim_restart:
         }
     }
 
+    /* Initial-state setup: register native motes' radio slot 0 with the
+     * appropriate spectrum (chip-emulated nodes do this through their
+     * own driver init -> sim_host_t.radio_set_channel callback). After
+     * this point, native channels are pulled inline at every byte/frame
+     * delivery site by sync_native_node_channel(). */
+    sync_node_channels();
+
     /* Initialize test engine if config has test section */
     sim_test_state_t test_state;
     js_test_engine_t js_engine;
@@ -4336,14 +4385,14 @@ sim_restart:
                 break;
         }
 
-        /* Lazy channel sync: only when TX activity has occurred */
+        /* Native channels are now sampled inline at every byte/frame
+         * delivery site (sync_native_node_channel), so the periodic lazy
+         * sync at tick boundaries is no longer needed. The dirty flag is
+         * still cleared so the bookkeeping stays consistent for any
+         * future readers. */
         double t_phase;
-        if (channels_dirty && radio_medium.type != RADIO_MEDIUM_NONE) {
-            t_phase = get_time_ms();
-            sync_node_channels();
+        if (channels_dirty)
             channels_dirty = false;
-            time_channel_sync += get_time_ms() - t_phase;
-        }
 
         if (num_threads > 0) {
             /* === PARALLEL PATH === */
@@ -4425,14 +4474,12 @@ sim_restart:
                                 (unsigned long long)next_byte_ev.seq);
                     }
                 }
-                /* Sync ALL native node channels before each event.
-                 * TSCH hops channels during ticks; we need current state
-                 * for frame delivery filtering. */
-                for (int n = 0; n < node_count; n++) {
-                    if (nodes[n].type == NODE_NATIVE && nodes[n].plat.native.simRadioChannel)
-                        radio_medium_set_channel(&radio_medium, n,
-                            *nodes[n].plat.native.simRadioChannel);
-                }
+                /* Native channels are now sampled inline at every byte/
+                 * frame delivery site (sync_native_node_channel), so the
+                 * old per-event "snapshot all natives" loop is obsolete.
+                 * Inline sync catches TSCH-style mid-tick hops at the
+                 * exact moment the medium consults the channel — no race
+                 * window between sync and filter. */
                 channels_dirty = false;
 
                 /* Cooja has a single EventQueue. MSP byte deliveries are

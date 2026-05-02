@@ -988,6 +988,67 @@ static void test_tsch_hop_one_radio_other_unaffected(void) {
     ASSERT_EQ(slot1_match, 16, "slot 1 unaffected by slot 0 hops");
 }
 
+/* Native-style mid-tick channel hop. Simulates a Cooja mote whose
+ * simRadioChannel pointer is mutated between two filter calls without
+ * any "sync event" inserted. Mirrors what test_mixed_multinode does
+ * for native motes after the harness moved channel sync from tick
+ * boundaries down to the byte-delivery sites: the harness reads
+ * simRadioChannel and pushes it via radio_medium_set_radio_channel
+ * just before each filter_byte/filter_frame, so a TSCH-style mid-tick
+ * hop is honoured at the moment the medium consults the value.
+ *
+ * This pins the medium-side guarantee: a set_radio_channel call landing
+ * between two filter calls flips the delivery decision immediately,
+ * with no inflight-frame caching that could mask the new channel. */
+static void test_native_mid_tick_channel_change_honored(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    /* Sender stays parked on ch 11. Receiver represents a native mote:
+     * the harness will push whatever simRadioChannel says before each
+     * filter call. */
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 1, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_set_radio_channel(&rm, 0, 0, 11);
+
+    /* Pretend the firmware hopped the receiver to ch 11 — frame passes. */
+    radio_medium_set_radio_channel(&rm, 1, 0, 11);
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "native sync: rx on ch 11 -> frame passes");
+
+    /* Mid-"tick": firmware (TSCH) hops to ch 25 underneath. The harness
+     * reads simRadioChannel and calls set_radio_channel BEFORE the next
+     * filter call. The medium must honour the new channel right now. */
+    radio_medium_set_radio_channel(&rm, 1, 0, 25);
+    ASSERT(!radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "native sync: hopped to ch 25 -> next frame drops");
+
+    /* And back: same tick, hop to ch 11 again. */
+    radio_medium_set_radio_channel(&rm, 1, 0, 11);
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "native sync: hopped back to ch 11 -> frame passes again");
+
+    /* Per-byte: a complete IEEE 802.15.4 frame's bytes get hopped under
+     * us mid-frame. Each byte must be matched against the channel that
+     * was current at the moment of the call — mirrors the byte-by-byte
+     * filter loop in mixed_rf_tx_handler. The frame bytes that land
+     * while we're on ch 11 deliver; the others drop. */
+    int delivered = 0, dropped = 0;
+    uint8_t frame[] = { 0x00,0x00,0x00,0x00, 0x7A, 0x05,
+                        0x11,0x22,0x33,0x44,0x55 };
+    for (size_t i = 0; i < sizeof(frame); i++) {
+        /* Even index byte: receiver hopped to ch 11; odd: ch 25. */
+        radio_medium_set_radio_channel(&rm, 1, 0, (i & 1) ? 25 : 11);
+        if (radio_medium_filter_byte_radio(&rm, 0, 0, 1, 0, frame[i]))
+            delivered++;
+        else
+            dropped++;
+    }
+    ASSERT_EQ(delivered, 6, "byte-by-byte hop: 6 even-index bytes pass");
+    ASSERT_EQ(dropped, 5, "byte-by-byte hop: 5 odd-index bytes drop");
+}
+
 /* ====================================================================
  * Backward compat — single-radio API still works
  * ==================================================================== */
@@ -1254,6 +1315,7 @@ int run_radio_medium_tests(int verbose) {
     /* TSCH-style hopping */
     test_tsch_rapid_hopping_per_byte_match();
     test_tsch_hop_one_radio_other_unaffected();
+    test_native_mid_tick_channel_change_honored();
 
     /* Backward compat */
     test_legacy_set_channel_auto_registers_24ghz();
