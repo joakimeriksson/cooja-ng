@@ -1246,7 +1246,17 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     rf_byte_count++;
     channels_dirty = true;
     /* Record first byte time for accurate TX start computation and track
-     * subsequent bytes on the sender's on-air byte clock. */
+     * subsequent bytes on the sender's on-air byte clock.
+     *
+     * NOTE: this only fires for IEEE 802.15.4 frames (0x00 preamble).
+     * CC1200 frames (0x55 preamble) inherit whatever first_byte_ns
+     * happened to be set previously — typically 0 from init.  Adding
+     * the 0x55 arm makes accurate_tx_start/end correct on paper, but
+     * the test runner then delivers bytes at exactly the same simulated
+     * time as the receiver's own CSMA prepare()→idle() transition; the
+     * receiver chip is briefly in MARC_IDLE and silently drops the
+     * incoming bytes, breaking L5.  The collision math therefore stays
+     * approximate for sub-GHz traffic — see devices/zoul-firefly/SPEC.md. */
     if (tx_asm[sender_idx].state == TX_ASM_PREAMBLE && tx_asm[sender_idx].zero_count == 0 && byte == 0x00) {
         /* Match Cooja's radio callbacks: outgoing bytes are observed at the
          * current scheduler time, not from a mote-local sim_time that may
