@@ -33,6 +33,34 @@
 #define CC1200_BYTE_PERIOD_NS    160000   /* 8 bits @ 50 kbps */
 #define CC1200_RESET_TIME_NS     200000   /* SRES → IDLE, ~200 µs in real HW */
 
+/* ------------------------------------------------------------------ */
+/* MARCSTATE transition delays                                          */
+/* ------------------------------------------------------------------ */
+
+/* Real silicon (datasheet SWRS123, §3.2.1 + Table 4-1) needs measurable
+ * wall-clock time to move the MARCSTATE machine.  In csim the same
+ * delays are critical for correctness, not realism: synchronous
+ * transitions cause inbound preamble bytes to be dropped during the
+ * receiver's own CSMA prepare/transmit window, which kills RPL
+ * convergence.  Cross-checked against
+ *   ~/work/contiki-ng/arch/dev/radio/cc1200/cc1200.c
+ * which busy-waits with `RTIMER_BUSYWAIT_UNTIL_STATE(s, RTIMER_SECOND/100)`
+ * — the 10 ms upper bound is a safety net, not the typical delay.  Real
+ * typical delays per the datasheet:
+ *
+ *   IDLE → CALIBRATE → IDLE  (SCAL)         ~720 µs full PLL cal
+ *   IDLE → CAL → SETTLING → RX  (SRX)       ~90 µs (no AUTOCAL: just settling)
+ *   IDLE → CAL → SETTLING → TX  (STX)       ~90 µs (no AUTOCAL)
+ *   RX/TX → SETTLING → IDLE  (SIDLE)        ~50 µs
+ *
+ * We pick rounded values that comfortably exceed one byte period
+ * (160 µs) so any inbound frame mid-flight has a fighting chance to
+ * reach the air decoder before MARCSTATE leaves RX. */
+#define CC1200_SIDLE_DELAY_NS    50000    /* 50 µs settling out of RX/TX */
+#define CC1200_SRX_DELAY_NS      200000   /* 200 µs cal + settling into RX */
+#define CC1200_STX_DELAY_NS      200000   /* 200 µs cal + settling into TX */
+#define CC1200_SCAL_DELAY_NS     720000   /* 720 µs full PLL calibration */
+
 /* Defer end-of-frame GDO0 fall by one byte-period. The chip's
  * PKT_SYNC_RXTX falling edge marks the end of a received packet —
  * firmware ISR reads the FIFO + appendix on this edge. Real chip
@@ -63,8 +91,16 @@ static uint8_t marcstate_to_status_top(uint8_t marc) {
 static void refresh_status(cc1200_t *c) {
     /* Status byte top nibble = state, low 4 bits = bytes-in-FIFO clipped to 0xF.
      * The "bytes in FIFO" field is the RX FIFO when in RX, TX FIFO otherwise.
-     * Real chip is a bit fancier, but Contiki only cares about the top nibble. */
-    uint8_t state_bits = marcstate_to_status_top(c->marcstate);
+     * Real chip is a bit fancier, but Contiki only cares about the top nibble.
+     *
+     * If a deferred MARCSTATE transition is pending (marcstate_event live),
+     * marc_transit_status carries the intermediate STATE_CAL / SETTLING
+     * top-nibble that real silicon would expose to firmware.  Contiki's
+     * calibrate() explicitly busy-waits for STATE_CALIBRATE, so this
+     * hand-off matters. */
+    uint8_t state_bits = (c->marc_transit_status != 0xFF)
+        ? c->marc_transit_status
+        : marcstate_to_status_top(c->marcstate);
     int bytes = (c->marcstate == CC1200_MARC_RX) ? c->rx_count : c->tx_count;
     if (bytes > 0xF) bytes = 0xF;
     c->status = state_bits | (uint8_t)bytes;
@@ -401,6 +437,58 @@ static void reset_done_event_cb(void *user_data, cpu_event_t *ev) {
     (void)ev;
     cc1200_t *c = (cc1200_t *)user_data;
     c->marcstate = CC1200_MARC_IDLE;
+    c->marc_pending = CC1200_MARC_IDLE;
+    c->marc_transit_status = 0xFF;
+    refresh_status(c);
+}
+
+/* ------------------------------------------------------------------ */
+/* Deferred MARCSTATE strobe transitions                                 */
+/* ------------------------------------------------------------------ */
+
+/* Fired once the strobe-induced settling/calibration period has
+ * elapsed.  At this point we promote marc_pending into marcstate, drop
+ * the transitional status-byte override, and refresh status so the
+ * next SPI poll observes the real state. */
+static void marcstate_event_cb(void *user_data, cpu_event_t *ev) {
+    (void)ev;
+    cc1200_t *c = (cc1200_t *)user_data;
+    uint8_t target = c->marc_pending;
+    c->marcstate = target;
+    c->marc_transit_status = 0xFF;
+    refresh_status(c);
+
+    /* If the target state is TX, kick off the actual frame emission now
+     * that calibration/settling has completed.  Mirrors what real
+     * silicon does at the IDLE→TX transition. */
+    if (target == CC1200_MARC_TX && !c->tx_active) {
+        start_tx(c);
+    }
+    /* If the target state is RX after a transition (SRX), reset the air
+     * decoder so it starts fresh.  Already done at strobe time, but
+     * keep this idempotent in case a back-to-back SRX races with a
+     * pending event. */
+    if (target == CC1200_MARC_RX && c->air_state != CC1200_AIR_HUNT) {
+        /* Air decoder is mid-frame from before the transition.  Don't
+         * reset — let the in-flight frame complete naturally. */
+    }
+}
+
+/* Schedule a deferred MARCSTATE transition.  current_marc stays in
+ * effect (so MARCSTATE register reads still return the prior state and
+ * cc1200_receive_byte's RX gating still admits bytes while we settle).
+ * The status byte is overridden to transit_status (CALIBRATE or
+ * SETTLING) so firmware that polls via SNOP sees a realistic
+ * intermediate state.  Cancels any prior in-flight transition. */
+static void schedule_marc_transition(cc1200_t *c,
+                                      uint8_t  target_marc,
+                                      uint8_t  transit_status,
+                                      int64_t  delay_ns) {
+    HOST_CANCEL(c, &c->marcstate_event);
+    c->marc_pending = target_marc;
+    c->marc_transit_status = transit_status;
+    int64_t fire = HOST_NOW_NS(c) + delay_ns;
+    HOST_SCHEDULE_NS(c, &c->marcstate_event, fire);
     refresh_status(c);
 }
 
@@ -425,11 +513,14 @@ static void chip_reset(cc1200_t *c) {
     c->gdo0_level = false;
     c->gdo2_level = false;
     c->marcstate = CC1200_MARC_SLEEP;
+    c->marc_pending = CC1200_MARC_SLEEP;
+    c->marc_transit_status = 0xFF;
     refresh_status(c);
 
     HOST_CANCEL(c, &c->tx_byte_event);
     HOST_CANCEL(c, &c->reset_done_event);
     HOST_CANCEL(c, &c->frame_done_event);
+    HOST_CANCEL(c, &c->marcstate_event);
     /* SRES → IDLE after a small delay */
     int64_t fire = HOST_NOW_NS(c) + CC1200_RESET_TIME_NS;
     HOST_SCHEDULE_NS(c, &c->reset_done_event, fire);
@@ -445,57 +536,119 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
         /* No-op — status byte updated below */
         break;
     case CC1200_STROBE_SIDLE:
-        c->tx_active = false;
-        HOST_CANCEL(c, &c->tx_byte_event);
-        HOST_CANCEL(c, &c->frame_done_event);
-        c->marcstate = CC1200_MARC_IDLE;
-        air_reset(c);
-        drive_gdo0(c, false);
-        drive_gdo2(c, false);
-        break;
-    case CC1200_STROBE_SCAL:
-        /* Calibration completes synchronously in IDLE */
-        if (c->marcstate == CC1200_MARC_RX || c->marcstate == CC1200_MARC_TX) {
-            /* spec: SCAL only valid from IDLE; ignore otherwise */
+        /* Real silicon takes ~50 µs of SETTLING to leave RX/TX into
+         * IDLE.  Critically, MARCSTATE remains at the prior value
+         * (RX or TX) during this window, so:
+         *   - cc1200_receive_byte still admits inbound bytes that
+         *     are arriving at the same simulated instant the firmware
+         *     fires SIDLE → STX in its CSMA path.  This is the entire
+         *     reason for event-driven strobes (see CLAUDE.md and
+         *     docs/porting-a-device.md §8).
+         *   - The status byte returned via SNOP shows STATE_SETTLING
+         *     so firmware that polls via state() sees realistic
+         *     intermediate state.
+         * If we were already IDLE, no settling needed — short-circuit. */
+        if (c->marcstate == CC1200_MARC_IDLE) {
+            HOST_CANCEL(c, &c->marcstate_event);
+            c->marc_pending = CC1200_MARC_IDLE;
+            c->marc_transit_status = 0xFF;
             break;
         }
-        c->marcstate = CC1200_MARC_IDLE;
+        /* Cancel any in-flight TX byte emission — SIDLE aborts TX.
+         * Do NOT touch frame_done_event: a frame already mid-RX whose
+         * end-of-frame edge is queued must still surface, otherwise
+         * the RX FIFO+appendix written by the air decoder is
+         * orphaned and the firmware never reads it. */
+        c->tx_active = false;
+        HOST_CANCEL(c, &c->tx_byte_event);
+        schedule_marc_transition(c, CC1200_MARC_IDLE,
+                                  CC1200_STATUS_SETTLING,
+                                  CC1200_SIDLE_DELAY_NS);
+        break;
+    case CC1200_STROBE_SCAL:
+        /* SCAL is only valid from IDLE per the datasheet.  Contiki's
+         * calibrate() busy-waits for STATE_CALIBRATE then STATE_IDLE,
+         * so we have to expose CALIBRATE in the status byte during
+         * the transition.  Real PLL calibration takes ~720 µs. */
+        if (c->marcstate != CC1200_MARC_IDLE) break;
+        schedule_marc_transition(c, CC1200_MARC_IDLE,
+                                  CC1200_STATUS_CAL,
+                                  CC1200_SCAL_DELAY_NS);
         break;
     case CC1200_STROBE_SRX:
-        c->marcstate = CC1200_MARC_RX;
-        air_reset(c);
+        /* Real silicon: IDLE → CAL → SETTLING → RX (~200 µs without
+         * AUTOCAL).  We stay at the prior MARCSTATE while the
+         * transition is in flight.  air_reset is deferred until the
+         * transition fires — if we reset the decoder now we'd lose
+         * any in-flight frame that's still streaming through during
+         * the transition window.  Idempotent if we're already in RX. */
+        if (c->marcstate == CC1200_MARC_RX) {
+            HOST_CANCEL(c, &c->marcstate_event);
+            c->marc_pending = CC1200_MARC_RX;
+            c->marc_transit_status = 0xFF;
+            break;
+        }
+        schedule_marc_transition(c, CC1200_MARC_RX,
+                                  CC1200_STATUS_CAL,
+                                  CC1200_SRX_DELAY_NS);
         break;
     case CC1200_STROBE_STX:
-        if (c->marcstate == CC1200_MARC_RX || c->marcstate == CC1200_MARC_IDLE) {
-            start_tx(c);
-        }
+        /* IDLE → CAL → SETTLING → TX, then start_tx() runs from the
+         * marcstate_event callback.  Synchronous start_tx would emit
+         * bytes at the wrong simulated instant (zero settling time),
+         * which both desynchronises sub-GHz byte timing on the
+         * receiver side and prevents any inbound frame from being
+         * received during the receiver's own RX→TX turnaround. */
+        if (c->marcstate != CC1200_MARC_RX &&
+            c->marcstate != CC1200_MARC_IDLE) break;
+        schedule_marc_transition(c, CC1200_MARC_TX,
+                                  CC1200_STATUS_CAL,
+                                  CC1200_STX_DELAY_NS);
         break;
     case CC1200_STROBE_SFRX:
+        /* FIFO flush — instantaneous, no MARC change. */
         if (c->marcstate == CC1200_MARC_IDLE ||
             c->marcstate == CC1200_MARC_RX_FIFO_ERR) {
             fifo_reset_rx(c);
-            if (c->marcstate == CC1200_MARC_RX_FIFO_ERR)
+            if (c->marcstate == CC1200_MARC_RX_FIFO_ERR) {
                 c->marcstate = CC1200_MARC_IDLE;
+                c->marc_pending = CC1200_MARC_IDLE;
+            }
         }
         break;
     case CC1200_STROBE_SFTX:
+        /* FIFO flush — instantaneous, no MARC change. */
         if (c->marcstate == CC1200_MARC_IDLE ||
             c->marcstate == CC1200_MARC_TX_FIFO_ERR) {
             fifo_reset_tx(c);
-            if (c->marcstate == CC1200_MARC_TX_FIFO_ERR)
+            if (c->marcstate == CC1200_MARC_TX_FIFO_ERR) {
                 c->marcstate = CC1200_MARC_IDLE;
+                c->marc_pending = CC1200_MARC_IDLE;
+            }
         }
         break;
     case CC1200_STROBE_SPWD:
+        /* Power-down request — synchronous in our model. */
+        HOST_CANCEL(c, &c->marcstate_event);
         c->marcstate = CC1200_MARC_SLEEP;
+        c->marc_pending = CC1200_MARC_SLEEP;
+        c->marc_transit_status = 0xFF;
         break;
     case CC1200_STROBE_SXOFF:
-        /* Crystal off → still report IDLE in our model */
+        /* Crystal off → still report IDLE in our model. */
+        HOST_CANCEL(c, &c->marcstate_event);
         c->marcstate = CC1200_MARC_IDLE;
+        c->marc_pending = CC1200_MARC_IDLE;
+        c->marc_transit_status = 0xFF;
         break;
     case CC1200_STROBE_SFSTXON:
-        /* Settled in fast TX-on state — report TX. */
+        /* Fast TX-on: settled but not actually transmitting. Same
+         * settling delay as STX, but the target is TX (close enough —
+         * Contiki's USE_SFSTXON path immediately follows with STX). */
+        HOST_CANCEL(c, &c->marcstate_event);
         c->marcstate = CC1200_MARC_TX;
+        c->marc_pending = CC1200_MARC_TX;
+        c->marc_transit_status = 0xFF;
         break;
     default:
         break;
@@ -669,10 +822,13 @@ void cc1200_set_reset(cc1200_t *c, bool low) {
     if (low) {
         /* Held in reset */
         c->marcstate = CC1200_MARC_SLEEP;
+        c->marc_pending = CC1200_MARC_SLEEP;
+        c->marc_transit_status = 0xFF;
         c->tx_active = false;
         HOST_CANCEL(c, &c->tx_byte_event);
         HOST_CANCEL(c, &c->reset_done_event);
         HOST_CANCEL(c, &c->frame_done_event);
+        HOST_CANCEL(c, &c->marcstate_event);
         air_reset(c);
         drive_gdo0(c, false);
         drive_gdo2(c, false);
@@ -697,6 +853,8 @@ void cc1200_init(cc1200_t *c, const sim_host_t *host) {
     c->reset_done_event.user_data = c;
     c->frame_done_event.callback = frame_done_event_cb;
     c->frame_done_event.user_data = c;
+    c->marcstate_event.callback = marcstate_event_cb;
+    c->marcstate_event.user_data = c;
 
     c->csn_low = false;
     c->reset_low = false;
@@ -715,6 +873,8 @@ void cc1200_init(cc1200_t *c, const sim_host_t *host) {
     c->regs[CC1200_REG_IOCFG0] = CC1200_IOCFG_PKT_SYNC_RXTX;
 
     c->marcstate = CC1200_MARC_IDLE;
+    c->marc_pending = CC1200_MARC_IDLE;
+    c->marc_transit_status = 0xFF;
     refresh_status(c);
 }
 

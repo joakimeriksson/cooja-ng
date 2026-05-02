@@ -225,6 +225,28 @@ typedef struct cc1200 {
      * §8 ("Synchronous side effects in chip-driver byte handlers"). */
     cpu_event_t frame_done_event;
 
+    /* Deferred MARCSTATE transition for SIDLE / SRX / STX / SCAL.
+     * Real silicon takes ~50 µs to leave RX/TX and ~150 µs of PLL
+     * calibration + settling to enter RX/TX. Modelling those delays
+     * is critical: with synchronous transitions, a receiver firing
+     * its own CSMA path (SIDLE → STX) at the same simulated instant
+     * the first preamble byte arrives ends up dropping the inbound
+     * frame because MARCSTATE flips out of RX before the air
+     * decoder can lock onto the sync word. Same architectural
+     * lesson as the frame-done event above — see
+     * docs/porting-a-device.md §8. */
+    cpu_event_t marcstate_event;
+    /* Target marcstate the in-flight transition will install when the
+     * marcstate_event fires.  Equal to c->marcstate when no transition
+     * is in flight. */
+    uint8_t  marc_pending;
+    /* Transitional status-byte top-nibble shown while marcstate_event
+     * is pending (firmware reads it via SNOP).  One of
+     * CC1200_STATUS_CAL / SETTLING — Contiki's SCAL path explicitly
+     * busy-waits for STATE_CALIBRATE, so we have to expose it.
+     * 0xFF means "no override; derive from c->marcstate". */
+    uint8_t  marc_transit_status;
+
     /* RF TX listener */
     cc1200_rf_callback_fn rf_tx_callback;
     void                 *rf_tx_user_data;
