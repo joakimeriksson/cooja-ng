@@ -3832,8 +3832,17 @@ sim_restart:
             }
             /* For all node types: set start_ns so the node isn't stepped
              * until its delay has elapsed.  Don't shift MSP430 internals
-             * — just start it later. */
-            node_start_ns[i] = node_sim_time_ns(i) + delay_ns;
+             * — just start it later.
+             *
+             * For ARM nodes the shift above already moved sim_time_ns
+             * forward by delay_ns, so node_sim_time_ns(i) already reflects
+             * the post-delay timestamp; adding delay_ns again would
+             * double-count it (Node 1 reported "start at 109 ms" for a
+             * 54 ms delay because of this). */
+            int64_t base_ns = node_sim_time_ns(i);
+            node_start_ns[i] = (nodes[i].type == NODE_ARM)
+                ? base_ns
+                : base_ns + delay_ns;
             printf("  Node %d: start at %lld ms (delay %d ms)\n",
                    nodes[i].id,
                    (long long)(node_start_ns[i] / MS_TO_NS), delay_ms);
