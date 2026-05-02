@@ -1592,8 +1592,19 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         if (emulated_rxfifo_available(i) >= frame_payload + 1) {
             /* Match Cooja's setReceivedPacket: deliver ALL bytes starting
              * at the current sim time (TX completion time), spaced 32µs apart.
-             * Pre-sync the receiver to this time first. */
-            int64_t delivery_start = accurate_tx_start;
+             * Pre-sync the receiver to this time first.
+             *
+             * Sub-GHz fixup (mirrors the coll_start fixup just above):
+             * accurate_tx_start is anchored to first_byte_ns which is never
+             * armed for the CC1200 0x55 preamble path, so it stays 0 and
+             * accurate_tx_start clamps to 0 too.  Using a 0 air-time here
+             * makes emu_deliver_bytes schedule the receiver in the deep
+             * past, which then pumps the inner event loop in 1 µs steps
+             * trying to "catch up", starving the receiver of real CPU time
+             * for many seconds.  Anchor sub-GHz delivery to current_sim_ns
+             * so the receiver's wake-up event is always near "now". */
+            int64_t delivery_start = tx_asm[sender_idx].subghz
+                ? current_sim_ns : accurate_tx_start;
             if (trace_tsch_ack_enabled() &&
                 sender->type == NODE_MSP430 && nodes[sender_idx].id == 2 &&
                 nodes[i].type == NODE_MSP430 && nodes[i].id == 1 &&
