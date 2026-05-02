@@ -288,18 +288,16 @@ Standard L0–L6 for the platform, plus chip-driver checkpoints
 
 - [x] `make clean && make` builds with no new warnings
 - [x] `./build/test_runner cc1200-mock-host` passes (chip-driver
-      unit tests; 53/53 PASS)
+      unit tests; 57/57 PASS — added strobe transition timing
+      assertions when SIDLE/SRX/STX moved to event-driven MARCSTATE
+      transitions in `src/arm/cc1200.c`)
 - [ ] `./build/test_runner zoul-firefly-firmware` passes (covers
       L0–L4) — the bringup subset is covered by `arm-firmware`
       (L2 banner check passes); no dedicated `zoul-firefly-firmware`
       subcommand was added since the existing arm-firmware harness
       already tests `bringup.zoul-firefly` for the platform.
 - [x] `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/nullnet-broadcast-subghz.zoul-firefly -t 20000 -q` shows ≥1 RX per node (L5) — passing
-- [ ] `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/udp-server-subghz.zoul-firefly firmware/zoul-firefly/udp-client-subghz.zoul-firefly -t 60000` exchanges ≥1 hello/response (L6) — RPL DAG does not converge in a 60 s sim. Frames are
-      delivered (5 RX in 60 s) but Node 2's CSMA retransmits collide
-      with Node 1's responses on the channel; further work needed
-      on collision/back-pressure modelling for the heavier RPL/UDP
-      traffic profile.
+- [ ] `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/udp-server-subghz.zoul-firefly firmware/zoul-firefly/udp-client-subghz.zoul-firefly -t 60000` exchanges ≥1 hello/response (L6) — RPL DAG does not converge in a 60 s sim. The architectural fix to event-driven CC1200 MARCSTATE strobes (SIDLE/SRX/STX, see `src/arm/cc1200.c` and `docs/porting-a-device.md` §8) is in place — receiver MARCSTATE now stays at RX for the ~50 µs SIDLE settling window so the air decoder ingests inbound preamble bytes that arrive while the firmware is entering its own CSMA prepare→transmit path.  Bytes do reach the chip's air decoder and the SFD edge fires on GDO0 (PB4); however the chip drives that edge inside the receiver firmware's "GPIO IRQ disabled" window (`DISABLE_GPIO_INTERRUPTS()` at the top of Contiki's `idle()`).  CC2538 GPIO RIS sticky bits do latch but `cc2538_gpio.c` does not re-pend NVIC when the firmware later writes IE 0→1 with RIS already set — this is a pre-existing CC2538 emulator gap orthogonal to the CC1200 port and out of scope for this task.
 - [x] `.github/workflows/test.yml` runs the new subcommands on PR
 - [x] CC1200 driver takes `sim_host_t` only — no `arm_cpu_t` /
       `cc2538_gpio_t` types leak in
