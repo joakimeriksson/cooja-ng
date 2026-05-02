@@ -187,18 +187,45 @@ static void test_strobe_state_machine(void) {
     mock_sim_host_advance_ns(&mock, 1000000);
     ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_IDLE, "SRES → IDLE");
 
+    /* SRX is event-driven: real silicon takes ~200 µs of CAL+SETTLING
+     * to enter RX from IDLE.  MARCSTATE stays at IDLE during that
+     * window — match the behaviour of real firmware which busy-waits
+     * on STATE_RX before assuming the chip is ready.  See
+     * src/arm/cc1200.c for the timing-source rationale. */
     spi_strobe(&chip, CC1200_STROBE_SRX);
-    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_RX,   "SRX → RX");
+    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_IDLE, "SRX before settling → still IDLE");
+    /* During settling the status byte exposes STATE_CAL so firmware
+     * polling via SNOP sees a realistic intermediate state. */
+    uint8_t cal_status = cc1200_status(&chip) & 0x70;
+    ASSERT_EQ(cal_status, CC1200_STATUS_CAL, "SRX in flight → STATE_CAL via SNOP");
+    mock_sim_host_advance_ns(&mock, 500000);  /* 500 µs >> 200 µs SRX delay */
+    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_RX,   "SRX → RX after settling");
 
+    /* SIDLE is event-driven too — ~50 µs of SETTLING before MARCSTATE
+     * leaves RX.  This is the architectural fix that lets a receiver
+     * ingest preamble bytes that arrive at the same instant it
+     * starts its own CSMA SIDLE → STX path. */
     spi_strobe(&chip, CC1200_STROBE_SIDLE);
-    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_IDLE, "SIDLE → IDLE");
+    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_RX, "SIDLE before settling → still RX");
+    mock_sim_host_advance_ns(&mock, 200000);  /* 200 µs >> 50 µs SIDLE delay */
+    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_IDLE, "SIDLE → IDLE after settling");
 
+    /* SPWD is synchronous (we don't model the wake-up delay). */
     spi_strobe(&chip, CC1200_STROBE_SPWD);
     ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_SLEEP, "SPWD → SLEEP");
 
-    /* MARCSTATE register must reflect the same value we read via the API */
+    /* MARCSTATE register must reflect the same value we read via the API
+     * after the (event-driven) SIDLE settles. */
     spi_strobe(&chip, CC1200_STROBE_SIDLE);
-    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_IDLE, "post-SLEEP SIDLE → IDLE");
+    /* SPWD left us at SLEEP; SIDLE from SLEEP is a no-op in our model
+     * because the strobe handler only schedules a transition for
+     * RX/TX → IDLE.  From SLEEP we jump straight to IDLE on the next
+     * SRES, which firmware always does after wake-up.  Force the
+     * issue with an explicit SRES + drain so we test the
+     * register-read path. */
+    spi_strobe(&chip, CC1200_STROBE_SRES);
+    mock_sim_host_advance_ns(&mock, 1000000);
+    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_IDLE, "post-SLEEP SRES → IDLE");
     uint8_t marc = spi_single_read(&chip, CC1200_EXT_MARCSTATE) & 0x1F;
     ASSERT_EQ(marc, CC1200_MARC_IDLE, "MARCSTATE register = IDLE");
 }
@@ -226,8 +253,11 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     spi_single_write(&chip, CC1200_REG_PKT_CFG2,
                       CC1200_PKT_CFG2_FG_MODE_802154G);
 
-    /* Enter RX so receive_byte will run the air decoder. */
+    /* Enter RX so receive_byte will run the air decoder.  SRX is
+     * event-driven now (~200 µs settling) so we need to drain the
+     * marcstate event before MARCSTATE actually flips to RX. */
     spi_strobe(&chip, CC1200_STROBE_SRX);
+    mock_sim_host_advance_ns(&mock, 500000);
     ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_RX, "SRX → RX before injecting bytes");
 
     int prior = mock.force_irq_edge_calls;
@@ -338,12 +368,20 @@ static void test_tx_path(void) {
     ASSERT_EQ(spi_single_read(&chip, CC1200_EXT_NUM_TXBYTES), 7,
               "NUM_TXBYTES register");
 
-    /* Start TX */
+    /* Start TX.  STX is event-driven now (~200 µs CAL+SETTLING before
+     * MARCSTATE leaves IDLE for TX, then start_tx emits bytes
+     * synchronously from the marcstate-event callback).  The
+     * intermediate status-byte top nibble is STATE_CAL so firmware
+     * polling via SNOP sees a realistic transition. */
     spi_strobe(&chip, CC1200_STROBE_STX);
-    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_TX, "STX → TX state");
+    ASSERT_EQ(cc1200_marcstate(&chip), CC1200_MARC_IDLE, "STX before settling → still IDLE");
+    uint8_t stx_status = cc1200_status(&chip) & 0x70;
+    ASSERT_EQ(stx_status, CC1200_STATUS_CAL, "STX in flight → STATE_CAL via SNOP");
 
-    /* Drain ~30 ms of byte-emission events. With 50 kbps × 8 bits, the
-     * 4+4+7 = 15-byte burst takes 15 × 160 µs = 2.4 ms. */
+    /* Drain ~5 ms of marcstate + byte-emission events. With 50 kbps ×
+     * 8 bits, the 4+4+7+2 = 17-byte burst takes 17 × 160 µs ≈ 2.7 ms,
+     * plus 200 µs of CAL+SETTLING and 160 µs of post-burst settling
+     * before TX → RX turnaround. */
     mock_sim_host_advance_ns(&mock, 5 * 1000000LL);
 
     ASSERT(rf_emit_count >= 15, "RF listener saw all air bytes");
