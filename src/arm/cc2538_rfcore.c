@@ -409,10 +409,25 @@ static void xreg_write(void *user_data, uint32_t addr, uint32_t value) {
         case RFCORE_XREG_FRMCTRL0:  rf->frmctrl0 = value; break;
         case RFCORE_XREG_FRMCTRL1:  rf->frmctrl1 = value; break;
         case RFCORE_XREG_RXENABLE:  rf->rxenable = value; break;
-        case RFCORE_XREG_FREQCTRL:
+        case RFCORE_XREG_FREQCTRL: {
             rf->freqctrl = value;
-            rf->channel = ((value & 0x7F) - 11) / 5 + 11;
+            /* CC2538 datasheet (SWRU319) §23.15: FREQCTRL.FREQ encodes
+             * carrier as 2394 + FREQ MHz (FREQ in 0..0x7F).  IEEE
+             * channel k uses 2405 + 5*(k - 11) MHz, so:
+             *     FREQ = 11 + 5*(k - 11)
+             *     k    = (FREQ - 11)/5 + 11
+             * Range-check before exposing: only k in [11..26] is a real
+             * 802.15.4 channel; otherwise leave the slot's view of the
+             * channel untouched (-1) so the medium doesn't gate on
+             * garbage. */
+            int freq = (int)(value & 0x7F);
+            int channel = ((freq - 11) / 5) + 11;
+            rf->channel = channel;
+            if (rf->channel_callback)
+                rf->channel_callback(rf->channel_user_data,
+                                     (channel >= 11 && channel <= 26) ? channel : -1);
             break;
+        }
         case RFCORE_XREG_TXPOWER:   rf->txpower = value; break;
         case RFCORE_XREG_FIFOPCTRL: rf->fifopctrl = value; break;
         case RFCORE_XREG_FSMCTRL:   rf->fsmctrl = value; break;
@@ -604,6 +619,17 @@ void cc2538_rfcore_set_tx_callback(cc2538_rfcore_t *rf,
                                    cc2538_rf_tx_fn cb, void *user_data) {
     rf->tx_callback = cb;
     rf->tx_user_data = user_data;
+}
+
+void cc2538_rfcore_set_channel_callback(cc2538_rfcore_t *rf,
+                                         cc2538_rf_channel_fn cb, void *user_data) {
+    rf->channel_callback = cb;
+    rf->channel_user_data = user_data;
+    /* If a sensible channel has already been programmed, surface it now
+     * so the harness sees the chip's current view without waiting for
+     * the next FREQCTRL write. */
+    if (cb && rf->channel >= 11 && rf->channel <= 26)
+        cb(user_data, rf->channel);
 }
 
 /* --- 802.15.4 address filter for auto-ACK --- */

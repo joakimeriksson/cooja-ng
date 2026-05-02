@@ -96,6 +96,12 @@ typedef enum {
 
 typedef void (*cc2538_rf_tx_fn)(void *user_data, uint8_t byte);
 typedef void (*cc2538_rf_state_fn)(void *user_data, int old_state, int new_state);
+/* External observer for FREQCTRL.FREQ writes — fires whenever firmware
+ * picks a new IEEE 802.15.4 channel. The simulation harness uses this
+ * to push the channel into the radio medium so per-radio routing can
+ * gate delivery. Optional; multiple writes with the same channel may
+ * fire (chip driver does not de-duplicate). */
+typedef void (*cc2538_rf_channel_fn)(void *user_data, int channel);
 
 /* RX frame parsing states */
 #define RF_RX_PREAMBLE  0
@@ -186,6 +192,10 @@ typedef struct cc2538_rfcore {
     cc2538_rf_state_fn state_callback;
     void              *state_user_data;
 
+    /* Channel change callback (for radio medium per-radio routing) */
+    cc2538_rf_channel_fn channel_callback;
+    void                *channel_user_data;
+
     /* RSSI value set by radio medium for current RX frame */
     int8_t           rx_rssi;
 
@@ -220,6 +230,10 @@ void cc2538_rfcore_init(cc2538_rfcore_t *rf, arm_cpu_t *cpu, arm_nvic_t *nvic);
 /* Set RF TX callback (for multi-node simulation) */
 void cc2538_rfcore_set_tx_callback(cc2538_rfcore_t *rf,
                                    cc2538_rf_tx_fn cb, void *user_data);
+
+/* Install a channel-change observer (fires on every FREQCTRL.FREQ write). */
+void cc2538_rfcore_set_channel_callback(cc2538_rfcore_t *rf,
+                                         cc2538_rf_channel_fn cb, void *user_data);
 
 /* Receive a byte from another radio (multi-node) */
 void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte);
