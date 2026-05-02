@@ -224,13 +224,18 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
         if (c->sync_match == sync_word_value(c)) {
             c->air_state = CC1200_AIR_PHR;
             c->air_phr_count = 0;
-            /* SFD detected → assert PKT_SYNC_RXTX (GDO0 default IOCFG). */
-            if (c->regs[CC1200_REG_IOCFG0] == CC1200_IOCFG_PKT_SYNC_RXTX) {
-                drive_gdo0(c, true);
-            }
-            if (c->regs[CC1200_REG_IOCFG2] == CC1200_IOCFG_PKT_SYNC_RXTX) {
-                drive_gdo2(c, true);
-            }
+            /* Always assert GDO0/GDO2 on sync detection regardless of the
+             * current IOCFG selection. Contiki's transmit() reconfigures
+             * IOCFG0 to MARC_2PIN_STATUS_0 (38) for TX-state polling, after
+             * disabling the GDO0 IRQ at the GPIO layer. A frame arriving in
+             * that window must still latch the RX-completion edge so the
+             * GPIO RIS bit is sticky-set; the cc2538_gpio.c IE 0→1 re-pend
+             * then fires the IRQ once Contiki re-enables GPIO interrupts
+             * post-TX, and cc1200_rx_interrupt drains the buffered frame.
+             * Spurious edges during IE-disabled windows are filtered by
+             * IE/IES at the GPIO layer (see cc2538_gpio_force_irq_edge). */
+            drive_gdo0(c, true);
+            drive_gdo2(c, true);
         }
         break;
     }

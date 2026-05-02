@@ -273,10 +273,17 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     cc1200_receive_byte(&chip, sync[2]);
     cc1200_receive_byte(&chip, sync[3]);
 
-    ASSERT(mock.force_irq_edge_calls > prior, "GDO0 edge fired on SFD");
-    ASSERT_EQ(mock.last_force_irq.port, 1, "GDO0 port = B");
-    ASSERT_EQ(mock.last_force_irq.pin,  4, "GDO0 pin = 4");
-    ASSERT(mock.last_force_irq.rising, "GDO0 rising on SFD");
+    /* Sync detection now fires GDO0 AND GDO2 unconditionally (both
+     * pins are wired in this fixture). The chip used to gate each on
+     * IOCFG[02] == PKT_SYNC_RXTX, but Contiki's transmit() reconfigures
+     * IOCFG0 to MARC_2PIN_STATUS_0 mid-flight — frames arriving in that
+     * window must still drive RX-completion edges so the GPIO RIS bit
+     * latches; the cc2538_gpio.c IE 0→1 re-pend handles the IRQ once
+     * Contiki re-enables GPIO interrupts. See cc1200.c sync-match path. */
+    ASSERT_EQ(mock.force_irq_edge_calls - prior, 2, "GDO0 + GDO2 edges fired on SFD");
+    ASSERT_EQ(mock.last_force_irq.port, 1, "GDO2 port = B (last call)");
+    ASSERT_EQ(mock.last_force_irq.pin,  0, "GDO2 pin = 0 (last call)");
+    ASSERT(mock.last_force_irq.rising, "GDO2 rising on SFD");
 
     /* On-air after sync: PHR(2) + payload(5) + auto-CRC(2). The chip
      * pushes PHR + payload to the RX FIFO, consumes the 2 CRC bytes
