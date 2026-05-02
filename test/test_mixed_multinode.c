@@ -233,8 +233,16 @@ static void tx_frame_asm_reset(tx_frame_asm_t *a) {
     a->first_byte_ns = 0;
 }
 
-/* Per-receiver RX frame queue for emulated nodes */
-#define EMU_RX_QUEUE_SIZE 16
+/* Per-receiver RX frame queue for emulated nodes.
+ *
+ * Sized to absorb sub-GHz CC1200 backpressure: at 50 kbps a 100-byte frame
+ * occupies the air for ~17 ms.  When CSMA retransmits during a hidden-
+ * terminal storm, a burst of 30+ frames can arrive at the receiver before
+ * its firmware drains the chip RX FIFO.  16 was too tight for L6 — the
+ * queue overflowed by ~900 frames in 60 s.  64 holds ~1 second of full-rate
+ * sub-GHz traffic, comfortably more than the firmware's worst-case process
+ * latency. */
+#define EMU_RX_QUEUE_SIZE 64
 #define EMU_RX_FRAME_MAX  160  /* preamble(4)+SFD(1)+len(1)+payload(≤127)+CRC(2) */
 
 typedef struct {
@@ -810,6 +818,34 @@ static int emulated_rxfifo_available(int idx) {
         return avail;
     }
     return 0;
+}
+
+/* Compute how many RX-FIFO bytes a complete air frame will occupy on the
+ * receiving chip's FIFO.  This must match what the chip driver actually
+ * pushes (PHR + payload + status appendix), and the offset of the payload
+ * length byte in the buffered air bytes depends on the on-air format:
+ *
+ *   - 2.4 GHz IEEE 802.15.4 (CC2420 / cc2538_rfcore):
+ *       data layout: 4×0x00 preamble + 0x7A SFD + length + payload (incl. FCS)
+ *       length byte at data[5] (the byte right after SFD).
+ *       Receiving chip pushes (length + 1) bytes into RX FIFO.
+ *
+ *   - Sub-GHz IEEE 802.15.4g (CC1200, standard PHR — Contiki default):
+ *       data layout: 4×0x55 preamble + 4-byte sync word + 1-byte PHR + payload + 2 CRC
+ *       length byte (PHR) at data[8] (the byte right after the sync word).
+ *       Receiving chip pushes (PHR + payload + 2 status) = (length + 3) bytes.
+ *
+ * Returns the number of FIFO bytes the chip needs free to accept the frame.
+ * Returns a sentinel > FIFO size if the buffer is too short to extract the
+ * length, so the caller queues the frame instead of trying to deliver it. */
+static int frame_fifo_bytes(const uint8_t *data, int len, bool subghz) {
+    if (subghz) {
+        /* Need preamble(4) + sync(4) + PHR(1) at minimum to read length. */
+        if (len < 9) return 9999;
+        return (int)data[8] + 3;
+    }
+    if (len < 6) return 9999;
+    return (int)data[5] + 1;
 }
 
 /* Push a complete frame into an emulated node's RX queue.
@@ -1580,8 +1616,9 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
             continue;
         }
 
-        int frame_payload = (frame_snap_len[i] > 5) ? frame_snap[i][5] : 0;
-        if (emulated_rxfifo_available(i) < frame_payload + 1) {
+        int fifo_needed = frame_fifo_bytes(frame_snap[i], frame_snap_len[i],
+                                           tx_asm[sender_idx].subghz);
+        if (emulated_rxfifo_available(i) < fifo_needed) {
             /* RXFIFO full — mini-step the receiver to let it read the
              * previous frame before delivering this one.  On real hardware
              * frames arrive with multi-ms gaps; here all TX/delivery is
@@ -1589,7 +1626,7 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
              * avoid triggering cascade transmissions from the receiver. */
             step_node_until(i, node_cycles(i) + 5000);
         }
-        if (emulated_rxfifo_available(i) >= frame_payload + 1) {
+        if (emulated_rxfifo_available(i) >= fifo_needed) {
             /* Match Cooja's setReceivedPacket: deliver ALL bytes starting
              * at the current sim time (TX completion time), spaced 32µs apart.
              * Pre-sync the receiver to this time first.
@@ -1840,9 +1877,9 @@ static void emu_rx_queue_drain(int idx) {
             continue;
         }
 
-        /* PHY length byte is at data[5] (after 4×preamble + SFD) */
-        int frame_payload = (f->len > 5) ? f->data[5] : 0;
-        if (emulated_rxfifo_available(idx) < frame_payload + 1) {
+        /* Required FIFO space depends on on-air format (see frame_fifo_bytes). */
+        int fifo_needed = frame_fifo_bytes(f->data, f->len, f->subghz);
+        if (emulated_rxfifo_available(idx) < fifo_needed) {
             if (nodes[idx].type == NODE_MSP430 && blocked_attempts < 4) {
                 int64_t freq = node_freq(idx);
                 int64_t spare_cycles = freq / 1000;
