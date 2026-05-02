@@ -50,6 +50,14 @@ jobs:
       - name: CC1200 chip-driver mock-host tests
         run: ./build/test_runner cc1200-mock-host
 
+      - name: Radio medium unit tests
+        run: ./build/test_runner radio-medium
+
+      - name: cc2538dk RPL-UDP convergence (with -d 100)
+        # Pins the -d (per-node startup-delay spread) mechanism end-to-end:
+        # the cc2538dk RPL-UDP pair must converge with the staggered start.
+        run: ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 30000 -d 100 -q
+
       - name: Zoul Firefly multinode (CC1200 nullnet, 20s sim)
         # The Firefly nullnet firmware sends a broadcast every 8 s, so
         # 20 s of sim is enough to verify the CC1200 RX path: each
