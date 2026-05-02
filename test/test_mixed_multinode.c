@@ -244,6 +244,7 @@ typedef struct {
     int64_t arrival_ns;
     int64_t end_ns;
     bool    collided;
+    bool    subghz;     /* CC1200 frame — use 160 µs/byte for re-delivery */
 } emu_rx_frame_t;
 
 typedef struct {
@@ -812,7 +813,8 @@ static int emulated_rxfifo_available(int idx) {
  * Doing overlap checks here would cause false positives (e.g., a data frame
  * and its auto-ACK from the same sender queued to the same receiver). */
 static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
-                               int8_t rssi, int64_t arrival_ns, int64_t end_ns) {
+                               int8_t rssi, int64_t arrival_ns, int64_t end_ns,
+                               bool subghz) {
     emu_rx_queue_t *q = &emu_rx_queue[idx];
     if (q->count >= EMU_RX_QUEUE_SIZE) {
         stat_emu_rx_dropped++;
@@ -826,6 +828,7 @@ static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
     q->frames[slot].arrival_ns = arrival_ns;
     q->frames[slot].end_ns = end_ns;
     q->frames[slot].collided = false;
+    q->frames[slot].subghz = subghz;
     q->count++;
     stat_emu_rx_queued++;
 }
@@ -984,8 +987,20 @@ static bool drain_msp430_rx_byte_event(int64_t up_to_ns) {
     return true;
 }
 
-/* 802.15.4 byte duration at 250 kbps = 32 µs = 32000 ns */
+/* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
+ * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. The
+ * `subghz` flag set by the per-sender frame assembler picks which one
+ * to use everywhere a wall-clock byte period is needed (RX byte spacing,
+ * frame air time, collision window, ACK timeline). Using the 2.4 GHz
+ * value for CC1200 frames (5x too fast) is what made hidden-terminal
+ * collisions look like real collisions to the simulator and starved
+ * RPL convergence — see devices/zoul-firefly/SPEC.md L6 entry. */
 #define IEEE802154_BYTE_NS 32000LL
+#define CC1200_50KBPS_BYTE_NS 160000LL
+
+static inline int64_t byte_period_ns(bool subghz) {
+    return subghz ? CC1200_50KBPS_BYTE_NS : IEEE802154_BYTE_NS;
+}
 
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
     /* Cap to global sim time — no node should advance past it (Cooja invariant) */
@@ -1029,13 +1044,19 @@ static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
  * Emits explicit RX timeline events with computed frame air time.
  * For MSP430, advance the receiver's internal clock before each byte to
  * better approximate Cooja's byte-delivery events: execute(t, 0) +
- * receivedByte(byte) + requestImmediateWakeup(). */
+ * receivedByte(byte) + requestImmediateWakeup().
+ *
+ * `subghz` selects the wall-clock byte period: 32 µs for 802.15.4
+ * (CC2420 / cc2538_rfcore), 160 µs for 802.15.4g (CC1200 50 kbps).
+ * Using the wrong value compresses RX on the receiver and breaks
+ * collision modelling — see byte_period_ns(). */
 static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
-                               int8_t rssi, int64_t air_time_ns) {
+                               int8_t rssi, int64_t air_time_ns, bool subghz) {
+    int64_t byte_ns = byte_period_ns(subghz);
     /* Emit RX timeline event using the provided air-time timestamp
      * (derived from the sender's TX timing) for consistency. */
     if (ui_server && len > 0) {
-        int64_t rx_dur = (int64_t)len * IEEE802154_BYTE_NS;
+        int64_t rx_dur = (int64_t)len * byte_ns;
         tl_radio_event(&timeline, nodes[idx].id, air_time_ns, TL_RADIO_RX);
         tl_radio_event(&timeline, nodes[idx].id, air_time_ns + rx_dur, TL_RADIO_ON);
         node_states[idx].radio_state = SIM_RADIO_ON;
@@ -1047,7 +1068,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         cc2420_radio_state_t rx_state = nodes[idx].plat.msp.cc2420.state;
         if (rx_state == CC2420_RX_FRAME || rx_state == CC2420_RX_OVERFLOW) {
             emu_rx_queue_push(idx, data, len, rssi, air_time_ns,
-                              air_time_ns + (int64_t)len * IEEE802154_BYTE_NS);
+                              air_time_ns + (int64_t)len * byte_ns, subghz);
             return;
         }
         /* Match Cooja's Msp802154Radio.receiveCustomData(): incoming bytes
@@ -1083,7 +1104,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
              * Match Cooja's Msp802154Radio.receiveCustomData():
              * each byte is preceded by execute(t, 0) at the byte's air time. */
             for (int j = 0; j < len; j++) {
-                int64_t byte_time_ns = air_time_ns + (int64_t)j * IEEE802154_BYTE_NS;
+                int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
                 sync_msp430_to_time(idx, byte_time_ns);
                 cc2420_receive_byte(&nodes[idx].plat.msp.cc2420, data[j]);
                 last_byte_ns = byte_time_ns;
@@ -1128,7 +1149,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
             }
         } else {
             for (int j = 0; j < len; j++) {
-                int64_t byte_time_ns = air_time_ns + (int64_t)j * IEEE802154_BYTE_NS;
+                int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
                 /* Advance the receiver's clock to this byte's air time so
                  * the RF Core ISR observes the correct simulated time when
                  * it fires (matches the MSP430 sync_msp430_to_time path). */
@@ -1185,8 +1206,12 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         tx_asm[sender_idx].first_byte_ns = current_sim_ns;
         tx_cap[sender_idx].len = 0;
     }
+    /* Per-sender byte period — sub-GHz CC1200 frames take 5x longer per
+     * byte than 2.4 GHz IEEE 802.15.4. Use the sender's frame profile
+     * detected by the assembler (subghz set on sync-word match). */
+    int64_t sender_byte_ns = byte_period_ns(tx_asm[sender_idx].subghz);
     int64_t byte_time_ns = tx_asm[sender_idx].first_byte_ns +
-                           (int64_t)tx_cap[sender_idx].len * IEEE802154_BYTE_NS;
+                           (int64_t)tx_cap[sender_idx].len * sender_byte_ns;
     node_last_tx_ns[sender_idx] = byte_time_ns;
     if (tx_cap[sender_idx].len < (int)sizeof(tx_cap[sender_idx].bytes))
         tx_cap[sender_idx].bytes[tx_cap[sender_idx].len++] = byte;
@@ -1286,8 +1311,13 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         ? (4 + 4 + tx_asm[sender_idx].subghz_phr_len +
            tx_asm[sender_idx].expected_len + 2)
         : (4 + 1 + 1 + tx_asm[sender_idx].expected_len);
-    int64_t frame_air_dur = (int64_t)total_air_bytes * IEEE802154_BYTE_NS;
-    int64_t accurate_tx_end = byte_time_ns + IEEE802154_BYTE_NS;
+    /* Per-sender byte period (see definition above). For CC1200 the
+     * 160 µs/byte rate makes a 95-byte data frame ~17 ms on air, which
+     * is what real CSMA backs off around — the previous 32 µs proxy
+     * pretended 3.4 ms and let "collisions" fire that wouldn't on
+     * actual hardware. */
+    int64_t frame_air_dur = (int64_t)total_air_bytes * sender_byte_ns;
+    int64_t accurate_tx_end = byte_time_ns + sender_byte_ns;
     int64_t accurate_tx_start = accurate_tx_end - frame_air_dur;
     if (accurate_tx_start < 0) accurate_tx_start = 0;
 
@@ -1443,7 +1473,7 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
                         (double)emu_rx_end_ns[i] / 1e9);
             /* Emit interference event on the receiver's timeline */
             if (ui_server) {
-                int64_t intf_dur = (int64_t)frame_snap_len[i] * IEEE802154_BYTE_NS;
+                int64_t intf_dur = (int64_t)frame_snap_len[i] * sender_byte_ns;
                 tl_radio_event(&timeline, nodes[i].id, accurate_tx_start, TL_RADIO_INTF);
                 tl_radio_event(&timeline, nodes[i].id, accurate_tx_start + intf_dur, TL_RADIO_ON);
             }
@@ -1476,7 +1506,8 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
                 tick_one_msp430(i, delivery_start);
             }
             emu_deliver_bytes(i, frame_snap[i], frame_snap_len[i],
-                              frame_snap_rssi[i], delivery_start);
+                              frame_snap_rssi[i], delivery_start,
+                              tx_asm[sender_idx].subghz);
             stat_emu_rx_direct++;
             emu_rx_end_ns[i] = coll_end;
 
@@ -1500,7 +1531,8 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
             }
         } else {
             emu_rx_queue_push(i, frame_snap[i], frame_snap_len[i],
-                              frame_snap_rssi[i], accurate_tx_start, coll_end);
+                              frame_snap_rssi[i], accurate_tx_start, coll_end,
+                              tx_asm[sender_idx].subghz);
             emu_rx_end_ns[i] = coll_end;
         }
 
@@ -1514,17 +1546,21 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         for (int j = 0; j < num_nodes; j++) {
             if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
                 if (ui_server && !ack_tx_emitted) {
-                    int64_t ack_dur = (int64_t)rf_pending[j].count * IEEE802154_BYTE_NS;
+                    /* ACKs follow the same PHY as the data frame they
+                     * acknowledge — CC1200 ACK = sub-GHz timing too. */
+                    int64_t ack_dur = (int64_t)rf_pending[j].count * sender_byte_ns;
                     tl_radio_event(&timeline, nodes[i].id, ack_start, TL_RADIO_TX);
                     tl_radio_event(&timeline, nodes[i].id, ack_start + ack_dur, TL_RADIO_ON);
                     ack_tx_emitted = 1;
                 }
                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
                 if (emulated_rxfifo_available(j) >= ack_payload + 1)
-                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count, -50, ack_start);
+                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count,
+                                      -50, ack_start, tx_asm[sender_idx].subghz);
                 else
                     emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                      -50, ack_start, coll_end);
+                                      -50, ack_start, coll_end,
+                                      tx_asm[sender_idx].subghz);
                 rf_pending[j].count = 0;
             }
         }
@@ -1666,11 +1702,13 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 
 /* Deliver buffered RF bytes to a native node's assembler.
  * Only called for native nodes — emulated nodes' bytes stay in rf_pending
- * until the per-sender frame assembler detects a complete frame. */
+ * until the per-sender frame assembler detects a complete frame.
+ * Native nodes use the 2.4 GHz framing in this test runner. */
 static void mixed_deliver_rf_bytes(int idx) {
     rf_buffer_t *buf = &rf_pending[idx];
     if (buf->count == 0) return;
-    emu_deliver_bytes(idx, buf->bytes, buf->count, 0, current_sim_ns);
+    emu_deliver_bytes(idx, buf->bytes, buf->count, 0, current_sim_ns,
+                      /*subghz=*/false);
     buf->count = 0;
 }
 
@@ -1713,8 +1751,10 @@ static void emu_rx_queue_drain(int idx) {
          * (each auto-ACK would see emu_rx_end_ns set by the previous one). */
         memset(emu_rx_end_ns, 0, sizeof(emu_rx_end_ns));
 
-        /* Deliver frame bytes to radio */
-        emu_deliver_bytes(idx, f->data, f->len, f->rssi, current_sim_ns);
+        /* Deliver frame bytes to radio — preserve the original frame's
+         * sub-GHz flag so re-delivery uses the correct byte timing. */
+        emu_deliver_bytes(idx, f->data, f->len, f->rssi, current_sim_ns,
+                          f->subghz);
         stat_emu_rx_drained++;
 
         q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
@@ -2145,13 +2185,16 @@ static void distribute_rf_outgoing(void) {
                         int frame_payload = (buf->count > 5) ? buf->bytes[5] : 0;
                         if (emulated_rxfifo_available(i) < frame_payload + 1)
                             step_node_until(i, node_cycles(i) + 5000);
+                        /* Native senders only emit 2.4 GHz frames in this
+                         * runner — pass subghz=false. */
                         if (emulated_rxfifo_available(i) >= frame_payload + 1) {
-                            emu_deliver_bytes(i, buf->bytes, buf->count, rssi, tx_start);
+                            emu_deliver_bytes(i, buf->bytes, buf->count, rssi, tx_start,
+                                              /*subghz=*/false);
                             stat_emu_rx_direct++;
                             emu_rx_end_ns[i] = tx_end;
                         } else {
                             emu_rx_queue_push(i, buf->bytes, buf->count, rssi,
-                                              tx_start, tx_end);
+                                              tx_start, tx_end, /*subghz=*/false);
                             emu_rx_end_ns[i] = tx_end;
                         }
                         buf->count = 0;
@@ -2164,10 +2207,13 @@ static void distribute_rf_outgoing(void) {
                             if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
                                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
                                 if (emulated_rxfifo_available(j) >= ack_payload + 1)
-                                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count, -50, native_ack_start);
+                                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count,
+                                                      -50, native_ack_start, /*subghz=*/false);
                                 else
                                     emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                                      -50, current_sim_ns, current_sim_ns + TIME_STEP_NS);
+                                                      -50, current_sim_ns,
+                                                      current_sim_ns + TIME_STEP_NS,
+                                                      /*subghz=*/false);
                                 rf_pending[j].count = 0;
                             }
                         }
