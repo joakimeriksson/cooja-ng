@@ -90,6 +90,13 @@
 /* PKT_CFG2 bits relevant to framing */
 #define CC1200_PKT_CFG2_FG_MODE_802154G  (1u << 5)  /* "FG_MODE" — bit5 enables
                                                        802.15.4g 2-byte PHR */
+/* Frequency configuration (extended-address space) — see cc1200-const.h
+ * and CC1200 datasheet SWRS123A §A.6. The 24-bit FREQ value lives in
+ * three registers: FREQ2 (high), FREQ1 (middle), FREQ0 (low). */
+#define CC1200_EXT_FREQ2             0x2F0C
+#define CC1200_EXT_FREQ1             0x2F0D
+#define CC1200_EXT_FREQ0             0x2F0E
+
 #define CC1200_EXT_RSSI1             0x2F71
 #define CC1200_EXT_RSSI0             0x2F72
 #define CC1200_EXT_MARCSTATE         0x2F73

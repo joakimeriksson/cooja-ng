@@ -833,6 +833,51 @@ static uint8_t reg_read(cc1200_t *c, uint16_t addr) {
     }
 }
 
+/* Reverse-map a 24-bit FREQ register value to a Contiki channel index
+ * for the EU 868 50 kbps profile (chan_center_freq0 = 863125 kHz,
+ * spacing = 200 kHz, FREQ_MULTIPLIER = 4096, FREQ_DIVIDER = 625).
+ *
+ * From cc1200.c calculate_freq():
+ *   freq_value = (chan_center_freq0_kHz + channel * spacing_kHz) * 4096 / 625
+ *
+ * Reverse:
+ *   freq_kHz = freq_value * 625 / 4096
+ *   channel  = (freq_kHz - 863125) / 200    (integer division, nearest)
+ *
+ * Channels outside the [0..33] range used by the Contiki 50 kbps profile
+ * (and the broader plausible 863-870 MHz EU sub-GHz band) are clamped to
+ * -1 so the medium doesn't gate on garbage during PLL settle / partial
+ * register writes.  See devices/zoul-firefly/DATASHEET-FINDINGS.md and
+ * arch/dev/radio/cc1200/cc1200-802154g-863-870-fsk-50kbps.c for the
+ * profile constants. */
+static int cc1200_channel_from_freq_value(uint32_t freq_value) {
+    if (freq_value == 0) return -1;
+    /* Use 64-bit math to avoid overflow on the multiplication. */
+    int64_t freq_kHz = ((int64_t)freq_value * 625) / 4096;
+    int64_t delta = freq_kHz - 863125;
+    /* Round to nearest channel rather than truncate — register writes
+     * may incur a 1-kHz rounding error from the integer-math
+     * formula. */
+    int64_t channel = (delta + 100) / 200;  /* +100 = half spacing (200/2) */
+    if (channel < 0 || channel > 63) return -1;
+    return (int)channel;
+}
+
+/* Push a channel update from the chip driver into the simulation
+ * harness via the sim_host_t vtable. Idempotent — chip drivers may call
+ * this on every FREQ register write; the harness can de-duplicate if
+ * needed. NULL-safe. */
+static void cc1200_push_channel(cc1200_t *c) {
+    if (!c->host || !c->host->radio_set_channel) return;
+    uint32_t freq_value =
+        ((uint32_t)c->regs[CC1200_EXT_FREQ2] << 16) |
+        ((uint32_t)c->regs[CC1200_EXT_FREQ1] << 8)  |
+        ((uint32_t)c->regs[CC1200_EXT_FREQ0]);
+    int channel = cc1200_channel_from_freq_value(freq_value);
+    /* CC1200 sits on radio slot 1 by convention (slot 0 = cc2538_rfcore). */
+    c->host->radio_set_channel(c->host->radio_user_data, /*radio_idx=*/1, channel);
+}
+
 static void reg_write(cc1200_t *c, uint16_t addr, uint8_t value) {
     if (addr >= CC1200_REG_SPACE_SIZE) return;
     /* MARCSTATE / FIFO counters are read-only — silently drop writes. */
@@ -858,6 +903,16 @@ static void reg_write(cc1200_t *c, uint16_t addr, uint8_t value) {
      * the now-selected signal currently holds. */
     if (addr == CC1200_REG_IOCFG0 || addr == CC1200_REG_IOCFG2) {
         propagate_signals(c);
+    }
+    /* Writing any of the FREQ bytes (FREQ0/1/2) triggers a channel
+     * recompute. The Contiki driver writes the three bytes back-to-back
+     * (single_write per byte); each write fires this path, but the
+     * intermediate values are still valid channels — they just don't
+     * match what the firmware ultimately programs. The medium gets the
+     * final channel after the third write completes. */
+    if (addr == CC1200_EXT_FREQ0 || addr == CC1200_EXT_FREQ1 ||
+        addr == CC1200_EXT_FREQ2) {
+        cc1200_push_channel(c);
     }
 }
 
