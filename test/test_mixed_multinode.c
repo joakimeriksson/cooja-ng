@@ -1256,7 +1256,13 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
      * time as the receiver's own CSMA prepare()→idle() transition; the
      * receiver chip is briefly in MARC_IDLE and silently drops the
      * incoming bytes, breaking L5.  The collision math therefore stays
-     * approximate for sub-GHz traffic — see devices/zoul-firefly/SPEC.md. */
+     * approximate for sub-GHz traffic — see devices/zoul-firefly/SPEC.md.
+     *
+     * The node_tx_busy_until_ns calculation below applies a sub-GHz
+     * fixup that anchors busy-until to current_sim_ns (CCA accuracy)
+     * without disturbing the byte-delivery air_time_ns.  This lets CCA
+     * detect in-progress sub-GHz transmissions without flipping the
+     * receiver's chip into IDLE/TX during byte delivery. */
     if (tx_asm[sender_idx].state == TX_ASM_PREAMBLE && tx_asm[sender_idx].zero_count == 0 && byte == 0x00) {
         /* Match Cooja's radio callbacks: outgoing bytes are observed at the
          * current scheduler time, not from a mote-local sim_time that may
@@ -1382,9 +1388,23 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     /* Mark the medium as TX-busy on this sender's channel until the frame
      * finishes on the air.  Receiver chips poll this via their channel-busy
      * query (see cc1200_set_channel_busy_query) so CCA reflects in-progress
-     * transmissions, not just frames already mid-RX. */
-    if (accurate_tx_end > node_tx_busy_until_ns[sender_idx])
-        node_tx_busy_until_ns[sender_idx] = accurate_tx_end;
+     * transmissions, not just frames already mid-RX.
+     *
+     * Sub-GHz fixup: first_byte_ns isn't armed for CC1200 frames (0x55
+     * preamble — see comment in the arm block above and the L5 break
+     * documented in commit e9bb945), so accurate_tx_end here is anchored
+     * to whatever stale first_byte_ns happened to be (often 0 from
+     * init).  That makes node_tx_busy_until_ns useless for sub-GHz CCA.
+     * Anchor the busy-until to current_sim_ns + frame_air_dur for CC1200
+     * traffic so neighbours' CCA reads "busy" for the frame's actual
+     * on-air duration.  This is the minimal fix that gives CSMA correct
+     * channel state without changing what air_time_ns the byte-delivery
+     * path sees (which is what trips the receiver's MARC_RX gating). */
+    int64_t busy_until = accurate_tx_end;
+    if (tx_asm[sender_idx].subghz)
+        busy_until = current_sim_ns + frame_air_dur;
+    if (busy_until > node_tx_busy_until_ns[sender_idx])
+        node_tx_busy_until_ns[sender_idx] = busy_until;
 
     if (trace_tsch_ack_enabled() && sender->type == NODE_MSP430 &&
         (tx_asm[sender_idx].expected_len == 23 || tx_asm[sender_idx].expected_len == 19 ||
@@ -1521,9 +1541,24 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         int i = snap_indices[s];
         /* Collision window: use actual frame air time for realistic
          * hidden-terminal collision detection. A frame occupies the
-         * channel from accurate_tx_start to accurate_tx_end. */
+         * channel from coll_start to coll_end.
+         *
+         * Sub-GHz fixup: accurate_tx_start/end are anchored on
+         * first_byte_ns which is never armed for CC1200 0x55 preamble
+         * (see comment in mixed_rf_tx_handler arm block above).  For
+         * sub-GHz frames, anchor the collision window to current_sim_ns
+         * so emu_rx_end_ns[i] tracks real wall-clock RX end and the
+         * 0 < emu_rx_end_ns[i] check stops misfiring after the very
+         * first sub-GHz frame.  Without this, every CC1200 frame after
+         * the first looks like a collision against the previous frame's
+         * stale 0-anchored end time — the "channel busy until 0.036 s"
+         * pattern that kept L6 from converging. */
         int64_t coll_start = accurate_tx_start;
         int64_t coll_end = accurate_tx_end;
+        if (tx_asm[sender_idx].subghz) {
+            coll_start = current_sim_ns;
+            coll_end = current_sim_ns + frame_air_dur;
+        }
 
         /* Collision check: does this frame overlap with a previously
          * delivered frame on this receiver? */
