@@ -169,22 +169,20 @@ static void test_channel_match_passes(void) {
     }
 }
 
-/* The within-band channel check is intentionally DISABLED right now
- * (TSCH hopping comment in radio_medium.c). Two nodes on different
- * 2.4 GHz channels (11 vs 26) currently DO see each other's frames at
- * the medium level — pin this surprising-but-deliberate behavior so
- * the refactor can decide whether to keep it. */
-static void test_within_band_channel_mismatch_currently_passes(void) {
+/* Two nodes on different 2.4 GHz channels (11 vs 26): the medium MUST
+ * drop because chip drivers now push their channel into the medium
+ * synchronously on register write. This is the post-refactor behavior;
+ * the pre-refactor pin was "passes" with a TSCH-hopping caveat. */
+static void test_within_band_channel_mismatch_drops(void) {
     radio_medium_t rm;
     radio_medium_init(&rm, 2);
     radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
     radio_medium_set_channel(&rm, 0, 11);
     radio_medium_set_channel(&rm, 1, 26);
 
-    /* filter_frame: cross-band check is FALSE (both 2.4 GHz), within-band
-     * check is disabled, distance 0 -> prob 1.0 -> passes. */
-    ASSERT(radio_medium_filter_frame(&rm, 0, 1),
-           "within-band channel mismatch (11 vs 26): frame passes today");
+    /* Both 2.4 GHz, channel mismatch -> dropped at the channel gate. */
+    ASSERT(!radio_medium_filter_frame(&rm, 0, 1),
+           "within-band channel mismatch (11 vs 26): frame dropped");
 }
 
 /* One node on a known channel, the other on -1 (unknown). The cross-band
@@ -246,19 +244,16 @@ static void test_subghz_same_channel_passes(void) {
 }
 
 /* Two sub-GHz nodes on different sub-GHz channels (100 vs 132) -> frames
- * STILL pass today, because the within-band channel check is disabled
- * (TSCH hopping comment) and they're both >= the sub-GHz base, so the
- * cross-band gate is false. Pin this — the refactor will likely
- * tighten this. */
-static void test_subghz_different_channels_currently_passes(void) {
+ * are now dropped. Same band, mismatched channel — channel gate fires. */
+static void test_subghz_different_channels_drops(void) {
     radio_medium_t rm;
     radio_medium_init(&rm, 2);
     radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
     radio_medium_set_channel(&rm, 0, 100);
     radio_medium_set_channel(&rm, 1, 132);
 
-    ASSERT(radio_medium_filter_frame(&rm, 0, 1),
-           "sub-GHz cross-channel (100 vs 132): frame passes today");
+    ASSERT(!radio_medium_filter_frame(&rm, 0, 1),
+           "sub-GHz cross-channel (100 vs 132): frame dropped");
 }
 
 /* ====================================================================
@@ -532,7 +527,7 @@ static void test_frame_tracker_802154_state_progression(void) {
     radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
     /* Default channels (-1) => tracker profile is IEEE 802.15.4. */
 
-    frame_tracker_t *ft = &rm.frame_track[0];
+    frame_tracker_t *ft = &rm.frame_track[0][0];
     ASSERT_EQ(ft->state, FRAME_IDLE, "starts IDLE");
     ASSERT_EQ(ft->frame_id, 0u, "no frame_id yet");
 
@@ -569,7 +564,7 @@ static void test_frame_tracker_802154_no_preamble(void) {
     radio_medium_t rm;
     radio_medium_init(&rm, 2);
     radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
-    frame_tracker_t *ft = &rm.frame_track[0];
+    frame_tracker_t *ft = &rm.frame_track[0][0];
 
     for (int i = 0; i < 16; i++) radio_medium_filter_byte(&rm, 0, 1, 0xAA);
     ASSERT_EQ(ft->state, FRAME_IDLE, "0xAA stream never escapes IDLE");
@@ -586,7 +581,7 @@ static void test_frame_tracker_802154_two_frames(void) {
     radio_medium_t rm;
     radio_medium_init(&rm, 2);
     radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
-    frame_tracker_t *ft = &rm.frame_track[0];
+    frame_tracker_t *ft = &rm.frame_track[0][0];
 
     /* Frame 1: 4×0x00, SFD, length=2, 2 payload. */
     uint8_t f1[] = { 0x00,0x00,0x00,0x00, 0x7A, 0x02, 0x11, 0x22 };
@@ -615,7 +610,7 @@ static void test_frame_tracker_802154g_state_progression(void) {
     radio_medium_set_channel(&rm, 0, RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
     radio_medium_set_channel(&rm, 1, RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
 
-    frame_tracker_t *ft = &rm.frame_track[0];
+    frame_tracker_t *ft = &rm.frame_track[0][0];
     ASSERT_EQ(ft->profile, RADIO_FRAME_PROFILE_IEEE802154G,
               "profile flipped to 802.15.4g on sub-GHz set_channel");
     ASSERT_EQ(ft->state, FRAME_IDLE, "starts IDLE");
@@ -695,15 +690,15 @@ static void test_set_channel_band_change_resets_tracker(void) {
     radio_medium_set_channel(&rm, 0, 11);
     radio_medium_filter_byte(&rm, 0, 1, 0x00);
     radio_medium_filter_byte(&rm, 0, 1, 0x00);
-    ASSERT_EQ(rm.frame_track[0].state, FRAME_PREAMBLE, "mid-preamble");
+    ASSERT_EQ(rm.frame_track[0][0].state, FRAME_PREAMBLE, "mid-preamble");
 
     /* Switch to sub-GHz — tracker resets. */
     radio_medium_set_channel(&rm, 0, RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
-    ASSERT_EQ(rm.frame_track[0].state, FRAME_IDLE,
+    ASSERT_EQ(rm.frame_track[0][0].state, FRAME_IDLE,
               "band change resets state to IDLE");
-    ASSERT_EQ(rm.frame_track[0].zero_count, 0, "zero_count reset");
-    ASSERT_EQ(rm.frame_track[0].sync_match, 0u, "sync_match reset");
-    ASSERT_EQ(rm.frame_track[0].profile, RADIO_FRAME_PROFILE_IEEE802154G,
+    ASSERT_EQ(rm.frame_track[0][0].zero_count, 0, "zero_count reset");
+    ASSERT_EQ(rm.frame_track[0][0].sync_match, 0u, "sync_match reset");
+    ASSERT_EQ(rm.frame_track[0][0].profile, RADIO_FRAME_PROFILE_IEEE802154G,
               "profile flipped to 802.15.4g");
 }
 
@@ -793,6 +788,406 @@ static void test_set_position_bounds(void) {
            "(3,4) -> (0,0) within tx_range 10");
 }
 
+/* ====================================================================
+ * Multi-radio per node (refactor coverage)
+ * ==================================================================== */
+
+/* Two-radio Firefly node: cc2538_rfcore on slot 0 (2.4 GHz) + cc1200 on
+ * slot 1 (sub-GHz). Registering both must not cross-contaminate. */
+static void test_multiradio_register_two_radios_independent(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 0, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+
+    ASSERT_EQ(rm.nodes[0].radio_count, 2, "two radios registered");
+    ASSERT_EQ(rm.nodes[0].radios[0].spectrum, RADIO_SPECTRUM_2_4GHZ_15_4,
+              "slot 0 spectrum = 2.4 GHz");
+    ASSERT_EQ(rm.nodes[0].radios[1].spectrum, RADIO_SPECTRUM_868MHZ_15_4G,
+              "slot 1 spectrum = 868 MHz");
+
+    /* Channels start unknown and are independent. */
+    ASSERT_EQ(rm.nodes[0].radios[0].channel, -1, "slot 0 channel default -1");
+    ASSERT_EQ(rm.nodes[0].radios[1].channel, -1, "slot 1 channel default -1");
+
+    radio_medium_set_radio_channel(&rm, 0, 0, 26);
+    radio_medium_set_radio_channel(&rm, 0, 1, 5);
+    ASSERT_EQ(rm.nodes[0].radios[0].channel, 26, "slot 0 channel set");
+    ASSERT_EQ(rm.nodes[0].radios[1].channel, 5, "slot 1 channel set");
+
+    /* Per-radio frame trackers carry the right profile. */
+    ASSERT_EQ(rm.frame_track[0][0].profile, RADIO_FRAME_PROFILE_IEEE802154,
+              "slot 0 tracker = 802.15.4");
+    ASSERT_EQ(rm.frame_track[0][1].profile, RADIO_FRAME_PROFILE_IEEE802154G,
+              "slot 1 tracker = 802.15.4g");
+}
+
+/* Per-radio dispatch: with a Firefly node 0 (cc2538_rfcore + cc1200) and
+ * a Firefly node 1 (same), bytes from slot 0 must reach slot 0, slot 1
+ * must reach slot 1, and cross-slot delivery must drop. */
+static void test_multiradio_per_radio_dispatch(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    for (int n = 0; n < 2; n++) {
+        radio_medium_register_radio(&rm, n, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+        radio_medium_register_radio(&rm, n, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+        radio_medium_set_radio_channel(&rm, n, 0, 26);
+        radio_medium_set_radio_channel(&rm, n, 1, 5);
+    }
+
+    /* Same-band, same-slot: passes. */
+    ASSERT(radio_medium_filter_byte_radio(&rm, 0, 0, 1, 0, 0xAB),
+           "node0/slot0 -> node1/slot0: passes");
+    ASSERT(radio_medium_filter_byte_radio(&rm, 0, 1, 1, 1, 0xAB),
+           "node0/slot1 -> node1/slot1: passes");
+
+    /* Cross-slot delivery: spectrum mismatch drops. */
+    ASSERT(!radio_medium_filter_byte_radio(&rm, 0, 0, 1, 1, 0xAB),
+           "node0/slot0(2.4GHz) -> node1/slot1(868MHz): drops (band mismatch)");
+    ASSERT(!radio_medium_filter_byte_radio(&rm, 0, 1, 1, 0, 0xAB),
+           "node0/slot1(868MHz) -> node1/slot0(2.4GHz): drops (band mismatch)");
+    ASSERT(!radio_medium_filter_frame_radio(&rm, 0, 0, 1, 1),
+           "filter_frame: cross-band cross-slot drops");
+}
+
+/* Changing one radio's channel must not affect the other on the same
+ * node. */
+static void test_multiradio_channel_change_isolation(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 0, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+    radio_medium_register_radio(&rm, 1, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 1, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+
+    radio_medium_set_radio_channel(&rm, 0, 0, 11);
+    radio_medium_set_radio_channel(&rm, 0, 1, 5);
+    radio_medium_set_radio_channel(&rm, 1, 0, 11);
+    radio_medium_set_radio_channel(&rm, 1, 1, 5);
+
+    /* Both pairs match — both deliver. */
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "slot 0 pair matches before any change");
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 1, 1, 1),
+           "slot 1 pair matches before any change");
+
+    /* Hop only slot 0 on node 0 to channel 26. Slot 1 must continue to
+     * deliver — independence proves per-radio channel state. */
+    radio_medium_set_radio_channel(&rm, 0, 0, 26);
+    ASSERT(!radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "slot 0 pair drops after slot 0 channel change");
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 1, 1, 1),
+           "slot 1 pair still matches (independent)");
+    /* Slot 1 still hasn't moved. */
+    ASSERT_EQ(rm.nodes[0].radios[1].channel, 5,
+              "slot 1 channel unaffected by slot 0 change");
+}
+
+/* Spectrum mismatch on the same channel index is still a drop (CC1200
+ * channel 5 is not the same as cc2538 channel 5). */
+static void test_multiradio_spectrum_mismatch_same_channel_drops(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 1, 0, RADIO_SPECTRUM_868MHZ_15_4G);
+    radio_medium_set_radio_channel(&rm, 0, 0, 5);
+    radio_medium_set_radio_channel(&rm, 1, 0, 5);
+
+    ASSERT(!radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "channel 5 on 2.4 GHz vs channel 5 on 868 MHz: drops");
+    ASSERT(!radio_medium_filter_byte_radio(&rm, 0, 0, 1, 0, 0xAA),
+           "byte: channel 5 on 2.4 GHz vs 868 MHz: drops");
+}
+
+/* RX-disabled receiver: even when band + channel match, no delivery. */
+static void test_rx_disabled_receiver_drops(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 1, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_set_radio_channel(&rm, 0, 0, 26);
+    radio_medium_set_radio_channel(&rm, 1, 0, 26);
+
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "default RX-on: frame passes");
+
+    radio_medium_set_radio_rx_enabled(&rm, 1, 0, false);
+    ASSERT(!radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "RX-off receiver: frame dropped");
+
+    radio_medium_set_radio_rx_enabled(&rm, 1, 0, true);
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "RX re-enabled: frame passes again");
+}
+
+/* TSCH-style rapid hopping: 50 channel changes simulated as a sequence
+ * of "set channel + check if the in-flight byte matches". Each delivered
+ * byte is matched against the channel that was active at the moment of
+ * the call — proves channel state is sampled synchronously, not via
+ * stale state. */
+static void test_tsch_rapid_hopping_per_byte_match(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 1, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+
+    int delivered = 0, dropped = 0;
+    /* 50 hops across channels 11..15. Sender stays on channel 11; the
+     * receiver hops every iteration. Only when the receiver is on 11 does
+     * the byte deliver. */
+    radio_medium_set_radio_channel(&rm, 0, 0, 11);
+    for (int i = 0; i < 50; i++) {
+        int rx_ch = 11 + (i % 5);  /* 11,12,13,14,15,11,12,... */
+        radio_medium_set_radio_channel(&rm, 1, 0, rx_ch);
+        bool ok = radio_medium_filter_byte_radio(&rm, 0, 0, 1, 0, 0xAA);
+        if (ok) delivered++; else dropped++;
+    }
+    /* 10 of 50 iterations should land on rx_ch == 11. */
+    ASSERT_EQ(delivered, 10, "rapid hop: 10/50 bytes match channel 11");
+    ASSERT_EQ(dropped, 40, "rapid hop: 40/50 bytes drop on mismatch");
+}
+
+/* Cross-radio TSCH: sender's slot 0 hops while slot 1 stays parked.
+ * Receiver's slot 1 must continue to deliver even when slot 0 mismatches. */
+static void test_tsch_hop_one_radio_other_unaffected(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    for (int n = 0; n < 2; n++) {
+        radio_medium_register_radio(&rm, n, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+        radio_medium_register_radio(&rm, n, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+        radio_medium_set_radio_channel(&rm, n, 1, 5);
+    }
+    radio_medium_set_radio_channel(&rm, 0, 0, 11);
+    radio_medium_set_radio_channel(&rm, 1, 0, 11);
+
+    int slot0_match = 0, slot1_match = 0;
+    for (int i = 0; i < 16; i++) {
+        /* Hop sender's 2.4 GHz radio between 11 and 26. */
+        int sch = (i & 1) ? 26 : 11;
+        radio_medium_set_radio_channel(&rm, 0, 0, sch);
+        if (radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0)) slot0_match++;
+        if (radio_medium_filter_frame_radio(&rm, 0, 1, 1, 1)) slot1_match++;
+    }
+    /* Slot 0: half the iterations land on ch 11 (matches receiver). */
+    ASSERT_EQ(slot0_match, 8, "slot 0 hopping: half land on ch 11");
+    /* Slot 1: parked on ch 5 both ends, never touched -> all 16 deliver. */
+    ASSERT_EQ(slot1_match, 16, "slot 1 unaffected by slot 0 hops");
+}
+
+/* ====================================================================
+ * Backward compat — single-radio API still works
+ * ==================================================================== */
+
+/* Existing platforms that only ever call radio_medium_set_channel(rm,
+ * n, ch) must continue to work unchanged. The legacy API forwards to
+ * slot 0 and auto-registers the appropriate spectrum. */
+static void test_legacy_set_channel_auto_registers_24ghz(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_set_channel(&rm, 0, 26);
+    radio_medium_set_channel(&rm, 1, 26);
+
+    ASSERT_EQ(rm.nodes[0].radios[0].spectrum, RADIO_SPECTRUM_2_4GHZ_15_4,
+              "legacy 2.4 GHz channel auto-registers spectrum");
+    ASSERT_EQ(rm.nodes[0].radio_count, 1, "single-radio: count = 1");
+    ASSERT_EQ(rm.nodes[0].channel, 26, "legacy alias mirrors slot 0 channel");
+    ASSERT(radio_medium_filter_frame(&rm, 0, 1),
+           "legacy single-radio: same channel passes");
+}
+
+static void test_legacy_set_channel_auto_registers_subghz(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_set_channel(&rm, 0, RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE + 0);
+    radio_medium_set_channel(&rm, 1, RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE + 0);
+
+    ASSERT_EQ(rm.nodes[0].radios[0].spectrum, RADIO_SPECTRUM_868MHZ_15_4G,
+              "legacy sub-GHz channel auto-registers 868 MHz spectrum");
+    ASSERT(radio_medium_filter_frame(&rm, 0, 1),
+           "legacy single-radio sub-GHz: same channel passes");
+}
+
+/* Legacy single-radio API drops on within-band channel mismatch — same
+ * post-refactor enforcement as the per-radio API. */
+static void test_legacy_single_radio_channel_mismatch_drops(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_set_channel(&rm, 0, 11);
+    radio_medium_set_channel(&rm, 1, 26);
+
+    ASSERT(!radio_medium_filter_frame(&rm, 0, 1),
+           "legacy: within-band channel mismatch drops");
+    ASSERT(!radio_medium_filter_byte(&rm, 0, 1, 0xAA),
+           "legacy: within-band channel-mismatch byte drops");
+}
+
+/* Mixing the two APIs on the same node — a subsequent
+ * radio_medium_set_channel call must keep slot 0's channel in sync
+ * with the legacy alias (no drift). */
+static void test_legacy_alias_stays_in_sync(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 1);
+
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_set_radio_channel(&rm, 0, 0, 11);
+    ASSERT_EQ(rm.nodes[0].channel, 11, "alias updated by per-radio set");
+
+    radio_medium_set_radio_channel(&rm, 0, 0, 26);
+    ASSERT_EQ(rm.nodes[0].channel, 26, "alias follows slot-0 hops");
+
+    /* Legacy set_channel also updates the alias. */
+    radio_medium_set_channel(&rm, 0, 15);
+    ASSERT_EQ(rm.nodes[0].channel, 15, "alias updated by legacy set");
+    ASSERT_EQ(rm.nodes[0].radios[0].channel, 15,
+              "legacy set propagates to slot 0");
+}
+
+/* Per-radio frame trackers don't share state. Driving a 2.4 GHz preamble
+ * on slot 0 must not advance slot 1's 802.15.4g sync-word matcher. */
+static void test_per_radio_frame_trackers_are_independent(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    /* Same node has both radios — sender side. */
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 0, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+    radio_medium_register_radio(&rm, 1, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 1, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+
+    /* Drive a complete 802.15.4 frame on slot 0. */
+    uint8_t f1[] = { 0x00,0x00,0x00,0x00, 0x7A, 0x02, 0x11, 0x22 };
+    for (size_t i = 0; i < sizeof(f1); i++)
+        radio_medium_filter_byte_radio(&rm, 0, 0, 1, 0, f1[i]);
+
+    /* Slot 0 tracker advanced; slot 1 tracker untouched. */
+    ASSERT(rm.frame_track[0][0].frame_id > 0,
+           "slot 0 sender tracker fired");
+    ASSERT_EQ(rm.frame_track[0][1].frame_id, 0u,
+              "slot 1 sender tracker never fired");
+    ASSERT_EQ(rm.frame_track[0][1].sync_match, 0u,
+              "slot 1 sync-word matcher untouched");
+}
+
+/* Re-registering a radio with the SAME spectrum is a no-op: it does NOT
+ * reset the tracker mid-frame (so a redundant chip-driver init call
+ * doesn't drop in-flight bytes). */
+static void test_register_same_spectrum_is_noop(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    /* Drive partial preamble. */
+    radio_medium_filter_byte(&rm, 0, 1, 0x00);
+    radio_medium_filter_byte(&rm, 0, 1, 0x00);
+    ASSERT_EQ(rm.frame_track[0][0].state, FRAME_PREAMBLE, "mid-preamble");
+
+    /* Re-register with same spectrum -> tracker should stay. */
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    ASSERT_EQ(rm.frame_track[0][0].state, FRAME_PREAMBLE,
+              "same-spectrum re-register: tracker preserved");
+
+    /* Switch to a different spectrum -> tracker resets. */
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_868MHZ_15_4G);
+    ASSERT_EQ(rm.frame_track[0][0].state, FRAME_IDLE,
+              "spectrum-change register: tracker reset");
+    ASSERT_EQ(rm.frame_track[0][0].profile, RADIO_FRAME_PROFILE_IEEE802154G,
+              "spectrum-change register: profile flipped");
+}
+
+/* The unregistered/legacy "channel-only" path still uses the sub-GHz-base
+ * heuristic for cross-band detection. Two nodes that haven't called
+ * register_radio (only set_channel) still get the legacy cross-band
+ * check based on channel value vs RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE. */
+static void test_unregistered_radio_falls_back_to_channel_heuristic(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    /* Both radios get registered automatically by the legacy
+     * set_channel path (one to 2.4 GHz, the other to sub-GHz), so the
+     * spectrum gate should drop the pair. */
+    radio_medium_set_channel(&rm, 0, 11);
+    radio_medium_set_channel(&rm, 1, RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
+
+    ASSERT(!radio_medium_filter_frame(&rm, 0, 1),
+           "auto-registered cross-band: drops");
+    ASSERT(!radio_medium_filter_byte(&rm, 0, 1, 0xAA),
+           "auto-registered cross-band byte: drops");
+}
+
+/* Non-zero-slot delivery requires both ends to register that slot.
+ * Firefly (slot 1 cc1200) MUST NOT leak bytes onto a single-radio
+ * cc2538dk (slot 1 unregistered). Slot 0 keeps the legacy "unregistered
+ * receiver allows everything" semantic for backward compat. */
+static void test_nonzero_slot_drops_unregistered_receiver(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    /* Sender: dual-radio Firefly. Receiver: single-radio cc2538dk. */
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_register_radio(&rm, 0, 1, RADIO_SPECTRUM_868MHZ_15_4G);
+    radio_medium_register_radio(&rm, 1, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_set_radio_channel(&rm, 0, 0, 26);
+    radio_medium_set_radio_channel(&rm, 0, 1, 5);
+    radio_medium_set_radio_channel(&rm, 1, 0, 26);
+
+    /* Slot 0 -> Slot 0: passes (both are 2.4 GHz on ch 26). */
+    ASSERT(radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
+           "slot 0 (registered) -> slot 0 (registered): passes");
+
+    /* Slot 1 -> Slot 1: receiver has no slot 1 — drop. */
+    ASSERT(!radio_medium_filter_frame_radio(&rm, 0, 1, 1, 1),
+           "slot 1 sub-GHz sender -> slot 1 unregistered receiver: drops");
+    ASSERT(!radio_medium_filter_byte_radio(&rm, 0, 1, 1, 1, 0xAA),
+           "byte: slot 1 -> slot 1 unregistered: drops");
+
+    /* Slot 1 -> Slot 0: spectrum mismatch (sender 868 vs receiver 2.4). */
+    ASSERT(!radio_medium_filter_frame_radio(&rm, 0, 1, 1, 0),
+           "slot 1 sub-GHz -> slot 0 2.4 GHz: drops on spectrum");
+}
+
+/* If receiver_radio is unregistered (NONE) and sender is registered, the
+ * spectrum gate falls back to the channel-heuristic and pairs based on
+ * channel range. Useful as a safety net during partial migrations. */
+static void test_partial_registration_pairs_via_channel(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+
+    /* Sender registers explicit spectrum; receiver only sets channel
+     * via the legacy path. The legacy path auto-registers the matching
+     * spectrum, so this still works. */
+    radio_medium_register_radio(&rm, 0, 0, RADIO_SPECTRUM_2_4GHZ_15_4);
+    radio_medium_set_radio_channel(&rm, 0, 0, 11);
+    radio_medium_set_channel(&rm, 1, 11);  /* legacy path */
+
+    ASSERT(radio_medium_filter_frame(&rm, 0, 1),
+           "partial-reg pair on same band/channel: passes");
+}
+
 /* ==================================================================== */
 
 int run_radio_medium_tests(int verbose) {
@@ -807,13 +1202,13 @@ int run_radio_medium_tests(int verbose) {
 
     /* Channel matching */
     test_channel_match_passes();
-    test_within_band_channel_mismatch_currently_passes();
+    test_within_band_channel_mismatch_drops();
     test_channel_unknown_passes();
 
     /* Cross-band isolation */
     test_cross_band_drops_both_directions();
     test_subghz_same_channel_passes();
-    test_subghz_different_channels_currently_passes();
+    test_subghz_different_channels_drops();
 
     /* UDGM distance */
     test_distance_inside_tx_range_passes();
@@ -846,6 +1241,28 @@ int run_radio_medium_tests(int verbose) {
     test_zero_nodes_no_crash();
     test_self_send_pins_current_behavior();
     test_set_position_bounds();
+
+    /* Multi-radio per node */
+    test_multiradio_register_two_radios_independent();
+    test_multiradio_per_radio_dispatch();
+    test_multiradio_channel_change_isolation();
+    test_multiradio_spectrum_mismatch_same_channel_drops();
+    test_rx_disabled_receiver_drops();
+    test_per_radio_frame_trackers_are_independent();
+    test_register_same_spectrum_is_noop();
+
+    /* TSCH-style hopping */
+    test_tsch_rapid_hopping_per_byte_match();
+    test_tsch_hop_one_radio_other_unaffected();
+
+    /* Backward compat */
+    test_legacy_set_channel_auto_registers_24ghz();
+    test_legacy_set_channel_auto_registers_subghz();
+    test_legacy_single_radio_channel_mismatch_drops();
+    test_legacy_alias_stays_in_sync();
+    test_unregistered_radio_falls_back_to_channel_heuristic();
+    test_nonzero_slot_drops_unregistered_receiver();
+    test_partial_registration_pairs_via_channel();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

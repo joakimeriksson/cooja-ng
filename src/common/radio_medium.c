@@ -12,17 +12,41 @@
 /* IEEE 802.15.4g (CC1200 50 kbps) sync word — see radio_medium.h. */
 #define SUBGHZ_SYNC_WORD  RADIO_FRAME_802154G_SYNC_WORD
 
-/* Cross-band check: drop bytes between sub-GHz and 2.4 GHz nodes. The
- * within-band channel check stays disabled (TSCH hopping makes stale
- * channel values unreliable between ticks), but the cross-band check
- * is needed for dual-radio Firefly fan-out — it isolates CC1200 chatter
- * from cc2538 RF Core nodes (and vice versa) without a real dual-radio
- * refactor. See devices/zoul-firefly/SPEC.md "Radio medium strategy". */
-static inline bool cross_band_drop(int ch_s, int ch_r) {
-    if (ch_s < 0 || ch_r < 0) return false;
-    bool s_sub = (ch_s >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
-    bool r_sub = (ch_r >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE);
-    return s_sub != r_sub;
+/* --- Helpers --- */
+
+static inline bool valid_node(const radio_medium_t *rm, int node) {
+    (void)rm;
+    return node >= 0 && node < RADIO_MEDIUM_MAX_NODES;
+}
+
+static inline bool valid_radio(int idx) {
+    return idx >= 0 && idx < RADIO_MEDIUM_MAX_RADIOS_PER_NODE;
+}
+
+static inline radio_frame_profile_t profile_for_spectrum(radio_spectrum_t s) {
+    switch (s) {
+    case RADIO_SPECTRUM_868MHZ_15_4G:
+    case RADIO_SPECTRUM_915MHZ_15_4G:
+        return RADIO_FRAME_PROFILE_IEEE802154G;
+    default:
+        return RADIO_FRAME_PROFILE_IEEE802154;
+    }
+}
+
+static inline radio_spectrum_t legacy_spectrum_for_channel(int ch) {
+    return (ch >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE)
+        ? RADIO_SPECTRUM_868MHZ_15_4G
+        : RADIO_SPECTRUM_2_4GHZ_15_4;
+}
+
+/* Mark a radio's frame tracker as needing a profile reset. The actual
+ * reset happens lazily when the tracker is next used; here we just stomp
+ * the state so any in-flight pattern is dropped. */
+static void reset_tracker(frame_tracker_t *ft, radio_frame_profile_t prof) {
+    ft->profile = prof;
+    ft->state = FRAME_IDLE;
+    ft->zero_count = 0;
+    ft->sync_match = 0;
 }
 
 /* --- xorshift32 PRNG --- */
@@ -152,8 +176,8 @@ static void track_byte_802154g(radio_medium_t *rm, int sender, uint8_t byte,
     }
 }
 
-static void track_byte(radio_medium_t *rm, int sender, uint8_t byte) {
-    frame_tracker_t *ft = &rm->frame_track[sender];
+static void track_byte(radio_medium_t *rm, int sender, int sender_radio, uint8_t byte) {
+    frame_tracker_t *ft = &rm->frame_track[sender][sender_radio];
     if (ft->profile == RADIO_FRAME_PROFILE_IEEE802154G) {
         track_byte_802154g(rm, sender, byte, ft);
     } else {
@@ -161,7 +185,7 @@ static void track_byte(radio_medium_t *rm, int sender, uint8_t byte) {
     }
 }
 
-/* --- Public API --- */
+/* --- Public API: init / configure --- */
 
 void radio_medium_init(radio_medium_t *rm, int node_count) {
     memset(rm, 0, sizeof(*rm));
@@ -172,6 +196,13 @@ void radio_medium_init(radio_medium_t *rm, int node_count) {
 
     for (int i = 0; i < RADIO_MEDIUM_MAX_NODES; i++) {
         rm->nodes[i].channel = -1;
+        for (int r = 0; r < RADIO_MEDIUM_MAX_RADIOS_PER_NODE; r++) {
+            rm->nodes[i].radios[r].spectrum   = RADIO_SPECTRUM_NONE;
+            rm->nodes[i].radios[r].channel    = -1;
+            /* Default to RX-enabled so platforms that never push
+             * rx_enabled state still deliver bytes. */
+            rm->nodes[i].radios[r].rx_enabled = true;
+        }
     }
 }
 
@@ -186,36 +217,74 @@ void radio_medium_configure_udgm(radio_medium_t *rm, double tx_range,
 }
 
 void radio_medium_set_position(radio_medium_t *rm, int node, double x, double y) {
-    if (node >= 0 && node < RADIO_MEDIUM_MAX_NODES) {
+    if (valid_node(rm, node)) {
         rm->nodes[node].x = x;
         rm->nodes[node].y = y;
-    }
-}
-
-void radio_medium_set_channel(radio_medium_t *rm, int node, int channel) {
-    if (node >= 0 && node < RADIO_MEDIUM_MAX_NODES) {
-        rm->nodes[node].channel = channel;
-        /* Pick the on-air frame profile from the channel range. The
-         * sub-GHz CC1200 lives at channels >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE;
-         * everything else is 2.4 GHz IEEE 802.15.4. */
-        radio_frame_profile_t prof =
-            (channel >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE)
-            ? RADIO_FRAME_PROFILE_IEEE802154G
-            : RADIO_FRAME_PROFILE_IEEE802154;
-        if (rm->frame_track[node].profile != prof) {
-            /* Profile changed — reset the frame tracker so we're not
-             * carrying forward state from the old framing. */
-            rm->frame_track[node].profile = prof;
-            rm->frame_track[node].state = FRAME_IDLE;
-            rm->frame_track[node].zero_count = 0;
-            rm->frame_track[node].sync_match = 0;
-        }
     }
 }
 
 void radio_medium_set_seed(radio_medium_t *rm, uint32_t seed) {
     rm->rng_state = seed ? seed : 0x12345678;
 }
+
+/* --- Per-radio API --- */
+
+void radio_medium_register_radio(radio_medium_t *rm, int node, int radio_idx,
+                                  radio_spectrum_t spectrum) {
+    if (!valid_node(rm, node) || !valid_radio(radio_idx)) return;
+    radio_t *r = &rm->nodes[node].radios[radio_idx];
+    radio_spectrum_t prev = r->spectrum;
+    r->spectrum = spectrum;
+    if (radio_idx + 1 > rm->nodes[node].radio_count)
+        rm->nodes[node].radio_count = radio_idx + 1;
+    /* Reset the frame tracker on spectrum change (or first registration)
+     * so we don't carry stale framing across band switches. */
+    if (prev != spectrum) {
+        reset_tracker(&rm->frame_track[node][radio_idx],
+                      profile_for_spectrum(spectrum));
+    }
+}
+
+void radio_medium_set_radio_channel(radio_medium_t *rm, int node, int radio_idx,
+                                     int channel) {
+    if (!valid_node(rm, node) || !valid_radio(radio_idx)) return;
+    rm->nodes[node].radios[radio_idx].channel = channel;
+    /* Keep the legacy alias in sync for callers that still read
+     * rm->nodes[i].channel directly. The alias tracks radio 0. */
+    if (radio_idx == 0) {
+        rm->nodes[node].channel = channel;
+    }
+}
+
+void radio_medium_set_radio_rx_enabled(radio_medium_t *rm, int node, int radio_idx,
+                                        bool on) {
+    if (!valid_node(rm, node) || !valid_radio(radio_idx)) return;
+    rm->nodes[node].radios[radio_idx].rx_enabled = on;
+}
+
+/* --- Legacy single-radio API --- */
+
+void radio_medium_set_channel(radio_medium_t *rm, int node, int channel) {
+    if (!valid_node(rm, node)) return;
+    /* Auto-register slot 0 with the spectrum implied by the channel
+     * range (sub-GHz vs 2.4 GHz). The legacy path accepts -1 (unknown)
+     * and leaves the spectrum at its current value in that case. */
+    radio_t *r0 = &rm->nodes[node].radios[0];
+    if (channel >= 0) {
+        radio_spectrum_t want = legacy_spectrum_for_channel(channel);
+        if (r0->spectrum != want) {
+            radio_medium_register_radio(rm, node, 0, want);
+        } else if (rm->nodes[node].radio_count == 0) {
+            /* Slot 0 already had this spectrum but radio_count was
+             * never bumped (init path). Make sure the count reflects
+             * the live registration. */
+            rm->nodes[node].radio_count = 1;
+        }
+    }
+    radio_medium_set_radio_channel(rm, node, 0, channel);
+}
+
+/* --- Compute neighbors --- */
 
 void radio_medium_compute_neighbors(radio_medium_t *rm) {
     double tx_range_sq = rm->udgm.tx_range * rm->udgm.tx_range;
@@ -239,16 +308,76 @@ void radio_medium_compute_neighbors(radio_medium_t *rm) {
     }
 }
 
-bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
+/* --- Per-radio match: spectrum + channel + rx_enabled --- */
+
+/* Returns true if the (sender, sender_radio) -> (receiver, receiver_radio)
+ * pair would deliver based on radio identity alone (band match, channel
+ * match, receiver is in RX). The legacy "either channel is -1 -> allow"
+ * semantic is preserved so platforms that never push channel state still
+ * communicate. */
+static bool radio_pair_match(const radio_medium_t *rm,
+                              int sender, int sender_radio,
+                              int receiver, int receiver_radio) {
+    const radio_t *s = &rm->nodes[sender].radios[sender_radio];
+    const radio_t *r = &rm->nodes[receiver].radios[receiver_radio];
+    /* Spectrum gate.
+     *
+     * Both registered: must match — otherwise different bands.
+     *
+     * Sender registered, receiver unregistered: the receiver doesn't
+     * have a radio in this slot at all — drop. This is what stops e.g.
+     * a Firefly's CC1200 (slot 1, 868 MHz) from leaking onto a
+     * cc2538dk's empty slot 1.
+     *
+     * Sender unregistered, receiver registered: same logic, drop.
+     *
+     * Both unregistered: legacy fallback — use the sub-GHz-channel-base
+     * heuristic via the channel field. This keeps platforms that never
+     * call register_radio (or auto-register via the legacy
+     * radio_medium_set_channel API) talking to each other. */
+    bool s_reg = s->spectrum != RADIO_SPECTRUM_NONE;
+    bool r_reg = r->spectrum != RADIO_SPECTRUM_NONE;
+    if (s_reg && r_reg) {
+        if (s->spectrum != r->spectrum) return false;
+    } else if (s_reg != r_reg) {
+        /* One side registered, the other not. For slot 0 we keep the
+         * legacy "unknown receiver allows everything" semantic so a
+         * single-radio platform that never bothered to push channel
+         * state still receives. For non-zero slots we treat the
+         * unregistered side as "no radio on that slot" — drops. This is
+         * what stops a Firefly's CC1200 (slot 1, 868 MHz) from leaking
+         * into a cc2538dk's empty slot 1. */
+        if (sender_radio != 0 || receiver_radio != 0) return false;
+    } else {
+        /* Both unregistered: cross-band drop based on legacy alias. */
+        int sc = s->channel, rc = r->channel;
+        if (sc >= 0 && rc >= 0) {
+            bool s_sub = sc >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE;
+            bool r_sub = rc >= RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE;
+            if (s_sub != r_sub) return false;
+        }
+    }
+    /* Channel match: -1 on either side is "unknown, allow" — TSCH may
+     * not have published its hop yet, and the legacy single-channel API
+     * never tracks per-radio state. Otherwise channels must agree. */
+    if (s->channel >= 0 && r->channel >= 0 && s->channel != r->channel)
+        return false;
+    /* RX-enabled gate: receiver must be willing to listen. */
+    if (!r->rx_enabled) return false;
+    return true;
+}
+
+/* --- Frame-level filter --- */
+
+bool radio_medium_filter_frame_radio(radio_medium_t *rm,
+    int sender, int sender_radio, int receiver, int receiver_radio) {
     if (rm->type == RADIO_MEDIUM_NONE)
         return true;
+    if (!valid_node(rm, sender) || !valid_node(rm, receiver)) return true;
+    if (!valid_radio(sender_radio) || !valid_radio(receiver_radio)) return true;
 
-    /* Cross-band check: same as filter_byte — 2.4 GHz never reaches sub-GHz. */
-    int ch_s = rm->nodes[sender].channel;
-    int ch_r = rm->nodes[receiver].channel;
-    if (cross_band_drop(ch_s, ch_r))
+    if (!radio_pair_match(rm, sender, sender_radio, receiver, receiver_radio))
         return false;
-    /* Within-band channel check disabled — see filter_byte. */
 
     /* Distance-based probabilistic check */
     double prob = udgm_reception_prob(rm, sender, receiver);
@@ -258,6 +387,12 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
         return true;
     return rng_next(rm) < prob;
 }
+
+bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
+    return radio_medium_filter_frame_radio(rm, sender, 0, receiver, 0);
+}
+
+/* --- RSSI --- */
 
 int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver) {
     if (rm->type == RADIO_MEDIUM_NONE)
@@ -281,25 +416,26 @@ int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver)
     return (int8_t)rssi;
 }
 
-bool radio_medium_filter_byte(radio_medium_t *rm, int sender, int receiver, uint8_t byte) {
+/* --- Byte-level filter --- */
+
+bool radio_medium_filter_byte_radio(radio_medium_t *rm,
+    int sender, int sender_radio, int receiver, int receiver_radio, uint8_t byte) {
     /* NONE type: pass everything through */
     if (rm->type == RADIO_MEDIUM_NONE)
         return true;
+    if (!valid_node(rm, sender) || !valid_node(rm, receiver)) return true;
+    if (!valid_radio(sender_radio) || !valid_radio(receiver_radio)) return true;
 
-    /* Track frame boundaries for this sender */
-    track_byte(rm, sender, byte);
+    /* Track frame boundaries for this (sender, sender_radio) — needs to
+     * happen even on dropped bytes so the tracker stays in sync with the
+     * sender's byte stream. */
+    track_byte(rm, sender, sender_radio, byte);
 
-    /* Cross-band check: 2.4 GHz <-> sub-GHz never overhear each other. */
-    int ch_s = rm->nodes[sender].channel;
-    int ch_r = rm->nodes[receiver].channel;
-    if (cross_band_drop(ch_s, ch_r))
+    if (!radio_pair_match(rm, sender, sender_radio, receiver, receiver_radio))
         return false;
-    /* Within-band channel check disabled for now — TSCH channel hopping
-     * makes stale simRadioChannel values unreliable between ticks.
-     * TODO: implement per-event channel sync for TSCH. */
 
     /* UDGM distance-based filtering */
-    frame_tracker_t *ft = &rm->frame_track[sender];
+    frame_tracker_t *ft = &rm->frame_track[sender][sender_radio];
     rx_decision_t *dec = &rm->rx_decisions[sender][receiver];
 
     /* If we're inside a tracked frame, use cached per-frame decision */
@@ -321,4 +457,8 @@ bool radio_medium_filter_byte(radio_medium_t *rm, int sender, int receiver, uint
     double dist_sq = dx * dx + dy * dy;
     double range = rm->udgm.tx_range;
     return dist_sq < (range * range);
+}
+
+bool radio_medium_filter_byte(radio_medium_t *rm, int sender, int receiver, uint8_t byte) {
+    return radio_medium_filter_byte_radio(rm, sender, 0, receiver, 0, byte);
 }
