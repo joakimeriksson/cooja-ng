@@ -1219,6 +1219,36 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
 }
 
 /*
+ * Per-chip TX listener context.
+ *
+ * Each chip's RF TX callback fires with a (node_idx, radio_idx) tag so
+ * the harness can dispatch into the medium's per-radio filter API
+ * without sniffing the byte stream.  Static storage keeps the address
+ * stable across the chip's lifetime, since the TX listener captures it
+ * by pointer.  Slot 0 is the on-board 2.4 GHz radio (CC2420 on MSP430,
+ * cc2538_rfcore on ARM); slot 1 is the off-SoC sub-GHz radio (CC1200
+ * on Firefly).  Native motes don't go through this path — they use
+ * the legacy mixed_rf_tx_handler entry which assumes slot 0.
+ */
+typedef struct {
+    int node_idx;
+    int radio_idx;
+} rf_listener_ctx_t;
+
+static rf_listener_ctx_t rf_ctx_slot0[MAX_NODES];
+static rf_listener_ctx_t rf_ctx_slot1[MAX_NODES];
+
+/* Forward decl — full body lives below. */
+static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t byte);
+
+/* Chip-side TX listener trampoline.  user_data is the per-(node, slot)
+ * rf_listener_ctx_t the chip was registered with. */
+static void mixed_rf_tx_chip_cb(void *user_data, uint8_t byte) {
+    rf_listener_ctx_t *ctx = (rf_listener_ctx_t *)user_data;
+    mixed_rf_tx_handler_radio(ctx->node_idx, ctx->radio_idx, byte);
+}
+
+/*
  * Native (Cooja-mote) channel sync. Emulated nodes push their channel
  * into the medium synchronously through chip-driver callbacks; native
  * motes have no such callback, so we read simRadioChannel and push it
@@ -1353,9 +1383,51 @@ static bool mixed_cc1200_channel_busy(void *user_data) {
  */
 static int rf_tx_depth = 0;
 
+/*
+ * Pick the receiver radio slot that should match a given sender's
+ * (node, radio_idx) emission.  Encodes the radio_pair_match
+ * spectrum-gate logic locally so the per-byte / per-frame loop in
+ * mixed_rf_tx_handler_radio knows which receiver_radio to dispatch to,
+ * keeping the medium API call count at one per receiver (no double-
+ * tracking against slots that aren't going to match).
+ *
+ * Returns the receiver radio_idx, or -1 if no slot matches (drop).
+ */
+static inline int pick_receiver_radio(int sender_idx, int sender_radio,
+                                       int receiver_idx) {
+    radio_spectrum_t s_spec =
+        radio_medium.nodes[sender_idx].radios[sender_radio].spectrum;
+    if (s_spec == RADIO_SPECTRUM_NONE) {
+        /* Sender slot unregistered: legacy "unknown sender allows
+         * everything" — target the receiver's slot 0 (the legacy
+         * single-radio slot). */
+        return 0;
+    }
+    /* Sender registered: find the receiver slot with matching spectrum. */
+    for (int r = 0; r < RADIO_MEDIUM_MAX_RADIOS_PER_NODE; r++) {
+        if (radio_medium.nodes[receiver_idx].radios[r].spectrum == s_spec)
+            return r;
+    }
+    /* No matching spectrum on receiver. Slot 0 unregistered keeps the
+     * legacy "receiver-unknown allows everything" behaviour for
+     * platforms that never call register_radio. */
+    if (radio_medium.nodes[receiver_idx].radios[0].spectrum == RADIO_SPECTRUM_NONE)
+        return 0;
+    return -1;
+}
+
+/* Legacy entry: callers that don't carry a sender_radio (native motes,
+ * JS motes, frame-to-byte conversion in mixed_js_rf_handler) treat the
+ * sender as slot 0. */
 static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     mixed_node_t *sender = (mixed_node_t *)user_data;
     int sender_idx = (int)(sender - nodes);
+    mixed_rf_tx_handler_radio(sender_idx, 0, byte);
+}
+
+static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t byte) {
+    if (sender_idx < 0 || sender_idx >= num_nodes) return;
+    mixed_node_t *sender = &nodes[sender_idx];
     rf_byte_count++;
     channels_dirty = true;
     /* Native sender: pull channel into the medium right now. Chip-emulated
@@ -1413,7 +1485,10 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
                 continue;
             /* Native receiver: pull current channel before the medium decides. */
             sync_native_node_channel(i);
-            if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
+            int rr = pick_receiver_radio(sender_idx, sender_radio, i);
+            if (rr < 0) continue;
+            if (!radio_medium_filter_byte_radio(&radio_medium, sender_idx,
+                                                 sender_radio, i, rr, byte))
                 continue;
             if (nodes[i].type == NODE_NATIVE) {
                 native_rx_assembler_feed(&nodes[i].plat.native, byte);
@@ -1450,7 +1525,10 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
             continue;
         /* Native receiver: pull current channel before the medium decides. */
         sync_native_node_channel(i);
-        if (!radio_medium_filter_byte(&radio_medium, sender_idx, i, byte))
+        int rr = pick_receiver_radio(sender_idx, sender_radio, i);
+        if (rr < 0) continue;
+        if (!radio_medium_filter_byte_radio(&radio_medium, sender_idx,
+                                             sender_radio, i, rr, byte))
             continue;
         if (nodes[i].type == NODE_NATIVE) {
             native_rx_assembler_feed(&nodes[i].plat.native, byte);
@@ -1618,7 +1696,11 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
     int snap_count = 0;
     static int snap_indices[MAX_NODES];
 
-    /* DEBUG: trace frame delivery */
+    /* DEBUG: trace frame delivery (verbose-only) — pick the receiver
+     * slot that matches the sender's spectrum and check it would pass
+     * the spectrum/channel gate.  Skips trackerful filter_byte to keep
+     * the debug print free of side effects on the per-sender frame
+     * tracker. */
     if (verbose) {
         fprintf(stderr, "  [RF] Node %d TX frame (%d bytes) @ %.3f s -> receivers:",
                 nodes[sender_idx].id, tx_asm[sender_idx].expected_len,
@@ -1626,7 +1708,13 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
         for (int i = 0; i < num_nodes; i++) {
             if (i == sender_idx || nodes[i].type == NODE_NATIVE || !node_active(i))
                 continue;
-            if (radio_medium_filter_byte(&radio_medium, sender_idx, i, 0))
+            int rr = pick_receiver_radio(sender_idx, sender_radio, i);
+            if (rr < 0) continue;
+            /* Quick non-probabilistic spectrum/channel check via per-radio
+             * frame filter (UDGM dice roll is deterministic at 100% rx
+             * ratio in the default tests). */
+            if (radio_medium_filter_frame_radio(&radio_medium, sender_idx,
+                                                 sender_radio, i, rr))
                 fprintf(stderr, " %d", nodes[i].id);
         }
         fprintf(stderr, "\n");
@@ -2672,7 +2760,12 @@ static int init_msp430_node(int idx, const char *firmware_path, int node_id) {
     }
 
     msp430_platform_set_console(plat, mixed_uart_callback, node);
-    cc2420_set_rf_listener(&plat->cc2420, mixed_rf_tx_handler, node);
+    /* Per-radio TX listener: CC2420 lives in slot 0. The chip stays
+     * unaware of which slot it occupies; the harness encodes that in
+     * the rf_listener_ctx_t it captures on the chip's side. */
+    rf_ctx_slot0[idx].node_idx  = idx;
+    rf_ctx_slot0[idx].radio_idx = 0;
+    cc2420_set_rf_listener(&plat->cc2420, mixed_rf_tx_chip_cb, &rf_ctx_slot0[idx]);
     plat->cc2420.node_id = node_id;
     /* CC2420's FSCTRL writes push channel via the sim_host_t vtable
      * onto radio slot 0 for this node. Same adapter as the ARM path. */
@@ -2861,7 +2954,11 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     }
 
     arm_platform_set_console(plat, mixed_uart_callback, node);
-    cc2538_rfcore_set_tx_callback(&plat->rfcore, mixed_rf_tx_handler, node);
+    /* Per-radio TX listener: cc2538_rfcore lives in slot 0 (2.4 GHz). */
+    rf_ctx_slot0[idx].node_idx  = idx;
+    rf_ctx_slot0[idx].radio_idx = 0;
+    cc2538_rfcore_set_tx_callback(&plat->rfcore, mixed_rf_tx_chip_cb,
+                                   &rf_ctx_slot0[idx]);
     plat->rfcore.node_id = node_id;
     plat->rfcore.state_callback = mixed_rf_state_handler;
     plat->rfcore.state_user_data = node;
@@ -2874,18 +2971,20 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     plat->host.radio_user_data  = node;
     plat->host.radio_set_channel = mixed_host_radio_set_channel;
 
-    /* Per-node CC1200 fan-out (Firefly only). The chip TX listener
-     * routes through the same mixed_rf_tx_handler used by cc2538_rfcore
-     * — bytes flow into the medium's normal byte stream and the
-     * receiver-side dispatch (in emu_deliver_bytes) feeds bytes to
-     * whichever chip on each receiver matches the sender's channel.
+    /* CC1200 (Firefly only) lives in slot 1 (sub-GHz).  Its TX listener
+     * tags emissions with sender_radio=1 so the medium dispatches them
+     * onto sub-GHz receivers only, with no per-byte sniffing required.
      *
-     * Each Firefly node is parked on a sub-GHz channel by default.
-     * The cross-band filter in radio_medium then keeps CC1200 chatter
-     * from leaking onto the cc2538_rfcore RX path of any 2.4 GHz node
-     * sharing the simulation. */
+     * Receiver-side, mixed_deliver_rf_bytes still feeds both chips on
+     * a Firefly node — the medium's per-radio filter has already
+     * dropped any cross-band bytes by this point, so the unaffected
+     * chip simply doesn't recognise the preamble/sync of bytes that
+     * weren't meant for it. */
     if (pcfg->has_cc1200) {
-        cc1200_set_rf_listener(&plat->cc1200, mixed_rf_tx_handler, node);
+        rf_ctx_slot1[idx].node_idx  = idx;
+        rf_ctx_slot1[idx].radio_idx = 1;
+        cc1200_set_rf_listener(&plat->cc1200, mixed_rf_tx_chip_cb,
+                                &rf_ctx_slot1[idx]);
         cc1200_set_channel_busy_query(&plat->cc1200,
                                        mixed_cc1200_channel_busy, node);
     }
