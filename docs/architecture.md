@@ -125,7 +125,7 @@ flowchart TB
 | `js_test_engine.c`  | COOJA-style JS test harness (QuickJS in a pthread, blocking `YIELD()` coroutine model fed by sim console lines) |
 | `packet_analyzer.c` | 802.15.4 / 6LoWPAN / IPv6 / RPL frame decoder for logs and timeline                                             |
 | `pcap_writer.c`     | libpcap nanosecond-precision writer for Wireshark consumption                                                   |
-| `radio_medium.c`    | UDGM medium: distance-based RX probability, xorshift32 PRNG, 802.15.4 PHY constants                             |
+| `radio_medium.c`    | Per-radio medium: spectrum + channel + RX-enabled gating, distance-based RX probability, xorshift32 PRNG, 802.15.4 + 802.15.4g frame trackers. Detailed reference: [`docs/radio-medium.md`](radio-medium.md). |
 | `sim_event_queue.c` | Min-heap event queue keyed on `(time_ns, seq)` for FIFO at equal times (matches COOJA)                          |
 | `sim_threads.c`     | Optional thread pool with atomic spin barrier for parallel per-node steps                                       |
 | `timeline.c`        | Ring buffer of TX/RX/INTF/LED/log events, JSON + CBOR serialization                                             |
