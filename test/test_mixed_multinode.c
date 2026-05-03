@@ -310,6 +310,43 @@ static int uart_byte_count = 0;
 static radio_medium_t radio_medium;
 static int64_t current_sim_ns = 0;
 
+/* ============================================================
+ * CSIM_TRACE_RADIO — channel + TX + filter trace for debugging
+ * ============================================================
+ * Enabled by `CSIM_TRACE_RADIO=1` env var. When on, every channel
+ * change, frame TX (start + complete), filter decision (deliver
+ * or drop with reason), and per-node CPU step is logged with a
+ * sim_ns timestamp. Output is one line per event, parseable.
+ *
+ * Format:
+ *   [t=12.345678s] event_type field=val field=val ...
+ *
+ * Disabled overhead = one TLS bool check.
+ */
+static int csim_radio_trace = -1;
+int csim_radio_trace_enabled(void) {
+    if (csim_radio_trace < 0) {
+        const char *e = getenv("CSIM_TRACE_RADIO");
+        csim_radio_trace = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return csim_radio_trace;
+}
+#define RTRACE(fmt, ...) do { \
+    if (csim_radio_trace_enabled()) \
+        fprintf(stderr, "[t=%.6fs] " fmt "\n", \
+                (double)current_sim_ns / 1e9, ##__VA_ARGS__); \
+} while (0)
+
+void csim_radio_trace_filter(int s, int sr, int rcv, int rr,
+                              int s_ch, int r_ch, int delivered) {
+    if (delivered)
+        RTRACE("filter sender=%d/%d receiver=%d/%d ch=%d/%d -> DELIVER",
+               s, sr, rcv, rr, s_ch, r_ch);
+    else
+        RTRACE("filter sender=%d/%d receiver=%d/%d ch=%d/%d -> DROP "
+               "(channel_mismatch)", s, sr, rcv, rr, s_ch, r_ch);
+}
+
 /* Optional pcap writer — opened by --pcap PATH, captures every TX frame
  * once at the on-air timestamp. */
 static pcap_writer_t pcap_writer = { 0 };
@@ -1290,6 +1327,10 @@ static void mixed_node_radio_set_channel(mixed_node_t *node, int radio_idx,
      * on slot 1 by convention. The chip drivers already call us with
      * the correct slot, so this is just a defensive sanity guard. */
     if (radio_idx < 0 || radio_idx >= RADIO_MEDIUM_MAX_RADIOS_PER_NODE) return;
+    int prev = radio_medium.nodes[idx].radios[radio_idx].channel;
+    if (prev != channel)
+        RTRACE("ch_set node=%d radio=%d ch=%d (was %d)",
+               idx, radio_idx, channel, prev);
     radio_medium_set_radio_channel(&radio_medium, idx, radio_idx, channel);
     /* Legacy alias — the CCA channel-busy query and a couple of older
      * call sites still read radio_medium.nodes[i].channel directly.
@@ -1430,6 +1471,13 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
     mixed_node_t *sender = &nodes[sender_idx];
     rf_byte_count++;
     channels_dirty = true;
+    if (csim_radio_trace_enabled()) {
+        int s_ch = (sender_idx >= 0 && sender_radio >= 0)
+            ? radio_medium.nodes[sender_idx].radios[sender_radio].channel : -1;
+        RTRACE("tx_byte node=%d radio=%d ch=%d byte=0x%02x state=%d zc=%d",
+               sender_idx, sender_radio, s_ch, byte,
+               tx_asm[sender_idx].state, tx_asm[sender_idx].zero_count);
+    }
     /* Native sender: pull channel into the medium right now. Chip-emulated
      * senders push synchronously through their FSCTRL/FREQ callbacks, so
      * this only matters for native (Cooja) motes. */
@@ -1548,6 +1596,16 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
     /* Feed the per-sender frame assembler */
     if (!tx_frame_asm_feed(&tx_asm[sender_idx], byte))
         return;  /* frame not yet complete */
+
+    if (csim_radio_trace_enabled()) {
+        int s_ch = radio_medium.nodes[sender_idx].radios[sender_radio].channel;
+        RTRACE("tx_frame_complete node=%d radio=%d ch=%d "
+               "subghz=%d expected_len=%d payload_count=%d",
+               sender_idx, sender_radio, s_ch,
+               tx_asm[sender_idx].subghz ? 1 : 0,
+               tx_asm[sender_idx].expected_len,
+               tx_asm[sender_idx].payload_count);
+    }
 
     /* Frame complete — snapshot each receiver's frame data, then deliver.
      * Snapshot is necessary because synchronous delivery triggers auto-ACK,
@@ -3486,20 +3544,30 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
 
 /* Schedule an emulated node's next wakeup */
 static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
+    /* Use current_sim_ns as the wall-clock baseline. cpu->sim_time_ns is
+     * cycle-derived and gets transiently rolled back inside execute_events
+     * callbacks (the cpu's sim_time_ns is recomputed from cycles each time
+     * an event fires, even when the surrounding tick had pinned it to the
+     * scheduler's current time). Computing a sim_eq schedule from a stale
+     * cpu->sim_time_ns can place the wakeup in the past — and because
+     * sim_eq_schedule_if_earlier replaces with earlier times, the node ends
+     * up trapped in a backward-time loop until something else schedules it
+     * forward.  current_sim_ns is the harness's monotonic wall clock and is
+     * the authoritative "now" for cross-node scheduling. */
     int64_t next;
     if (emu_rx_queue[idx].count > 0) {
         /* Match Cooja requestImmediateWakeup(): re-run the mote at the
          * current simulation time, not one microsecond later. */
-        next = node_sim_time_ns(idx);
+        next = current_sim_ns;
         sim_eq_schedule_if_earlier(eq, idx, next);
         return;
     }
     if (nodes[idx].type == NODE_ARM) {
         arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
         if (cpu->next_event_cycle <= cpu->cycles)
-            next = cpu->sim_time_ns;
+            next = current_sim_ns;
         else
-            next = cpu->sim_time_ns + arm_cycles_to_ns(
+            next = current_sim_ns + arm_cycles_to_ns(
                 cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
     } else {
         msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
@@ -3507,9 +3575,9 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
              cpu->serviced_interrupt == -1 &&
              cpu->interrupt_max >= 0) ||
             cpu->next_event_cycle <= cpu->cycles) {
-            next = cpu->sim_time_ns;
+            next = current_sim_ns;
         } else {
-            next = cpu->sim_time_ns + msp430_cycles_to_ns(
+            next = current_sim_ns + msp430_cycles_to_ns(
                 cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
         }
     }

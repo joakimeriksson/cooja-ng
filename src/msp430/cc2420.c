@@ -343,6 +343,24 @@ static void set_state(cc2420_t *r, cc2420_radio_state_t new_state) {
     cc2420_radio_state_t old_state = r->state;
     r->state = new_state;
 
+    /* CSIM_TRACE_RADIO hook: log every state transition for chip-level
+     * debugging. Cheap when disabled (one TLS bool check).
+     *
+     * Note on timestamps: HOST_NOW_NS reads cpu->sim_time_ns, which is
+     * cycle-derived inside execute_events callbacks (the harness's pin
+     * to scheduler-time only persists until the first chip event fires).
+     * The printed t= is therefore the chip's view of "now" rather than
+     * the harness's wall clock, and may lag behind it by a slice's worth
+     * of cycle vs. wall-clock drift.  This is fine for debugging chip
+     * sequencing — the deltas between transitions are still correct —
+     * but don't compare these timestamps to current_sim_ns directly. */
+    extern int csim_radio_trace_enabled(void);
+    if (csim_radio_trace_enabled() && old_state != new_state) {
+        fprintf(stderr, "[t=%.6fs] cc2420 node=%d state %s -> %s\n",
+                (double)HOST_NOW_NS(r) / 1e9, r->node_id,
+                cc2420_state_str(old_state), cc2420_state_str(new_state));
+    }
+
     if (trace_tsch_ack_enabled() && trace_tsch_ack_lines < TRACE_TSCH_ACK_MAX_LINES &&
         r->node_id > 0 && r->node_id <= 2 &&
         old_state != new_state &&
