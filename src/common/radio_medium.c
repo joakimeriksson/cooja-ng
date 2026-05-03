@@ -4,6 +4,7 @@
 #include "radio_medium.h"
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 /* IEEE 802.15.4 (2.4 GHz CC2420/CC2538) PHY constants */
 #define SFD_BYTE        0x7A
@@ -357,11 +358,44 @@ static bool radio_pair_match(const radio_medium_t *rm,
             if (s_sub != r_sub) return false;
         }
     }
-    /* Channel match: -1 on either side is "unknown, allow" — TSCH may
-     * not have published its hop yet, and the legacy single-channel API
-     * never tracks per-radio state. Otherwise channels must agree. */
-    if (s->channel >= 0 && r->channel >= 0 && s->channel != r->channel)
+    /* Channel match: deliberately disabled.
+     *
+     * In a perfect-clock simulator like csim, two TSCH nodes hop in
+     * lockstep but their per-byte channel state at the EXACT delivery
+     * instant doesn't always align with where the sender was at the
+     * EB transmit instant — the slot-boundary jitter that real radios
+     * use to bootstrap association doesn't exist here. Enforcing
+     * channel match drops the EBs that scanners need to associate,
+     * preventing TSCH from converging.
+     *
+     * Cross-band isolation (see s_reg/r_reg block above) still applies,
+     * so 2.4 GHz and sub-GHz traffic don't leak across each other. The
+     * within-band channel field is propagated synchronously by chip
+     * drivers (so visualizations / pcap can show the channel), but the
+     * filter does not gate on it. The original pre-refactor code had
+     * the same behavior with a different mechanism (channel value was
+     * always -1 because nothing pushed it). See git log for context.
+     *
+     * TODO: real fix is harness-level slot-jitter modeling so channels
+     * realistically misalign across nodes by sub-slot offsets, OR a
+     * "recently-used channels" set so EBs sent on channel C reach a
+     * scanner that was on C in the previous N microseconds. */
+    /* Channel match: enforced. Both nodes must be on the same channel
+     * for the frame/byte to be delivered. -1 (unknown) on either side
+     * passes — that's the legacy single-channel API path where channel
+     * was never tracked. Trace hook stays available via CSIM_TRACE_RADIO. */
+    extern int csim_radio_trace_enabled(void);
+    extern void csim_radio_trace_filter(int sender, int sender_radio,
+        int receiver, int receiver_radio, int s_ch, int r_ch, int delivered);
+    if (s->channel >= 0 && r->channel >= 0 && s->channel != r->channel) {
+        if (csim_radio_trace_enabled())
+            csim_radio_trace_filter(sender, sender_radio, receiver,
+                receiver_radio, s->channel, r->channel, 0);
         return false;
+    }
+    if (csim_radio_trace_enabled())
+        csim_radio_trace_filter(sender, sender_radio, receiver,
+            receiver_radio, s->channel, r->channel, 1);
     /* RX-enabled gate: receiver must be willing to listen. */
     if (!r->rx_enabled) return false;
     return true;
