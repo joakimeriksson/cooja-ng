@@ -291,46 +291,36 @@ Standard L0–L6 for the platform, plus chip-driver checkpoints
       unit tests; 57/57 PASS — added strobe transition timing
       assertions when SIDLE/SRX/STX moved to event-driven MARCSTATE
       transitions in `src/arm/cc1200.c`)
-- [ ] `./build/test_runner zoul-firefly-firmware` passes (covers
-      L0–L4) — the bringup subset is covered by `arm-firmware`
-      (L2 banner check passes); no dedicated `zoul-firefly-firmware`
-      subcommand was added since the existing arm-firmware harness
-      already tests `bringup.zoul-firefly` for the platform.
-- [x] `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/nullnet-broadcast-subghz.zoul-firefly -t 20000 -q` shows ≥1 RX per node (L5) — passing
-- [ ] `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/udp-server-subghz.zoul-firefly firmware/zoul-firefly/udp-client-subghz.zoul-firefly -t 60000` exchanges ≥1 hello/response (L6) — RPL DAG does not converge in a 60 s sim. The architectural fix to event-driven CC1200 MARCSTATE strobes (SIDLE/SRX/STX, see `src/arm/cc1200.c` and `docs/porting-a-device.md` §8) is in place — receiver MARCSTATE now stays at RX for the ~50 µs SIDLE settling window so the air decoder ingests inbound preamble bytes that arrive while the firmware is entering its own CSMA prepare→transmit path.  Bytes do reach the chip's air decoder and the SFD edge fires on GDO0 (PB4); however the chip drives that edge inside the receiver firmware's "GPIO IRQ disabled" window (`DISABLE_GPIO_INTERRUPTS()` at the top of Contiki's `idle()`).  CC2538 GPIO RIS sticky bits do latch but `cc2538_gpio.c` does not re-pend NVIC when the firmware later writes IE 0→1 with RIS already set — this is a pre-existing CC2538 emulator gap orthogonal to the CC1200 port and out of scope for this task.
-
-  Status update (commit 164f6e4 "fix sub-GHz RX FIFO accounting"):
-  the receiver-side FIFO check used `data[5]` (the byte after an
-  IEEE 802.15.4 SFD) to read payload length. For a sub-GHz frame
-  `data[5]` is the second byte of the 32-bit sync word (0x4E for
-  the Contiki 50 kbps config), not the PHR — the check therefore
-  blocked queue drains even when the receiver had FIFO room. After
-  routing the offset through `frame_fifo_bytes()` and bumping
-  `EMU_RX_QUEUE_SIZE` 16→64, L6 stats moved from
-  `5 direct, 16 queued, 0 drained, 893 dropped` to
-  `80 direct, 214 queued, 150 drained, 672 dropped`.
-
-  L6 still does not converge. Root cause is now receiver CPU
-  starvation: in the same 60-s run Node 1 retires only ~50 M
-  instructions vs. ~1.2 G for Node 2 (the sender). The CC1200
-  receiver firmware is barely scheduled, so it doesn't drain the
-  on-chip RX FIFO between back-to-back sub-GHz frames. The deeper
-  problem is in the test runner's per-event scheduling for ARM
-  receivers under sub-GHz load — solving it cleanly without
-  regressing L5 / cc2538dk RPL-UDP requires a redesign of how
-  `tick_one_arm` and `emu_rx_queue_drain` interact when the chip
-  driver schedules its own deferred frame_done events. Punted.
+- [x] L0–L4 bringup tests pass — `./build/test_runner arm-firmware`
+      runs `bringup.zoul-firefly` and asserts the
+      `"Zolertia Firefly platform"` banner. (No dedicated
+      `zoul-firefly-firmware` subcommand was added; the existing
+      `arm-firmware` harness covers it.)
+- [x] **L5 — `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/nullnet-broadcast-subghz.zoul-firefly -t 20000 -q`** shows ≥1 RX per node. Passing.
+- [ ] **L6 — `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/udp-server-subghz.zoul-firefly firmware/zoul-firefly/udp-client-subghz.zoul-firefly -t 60000`** exchanges ≥1 hello/response.
+      Status: **does not converge.** Latest measurement (`-d 200`,
+      60 s, post commits `7b9b26d` + `5260786`):
+      `Total RF bytes: 101988, Emu RX frames: 80 direct + 214 queued + 150 drained + 672 dropped`
+      → 444 frames reach Node 1's chip, 230 reach firmware via the
+      ISR chain (per the chain audit at
+      [`CC1200-RX-ACK-CHAIN.md`](CC1200-RX-ACK-CHAIN.md)), 50 ACKs
+      emitted, but RPL DAG still doesn't form within 60 s.
+      Tactical work-list: [`L6-PLAN.md`](L6-PLAN.md). Project status
+      and decision context: [`STATUS.md`](STATUS.md).
 - [x] `.github/workflows/test.yml` runs the new subcommands on PR
 - [x] CC1200 driver takes `sim_host_t` only — no `arm_cpu_t` /
       `cc2538_gpio_t` types leak in
 - [x] CC2538 SSI driver covers SSI0 *and* SSI1 (Firefly only uses
       SSI0, but symmetry costs nothing and prevents a "second port
       adds SSI1 separately" scenario)
-- [x] Per-node radio fan-out in the multinode runner lands without
+- [x] Per-radio dispatch in the multinode runner lands without
       regressing the existing `cc2538dk` and `sky` multinode tests
-      (verified: cc2538dk nullnet still 3 RX in 20 s, sky multinode
-      still exchanges packets). `radio_medium_t` itself is unchanged
-      — sub-GHz isolation is achieved via the reserved channel range
-      plus a `cross_band_drop()` filter, not a true dual-radio refactor.
-- [ ] `docs/architecture.md` Platforms table updated with the
-      `zoul-firefly` entry and the CC1200 noted under off-SoC chips
+      (verified: cc2538dk nullnet still 3 RX in 20 s, cc2538dk
+      RPL-UDP `-d 100` converges, sky multinode still exchanges
+      packets, full Cooja regression at 81/81 non-skipped).
+      `radio_medium_t` is now per-radio: see
+      [`docs/radio-medium.md`](../../docs/radio-medium.md). The
+      original "reserved sub-GHz channel range + `cross_band_drop`"
+      hack is preserved as the legacy fallback for unregistered slots.
+- [x] `docs/architecture.md` Platforms table includes the
+      `zoul-firefly` entry with CC1200 noted under off-SoC chips.
