@@ -1331,6 +1331,23 @@ static void mixed_node_radio_set_channel(mixed_node_t *node, int radio_idx,
     if (prev != channel)
         RTRACE("ch_set node=%d radio=%d ch=%d (was %d)",
                idx, radio_idx, channel, prev);
+    /* Auto-register the radio's spectrum on first channel push if not
+     * already registered. Without this, pick_receiver_radio sees
+     * SPECTRUM_NONE and falls back to "target slot 0" — which routes
+     * CC1200 (slot 1) bytes to the receiver's parked cc2538_rfcore
+     * (slot 0) instead of to its CC1200. Convention:
+     *   slot 0 → 2.4 GHz IEEE 802.15.4 (CC2420 / cc2538_rfcore)
+     *   slot 1 → sub-GHz 802.15.4g (CC1200 EU 868 MHz default)
+     * This is harness-side metadata; chip drivers stay portable
+     * (they just push a (radio_idx, channel) pair). */
+    if (channel >= 0 &&
+        radio_medium.nodes[idx].radios[radio_idx].spectrum
+            == RADIO_SPECTRUM_NONE) {
+        radio_spectrum_t want = (radio_idx == 0)
+            ? RADIO_SPECTRUM_2_4GHZ_15_4
+            : RADIO_SPECTRUM_868MHZ_15_4G;
+        radio_medium_register_radio(&radio_medium, idx, radio_idx, want);
+    }
     radio_medium_set_radio_channel(&radio_medium, idx, radio_idx, channel);
     /* Legacy alias — the CCA channel-busy query and a couple of older
      * call sites still read radio_medium.nodes[i].channel directly.
