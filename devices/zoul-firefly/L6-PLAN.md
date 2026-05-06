@@ -1,38 +1,68 @@
-# L6 RPL-UDP — Tactical Fix List
+# L6 RPL-UDP — RESOLVED 2026-05-06
 
-> Operational doc: open items that gate L6 RPL-UDP convergence on the
-> Zoul Firefly + CC1200 stack in csim. One section per item, ordered by
-> a mix of expected impact and dependency.
+> **L6 is now passing in csim.** Resolution came from two upstream
+> Contiki-NG firmware fixes, not from csim changes. See
+> [`STATUS.md`](STATUS.md) §"L6 RPL-UDP — resolved" for the full
+> narrative; this file is kept for the historical investigation trail.
 >
-> Use this when assigning work or briefing an agent. For "should we
-> still chase L6 at all?" see [`STATUS.md`](STATUS.md). For background
-> on the chain we audited, see
-> [`CC1200-RX-ACK-CHAIN.md`](CC1200-RX-ACK-CHAIN.md).
->
-> Each item has: status, evidence/citation, hypothesis, fix sketch,
-> verification command, and risk notes.
+> The original tactical items below (L6-1 through L6-6) were
+> *symptoms* of the firmware bugs amplified through csim's faithful
+> emulation. With the firmware fixed, the symptoms vanish without any
+> csim-side change.
 
-## Current L6 baseline (as of commit `5260786`)
+## Resolution summary
+
+Two Contiki-NG PR branches:
+
+1. `fix/zoul-cc1200-ack-wait` — Zoul `CSMA_CONF_ACK_WAIT_TIME`
+   `RTIMER_SECOND/200` (5 ms) → `RTIMER_SECOND/40` (25 ms).
+   The 5 ms default is below the cc1200 driver's actual ACK
+   round-trip (~12.5 ms measured). Per IEEE 802.15.4-2015 §6.4.5.4,
+   spec macAckWaitDuration on SUN FSK 50 kbps is ~3.6 ms, but
+   Contiki's cc1200 software auto-ACK path is much slower than spec.
+2. `fix/cc1200-pending-packet-race` — `clock_delay_usec(300)` after
+   the SPI register read in `pending_packet()`. Without it, CSMA's
+   `RTIMER_BUSYWAIT_UNTIL` polls so tightly that the rapid
+   `LOCK_SPI`/`single_read`/`RELEASE_SPI` cycle starves the cc1200
+   RX IRQ chain — ACK is received over the air but never delivered
+   to MAC. Race had been masked for years by the `INFO("RF: Pending")`
+   printf, which provided the same throttle as a UART-blocking side
+   effect when `DEBUG_LEVEL >= 3`.
+
+## Current L6 baseline with fixed firmware (2026-05-06)
 
 ```
 $ ./build/test_runner zoul-firefly-multinode \
-    firmware/zoul-firefly/udp-server-subghz.zoul-firefly \
-    firmware/zoul-firefly/udp-client-subghz.zoul-firefly \
+    firmware/zoul-firefly/udp-server-subghz-fixed.zoul-firefly \
+    firmware/zoul-firefly/udp-client-subghz-fixed.zoul-firefly \
     -t 60000 -d 200
 
+Total RF bytes:    2 242            (was 101 988 — ~50× less)
+Emu RX frames:     26 direct, 1 queued, 1 drained, 0 dropped, 0 collided
+Node 1 (server):   961 M cycles, 10.9 M instructions
+Node 2 (client):   961 M cycles, 11.8 M instructions
+RPL-UDP:           6/6 hello request/response cycles complete
+Speed:             9.4× real-time
+```
+
+Same firmware also converges on real Zolertia Firefly hardware (see
+[`HARDWARE-TEST.md`](HARDWARE-TEST.md)).
+
+## Original baseline (pre-fix) for comparison
+
+```
 Total RF bytes:    101 988
 Emu RX frames:     80 direct + 214 queued + 150 drained + 672 dropped
 Node 1 (server):   1 010 M cycles,    50 M instructions   ← mostly idle WFI
-Node 2 (client):   1 702 M cycles, 1 216 M instructions   ← active
-Firmware-level:    "Not reachable yet" every ~9 s, no DAG, no UDP
-                   exchange
+Node 2 (client):   1 702 M cycles, 1 216 M instructions   ← active retx storm
+Firmware-level:    "Not reachable yet" every ~9 s, no DAG, no UDP exchange
 ```
 
-230 frames make it through the chip's ISR chain (we counted 121 frame
-completions + 50 emitted ACKs in a 30-s run during the audit). RPL just
-doesn't bootstrap.
+230 frames per minute reached Node 1's chip; 50 ACKs emitted; RPL
+never bootstrapped — exactly the failure mode the firmware bugs
+produce. The csim emulation was correct; it was reporting a real bug.
 
-## Open items
+## Original investigation items (historical, all resolved)
 
 ### L6-1: CC1200 `rx_incoming[]` buffer for transient MARC≠RX windows
 
@@ -119,18 +149,34 @@ doesn't bootstrap.
 
 ### L6-4: ACK turnaround timing
 
-- **Status**: open, fidelity item.
+- **Status**: open, **promoted to high-priority** after 2026-05-05
+  hardware test (see [`STATUS.md`](STATUS.md) §Hardware test result).
 - **Evidence**: Audit step 10. csim emits ACKs ~1 byte-period after
   the RX_END event; real CC1200 ACK turnaround is closer to the chip's
   `tx_rx_turnaround` window (typically ~10 ms per
   `cc1200-802154g-863-870-fsk-50kbps.c`). Contiki's
   `CSMA_CONF_ACK_WAIT_TIME` on Zoul is 5 ms (override of the
   csma.h default 400 µs).
-- **Hypothesis**: 5 ms is enough headroom in csim's compressed
-  timeline. Probably not the L6 blocker but worth confirming once
-  L6-1 unblocks the main path.
-- **Verify**: per-frame ACK arrival time in `CSIM_TRACE_RADIO` output —
-  should be < 5 ms after the data frame's last byte.
+  Hardware run on 2026-05-05 shows **server→client unicast takes 8 MAC
+  retxs per packet** (server: `status 2, tx 8`; client: 7×
+  `drop duplicate link layer packet` per seqno). Data arrives every
+  time, but auto-ACK doesn't land in the sender's wait window —
+  exactly the failure mode this item describes, on real silicon.
+- **Hypothesis (revised)**: csim's synchronous auto-ACK (zero
+  turnaround latency) makes csim *too forgiving* — 1-tx delivery
+  where hardware shows 8-tx. To reproduce hardware faithfully, model
+  CC1200 TX→RX→ACK turnaround as a scheduled event ~160–200 µs after
+  RX_END, not synchronous. Also worth confirming whether Contiki's
+  `CSMA_CONF_ACK_WAIT_TIME = 5 ms` is actually being honored on the
+  sender side — if the sender closes its wait window earlier, that's
+  a Contiki bug independent of csim.
+- **Verify**: after modeling turnaround latency, csim should
+  reproduce a non-zero retx rate on unicast frames. Compare
+  retx-per-packet in csim trace vs hardware logs (currently 0 vs 7).
+- **Cross-ref**: this is now arguably a more important fidelity gap
+  than L6-1, because hardware proves the firmware *does* converge —
+  the simulator's job is to faithfully reproduce that path, including
+  its inefficiencies.
 
 ### L6-5: Sub-GHz CCA — RSSI / CARRIER_SENSE settling time
 
@@ -149,15 +195,14 @@ doesn't bootstrap.
 
 ### L6-6: Firmware-level `CSMA_CONF_MAX_FRAME_RETRIES` tuning
 
-- **Status**: needs hardware comparison.
-- **Evidence**: Real CC1200 + Contiki deployments often need tuning
-  beyond defaults. We don't know if the stock Contiki RPL-UDP firmware
-  ever converges on real Firefly hardware with default settings.
-- **Hypothesis**: even with all csim emulator bugs fixed, this
-  specific firmware combination might not converge in 60 s on real
-  hardware either.
-- **Verify**: needs physical hardware (see [`STATUS.md`](STATUS.md)
-  §"Where physical hardware would help").
+- **Status**: **resolved by hardware test 2026-05-05.** Stock
+  Contiki firmware with default `CSMA_CONF_MAX_FRAME_RETRIES` *does*
+  converge on real Firefly hardware (RPL DAG forms, UDP exchange
+  works). The retx storm is real (8 tx per unicast — see L6-4) but
+  the default retry limit is sufficient to push frames through. So
+  the L6 csim failure is not a Contiki tuning gap; it's csim
+  emulation gaps. The productive direction is closing those gaps
+  (L6-1, L6-4 first), not retuning the firmware.
 
 ## Closed items (kept for context)
 
