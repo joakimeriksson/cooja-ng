@@ -605,9 +605,10 @@ void msp430_platform_init(msp430_platform_t *plat,
         } else {
             /* Classic USART0: IFG1 (0x02) bit 7 = TX, bit 6 = RX
              * IE1 (0x00) bit 7 = UTXIE0, bit 6 = URXIE0
-             * Vector 9 = USART0TX, Vector 8 = USART0RX */
+             * Per MSP430F1611 datasheet: USART0 RX vector at 0xFFF2 = vec 9,
+             * USART0 TX vector at 0xFFF0 = vec 8. */
             msp430_usart_set_ifg(&plat->usart0, &plat->sfr_regs[2], 0x80);
-            msp430_usart_set_ie(&plat->usart0, &plat->sfr_regs[0], 0x80, 9, 8);
+            msp430_usart_set_ie(&plat->usart0, &plat->sfr_regs[0], 0x80, 8, 9);
         }
     }
     if (mcu->usart1_base != 0) {
@@ -623,9 +624,13 @@ void msp430_platform_init(msp430_platform_t *plat,
         } else {
             /* Classic USART1: IFG2 (0x03) bit 5 = TX, bit 4 = RX
              * IE2 (0x01) bit 5 = UTXIE1, bit 4 = URXIE1
-             * Vector 7 = USART1TX, Vector 6 = USART1RX */
+             * Per MSP430F1611 datasheet (and MSPSim USART.java): USART1 TX
+             * vector at 0xFFE4 = vec 2, USART1 RX vector at 0xFFE6 = vec 3.
+             * The previous values (7, 6) collided with ADC12 (vec 7) and
+             * TIMERA0 (vec 6), causing UART RX events to spuriously fire
+             * the TIMERA0 ISR. */
             msp430_usart_set_ifg(&plat->usart1, &plat->sfr_regs[3], 0x20);
-            msp430_usart_set_ie(&plat->usart1, &plat->sfr_regs[1], 0x20, 7, 6);
+            msp430_usart_set_ie(&plat->usart1, &plat->sfr_regs[1], 0x20, 2, 3);
         }
     }
 
