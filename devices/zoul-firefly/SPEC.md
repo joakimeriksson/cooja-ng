@@ -297,16 +297,20 @@ Standard L0–L6 for the platform, plus chip-driver checkpoints
       `zoul-firefly-firmware` subcommand was added; the existing
       `arm-firmware` harness covers it.)
 - [x] **L5 — `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/nullnet-broadcast-subghz.zoul-firefly -t 20000 -q`** shows ≥1 RX per node. Passing.
-- [ ] **L6 — `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/udp-server-subghz.zoul-firefly firmware/zoul-firefly/udp-client-subghz.zoul-firefly -t 60000`** exchanges ≥1 hello/response.
-      Status: **does not converge.** Latest measurement (`-d 200`,
-      60 s, post commits `7b9b26d` + `5260786`):
-      `Total RF bytes: 101988, Emu RX frames: 80 direct + 214 queued + 150 drained + 672 dropped`
-      → 444 frames reach Node 1's chip, 230 reach firmware via the
-      ISR chain (per the chain audit at
-      [`CC1200-RX-ACK-CHAIN.md`](CC1200-RX-ACK-CHAIN.md)), 50 ACKs
-      emitted, but RPL DAG still doesn't form within 60 s.
-      Tactical work-list: [`L6-PLAN.md`](L6-PLAN.md). Project status
-      and decision context: [`STATUS.md`](STATUS.md).
+- [x] **L6 — `./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/udp-server-subghz-fixed.zoul-firefly firmware/zoul-firefly/udp-client-subghz-fixed.zoul-firefly -t 60000`** exchanges ≥1 hello/response.
+      Status: **PASSING with corrected Contiki-NG firmware
+      (2026-05-06).** Latest measurement (`-d 200`, 60 s):
+      6/6 hello cycles, `Total RF bytes: 2242, Emu RX frames: 26
+      direct + 1 queued + 1 drained + 0 dropped + 0 collided`,
+      9.4× real-time. The pre-fix failure was caused by two upstream
+      Contiki-NG firmware bugs (Zoul `CSMA_CONF_ACK_WAIT_TIME` 5 ms
+      far below actual ~12.5 ms ACK round-trip; cc1200
+      `pending_packet()` busy-wait race starving the RX IRQ chain
+      via SPI). csim's emulation faithfully exposed both bugs;
+      neither csim change was needed. Same firmware also converges
+      on real Zolertia Firefly hardware. Resolution narrative:
+      [`STATUS.md`](STATUS.md). Historical investigation:
+      [`L6-PLAN.md`](L6-PLAN.md).
 - [x] `.github/workflows/test.yml` runs the new subcommands on PR
 - [x] CC1200 driver takes `sim_host_t` only — no `arm_cpu_t` /
       `cc2538_gpio_t` types leak in
