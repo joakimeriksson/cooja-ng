@@ -101,7 +101,7 @@ else
     SKIP_PATTERNS=""
 fi
 
-TMP_DIR=$(mktemp -d)
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cooja-tests.XXXXXX")
 trap "rm -rf $TMP_DIR" EXIT
 
 passed=0
