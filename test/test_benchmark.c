@@ -450,7 +450,7 @@ static void bench_firmware(const char *name, const char *path) {
         msp430_register_io(&cpu, 0, 4, bench_sfr_read, bench_sfr_write, NULL);
 
         msp430_clock_t clock;
-        msp430_clock_init(&clock, &cpu, cfg->bcs_base, cfg->max_dco_freq);
+        msp430_clock_init(&clock, &cpu, cfg->bcs_base, cfg->max_dco_freq, cfg->clock_type);
 
         msp430_timer_t timer_a, timer_b;
         msp430_timer_init(&timer_a, &cpu, &clock, "Timer_A3",
@@ -470,8 +470,8 @@ static void bench_firmware(const char *name, const char *path) {
         msp430_gpio_add_port(&gpio, 4, 0x1C, -1);
 
         msp430_usart_t usart0, usart1;
-        msp430_usart_init(&usart0, &cpu, cfg->usart0_base, cfg->usart_tx_offset);
-        msp430_usart_init(&usart1, &cpu, cfg->usart1_base, cfg->usart_tx_offset);
+        msp430_usart_init(&usart0, &cpu, cfg->usart0_base, cfg->usart_tx_offset, false);
+        msp430_usart_init(&usart1, &cpu, cfg->usart1_base, cfg->usart_tx_offset, false);
         msp430_usart_set_callback(&usart0, bench_tx_noop, NULL);
         msp430_usart_set_callback(&usart1, bench_tx_noop, NULL);
         msp430_usart_set_ifg(&usart0, &bench_sfr.ifg1, 0x80);
