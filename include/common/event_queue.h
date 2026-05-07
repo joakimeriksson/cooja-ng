@@ -83,9 +83,14 @@ static void execute_events(cpu_t *cpu) {                                       \
         event_t *ev = cpu->event_queue;                                         \
         cpu->event_queue = ev->next;                                            \
         ev->next = NULL;                                                        \
+        /* Sync sim_time_ns from the cycle anchor so freq changes don't
+         * cause sim_time_ns to retroactively miscompute time spent at
+         * previous frequencies. anchor_sim_time_ns + cycles-since-anchor
+         * at the current freq. */                                             \
         if (cpu->cpu_freq_hz > 0)                                              \
-            cpu->sim_time_ns =                                                  \
-                cpu_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);               \
+            cpu->sim_time_ns = cpu->anchor_sim_time_ns +                       \
+                cpu_cycles_to_ns(cpu->cycles - cpu->anchor_cycles,             \
+                                 cpu->cpu_freq_hz);                            \
         ev->fire_ns = 0;                                                        \
         ev->callback(ev->user_data, ev);                                       \
     }                                                                           \
@@ -95,9 +100,15 @@ static void execute_events(cpu_t *cpu) {                                       \
                                                                                 \
 void PREFIX##_cpu_set_frequency(cpu_t *cpu, uint32_t freq_hz) {                \
     if (freq_hz == 0) return;                                                   \
+    /* Sync sim_time_ns to the OLD freq before switching, then re-anchor
+     * cycles+sim_time_ns at the change instant so subsequent
+     * execute_events syncs measure cycles only at the NEW freq. */            \
     if (cpu->cpu_freq_hz > 0)                                                  \
-        cpu->sim_time_ns =                                                      \
-            cpu_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);                   \
+        cpu->sim_time_ns = cpu->anchor_sim_time_ns +                           \
+            cpu_cycles_to_ns(cpu->cycles - cpu->anchor_cycles,                 \
+                             cpu->cpu_freq_hz);                                \
+    cpu->anchor_cycles = cpu->cycles;                                          \
+    cpu->anchor_sim_time_ns = cpu->sim_time_ns;                                \
     cpu->cpu_freq_hz = freq_hz;                                                \
                                                                                 \
     /* Recompute fire_cycle for all ns-based events */                         \

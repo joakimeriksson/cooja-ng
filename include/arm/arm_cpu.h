@@ -135,6 +135,10 @@ typedef struct arm_cpu {
     /* Nanosecond simulation time */
     int64_t      sim_time_ns;
     uint32_t     cpu_freq_hz;
+    /* Anchor for cycle->ns conversion across freq changes — see
+     * msp430_cpu.h for rationale. */
+    int64_t      anchor_cycles;
+    int64_t      anchor_sim_time_ns;
 
     /* Config */
     const arm_config_t *config;

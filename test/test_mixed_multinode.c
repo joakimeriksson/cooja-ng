@@ -260,21 +260,6 @@ typedef struct {
     int head, count;
 } emu_rx_queue_t;
 
-#define MSP_RX_BYTE_QUEUE_SIZE 32768
-typedef struct {
-    int node_idx;
-    int sender_idx;
-    uint8_t byte;
-    int8_t rssi;
-    int64_t time_ns;
-    uint64_t seq;
-} msp_rx_byte_event_t;
-
-typedef struct {
-    msp_rx_byte_event_t heap[MSP_RX_BYTE_QUEUE_SIZE];
-    int count;
-} msp_rx_byte_queue_t;
-
 static mixed_node_t nodes[MAX_NODES];
 static int ticking_node_idx = -1;  /* node currently inside tick_one_msp430 (re-entrancy guard) */
 static int64_t tick_one_msp430(int idx, int64_t sim_ns);  /* forward decl */
@@ -285,7 +270,7 @@ static int cc2420_transmit_count;
 static int tsch_eb_process_count;
 static int tsch_queue_add_count;
 void srh_trace_cb(void *data, uint32_t pc, uint32_t *reg, uint8_t *mem) {
-    (void)data; (void)mem; (void)reg;
+    (void)data; (void)reg; (void)mem;
     /* Track firmware-level cc2420_transmit calls */
     if (srh_trace_fn_addr && pc == srh_trace_fn_addr)
         cc2420_transmit_count++;
@@ -302,10 +287,9 @@ static rf_buffer_t rf_pending[MAX_NODES];
 static tx_frame_asm_t tx_asm[MAX_NODES];     /* per-sender frame assembler */
 static tx_frame_capture_t tx_cap[MAX_NODES]; /* sender-side full-frame capture */
 static emu_rx_queue_t emu_rx_queue[MAX_NODES]; /* per-receiver frame queue */
-static msp_rx_byte_queue_t msp_rx_byte_queue;
 static int64_t emu_rx_end_ns[MAX_NODES];      /* end time of last RX for each emulated receiver */
 static int rf_byte_count = 0;
-static sim_event_queue_t sim_eq;              /* event queue (used by emu_deliver_bytes) */
+static sim_event_queue_t sim_eq;              /* unified event queue: mote wakeups + RX byte deliveries */
 static int uart_byte_count = 0;
 static radio_medium_t radio_medium;
 static int64_t current_sim_ns = 0;
@@ -912,146 +896,35 @@ static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
     stat_emu_rx_queued++;
 }
 
-static bool msp_rx_byte_event_less(const msp_rx_byte_event_t *a,
-                                   const msp_rx_byte_event_t *b) {
-    if (a->time_ns != b->time_ns)
-        return a->time_ns < b->time_ns;
-    return a->seq < b->seq;
-}
-
-static bool msp_rx_byte_event_before_node(const msp_rx_byte_event_t *byte_ev,
-                                          const sim_event_t *node_ev) {
-    if (byte_ev->time_ns != node_ev->time_ns)
-        return byte_ev->time_ns < node_ev->time_ns;
-    return byte_ev->seq < node_ev->seq;
-}
-
-static void msp_rx_byte_heap_swap(msp_rx_byte_queue_t *q, int i, int j) {
-    msp_rx_byte_event_t tmp = q->heap[i];
-    q->heap[i] = q->heap[j];
-    q->heap[j] = tmp;
-}
-
-static void msp_rx_byte_heap_sift_up(msp_rx_byte_queue_t *q, int idx) {
-    while (idx > 0) {
-        int parent = (idx - 1) / 2;
-        if (!msp_rx_byte_event_less(&q->heap[idx], &q->heap[parent]))
-            break;
-        msp_rx_byte_heap_swap(q, idx, parent);
-        idx = parent;
-    }
-}
-
-static void msp_rx_byte_heap_sift_down(msp_rx_byte_queue_t *q, int idx) {
-    while (1) {
-        int smallest = idx;
-        int left = 2 * idx + 1;
-        int right = 2 * idx + 2;
-        if (left < q->count && msp_rx_byte_event_less(&q->heap[left], &q->heap[smallest]))
-            smallest = left;
-        if (right < q->count && msp_rx_byte_event_less(&q->heap[right], &q->heap[smallest]))
-            smallest = right;
-        if (smallest == idx)
-            break;
-        msp_rx_byte_heap_swap(q, idx, smallest);
-        idx = smallest;
-    }
-}
-
-static void msp_rx_byte_queue_push(int idx, int sender_idx, uint8_t byte, int8_t rssi,
-                                   int64_t time_ns) {
-    msp_rx_byte_queue_t *q = &msp_rx_byte_queue;
-    if (q->count >= MSP_RX_BYTE_QUEUE_SIZE) {
-        stat_emu_rx_dropped++;
+/* Process a SIM_EV_RX_BYTE event for an MSP430 receiver. Mirrors Cooja's
+ * MspMoteTimeEvent: execute(t, 0) to advance the receiver's clock, then
+ * receivedByte(), then requestImmediateWakeup. */
+static void deliver_msp430_rx_byte(const sim_event_t *ev) {
+    if (ev->node_idx < 0 || ev->node_idx >= num_nodes ||
+        !node_active(ev->node_idx) || nodes[ev->node_idx].type != NODE_MSP430)
         return;
-    }
-    stat_msp_byte_push[idx]++;
-    if (sender_idx >= 0 && sender_idx < num_nodes &&
-        nodes[sender_idx].id == 2 && nodes[idx].id == 1) {
-        stat_msp_byte_push_2_to_1++;
-    }
-    int slot = q->count++;
-    q->heap[slot].node_idx = idx;
-    q->heap[slot].sender_idx = sender_idx;
-    q->heap[slot].byte = byte;
-    q->heap[slot].rssi = rssi;
-    q->heap[slot].time_ns = time_ns;
-    q->heap[slot].seq = sim_eq.next_seq++;
-    msp_rx_byte_heap_sift_up(q, slot);
-}
-
-static int64_t msp_rx_byte_queue_peek_time(void) {
-    return msp_rx_byte_queue.count > 0 ? msp_rx_byte_queue.heap[0].time_ns : INT64_MAX;
-}
-
-static msp_rx_byte_event_t msp_rx_byte_queue_peek(void) {
-    if (msp_rx_byte_queue.count <= 0) {
-        msp_rx_byte_event_t empty = {
-            .node_idx = -1, .sender_idx = -1, .byte = 0, .rssi = 0,
-            .time_ns = INT64_MAX, .seq = UINT64_MAX
-        };
-        return empty;
-    }
-    return msp_rx_byte_queue.heap[0];
-}
-
-static bool msp_rx_byte_queue_pop(msp_rx_byte_event_t *out) {
-    msp_rx_byte_queue_t *q = &msp_rx_byte_queue;
-    if (q->count <= 0)
-        return false;
-    *out = q->heap[0];
-    q->heap[0] = q->heap[--q->count];
-    if (q->count > 0)
-        msp_rx_byte_heap_sift_down(q, 0);
-    return true;
-}
-
-static void msp_rx_byte_queue_remove_node(int idx) {
-    msp_rx_byte_queue_t *q = &msp_rx_byte_queue;
-    int write = 0;
-    for (int read = 0; read < q->count; read++) {
-        if (q->heap[read].node_idx == idx)
-            continue;
-        if (write != read)
-            q->heap[write] = q->heap[read];
-        write++;
-    }
-    q->count = write;
-    for (int i = q->count / 2 - 1; i >= 0; i--)
-        msp_rx_byte_heap_sift_down(q, i);
-}
-
-static bool drain_msp430_rx_byte_event(int64_t up_to_ns) {
-    msp_rx_byte_event_t ev;
-    if (msp_rx_byte_queue.count <= 0 || msp_rx_byte_queue.heap[0].time_ns > up_to_ns)
-        return false;
-    if (!msp_rx_byte_queue_pop(&ev))
-        return false;
-    if (ev.node_idx < 0 || ev.node_idx >= num_nodes ||
-        !node_active(ev.node_idx) || nodes[ev.node_idx].type != NODE_MSP430)
-        return true;
-    stat_msp_byte_pop[ev.node_idx]++;
-    if (ev.sender_idx >= 0 && ev.sender_idx < num_nodes &&
-        nodes[ev.sender_idx].id == 2 && nodes[ev.node_idx].id == 1) {
+    stat_msp_byte_pop[ev->node_idx]++;
+    if (ev->sender_idx >= 0 && ev->sender_idx < num_nodes &&
+        nodes[ev->sender_idx].id == 2 && nodes[ev->node_idx].id == 1) {
         stat_msp_byte_pop_2_to_1++;
     }
-    int64_t returned_us = sync_msp430_to_time(ev.node_idx, ev.time_ns);
-    cc2420_radio_state_t old_state = nodes[ev.node_idx].plat.msp.cc2420.state;
+    int64_t returned_us = sync_msp430_to_time(ev->node_idx, ev->time_ns);
+    cc2420_radio_state_t old_state = nodes[ev->node_idx].plat.msp.cc2420.state;
     if (trace_tsch_ack_enabled() &&
-        nodes[ev.node_idx].id > 0 && nodes[ev.node_idx].id <= 2) {
+        nodes[ev->node_idx].id > 0 && nodes[ev->node_idx].id <= 2) {
         trace_tsch_ack_log("byte event node=%d byte=%02x t=%.6f state_before=%s",
-                           nodes[ev.node_idx].id,
-                           ev.byte, (double)ev.time_ns / 1e9,
+                           nodes[ev->node_idx].id,
+                           ev->byte, (double)ev->time_ns / 1e9,
                            cc2420_state_str(old_state));
     }
-    nodes[ev.node_idx].plat.msp.cc2420.rx_rssi = ev.rssi;
-    cc2420_receive_byte(&nodes[ev.node_idx].plat.msp.cc2420, ev.byte);
-    cc2420_radio_state_t new_state = nodes[ev.node_idx].plat.msp.cc2420.state;
+    nodes[ev->node_idx].plat.msp.cc2420.rx_rssi = ev->rssi;
+    cc2420_receive_byte(&nodes[ev->node_idx].plat.msp.cc2420, ev->byte);
+    cc2420_radio_state_t new_state = nodes[ev->node_idx].plat.msp.cc2420.state;
     if (trace_tsch_ack_enabled() &&
-        nodes[ev.node_idx].id > 0 && nodes[ev.node_idx].id <= 2 &&
+        nodes[ev->node_idx].id > 0 && nodes[ev->node_idx].id <= 2 &&
         new_state != old_state) {
         trace_tsch_ack_log("byte event node=%d state %s -> %s",
-                           nodes[ev.node_idx].id,
+                           nodes[ev->node_idx].id,
                            cc2420_state_str(old_state),
                            cc2420_state_str(new_state));
     }
@@ -1059,11 +932,10 @@ static bool drain_msp430_rx_byte_event(int64_t up_to_ns) {
         /* Match Cooja's MspMoteTimeEvent + requestImmediateWakeup:
          * execute(t, 0) first, then receivedByte(), then a same-time mote
          * wakeup request. Also retain the next wakeup returned by execute. */
-        int64_t next_ns = ev.time_ns + returned_us * 1000LL;
-        sim_eq_schedule_if_earlier(&sim_eq, ev.node_idx, next_ns);
-        sim_eq_schedule_if_earlier(&sim_eq, ev.node_idx, ev.time_ns);
+        int64_t next_ns = ev->time_ns + returned_us * 1000LL;
+        sim_eq_schedule_if_earlier(&sim_eq, ev->node_idx, next_ns);
+        sim_eq_schedule_if_earlier(&sim_eq, ev->node_idx, ev->time_ns);
     }
-    return true;
 }
 
 /* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
@@ -1569,7 +1441,19 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                 }
                 /* Match Cooja CustomDataRadio delivery: each transmitted byte
                  * is forwarded at the sender's current simulation time. */
-                msp_rx_byte_queue_push(i, sender_idx, byte, rssi, current_sim_ns);
+                stat_msp_byte_push[i]++;
+                if (sender_idx >= 0 && sender_idx < num_nodes &&
+                    nodes[sender_idx].id == 2 && nodes[i].id == 1)
+                    stat_msp_byte_push_2_to_1++;
+                /* Spread bytes by their on-air timing within the frame
+                 * (first_byte_ns + byte_index * byte_period), matching
+                 * Cooja's Msp802154Radio per-byte schedule. Clamp to
+                 * current_sim_ns: if the sender's cycle progression
+                 * lagged the scheduler, byte_time_ns can fall in the
+                 * past — sim_eq must stay monotonic. */
+                { int64_t bt = byte_time_ns;
+                  if (bt < current_sim_ns) bt = current_sim_ns;
+                  sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
             } else {
                 rf_buffer_t *buf = &rf_pending[i];
                 if (buf->count < RF_BUF_SIZE)
@@ -1602,7 +1486,16 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
             /* Match Cooja CustomDataRadio delivery: per-byte receive events
              * are scheduled at the current simulation time of the sender's
              * transmit callback, not with an extra receiver-side byte delay. */
-            msp_rx_byte_queue_push(i, sender_idx, byte, rssi, current_sim_ns);
+            stat_msp_byte_push[i]++;
+            if (sender_idx >= 0 && sender_idx < num_nodes &&
+                nodes[sender_idx].id == 2 && nodes[i].id == 1)
+                stat_msp_byte_push_2_to_1++;
+            /* Spread bytes by on-air timing; clamp to current_sim_ns
+             * to keep the queue monotonic when byte_time_ns falls
+             * behind scheduler. */
+            { int64_t bt = byte_time_ns;
+              if (bt < current_sim_ns) bt = current_sim_ns;
+              sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
         } else {
             rf_buffer_t *buf = &rf_pending[i];
             if (buf->count < RF_BUF_SIZE)
@@ -1727,7 +1620,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
             if (verbose)
                 fprintf(stderr, "  [PKT] Node %d TX: %s\n",
                         nodes[sender_idx].id, pinfo.summary);
-            if (verbose && pinfo.dst_mode == 3 && frame_len < 120) {
+            if (verbose && frame_len < 120 &&
+                (pinfo.dst_mode == 3 || frame_len > 80)) {
                 fprintf(stderr, "  [HEX] ");
                 for (int h = 0; h < frame_len; h++)
                     fprintf(stderr, "%02x", buf[fstart + h]);
@@ -2964,42 +2858,11 @@ static int init_msp430_node(int idx, const char *firmware_path, int node_id) {
            plat->cpu.event_queue ? "yes" : "nil",
            (long long)plat->cpu.next_event_cycle);
 
-    /* MSP430X: patch IPv6 link-local address into uip_ds6_if addr_list.
-     * The firmware's uip_ds6_addr_add can't find free list entries on MSP430X
-     * because after memset to 0, the compiled code's isused check (at entry
-     * offset 16) treats 0 as "in use". This matches Cooja's MspMote which
-     * configures node addresses externally. */
-    if (plat->cpu.config->is_msp430x) {
-        uint32_t ds6 = msp430_elf_find_symbol(firmware_path, "uip_ds6_if");
-        uint32_t lla = msp430_elf_find_symbol(firmware_path, "uip_lladdr");
-        if (ds6 && lla) {
-            uint8_t *mem = plat->cpu.memory;
-            uint8_t ll[8];
-            memcpy(ll, &mem[lla], 8);
-            /* fe80::<IID> with U/L bit toggled */
-            uint8_t ip[16] = {0xfe,0x80, 0,0, 0,0, 0,0,
-                              ll[0]^0x02,ll[1],ll[2],ll[3],ll[4],ll[5],ll[6],ll[7]};
-            /* Entry layout: ipaddr(16) + isused(1) + state(1) + ... = 28 bytes.
-             * Header before addr_list: 18 bytes. */
-            uint32_t e = ds6 + 18;
-            memcpy(&mem[e], ip, 16);
-            mem[e + 16] = 0xFF;  /* isused = non-zero */
-            mem[e + 17] = 0x02;  /* state = PREFERRED */
-            printf("  Patched IPv6 fe80::%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
-                   ip[8],ip[9],ip[10],ip[11],ip[12],ip[13],ip[14],ip[15]);
-
-            /* Patch rpl_has_joined to always return true (RETA with R15=1).
-             * This bypasses the RPL DODAG check for TSCH EB generation. */
-            uint32_t rhj = msp430_elf_find_symbol(firmware_path, "rpl_has_joined");
-            if (rhj) {
-                mem[rhj + 0] = 0x1F;  /* MOV #1, R15 (0x431F) */
-                mem[rhj + 1] = 0x43;
-                mem[rhj + 2] = 0x10;  /* RETA (0x0110) */
-                mem[rhj + 3] = 0x01;
-                printf("  Patched rpl_has_joined → always true\n");
-            }
-        }
-    }
+    /* No firmware patches: Cooja MSPSim runs the firmware unmodified
+     * and so should we. The firmware exports uip_ds6_addr_size and
+     * uip_ds6_netif_addr_list_offset for tools (Cooja's IPAddress.java)
+     * to observe — Cooja never WRITES the addr_list. The firmware does
+     * its own IPv6 setup via uip_ds6_addr_add(). */
 
     return 0;
 }
@@ -3292,7 +3155,7 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
-    msp_rx_byte_queue_remove_node(idx);
+    sim_eq_remove_node(&sim_eq, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
 
@@ -3336,7 +3199,7 @@ static int reboot_node(int idx) {
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
-    msp_rx_byte_queue_remove_node(idx);
+    sim_eq_remove_node(&sim_eq, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
 
@@ -3390,13 +3253,21 @@ static int64_t tick_one_msp430(int idx, int64_t sim_ns) {
         }
     }
 
-    /* Match Cooja's MspMote.execute(t, duration): peripheral events raised
-     * during this execute slice should be scheduled relative to the current
-     * scheduler time t, not a cycle-derived local time that may have drifted.
-     * Keep the CPU's event-time view pinned to sim_ns across the slice. */
+    /* Match Cooja's MspMote.execute(t, duration): peripheral events
+     * raised during this execute slice should be scheduled relative to
+     * the current scheduler time t, not a cycle-derived local time that
+     * may have drifted. Pin sim_time_ns to sim_ns across the slice AND
+     * re-anchor the cycle/ns conversion: the anchor expresses
+     * "sim_time_ns at this cycle count" so subsequent execute_events
+     * re-derives sim_time_ns from sim_ns + cycles-since-anchor at the
+     * current freq, never lagging behind the scheduler. */
     cpu->sim_time_ns = sim_ns;
+    cpu->anchor_sim_time_ns = sim_ns;
+    cpu->anchor_cycles = cpu->cycles;
     int64_t returned_us = msp430_step_micros(cpu, jump_us, 1);
     cpu->sim_time_ns = sim_ns;
+    cpu->anchor_sim_time_ns = sim_ns;
+    cpu->anchor_cycles = cpu->cycles;
 
     if (deviation != 1.0 && returned_us > 0)
         returned_us = (int64_t)((double)returned_us / deviation);
@@ -3431,12 +3302,18 @@ static int64_t tick_one_arm(int idx, int64_t sim_ns) {
         }
     }
 
-    /* Match Cooja's execute(t, duration): peripheral events raised during
-     * this slice should be scheduled relative to the scheduler's time t,
-     * not a cycle-derived local time.  Pin sim_time_ns before and after. */
+    /* Match Cooja's execute(t, duration): peripheral events raised
+     * during this slice should be scheduled relative to the scheduler's
+     * time t, not a cycle-derived local time. Pin sim_time_ns before
+     * and after, AND re-anchor cycles → ns conversion so freq changes
+     * during the slice don't drift sim_time_ns away from sim_ns. */
     cpu->sim_time_ns = sim_ns;
+    cpu->anchor_sim_time_ns = sim_ns;
+    cpu->anchor_cycles = cpu->cycles;
     int64_t returned_us = arm_step_micros(cpu, jump_us, 1);
     cpu->sim_time_ns = sim_ns;
+    cpu->anchor_sim_time_ns = sim_ns;
+    cpu->anchor_cycles = cpu->cycles;
 
     if (deviation != 1.0 && returned_us > 0)
         returned_us = (int64_t)((double)returned_us / deviation);
@@ -4234,6 +4111,7 @@ sim_restart:
                 nodes[i].plat.msp.cpu.pc_trace_lo = 0x3d00;
                 nodes[i].plat.msp.cpu.pc_trace_hi = 0x10000;
                 nodes[i].plat.msp.cpu.pc_trace_fn = srh_trace_cb;
+                nodes[i].plat.msp.cpu.pc_trace_data = &nodes[i];
                 printf("  PC trace: cc2420_transmit=0x%04x eb_process=0xcb32 queue_add=0xb138 (Node %d)\n",
                        tx_addr, nodes[i].id);
             }
@@ -4257,10 +4135,9 @@ sim_restart:
     int64_t ui_interval_ns = 100LL * MS_TO_NS;  /* 100ms sim time between UI updates */
     int64_t next_ui_ns = sim_ns + ui_interval_ns;
 
-    /* Initialize event queue for COOJA-model sequential stepping.
+    /* Initialize event queue for Cooja-model sequential stepping.
      * File-scope so emu_deliver_bytes() can schedule receivers. */
     sim_eq_init(&sim_eq);
-    memset(&msp_rx_byte_queue, 0, sizeof(msp_rx_byte_queue));
     if (num_threads == 0) {
         for (int i = 0; i < node_count; i++) {
             if (node_start_ns[i] >= INT64_MAX) continue;  /* removed node */
@@ -4625,12 +4502,11 @@ sim_restart:
 
             t_phase = get_time_ms();
 
-            /* Process events up to sim_ns */
+            /* Process events up to sim_ns. Single Cooja-style queue holds
+             * both NODE_WAKEUP and RX_BYTE entries; same-time ordering is
+             * the natural FIFO of (time, seq). */
             while (1) {
-                sim_event_t next_node_ev = sim_eq_peek(&sim_eq);
-                msp_rx_byte_event_t next_byte_ev = msp_rx_byte_queue_peek();
-                int64_t next_ev_time = next_node_ev.time_ns < next_byte_ev.time_ns
-                    ? next_node_ev.time_ns : next_byte_ev.time_ns;
+                int64_t next_ev_time = sim_eq_peek_time(&sim_eq);
                 if (next_ev_time > sim_ns)
                     break;
                 /* Match Cooja's simulation.getSimulationTime(): callbacks
@@ -4645,17 +4521,12 @@ sim_restart:
                         spin_trace_count = 1;
                     }
                     if (spin_trace_count == 1000000ULL) {
+                        sim_event_t peek = sim_eq_peek(&sim_eq);
                         fprintf(stderr,
-                                "  [SPIN] t=%.6f node_ev={node=%d time=%.6f seq=%llu} "
-                                "byte_ev={node=%d sender=%d time=%.6f seq=%llu}\n",
+                                "  [SPIN] t=%.6f kind=%d node=%d sender=%d seq=%llu\n",
                                 (double)next_ev_time / 1e9,
-                                next_node_ev.node_idx,
-                                (double)next_node_ev.time_ns / 1e9,
-                                (unsigned long long)next_node_ev.seq,
-                                next_byte_ev.node_idx,
-                                next_byte_ev.sender_idx,
-                                (double)next_byte_ev.time_ns / 1e9,
-                                (unsigned long long)next_byte_ev.seq);
+                                (int)peek.kind, peek.node_idx, peek.sender_idx,
+                                (unsigned long long)peek.seq);
                     }
                 }
                 /* Native channels are now sampled inline at every byte/
@@ -4666,17 +4537,15 @@ sim_restart:
                  * window between sync and filter. */
                 channels_dirty = false;
 
-                /* Cooja has a single EventQueue. MSP byte deliveries are
-                 * MspMoteTimeEvent instances in that same queue, so same-time
-                 * ordering is FIFO by insertion sequence, not a blanket
-                 * node-before-byte rule. */
-                bool do_byte_event = msp_rx_byte_event_before_node(&next_byte_ev, &next_node_ev);
-                if (do_byte_event) {
-                    (void)drain_msp430_rx_byte_event(next_byte_ev.time_ns);
+                sim_event_t ev = sim_eq_pop(&sim_eq);
+
+                /* RX byte deliveries: dispatch to receiver chip and continue. */
+                if (ev.kind == SIM_EV_RX_BYTE) {
+                    deliver_msp430_rx_byte(&ev);
                     continue;
                 }
 
-                sim_event_t ev = sim_eq_pop(&sim_eq);
+                /* NODE_WAKEUP: tick one mote. */
                 int i = ev.node_idx;
                 if (i < 0 || i >= node_count || !node_active(i))
                     continue;
@@ -5034,7 +4903,7 @@ sim_restart:
         rf_byte_count = 0;
         uart_byte_count = 0;
         current_sim_ns = 0;
-        memset(&msp_rx_byte_queue, 0, sizeof(msp_rx_byte_queue));
+        sim_eq_init(&sim_eq);
         stat_rf_frames = 0;
         stat_emu_rx_direct = 0;
         stat_emu_rx_queued = 0;
