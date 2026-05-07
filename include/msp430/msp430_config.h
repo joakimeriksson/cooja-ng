@@ -51,8 +51,15 @@ typedef struct msp430_config {
     int      timer_b_ccr1_vec;  /* shared vector for CCR1+ and overflow */
 
     /* Clock */
-    uint32_t bcs_base;          /* 0x56 for f1611 */
+    uint32_t bcs_base;          /* 0x56 for f1611, 0x160 for fr5969 */
     uint32_t max_dco_freq;      /* 4915200 for f1611 */
+    int      clock_type;        /* 0=BCS (classic), 1=CS (FR5xxx) */
+
+    /* Hardware multiplier */
+    uint32_t hwmul_base;        /* 0x130 for classic, 0x4C0 for FR5xxx */
+
+    /* USCI variant */
+    bool     is_eusci;          /* true for FR5xxx eUSCI; false for classic USART or USCI */
 
     /* GPIO */
     int              gpio_num_ports;
@@ -65,6 +72,7 @@ extern const msp430_config_t msp430f1611_config;
 extern const msp430_config_t msp430f2617_config;
 extern const msp430_config_t msp430f5437_config;
 extern const msp430_config_t cc430f5137_config;
+extern const msp430_config_t msp430fr5969_config;
 
 /* Lookup by name (case-insensitive), returns NULL if not found */
 const msp430_config_t *msp430_config_find(const char *name);

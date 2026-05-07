@@ -31,6 +31,9 @@ typedef struct msp430_usart {
     int                tx_vector;     /* Interrupt vector for TX (USCI: shared TX vector) */
     int                rx_vector;     /* Interrupt vector for RX */
     bool               is_usci;       /* true for USCI (MSP430X), false for classic USART */
+    bool               is_eusci;      /* true for eUSCI (FR5xxx), uses internal IFG/IE */
+    uint16_t           eusci_ifg;     /* Internal IFG register for eUSCI mode */
+    uint16_t           eusci_ie;      /* Internal IE register for eUSCI mode */
     bool               ucswrst;       /* USCI software reset (TX disabled while set) */
     uint8_t            baud_lo;       /* USCI BR0 (baud rate low byte) */
     uint8_t            baud_hi;       /* USCI BR1 (baud rate high byte) */
@@ -40,9 +43,11 @@ typedef struct msp430_usart {
     int                dma_trigger_source;  /* e.g., 9 for USART1 RX */
 } msp430_usart_t;
 
-/* Initialize and register a USART at the given base address */
+/* Initialize and register a USART at the given base address.
+ * is_eusci=true for FR5xxx eUSCI modules (per-module IFG at base+0x1C). */
 void msp430_usart_init(msp430_usart_t *usart, msp430_cpu_t *cpu,
-                        uint32_t base_addr, uint32_t tx_offset);
+                        uint32_t base_addr, uint32_t tx_offset,
+                        bool is_eusci);
 
 /* Set the callback for TX byte output */
 void msp430_usart_set_callback(msp430_usart_t *usart,

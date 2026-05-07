@@ -59,30 +59,110 @@ static void sfr_write(void *user_data, uint32_t addr, int value, bool word, int6
     }
 }
 
-/* Hardware multiplier registers (MSP430F1xx/F2xx at 0x0130-0x013E) */
-#define HW_MPY_BASE  0x0130
-#define HW_MPY       0x0130  /* Multiply unsigned */
-#define HW_MPYS      0x0132  /* Multiply signed */
-#define HW_MAC       0x0134  /* Multiply unsigned and accumulate */
-#define HW_MACS      0x0136  /* Multiply signed and accumulate */
-#define HW_OP2       0x0138  /* Second operand — triggers multiplication */
-#define HW_RESLO     0x013A  /* Result low word */
-#define HW_RESHI     0x013C  /* Result high word */
-#define HW_SUMEXT    0x013E  /* Sum extension register */
+/* Hardware multiplier register offsets (relative to mcu->hwmul_base).
+ * Classic/MSP430X: base 0x0130 (16-bit only).
+ * FR5xxx MPY32:    base 0x04C0 (16-bit subset + 32-bit registers). */
+#define HW_MPY_OFF      0x00  /* MPY    — 16-bit unsigned op1 */
+#define HW_MPYS_OFF     0x02  /* MPYS   — 16-bit signed op1 */
+#define HW_MAC_OFF      0x04  /* MAC    — 16-bit unsigned MAC op1 */
+#define HW_MACS_OFF     0x06  /* MACS   — 16-bit signed MAC op1 */
+#define HW_OP2_OFF      0x08  /* OP2    — 16-bit op2 (triggers 16-bit op) */
+#define HW_RESLO_OFF    0x0A  /* RESLO == RES0 */
+#define HW_RESHI_OFF    0x0C  /* RESHI == RES1 */
+#define HW_SUMEXT_OFF   0x0E  /* SUMEXT */
+/* MPY32 32-bit register set */
+#define HW_MPY32L_OFF   0x10  /* MPY32L  — 32-bit unsigned op1 low (sets mode=0, op_32) */
+#define HW_MPY32H_OFF   0x12  /* MPY32H  — high half of op1 */
+#define HW_MPYS32L_OFF  0x14  /* MPYS32L — 32-bit signed op1 low (sets mode=1, op_32) */
+#define HW_MPYS32H_OFF  0x16
+#define HW_MAC32L_OFF   0x18  /* MAC32L  — 32-bit unsigned MAC op1 low (sets mode=2) */
+#define HW_MAC32H_OFF   0x1A
+#define HW_MACS32L_OFF  0x1C  /* MACS32L — 32-bit signed MAC op1 low (sets mode=3) */
+#define HW_MACS32H_OFF  0x1E
+#define HW_OP2L_OFF     0x20  /* OP2L    — low half of 32-bit op2 (no trigger) */
+#define HW_OP2H_OFF     0x22  /* OP2H    — high half of 32-bit op2 (triggers 32-bit op) */
+#define HW_RES0_OFF     0x24  /* RES0 mirrors RESLO */
+#define HW_RES1_OFF     0x26  /* RES1 mirrors RESHI */
+#define HW_RES2_OFF     0x28  /* RES2 — bits [47:32] of 64-bit result */
+#define HW_RES3_OFF     0x2A  /* RES3 — bits [63:48] of 64-bit result */
+#define HW_MPY32CTL0_OFF 0x2C /* MPY32CTL0 — control: mode/fraction/saturation */
+
+/* Compute the multiplier output for the currently-staged operands.  The op
+ * size (16 vs 32) comes from `op1_32` and how OP2 was written; mode 0/1/2/3
+ * selects MPY/MPYS/MAC/MACS.  Result is stored as the platform's result
+ * registers (RESLO/RESHI for low 32 bits, RES2/RES3 for upper 32 bits). */
+static void mpy_perform(msp430_platform_t *plat, uint32_t op2_lo, uint32_t op2_hi,
+                         bool op2_32) {
+    bool is_signed = (plat->mpy_mode == 1 || plat->mpy_mode == 3);
+    bool is_mac    = (plat->mpy_mode >= 2);
+
+    uint64_t op1, op2, prev = 0;
+    if (plat->mpy_op1_32) {
+        op1 = plat->mpy_op1_word;
+        if (is_signed && (op1 & 0x80000000)) op1 |= 0xFFFFFFFF00000000ULL;
+    } else {
+        op1 = plat->mpy_op1;
+        if (is_signed && (op1 & 0x8000)) op1 |= 0xFFFFFFFFFFFF0000ULL;
+    }
+
+    if (op2_32) {
+        op2 = (op2_hi << 16) | op2_lo;
+        if (is_signed && (op2 & 0x80000000)) op2 |= 0xFFFFFFFF00000000ULL;
+    } else {
+        op2 = op2_lo;
+        if (is_signed && (op2 & 0x8000)) op2 |= 0xFFFFFFFFFFFF0000ULL;
+    }
+
+    uint64_t product = op1 * op2;  /* signed bits already extended */
+
+    if (is_mac) {
+        prev = ((uint64_t)plat->mpy_res3 << 48) | ((uint64_t)plat->mpy_res2 << 32) |
+               ((uint64_t)plat->mpy_reshi << 16) | plat->mpy_reslo;
+        product += prev;
+    }
+
+    plat->mpy_reslo = (uint16_t)(product & 0xFFFF);
+    plat->mpy_reshi = (uint16_t)((product >> 16) & 0xFFFF);
+    plat->mpy_res2  = (uint16_t)((product >> 32) & 0xFFFF);
+    plat->mpy_res3  = (uint16_t)((product >> 48) & 0xFFFF);
+
+    /* SUMEXT mirrors the sign of the 32-bit result for 16-bit signed ops;
+     * for 32-bit ops the upper 32 bits sit in RES2/RES3 and SUMEXT is 0. */
+    if (!plat->mpy_op1_32 && !op2_32 && is_signed)
+        plat->mpy_sumext = (product & 0x80000000ULL) ? 0xFFFF : 0;
+    else
+        plat->mpy_sumext = 0;
+}
 
 static int hwmul_read(void *user_data, uint32_t addr, bool word, int64_t cycles) {
     msp430_platform_t *plat = (msp430_platform_t *)user_data;
     (void)word; (void)cycles;
-    switch (addr) {
-        case HW_MPY:
-        case HW_MPYS:
-        case HW_MAC:
-        case HW_MACS:  return plat->mpy_op1;
-        case HW_OP2:    return plat->mpy_op2;
-        case HW_RESLO:  return plat->mpy_reslo;
-        case HW_RESHI:  return plat->mpy_reshi;
-        case HW_SUMEXT: return plat->mpy_sumext;
-        default:        return 0;
+    uint32_t off = addr - plat->config->mcu->hwmul_base;
+    switch (off) {
+        case HW_MPY_OFF:
+        case HW_MPYS_OFF:
+        case HW_MAC_OFF:
+        case HW_MACS_OFF:    return plat->mpy_op1;
+        case HW_OP2_OFF:     return plat->mpy_op2;
+        case HW_RESLO_OFF:   return plat->mpy_reslo;
+        case HW_RESHI_OFF:   return plat->mpy_reshi;
+        case HW_SUMEXT_OFF:  return plat->mpy_sumext;
+        case HW_MPY32L_OFF:
+        case HW_MPYS32L_OFF:
+        case HW_MAC32L_OFF:
+        case HW_MACS32L_OFF: return (uint16_t)(plat->mpy_op1_word & 0xFFFF);
+        case HW_MPY32H_OFF:
+        case HW_MPYS32H_OFF:
+        case HW_MAC32H_OFF:
+        case HW_MACS32H_OFF: return (uint16_t)(plat->mpy_op1_word >> 16);
+        case HW_OP2L_OFF:    return plat->mpy_op2_lo;
+        case HW_OP2H_OFF:    return plat->mpy_op2;
+        case HW_RES0_OFF:    return plat->mpy_reslo;
+        case HW_RES1_OFF:    return plat->mpy_reshi;
+        case HW_RES2_OFF:    return plat->mpy_res2;
+        case HW_RES3_OFF:    return plat->mpy_res3;
+        case HW_MPY32CTL0_OFF: return plat->mpy_ctl0;
+        default:             return 0;
     }
 }
 
@@ -90,52 +170,51 @@ static void hwmul_write(void *user_data, uint32_t addr, int value, bool word, in
     msp430_platform_t *plat = (msp430_platform_t *)user_data;
     (void)cycles;
     uint16_t val = word ? (uint16_t)value : (uint8_t)value;
+    uint32_t off = addr - plat->config->mcu->hwmul_base;
 
-    switch (addr) {
-        case HW_MPY:   plat->mpy_op1 = val; plat->mpy_mode = 0; break;
-        case HW_MPYS:  plat->mpy_op1 = val; plat->mpy_mode = 1; break;
-        case HW_MAC:   plat->mpy_op1 = val; plat->mpy_mode = 2; break;
-        case HW_MACS:  plat->mpy_op1 = val; plat->mpy_mode = 3; break;
-        case HW_OP2: {
-            /* Writing OP2 triggers the multiplication */
-            plat->mpy_op2 = val;  /* Store for readback (SXT pattern) */
-            uint16_t op1 = plat->mpy_op1;
-            uint16_t op2 = val;
-            uint32_t result;
+    switch (off) {
+        /* 16-bit op1 selectors — clears 32-bit mode and stores low op1. */
+        case HW_MPY_OFF:    plat->mpy_op1 = val; plat->mpy_op1_word = val; plat->mpy_mode = 0; plat->mpy_op1_32 = false; break;
+        case HW_MPYS_OFF:   plat->mpy_op1 = val; plat->mpy_op1_word = val; plat->mpy_mode = 1; plat->mpy_op1_32 = false; break;
+        case HW_MAC_OFF:    plat->mpy_op1 = val; plat->mpy_op1_word = val; plat->mpy_mode = 2; plat->mpy_op1_32 = false; break;
+        case HW_MACS_OFF:   plat->mpy_op1 = val; plat->mpy_op1_word = val; plat->mpy_mode = 3; plat->mpy_op1_32 = false; break;
 
-            switch (plat->mpy_mode) {
-                case 0: /* MPY: unsigned × unsigned */
-                    result = (uint32_t)op1 * (uint32_t)op2;
-                    plat->mpy_reslo = (uint16_t)(result & 0xFFFF);
-                    plat->mpy_reshi = (uint16_t)(result >> 16);
-                    plat->mpy_sumext = 0;
-                    break;
-                case 1: /* MPYS: signed × signed */
-                    result = (uint32_t)((int32_t)(int16_t)op1 * (int32_t)(int16_t)op2);
-                    plat->mpy_reslo = (uint16_t)(result & 0xFFFF);
-                    plat->mpy_reshi = (uint16_t)(result >> 16);
-                    plat->mpy_sumext = (result & 0x80000000) ? 0xFFFF : 0;
-                    break;
-                case 2: /* MAC: unsigned multiply-accumulate */
-                    result = (uint32_t)op1 * (uint32_t)op2;
-                    result += ((uint32_t)plat->mpy_reshi << 16) | plat->mpy_reslo;
-                    plat->mpy_reslo = (uint16_t)(result & 0xFFFF);
-                    plat->mpy_reshi = (uint16_t)(result >> 16);
-                    plat->mpy_sumext = 0; /* carry not tracked for simplicity */
-                    break;
-                case 3: /* MACS: signed multiply-accumulate */
-                    result = (uint32_t)((int32_t)(int16_t)op1 * (int32_t)(int16_t)op2);
-                    result += ((uint32_t)plat->mpy_reshi << 16) | plat->mpy_reslo;
-                    plat->mpy_reslo = (uint16_t)(result & 0xFFFF);
-                    plat->mpy_reshi = (uint16_t)(result >> 16);
-                    plat->mpy_sumext = (result & 0x80000000) ? 0xFFFF : 0;
-                    break;
-            }
+        /* 32-bit op1 selectors — low half write also sets the mode and 32-bit flag.
+         * High half write only updates the upper 16 bits of op1 (no mode change). */
+        case HW_MPY32L_OFF:   plat->mpy_op1_word = (plat->mpy_op1_word & 0xFFFF0000U) | val; plat->mpy_op1 = val; plat->mpy_mode = 0; plat->mpy_op1_32 = true; break;
+        case HW_MPYS32L_OFF:  plat->mpy_op1_word = (plat->mpy_op1_word & 0xFFFF0000U) | val; plat->mpy_op1 = val; plat->mpy_mode = 1; plat->mpy_op1_32 = true; break;
+        case HW_MAC32L_OFF:   plat->mpy_op1_word = (plat->mpy_op1_word & 0xFFFF0000U) | val; plat->mpy_op1 = val; plat->mpy_mode = 2; plat->mpy_op1_32 = true; break;
+        case HW_MACS32L_OFF:  plat->mpy_op1_word = (plat->mpy_op1_word & 0xFFFF0000U) | val; plat->mpy_op1 = val; plat->mpy_mode = 3; plat->mpy_op1_32 = true; break;
+        case HW_MPY32H_OFF:
+        case HW_MPYS32H_OFF:
+        case HW_MAC32H_OFF:
+        case HW_MACS32H_OFF:  plat->mpy_op1_word = (plat->mpy_op1_word & 0x0000FFFFU) | ((uint32_t)val << 16); break;
+
+        case HW_OP2_OFF:
+            /* 16-bit op2 — triggers operation (16x16 or 32x16). */
+            plat->mpy_op2 = val;
+            mpy_perform(plat, val, 0, false);
             break;
-        }
-        case HW_RESLO:  plat->mpy_reslo = val; break;
-        case HW_RESHI:  plat->mpy_reshi = val; break;
-        case HW_SUMEXT: plat->mpy_sumext = val; break;
+
+        case HW_OP2L_OFF:
+            /* Low half of 32-bit op2 — no trigger, just capture. */
+            plat->mpy_op2_lo = val;
+            break;
+
+        case HW_OP2H_OFF:
+            /* High half of 32-bit op2 — triggers 32-bit operation. */
+            plat->mpy_op2 = val;
+            mpy_perform(plat, plat->mpy_op2_lo, val, true);
+            break;
+
+        case HW_RESLO_OFF:
+        case HW_RES0_OFF:    plat->mpy_reslo = val; break;
+        case HW_RESHI_OFF:
+        case HW_RES1_OFF:    plat->mpy_reshi = val; break;
+        case HW_SUMEXT_OFF:  plat->mpy_sumext = val; break;
+        case HW_RES2_OFF:    plat->mpy_res2 = val; break;
+        case HW_RES3_OFF:    plat->mpy_res3 = val; break;
+        case HW_MPY32CTL0_OFF: plat->mpy_ctl0 = val; break;
     }
 }
 
@@ -368,6 +447,15 @@ static const msp430_platform_config_t platform_cc430 = {
     .num_leds       = 0,
 };
 
+/* MSP-EXP430FR5969 LaunchPad: 2 LEDs, backchannel UART on eUSCI_A0. */
+static const msp430_platform_config_t platform_fr5969 = {
+    .name           = "fr5969",
+    .mcu            = &msp430fr5969_config,
+    .console_usart  = 0,
+    .num_leds       = 2,
+    .leds           = { {1, 0}, {4, 6} },  /* P1.0 (red), P4.6 (green) */
+};
+
 static const msp430_platform_config_t *all_platforms[] = {
     &platform_sky,
     &platform_esb,
@@ -375,6 +463,7 @@ static const msp430_platform_config_t *all_platforms[] = {
     &platform_wismote,
     &platform_exp5438,
     &platform_cc430,
+    &platform_fr5969,
     NULL
 };
 
@@ -562,15 +651,20 @@ void msp430_platform_init(msp430_platform_t *plat,
         plat->sfr_regs[3] |= 0x0E;  /* UCB0TXIFG(3) | UCB0RXIFG(2) | UCA0TXIFG(1) */
     }
 
-    /* Hardware multiplier (16-bit: 0x0130-0x013E) */
-    msp430_register_io(&plat->cpu, HW_MPY_BASE, 16, hwmul_read, hwmul_write, plat);
+    /* Hardware multiplier — 16-byte register file at classic base 0x0130;
+     * MPY32 (FR5xxx at base 0x04C0) extends to offset 0x2C, so register
+     * 48 bytes when the MCU has the 32-bit register set. */
+    uint32_t hwmul_size = (mcu->hwmul_base == 0x4C0) ? 48 : 16;
+    msp430_register_io(&plat->cpu, mcu->hwmul_base, hwmul_size,
+                        hwmul_read, hwmul_write, plat);
 
     /* DMA controller — DMACTL0 at 0x0122 (2 bytes) + DMA0 regs at 0x01E0 (8 bytes) */
     msp430_register_io(&plat->cpu, DMACTL0_ADDR, 2, dmactl0_read, dmactl0_write, plat);
     msp430_register_io(&plat->cpu, DMA0CTL_ADDR, 8, dma_ctl_read, dma_ctl_write, plat);
 
-    /* Clock */
-    msp430_clock_init(&plat->clock, &plat->cpu, mcu->bcs_base, mcu->max_dco_freq);
+    /* Clock (BCS for classic/UCS, CS for FR5xxx) */
+    msp430_clock_init(&plat->clock, &plat->cpu, mcu->bcs_base, mcu->max_dco_freq,
+                       mcu->clock_type);
 
     /* Timer A */
     msp430_timer_init(&plat->timer_a, &plat->cpu, &plat->clock, "Timer_A",
@@ -594,9 +688,14 @@ void msp430_platform_init(msp430_platform_t *plat,
     /* USARTs */
     if (mcu->usart0_base != 0) {
         msp430_usart_init(&plat->usart0, &plat->cpu,
-                           mcu->usart0_base, mcu->usart_tx_offset);
-        plat->usart0.is_usci = mcu->is_msp430x;
-        if (mcu->is_msp430x) {
+                           mcu->usart0_base, mcu->usart_tx_offset, mcu->is_eusci);
+        plat->usart0.is_usci = mcu->is_msp430x && !mcu->is_eusci;
+        if (mcu->is_eusci) {
+            /* eUSCI: per-module UCAxIE/UCAxIFG handled inside usart object.
+             * eUSCI_A0 uses interrupt vector 56 on FR5969 (single combined vector). */
+            plat->usart0.tx_vector = 56;
+            plat->usart0.rx_vector = 56;
+        } else if (mcu->is_msp430x) {
             /* USCI_A0: IFG2 (0x03) bit 1 = TX, bit 0 = RX
              * IE2 (0x01) bit 1 = TXIE, bit 0 = RXIE
              * Vector 23 = USCIAB0TX, Vector 22 = USCIAB0RX */
@@ -612,9 +711,13 @@ void msp430_platform_init(msp430_platform_t *plat,
     }
     if (mcu->usart1_base != 0) {
         msp430_usart_init(&plat->usart1, &plat->cpu,
-                           mcu->usart1_base, mcu->usart_tx_offset);
-        plat->usart1.is_usci = mcu->is_msp430x;
-        if (mcu->is_msp430x) {
+                           mcu->usart1_base, mcu->usart_tx_offset, mcu->is_eusci);
+        plat->usart1.is_usci = mcu->is_msp430x && !mcu->is_eusci;
+        if (mcu->is_eusci) {
+            /* eUSCI_A1 uses interrupt vector 51 on FR5969. */
+            plat->usart1.tx_vector = 51;
+            plat->usart1.rx_vector = 51;
+        } else if (mcu->is_msp430x) {
             /* USCI_B0: IFG2 (0x03) bit 3 = TX, bit 2 = RX
              * IE2 (0x01) bit 3 = TXIE, bit 2 = RXIE
              * Vector 23 = USCIAB0TX, Vector 22 = USCIAB0RX (shared with USCI_A0) */

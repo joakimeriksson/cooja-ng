@@ -8,7 +8,7 @@ A fast, multi-architecture emulator and network simulator for Contiki-NG, writte
                        ┌──────────────────────────────────────────┐
                        │           csim test_runner               │
                        │                                          │
-   firmware/*.sky ────►│  MSP430F1611/F2617/F5437/CC430 + CC2420  │
+   firmware/*.sky ────►│  MSP430 F1611/F2617/F5437/CC430/FR5969   │
    firmware/*.cc2538dk►│  ARM Cortex-M3 + CC2538 RF Core          │──► UART, packets,
    firmware/*.cooja  ─►│  Native Cooja motes (dlopen)             │    timeline, UI
                        │                                          │
@@ -60,8 +60,8 @@ Compared to upstream Cooja + MSPSim, csim is roughly an order of magnitude faste
 - **Cycle-accurate timing** — operand-mode cycle tables matching MSPSim, 6-cycle interrupt service, deterministic event scheduling.
 - **Optional JIT** — GNU Lightning compiles hot basic blocks to native code (~430 MIPS for ALU-bound micro-benchmarks on Apple Silicon). Auto-detected via `pkg-config`; without it the interpreter is used everywhere. Disabled for MSP430X by design (extension-word ambiguity).
 - **CC2420 radio** — full state machine matching `CC2420.java`: VREG_OFF → POWER_DOWN → IDLE → calibrate → SFD search → frame reception, plus the TX chain. CCITT-16 with bit reversal, address filtering, auto-ACK, RXFIFO circular buffer, RX "incoming buffer" for bytes that arrive during calibration. ns-based byte timing (16 µs symbol / 32 µs byte / 192 µs cal / 1 ms VREG startup).
-- **Peripherals** — Timer A/B (on-demand counter, CCR compare, capture mode, all clock sources), USART/USCI in UART and SPI mode, GPIO ports P1–P10 with edge-triggered interrupts, DCO clock with the exact MSPSim frequency formula, hardware multiplier (MPY/MPYS/MAC/MACS).
-- **Platforms** — Tmote Sky (F1611), ETH ESB (F149), Zolertia Z1 (F2617), WisMote / EXP5438 (F5437), CC430F5137 eval board.
+- **Peripherals** — Timer A/B (on-demand counter, CCR compare, capture mode, all clock sources), USART / USCI / eUSCI in UART and SPI mode, GPIO ports P1–P10 with edge-triggered interrupts, BCS (classic) and CS (FR5xxx) clock modules with separate MCLK/SMCLK/ACLK sources and dividers, hardware multiplier (16-bit MPY/MPYS/MAC/MACS, plus MPY32 32×32→64 on FR5xxx).
+- **Platforms** — Tmote Sky (F1611), ETH ESB (F149), Zolertia Z1 (F2617), WisMote / EXP5438 (F5437), CC430F5137 eval board, MSP-EXP430FR5969 LaunchPad (FR5969 with FRAM and eUSCI).
 - **Debug helpers** — ELF loader with symbol lookup, instruction-level tracing hooks, JIT cache inspection.
 
 ### ARM Cortex-M3 emulator (`src/arm/`)
@@ -204,7 +204,8 @@ Node platform is auto-detected from the firmware extension:
 
 | Extension | Platform |
 |---|---|
-| `.sky` | MSP430 (Tmote Sky + CC2420) |
+| `.sky` | MSP430 (Tmote Sky + CC2420) — also the default for `.z1`, `.esb`, `.wismote`, `.exp5438` |
+| `.msp430fr5969` | MSP430 (MSP-EXP430FR5969 LaunchPad, FRAM, no radio) |
 | `.cc2538dk` | ARM Cortex-M3 (CC2538 + on-chip 802.15.4) |
 | `.cooja` | Native Cooja shared library |
 
