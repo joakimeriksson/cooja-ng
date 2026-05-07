@@ -125,6 +125,12 @@ typedef struct {
     uint32_t frame_id;  /* unique ID for current frame */
     int phr_hi;         /* 802.15.4g: top 3 bits of 11-bit length */
     radio_frame_profile_t profile;  /* updated when set_channel changes band */
+    /* Sender's channel at the moment this frame started, snapshotted at
+     * SFD detection. The per-byte channel filter compares the receiver's
+     * current channel to this snapshot, not to the sender's current
+     * channel — matches Cooja's createConnections() semantic and real
+     * hardware (chip is committed to TX channel for the frame duration). */
+    int frame_start_channel;
 } frame_tracker_t;
 
 /* Per-(sender,receiver) frame decision cache */
@@ -132,6 +138,13 @@ typedef struct {
     uint32_t frame_id;
     bool decided;       /* true if we've rolled the dice for this frame */
     bool drop;          /* true if this frame should be dropped */
+    /* Channel-match decision frozen at the first byte we processed for
+     * this (sender, receiver) pair for the current frame_id. Mirrors
+     * Cooja's RadioConnection destination set: once the receiver's
+     * channel matched the sender's channel at frame start, we keep
+     * delivering even if either side retunes mid-frame. */
+    bool channel_decided;
+    bool channel_match;
 } rx_decision_t;
 
 /* Precomputed neighbor list per node */

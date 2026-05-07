@@ -48,6 +48,8 @@ static void reset_tracker(frame_tracker_t *ft, radio_frame_profile_t prof) {
     ft->state = FRAME_IDLE;
     ft->zero_count = 0;
     ft->sync_match = 0;
+    ft->frame_id = 0;
+    ft->frame_start_channel = -1;
 }
 
 /* --- xorshift32 PRNG --- */
@@ -86,18 +88,26 @@ static double udgm_reception_prob(const radio_medium_t *rm, int sender, int rece
 
 /* --- Frame tracking state machine --- */
 
-/* Mark a new frame: bump frame_id and invalidate per-receiver decisions
- * so each receiver gets a fresh dice roll for this frame. */
-static void start_new_frame(radio_medium_t *rm, int sender, frame_tracker_t *ft) {
+/* Mark a new frame: bump frame_id, invalidate per-receiver decisions
+ * so each receiver gets a fresh dice roll for this frame, and snapshot
+ * the sender's current channel — this is the channel the per-byte
+ * filter will compare receivers' channels against for the duration of
+ * the frame, mirroring Cooja's createConnections() / a real radio's
+ * commitment to the TX-start channel. */
+static void start_new_frame(radio_medium_t *rm, int sender, int sender_radio,
+                            frame_tracker_t *ft) {
     ft->frame_id = ++rm->next_frame_id;
+    ft->frame_start_channel = rm->nodes[sender].radios[sender_radio].channel;
     for (int r = 0; r < rm->node_count; r++) {
         rm->rx_decisions[sender][r].decided = false;
         rm->rx_decisions[sender][r].frame_id = ft->frame_id;
+        rm->rx_decisions[sender][r].channel_decided = false;
+        rm->rx_decisions[sender][r].channel_match = false;
     }
 }
 
-static void track_byte_802154(radio_medium_t *rm, int sender, uint8_t byte,
-                               frame_tracker_t *ft) {
+static void track_byte_802154(radio_medium_t *rm, int sender, int sender_radio,
+                               uint8_t byte, frame_tracker_t *ft) {
     switch (ft->state) {
     case FRAME_IDLE:
         if (byte == 0x00) {
@@ -111,7 +121,7 @@ static void track_byte_802154(radio_medium_t *rm, int sender, uint8_t byte,
             ft->zero_count++;
         } else if (byte == SFD_BYTE && ft->zero_count >= MIN_PREAMBLE) {
             ft->state = FRAME_SFD;
-            start_new_frame(rm, sender, ft);
+            start_new_frame(rm, sender, sender_radio, ft);
         } else {
             ft->state = FRAME_IDLE;
             ft->zero_count = 0;
@@ -138,8 +148,8 @@ static void track_byte_802154(radio_medium_t *rm, int sender, uint8_t byte,
     }
 }
 
-static void track_byte_802154g(radio_medium_t *rm, int sender, uint8_t byte,
-                                frame_tracker_t *ft) {
+static void track_byte_802154g(radio_medium_t *rm, int sender, int sender_radio,
+                                uint8_t byte, frame_tracker_t *ft) {
     switch (ft->state) {
     case FRAME_IDLE:
     case FRAME_PREAMBLE:
@@ -147,7 +157,7 @@ static void track_byte_802154g(radio_medium_t *rm, int sender, uint8_t byte,
         ft->sync_match = (ft->sync_match << 8) | byte;
         if (ft->sync_match == SUBGHZ_SYNC_WORD) {
             ft->state = FRAME_PHR_LO;
-            start_new_frame(rm, sender, ft);
+            start_new_frame(rm, sender, sender_radio, ft);
         } else {
             ft->state = FRAME_PREAMBLE;  /* keep sliding */
         }
@@ -180,9 +190,9 @@ static void track_byte_802154g(radio_medium_t *rm, int sender, uint8_t byte,
 static void track_byte(radio_medium_t *rm, int sender, int sender_radio, uint8_t byte) {
     frame_tracker_t *ft = &rm->frame_track[sender][sender_radio];
     if (ft->profile == RADIO_FRAME_PROFILE_IEEE802154G) {
-        track_byte_802154g(rm, sender, byte, ft);
+        track_byte_802154g(rm, sender, sender_radio, byte, ft);
     } else {
-        track_byte_802154(rm, sender, byte, ft);
+        track_byte_802154(rm, sender, sender_radio, byte, ft);
     }
 }
 
@@ -316,7 +326,7 @@ void radio_medium_compute_neighbors(radio_medium_t *rm) {
  * match, receiver is in RX). The legacy "either channel is -1 -> allow"
  * semantic is preserved so platforms that never push channel state still
  * communicate. */
-static bool radio_pair_match(const radio_medium_t *rm,
+static bool radio_pair_match(radio_medium_t *rm,
                               int sender, int sender_radio,
                               int receiver, int receiver_radio) {
     const radio_t *s = &rm->nodes[sender].radios[sender_radio];
@@ -358,44 +368,59 @@ static bool radio_pair_match(const radio_medium_t *rm,
             if (s_sub != r_sub) return false;
         }
     }
-    /* Channel match: deliberately disabled.
+    /* Channel match: per-frame, snapshotted at frame start. This mirrors
+     * Cooja's UDGM.createConnections() (called once at TX-start) and
+     * real-radio physics: once the sender's chip has strobed into TX
+     * and the receiver has locked onto preamble+SFD into RX_FRAME, both
+     * are committed for the duration of the frame. Subsequent FSCTRL
+     * writes by firmware don't retune the analog front-end mid-frame.
      *
-     * In a perfect-clock simulator like csim, two TSCH nodes hop in
-     * lockstep but their per-byte channel state at the EXACT delivery
-     * instant doesn't always align with where the sender was at the
-     * EB transmit instant — the slot-boundary jitter that real radios
-     * use to bootstrap association doesn't exist here. Enforcing
-     * channel match drops the EBs that scanners need to associate,
-     * preventing TSCH from converging.
+     * Implementation:
+     *   - inside a frame (ft->frame_id > 0): sender's effective channel
+     *     is the snapshot taken in start_new_frame() — not the live
+     *     value (which may have advanced during the same scheduler tick
+     *     as the byte was queued). The receiver's channel at the FIRST
+     *     byte we filter for this (sender, receiver) pair is frozen via
+     *     the rx_decisions cache, so later retunes on either side don't
+     *     break in-flight delivery.
+     *   - outside a frame (preamble bytes before SFD lock, or
+     *     synchronization-only paths): use the live channel values; no
+     *     frame is in flight to be committed to.
      *
-     * Cross-band isolation (see s_reg/r_reg block above) still applies,
-     * so 2.4 GHz and sub-GHz traffic don't leak across each other. The
-     * within-band channel field is propagated synchronously by chip
-     * drivers (so visualizations / pcap can show the channel), but the
-     * filter does not gate on it. The original pre-refactor code had
-     * the same behavior with a different mechanism (channel value was
-     * always -1 because nothing pushed it). See git log for context.
-     *
-     * TODO: real fix is harness-level slot-jitter modeling so channels
-     * realistically misalign across nodes by sub-slot offsets, OR a
-     * "recently-used channels" set so EBs sent on channel C reach a
-     * scanner that was on C in the previous N microseconds. */
-    /* Channel match: enforced. Both nodes must be on the same channel
-     * for the frame/byte to be delivered. -1 (unknown) on either side
-     * passes — that's the legacy single-channel API path where channel
-     * was never tracked. Trace hook stays available via CSIM_TRACE_RADIO. */
+     * -1 (unknown) on either side passes — legacy single-channel API
+     * path where channel was never tracked. Cross-band isolation above
+     * still applies. Trace hook stays available via CSIM_TRACE_RADIO. */
     extern int csim_radio_trace_enabled(void);
     extern void csim_radio_trace_filter(int sender, int sender_radio,
         int receiver, int receiver_radio, int s_ch, int r_ch, int delivered);
-    if (s->channel >= 0 && r->channel >= 0 && s->channel != r->channel) {
+    const frame_tracker_t *ft = &rm->frame_track[sender][sender_radio];
+    int s_eff_channel = s->channel;
+    bool channel_ok;
+    if (ft->frame_id > 0) {
+        rx_decision_t *dec = &rm->rx_decisions[sender][receiver];
+        s_eff_channel = ft->frame_start_channel;
+        if (dec->channel_decided && dec->frame_id == ft->frame_id) {
+            channel_ok = dec->channel_match;
+        } else {
+            channel_ok = (s_eff_channel < 0 || r->channel < 0 ||
+                          s_eff_channel == r->channel);
+            dec->frame_id = ft->frame_id;
+            dec->channel_match = channel_ok;
+            dec->channel_decided = true;
+        }
+    } else {
+        channel_ok = (s->channel < 0 || r->channel < 0 ||
+                      s->channel == r->channel);
+    }
+    if (!channel_ok) {
         if (csim_radio_trace_enabled())
             csim_radio_trace_filter(sender, sender_radio, receiver,
-                receiver_radio, s->channel, r->channel, 0);
+                receiver_radio, s_eff_channel, r->channel, 0);
         return false;
     }
     if (csim_radio_trace_enabled())
         csim_radio_trace_filter(sender, sender_radio, receiver,
-            receiver_radio, s->channel, r->channel, 1);
+            receiver_radio, s_eff_channel, r->channel, 1);
     /* RX-enabled gate: receiver must be willing to listen. */
     if (!r->rx_enabled) return false;
     return true;
