@@ -76,6 +76,31 @@ Verification — zero regressions:
   - 68/68 MSP430 + 48/48 ARM correctness (33 base + 15 M4 DSP)
   - ARM Firefly bringup PASS, cc2538dk RPL-UDP 26 RX, 11.0× real-time
 
+## Towards L5–L6 (RPL-UDP)
+
+The remaining work is dominated by the on-chip RADIO peripheral at
+0x40001000. Estimated dependency chain:
+
+  - **TIMER0..4** (0x40008000+): Contiki TSCH/MAC may schedule precise
+    deadlines via TIMER. CSMA might not need it; check what RPL-UDP
+    over CSMA actually exercises.
+  - **RNG** (0x4000D000): Contiki uses random for CSMA backoff and for
+    seeding RPL DAG IDs. Tiny stub: VALRDY event + VALUE register.
+  - **NVMC / FICR** (0x10000000): firmware reads FICR.DEVICEADDR for
+    the IEEE EUI-64. Per-node patching done by the multinode runner.
+  - **RADIO** (0x40001000) — **the dominant work**. nRF52840 RADIO in
+    802.15.4 mode uses EasyDMA for frame buffers, hardware shorts to
+    chain state transitions (RXREADY→START, END→DISABLE, etc.), and
+    a state machine: DISABLED → RXRU → RXIDLE → RX → RXIDLE → ...
+    Plus interrupts (READY, END, DISABLED, FRAMESTART, CRCOK,
+    BCMATCH). Comparable to the CC1200 driver in scope.
+  - **Multinode harness** (`test_mixed_multinode.c`): recognise the
+    `.nrf52840-dongle` extension, init the platform, register the
+    radio TX callback to the medium, fan-out medium→radio bytes,
+    patch FICR.DEVICEADDR per-node.
+
+Each step lands as its own commit, same shape as everything to date.
+
 ## Why this port, why this board
 
 - **Why nRF52840:** large installed base (Particle Argon, Adafruit
@@ -197,25 +222,41 @@ Explicitly **not** part of this port:
 be created if and when the port reaches the corresponding stage.
 Don't pre-create empty docs.)
 
-## Next concrete step
+## L3 milestone — Contiki main loop alive on RTC IRQ
 
-After the hello-world output, the firmware parks at PC=0x00004b30 —
-the next unmodelled peripheral. Likely **RTC** for Contiki's etimer
-process (the main loop wants to schedule periodic wake-ups). Find out
-which IO address it's reading and add the corresponding stub:
-  - Disassemble around 0x4b30 to see which peripheral base register
-    is being polled.
-  - Most likely candidate: RTC1 at 0x40011000 (Contiki uses RTC1 for
-    its tick source) — model COUNTER (0x504) + EVENTS_COMPARE[0]
-    (0x140) + start/stop tasks.
-  - Possible alternative: GPIOTE / POWER if firmware sleeps via WFI
-    and waits for an event.
+After the hello-world banner, the firmware was parking at PC=0x4b30
+which is the `dmb sy` immediately after `wfi` in `platform_idle`:
 
-Iterate: each new spin discovers the next peripheral. The L4 milestone
-("`Starting Contiki-NG-…` + on-chip RADIO probe") will need RTC,
-TIMER, and the on-chip RADIO (0x40001000 — note: confusingly, RADIO
-is at 0x40001000, while CLOCK is at 0x40000000 because they share the
-same peripheral ID 0).
+```
+4b1e: bl  int_master_read_and_disable    @ disable IRQs
+4b28: bl  process_nevents
+4b2c: cbnz r0, 4b30                       @ skip wfi if events queued
+4b2e: wfi                                 @ sleep until interrupt
+4b30: dmb sy                              @ ← was stuck here
+4b3a: b.w int_master_status_set           @ re-enable IRQs (takes pending IRQ)
+```
+
+Two pieces unblock the loop:
+
+  - **RTC0** stub (0x4000B000) — 24-bit counter + TICK / OVRFLW /
+    COMPARE[0..3] events + INTENSET/INTENCLR + PRESCALER + CC. The
+    counter advances via a recurring TICK event scheduled on the ARM
+    event queue; on each tick we latch EVENTS_TICK and (if INTENSET.TICK
+    is set) raise the RTC0 NVIC IRQ (vector 11). Counter reads compute
+    a value lazily from `(cycles - anchor_cycles) / tick_period_cycles`.
+  - **WFI handling fix in arm_cpu.c** — Cortex-M `wfi` wakes on any
+    pending interrupt regardless of PRIMASK. The previous code only
+    cleared `cpu_off` if `arm_nvic_check_pending` actually took the
+    exception, which it skips when PRIMASK=1. Result: with the
+    `disable IRQ → wfi → re-enable` idle pattern, the CPU never woke.
+    Fix: clear `cpu_off` on any pending IRQ; the IRQ fires later when
+    PRIMASK clears. Affects every ARM platform; CC2538 just doesn't
+    use this idle pattern.
+
+The firmware is now alive end-to-end: PC oscillates between
+`platform_idle` (0x4b30 wfi), the RTC IRQ entry (0x4d62), some etimer
+pump path (0xbd58), and back. ~70× real-time speed. The hello-world
+example prints once and idles forever, exactly as expected.
 
 For the architectural reference, the boundary nRF peripherals plug
 into:
