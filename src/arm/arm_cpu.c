@@ -2218,6 +2218,47 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         /* MLS Rd, Rn, Rm, Ra */
                         cpu->reg[rd] = cpu->reg[ra] - cpu->reg[rn] * cpu->reg[rm];
                     }
+                } else if (op_misc == 1 && (hw1 & 0x100)) {
+                    /* M4 DSP — halfword multiply (hw1=0xFB1.).
+                     * SMUL{B,T}{B,T}: ra=0xF, no accumulator.
+                     * SMLA{B,T}{B,T}: ra<0xF, 32-bit accumulator (sets Q on overflow).
+                     * op2_misc layout: 00 N M  — N selects top half of Rn, M of Rm. */
+                    if ((op2_misc & 0xC) == 0) {
+                        int n_half = (op2_misc >> 1) & 1;
+                        int m_half = op2_misc & 1;
+                        int16_t a = (int16_t)(n_half ? (cpu->reg[rn] >> 16)
+                                                     : (cpu->reg[rn] & 0xFFFF));
+                        int16_t b = (int16_t)(m_half ? (cpu->reg[rm] >> 16)
+                                                     : (cpu->reg[rm] & 0xFFFF));
+                        int32_t prod = (int32_t)a * (int32_t)b;
+                        if (ra == 0xF) {
+                            cpu->reg[rd] = (uint32_t)prod;
+                        } else {
+                            int64_t sum = (int64_t)(int32_t)cpu->reg[ra] + (int64_t)prod;
+                            cpu->reg[rd] = (uint32_t)(int32_t)sum;
+                            if (sum != (int64_t)(int32_t)sum)
+                                cpu->xpsr |= APSR_Q;
+                        }
+                    }
+                } else if (op_misc == 3 && (hw1 & 0x100)) {
+                    /* M4 DSP — SMULWB/WT and SMLAWB/WT (hw1=0xFB3.).
+                     * 32x16 → middle 32 bits of 48-bit product (bits [47:16]).
+                     * op2_misc layout: 000 M — M selects top half of Rm. */
+                    if ((op2_misc & 0xE) == 0) {
+                        int m_half = op2_misc & 1;
+                        int16_t b = (int16_t)(m_half ? (cpu->reg[rm] >> 16)
+                                                     : (cpu->reg[rm] & 0xFFFF));
+                        int64_t prod48 = (int64_t)(int32_t)cpu->reg[rn] * (int64_t)b;
+                        int32_t result = (int32_t)(prod48 >> 16);
+                        if (ra == 0xF) {
+                            cpu->reg[rd] = (uint32_t)result;
+                        } else {
+                            int64_t sum = (int64_t)(int32_t)cpu->reg[ra] + (int64_t)result;
+                            cpu->reg[rd] = (uint32_t)(int32_t)sum;
+                            if (sum != (int64_t)(int32_t)sum)
+                                cpu->xpsr |= APSR_Q;
+                        }
+                    }
                 } else if (op_misc == 8) {
                     /* SMULL RdLo, RdHi, Rn, Rm (hw1=0xFB8.)
                        hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
@@ -2284,13 +2325,32 @@ int arm_step(arm_cpu_t *cpu, int count) {
                             cpu->reg[rd] = cpu->reg[rn] / cpu->reg[rm];
                     }
                 } else if (op_misc == 0xC) {
-                    /* SMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBC.)
-                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
-                    int64_t acc = ((int64_t)(uint32_t)cpu->reg[ra]) |
-                                  ((int64_t)(int32_t)cpu->reg[rd] << 32);
-                    acc += (int64_t)(int32_t)cpu->reg[rn] * (int64_t)(int32_t)cpu->reg[rm];
-                    cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
-                    cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
+                    /* SMLAL family (hw1=0xFBC.), discriminated by op2_misc.
+                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd). */
+                    if (op2_misc == 0) {
+                        /* SMLAL RdLo, RdHi, Rn, Rm — 32x32 + 64-bit accumulator */
+                        int64_t acc = ((int64_t)(uint32_t)cpu->reg[ra]) |
+                                      ((int64_t)(int32_t)cpu->reg[rd] << 32);
+                        acc += (int64_t)(int32_t)cpu->reg[rn] * (int64_t)(int32_t)cpu->reg[rm];
+                        cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
+                        cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
+                    } else if ((op2_misc & 0xC) == 0x8) {
+                        /* M4 DSP — SMLALBB/BT/TB/TT.
+                         * op2_misc layout: 10 N M — N selects top half of Rn, M of Rm.
+                         * 16x16 sign-extended to 64, added to {RdHi:RdLo}. */
+                        int n_half = (op2_misc >> 1) & 1;
+                        int m_half = op2_misc & 1;
+                        int16_t a = (int16_t)(n_half ? (cpu->reg[rn] >> 16)
+                                                     : (cpu->reg[rn] & 0xFFFF));
+                        int16_t b = (int16_t)(m_half ? (cpu->reg[rm] >> 16)
+                                                     : (cpu->reg[rm] & 0xFFFF));
+                        int64_t prod = (int64_t)((int32_t)a * (int32_t)b);
+                        int64_t acc = ((int64_t)(uint32_t)cpu->reg[ra]) |
+                                      ((int64_t)(int32_t)cpu->reg[rd] << 32);
+                        acc += prod;
+                        cpu->reg[ra] = (uint32_t)acc;
+                        cpu->reg[rd] = (uint32_t)(acc >> 32);
+                    }
                 } else if (op_misc == 0xE) {
                     /* UMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBE.)
                        hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
