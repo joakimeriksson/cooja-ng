@@ -6,21 +6,32 @@
 
 ## Current state — short version
 
-**Pre-L0 scaffolding started.** The contract — [`SPEC.md`](SPEC.md)
-and this file — defines what the port covers, how it splits across
-commits, and where the risks sit.
+**Pre-L0 scaffolding in progress; the architectural decision needed
+before peripheral code lands has been resolved.** The contract —
+[`SPEC.md`](SPEC.md) and this file — defines what the port covers,
+how it splits across commits, and where the risks sit.
 
 Concrete progress so far:
 
 - `arm_config_t nrf52840_config` added to `src/arm/arm_config.{c,h}`:
   64 MHz, 1 MiB flash @ `0x00000000`, 256 KiB SRAM @ `0x20000000`,
-  48 IRQs. Compiles clean; existing 68 MSP430 + 33 ARM correctness
-  tests still pass.
+  48 IRQs. Per nRF52840 PS v1.7.
+- **`arm_platform_t` is now SoC-polymorphic.** SoC-specific peripherals
+  live behind `plat->soc` + an `arm_soc_ops_t` vtable (init / destroy /
+  set_console). CC2538 peripherals migrated into `cc2538_soc_t`
+  (`include/arm/cc2538_soc.h`, `src/arm/cc2538_soc.c`); consumers reach
+  them via the `arm_platform_cc2538(plat)` accessor. The new
+  `arm_platform.h` no longer mentions any CC2538 type. nRF peripherals
+  will plug in via the same shape with their own `nrf52840_soc_t` +
+  `nrf52840_soc_ops` once they land.
 
-This is the smallest first commit. It introduces no architectural
-commitment (no nRF entry in `arm_platform_t` yet — that struct is
-hard-wired to CC2538 peripherals and needs deliberate redesign before
-nRF peripherals can land alongside it).
+Verification of the polymorphism refactor (zero regressions):
+- 68/68 MSP430 + 33/33 ARM correctness
+- ARM Firefly bringup firmware (Zolertia banner) PASS
+- 2-node cc2538dk nullnet 15.2× real-time
+- 2-node cc2538dk RPL-UDP 11.2× real-time, 26 direct RX
+- 73/73 CC1200 mock-host, 21/21 CC2420 mock-host
+- 235/235 radio_medium
 
 ## Why this port, why this board
 
@@ -139,47 +150,44 @@ Don't pre-create empty docs.)
 
 ## Next concrete step
 
-Now that `nrf52840_config` exists, the next step is the **architecture
-question for nRF peripherals** — before writing any peripheral code.
-
-`arm_platform_t` (in `include/arm/arm_platform.h`) currently embeds
-CC2538-specific peripheral structs by value:
+Architecture decided and landed: option 1 (vtable polymorphism). The
+boundary the nRF peripherals will plug into looks like this:
 
 ```c
+/* arm_platform.h */
+typedef struct arm_soc_ops {
+    const char *name;
+    void (*init)(struct arm_platform *plat);
+    void (*destroy)(struct arm_platform *plat);
+    void (*set_console)(struct arm_platform *plat,
+                        arm_uart_tx_callback cb, void *user_data);
+} arm_soc_ops_t;
+
 typedef struct arm_platform {
-    arm_cpu_t           cpu;
-    arm_nvic_t          nvic;
-    arm_systick_t       systick;
-    cc2538_uart_t       uart0;       /* ← CC2538-specific */
-    cc2538_gpio_t       gpio;        /* ← CC2538-specific */
-    /* ... more cc2538_* ... */
+    arm_cpu_t           cpu;          /* common */
+    arm_nvic_t          nvic;         /* common */
+    arm_systick_t       systick;      /* common */
+    sim_host_t          host;         /* populated by soc_ops->init */
+    void               *soc;          /* per-SoC state */
+    const arm_platform_config_t *config;
 } arm_platform_t;
 ```
 
-Adding nRF peripherals here would either bloat the struct with unused
-CC2538 fields (and vice versa) or force every consumer to know which
-SoC it's running on.
+The L0 path is now unblocked. Order:
 
-Three options worth weighing before any peripheral code lands:
+1. **`include/arm/nrf52840_soc.h` + `src/arm/nrf52840_soc.c`** — the
+   SoC bundle. Initially: empty struct, `nrf52840_soc_ops` with init
+   that does nothing useful and a stub `set_console` (writes to
+   stderr). Mirrors `cc2538_soc.{c,h}` shape so the pattern stays
+   uniform.
+2. **`platform_nrf52840_dongle`** entry in `arm_platform.c`'s
+   registry, pointing at `nrf52840_config` + `nrf52840_soc_ops`.
+3. **Pick the first nrf ELF**: the simplest Contiki-NG nrf52840
+   firmware that builds clean. Run it through `arm_load_elf` →
+   `arm_cpu_reset` → `arm_step` and see what address the first
+   peripheral access lands on. That tells us which peripheral to
+   model first (almost certainly CLOCK or NVMC).
+4. Iterate: stub the next peripheral, step further, repeat until we
+   reach `main()`. That's L1.
 
-1. **Polymorphic platform via `sim_host_t`-style vtable.**
-   Generalize `arm_platform_t` so the SoC-specific peripheral state
-   lives behind a void pointer + ops table. Biggest one-time cost,
-   cleanest end state. Likely the right answer.
-2. **Parallel `nrf_platform_t`.** Mirror the existing struct for
-   nRF, accept the `test_mixed_multinode` plumbing duplication.
-   Faster to first L0, more cleanup debt.
-3. **Single fat union.** Put both peripheral sets in `arm_platform_t`
-   behind a `soc_kind` discriminator. Pragmatic, ugly, doesn't scale
-   beyond two SoCs.
-
-Recommendation: do option 1, scoped to *just* the platform struct
-(don't refactor `sim_host_t` itself — that interface is already SoC-
-agnostic). Then write the first peripheral (CLOCK stub) against the
-new shape so the boundary is exercised before there's much code to
-move.
-
-Once that decision lands, the L0 path is: minimal `nrf_clock` +
-`nrf_power` stubs → load any nRF ELF → step until first peripheral
-access → log every IO touch → see how far we get. Same empirical
-loop the Sky and Firefly ports used.
+Same empirical loop the Sky and Firefly ports used.
