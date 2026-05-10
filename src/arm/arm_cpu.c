@@ -718,13 +718,21 @@ int arm_step(arm_cpu_t *cpu, int count) {
         if (cpu->cycles >= cpu->next_event_cycle)
             execute_events(cpu);
 
-        /* CPU off (WFI) — advance to next event or wake on interrupt */
+        /* CPU off (WFI) — advance to next event or wake on interrupt.
+         *
+         * Cortex-M WFI wakes on any pending interrupt regardless of
+         * PRIMASK. If PRIMASK is set, the IRQ stays pending and the
+         * CPU just resumes at the instruction after WFI; the IRQ
+         * fires later when PRIMASK clears. So `has_pending` always
+         * clears `cpu_off` here, even though `arm_nvic_check_pending`
+         * may decide not to take the exception yet. */
         if (cpu->cpu_off) {
             if (cpu->nvic) {
                 arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
                 if (nvic->has_pending) {
+                    cpu->cpu_off = false;
                     arm_nvic_check_pending(nvic);
-                    if (!cpu->cpu_off) continue;
+                    continue;
                 }
             }
             if (cpu->event_queue) {
