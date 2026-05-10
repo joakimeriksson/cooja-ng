@@ -20,18 +20,45 @@ Concrete progress so far:
   live behind `plat->soc` + an `arm_soc_ops_t` vtable (init / destroy /
   set_console). CC2538 peripherals migrated into `cc2538_soc_t`
   (`include/arm/cc2538_soc.h`, `src/arm/cc2538_soc.c`); consumers reach
-  them via the `arm_platform_cc2538(plat)` accessor. The new
-  `arm_platform.h` no longer mentions any CC2538 type. nRF peripherals
-  will plug in via the same shape with their own `nrf52840_soc_t` +
-  `nrf52840_soc_ops` once they land.
+  them via the `arm_platform_cc2538(plat)` accessor.
+- **Per-instance memory layout in `arm_cpu_t`.** `flash_base`, `flash_end`,
+  `sram_base`, `sram_end`, `rom_size` are populated from the SoC config
+  at init time. Every memory access in `arm_cpu.c` / `arm_elf.c` /
+  `arm_nvic.c` consults these fields instead of CC2538-hardcoded macros
+  (`ARM_FLASH_BASE`, etc.). The macros stay in `arm_cpu.h` as constants
+  for `test_arm_correctness.c` (which always uses cc2538_config).
+- **Vector-table discovery is SoC-aware.** `arm_config_t::vtor_default`:
+  if non-zero, used directly at reset; if zero, falls back to the CC2538
+  CCA convention (read flash_end - 0x2C + 8). `nrf52840_config` sets
+  `vtor_default = 0x1000` because the dongle reserves 0x0..0xfff for
+  the Open Bootloader.
+- **`nrf52840_soc.{h,c}` skeleton landed** — empty `nrf52840_soc_t`,
+  `nrf52840_soc_ops` (init / destroy / set_console no-ops), wired into
+  the platform registry as `platform_nrf52840_dongle`.
 
-Verification of the polymorphism refactor (zero regressions):
-- 68/68 MSP430 + 33/33 ARM correctness
-- ARM Firefly bringup firmware (Zolertia banner) PASS
-- 2-node cc2538dk nullnet 15.2× real-time
-- 2-node cc2538dk RPL-UDP 11.2× real-time, 26 direct RX
-- 73/73 CC1200 mock-host, 21/21 CC2420 mock-host
-- 235/235 radio_medium
+**L0–L1 milestone reached.** A smoke runner (`/tmp/nrf_l0`) loads the
+real `firmware/nrf52840-dongle/hello-world.nrf52840-dongle` ELF (built
+with `tools/build-device-firmware.sh --target nrf52840 --board dongle`,
+197 KiB), resets the CPU, and runs **5 million instructions**:
+  - MSP correctly read from `*0x1000` = `0x20040000` (SRAM end)
+  - PC starts at `Reset_Handler` (0x530c) per `__isr_vector[1]`
+  - Executes Reset_Handler → SystemInit → libc init (.data/.bss) →
+    `main()` (0x41ac) → Contiki autostart → into the nRF radio driver
+    `init()` (0x6474), all without faulting
+  - Eventually spins at PC=0x64a8 reading `0x40000100`
+    (CLOCK->EVENTS_HFCLKSTARTED) — *exactly* the CLOCK handshake quirk
+    flagged in `SPEC.md` §"Known firmware quirks" — because csim
+    returns 0 for unmapped IO and the firmware waits for the event bit
+    to become non-zero.
+
+That spin-loop is the L0/L1 success signal: the interpreter ran the
+entire pre-peripheral path correctly. Adding a 4-line CLOCK stub
+(write 0x40000000 → set 0x40000100) unblocks the next slice.
+
+Verification — zero regressions:
+  - 68/68 MSP430 + 48/48 ARM correctness (33 base + 15 M4 DSP)
+  - ARM Firefly bringup PASS, cc2538dk nullnet PASS, RPL-UDP 26 RX,
+    11.0× real-time
 
 ## Why this port, why this board
 
@@ -156,8 +183,21 @@ Don't pre-create empty docs.)
 
 ## Next concrete step
 
-Architecture decided and landed: option 1 (vtable polymorphism). The
-boundary the nRF peripherals will plug into looks like this:
+The L1 spin-loop discovery makes the next move concrete:
+
+**Add a minimal CLOCK peripheral stub** — register an IO region at
+`0x40000000` (size 0x1000) inside `nrf52840_soc_init`. Behaviour:
+- Writes to TASKS_HFCLKSTART (0x000) → set EVENTS_HFCLKSTARTED (0x100) = 1
+- Writes to TASKS_LFCLKSTART (0x008) → set EVENTS_LFCLKSTARTED (0x104) = 1
+- Reads of 0x100 / 0x104 return the latched events
+- Writes of 0 to 0x100 / 0x104 clear them (firmware acks events)
+
+That should unblock the spin-loop and let the firmware continue past
+radio init. Iterate: each new spin-loop or zero-read will identify the
+next peripheral to model (almost certainly RTC1 or POWER next).
+
+For the architectural reference, the boundary nRF peripherals plug
+into:
 
 ```c
 /* arm_platform.h */

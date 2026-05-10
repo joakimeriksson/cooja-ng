@@ -144,6 +144,12 @@ typedef struct arm_cpu {
     /* Config */
     const arm_config_t *config;
 
+    /* Per-instance memory layout (cached from config for hot-path use).
+     * `*_end` are pre-computed (base + size) to save one add per access. */
+    uint32_t  flash_base, flash_end;
+    uint32_t  sram_base,  sram_end;
+    uint32_t  rom_size;     /* 0 if SoC has no ROM region (e.g. nRF52840) */
+
     /* Vector table offset register */
     uint32_t  vtor;
 

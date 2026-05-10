@@ -12,20 +12,20 @@ static elf_segment_route_t arm_route(void *ctx, uint32_t paddr,
     /* Try paddr first, then vaddr */
     uint32_t addr = paddr;
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (addr >= ARM_FLASH_BASE && addr + size <= ARM_FLASH_BASE + ARM_FLASH_SIZE)
+        if (addr >= cpu->flash_base && addr + size <= cpu->flash_end)
             return (elf_segment_route_t){
-                cpu->flash + (addr - ARM_FLASH_BASE),
-                ARM_FLASH_BASE + ARM_FLASH_SIZE - addr
+                cpu->flash + (addr - cpu->flash_base),
+                cpu->flash_end - addr
             };
-        if (addr >= ARM_SRAM_BASE && addr + size <= ARM_SRAM_BASE + ARM_SRAM_SIZE)
+        if (addr >= cpu->sram_base && addr + size <= cpu->sram_end)
             return (elf_segment_route_t){
-                cpu->sram + (addr - ARM_SRAM_BASE),
-                ARM_SRAM_BASE + ARM_SRAM_SIZE - addr
+                cpu->sram + (addr - cpu->sram_base),
+                cpu->sram_end - addr
             };
-        if (addr < ARM_ROM_SIZE)
+        if (cpu->rom && addr < cpu->rom_size)
             return (elf_segment_route_t){
                 cpu->rom + addr,
-                ARM_ROM_SIZE - addr
+                cpu->rom_size - addr
             };
         addr = vaddr;  /* retry with vaddr */
     }

@@ -187,7 +187,7 @@ void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu) {
     nvic->cpu = cpu;
     nvic->active_exception = 0;
     nvic->pending_exception = -1;
-    nvic->vtor = ARM_FLASH_BASE; /* CC2538 default VTOR */
+    nvic->vtor = cpu->flash_base; /* SoC's flash base — VTOR points at the vector table */
     nvic->ccr = 0x200; /* STKALIGN=1 by default */
 
     /* Set back-pointer so exception_return can access NVIC */

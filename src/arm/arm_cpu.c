@@ -25,17 +25,17 @@ static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
 
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
-    if (addr < ARM_ROM_SIZE) {
+    if (cpu->rom && addr < cpu->rom_size) {
         return cpu->rom[addr] | (cpu->rom[addr+1]<<8) |
                (cpu->rom[addr+2]<<16) | (cpu->rom[addr+3]<<24);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8) |
                (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
     }
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8) |
                (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
     }
@@ -60,13 +60,13 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8) |
                (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8) |
                (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
     }
@@ -75,29 +75,29 @@ static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline uint16_t mem_read16(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~1u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8);
     }
     return arm_read16(cpu, addr);
 }
 
 static inline uint8_t mem_read8(arm_cpu_t *cpu, uint32_t addr) {
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1))
-        return cpu->sram[addr - ARM_SRAM_BASE];
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE)
-        return cpu->flash[addr - ARM_FLASH_BASE];
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1))
+        return cpu->sram[addr - cpu->sram_base];
+    if (addr >= cpu->flash_base && addr < cpu->flash_end)
+        return cpu->flash[addr - cpu->flash_base];
     return arm_read8(cpu, addr);
 }
 
 static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     addr &= ~3u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         cpu->sram[off+2] = (val >> 16) & 0xFF;
@@ -109,8 +109,8 @@ static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
 
 static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
     addr &= ~1u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         return;
@@ -119,8 +119,8 @@ static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
 }
 
 static inline void mem_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        cpu->sram[addr - ARM_SRAM_BASE] = val;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        cpu->sram[addr - cpu->sram_base] = val;
         return;
     }
     arm_write8(cpu, addr, val);
@@ -161,15 +161,15 @@ static inline void mem_write16_unaligned(arm_cpu_t *cpu, uint32_t addr, uint16_t
 
 uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~1u;
-    if (addr < ARM_ROM_SIZE) {
+    if (cpu->rom && addr < cpu->rom_size) {
         return cpu->rom[addr] | (cpu->rom[addr+1]<<8);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8);
     }
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
     }
     arm_io_region_t *r = find_io_region(cpu, addr);
@@ -178,11 +178,11 @@ uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
 }
 
 uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
-    if (addr < ARM_ROM_SIZE) return cpu->rom[addr];
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE)
-        return cpu->flash[addr - ARM_FLASH_BASE];
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE)
-        return cpu->sram[addr - ARM_SRAM_BASE];
+    if (cpu->rom && addr < cpu->rom_size) return cpu->rom[addr];
+    if (addr >= cpu->flash_base && addr < cpu->flash_end)
+        return cpu->flash[addr - cpu->flash_base];
+    if (addr >= cpu->sram_base && addr < cpu->sram_end)
+        return cpu->sram[addr - cpu->sram_base];
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) return (uint8_t)r->read(r->user_data, addr);
     return 0;
@@ -190,23 +190,23 @@ uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
 
 void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     addr &= ~3u;
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         cpu->sram[off+2] = (val >> 16) & 0xFF;
         cpu->sram[off+3] = (val >> 24) & 0xFF;
         return;
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         cpu->flash[off]   = val & 0xFF;
         cpu->flash[off+1] = (val >> 8) & 0xFF;
         cpu->flash[off+2] = (val >> 16) & 0xFF;
         cpu->flash[off+3] = (val >> 24) & 0xFF;
         return;
     }
-    if (addr < ARM_ROM_SIZE) return; /* ROM is read-only */
+    if (cpu->rom && addr < cpu->rom_size) return; /* ROM is read-only */
     /* Bit-band alias for peripheral region */
     if (addr >= ARM_BITBAND_BASE && addr < ARM_BITBAND_BASE + 0x02000000) {
         uint32_t bb_off = addr - ARM_BITBAND_BASE;
@@ -225,14 +225,14 @@ void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
 
 void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
     addr &= ~1u;
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         return;
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         cpu->flash[off]   = val & 0xFF;
         cpu->flash[off+1] = (val >> 8) & 0xFF;
         return;
@@ -242,13 +242,13 @@ void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
 }
 
 void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off] = val;
         return;
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        cpu->flash[addr - ARM_FLASH_BASE] = val;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        cpu->flash[addr - cpu->flash_base] = val;
         return;
     }
     arm_io_region_t *r = find_io_region(cpu, addr);
@@ -258,14 +258,14 @@ void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
 /* --- Inline fetch helpers --- */
 
 static inline uint16_t fetch16(arm_cpu_t *cpu, uint32_t addr) {
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1] << 8);
     }
-    if (addr < ARM_ROM_SIZE)
+    if (cpu->rom && addr < cpu->rom_size)
         return cpu->rom[addr] | (cpu->rom[addr+1] << 8);
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1] << 8);
     }
     return arm_read16(cpu, addr);
@@ -278,9 +278,16 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->config = config;
     cpu->gdb_stub = NULL;
 
-    cpu->rom   = (uint8_t *)calloc(ARM_ROM_SIZE, 1);
-    cpu->flash = (uint8_t *)calloc(ARM_FLASH_SIZE, 1);
-    cpu->sram  = (uint8_t *)calloc(ARM_SRAM_SIZE, 1);
+    /* Cache memory layout from config — used by every load/store hot path. */
+    cpu->flash_base = config->flash_base;
+    cpu->flash_end  = config->flash_base + config->flash_size;
+    cpu->sram_base  = config->sram_base;
+    cpu->sram_end   = config->sram_base + config->sram_size;
+    cpu->rom_size   = config->rom_size;
+
+    cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
+    cpu->sram  = (uint8_t *)calloc(config->sram_size,  1);
+    cpu->rom   = (config->rom_size > 0) ? (uint8_t *)calloc(config->rom_size, 1) : NULL;
 
     cpu->next_event_cycle = INT64_MAX;
     cpu->cycle_limit = INT64_MAX;
@@ -292,7 +299,12 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->cpu_freq_hz = config->default_cpu_freq;
     cpu->interrupts_enabled = true;
 
-    /* CC2538 ROM utility function table layout:
+    /* CC2538-specific ROM utility table — only present when the SoC has
+     * an emulated ROM region (cc2538_config). nRF52840 and other ROM-less
+     * SoCs skip this entirely; firmware that doesn't try to call into ROM
+     * never notices.
+     *
+     * CC2538 ROM utility function table layout:
      * ROM[0x10] = pointer to rom_util_api struct (0x48)
      * rom_util_api struct at 0x48:
      *   offset 0x18 (addr 0x60): memset function pointer
@@ -301,23 +313,22 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
      * Firmware loads function pointers via: ldr r3, [r4, #0x60] (with r4=0)
      * We place trap addresses at those ROM locations and intercept execution there.
      */
-    cpu->rom_util_memset = 0x00000060;
-    cpu->rom_util_memcpy = 0x00000064;
-    cpu->rom_util_memcmp = 0x00000068;
-
-    /* Write self-referential function pointers into ROM (addr | 1 for Thumb bit) */
-    /* When firmware does ldr+blx, it reads the pointer, then branches to it */
+    if (cpu->rom) {
+        cpu->rom_util_memset = 0x00000060;
+        cpu->rom_util_memcpy = 0x00000064;
+        cpu->rom_util_memcmp = 0x00000068;
 #define WRITE_ROM32(off, val) do { \
     cpu->rom[(off)]   = (val) & 0xFF; \
     cpu->rom[(off)+1] = ((val) >> 8) & 0xFF; \
     cpu->rom[(off)+2] = ((val) >> 16) & 0xFF; \
     cpu->rom[(off)+3] = ((val) >> 24) & 0xFF; \
 } while(0)
-    WRITE_ROM32(0x10, 0x00000048);  /* rom_util_api table pointer */
-    WRITE_ROM32(0x60, 0x00000061);  /* memset: points to 0x60 | Thumb */
-    WRITE_ROM32(0x64, 0x00000065);  /* memcpy: points to 0x64 | Thumb */
-    WRITE_ROM32(0x68, 0x00000069);  /* memcmp: points to 0x68 | Thumb */
+        WRITE_ROM32(0x10, 0x00000048);  /* rom_util_api table pointer */
+        WRITE_ROM32(0x60, 0x00000061);  /* memset: points to 0x60 | Thumb */
+        WRITE_ROM32(0x64, 0x00000065);  /* memcpy: points to 0x64 | Thumb */
+        WRITE_ROM32(0x68, 0x00000069);  /* memcmp: points to 0x68 | Thumb */
 #undef WRITE_ROM32
+    }
 }
 
 void arm_cpu_destroy(arm_cpu_t *cpu) {
@@ -347,13 +358,22 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->micro_clock_ready = false;
     cpu->step_cycle_remainder = 0.0;
 
-    /* Find vector table via CC2538 CCA (Customer Configuration Area).
-     * CCA is at flash end - 0x2C (0x0027FFD4 for 512KB flash).
-     * CCA+8 = app_entry_point = vector table address. */
-    uint32_t cca_addr = ARM_FLASH_BASE + ARM_FLASH_SIZE - 0x2C;
-    cpu->vtor = arm_read32(cpu, cca_addr + 8);
-    if (cpu->vtor < ARM_FLASH_BASE || cpu->vtor >= ARM_FLASH_BASE + ARM_FLASH_SIZE)
-        cpu->vtor = ARM_FLASH_BASE; /* fallback */
+    /* Vector table discovery, in order of preference:
+     *   1. config->vtor_default if non-zero (e.g. nRF52840 dongle: 0x1000
+     *      because the Open Bootloader reserves 0x0..0xfff).
+     *   2. CC2538 CCA at flash_end - 0x2C, where CCA+8 carries the
+     *      application entry point. CCA is a TI-specific convention.
+     *   3. Plain flash_base as a last resort (works for SoCs that put
+     *      the vector table at the very start of flash and have no
+     *      side-table). */
+    if (cpu->config && cpu->config->vtor_default != 0) {
+        cpu->vtor = cpu->config->vtor_default;
+    } else {
+        uint32_t cca_addr = cpu->flash_end - 0x2C;
+        cpu->vtor = arm_read32(cpu, cca_addr + 8);
+        if (cpu->vtor < cpu->flash_base || cpu->vtor >= cpu->flash_end)
+            cpu->vtor = cpu->flash_base; /* fallback */
+    }
     uint32_t sp = arm_read32(cpu, cpu->vtor);
     uint32_t pc = arm_read32(cpu, cpu->vtor + 4);
 

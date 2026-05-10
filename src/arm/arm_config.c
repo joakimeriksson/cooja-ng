@@ -41,4 +41,9 @@ const arm_config_t nrf52840_config = {
     .sram_base       = 0x20000000,
     .default_cpu_freq = 64000000,   /* 64 MHz HFCLK */
     .num_irqs        = 48,
+    /* Application vector table sits at 0x1000 on PCA10059 (the dongle
+     * reserves 0x0..0xfff for the Open Bootloader). DK firmware also
+     * uses 0x1000 — Contiki's nrf52840 platform places `__isr_vector`
+     * at this offset via the linker script. */
+    .vtor_default    = 0x00001000,
 };
