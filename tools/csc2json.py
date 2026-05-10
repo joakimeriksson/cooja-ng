@@ -188,6 +188,14 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
                 if "rpl-classic" in src_path and not make_args:
                     fw_variant = f"{fw_name}-classic"
 
+            # If the per-mote build.target differs from firmware_dir's leaf
+            # (e.g. firmware-dir=firmware/cooja but target=sky), route to the
+            # matching sibling dir so build output and lookup agree.
+            target_firmware_dir = firmware_dir
+            if build_target and os.path.basename(firmware_dir.rstrip(os.sep)) != build_target:
+                parent = os.path.dirname(firmware_dir.rstrip(os.sep)) or "."
+                target_firmware_dir = os.path.join(parent, build_target)
+
             # When make_args produce a variant name, use ONLY the variant.
             # Don't fall back to the base name — it's a different build.
             # When no variant (no make_args), try the base name as usual.
@@ -196,12 +204,12 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
             for name_candidate in search_names:
                 if build_target:
                     ext = "." + build_target
-                    candidate = os.path.join(firmware_dir, name_candidate + ext)
+                    candidate = os.path.join(target_firmware_dir, name_candidate + ext)
                     if os.path.exists(candidate):
                         fw_path = candidate
                         break
                 for ext in (".cooja", ".cc2538dk", ".sky"):
-                    candidate = os.path.join(firmware_dir, name_candidate + ext)
+                    candidate = os.path.join(target_firmware_dir, name_candidate + ext)
                     if os.path.exists(candidate):
                         fw_path = candidate
                         break
@@ -209,7 +217,7 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
                     break
             if fw_path is None:
                 fallback_ext = "." + build_target if build_target else ".cc2538dk"
-                fw_path = os.path.join(firmware_dir, fw_variant + fallback_ext)
+                fw_path = os.path.join(target_firmware_dir, fw_variant + fallback_ext)
         elif fw_name:
             fallback_ext = "." + build_target if build_target else ".cc2538dk"
             fw_path = fw_name + fallback_ext

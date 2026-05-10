@@ -23,6 +23,7 @@ TEST_PATTERN="*"
 VERBOSE=""
 AUTO_BUILD=1
 WITH_TUN=0
+CLEAN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,12 +36,16 @@ while [ $# -gt 0 ]; do
         --with-tun)
             WITH_TUN=1
             ;;
+        --clean)
+            CLEAN=1
+            ;;
         -h|--help)
-            echo "Usage: $0 [test-dir-pattern] [-v] [--no-build] [--with-tun]"
+            echo "Usage: $0 [test-dir-pattern] [-v] [--no-build] [--with-tun] [--clean]"
             echo "  test-dir-pattern: glob to filter test dirs (e.g. '07-*' or '14-rpl-lite')"
             echo "  -v, --verbose: show test output"
             echo "  --no-build: skip auto-building missing firmware"
             echo "  --with-tun: include border-router tests (requires sudo for TUN)"
+            echo "  --clean: wipe firmware/<target>/* before running (forces full rebuild)"
             echo ""
             echo "CONTIKI_DIR resolution: env variable -> csim.conf -> ../contiki-ng"
             exit 0
@@ -71,16 +76,32 @@ fi
 
 CONTIKI_DIR="$(cd "$CONTIKI_DIR" && pwd)"
 
-# Auto-detect firmware target: prefer cooja, fall back to cc2538dk
-if [ -d "$CSIM_DIR/firmware/cooja" ] && ls "$CSIM_DIR/firmware/cooja"/*.cooja >/dev/null 2>&1; then
+# Auto-detect firmware target: prefer cooja, fall back to cc2538dk.
+# With --clean we force cooja (the suite's default) so the wipe and the
+# subsequent auto-build target match, regardless of leftover artifacts.
+if [ "$CLEAN" -eq 1 ]; then
+    FIRMWARE_TARGET="cooja"
+elif [ -d "$CSIM_DIR/firmware/cooja" ] && ls "$CSIM_DIR/firmware/cooja"/*.cooja >/dev/null 2>&1; then
     FIRMWARE_TARGET="cooja"
 elif [ -d "$CSIM_DIR/firmware/cc2538dk" ] && ls "$CSIM_DIR/firmware/cc2538dk"/*.cc2538dk >/dev/null 2>&1; then
     FIRMWARE_TARGET="cc2538dk"
 else
-    # No firmware yet — default to cooja (will auto-build)
     FIRMWARE_TARGET="cooja"
 fi
 FIRMWARE_DIR="$CSIM_DIR/firmware/$FIRMWARE_TARGET"
+
+if [ "$CLEAN" -eq 1 ]; then
+    # Wipe every Cooja-suite firmware target so nothing is reused across the
+    # rebuild.  cc2538dk is left alone — it belongs to the standalone ARM
+    # test_runner suite, not to the Cooja suite.
+    for sub in cooja sky z1; do
+        d="$CSIM_DIR/firmware/$sub"
+        [ -d "$d" ] || continue
+        wiped=$(find "$d" -maxdepth 1 -type f -name "*.$sub" | wc -l | tr -d ' ')
+        find "$d" -maxdepth 1 -type f -name "*.$sub" -delete
+        echo "  CLEAN $d (removed $wiped firmware artifacts)"
+    done
+fi
 
 if [ ! -f "$TEST_RUNNER" ]; then
     echo "Error: test_runner not found at $TEST_RUNNER (run 'make' first)"
