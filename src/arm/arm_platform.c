@@ -9,6 +9,7 @@
 #include "arm_platform.h"
 #include "arm_elf.h"
 #include "cc2538_soc.h"
+#include "nrf52840_soc.h"
 #include <ctype.h>
 #include <string.h>
 
@@ -58,10 +59,22 @@ static const arm_platform_config_t platform_zoul_firefly = {
     .cc1200_gdo2   = { .port = 1, .pin = 0, .active_low = false }, /* PB0 */
 };
 
+/* Nordic nRF52840 USB Dongle (PCA10059, TARGET=nrf52840 BOARD=dongle).
+ * Single-chip SoC — no off-SoC peripherals on this board. Console pinout
+ * (UART0 on dongle pads) and LED/button wiring will be filled in once the
+ * corresponding peripherals are modelled. See devices/nrf52840-dongle/. */
+static const arm_platform_config_t platform_nrf52840_dongle = {
+    .name          = "nrf52840-dongle",
+    .soc           = &nrf52840_config,
+    .soc_ops       = &nrf52840_soc_ops,
+    .console_uart  = 0,
+};
+
 static const arm_platform_config_t *all_arm_platforms[] = {
     &platform_cc2538dk,
     &platform_openmote,
     &platform_zoul_firefly,
+    &platform_nrf52840_dongle,
     NULL
 };
 
