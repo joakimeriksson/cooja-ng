@@ -310,7 +310,7 @@ Standard L0–L6 for the platform, plus chip-driver checkpoints
       neither csim change was needed. Same firmware also converges
       on real Zolertia Firefly hardware. Resolution narrative:
       [`STATUS.md`](STATUS.md). Historical investigation:
-      [`L6-PLAN.md`](L6-PLAN.md).
+      [`archive/L6-PLAN.md`](archive/L6-PLAN.md).
 - [x] `.github/workflows/test.yml` runs the new subcommands on PR
 - [x] CC1200 driver takes `sim_host_t` only — no `arm_cpu_t` /
       `cc2538_gpio_t` types leak in

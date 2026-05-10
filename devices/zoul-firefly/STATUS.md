@@ -1,9 +1,9 @@
 # Zoul Firefly Port — Status & Direction
 
 > Strategic doc: where the port is, where it's going, and what's
-> explicitly out of scope. For the actual operational task list see
-> [`L6-PLAN.md`](L6-PLAN.md). For the device contract see
-> [`SPEC.md`](SPEC.md).
+> explicitly out of scope. For the device contract see
+> [`SPEC.md`](SPEC.md). The original L6 investigation trail is
+> archived under [`archive/`](archive/) — all items resolved.
 
 ## Current state — short version
 
@@ -40,7 +40,7 @@ Firefly):
 
 After a hardware investigation on real Zolertia Firefly boards
 (see [`HARDWARE-TEST.md`](HARDWARE-TEST.md) and
-[`L6-PLAN.md`](L6-PLAN.md) for the full trail), **L6 was a Contiki-NG
+[`archive/L6-PLAN.md`](archive/L6-PLAN.md) for the full trail), **L6 was a Contiki-NG
 firmware bug, not a csim emulation gap.** Two upstream Contiki-NG
 fixes resolve it both on hardware *and* in csim:
 
@@ -62,7 +62,14 @@ fixes resolve it both on hardware *and* in csim:
    UART blocking when `DEBUG_LEVEL >= 3`.
 
 Both fixes are scoped to upstream Contiki-NG; csim required no
-changes. With the fixed firmware:
+changes. The csim "fixes" originally proposed in the L6 investigation
+(rx_incoming buffering, queue depth bumps, ACK turnaround modelling
+— see [`archive/L6-PLAN.md`](archive/L6-PLAN.md) and
+[`archive/CC1200-RX-ACK-CHAIN.md`](archive/CC1200-RX-ACK-CHAIN.md))
+would have *masked* the firmware bugs and are explicitly **not**
+landing. See [`docs/porting-a-device.md`](../../docs/porting-a-device.md)
+§8 "Don't add fidelity buffers to mask firmware races." With the
+fixed firmware:
 
 - 6/6 RPL-UDP hello cycles complete in 60 s in csim (was 0/6)
 - Total RF bytes 2,242 (was 101,988 — ~50× less, no retx storm)
@@ -73,10 +80,10 @@ changes. With the fixed firmware:
 
 **This means csim's CC1200 emulation was correct enough to faithfully
 expose two real upstream firmware bugs.** The items in
-[`L6-PLAN.md`](L6-PLAN.md) (rx_incoming buffering, Node 1 starvation,
-queue overflow) were *symptoms* of the firmware bugs amplified through
-csim's emulation, not gaps in the simulator. With both firmware bugs
-fixed, the symptoms disappear naturally.
+[`archive/L6-PLAN.md`](archive/L6-PLAN.md) (rx_incoming buffering,
+Node 1 starvation, queue overflow) were *symptoms* of the firmware
+bugs amplified through csim's emulation, not gaps in the simulator.
+With both firmware bugs fixed, the symptoms disappear naturally.
 
 The two fixes are staged as upstream Contiki-NG PR branches:
 - `fix/zoul-cc1200-ack-wait` (`53d219af5`)
@@ -110,10 +117,14 @@ These are explicitly NOT going to be tackled as part of this port:
 
 ## Files
 - [`SPEC.md`](SPEC.md) — device contract, definition of done
-- [`L6-PLAN.md`](L6-PLAN.md) — tactical work-list for the L6 gap
-- [`CC1200-RX-ACK-CHAIN.md`](CC1200-RX-ACK-CHAIN.md) — datasheet + code
-  audit of the 10-step RX→ACK chain (the diagnostic source for L6-PLAN)
+- [`HARDWARE-TEST.md`](HARDWARE-TEST.md) — real-Firefly run that
+  reframed L6 from "csim bug" to "firmware bug"
 - [`DATASHEET-FINDINGS.md`](DATASHEET-FINDINGS.md) — citations from
   CC1200 SWRU346B and CC2538 SWRU319C user guides
+- [`archive/`](archive/) — historical L6 investigation trail
+  (`L6-PLAN.md`, `CC1200-RX-ACK-CHAIN.md`); all items resolved
+- [`../../docs/porting-a-device.md`](../../docs/porting-a-device.md)
+  §8 (pitfalls), §10 (closing out a port) — the lessons distilled
+  from this port
 - [`../../docs/radio-medium.md`](../../docs/radio-medium.md) — how the
   radio medium routes bytes between nodes
