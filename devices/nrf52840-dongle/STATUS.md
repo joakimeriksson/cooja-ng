@@ -36,29 +36,45 @@ Concrete progress so far:
   `nrf52840_soc_ops` (init / destroy / set_console no-ops), wired into
   the platform registry as `platform_nrf52840_dongle`.
 
-**L0–L1 milestone reached.** A smoke runner (`/tmp/nrf_l0`) loads the
-real `firmware/nrf52840-dongle/hello-world.nrf52840-dongle` ELF (built
-with `tools/build-device-firmware.sh --target nrf52840 --board dongle`,
-197 KiB), resets the CPU, and runs **5 million instructions**:
-  - MSP correctly read from `*0x1000` = `0x20040000` (SRAM end)
-  - PC starts at `Reset_Handler` (0x530c) per `__isr_vector[1]`
-  - Executes Reset_Handler → SystemInit → libc init (.data/.bss) →
-    `main()` (0x41ac) → Contiki autostart → into the nRF radio driver
-    `init()` (0x6474), all without faulting
-  - Eventually spins at PC=0x64a8 reading `0x40000100`
-    (CLOCK->EVENTS_HFCLKSTARTED) — *exactly* the CLOCK handshake quirk
-    flagged in `SPEC.md` §"Known firmware quirks" — because csim
-    returns 0 for unmapped IO and the firmware waits for the event bit
-    to become non-zero.
+**L0 / L1 / L2 reached.** Built two reference firmware ELFs via
+`tools/build-device-firmware.sh --target nrf52840 --board dongle`:
+  - `hello-world.nrf52840-dongle` (197 KiB) — default dongle build,
+    console = USB-CDC.
+  - `hello-world-uart.nrf52840-dongle` (118 KiB) — same source built
+    with `NRF52840_NATIVE_USB=0`, console = legacy UART0 register
+    window. **This is the one csim currently runs end-to-end.**
 
-That spin-loop is the L0/L1 success signal: the interpreter ran the
-entire pre-peripheral path correctly. Adding a 4-line CLOCK stub
-(write 0x40000000 → set 0x40000100) unblocks the next slice.
+Then added two minimal peripheral stubs in `nrf52840_soc.c`:
+  - **CLOCK** (0x40000000): TASKS_HFCLKSTART / TASKS_LFCLKSTART writes
+    set the corresponding EVENTS_*STARTED registers immediately.
+  - **UART0 legacy window** (0x40002000): writes to TXD (0x51C) call
+    the platform's console callback and set EVENTS_TXDRDY (0x11C);
+    firmware acks by writing 0 back to EVENTS_TXDRDY.
+
+A smoke runner loads the UART ELF, hooks `set_console` to stdout,
+resets, and steps. Result is the full Contiki-NG bring-up banner +
+the hello message:
+
+```
+[INFO: Main      ] Starting Contiki-NG-release/v5.1-81-gad0d07381
+[INFO: Main      ] - Routing: RPL Lite
+[INFO: Main      ] - Net: sicslowpan
+[INFO: Main      ] - MAC: CSMA
+[INFO: Main      ] - 802.15.4 PANID: 0xabcd
+[INFO: Main      ] - 802.15.4 Default channel: 26
+[INFO: Main      ] Node ID: 0
+[INFO: Main      ] Link-layer address: f4ce.3600.0000.0000
+[INFO: Main      ] Tentative link-local IPv6 address: fe80::f6ce:3600:0:0
+Hello, world
+```
+
+443 UART bytes emitted across ~836 K instructions in ~1.1 M cycles.
+Then PC parks at 0x00004b30 — the next unmodelled peripheral spin
+(probably RTC for Contiki's etimer process; investigate next).
 
 Verification — zero regressions:
   - 68/68 MSP430 + 48/48 ARM correctness (33 base + 15 M4 DSP)
-  - ARM Firefly bringup PASS, cc2538dk nullnet PASS, RPL-UDP 26 RX,
-    11.0× real-time
+  - ARM Firefly bringup PASS, cc2538dk RPL-UDP 26 RX, 11.0× real-time
 
 ## Why this port, why this board
 
@@ -183,18 +199,23 @@ Don't pre-create empty docs.)
 
 ## Next concrete step
 
-The L1 spin-loop discovery makes the next move concrete:
+After the hello-world output, the firmware parks at PC=0x00004b30 —
+the next unmodelled peripheral. Likely **RTC** for Contiki's etimer
+process (the main loop wants to schedule periodic wake-ups). Find out
+which IO address it's reading and add the corresponding stub:
+  - Disassemble around 0x4b30 to see which peripheral base register
+    is being polled.
+  - Most likely candidate: RTC1 at 0x40011000 (Contiki uses RTC1 for
+    its tick source) — model COUNTER (0x504) + EVENTS_COMPARE[0]
+    (0x140) + start/stop tasks.
+  - Possible alternative: GPIOTE / POWER if firmware sleeps via WFI
+    and waits for an event.
 
-**Add a minimal CLOCK peripheral stub** — register an IO region at
-`0x40000000` (size 0x1000) inside `nrf52840_soc_init`. Behaviour:
-- Writes to TASKS_HFCLKSTART (0x000) → set EVENTS_HFCLKSTARTED (0x100) = 1
-- Writes to TASKS_LFCLKSTART (0x008) → set EVENTS_LFCLKSTARTED (0x104) = 1
-- Reads of 0x100 / 0x104 return the latched events
-- Writes of 0 to 0x100 / 0x104 clear them (firmware acks events)
-
-That should unblock the spin-loop and let the firmware continue past
-radio init. Iterate: each new spin-loop or zero-read will identify the
-next peripheral to model (almost certainly RTC1 or POWER next).
+Iterate: each new spin discovers the next peripheral. The L4 milestone
+("`Starting Contiki-NG-…` + on-chip RADIO probe") will need RTC,
+TIMER, and the on-chip RADIO (0x40001000 — note: confusingly, RADIO
+is at 0x40001000, while CLOCK is at 0x40000000 because they share the
+same peripheral ID 0).
 
 For the architectural reference, the boundary nRF peripherals plug
 into:
