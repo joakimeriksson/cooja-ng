@@ -1,7 +1,8 @@
 # Hardware Test Plan — Zoul Firefly + CC1200
 
 > Briefing for whoever (Claude or human) does the actual hardware test.
-> Companion to [`STATUS.md`](STATUS.md) and [`L6-PLAN.md`](L6-PLAN.md).
+> Companion to [`STATUS.md`](STATUS.md); historical investigation
+> trail in [`archive/L6-PLAN.md`](archive/L6-PLAN.md).
 
 ## What we're testing
 
@@ -168,8 +169,10 @@ correct or wrong:
    sim_time concept), but if hardware behaves notably differently
    from csim on TSCH, this would be a place to look.
 
-## When you have hardware data
+## Outcome (2026-05-06)
 
-Update [`STATUS.md`](STATUS.md) Option B section with the actual
-findings. Update [`L6-PLAN.md`](L6-PLAN.md) items that are now
-informed by hardware data.
+The hardware run reframed L6 from "csim emulation gap" to "upstream
+Contiki-NG firmware bug" and produced the two PR branches now tracked
+in [`STATUS.md`](STATUS.md). The investigation trail that this run
+closed out is archived in [`archive/L6-PLAN.md`](archive/L6-PLAN.md)
+and [`archive/CC1200-RX-ACK-CHAIN.md`](archive/CC1200-RX-ACK-CHAIN.md).
