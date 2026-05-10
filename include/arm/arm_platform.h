@@ -1,5 +1,15 @@
 /*
- * ARM platform — bundles SoC config with all peripheral instances.
+ * ARM platform — SoC-agnostic skeleton.
+ *
+ * Holds the CPU + NVIC + SysTick that every Cortex-M variant shares,
+ * plus a `sim_host_t` vtable for off-SoC chip drivers and an
+ * `arm_soc_ops_t` vtable that abstracts SoC-specific peripheral
+ * lifecycle (init / destroy / console hookup).
+ *
+ * The actual SoC peripherals live behind `plat->soc`, allocated by the
+ * SoC's `init` op. CC2538 peripherals live in `cc2538_soc_t` (see
+ * `cc2538_soc.h`); future SoCs (nRF52840, ...) plug in here without
+ * changing this header.
  */
 #ifndef ARM_PLATFORM_H
 #define ARM_PLATFORM_H
@@ -8,15 +18,6 @@
 #include "arm_config.h"
 #include "arm_nvic.h"
 #include "arm_systick.h"
-#include "cc2538_uart.h"
-#include "cc2538_gpio.h"
-#include "cc2538_gptimer.h"
-#include "cc2538_sys_ctrl.h"
-#include "cc2538_ioc.h"
-#include "cc2538_rfcore.h"
-#include "cc2538_sleeptimer.h"
-#include "cc2538_ssi.h"
-#include "cc1200.h"
 #include "sim_host.h"
 
 /* UART TX callback */
@@ -31,54 +32,70 @@ typedef struct arm_gpio_pin {
     bool    active_low;   /* true if asserted = drive low */
 } arm_gpio_pin_t;
 
+/* Forward declarations for the SoC-ops vtable. */
+struct arm_platform;
+struct arm_platform_config;
+
+/* SoC-specific lifecycle vtable. One instance per SoC family
+ * (cc2538_soc_ops, nrf52840_soc_ops, …). Installed via
+ * `arm_platform_config_t::soc_ops`.
+ *
+ * The init op owns:
+ *   - allocating `plat->soc` (and the peripheral state inside it),
+ *   - constructing the per-peripheral state (UART/GPIO/timer/radio/…),
+ *   - populating `plat->host` with pointers to the SoC's GPIO etc.,
+ *   - installing any off-SoC chip wiring described by the platform
+ *     config (e.g. CC1200 on Firefly).
+ *
+ * The destroy op tears down whatever init allocated. The set_console
+ * op is split out because it may be called outside init (e.g. when the
+ * test harness wires a per-node UART callback after platform init). */
+typedef struct arm_soc_ops {
+    const char *name;             /* "cc2538", "nrf52840", … */
+    void   (*init)(struct arm_platform *plat);
+    void   (*destroy)(struct arm_platform *plat);
+    void   (*set_console)(struct arm_platform *plat,
+                          arm_uart_tx_callback cb, void *user_data);
+} arm_soc_ops_t;
+
 /* Static platform configuration */
 typedef struct arm_platform_config {
     const char          *name;
-    const arm_config_t  *soc;
-    int                  console_uart;   /* 0 or 1 */
+    const arm_config_t  *soc;          /* SoC memory map / IRQ count / freq */
+    const arm_soc_ops_t *soc_ops;      /* SoC peripheral lifecycle vtable */
+    int                  console_uart; /* 0 or 1 (for SoCs with multiple UARTs) */
     /* Board wiring metadata. Optional — zero-initialized entries are
      * treated as "not described". Currently informational only; the
-     * underlying CC2538 GPIO peripheral is wired identically for all
-     * boards. Fields populated here become useful once a board needs
-     * platform-managed LED state or output-pin callback fan-out
-     * (e.g. for off-SoC chip control pins). */
-    arm_gpio_pin_t       leds[3];        /* up to 3 status LEDs */
-    arm_gpio_pin_t       button;         /* user button */
+     * underlying GPIO peripheral is wired identically for all boards
+     * on a given SoC. Useful once a board needs platform-managed LED
+     * state or output-pin callback fan-out. */
+    arm_gpio_pin_t       leds[3];      /* up to 3 status LEDs */
+    arm_gpio_pin_t       button;       /* user button */
     /* Off-SoC CC1200 sub-GHz radio wiring. Set has_cc1200=true to enable;
-     * leave zero-initialized to skip CC1200 init entirely. */
+     * leave zero-initialized to skip CC1200 init entirely. CC2538-only
+     * for now; if a future non-CC2538 board adds a CC1200, move this
+     * block into a per-SoC sub-config. */
     bool                 has_cc1200;
-    int                  cc1200_ssi;     /* 0 or 1 — which SSI bus  */
-    arm_gpio_pin_t       cc1200_csn;     /* chip-select (active low) */
-    arm_gpio_pin_t       cc1200_reset;   /* reset       (active low) */
-    arm_gpio_pin_t       cc1200_gdo0;    /* GDO0        (input to MCU) */
-    arm_gpio_pin_t       cc1200_gdo2;    /* GDO2        (input to MCU, optional) */
+    int                  cc1200_ssi;       /* 0 or 1 — which SSI bus  */
+    arm_gpio_pin_t       cc1200_csn;       /* chip-select (active low) */
+    arm_gpio_pin_t       cc1200_reset;     /* reset       (active low) */
+    arm_gpio_pin_t       cc1200_gdo0;      /* GDO0        (input to MCU) */
+    arm_gpio_pin_t       cc1200_gdo2;      /* GDO2        (input to MCU, optional) */
 } arm_platform_config_t;
 
-/* Platform runtime state */
+/* Platform runtime state. SoC-agnostic — the SoC-specific peripheral
+ * bundle lives behind `soc` and is reached via the SoC's accessor
+ * (e.g. `arm_platform_cc2538(plat)`). */
 typedef struct arm_platform {
-    arm_cpu_t         cpu;
-    arm_nvic_t        nvic;
-    arm_systick_t     systick;
-    cc2538_uart_t     uart0;
-    cc2538_uart_t     uart1;
-    cc2538_gpio_t     gpio;
-    cc2538_gptimer_t  gptimer[4];
-    cc2538_sys_ctrl_t sys_ctrl;
-    cc2538_ioc_t      ioc;
-    cc2538_rfcore_t   rfcore;
-    cc2538_sleeptimer_t sleeptimer;
-    cc2538_ssi_t      ssi0;
-    cc2538_ssi_t      ssi1;
-    /* Off-SoC CC1200 sub-GHz radio (Firefly only — other boards leave
-     * it unused). Lives directly in the platform struct so per-node
-     * fan-out can reach it without an extra alloc. */
-    cc1200_t          cc1200;
-    /* uDMA state (opaque, allocated by platform init) */
-    void *udma;
-    /* USB state (opaque, allocated by platform init) */
-    void *usb;
-    /* CPU-agnostic vtable for off-SoC chip drivers (CC1200, external CC2420, etc.) */
-    sim_host_t      host;
+    arm_cpu_t           cpu;
+    arm_nvic_t          nvic;
+    arm_systick_t       systick;
+    /* CPU-agnostic vtable for off-SoC chip drivers (CC1200, external
+     * CC2420, etc.). Populated by the SoC's init op once GPIO is up. */
+    sim_host_t          host;
+    /* SoC-specific peripheral state. Allocated by `soc_ops->init`,
+     * freed by `soc_ops->destroy`. */
+    void               *soc;
     const arm_platform_config_t *config;
 } arm_platform_t;
 

@@ -17,6 +17,7 @@
 #include "msp430_elf.h"
 #include "cc2420.h"
 #include "arm_platform.h"
+#include "cc2538_soc.h"
 #include "arm_systick.h"
 #include "arm_elf.h"
 #include "native_node.h"
@@ -566,7 +567,7 @@ static void update_radio_state(int idx) {
             new_state = SIM_RADIO_ON;       /* on, listening (gray) */
         /* else: VREG_OFF, POWER_DOWN, IDLE -> OFF (white) */
     } else if (nodes[idx].type == NODE_ARM) {
-        rf_state_t rs = nodes[idx].plat.arm.rfcore.state;
+        rf_state_t rs = arm_platform_cc2538(&nodes[idx].plat.arm)->rfcore.state;
         if (rs >= RF_STATE_TX_CALIBR && rs <= RF_STATE_TX_FINAL)
             new_state = SIM_RADIO_TX;
         else if (rs == RF_STATE_RX)
@@ -601,7 +602,7 @@ static void update_led_state(int idx) {
         leds[1] = (p5out >> 5) & 1;  /* yellow = P5.5 */
         leds[2] = (p5out >> 6) & 1;  /* red    = P5.6 */
     } else if (nodes[idx].type == NODE_ARM) {
-        uint32_t pc_data = nodes[idx].plat.arm.gpio.ports[2].data;
+        uint32_t pc_data = arm_platform_cc2538(&nodes[idx].plat.arm)->gpio.ports[2].data;
         leds[0] = (pc_data >> 0) & 1;  /* red */
         leds[1] = (pc_data >> 1) & 1;  /* yellow */
         leds[2] = (pc_data >> 2) & 1;  /* green */
@@ -829,11 +830,12 @@ static int emulated_rxfifo_available(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return 128 - nodes[idx].plat.msp.cc2420.rx_fifo_len;
     else if (nodes[idx].type == NODE_ARM) {
-        cc2538_rfcore_t *rf = &nodes[idx].plat.arm.rfcore;
+        cc2538_soc_t *soc = arm_platform_cc2538(&nodes[idx].plat.arm);
+        cc2538_rfcore_t *rf = &soc->rfcore;
         int avail = RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
         const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
         if (pcfg && pcfg->has_cc1200) {
-            int cc1200_avail = 128 - nodes[idx].plat.arm.cc1200.rx_count;
+            int cc1200_avail = 128 - soc->cc1200.rx_count;
             if (cc1200_avail < avail) avail = cc1200_avail;
         }
         return avail;
@@ -1084,9 +1086,10 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
          * arrive on the chip its NETSTACK_RADIO points at. */
         const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
         bool has_cc1200 = pcfg && pcfg->has_cc1200;
-        nodes[idx].plat.arm.rfcore.rx_rssi = rssi;
+        cc2538_soc_t *soc = arm_platform_cc2538(&nodes[idx].plat.arm);
+        soc->rfcore.rx_rssi = rssi;
         if (has_cc1200) {
-            nodes[idx].plat.arm.cc1200.rx_rssi = rssi;
+            soc->cc1200.rx_rssi = rssi;
         }
         int64_t last_byte_ns = air_time_ns;
         if (idx == ticking_node_idx) {
@@ -1095,8 +1098,8 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
              * RF Core; the current tick's remaining budget lets the CPU
              * process them before returning to the scheduler. */
             for (int j = 0; j < len; j++) {
-                cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
-                if (has_cc1200) cc1200_receive_byte(&nodes[idx].plat.arm.cc1200, data[j]);
+                cc2538_rfcore_receive_byte(&soc->rfcore, data[j]);
+                if (has_cc1200) cc1200_receive_byte(&soc->cc1200, data[j]);
             }
         } else {
             for (int j = 0; j < len; j++) {
@@ -1115,8 +1118,8 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
                 arm_step_micros(cpu, jump_us, 0);
                 cpu->sim_time_ns = byte_time_ns;
                 cpu->last_execute_us = t_us;
-                cc2538_rfcore_receive_byte(&nodes[idx].plat.arm.rfcore, data[j]);
-                if (has_cc1200) cc1200_receive_byte(&nodes[idx].plat.arm.cc1200, data[j]);
+                cc2538_rfcore_receive_byte(&soc->rfcore, data[j]);
+                if (has_cc1200) cc1200_receive_byte(&soc->cc1200, data[j]);
                 last_byte_ns = byte_time_ns;
             }
         }
@@ -2303,8 +2306,9 @@ static void ss_inject_serial(void) {
                 schedule_emulated_wakeup(&sim_eq, ss_node_idx);
         }
     } else if (node->type == NODE_ARM) {
+        cc2538_soc_t *soc = arm_platform_cc2538(&node->plat.arm);
         while (ss_rx_count > 0) {
-            cc2538_uart_receive_byte(&node->plat.arm.uart0, ss_rx_buf[ss_rx_head]);
+            cc2538_uart_receive_byte(&soc->uart0, ss_rx_buf[ss_rx_head]);
             ss_rx_head = (ss_rx_head + 1) % SS_RX_BUF_SIZE;
             ss_rx_count--;
         }
@@ -2893,18 +2897,19 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
 
     arm_platform_set_console(plat, mixed_uart_callback, node);
     /* Per-radio TX listener: cc2538_rfcore lives in slot 0 (2.4 GHz). */
+    cc2538_soc_t *soc = arm_platform_cc2538(plat);
     rf_ctx_slot0[idx].node_idx  = idx;
     rf_ctx_slot0[idx].radio_idx = 0;
-    cc2538_rfcore_set_tx_callback(&plat->rfcore, mixed_rf_tx_chip_cb,
+    cc2538_rfcore_set_tx_callback(&soc->rfcore, mixed_rf_tx_chip_cb,
                                    &rf_ctx_slot0[idx]);
-    plat->rfcore.node_id = node_id;
-    plat->rfcore.state_callback = mixed_rf_state_handler;
-    plat->rfcore.state_user_data = node;
+    soc->rfcore.node_id = node_id;
+    soc->rfcore.state_callback = mixed_rf_state_handler;
+    soc->rfcore.state_user_data = node;
     /* Per-radio channel push: the on-SoC RF Core observer reports
      * FREQCTRL.FREQ writes; the off-SoC sim_host_t adapter reports
      * CC1200 FREQ writes (slot 1). Both flow through
      * mixed_node_radio_set_channel and into the radio medium. */
-    cc2538_rfcore_set_channel_callback(&plat->rfcore,
+    cc2538_rfcore_set_channel_callback(&soc->rfcore,
                                         mixed_rfcore_channel_callback, node);
     plat->host.radio_user_data  = node;
     plat->host.radio_set_channel = mixed_host_radio_set_channel;
@@ -2921,9 +2926,9 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     if (pcfg->has_cc1200) {
         rf_ctx_slot1[idx].node_idx  = idx;
         rf_ctx_slot1[idx].radio_idx = 1;
-        cc1200_set_rf_listener(&plat->cc1200, mixed_rf_tx_chip_cb,
+        cc1200_set_rf_listener(&soc->cc1200, mixed_rf_tx_chip_cb,
                                 &rf_ctx_slot1[idx]);
-        cc1200_set_channel_busy_query(&plat->cc1200,
+        cc1200_set_channel_busy_query(&soc->cc1200,
                                        mixed_cc1200_channel_busy, node);
     }
 
@@ -2934,7 +2939,7 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         h ^= h << 13; h ^= h >> 17; h ^= h << 5;   /* xorshift32 */
         h *= 2654435761u;                             /* Knuth multiplicative hash */
         h ^= h >> 16;
-        plat->rfcore.rfrnd_state = h ? h : 0xDEADBEEF;
+        soc->rfcore.rfrnd_state = h ? h : 0xDEADBEEF;
 
         if (verbose)
             printf("  Node %d: rfrnd_seed=0x%08x\n", node_id, h);
@@ -2949,7 +2954,7 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
                                 (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
                                 (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
                                 (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8) };
-    memcpy(plat->rfcore.ext_addr, unique_addr, 8);
+    memcpy(soc->rfcore.ext_addr, unique_addr, 8);
 
     arm_cpu_reset(&plat->cpu);
 
@@ -4071,7 +4076,8 @@ sim_restart:
             } else if (nodes[i].type == NODE_ARM) {
                 arm_platform_set_console(&nodes[i].plat.arm,
                     threaded_uart_callback, &nodes[i]);
-                cc2538_rfcore_set_tx_callback(&nodes[i].plat.arm.rfcore,
+                cc2538_rfcore_set_tx_callback(
+                    &arm_platform_cc2538(&nodes[i].plat.arm)->rfcore,
                     threaded_rf_tx_handler, &nodes[i]);
             } else {
                 nodes[i].plat.native.log_callback = threaded_uart_callback;
@@ -4212,7 +4218,7 @@ sim_restart:
                             if (nodes[i].type == NODE_ARM) {
                                 for (int b = 0; act->data[b]; b++)
                                     cc2538_uart_receive_byte(
-                                        &nodes[i].plat.arm.uart0,
+                                        &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
                                         (uint8_t)act->data[b]);
                             } else if (nodes[i].type == NODE_NATIVE) {
                                 native_node_t *nat = &nodes[i].plat.native;
@@ -4239,7 +4245,7 @@ sim_restart:
                         if (nodes[i].type == NODE_ARM) {
                             for (int b = 0; act->data[b]; b++)
                                 cc2538_uart_receive_byte(
-                                    &nodes[i].plat.arm.uart0,
+                                    &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
                                     (uint8_t)act->data[b]);
                         } else if (nodes[i].type == NODE_NATIVE) {
                             native_node_t *nat = &nodes[i].plat.native;
@@ -4309,7 +4315,8 @@ sim_restart:
                             if (nodes[i].type == NODE_ARM) {
                                 for (int b = 0; act->data[b]; b++)
                                     cc2538_uart_receive_byte(
-                                        &nodes[i].plat.arm.uart0, (uint8_t)act->data[b]);
+                                        &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
+                                        (uint8_t)act->data[b]);
                             } else if (nodes[i].type == NODE_NATIVE) {
                                 native_node_t *nat = &nodes[i].plat.native;
                                 if (nat->simSerialReceivingData) {
@@ -4334,7 +4341,8 @@ sim_restart:
                         if (nodes[i].type == NODE_ARM) {
                             for (int b = 0; act->data[b]; b++)
                                 cc2538_uart_receive_byte(
-                                    &nodes[i].plat.arm.uart0, (uint8_t)act->data[b]);
+                                    &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
+                                    (uint8_t)act->data[b]);
                         } else if (nodes[i].type == NODE_NATIVE) {
                             native_node_t *nat = &nodes[i].plat.native;
                             if (nat->simSerialReceivingData) {

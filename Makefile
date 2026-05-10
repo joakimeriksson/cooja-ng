@@ -39,6 +39,7 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/arm_elf.c \
               $(ARM_SRC_DIR)/arm_gdb.c \
               $(ARM_SRC_DIR)/arm_platform.c \
+              $(ARM_SRC_DIR)/cc2538_soc.c \
               $(ARM_SRC_DIR)/cc2538_uart.c \
               $(ARM_SRC_DIR)/cc2538_gpio.c \
               $(ARM_SRC_DIR)/cc2538_gptimer.c \
