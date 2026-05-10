@@ -55,17 +55,23 @@ they can be developed in parallel after L0–L1 is green.
 
 ### Track A — Cortex-M4F support (CPU-side)
 
-The existing ARM interpreter is Cortex-M3. M4 adds:
-- DSP/SIMD instructions (`SADD16`, `SMLAxy`, …)
-- VFPv4 single-precision FPU
-- Bit-band aliases (also exist on M3, may differ in detail)
-- M4-specific MPU bits
+The existing ARM interpreter started Cortex-M3-only. M4 adds:
+- DSP halfword multiply (SMUL{B,T}{B,T}, SMLA{B,T}{B,T}, SMULW{B,T},
+  SMLAW{B,T}, SMLAL{B,T}{B,T}) — **landed**, 15 correctness tests
+- DSP SIMD halfword/byte (SADD16/SSUB16/SADD8/SSUB8 + signed/unsigned
+  + halving/saturating variants) — pending
+- DSP saturating (QADD/QSUB/QDADD/QDSUB) — pending
+- DSP packing (PKHBT/PKHTB) and bitfield variants — pending
+- DSP misc (SMLAD/SMLSD/SMMUL/SMMLA/SMMLS, USAD8) — pending
+- VFPv4 single-precision FPU — pending; not expected on the
+  networking path
+- Bit-band aliases (also exist on M3, may differ in detail) — TODO
+- M4-specific MPU bits — TODO; Contiki rarely enables MPU
 
-Realistic estimate based on past experience: **Contiki networking
-firmware does not exercise the FPU or DSP/SIMD instructions.** The
-existing M3 interpreter probably runs nrf52840 firmware end-to-end on
-day one, with M4-specific opcodes added only if firmware actually
-traps on them. Empirical, not assumed — we'll know on L1.
+Strategy: implement DSP families upfront with correctness tests; add
+FPU on-demand if firmware traps. Each family extends the existing
+multiply/shift handler chain in `arm_cpu.c`. APSR_Q (sticky saturation
+flag) is now defined.
 
 ### Track B — nRF52840 peripherals
 

@@ -448,10 +448,201 @@ static void test_adc_sbc(void) {
 }
 
 /* ===================================================================
+ * Cortex-M4 DSP extension — halfword multiply family
+ *
+ * Encoding reference: ARMv7-M Architecture Reference Manual, A7.7.121–
+ * A7.7.169 (SMLA/SMUL halfword variants), A7.7.123 (SMLAL halfword).
+ *
+ * Common encoding sketch:
+ *   SMUL{B,T}{B,T}: 1111 1011 0001 Rn | 1111 Rd  00 N M Rm   (hw1=0xFB1n)
+ *   SMLA{B,T}{B,T}: 1111 1011 0001 Rn | Ra   Rd  00 N M Rm
+ *   SMULW{B,T}    : 1111 1011 0011 Rn | 1111 Rd  000 M Rm    (hw1=0xFB3n)
+ *   SMLAW{B,T}    : 1111 1011 0011 Rn | Ra   Rd  000 M Rm
+ *   SMLAL{B,T}{B,T}: 1111 1011 1100 Rn | RdLo RdHi 10 N M Rm (hw1=0xFBCn)
+ *
+ * N selects top (1) vs bottom (0) half of Rn; M selects top vs bottom of Rm.
+ * =================================================================== */
+static void test_m4_dsp_halfword_multiply(void) {
+    printf("--- M4 DSP halfword multiply tests ---\n");
+
+    /* SMULBB R2, R0, R1 — R0[15:0] * R1[15:0] (signed) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0xDEAD0007;   /* low half = 7 */
+        cpu.reg[1] = 0xBEEF000A;   /* low half = 10 */
+        /* Encoding: hw1 = 0xFB10 | Rn(0), hw2 = 0xF000 | Rd(2)<<8 | 0x00 | Rm(1) */
+        write_thumb32(&cpu, CODE_BASE, 0xFB10, 0xF201);
+        arm_step(&cpu, 1);
+        assert_eq("SMULBB R2 = 7*10", 70, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMULBT R2, R0, R1 — R0[15:0] * R1[31:16] */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00000003;
+        cpu.reg[1] = 0x00040000;   /* top half = 4 */
+        /* op2_misc = 01 (M=1, N=0): hw2 = 0xF000 | Rd<<8 | 0x10 | Rm */
+        write_thumb32(&cpu, CODE_BASE, 0xFB10, 0xF211);
+        arm_step(&cpu, 1);
+        assert_eq("SMULBT R2 = 3 * top(4)", 12, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMULTB R2, R0, R1 — R0[31:16] * R1[15:0] */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00050000;
+        cpu.reg[1] = 0x00000006;
+        /* op2_misc = 10 (N=1, M=0): hw2 = 0xF000 | Rd<<8 | 0x20 | Rm */
+        write_thumb32(&cpu, CODE_BASE, 0xFB10, 0xF221);
+        arm_step(&cpu, 1);
+        assert_eq("SMULTB R2 = top(5) * 6", 30, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMULTT R2, R0, R1 — R0[31:16] * R1[31:16] */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00070000;
+        cpu.reg[1] = 0x00080000;
+        /* op2_misc = 11 (N=1, M=1): hw2 = 0xF000 | Rd<<8 | 0x30 | Rm */
+        write_thumb32(&cpu, CODE_BASE, 0xFB10, 0xF231);
+        arm_step(&cpu, 1);
+        assert_eq("SMULTT R2 = top(7) * top(8)", 56, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMULBB with negative inputs — checks signed sign-extension */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x0000FFFF;   /* low half = -1 (signed 16) */
+        cpu.reg[1] = 0x00000003;   /* low half = 3 */
+        write_thumb32(&cpu, CODE_BASE, 0xFB10, 0xF201);
+        arm_step(&cpu, 1);
+        assert_eq("SMULBB R2 = -1 * 3", (uint32_t)-3, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMLABB R2, R0, R1, R3 — R3 + R0[15:0] * R1[15:0] */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00000007;
+        cpu.reg[1] = 0x0000000A;
+        cpu.reg[3] = 100;
+        /* hw2 = Ra(3)<<12 | Rd(2)<<8 | 0x00 | Rm(1) */
+        write_thumb32(&cpu, CODE_BASE, 0xFB10, 0x3201);
+        arm_step(&cpu, 1);
+        assert_eq("SMLABB R2 = 100 + 7*10", 170, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMLATT R2, R0, R1, R3 with overflow → Q flag set, low 32 bits stored */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* top(R0)=0x7FFF (max int16), top(R1)=0x7FFF — product = 0x3FFF0001 */
+        cpu.reg[0] = 0x7FFF0000;
+        cpu.reg[1] = 0x7FFF0000;
+        cpu.reg[3] = 0x7FFFFFFF;   /* near max int32 */
+        write_thumb32(&cpu, CODE_BASE, 0xFB10, 0x3231);
+        arm_step(&cpu, 1);
+        /* Sum = 0x7FFFFFFF + 0x3FFF0001 overflows int32 → Q sticky */
+        assert_eq("SMLATT R2 = wrapped sum",
+                  (uint32_t)(0x7FFFFFFF + 0x3FFF0001), cpu.reg[2]);
+        assert_true("SMLATT overflow sets Q", (cpu.xpsr & APSR_Q) != 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMULWB R2, R0, R1 — (R0:32 * R1[15:0]) >> 16, taking middle 32 bits */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00010000;   /* 65536 */
+        cpu.reg[1] = 0x00000004;   /* low half = 4 */
+        /* hw1 = 0xFB30 | Rn(0); op2_misc = 0 (M=0): hw2 = 0xF000 | Rd<<8 | 0x00 | Rm */
+        write_thumb32(&cpu, CODE_BASE, 0xFB30, 0xF201);
+        arm_step(&cpu, 1);
+        /* 65536 * 4 = 262144 = 0x40000; >> 16 = 4 */
+        assert_eq("SMULWB R2 = (65536 * 4) >> 16", 4, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMULWT R2, R0, R1 — (R0:32 * R1[31:16]) >> 16 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00010000;
+        cpu.reg[1] = 0x00050000;   /* top half = 5 */
+        /* op2_misc = 1 (M=1): hw2 = 0xF000 | Rd<<8 | 0x10 | Rm */
+        write_thumb32(&cpu, CODE_BASE, 0xFB30, 0xF211);
+        arm_step(&cpu, 1);
+        assert_eq("SMULWT R2 = (65536 * 5) >> 16", 5, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMLAWB R2, R0, R1, R3 — R3 + ((R0 * R1[15:0]) >> 16) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00020000;
+        cpu.reg[1] = 0x00000003;
+        cpu.reg[3] = 1000;
+        /* hw2 = Ra(3)<<12 | Rd(2)<<8 | 0x00 | Rm(1) */
+        write_thumb32(&cpu, CODE_BASE, 0xFB30, 0x3201);
+        arm_step(&cpu, 1);
+        /* (131072 * 3) >> 16 = 393216 >> 16 = 6; + 1000 = 1006 */
+        assert_eq("SMLAWB R2 = 1000 + ((131072*3)>>16)", 1006, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMLALBB R3:R2 += R0[15:0] * R1[15:0] (signed)
+       hw1 = 0xFBC0 | Rn(0); hw2 = RdLo(2)<<12 | RdHi(3)<<8 | 0x80 | Rm(1) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x000000C8;   /* 200 */
+        cpu.reg[1] = 0x00000005;   /* 5 */
+        cpu.reg[2] = 50;            /* RdLo (acc low)  */
+        cpu.reg[3] = 0;             /* RdHi (acc high) */
+        write_thumb32(&cpu, CODE_BASE, 0xFBC0, 0x2381);
+        arm_step(&cpu, 1);
+        /* Acc starts at 50, += 200*5=1000 → 1050 */
+        assert_eq("SMLALBB acc lo = 1050", 1050, cpu.reg[2]);
+        assert_eq("SMLALBB acc hi = 0", 0, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SMLALTT — accumulator carries into high word */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x70000000;   /* top = 0x7000 */
+        cpu.reg[1] = 0x40000000;   /* top = 0x4000 */
+        cpu.reg[2] = 0xFFFFFFFF;   /* RdLo near wrap */
+        cpu.reg[3] = 0;             /* RdHi */
+        /* op2_misc = 1011 (N=1, M=1): hw2 = RdLo<<12 | RdHi<<8 | 0xB0 | Rm */
+        write_thumb32(&cpu, CODE_BASE, 0xFBC0, 0x23B1);
+        arm_step(&cpu, 1);
+        /* Product = 0x7000 * 0x4000 = 0x1C000000 (positive)
+           Acc = 0xFFFFFFFF + 0x1C000000 = 0x1_1BFFFFFF */
+        assert_eq("SMLALTT lo wrap", 0x1BFFFFFF, cpu.reg[2]);
+        assert_eq("SMLALTT hi carries", 1, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
  * Run all tests
  * =================================================================== */
 int run_arm_correctness_tests(int v) {
-    printf("=== ARM Cortex-M3 Correctness Tests ===\n\n");
+    printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
     failed = 0;
     verbose = v;
@@ -465,6 +656,7 @@ int run_arm_correctness_tests(int v) {
     test_branch();
     test_extensions();
     test_adc_sbc();
+    test_m4_dsp_halfword_multiply();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

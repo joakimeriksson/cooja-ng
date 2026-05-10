@@ -34,6 +34,7 @@
 #define APSR_Z  (1u << 30)  /* Zero */
 #define APSR_C  (1u << 29)  /* Carry */
 #define APSR_V  (1u << 28)  /* Overflow */
+#define APSR_Q  (1u << 27)  /* Sticky saturation (M4 DSP / saturating insns) */
 
 /* --- Exception numbers --- */
 #define EXC_RESET       1
