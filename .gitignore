@@ -27,5 +27,8 @@ csim.conf
 *.testlog
 cooja-tests*.log
 
+# Benchmark results (exported for paper, not part of repo)
+cooja-bench-results/
+
 # OS files
 .DS_Store
