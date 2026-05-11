@@ -69,12 +69,125 @@ typedef struct nrf_rtc_state {
     void    *soc;                     /* back-pointer for the event callback */
 } nrf_rtc_state_t;
 
+/* RADIO at 0x40001000.
+ *
+ * 2.4 GHz multi-protocol radio. In 802.15.4 mode the state machine is:
+ *
+ *   DISABLED →[TXEN]→ TXRU →(auto)→ TXIDLE →[START]→ TX →(auto)→ TXIDLE
+ *   DISABLED →[RXEN]→ RXRU →(auto)→ RXIDLE →[START]→ RX
+ *
+ * SHORTS register chains transitions automatically:
+ *   READY_START         — when ramp-up completes, trigger START
+ *   TXREADY_START       — same, 802.15.4-specific
+ *   RXREADY_START       — same, 802.15.4-specific
+ *   END_DISABLE         — when frame done, trigger DISABLE
+ *   DISABLED_TXEN       — restart in TX after DISABLE
+ *   DISABLED_RXEN       — restart in RX after DISABLE
+ *
+ * For the first cut we model: STATE register, task → state transitions
+ * (instant — no rampup delay), READY / END / DISABLED / TXREADY /
+ * RXREADY / FRAMESTART events, SHORTS auto-chaining, EVENTS firing
+ * NVIC IRQ (vector 1) when INTENSET allows.
+ *
+ * No EasyDMA frame data movement yet: TX bytes are dropped, RX never
+ * fires END from "external" data. That keeps the firmware's TX/RX state
+ * machines progressing without spin-locking; multinode delivery comes
+ * once we wire RX into the radio_medium.
+ */
+typedef struct nrf_radio_state {
+    /* State machine */
+    uint32_t state;           /* current STATE; see NRF_RADIO_STATE_* */
+    /* Mapped configuration registers (kept verbatim for firmware to
+     * read back; only some are interpreted). */
+    uint32_t mode;            /* 0x510 — protocol mode (15.4 mode = 15) */
+    uint32_t frequency;       /* 0x508 */
+    uint32_t txpower;         /* 0x50C */
+    uint32_t pcnf0;           /* 0x514 */
+    uint32_t pcnf1;           /* 0x518 */
+    uint32_t base0;           /* 0x51C */
+    uint32_t base1;           /* 0x520 */
+    uint32_t prefix0;         /* 0x524 */
+    uint32_t prefix1;         /* 0x528 */
+    uint32_t txaddress;       /* 0x52C */
+    uint32_t rxaddresses;     /* 0x530 */
+    uint32_t crccnf;          /* 0x534 */
+    uint32_t crcpoly;         /* 0x538 */
+    uint32_t crcinit;         /* 0x53C */
+    uint32_t shorts;          /* 0x200 */
+    uint32_t intenset;        /* 0x304 */
+    uint32_t packetptr;       /* 0x504 — EasyDMA buffer pointer */
+    uint32_t modecnf0;        /* 0x650 */
+    uint32_t ccactrl;         /* 0x66C */
+    uint32_t power;           /* 0xFFC */
+
+    /* Latched events (offsets relative to RADIO base) */
+    uint32_t evt_ready;        /* 0x100 */
+    uint32_t evt_address;      /* 0x104 */
+    uint32_t evt_payload;      /* 0x108 */
+    uint32_t evt_end;          /* 0x10C */
+    uint32_t evt_disabled;     /* 0x110 */
+    uint32_t evt_devmatch;     /* 0x114 */
+    uint32_t evt_devmiss;      /* 0x118 */
+    uint32_t evt_rssiend;      /* 0x11C */
+    uint32_t evt_bcmatch;      /* 0x128 */
+    uint32_t evt_crcok;        /* 0x130 */
+    uint32_t evt_crcerror;     /* 0x134 */
+    uint32_t evt_framestart;   /* 0x138 */
+    uint32_t evt_edend;        /* 0x13C */
+    uint32_t evt_edstopped;    /* 0x140 */
+    uint32_t evt_ccaidle;      /* 0x144 */
+    uint32_t evt_ccabusy;      /* 0x148 */
+    uint32_t evt_ccastopped;   /* 0x14C */
+    uint32_t evt_rateboost;    /* 0x150 */
+    uint32_t evt_txready;      /* 0x154 */
+    uint32_t evt_rxready;      /* 0x158 */
+    uint32_t evt_mhrmatch;     /* 0x15C */
+    uint32_t evt_phyend;       /* 0x16C */
+
+    int      irq_num;          /* RADIO IRQ = 1 */
+} nrf_radio_state_t;
+
+/* TIMER0..4 at 0x40008000 / 0x40009000 / 0x4000A000 / 0x4001A000 / 0x4001B000.
+ *
+ * Contiki's rtimer_arch_now() captures TIMER0 CC[0] and reads it back.
+ * That's the only access pattern we model in this first cut — counter
+ * advances based on simulated cycles, capture latches into CC[i], read
+ * returns the latched value.  Compare / IRQ paths land later if firmware
+ * needs them. */
+typedef struct nrf_timer_state {
+    uint32_t base;            /* peripheral base address (for IO range) */
+    bool     running;
+    int64_t  start_cycles;    /* cpu->cycles when TASKS_START fired */
+    uint32_t counter_at_start;
+    uint32_t prescaler;       /* 0..9; tick rate = 16 MHz >> prescaler */
+    uint32_t bitmode;         /* 0=16, 1=8, 2=24, 3=32-bit */
+    uint32_t mode;            /* 0=Timer (default), 1=Counter */
+    uint32_t cc[6];
+    uint32_t evt_compare[6];
+    uint32_t intenset;
+    uint32_t shorts;
+    struct nrf52840_soc *soc; /* back-pointer for cpu access */
+} nrf_timer_state_t;
+
 typedef struct nrf52840_soc {
     nrf_clock_state_t clock;
     nrf_uart_state_t  uart0;
     nrf_rtc_state_t   rtc0;
+    nrf_radio_state_t radio;
+    nrf_timer_state_t timer[5];
     arm_platform_t   *plat;   /* back-pointer for event-callback NVIC access */
 } nrf52840_soc_t;
+
+/* nRF52840 RADIO state enum values (per PS v1.7 §6.20.15.39). */
+#define NRF_RADIO_STATE_DISABLED   0
+#define NRF_RADIO_STATE_RXRU       1
+#define NRF_RADIO_STATE_RXIDLE     2
+#define NRF_RADIO_STATE_RX         3
+#define NRF_RADIO_STATE_RXDISABLE  4
+#define NRF_RADIO_STATE_TXRU       9
+#define NRF_RADIO_STATE_TXIDLE    10
+#define NRF_RADIO_STATE_TX        11
+#define NRF_RADIO_STATE_TXDISABLE 12
 
 extern const arm_soc_ops_t nrf52840_soc_ops;
 

@@ -323,6 +323,491 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
 }
 
 /* ============================================================
+ * RADIO (0x40001000) — first cut
+ *
+ * Models the state machine + tasks/events/SHORTS that the Contiki
+ * nrf52840-ieee driver busy-waits on, but does NOT yet move frame
+ * data through PACKETPTR. TX bytes are dropped; RX never fires END
+ * from external data. That keeps the firmware's TX/RX paths
+ * progressing without spin-locking; multinode delivery comes when we
+ * wire RX into radio_medium.
+ * ============================================================ */
+#define NRF_RADIO_BASE   0x40001000u
+#define NRF_RADIO_SIZE   0x1000u
+#define NRF_RADIO_IRQ    1
+
+/* Tasks */
+#define RADIO_TASKS_TXEN          0x000
+#define RADIO_TASKS_RXEN          0x004
+#define RADIO_TASKS_START         0x008
+#define RADIO_TASKS_STOP          0x00C
+#define RADIO_TASKS_DISABLE       0x010
+#define RADIO_TASKS_RSSISTART     0x014
+#define RADIO_TASKS_RSSISTOP      0x018
+#define RADIO_TASKS_BCSTART       0x01C
+#define RADIO_TASKS_BCSTOP        0x020
+#define RADIO_TASKS_EDSTART       0x024
+#define RADIO_TASKS_EDSTOP        0x028
+#define RADIO_TASKS_CCASTART      0x02C
+#define RADIO_TASKS_CCASTOP       0x030
+
+/* Event offsets */
+#define RADIO_EVENTS_READY        0x100
+#define RADIO_EVENTS_ADDRESS      0x104
+#define RADIO_EVENTS_PAYLOAD      0x108
+#define RADIO_EVENTS_END          0x10C
+#define RADIO_EVENTS_DISABLED     0x110
+#define RADIO_EVENTS_DEVMATCH     0x114
+#define RADIO_EVENTS_DEVMISS      0x118
+#define RADIO_EVENTS_RSSIEND      0x11C
+#define RADIO_EVENTS_BCMATCH      0x128
+#define RADIO_EVENTS_CRCOK        0x130
+#define RADIO_EVENTS_CRCERROR     0x134
+#define RADIO_EVENTS_FRAMESTART   0x138
+#define RADIO_EVENTS_EDEND        0x13C
+#define RADIO_EVENTS_EDSTOPPED    0x140
+#define RADIO_EVENTS_CCAIDLE      0x144
+#define RADIO_EVENTS_CCABUSY      0x148
+#define RADIO_EVENTS_CCASTOPPED   0x14C
+#define RADIO_EVENTS_RATEBOOST    0x150
+#define RADIO_EVENTS_TXREADY      0x154
+#define RADIO_EVENTS_RXREADY      0x158
+#define RADIO_EVENTS_MHRMATCH     0x15C
+#define RADIO_EVENTS_PHYEND       0x16C
+
+/* Other registers */
+#define RADIO_SHORTS              0x200
+#define RADIO_INTENSET            0x304
+#define RADIO_INTENCLR            0x308
+#define RADIO_CRCSTATUS           0x400
+#define RADIO_RXMATCH             0x408
+#define RADIO_RXCRC               0x40C
+#define RADIO_DAI                 0x410
+#define RADIO_PDUSTAT             0x414
+#define RADIO_PACKETPTR           0x504
+#define RADIO_FREQUENCY           0x508
+#define RADIO_TXPOWER             0x50C
+#define RADIO_MODE                0x510
+#define RADIO_PCNF0               0x514
+#define RADIO_PCNF1               0x518
+#define RADIO_BASE0               0x51C
+#define RADIO_BASE1               0x520
+#define RADIO_PREFIX0             0x524
+#define RADIO_PREFIX1             0x528
+#define RADIO_TXADDRESS           0x52C
+#define RADIO_RXADDRESSES         0x530
+#define RADIO_CRCCNF              0x534
+#define RADIO_CRCPOLY             0x538
+#define RADIO_CRCINIT             0x53C
+#define RADIO_STATE               0x550
+#define RADIO_DATAWHITEIV         0x554
+#define RADIO_BCC                 0x560
+#define RADIO_DAB_0               0x600
+#define RADIO_DAP_0               0x620
+#define RADIO_DACNF               0x640
+#define RADIO_MHRMATCHCONF        0x644
+#define RADIO_MHRMATCHMAS         0x648
+#define RADIO_MODECNF0            0x650
+#define RADIO_SFD                 0x660
+#define RADIO_EDCNT               0x664
+#define RADIO_EDSAMPLE            0x668
+#define RADIO_CCACTRL             0x66C
+#define RADIO_POWER               0xFFC
+
+/* SHORTS bit positions (subset relevant to 802.15.4 driver) */
+#define SHORT_READY_START         (1u << 0)
+#define SHORT_END_DISABLE         (1u << 1)
+#define SHORT_DISABLED_TXEN       (1u << 2)
+#define SHORT_DISABLED_RXEN       (1u << 3)
+#define SHORT_ADDRESS_RSSISTART   (1u << 4)
+#define SHORT_END_START           (1u << 5)
+#define SHORT_ADDRESS_BCSTART     (1u << 6)
+#define SHORT_DISABLED_RSSISTOP   (1u << 8)
+#define SHORT_RXREADY_CCASTART    (1u << 11)
+#define SHORT_CCAIDLE_TXEN        (1u << 12)
+#define SHORT_CCABUSY_DISABLE     (1u << 13)
+#define SHORT_FRAMESTART_BCSTART  (1u << 14)
+#define SHORT_READY_EDSTART       (1u << 15)
+#define SHORT_EDEND_DISABLE       (1u << 16)
+#define SHORT_CCAIDLE_STOP        (1u << 17)
+#define SHORT_TXREADY_START       (1u << 19)
+#define SHORT_RXREADY_START       (1u << 20)
+#define SHORT_PHYEND_DISABLE      (1u << 21)
+#define SHORT_PHYEND_START        (1u << 22)
+
+/* INTENSET bit positions (one per event) */
+#define RADIO_INT_READY        (1u << 0)
+#define RADIO_INT_ADDRESS      (1u << 1)
+#define RADIO_INT_PAYLOAD      (1u << 2)
+#define RADIO_INT_END          (1u << 3)
+#define RADIO_INT_DISABLED     (1u << 4)
+#define RADIO_INT_FRAMESTART   (1u << 13)
+#define RADIO_INT_CRCOK        (1u << 14)
+#define RADIO_INT_CRCERROR     (1u << 15)
+#define RADIO_INT_TXREADY      (1u << 21)
+#define RADIO_INT_RXREADY      (1u << 22)
+#define RADIO_INT_MHRMATCH     (1u << 23)
+
+/* Forward decls */
+static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off);
+static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state);
+static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask);
+
+/* Raise IRQ if any of the latched events have INTENSET bit set. */
+static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask) {
+    nrf_radio_state_t *r = &soc->radio;
+    *evt_field = 1;
+    if ((r->intenset & int_mask) && soc->plat && soc->plat->cpu.nvic)
+        arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, r->irq_num);
+}
+
+/* Apply SHORTS that fire on entering a state. The driver enables
+ * READY_START / TXREADY_START / RXREADY_START so the radio rolls
+ * straight from RU to RX/TX without firmware intervention. */
+static void radio_apply_shorts_after_event(nrf52840_soc_t *soc, uint32_t event_mask) {
+    nrf_radio_state_t *r = &soc->radio;
+    if (r->shorts & event_mask) {
+        switch (event_mask) {
+            case SHORT_READY_START:
+            case SHORT_TXREADY_START:
+            case SHORT_RXREADY_START:
+            case SHORT_PHYEND_START:
+            case SHORT_END_START:
+                radio_trigger_task(soc, RADIO_TASKS_START);
+                break;
+            case SHORT_END_DISABLE:
+            case SHORT_PHYEND_DISABLE:
+            case SHORT_CCABUSY_DISABLE:
+            case SHORT_EDEND_DISABLE:
+                radio_trigger_task(soc, RADIO_TASKS_DISABLE);
+                break;
+            case SHORT_DISABLED_TXEN:
+                radio_trigger_task(soc, RADIO_TASKS_TXEN);
+                break;
+            case SHORT_DISABLED_RXEN:
+                radio_trigger_task(soc, RADIO_TASKS_RXEN);
+                break;
+            case SHORT_CCAIDLE_TXEN:
+                radio_trigger_task(soc, RADIO_TASKS_TXEN);
+                break;
+        }
+    }
+}
+
+static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state) {
+    nrf_radio_state_t *r = &soc->radio;
+    r->state = new_state;
+    /* Fire entry events. We collapse RU → IDLE in one step (no rampup
+     * delay). After firing each event, check SHORTS for chained tasks. */
+    switch (new_state) {
+        case NRF_RADIO_STATE_RXIDLE:
+            radio_event(soc, &r->evt_ready,   RADIO_INT_READY);
+            radio_event(soc, &r->evt_rxready, RADIO_INT_RXREADY);
+            radio_apply_shorts_after_event(soc, SHORT_READY_START);
+            radio_apply_shorts_after_event(soc, SHORT_RXREADY_START);
+            break;
+        case NRF_RADIO_STATE_TXIDLE:
+            radio_event(soc, &r->evt_ready,   RADIO_INT_READY);
+            radio_event(soc, &r->evt_txready, RADIO_INT_TXREADY);
+            radio_apply_shorts_after_event(soc, SHORT_READY_START);
+            radio_apply_shorts_after_event(soc, SHORT_TXREADY_START);
+            break;
+        case NRF_RADIO_STATE_DISABLED:
+            radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
+            radio_apply_shorts_after_event(soc, SHORT_DISABLED_TXEN);
+            radio_apply_shorts_after_event(soc, SHORT_DISABLED_RXEN);
+            break;
+        default:
+            break;
+    }
+}
+
+static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
+    nrf_radio_state_t *r = &soc->radio;
+    switch (off) {
+        case RADIO_TASKS_TXEN:
+            /* DISABLED → TXRU → TXIDLE (instant). */
+            if (r->state == NRF_RADIO_STATE_DISABLED ||
+                r->state == NRF_RADIO_STATE_TXIDLE)
+                radio_set_state(soc, NRF_RADIO_STATE_TXIDLE);
+            break;
+        case RADIO_TASKS_RXEN:
+            if (r->state == NRF_RADIO_STATE_DISABLED ||
+                r->state == NRF_RADIO_STATE_RXIDLE)
+                radio_set_state(soc, NRF_RADIO_STATE_RXIDLE);
+            break;
+        case RADIO_TASKS_START:
+            /* TXIDLE → TX → (instantly transmit) → TXIDLE.
+             * RXIDLE → RX (stay there until a frame arrives). */
+            if (r->state == NRF_RADIO_STATE_TXIDLE) {
+                /* Transition through TX, fire FRAMESTART/END/PHYEND, return to TXIDLE. */
+                r->state = NRF_RADIO_STATE_TX;
+                radio_event(soc, &r->evt_address,    RADIO_INT_ADDRESS);
+                radio_event(soc, &r->evt_framestart, RADIO_INT_FRAMESTART);
+                radio_event(soc, &r->evt_payload,    RADIO_INT_PAYLOAD);
+                radio_event(soc, &r->evt_end,        RADIO_INT_END);
+                radio_event(soc, &r->evt_phyend,     0);
+                r->state = NRF_RADIO_STATE_TXIDLE;
+                radio_apply_shorts_after_event(soc, SHORT_END_DISABLE);
+                radio_apply_shorts_after_event(soc, SHORT_PHYEND_DISABLE);
+                radio_apply_shorts_after_event(soc, SHORT_END_START);
+                radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
+            } else if (r->state == NRF_RADIO_STATE_RXIDLE) {
+                /* Sit in RX until external data arrives (none yet). */
+                r->state = NRF_RADIO_STATE_RX;
+            }
+            break;
+        case RADIO_TASKS_STOP:
+            if (r->state == NRF_RADIO_STATE_RX)  r->state = NRF_RADIO_STATE_RXIDLE;
+            if (r->state == NRF_RADIO_STATE_TX)  r->state = NRF_RADIO_STATE_TXIDLE;
+            break;
+        case RADIO_TASKS_DISABLE:
+            radio_set_state(soc, NRF_RADIO_STATE_DISABLED);
+            break;
+        case RADIO_TASKS_CCASTART:
+            /* No interference model — always idle. */
+            radio_event(soc, &r->evt_ccaidle, 0);
+            radio_apply_shorts_after_event(soc, SHORT_CCAIDLE_TXEN);
+            radio_apply_shorts_after_event(soc, SHORT_CCAIDLE_STOP);
+            break;
+        case RADIO_TASKS_RSSISTART:
+            radio_event(soc, &r->evt_rssiend, 0);
+            break;
+        case RADIO_TASKS_EDSTART:
+            radio_event(soc, &r->evt_edend,   0);
+            break;
+        default:
+            break;
+    }
+}
+
+static int nrf_radio_read(void *user_data, uint32_t addr) {
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
+    nrf_radio_state_t *r = &soc->radio;
+    uint32_t off = addr - NRF_RADIO_BASE;
+    switch (off) {
+        case RADIO_STATE:        return (int)r->state;
+        case RADIO_EVENTS_READY:        return (int)r->evt_ready;
+        case RADIO_EVENTS_ADDRESS:      return (int)r->evt_address;
+        case RADIO_EVENTS_PAYLOAD:      return (int)r->evt_payload;
+        case RADIO_EVENTS_END:          return (int)r->evt_end;
+        case RADIO_EVENTS_DISABLED:     return (int)r->evt_disabled;
+        case RADIO_EVENTS_DEVMATCH:     return (int)r->evt_devmatch;
+        case RADIO_EVENTS_DEVMISS:      return (int)r->evt_devmiss;
+        case RADIO_EVENTS_RSSIEND:      return (int)r->evt_rssiend;
+        case RADIO_EVENTS_BCMATCH:      return (int)r->evt_bcmatch;
+        case RADIO_EVENTS_CRCOK:        return (int)r->evt_crcok;
+        case RADIO_EVENTS_CRCERROR:     return (int)r->evt_crcerror;
+        case RADIO_EVENTS_FRAMESTART:   return (int)r->evt_framestart;
+        case RADIO_EVENTS_EDEND:        return (int)r->evt_edend;
+        case RADIO_EVENTS_CCAIDLE:      return (int)r->evt_ccaidle;
+        case RADIO_EVENTS_CCABUSY:      return (int)r->evt_ccabusy;
+        case RADIO_EVENTS_TXREADY:      return (int)r->evt_txready;
+        case RADIO_EVENTS_RXREADY:      return (int)r->evt_rxready;
+        case RADIO_EVENTS_MHRMATCH:     return (int)r->evt_mhrmatch;
+        case RADIO_EVENTS_PHYEND:       return (int)r->evt_phyend;
+        case RADIO_SHORTS:       return (int)r->shorts;
+        case RADIO_INTENSET:
+        case RADIO_INTENCLR:     return (int)r->intenset;
+        case RADIO_CRCSTATUS:    return 1;          /* always OK */
+        case RADIO_PACKETPTR:    return (int)r->packetptr;
+        case RADIO_FREQUENCY:    return (int)r->frequency;
+        case RADIO_TXPOWER:      return (int)r->txpower;
+        case RADIO_MODE:         return (int)r->mode;
+        case RADIO_PCNF0:        return (int)r->pcnf0;
+        case RADIO_PCNF1:        return (int)r->pcnf1;
+        case RADIO_BASE0:        return (int)r->base0;
+        case RADIO_BASE1:        return (int)r->base1;
+        case RADIO_PREFIX0:      return (int)r->prefix0;
+        case RADIO_PREFIX1:      return (int)r->prefix1;
+        case RADIO_TXADDRESS:    return (int)r->txaddress;
+        case RADIO_RXADDRESSES:  return (int)r->rxaddresses;
+        case RADIO_CRCCNF:       return (int)r->crccnf;
+        case RADIO_CRCPOLY:      return (int)r->crcpoly;
+        case RADIO_CRCINIT:      return (int)r->crcinit;
+        case RADIO_MODECNF0:     return (int)r->modecnf0;
+        case RADIO_CCACTRL:      return (int)r->ccactrl;
+        case RADIO_POWER:        return (int)r->power;
+        default: return 0;
+    }
+}
+
+static void nrf_radio_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
+    nrf_radio_state_t *r = &soc->radio;
+    uint32_t off = addr - NRF_RADIO_BASE;
+
+    /* Tasks: trigger on write of 1 */
+    if (off <= RADIO_TASKS_CCASTOP) {
+        if (value == 1) radio_trigger_task(soc, off);
+        return;
+    }
+    /* Events: firmware writes 0 to ack. */
+    if (off >= RADIO_EVENTS_READY && off <= RADIO_EVENTS_PHYEND) {
+        switch (off) {
+            case RADIO_EVENTS_READY:        r->evt_ready      = value & 1; break;
+            case RADIO_EVENTS_ADDRESS:      r->evt_address    = value & 1; break;
+            case RADIO_EVENTS_PAYLOAD:      r->evt_payload    = value & 1; break;
+            case RADIO_EVENTS_END:          r->evt_end        = value & 1; break;
+            case RADIO_EVENTS_DISABLED:     r->evt_disabled   = value & 1; break;
+            case RADIO_EVENTS_DEVMATCH:     r->evt_devmatch   = value & 1; break;
+            case RADIO_EVENTS_DEVMISS:      r->evt_devmiss    = value & 1; break;
+            case RADIO_EVENTS_RSSIEND:      r->evt_rssiend    = value & 1; break;
+            case RADIO_EVENTS_BCMATCH:      r->evt_bcmatch    = value & 1; break;
+            case RADIO_EVENTS_CRCOK:        r->evt_crcok      = value & 1; break;
+            case RADIO_EVENTS_CRCERROR:     r->evt_crcerror   = value & 1; break;
+            case RADIO_EVENTS_FRAMESTART:   r->evt_framestart = value & 1; break;
+            case RADIO_EVENTS_EDEND:        r->evt_edend      = value & 1; break;
+            case RADIO_EVENTS_CCAIDLE:      r->evt_ccaidle    = value & 1; break;
+            case RADIO_EVENTS_CCABUSY:      r->evt_ccabusy    = value & 1; break;
+            case RADIO_EVENTS_TXREADY:      r->evt_txready    = value & 1; break;
+            case RADIO_EVENTS_RXREADY:      r->evt_rxready    = value & 1; break;
+            case RADIO_EVENTS_MHRMATCH:     r->evt_mhrmatch   = value & 1; break;
+            case RADIO_EVENTS_PHYEND:       r->evt_phyend     = value & 1; break;
+        }
+        return;
+    }
+    switch (off) {
+        case RADIO_SHORTS:       r->shorts    = value; break;
+        case RADIO_INTENSET:     r->intenset |= value; break;
+        case RADIO_INTENCLR:     r->intenset &= ~value; break;
+        case RADIO_PACKETPTR:    r->packetptr = value; break;
+        case RADIO_FREQUENCY:    r->frequency = value; break;
+        case RADIO_TXPOWER:      r->txpower   = value; break;
+        case RADIO_MODE:         r->mode      = value; break;
+        case RADIO_PCNF0:        r->pcnf0     = value; break;
+        case RADIO_PCNF1:        r->pcnf1     = value; break;
+        case RADIO_BASE0:        r->base0     = value; break;
+        case RADIO_BASE1:        r->base1     = value; break;
+        case RADIO_PREFIX0:      r->prefix0   = value; break;
+        case RADIO_PREFIX1:      r->prefix1   = value; break;
+        case RADIO_TXADDRESS:    r->txaddress = value; break;
+        case RADIO_RXADDRESSES:  r->rxaddresses = value; break;
+        case RADIO_CRCCNF:       r->crccnf    = value; break;
+        case RADIO_CRCPOLY:      r->crcpoly   = value; break;
+        case RADIO_CRCINIT:      r->crcinit   = value; break;
+        case RADIO_MODECNF0:     r->modecnf0  = value; break;
+        case RADIO_CCACTRL:      r->ccactrl   = value; break;
+        case RADIO_POWER:        r->power     = value; break;
+        default: break;
+    }
+}
+
+/* ============================================================
+ * TIMER0..4 — minimum for rtimer_arch_now()
+ *
+ * 16 MHz base clock, scaled by 2^PRESCALER. Counter increments
+ * lazily on read; TASKS_CAPTURE[i] latches into CC[i].
+ * ============================================================ */
+#define TIMER_TASKS_START      0x000
+#define TIMER_TASKS_STOP       0x004
+#define TIMER_TASKS_COUNT      0x008
+#define TIMER_TASKS_CLEAR      0x00C
+#define TIMER_TASKS_SHUTDOWN   0x010
+#define TIMER_TASKS_CAPTURE_0  0x040  /* +4 each, up to CAPTURE_5 */
+#define TIMER_EVENTS_COMPARE_0 0x140  /* +4 each */
+#define TIMER_SHORTS           0x200
+#define TIMER_INTENSET         0x304
+#define TIMER_INTENCLR         0x308
+#define TIMER_MODE             0x504
+#define TIMER_BITMODE          0x508
+#define TIMER_PRESCALER        0x510
+#define TIMER_CC_0             0x540  /* +4 each, up to CC_5 */
+
+#define TIMER_BASE_HZ          16000000u
+
+static uint32_t timer_bit_mask(uint32_t bitmode) {
+    switch (bitmode) {
+        case 0: return 0xFFFFu;        /* 16-bit */
+        case 1: return 0xFFu;          /* 8-bit */
+        case 2: return 0xFFFFFFu;      /* 24-bit */
+        case 3: default: return 0xFFFFFFFFu;  /* 32-bit */
+    }
+}
+
+static uint32_t timer_compute_counter(const nrf_timer_state_t *t, int64_t now_cycles, uint32_t cpu_freq_hz) {
+    if (!t->running) return t->counter_at_start;
+    int64_t elapsed = now_cycles - t->start_cycles;
+    if (elapsed < 0) elapsed = 0;
+    /* tick_rate_hz = TIMER_BASE_HZ >> prescaler */
+    uint64_t tick_hz = (uint64_t)TIMER_BASE_HZ >> t->prescaler;
+    if (tick_hz == 0) tick_hz = 1;
+    /* ticks = elapsed * tick_hz / cpu_freq_hz */
+    uint64_t ticks = ((uint64_t)elapsed * tick_hz) / (uint64_t)cpu_freq_hz;
+    return (t->counter_at_start + (uint32_t)ticks) & timer_bit_mask(t->bitmode);
+}
+
+static int nrf_timer_read(void *user_data, uint32_t addr) {
+    nrf_timer_state_t *t = (nrf_timer_state_t *)user_data;
+    uint32_t off = addr - t->base;
+    if (off >= TIMER_EVENTS_COMPARE_0 && off < TIMER_EVENTS_COMPARE_0 + 6 * 4)
+        return (int)t->evt_compare[(off - TIMER_EVENTS_COMPARE_0) / 4];
+    if (off >= TIMER_CC_0 && off < TIMER_CC_0 + 6 * 4)
+        return (int)t->cc[(off - TIMER_CC_0) / 4];
+    switch (off) {
+        case TIMER_SHORTS:    return (int)t->shorts;
+        case TIMER_INTENSET:
+        case TIMER_INTENCLR:  return (int)t->intenset;
+        case TIMER_MODE:      return (int)t->mode;
+        case TIMER_BITMODE:   return (int)t->bitmode;
+        case TIMER_PRESCALER: return (int)t->prescaler;
+        default: return 0;
+    }
+}
+
+static void nrf_timer_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf_timer_state_t *t = (nrf_timer_state_t *)user_data;
+    arm_cpu_t *cpu = &t->soc->plat->cpu;
+    uint32_t off = addr - t->base;
+
+    if (off >= TIMER_TASKS_CAPTURE_0 && off < TIMER_TASKS_CAPTURE_0 + 6 * 4) {
+        if (value == 1) {
+            int i = (off - TIMER_TASKS_CAPTURE_0) / 4;
+            t->cc[i] = timer_compute_counter(t, (int64_t)cpu->cycles, cpu->cpu_freq_hz);
+        }
+        return;
+    }
+    if (off >= TIMER_EVENTS_COMPARE_0 && off < TIMER_EVENTS_COMPARE_0 + 6 * 4) {
+        t->evt_compare[(off - TIMER_EVENTS_COMPARE_0) / 4] = value & 1;
+        return;
+    }
+    if (off >= TIMER_CC_0 && off < TIMER_CC_0 + 6 * 4) {
+        t->cc[(off - TIMER_CC_0) / 4] = value;
+        return;
+    }
+    switch (off) {
+        case TIMER_TASKS_START:
+            if (value == 1 && !t->running) {
+                t->counter_at_start = timer_compute_counter(t, (int64_t)cpu->cycles, cpu->cpu_freq_hz);
+                t->start_cycles = (int64_t)cpu->cycles;
+                t->running = true;
+            }
+            break;
+        case TIMER_TASKS_STOP:
+        case TIMER_TASKS_SHUTDOWN:
+            if (value == 1 && t->running) {
+                t->counter_at_start = timer_compute_counter(t, (int64_t)cpu->cycles, cpu->cpu_freq_hz);
+                t->start_cycles = (int64_t)cpu->cycles;
+                t->running = false;
+            }
+            break;
+        case TIMER_TASKS_CLEAR:
+            if (value == 1) {
+                t->counter_at_start = 0;
+                t->start_cycles = (int64_t)cpu->cycles;
+            }
+            break;
+        case TIMER_SHORTS:    t->shorts    = value; break;
+        case TIMER_INTENSET:  t->intenset |= value; break;
+        case TIMER_INTENCLR:  t->intenset &= ~value; break;
+        case TIMER_MODE:      t->mode      = value & 3; break;
+        case TIMER_BITMODE:   t->bitmode   = value & 3; break;
+        case TIMER_PRESCALER: t->prescaler = value & 0xF; break;
+        default: break;
+    }
+}
+
+/* ============================================================
  * SoC lifecycle
  * ============================================================ */
 
@@ -354,6 +839,29 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     soc->rtc0.soc = soc;
     arm_register_io(&plat->cpu, NRF_RTC0_BASE, NRF_RTC0_SIZE,
                     nrf_rtc_read, nrf_rtc_write, soc);
+
+    /* RADIO — on-chip 2.4 GHz multi-protocol radio. */
+    soc->radio.irq_num = NRF_RADIO_IRQ;
+    soc->radio.state   = NRF_RADIO_STATE_DISABLED;
+    soc->radio.power   = 1;       /* powered up by default */
+    arm_register_io(&plat->cpu, NRF_RADIO_BASE, NRF_RADIO_SIZE,
+                    nrf_radio_read, nrf_radio_write, soc);
+
+    /* TIMER0..4. Bases per nRF52840 PS table 19. */
+    static const uint32_t timer_bases[5] = {
+        0x40008000u,  /* TIMER0 */
+        0x40009000u,  /* TIMER1 */
+        0x4000A000u,  /* TIMER2 */
+        0x4001A000u,  /* TIMER3 */
+        0x4001B000u   /* TIMER4 */
+    };
+    for (int i = 0; i < 5; i++) {
+        soc->timer[i].base = timer_bases[i];
+        soc->timer[i].soc  = soc;
+        soc->timer[i].bitmode = 0;          /* 16-bit default */
+        arm_register_io(&plat->cpu, timer_bases[i], 0x1000,
+                        nrf_timer_read, nrf_timer_write, &soc->timer[i]);
+    }
 }
 
 static void nrf52840_soc_destroy(arm_platform_t *plat) {
