@@ -639,6 +639,335 @@ static void test_m4_dsp_halfword_multiply(void) {
 }
 
 /* ===================================================================
+ * Cortex-M4F VFP (FPv4-SP-D16) tests
+ *
+ * Each test pre-seeds vfp_s[] (and/or core regs) with a known value,
+ * writes the VFP encoding into flash, runs one instruction, and
+ * asserts the destination register / FPSCR.
+ *
+ * Encoding reference: ARMv7-M ARM A6.6, A7.7.224–A7.7.276.
+ *
+ * Common encoding shape for SP data-processing:
+ *   hw1 = 1110_1110_opc1_Vn   (Vn = N:Vn<3:0>, N at hw1[7])
+ *   hw2 = Vd_3:0_:1010_:N_opc3_M_0_Vm   (Vd = D:Vd<3:0>, D at hw1[6];
+ *                                        Vm = M:Vm<3:0>, M at hw2[5])
+ *
+ * Helper: type-pun float ↔ uint32 so test sources can write raw bit
+ * patterns without depending on endianness/conversion details.
+ * =================================================================== */
+#include <math.h>
+#include <string.h>
+
+static uint32_t f_to_u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float    u_to_f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+static void test_m4_vfp(void) {
+    printf("--- M4 VFP (FPv4-SP-D16) tests ---\n");
+
+    /* ---- VMOV S0, R0  (core → single) ----
+     * hw1 = 1110_1110_0000_0000 = 0xEE00, hw2 = Rt(0)<<12 | 0x0A10 = 0x0A10 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x12345678;
+        write_thumb32(&cpu, CODE_BASE, 0xEE00, 0x0A10);
+        arm_step(&cpu, 1);
+        assert_eq("VMOV S0, R0 (raw bits preserved)", 0x12345678, cpu.vfp_s[0]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VMOV R1, S2  (single → core) ----
+     * Sn=2 → Vn<3:0>=1 (Vn>>1), N=0. op=1.
+     * hw1 = 1110_1110_0001_0001 = 0xEE11
+     * hw2 = Rt(1)<<12 | 0x0A10 = 0x1A10 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[2] = 0xCAFEBABE;
+        write_thumb32(&cpu, CODE_BASE, 0xEE11, 0x1A10);
+        arm_step(&cpu, 1);
+        assert_eq("VMOV R1, S2 (raw bits preserved)", 0xCAFEBABE, cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VPUSH {S0, S1}  (push 2 SP regs) ----
+     * hw1 = 1110_1101_0010_1101 = 0xED2D (D=0, Vd<5>=0)
+     * hw2 = Vd<3:0>(0)<<12 | 0x0A02 = 0x0A02   (imm8 = 2 single regs) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[0] = 0x11111111;
+        cpu.vfp_s[1] = 0x22222222;
+        uint32_t sp_before = cpu.reg[13];
+        write_thumb32(&cpu, CODE_BASE, 0xED2D, 0x0A02);
+        arm_step(&cpu, 1);
+        assert_eq("VPUSH {S0,S1} adjusts SP -8",
+                  sp_before - 8, cpu.reg[13]);
+        assert_eq("VPUSH {S0,S1} stored S0 at [SP]",
+                  0x11111111, arm_read32(&cpu, cpu.reg[13]));
+        assert_eq("VPUSH {S0,S1} stored S1 at [SP+4]",
+                  0x22222222, arm_read32(&cpu, cpu.reg[13] + 4));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VPOP {S0, S1}  (pop 2 SP regs) ----
+     * hw1 = 1110_1100_1011_1101 = 0xECBD, hw2 = 0x0A02 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* setup_arm leaves SP at SRAM end (0x20008000) — pointing one
+         * past the last byte. Move SP into SRAM and seed the popped data. */
+        uint32_t sp = ARM_SRAM_BASE + 0x100;
+        cpu.reg[13] = sp;
+        arm_write32(&cpu, sp,     0x55556666);
+        arm_write32(&cpu, sp + 4, 0x77778888);
+        write_thumb32(&cpu, CODE_BASE, 0xECBD, 0x0A02);
+        arm_step(&cpu, 1);
+        assert_eq("VPOP {S0,S1} adjusts SP +8", sp + 8, cpu.reg[13]);
+        assert_eq("VPOP {S0,S1} loaded S0 from [SP]", 0x55556666, cpu.vfp_s[0]);
+        assert_eq("VPOP {S0,S1} loaded S1 from [SP+4]", 0x77778888, cpu.vfp_s[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VPUSH {D8} = VPUSH {S16,S17}  (coproc=B alias) ----
+     * hw1 = 0xED2D (D=0, Vd<5>=0)
+     * hw2 = Vd<3:0>(8)<<12 | 0x0B02 = 0x8B02  (coproc=B, imm8 = 1 D-reg = 2 S-regs) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[16] = 0xAAAAAAAA;
+        cpu.vfp_s[17] = 0xBBBBBBBB;
+        uint32_t sp_before = cpu.reg[13];
+        write_thumb32(&cpu, CODE_BASE, 0xED2D, 0x8B02);
+        arm_step(&cpu, 1);
+        assert_eq("VPUSH {D8}: SP -= 8", sp_before - 8, cpu.reg[13]);
+        assert_eq("VPUSH {D8}: S16 stored",
+                  0xAAAAAAAA, arm_read32(&cpu, cpu.reg[13]));
+        assert_eq("VPUSH {D8}: S17 stored",
+                  0xBBBBBBBB, arm_read32(&cpu, cpu.reg[13] + 4));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VLDR S0, [R0, #0]  (single load from immediate-addressed mem) ----
+     * hw1 = 1110_1101_1001_0000 = 0xED90  (U=1, D=0, L=1, Rn=0)
+     * hw2 = Vd<3:0>(0)<<12 | 0x0A00 (imm8 = 0) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t scratch = ARM_SRAM_BASE + 0x100;
+        arm_write32(&cpu, scratch, 0xDEADC0DE);
+        cpu.reg[0] = scratch;
+        write_thumb32(&cpu, CODE_BASE, 0xED90, 0x0A00);
+        arm_step(&cpu, 1);
+        assert_eq("VLDR S0, [R0]", 0xDEADC0DE, cpu.vfp_s[0]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VSTR S1, [R0, #4] ----
+     * Sd=1 → Vd<3:0>=0, D=1. hw1 = 0xED80 | (D<<6)=0x40 | Rn(0) = 0xEDC0.
+     * hw2 = Vd<3:0>(0)<<12 | 0x0A01 (imm8 = 1 → offset 4) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t scratch = ARM_SRAM_BASE + 0x100;
+        cpu.reg[0] = scratch;
+        cpu.vfp_s[1] = 0xFEEDFACE;
+        write_thumb32(&cpu, CODE_BASE, 0xEDC0, 0x0A01);
+        arm_step(&cpu, 1);
+        assert_eq("VSTR S1, [R0,#4]", 0xFEEDFACE, arm_read32(&cpu, scratch + 4));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VADD.F32 S0, S1, S2 ----
+     * Sd=0 (D=0,Vd[3:0]=0); Sn=1 (N=1,Vn[3:0]=0); Sm=2 (M=0,Vm[3:0]=1).
+     * hw1 = 1110_1110_0011_0000 | (N<<7) = 0xEE30 | 0x80 = 0xEE30 with N at bit 7.
+     * Actually N is at hw1[7]. Sn=1 means Vn<5>=N=1, Vn<3:0>=0. So hw1 bit 7 = 1.
+     * hw1 = 1110_1110_0011_0000 with bit 7 set = 0xEE30 | 0x80? wait that overlaps with opc1.
+     * Let me recompute: hw1 = 0xEE30 base for VADD opc1==0x3. Vn<3:0> at hw1[3:0] = 0.
+     * N at hw1[7] = 1. So hw1 = 0xEE30 with bit 7 set:
+     *   0xEE30 = 1110_1110_0011_0000 — bit 7 is 0 here.
+     *   With N=1: 0xEE30 | 0x0080 = 0xEEB0... wait that overlaps with opc1=0xB.
+     * The encoding is hw1[7] for Vn[5] (the N bit). Bit 7 in 0xEE30 = 0. Setting it gives 0xEEB0
+     * which conflicts with the misc-DP opc1=0xB encoding!
+     *
+     * To stay outside the misc-DP space, use Sn=0 (N=0). Sd=2, Sn=0, Sm=4:
+     *   Sd=2: D=0, Vd[3:0]=1
+     *   Sn=0: N=0, Vn[3:0]=0
+     *   Sm=4: M=0, Vm[3:0]=2
+     * hw1 = 0xEE30 (opc1=3, N=0, Vn[3:0]=0)
+     * hw2 = Vd[3:0](1)<<12 | 0x0A00 | (M<<5) | Vm[3:0](2) = 0x1A02
+     */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[0] = f_to_u(2.5f);
+        cpu.vfp_s[4] = f_to_u(1.5f);
+        write_thumb32(&cpu, CODE_BASE, 0xEE30, 0x1A02);
+        arm_step(&cpu, 1);
+        assert_eq("VADD.F32 S2, S0, S4 = 2.5 + 1.5",
+                  f_to_u(4.0f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VSUB.F32 S2, S0, S4 ---- (opc3 bit 6 = 1 → subtract)
+     * hw2 = Vd<<12 | 0x0A00 | (1<<6) | (M<<5) | Vm = 0x1A42 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[0] = f_to_u(5.0f);
+        cpu.vfp_s[4] = f_to_u(1.25f);
+        write_thumb32(&cpu, CODE_BASE, 0xEE30, 0x1A42);
+        arm_step(&cpu, 1);
+        assert_eq("VSUB.F32 S2 = 5.0 - 1.25", f_to_u(3.75f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VMUL.F32 S2, S0, S4 ----
+     * opc1 = 0x2 → hw1 = 0xEE20, hw2 = 0x1A02 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[0] = f_to_u(3.0f);
+        cpu.vfp_s[4] = f_to_u(2.5f);
+        write_thumb32(&cpu, CODE_BASE, 0xEE20, 0x1A02);
+        arm_step(&cpu, 1);
+        assert_eq("VMUL.F32 S2 = 3.0 * 2.5", f_to_u(7.5f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VDIV.F32 S2, S0, S4 ----
+     * opc1 = 0x8 → hw1 = 0xEE80, hw2 = 0x1A02 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[0] = f_to_u(9.0f);
+        cpu.vfp_s[4] = f_to_u(4.0f);
+        write_thumb32(&cpu, CODE_BASE, 0xEE80, 0x1A02);
+        arm_step(&cpu, 1);
+        assert_eq("VDIV.F32 S2 = 9.0 / 4.0", f_to_u(2.25f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VABS.F32 S2, S4 ----  (opc1=B, opc2=0, opc3=3 → VABS)
+     * hw1 = 0xEEB0 (opc1=B, Vn ignored), hw2 = Vd(1)<<12 | 0x0AC0 | Vm(2) = 0x1AC2 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[4] = f_to_u(-3.5f);
+        write_thumb32(&cpu, CODE_BASE, 0xEEB0, 0x1AC2);
+        arm_step(&cpu, 1);
+        assert_eq("VABS.F32 S2 = abs(-3.5)", f_to_u(3.5f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VNEG.F32 S2, S4 ----  (opc1=B, opc2=1, opc3=1 → VNEG)
+     * hw1 = 0xEEB1, hw2 = Vd(1)<<12 | 0x0A40 | Vm(2) = 0x1A42 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[4] = f_to_u(7.25f);
+        write_thumb32(&cpu, CODE_BASE, 0xEEB1, 0x1A42);
+        arm_step(&cpu, 1);
+        assert_eq("VNEG.F32 S2 = -7.25", f_to_u(-7.25f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VSQRT.F32 S2, S4 ----  (opc1=B, opc2=1, opc3=3 → VSQRT)
+     * hw1 = 0xEEB1, hw2 = Vd(1)<<12 | 0x0AC0 | Vm(2) = 0x1AC2 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[4] = f_to_u(16.0f);
+        write_thumb32(&cpu, CODE_BASE, 0xEEB1, 0x1AC2);
+        arm_step(&cpu, 1);
+        assert_eq("VSQRT.F32 S2 = sqrt(16) = 4.0", f_to_u(4.0f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VCMP.F32 S2, S4 ----  (opc1=B, opc2=4, opc3=1)
+     * Compare 2.0 vs 1.0 → greater → FPSCR NZCV = 0010 (C=1, Z=0, N=0, V=0) → 0x20000000.
+     * hw1 = 0xEEB4, hw2 = Vd(1)<<12 | 0x0A40 | Vm(2) = 0x1A42 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[2] = f_to_u(2.0f);
+        cpu.vfp_s[4] = f_to_u(1.0f);
+        write_thumb32(&cpu, CODE_BASE, 0xEEB4, 0x1A42);
+        arm_step(&cpu, 1);
+        assert_eq("VCMP 2.0 > 1.0 → FPSCR.NZCV = 0010 (C set)",
+                  0x20000000u, cpu.fpscr & 0xF0000000u);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* VCMP equal */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[2] = f_to_u(1.5f);
+        cpu.vfp_s[4] = f_to_u(1.5f);
+        write_thumb32(&cpu, CODE_BASE, 0xEEB4, 0x1A42);
+        arm_step(&cpu, 1);
+        assert_eq("VCMP 1.5 == 1.5 → FPSCR.NZCV = 0110 (Z+C)",
+                  0x60000000u, cpu.fpscr & 0xF0000000u);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* VCMP less */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[2] = f_to_u(-1.0f);
+        cpu.vfp_s[4] = f_to_u(0.5f);
+        write_thumb32(&cpu, CODE_BASE, 0xEEB4, 0x1A42);
+        arm_step(&cpu, 1);
+        assert_eq("VCMP -1.0 < 0.5 → FPSCR.NZCV = 1000 (N set)",
+                  0x80000000u, cpu.fpscr & 0xF0000000u);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VCVT.F32.S32 S2, S4 ----  (signed int → float; opc1=B, opc2=8)
+     * hw1 = 0xEEB8, hw2 = Vd(1)<<12 | 0x0AC0 | Vm(2) = 0x1AC2 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[4] = (uint32_t)-42;
+        write_thumb32(&cpu, CODE_BASE, 0xEEB8, 0x1AC2);
+        arm_step(&cpu, 1);
+        assert_eq("VCVT.F32.S32 S2 = float(-42)", f_to_u(-42.0f), cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VCVT.S32.F32 S2, S4 ----  (float → signed int; opc1=B, opc2=D, RTZ)
+     * hw1 = 0xEEBD, hw2 = Vd(1)<<12 | 0x0AC0 | Vm(2) = 0x1AC2 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[4] = f_to_u(-7.9f);
+        write_thumb32(&cpu, CODE_BASE, 0xEEBD, 0x1AC2);
+        arm_step(&cpu, 1);
+        /* Round-to-zero of -7.9 is -7. */
+        assert_eq("VCVT.S32.F32 S2 = int(-7.9) RTZ = -7",
+                  (uint32_t)(int32_t)-7, cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- VMOV.F32 S2, S4 ----  (opc1=B, opc2=0, opc3=1 → VMOV)
+     * hw1 = 0xEEB0, hw2 = Vd(1)<<12 | 0x0A40 | Vm(2) = 0x1A42 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.vfp_s[4] = 0xCAFEF00D;
+        write_thumb32(&cpu, CODE_BASE, 0xEEB0, 0x1A42);
+        arm_step(&cpu, 1);
+        assert_eq("VMOV.F32 S2, S4 (raw bits)", 0xCAFEF00D, cpu.vfp_s[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ---- Unused helper to silence -Wunused-function ---- */
+    (void)u_to_f;
+}
+
+/* ===================================================================
  * Run all tests
  * =================================================================== */
 int run_arm_correctness_tests(int v) {
@@ -657,6 +986,7 @@ int run_arm_correctness_tests(int v) {
     test_extensions();
     test_adc_sbc();
     test_m4_dsp_halfword_multiply();
+    test_m4_vfp();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;
