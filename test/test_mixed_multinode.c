@@ -18,6 +18,7 @@
 #include "cc2420.h"
 #include "arm_platform.h"
 #include "cc2538_soc.h"
+#include "nrf52840_soc.h"
 #include "arm_systick.h"
 #include "arm_elf.h"
 #include "native_node.h"
@@ -1086,10 +1087,11 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
          * arrive on the chip its NETSTACK_RADIO points at. */
         const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
         bool has_cc1200 = pcfg && pcfg->has_cc1200;
-        cc2538_soc_t *soc = arm_platform_cc2538(&nodes[idx].plat.arm);
-        soc->rfcore.rx_rssi = rssi;
-        if (has_cc1200) {
-            soc->cc1200.rx_rssi = rssi;
+        cc2538_soc_t   *cc_soc  = arm_platform_cc2538(&nodes[idx].plat.arm);
+        nrf52840_soc_t *nrf_soc = arm_platform_nrf52840(&nodes[idx].plat.arm);
+        if (cc_soc) {
+            cc_soc->rfcore.rx_rssi = rssi;
+            if (has_cc1200) cc_soc->cc1200.rx_rssi = rssi;
         }
         int64_t last_byte_ns = air_time_ns;
         if (idx == ticking_node_idx) {
@@ -1098,15 +1100,15 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
              * RF Core; the current tick's remaining budget lets the CPU
              * process them before returning to the scheduler. */
             for (int j = 0; j < len; j++) {
-                cc2538_rfcore_receive_byte(&soc->rfcore, data[j]);
-                if (has_cc1200) cc1200_receive_byte(&soc->cc1200, data[j]);
+                if (cc_soc) {
+                    cc2538_rfcore_receive_byte(&cc_soc->rfcore, data[j]);
+                    if (has_cc1200) cc1200_receive_byte(&cc_soc->cc1200, data[j]);
+                }
+                if (nrf_soc) nrf_radio_receive_byte(nrf_soc, data[j]);
             }
         } else {
             for (int j = 0; j < len; j++) {
                 int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
-                /* Advance the receiver's clock to this byte's air time so
-                 * the RF Core ISR observes the correct simulated time when
-                 * it fires (matches the MSP430 sync_msp430_to_time path). */
                 int64_t t_us = byte_time_ns / 1000LL;
                 arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
                 int64_t jump_us = 0;
@@ -1118,8 +1120,11 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
                 arm_step_micros(cpu, jump_us, 0);
                 cpu->sim_time_ns = byte_time_ns;
                 cpu->last_execute_us = t_us;
-                cc2538_rfcore_receive_byte(&soc->rfcore, data[j]);
-                if (has_cc1200) cc1200_receive_byte(&soc->cc1200, data[j]);
+                if (cc_soc) {
+                    cc2538_rfcore_receive_byte(&cc_soc->rfcore, data[j]);
+                    if (has_cc1200) cc1200_receive_byte(&cc_soc->cc1200, data[j]);
+                }
+                if (nrf_soc) nrf_radio_receive_byte(nrf_soc, data[j]);
                 last_byte_ns = byte_time_ns;
             }
         }
@@ -2664,6 +2669,9 @@ static node_type_t detect_node_type(const char *path) {
     /* Zolertia Firefly: same CC2538 SoC as cc2538dk, different board glue. */
     if (dot && strcmp(dot, ".zoul-firefly") == 0)
         return NODE_ARM;
+    /* Nordic nRF52840 USB Dongle. */
+    if (dot && strcmp(dot, ".nrf52840-dongle") == 0)
+        return NODE_ARM;
     if (dot && strcmp(dot, ".cooja") == 0)
         return NODE_NATIVE;
     if (dot && strcmp(dot, ".js") == 0)
@@ -2877,13 +2885,13 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     arm_platform_t *plat = &node->plat.arm;
 
-    /* Derive ARM platform from firmware extension: .cc2538dk -> cc2538dk,
-     * .zoul-firefly -> zoul-firefly. Both reuse the same CC2538 SoC; the
-     * difference is board wiring (LEDs, button, off-SoC chips). */
+    /* Derive ARM platform from firmware extension. */
     const char *dot = strrchr(firmware_path, '.');
     const char *plat_name = "cc2538dk";
     if (dot && strcmp(dot, ".zoul-firefly") == 0)
         plat_name = "zoul-firefly";
+    else if (dot && strcmp(dot, ".nrf52840-dongle") == 0)
+        plat_name = "nrf52840-dongle";
 
     const arm_platform_config_t *pcfg = arm_platform_find(plat_name);
     if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }
@@ -2896,65 +2904,81 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     }
 
     arm_platform_set_console(plat, mixed_uart_callback, node);
-    /* Per-radio TX listener: cc2538_rfcore lives in slot 0 (2.4 GHz). */
-    cc2538_soc_t *soc = arm_platform_cc2538(plat);
-    rf_ctx_slot0[idx].node_idx  = idx;
-    rf_ctx_slot0[idx].radio_idx = 0;
-    cc2538_rfcore_set_tx_callback(&soc->rfcore, mixed_rf_tx_chip_cb,
-                                   &rf_ctx_slot0[idx]);
-    soc->rfcore.node_id = node_id;
-    soc->rfcore.state_callback = mixed_rf_state_handler;
-    soc->rfcore.state_user_data = node;
-    /* Per-radio channel push: the on-SoC RF Core observer reports
-     * FREQCTRL.FREQ writes; the off-SoC sim_host_t adapter reports
-     * CC1200 FREQ writes (slot 1). Both flow through
-     * mixed_node_radio_set_channel and into the radio medium. */
-    cc2538_rfcore_set_channel_callback(&soc->rfcore,
-                                        mixed_rfcore_channel_callback, node);
     plat->host.radio_user_data  = node;
     plat->host.radio_set_channel = mixed_host_radio_set_channel;
 
-    /* CC1200 (Firefly only) lives in slot 1 (sub-GHz).  Its TX listener
-     * tags emissions with sender_radio=1 so the medium dispatches them
-     * onto sub-GHz receivers only, with no per-byte sniffing required.
-     *
-     * Receiver-side, mixed_deliver_rf_bytes still feeds both chips on
-     * a Firefly node — the medium's per-radio filter has already
-     * dropped any cross-band bytes by this point, so the unaffected
-     * chip simply doesn't recognise the preamble/sync of bytes that
-     * weren't meant for it. */
-    if (pcfg->has_cc1200) {
-        rf_ctx_slot1[idx].node_idx  = idx;
-        rf_ctx_slot1[idx].radio_idx = 1;
-        cc1200_set_rf_listener(&soc->cc1200, mixed_rf_tx_chip_cb,
-                                &rf_ctx_slot1[idx]);
-        cc1200_set_channel_busy_query(&soc->cc1200,
-                                       mixed_cc1200_channel_busy, node);
-    }
+    cc2538_soc_t  *cc_soc  = arm_platform_cc2538(plat);
+    nrf52840_soc_t *nrf_soc = arm_platform_nrf52840(plat);
 
-    /* Seed RFRND and sleep timer uniquely per node.
-     * Use bit mixing so close IDs produce divergent sequences. */
-    {
+    if (cc_soc) {
+        /* CC2538-class platform (cc2538dk / openmote / zoul-firefly). */
+        rf_ctx_slot0[idx].node_idx  = idx;
+        rf_ctx_slot0[idx].radio_idx = 0;
+        cc2538_rfcore_set_tx_callback(&cc_soc->rfcore, mixed_rf_tx_chip_cb,
+                                       &rf_ctx_slot0[idx]);
+        cc_soc->rfcore.node_id = node_id;
+        cc_soc->rfcore.state_callback = mixed_rf_state_handler;
+        cc_soc->rfcore.state_user_data = node;
+        cc2538_rfcore_set_channel_callback(&cc_soc->rfcore,
+                                            mixed_rfcore_channel_callback, node);
+
+        if (pcfg->has_cc1200) {
+            rf_ctx_slot1[idx].node_idx  = idx;
+            rf_ctx_slot1[idx].radio_idx = 1;
+            cc1200_set_rf_listener(&cc_soc->cc1200, mixed_rf_tx_chip_cb,
+                                    &rf_ctx_slot1[idx]);
+            cc1200_set_channel_busy_query(&cc_soc->cc1200,
+                                           mixed_cc1200_channel_busy, node);
+        }
+
+        /* Seed RFRND and sleep timer uniquely per node. */
+        {
+            uint32_t h = (uint32_t)node_id;
+            h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+            h *= 2654435761u;
+            h ^= h >> 16;
+            cc_soc->rfcore.rfrnd_state = h ? h : 0xDEADBEEF;
+            if (verbose)
+                printf("  Node %d: rfrnd_seed=0x%08x\n", node_id, h);
+        }
+
+        /* Unique IEEE 64-bit ext_addr using Cooja's repeated scheme. */
+        uint8_t unique_addr[8] = { (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
+                                    (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
+                                    (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
+                                    (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8) };
+        memcpy(cc_soc->rfcore.ext_addr, unique_addr, 8);
+    } else if (nrf_soc) {
+        /* nRF52840 dongle. The SoC has only one radio (on-die), so
+         * only slot 0 is in play. TX bytes flow out through the radio
+         * listener; RX bytes flow in via nrf_radio_receive_byte (see
+         * mixed_deliver_rf_bytes branch). */
+        rf_ctx_slot0[idx].node_idx  = idx;
+        rf_ctx_slot0[idx].radio_idx = 0;
+        nrf_radio_set_tx_listener(nrf_soc, mixed_rf_tx_chip_cb,
+                                   &rf_ctx_slot0[idx]);
+
+        /* FICR.DEVICEADDR per-node — Contiki uses these to derive the
+         * IEEE EUI-64 (Nordic OUI f4:ce:36 prepended in platform.c).
+         * Seed with a per-node hash so addresses are distinct. */
         uint32_t h = (uint32_t)node_id;
-        h ^= h << 13; h ^= h >> 17; h ^= h << 5;   /* xorshift32 */
-        h *= 2654435761u;                             /* Knuth multiplicative hash */
+        h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+        h *= 2654435761u;
         h ^= h >> 16;
-        soc->rfcore.rfrnd_state = h ? h : 0xDEADBEEF;
+        nrf_soc->ficr.deviceaddr0 = h;
+        nrf_soc->ficr.deviceaddr1 = (uint32_t)node_id;
+        nrf_soc->rng.prng_state   = h ? h : 0xDEADBEEF;
 
+        /* nRF doesn't drive a "channel" register the way cc2538 does;
+         * the medium currently uses the on-chip 2.4 GHz channel range
+         * (11..26) and we let the firmware's RADIO->FREQUENCY land in
+         * unmapped IO. Default to channel 26 (matches firmware default
+         * "802.15.4 Default channel: 26"). */
         if (verbose)
-            printf("  Node %d: rfrnd_seed=0x%08x\n", node_id, h);
+            printf("  Node %d [nrf52840]: ficr=%08x:%08x prng=%08x\n",
+                   node_id, nrf_soc->ficr.deviceaddr1, nrf_soc->ficr.deviceaddr0,
+                   nrf_soc->rng.prng_state);
     }
-
-    /* Set unique IEEE 64-bit extended address using Cooja's scheme:
-     * linkaddr = {id>>8, id&0xff} repeated 4 times (big-endian pairs)
-     * Stored in little-endian (reversed) for ieee_addr_cpy_to() reversal.
-     * This gives node N the IPv6 IID 02XX:00XX:00XX:00XX where XX=node_id,
-     * matching Contiki-NG's Cooja platform addressing. */
-    uint8_t unique_addr[8] = { (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
-                                (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
-                                (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8),
-                                (uint8_t)(node_id & 0xFF), (uint8_t)(node_id >> 8) };
-    memcpy(soc->rfcore.ext_addr, unique_addr, 8);
 
     arm_cpu_reset(&plat->cpu);
 

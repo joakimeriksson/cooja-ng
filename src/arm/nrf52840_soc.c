@@ -430,10 +430,10 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
 #define SHORT_READY_EDSTART       (1u << 15)
 #define SHORT_EDEND_DISABLE       (1u << 16)
 #define SHORT_CCAIDLE_STOP        (1u << 17)
-#define SHORT_TXREADY_START       (1u << 19)
-#define SHORT_RXREADY_START       (1u << 20)
-#define SHORT_PHYEND_DISABLE      (1u << 21)
-#define SHORT_PHYEND_START        (1u << 22)
+#define SHORT_TXREADY_START       (1u << 18)
+#define SHORT_RXREADY_START       (1u << 19)
+#define SHORT_PHYEND_DISABLE      (1u << 20)
+#define SHORT_PHYEND_START        (1u << 21)
 
 /* INTENSET bit positions (one per event) */
 #define RADIO_INT_READY        (1u << 0)
@@ -552,14 +552,17 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
     nrf_radio_state_t *r = &soc->radio;
     switch (off) {
         case RADIO_TASKS_TXEN:
-            /* DISABLED → TXRU → TXIDLE (instant). */
-            if (r->state == NRF_RADIO_STATE_DISABLED ||
-                r->state == NRF_RADIO_STATE_TXIDLE)
+            /* Per nRF52840 PS, TXEN is only legal from DISABLED, but
+             * Contiki's nrf52840-ieee driver fires TXEN directly from
+             * RXIDLE (after STOP) and depends on hardware to handle the
+             * implicit transition. Mirror that lenience. */
+            if (r->state != NRF_RADIO_STATE_TX &&
+                r->state != NRF_RADIO_STATE_TXRU)
                 radio_set_state(soc, NRF_RADIO_STATE_TXIDLE);
             break;
         case RADIO_TASKS_RXEN:
-            if (r->state == NRF_RADIO_STATE_DISABLED ||
-                r->state == NRF_RADIO_STATE_RXIDLE)
+            if (r->state != NRF_RADIO_STATE_RX &&
+                r->state != NRF_RADIO_STATE_RXRU)
                 radio_set_state(soc, NRF_RADIO_STATE_RXIDLE);
             break;
         case RADIO_TASKS_START:
@@ -732,6 +735,11 @@ static void radio_emit_tx(nrf52840_soc_t *soc) {
     if (!soc->radio_tx_cb) return;
     arm_cpu_t *cpu = &soc->plat->cpu;
 
+    /* PACKETPTR must point into SRAM. Real EasyDMA silently fails
+     * otherwise; we drop the TX and warn. */
+    if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)
+        return;
+
     uint8_t phr = arm_read8(cpu, r->packetptr);
     if (phr < 2 || phr > 127) return;       /* malformed; drop silently */
 
@@ -773,6 +781,9 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
     /* Only when actually in RX. */
     if (r->state != NRF_RADIO_STATE_RX) return;
     arm_cpu_t *cpu = &soc->plat->cpu;
+    /* Bounds-check PACKETPTR — must point into SRAM. */
+    if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)
+        return;
 
     switch (r->rx_phase) {
         case NRF_RX_WAIT_PREAMBLE:
