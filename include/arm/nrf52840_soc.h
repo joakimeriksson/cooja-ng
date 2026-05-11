@@ -145,6 +145,10 @@ typedef struct nrf_radio_state {
     uint32_t evt_phyend;       /* 0x16C */
 
     int      irq_num;          /* RADIO IRQ = 1 */
+    /* RX byte parser state — incoming on-air bytes feed this. */
+    int      rx_phase;         /* nrf_rx_phase_t enum */
+    int      rx_remaining;
+    int      rx_offset;
 } nrf_radio_state_t;
 
 /* TIMER0..4 at 0x40008000 / 0x40009000 / 0x4000A000 / 0x4001A000 / 0x4001B000.
@@ -169,14 +173,46 @@ typedef struct nrf_timer_state {
     struct nrf52840_soc *soc; /* back-pointer for cpu access */
 } nrf_timer_state_t;
 
+/* RNG at 0x4000D000 — random byte generator. */
+typedef struct nrf_rng_state {
+    uint32_t evt_valrdy;      /* offset 0x100 */
+    uint32_t intenset;        /* offset 0x304 (bit 0 = VALRDY) */
+    uint32_t shorts;          /* offset 0x200 */
+    bool     running;
+    uint32_t prng_state;      /* xorshift32 seeded per-node */
+} nrf_rng_state_t;
+
+/* FICR at 0x10000000 — factory information. csim only models the
+ * DEVICEADDR pair (used by the platform glue to derive the IEEE
+ * EUI-64). The multinode harness writes per-node values here. */
+typedef struct nrf_ficr_state {
+    uint32_t deviceaddr0;     /* 0x100000A4 — low 32 bits */
+    uint32_t deviceaddr1;     /* 0x100000A8 — top 16 bits */
+} nrf_ficr_state_t;
+
+/* Radio TX byte listener — installed by the multinode runner so air
+ * bytes get pushed into radio_medium. Receives bytes one at a time
+ * starting from the preamble. */
+typedef void (*nrf_radio_tx_listener_t)(void *user_data, uint8_t byte);
+
 typedef struct nrf52840_soc {
     nrf_clock_state_t clock;
     nrf_uart_state_t  uart0;
     nrf_rtc_state_t   rtc0;
     nrf_radio_state_t radio;
     nrf_timer_state_t timer[5];
+    nrf_rng_state_t   rng;
+    nrf_ficr_state_t  ficr;
     arm_platform_t   *plat;   /* back-pointer for event-callback NVIC access */
+    /* Radio TX listener installed by the harness. */
+    nrf_radio_tx_listener_t radio_tx_cb;
+    void                   *radio_tx_user;
 } nrf52840_soc_t;
+
+/* Public hook used by the multinode harness to install the TX listener
+ * and to push received bytes into the radio. */
+void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, void *user_data);
+void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte);
 
 /* nRF52840 RADIO state enum values (per PS v1.7 §6.20.15.39). */
 #define NRF_RADIO_STATE_DISABLED   0

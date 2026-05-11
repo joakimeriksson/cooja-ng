@@ -448,10 +448,36 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
 #define RADIO_INT_RXREADY      (1u << 22)
 #define RADIO_INT_MHRMATCH     (1u << 23)
 
+/* IEEE 802.15.4 on-air framing — same convention used by cc2420 /
+ * cc2538_rfcore in this tree, so radio_medium can route bytes between
+ * nrf52840 and cc2538dk nodes if anyone tries it. */
+#define IEEE802154_PREAMBLE_BYTE  0x00
+#define IEEE802154_PREAMBLE_LEN   4
+#define IEEE802154_SFD            0x7A
+
+/* RX byte parser phase for incoming on-air bytes. */
+enum nrf_rx_phase {
+    NRF_RX_WAIT_PREAMBLE = 0,
+    NRF_RX_WAIT_SFD,
+    NRF_RX_READ_PHR,
+    NRF_RX_READ_PAYLOAD
+};
+
 /* Forward decls */
 static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off);
 static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state);
 static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask);
+static void radio_emit_tx(nrf52840_soc_t *soc);
+
+/* CCITT-16 CRC, matches IEEE 802.15.4 FCS. Same algorithm as cc2420.c. */
+static uint16_t nrf_crc_add(uint16_t crc, uint8_t data) {
+    uint16_t newcrc = ((crc >> 8) & 0xff) | ((crc << 8) & 0xffff);
+    newcrc ^= data;
+    newcrc ^= (newcrc & 0xff) >> 4;
+    newcrc ^= (newcrc << 12) & 0xffff;
+    newcrc ^= (newcrc & 0xff) << 5;
+    return newcrc & 0xffff;
+}
 
 /* Raise IRQ if any of the latched events have INTENSET bit set. */
 static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask) {
@@ -540,8 +566,11 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             /* TXIDLE → TX → (instantly transmit) → TXIDLE.
              * RXIDLE → RX (stay there until a frame arrives). */
             if (r->state == NRF_RADIO_STATE_TXIDLE) {
-                /* Transition through TX, fire FRAMESTART/END/PHYEND, return to TXIDLE. */
+                /* Walk PACKETPTR, build the on-air frame, push bytes
+                 * out via the TX listener (multinode harness installs
+                 * one). Then fire post-TX events and return to TXIDLE. */
                 r->state = NRF_RADIO_STATE_TX;
+                radio_emit_tx(soc);
                 radio_event(soc, &r->evt_address,    RADIO_INT_ADDRESS);
                 radio_event(soc, &r->evt_framestart, RADIO_INT_FRAMESTART);
                 radio_event(soc, &r->evt_payload,    RADIO_INT_PAYLOAD);
@@ -553,8 +582,10 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 radio_apply_shorts_after_event(soc, SHORT_END_START);
                 radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
             } else if (r->state == NRF_RADIO_STATE_RXIDLE) {
-                /* Sit in RX until external data arrives (none yet). */
-                r->state = NRF_RADIO_STATE_RX;
+                /* Sit in RX waiting for external bytes (delivered via
+                 * nrf_radio_receive_byte). Reset the byte parser. */
+                r->state    = NRF_RADIO_STATE_RX;
+                r->rx_phase = NRF_RX_WAIT_PREAMBLE;
             }
             break;
         case RADIO_TASKS_STOP:
@@ -691,6 +722,195 @@ static void nrf_radio_write(void *user_data, uint32_t addr, uint32_t value) {
         case RADIO_POWER:        r->power     = value; break;
         default: break;
     }
+}
+
+/* Walk the buffer at PACKETPTR, compute IEEE 802.15.4 FCS, and emit
+ * the on-air byte sequence (4×preamble + SFD + PHR + payload + CRC).
+ * Called when the radio enters TX state via TASKS_START. */
+static void radio_emit_tx(nrf52840_soc_t *soc) {
+    nrf_radio_state_t *r = &soc->radio;
+    if (!soc->radio_tx_cb) return;
+    arm_cpu_t *cpu = &soc->plat->cpu;
+
+    uint8_t phr = arm_read8(cpu, r->packetptr);
+    if (phr < 2 || phr > 127) return;       /* malformed; drop silently */
+
+    /* Driver layout: PACKETPTR[0]=PHR; PACKETPTR[1..PHR-2]=payload
+     * (PHR-2 bytes); PACKETPTR[PHR-1..PHR]=FCS slot the hardware fills
+     * in. We compute the FCS over PHR-2 payload bytes and append. */
+    uint8_t payload[125];
+    int payload_len = (int)phr - 2;
+    for (int i = 0; i < payload_len; i++)
+        payload[i] = arm_read8(cpu, r->packetptr + 1 + (uint32_t)i);
+
+    /* IEEE 802.15.4 FCS is computed over MPDU only (NOT including PHR). */
+    uint16_t crc = 0;
+    for (int i = 0; i < payload_len; i++) crc = nrf_crc_add(crc, payload[i]);
+
+    nrf_radio_tx_listener_t cb = soc->radio_tx_cb;
+    void *ud = soc->radio_tx_user;
+    for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
+        cb(ud, IEEE802154_PREAMBLE_BYTE);
+    cb(ud, IEEE802154_SFD);
+    cb(ud, phr);
+    for (int i = 0; i < payload_len; i++) cb(ud, payload[i]);
+    cb(ud, (uint8_t)(crc & 0xFF));
+    cb(ud, (uint8_t)((crc >> 8) & 0xFF));
+}
+
+void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, void *user_data) {
+    soc->radio_tx_cb = cb;
+    soc->radio_tx_user = user_data;
+}
+
+/* Push a single on-air byte into the receiver. Frames bytes through the
+ * preamble/SFD/PHR/payload state machine, writes accepted bytes into
+ * the PACKETPTR-pointed RAM buffer, and fires FRAMESTART/CRCOK/END
+ * events on completion. Called by the multinode harness when the medium
+ * delivers a byte to this node. */
+void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
+    nrf_radio_state_t *r = &soc->radio;
+    /* Only when actually in RX. */
+    if (r->state != NRF_RADIO_STATE_RX) return;
+    arm_cpu_t *cpu = &soc->plat->cpu;
+
+    switch (r->rx_phase) {
+        case NRF_RX_WAIT_PREAMBLE:
+            if (byte == IEEE802154_PREAMBLE_BYTE)
+                r->rx_phase = NRF_RX_WAIT_SFD;
+            break;
+        case NRF_RX_WAIT_SFD:
+            if (byte == IEEE802154_SFD) {
+                r->rx_phase = NRF_RX_READ_PHR;
+                radio_event(soc, &r->evt_address,    RADIO_INT_ADDRESS);
+                radio_event(soc, &r->evt_framestart, RADIO_INT_FRAMESTART);
+            } else if (byte != IEEE802154_PREAMBLE_BYTE) {
+                /* Stray byte — restart preamble search. */
+                r->rx_phase = NRF_RX_WAIT_PREAMBLE;
+            }
+            break;
+        case NRF_RX_READ_PHR:
+            if (byte < 2 || byte > 127) {
+                r->rx_phase = NRF_RX_WAIT_PREAMBLE;
+                break;
+            }
+            arm_write8(cpu, r->packetptr, byte);
+            r->rx_remaining = byte;          /* PHR includes 2 FCS bytes */
+            r->rx_offset    = 1;
+            r->rx_phase     = NRF_RX_READ_PAYLOAD;
+            break;
+        case NRF_RX_READ_PAYLOAD:
+            arm_write8(cpu, r->packetptr + (uint32_t)r->rx_offset, byte);
+            r->rx_offset++;
+            r->rx_remaining--;
+            if (r->rx_remaining == 0) {
+                /* Frame complete. Always treat as CRC-OK for now —
+                 * generators sign their own CRCs and the medium drops
+                 * collided bytes already. */
+                radio_event(soc, &r->evt_payload,  RADIO_INT_PAYLOAD);
+                radio_event(soc, &r->evt_end,      RADIO_INT_END);
+                radio_event(soc, &r->evt_phyend,   0);
+                radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
+                /* Driver typically transitions back to RXIDLE via END
+                 * processing; mirror that to drain the parser. */
+                r->state    = NRF_RADIO_STATE_RXIDLE;
+                r->rx_phase = NRF_RX_WAIT_PREAMBLE;
+                radio_apply_shorts_after_event(soc, SHORT_END_DISABLE);
+            }
+            break;
+    }
+}
+
+/* ============================================================
+ * RNG (0x4000D000)
+ *
+ * Tiny PRNG-backed model. TASKS_START sets EVENTS_VALRDY immediately;
+ * VALUE returns the next byte from a per-node xorshift32 stream.
+ * Contiki uses this for CSMA backoff and RPL DAG-ID seeding.
+ * ============================================================ */
+#define NRF_RNG_BASE              0x4000D000u
+#define NRF_RNG_TASKS_START       0x000
+#define NRF_RNG_TASKS_STOP        0x004
+#define NRF_RNG_EVENTS_VALRDY     0x100
+#define NRF_RNG_SHORTS            0x200
+#define NRF_RNG_INTENSET          0x304
+#define NRF_RNG_INTENCLR          0x308
+#define NRF_RNG_CONFIG            0x504
+#define NRF_RNG_VALUE             0x508
+
+static uint8_t rng_next(nrf_rng_state_t *rng) {
+    uint32_t s = rng->prng_state ? rng->prng_state : 0x12345678u;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    rng->prng_state = s;
+    return (uint8_t)(s & 0xFF);
+}
+
+static int nrf_rng_read(void *user_data, uint32_t addr) {
+    nrf_rng_state_t *rng = (nrf_rng_state_t *)user_data;
+    uint32_t off = addr - NRF_RNG_BASE;
+    switch (off) {
+        case NRF_RNG_EVENTS_VALRDY: return (int)rng->evt_valrdy;
+        case NRF_RNG_INTENSET:
+        case NRF_RNG_INTENCLR:      return (int)rng->intenset;
+        case NRF_RNG_SHORTS:        return (int)rng->shorts;
+        case NRF_RNG_VALUE:         return (int)rng_next(rng);
+        default: return 0;
+    }
+}
+
+static void nrf_rng_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf_rng_state_t *rng = (nrf_rng_state_t *)user_data;
+    uint32_t off = addr - NRF_RNG_BASE;
+    switch (off) {
+        case NRF_RNG_TASKS_START:
+            if (value == 1) { rng->running = true; rng->evt_valrdy = 1; }
+            break;
+        case NRF_RNG_TASKS_STOP:
+            if (value == 1) rng->running = false;
+            break;
+        case NRF_RNG_EVENTS_VALRDY: rng->evt_valrdy = value & 1; break;
+        case NRF_RNG_SHORTS:        rng->shorts     = value;     break;
+        case NRF_RNG_INTENSET:      rng->intenset  |= value;     break;
+        case NRF_RNG_INTENCLR:      rng->intenset  &= ~value;    break;
+        default: break;
+    }
+}
+
+/* ============================================================
+ * FICR at 0x10000000 — only DEVICEADDR pair is useful here.
+ *
+ * Per nRF52840 PS, FICR is in the same 0x10000000 page as UICR;
+ * we expose a 4 KiB window. DEVICEADDR[0] = 0xA4, DEVICEADDR[1] = 0xA8.
+ * ============================================================ */
+#define NRF_FICR_BASE        0x10000000u
+#define NRF_FICR_DEVICEADDR0 0xA4
+#define NRF_FICR_DEVICEADDR1 0xA8
+/* Other commonly-read FICR fields we return useful constants for. */
+#define NRF_FICR_CODEPAGESIZE 0x10
+#define NRF_FICR_CODESIZE     0x14
+#define NRF_FICR_DEVICEID0    0x60
+#define NRF_FICR_DEVICEID1    0x64
+#define NRF_FICR_DEVICEADDRTYPE 0xA0
+
+static int nrf_ficr_read(void *user_data, uint32_t addr) {
+    nrf_ficr_state_t *ficr = (nrf_ficr_state_t *)user_data;
+    uint32_t off = addr - NRF_FICR_BASE;
+    switch (off) {
+        case NRF_FICR_CODEPAGESIZE:    return 4096;            /* 4 KiB pages */
+        case NRF_FICR_CODESIZE:        return 256;             /* 256 pages → 1 MiB */
+        case NRF_FICR_DEVICEADDRTYPE:  return 1;               /* random-static */
+        case NRF_FICR_DEVICEADDR0:     return (int)ficr->deviceaddr0;
+        case NRF_FICR_DEVICEADDR1:     return (int)ficr->deviceaddr1;
+        case NRF_FICR_DEVICEID0:       return (int)ficr->deviceaddr0;
+        case NRF_FICR_DEVICEID1:       return (int)ficr->deviceaddr1;
+        default: return 0xFFFFFFFF;     /* erased flash */
+    }
+}
+
+static void nrf_ficr_write(void *user_data, uint32_t addr, uint32_t value) {
+    /* FICR is read-only on real hardware. Allow writes from the
+     * harness via direct struct access; the firmware never writes here. */
+    (void)user_data; (void)addr; (void)value;
 }
 
 /* ============================================================
@@ -862,6 +1082,17 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
         arm_register_io(&plat->cpu, timer_bases[i], 0x1000,
                         nrf_timer_read, nrf_timer_write, &soc->timer[i]);
     }
+
+    /* RNG */
+    soc->rng.prng_state = 0xDEADBEEF;
+    arm_register_io(&plat->cpu, NRF_RNG_BASE, 0x1000,
+                    nrf_rng_read, nrf_rng_write, &soc->rng);
+
+    /* FICR — default values; harness patches DEVICEADDR0/1 per node. */
+    soc->ficr.deviceaddr0 = 0x00000000;
+    soc->ficr.deviceaddr1 = 0x0000F4CE;     /* upper bytes used as MAC OUI fragment */
+    arm_register_io(&plat->cpu, NRF_FICR_BASE, 0x1000,
+                    nrf_ficr_read, nrf_ficr_write, &soc->ficr);
 }
 
 static void nrf52840_soc_destroy(arm_platform_t *plat) {

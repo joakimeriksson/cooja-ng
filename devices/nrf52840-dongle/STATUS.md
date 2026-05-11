@@ -110,26 +110,34 @@ That's L4 in spirit: the firmware reaches the app process, schedules
 events, and runs them on time. CSMA/MAC layers also functional —
 they accept the TX call without spin-locking.
 
-## Towards L5–L6 (RPL-UDP convergence)
+## Data path + RNG + FICR landed; multinode harness next
 
-What remains for RPL-UDP between two nrf52840 nodes:
+  - **PACKETPTR EasyDMA in RADIO** (TX): on TASKS_START in TX state,
+    `radio_emit_tx()` walks the buffer at PACKETPTR (PHR + payload),
+    computes the IEEE 802.15.4 CCITT-16 FCS, and emits the on-air
+    byte sequence (4×0x00 preamble + 0x7A SFD + PHR + payload + CRC
+    low + CRC high) through `soc->radio_tx_cb`.
+  - **PACKETPTR EasyDMA in RADIO** (RX): `nrf_radio_receive_byte()`
+    is a public API (called by the multinode harness) that frames
+    incoming bytes through preamble→SFD→PHR→payload, writes accepted
+    bytes into PACKETPTR-pointed RAM, and fires
+    FRAMESTART/PAYLOAD/END/PHYEND/CRCOK on completion.
+  - **RNG** (0x4000D000): TASKS_START → set EVENTS_VALRDY immediately;
+    VALUE returns next byte from a per-node xorshift32 PRNG (seed
+    initialised by SoC init, the harness can override).
+  - **FICR** (0x10000000): DEVICEADDR0/1 + CODEPAGESIZE/CODESIZE +
+    DEVICEADDRTYPE returned. The harness writes per-node DEVICEADDR
+    values directly via the soc->ficr struct for unique IEEE EUI-64.
 
-  - **PACKETPTR EasyDMA in RADIO**: on TASKS_START in TX state, walk
-    the PACKETPTR-pointed RAM buffer (PHR + payload + CRC bytes per
-    PCNF0/PCNF1), emit each byte to a TX callback. On external bytes
-    arriving while in RX, write into PACKETPTR-pointed RAM, fire
-    FRAMESTART then END/CRCOK. Compute the IEEE 802.15.4 CRC.
-  - **RNG** (0x4000D000): Contiki uses random for CSMA backoff. Tiny
-    stub: VALRDY event + VALUE register seeded per-node.
-  - **NVMC / FICR** (0x10000000): firmware reads FICR.DEVICEADDR
-    (0x100000A4 / 0x100000A8) for the IEEE EUI-64. The multinode
-    harness needs to patch this per-node.
+What remains:
   - **Multinode harness** (`test_mixed_multinode.c`): recognise the
-    `.nrf52840-dongle` extension, init the platform, register the
-    radio TX callback into `radio_medium`, fan-out medium→RADIO RX
-    bytes per node, patch FICR.DEVICEADDR per node.
-
-Each step lands as its own commit, same shape as everything to date.
+    `.nrf52840-dongle` extension, init the platform, install the
+    TX listener via `nrf_radio_set_tx_listener()`, fan-out
+    `radio_medium` deliveries via `nrf_radio_receive_byte()`, set
+    per-node `soc->ficr.deviceaddr0/1`.
+  - **Debug RPL-UDP convergence**: per past porting experience, this
+    is the unpredictable part — frame format mismatches, IRQ priority
+    issues, timing dependencies typically surface here.
 
 ## Why this port, why this board
 
