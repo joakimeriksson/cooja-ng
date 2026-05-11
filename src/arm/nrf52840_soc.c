@@ -825,10 +825,11 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                 radio_event(soc, &r->evt_phyend,   0);
                 radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
                 if (getenv("NRF_RX_TRACE")) {
-                    fprintf(stderr, "[nrf-rx] frame done off=%d packetptr=0x%08x irq_pend=%d intenset=0x%x\n",
-                            r->rx_offset, r->packetptr,
-                            soc->plat && soc->plat->cpu.nvic ? ((arm_nvic_t *)soc->plat->cpu.nvic)->has_pending : -1,
-                            r->intenset);
+                    fprintf(stderr, "[nrf-rx] frame off=%d phr=", r->rx_offset);
+                    int dump = r->rx_offset > 24 ? 24 : r->rx_offset;
+                    for (int i = 0; i < dump; i++)
+                        fprintf(stderr, "%02x ", arm_read8(cpu, r->packetptr + (uint32_t)i));
+                    fprintf(stderr, "\n");
                 }
                 /* Driver typically transitions back to RXIDLE via END
                  * processing; mirror that to drain the parser. */
@@ -1054,6 +1055,12 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)calloc(1, sizeof(*soc));
     plat->soc = soc;
     soc->plat = plat;
+
+    /* Honour the platform's VTOR override (board-specific: DK = 0x0,
+     * Dongle = 0x1000 due to the Open Bootloader). Falls back to the
+     * SoC config's vtor_default if the platform leaves it 0. */
+    if (plat->config && plat->config->vtor_override)
+        plat->cpu.vtor_default = plat->config->vtor_override;
 
     /* Minimum host vtable. */
     plat->host.cpu         = &plat->cpu;

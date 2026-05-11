@@ -279,11 +279,12 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->gdb_stub = NULL;
 
     /* Cache memory layout from config — used by every load/store hot path. */
-    cpu->flash_base = config->flash_base;
-    cpu->flash_end  = config->flash_base + config->flash_size;
-    cpu->sram_base  = config->sram_base;
-    cpu->sram_end   = config->sram_base + config->sram_size;
-    cpu->rom_size   = config->rom_size;
+    cpu->flash_base   = config->flash_base;
+    cpu->flash_end    = config->flash_base + config->flash_size;
+    cpu->sram_base    = config->sram_base;
+    cpu->sram_end     = config->sram_base + config->sram_size;
+    cpu->rom_size     = config->rom_size;
+    cpu->vtor_default = config->vtor_default;
 
     cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
     cpu->sram  = (uint8_t *)calloc(config->sram_size,  1);
@@ -359,15 +360,14 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->step_cycle_remainder = 0.0;
 
     /* Vector table discovery, in order of preference:
-     *   1. config->vtor_default if non-zero (e.g. nRF52840 dongle: 0x1000
-     *      because the Open Bootloader reserves 0x0..0xfff).
+     *   1. cpu->vtor_default (seeded from SoC config, may be overridden
+     *      by SoC init op based on platform config — e.g. nrf52840
+     *      Dongle = 0x1000, DK = 0x0).
      *   2. CC2538 CCA at flash_end - 0x2C, where CCA+8 carries the
      *      application entry point. CCA is a TI-specific convention.
-     *   3. Plain flash_base as a last resort (works for SoCs that put
-     *      the vector table at the very start of flash and have no
-     *      side-table). */
-    if (cpu->config && cpu->config->vtor_default != 0) {
-        cpu->vtor = cpu->config->vtor_default;
+     *   3. Plain flash_base as a last resort. */
+    if (cpu->vtor_default != 0) {
+        cpu->vtor = cpu->vtor_default;
     } else {
         uint32_t cca_addr = cpu->flash_end - 0x2C;
         cpu->vtor = arm_read32(cpu, cca_addr + 8);

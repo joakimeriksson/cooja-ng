@@ -27,8 +27,11 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
 
-# nRF52840 USB Dongle (Cortex-M4F + on-chip 802.15.4 radio)
+# nRF52840 USB Dongle (PCA10059, Cortex-M4F + on-chip 802.15.4 radio)
 ./build/test_runner nrf52840-dongle-multinode firmware/nrf52840-dongle/udp-server.nrf52840-dongle firmware/nrf52840-dongle/udp-client.nrf52840-dongle -t 60000
+
+# nRF52840 Development Kit (PCA10056, same SoC + SEGGER UART)
+./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/udp-server.nrf52840-dk firmware/nrf52840-dk/udp-client.nrf52840-dk -t 60000
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
@@ -203,7 +206,8 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **cc2538dk** | CC2538 (ARM Cortex-M3) | Yes (on-chip) | UART0 | TI SmartRF06 + CC2538EM |
 | **openmote** | CC2538 (ARM Cortex-M3) | Yes (on-chip) | UART0 | OpenMote board (same SoC as cc2538dk) |
 | **zoul-firefly** | CC2538 (ARM Cortex-M3) | Yes (on-chip) + CC1200 (off-SoC sub-GHz) | UART0 | Zolertia Firefly — dual-band |
-| **nrf52840-dongle** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10059 USB Dongle, M4F + FPv4-SP-D16 |
+| **nrf52840-dongle** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10059 USB Dongle, M4F + FPv4-SP-D16, VTOR=0x1000 (Open Bootloader region at 0x0..0xfff) |
+| **nrf52840-dk** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10056 Development Kit, same SoC as Dongle, VTOR=0x0, SEGGER VCP console |
 
 ## MCU Configurations
 

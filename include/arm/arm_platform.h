@@ -81,6 +81,12 @@ typedef struct arm_platform_config {
     arm_gpio_pin_t       cc1200_reset;     /* reset       (active low) */
     arm_gpio_pin_t       cc1200_gdo0;      /* GDO0        (input to MCU) */
     arm_gpio_pin_t       cc1200_gdo2;      /* GDO2        (input to MCU, optional) */
+    /* Per-board VTOR override. 0 → use SoC's `arm_config_t::vtor_default`
+     * (and fall back to flash_base / CCA discovery). Non-zero → that
+     * absolute address. Lets two boards with the same SoC differ on
+     * whether the application starts at flash_base or above a
+     * bootloader region (e.g. nrf52840 DK at 0x0 vs Dongle at 0x1000). */
+    uint32_t             vtor_override;
 } arm_platform_config_t;
 
 /* Platform runtime state. SoC-agnostic — the SoC-specific peripheral
