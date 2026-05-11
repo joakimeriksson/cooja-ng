@@ -824,6 +824,51 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                 radio_event(soc, &r->evt_end,      RADIO_INT_END);
                 radio_event(soc, &r->evt_phyend,   0);
                 radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
+
+                /* Hardware-style auto-ACK for unicast Data frames that
+                 * have the ACK_REQUEST bit set. Real nRF52840 silicon
+                 * achieves sub-200 µs ACK turnaround via PPI + TIMER +
+                 * SHORTS choreography (set up by Nordic's 802.15.4
+                 * driver). The Contiki nrf driver leaves that path
+                 * unconfigured and relies on CSMA's software ACK
+                 * (`CSMA_SEND_SOFT_ACK`), but csim's tick granularity
+                 * makes the software path arrive after the sender's
+                 * CSMA_ACK_WAIT_TIME — driving a retx storm that's
+                 * pure simulator artefact.  Emit the ACK synchronously
+                 * inside the chip model, same convention as cc2538
+                 * (cc2538_rfcore.c). The firmware's later software
+                 * ACK arrives as a duplicate and is harmlessly dropped
+                 * at the sender (already acked, seqno already cleared).
+                 *
+                 * Layout in PACKETPTR: [PHR][FCF0][FCF1][DSN][...].
+                 * Per IEEE 802.15.4 FCF: bit 0:2 = frame type, bit 5 =
+                 * ACK_REQUEST. Broadcast frames never set ACK_REQUEST. */
+                if (soc->radio_tx_cb && r->rx_offset > 4) {
+                    uint8_t fcf0       = arm_read8(cpu, r->packetptr + 1);
+                    uint8_t dsn        = arm_read8(cpu, r->packetptr + 3);
+                    int     frame_type = fcf0 & 0x07;
+                    int     ack_req    = (fcf0 >> 5) & 1;
+                    if (frame_type == 0x1 /* Data */ && ack_req) {
+                        uint8_t ack_fcf0 = 0x02; /* frame type = ACK */
+                        uint8_t ack_fcf1 = 0x00;
+                        uint16_t crc = 0;
+                        crc = nrf_crc_add(crc, ack_fcf0);
+                        crc = nrf_crc_add(crc, ack_fcf1);
+                        crc = nrf_crc_add(crc, dsn);
+                        nrf_radio_tx_listener_t cb = soc->radio_tx_cb;
+                        void *ud                   = soc->radio_tx_user;
+                        for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
+                            cb(ud, IEEE802154_PREAMBLE_BYTE);
+                        cb(ud, IEEE802154_SFD);
+                        cb(ud, 5);              /* PHR: FCF(2)+DSN(1)+FCS(2) */
+                        cb(ud, ack_fcf0);
+                        cb(ud, ack_fcf1);
+                        cb(ud, dsn);
+                        cb(ud, (uint8_t)(crc & 0xFF));
+                        cb(ud, (uint8_t)((crc >> 8) & 0xFF));
+                    }
+                }
+
                 if (getenv("NRF_RX_TRACE")) {
                     fprintf(stderr, "[nrf-rx] frame off=%d phr=", r->rx_offset);
                     int dump = r->rx_offset > 24 ? 24 : r->rx_offset;
