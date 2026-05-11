@@ -21,11 +21,14 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner multinode         # 2-node nullnet-broadcast (default 20s)
 ./build/test_runner multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
 
-# ARM Cortex-M3 tests
-./build/test_runner arm-correctness -v   # 33 instruction-level tests
+# ARM Cortex-M3/M4 tests
+./build/test_runner arm-correctness -v   # 74 instruction-level tests (Thumb-2 + M4 DSP + M4 VFP)
 ./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
+
+# nRF52840 USB Dongle (Cortex-M4F + on-chip 802.15.4 radio)
+./build/test_runner nrf52840-dongle-multinode firmware/nrf52840-dongle/udp-server.nrf52840-dongle firmware/nrf52840-dongle/udp-client.nrf52840-dongle -t 60000
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
@@ -198,6 +201,9 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **exp5438** | MSP430F5437 | No | USART1 | MSP-EXP5438 |
 | **cc430** | CC430F5137 | No | USART0 | CC430 eval board |
 | **cc2538dk** | CC2538 (ARM Cortex-M3) | Yes (on-chip) | UART0 | TI SmartRF06 + CC2538EM |
+| **openmote** | CC2538 (ARM Cortex-M3) | Yes (on-chip) | UART0 | OpenMote board (same SoC as cc2538dk) |
+| **zoul-firefly** | CC2538 (ARM Cortex-M3) | Yes (on-chip) + CC1200 (off-SoC sub-GHz) | UART0 | Zolertia Firefly — dual-band |
+| **nrf52840-dongle** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10059 USB Dongle, M4F + FPv4-SP-D16 |
 
 ## MCU Configurations
 
