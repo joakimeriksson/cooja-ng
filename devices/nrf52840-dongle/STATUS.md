@@ -76,28 +76,58 @@ Verification — zero regressions:
   - 68/68 MSP430 + 48/48 ARM correctness (33 base + 15 M4 DSP)
   - ARM Firefly bringup PASS, cc2538dk RPL-UDP 26 RX, 11.0× real-time
 
-## Towards L5–L6 (RPL-UDP)
+## L4 milestone — single-node application logic running
 
-The remaining work is dominated by the on-chip RADIO peripheral at
-0x40001000. Estimated dependency chain:
+Two more peripherals + one fix lifted the firmware from idle into real
+application code:
 
-  - **TIMER0..4** (0x40008000+): Contiki TSCH/MAC may schedule precise
-    deadlines via TIMER. CSMA might not need it; check what RPL-UDP
-    over CSMA actually exercises.
-  - **RNG** (0x4000D000): Contiki uses random for CSMA backoff and for
-    seeding RPL DAG IDs. Tiny stub: VALRDY event + VALUE register.
-  - **NVMC / FICR** (0x10000000): firmware reads FICR.DEVICEADDR for
-    the IEEE EUI-64. Per-node patching done by the multinode runner.
-  - **RADIO** (0x40001000) — **the dominant work**. nRF52840 RADIO in
-    802.15.4 mode uses EasyDMA for frame buffers, hardware shorts to
-    chain state transitions (RXREADY→START, END→DISABLE, etc.), and
-    a state machine: DISABLED → RXRU → RXIDLE → RX → RXIDLE → ...
-    Plus interrupts (READY, END, DISABLED, FRAMESTART, CRCOK,
-    BCMATCH). Comparable to the CC1200 driver in scope.
+  - **RADIO state machine** (0x40001000): tasks (TXEN/RXEN/START/STOP/
+    DISABLE/CCASTART/RSSISTART/EDSTART) drive transitions through
+    DISABLED→RXRU→RXIDLE→RX, DISABLED→TXRU→TXIDLE→TX, with the relevant
+    SHORTS auto-chained (READY_START, TXREADY_START, RXREADY_START,
+    END_DISABLE, etc.). State entry fires READY/RXREADY/TXREADY/END/
+    PHYEND/DISABLED events; events with INTENSET bits set raise the
+    RADIO IRQ (vector 1). All transitions are instant (no rampup
+    delay).
+    **Not yet modelled**: PACKETPTR-based EasyDMA (TX bytes are
+    dropped, RX never delivers external data), CRC verification,
+    BCMATCH/MHRMATCH, RSSI/EDSAMPLE values. That's the work for the
+    multinode integration.
+
+  - **TIMER0..4** (0x40008000+): minimal model that satisfies
+    `rtimer_arch_now()` (TASKS_CAPTURE[i] → CC[i] = current counter,
+    counter advances at 16 MHz >> PRESCALER). Without this the radio
+    driver's `RTIMER_BUSYWAIT(TXRU_DURATION_TIMER)` spun forever.
+
+Empirical: `udp-client.nrf52840-dongle` runs **90 sim seconds in 15 s
+wall** (≈6× real-time, ARM interpreter only). Prints the Contiki banner
+and then 4 instances of `[INFO: App       ] Not reachable yet` — the
+client's app timer firing every ~22 s, reporting "no RPL parent" because
+no DIO has been received (no working radio data path yet, and no second
+node to receive DIOs from).
+
+That's L4 in spirit: the firmware reaches the app process, schedules
+events, and runs them on time. CSMA/MAC layers also functional —
+they accept the TX call without spin-locking.
+
+## Towards L5–L6 (RPL-UDP convergence)
+
+What remains for RPL-UDP between two nrf52840 nodes:
+
+  - **PACKETPTR EasyDMA in RADIO**: on TASKS_START in TX state, walk
+    the PACKETPTR-pointed RAM buffer (PHR + payload + CRC bytes per
+    PCNF0/PCNF1), emit each byte to a TX callback. On external bytes
+    arriving while in RX, write into PACKETPTR-pointed RAM, fire
+    FRAMESTART then END/CRCOK. Compute the IEEE 802.15.4 CRC.
+  - **RNG** (0x4000D000): Contiki uses random for CSMA backoff. Tiny
+    stub: VALRDY event + VALUE register seeded per-node.
+  - **NVMC / FICR** (0x10000000): firmware reads FICR.DEVICEADDR
+    (0x100000A4 / 0x100000A8) for the IEEE EUI-64. The multinode
+    harness needs to patch this per-node.
   - **Multinode harness** (`test_mixed_multinode.c`): recognise the
     `.nrf52840-dongle` extension, init the platform, register the
-    radio TX callback to the medium, fan-out medium→radio bytes,
-    patch FICR.DEVICEADDR per-node.
+    radio TX callback into `radio_medium`, fan-out medium→RADIO RX
+    bytes per node, patch FICR.DEVICEADDR per node.
 
 Each step lands as its own commit, same shape as everything to date.
 
