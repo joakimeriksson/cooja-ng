@@ -1459,11 +1459,17 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             int ad = (instr >> 4) & 0x3;
             bool bw = (instr & 0x0040) != 0;
 
-            /* Extension word handling for single-op */
+            /* Extension word handling for single-op. Single-op
+             * extended instructions have only ONE operand (the dst).
+             * Per MSP430X reference and MSPSim (MSP430Core.java:1487
+             * and around), bits 3:0 of the ext word hold the operand
+             * 19:16. csim previously used bits 10:7 (the source bits)
+             * which made indexed/absolute access to upper memory
+             * compute the wrong address. */
             int sext = cpu->ext_word;
             uint32_t sext_dst_hi = 0;
             if (sext) {
-                sext_dst_hi = (sext >> 7) & 0xf;  /* bits 10:7: src/dst 19:16 per MSPSim */
+                sext_dst_hi = sext & 0xf;  /* bits 3:0: operand 19:16 */
                 /* A/L and BW interaction same as two-op */
                 bool al = (sext >> 6) & 1;  /* bit 6: A/L per MSPSim */
                 if (!al) {
@@ -1936,6 +1942,19 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 /* Re-read dst from register for repeated operations */
                 if (dst_reg_mode && op != OP_MOV)
                     dst = reg[dst_register] & mask;
+                /* Re-read src from register too — when an X-mode RPT
+                 * repeats e.g. ADDX R14,R14, src and dst share the same
+                 * register, and src must reflect the live register
+                 * value each iteration. Without this, src stays at the
+                 * pre-loop value (e.g. 3) while dst doubles, producing
+                 * 3 + 3 + 3 + 3 = 15 instead of 3 << 4 = 48.
+                 *
+                 * For non-register addressing modes (immediate, indexed,
+                 * autoincrement) src was fetched once at instruction
+                 * start; per the MSP430X spec, only register operands
+                 * are re-read on each repeat. */
+                if (!src_is_cg && as == AM_REG)
+                    src = reg[src_register] & mask;
             }
             write_result = false;
             update_status = true;

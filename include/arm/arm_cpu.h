@@ -34,6 +34,7 @@
 #define APSR_Z  (1u << 30)  /* Zero */
 #define APSR_C  (1u << 29)  /* Carry */
 #define APSR_V  (1u << 28)  /* Overflow */
+#define APSR_Q  (1u << 27)  /* Sticky saturation (M4 DSP / saturating insns) */
 
 /* --- Exception numbers --- */
 #define EXC_RESET       1
@@ -135,9 +136,32 @@ typedef struct arm_cpu {
     /* Nanosecond simulation time */
     int64_t      sim_time_ns;
     uint32_t     cpu_freq_hz;
+    /* Anchor for cycle->ns conversion across freq changes — see
+     * msp430_cpu.h for rationale. */
+    int64_t      anchor_cycles;
+    int64_t      anchor_sim_time_ns;
 
     /* Config */
     const arm_config_t *config;
+
+    /* Per-instance memory layout (cached from config for hot-path use).
+     * `*_end` are pre-computed (base + size) to save one add per access. */
+    uint32_t  flash_base, flash_end;
+    uint32_t  sram_base,  sram_end;
+    uint32_t  rom_size;     /* 0 if SoC has no ROM region (e.g. nRF52840) */
+    /* Effective default vector table address used at reset. Seeded
+     * from `config->vtor_default` by arm_cpu_init; can be overridden
+     * by the SoC init op from the platform config (e.g. nrf52840
+     * Dongle = 0x1000, DK = 0). 0 → use SoC-specific discovery
+     * (CC2538 CCA) or fall back to flash_base. */
+    uint32_t  vtor_default;
+
+    /* Cortex-M4F VFP — single-precision (32 × s0..s31). Stored as raw
+     * 32-bit words; arm_vfp.c interprets them per the IEEE 754 binary32
+     * format when arithmetic ops touch them. fpscr holds the FP status
+     * (NZCV flags from VCMP, IXC/UFC/OFC/DZC/IOC exception bits). */
+    uint32_t  vfp_s[32];
+    uint32_t  fpscr;
 
     /* Vector table offset register */
     uint32_t  vtor;
@@ -182,6 +206,10 @@ int64_t arm_step_micros(arm_cpu_t *cpu, int64_t jump_us, int64_t execute_us);
 void arm_stop(arm_cpu_t *cpu);
 
 /* IO region registration */
+/* Cortex-M4F VFP step — defined in arm_vfp.c. Returns true if hw1/hw2
+ * was handled, false otherwise (caller should fault loudly). */
+bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2);
+
 void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
                      arm_io_read_fn read, arm_io_write_fn write, void *data);
 
