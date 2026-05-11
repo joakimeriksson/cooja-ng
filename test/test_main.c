@@ -12,6 +12,9 @@
  *   ./test_runner zoul-firefly-multinode [opts]
  *                                          Run Zolertia Firefly multi-node test
  *                                          (CC1200 sub-GHz radio path)
+ *   ./test_runner nrf52840-dongle-multinode [opts]
+ *                                          Run nRF52840 USB Dongle multi-node test
+ *                                          (on-chip 2.4 GHz radio path)
  *   ./test_runner mixed-multinode [opts]   Run mixed MSP430+ARM multi-node test
  *   ./test_runner all [-v]                 Run all (except multinode)
  */
@@ -57,7 +60,7 @@ int main(int argc, char **argv) {
         printf("Usage: %s <mode> [-v]\n", argv[0]);
         printf("MSP430 modes: correctness, bench, firmware, multinode\n");
         printf("ARM modes:    arm-correctness, arm-firmware, arm-multinode,\n");
-        printf("              zoul-firefly-multinode\n");
+        printf("              zoul-firefly-multinode, nrf52840-dongle-multinode\n");
         printf("Mixed:        mixed-multinode\n");
         printf("Chip drivers: cc1200-mock-host\n");
         printf("Radio medium: radio-medium\n");
@@ -148,6 +151,39 @@ int main(int argc, char **argv) {
                 i + 1 < extra_argc) {
                 if (strcmp(extra_argv[i], "-n") == 0) has_n = 1;
                 i++;  /* skip the value */
+            } else if (extra_argv[i][0] != '-') {
+                firmware_count++;
+            }
+        }
+        if (!has_n && firmware_count == 1) {
+            int new_argc = extra_argc + 2;
+            char **new_argv = malloc((new_argc + 1) * sizeof(char *));
+            for (int i = 0; i < extra_argc; i++) new_argv[i] = extra_argv[i];
+            new_argv[extra_argc]     = (char *)"-n";
+            new_argv[extra_argc + 1] = (char *)"2";
+            new_argv[new_argc] = NULL;
+            failures += run_mixed_multinode_test(new_argc, new_argv);
+            free(new_argv);
+        } else {
+            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+        }
+    }
+
+    /* Nordic nRF52840 USB Dongle multinode wrapper. Same default-to-
+     * 2-nodes convenience as the Firefly wrapper so the SPEC's example
+     * commands match the binary verbatim. */
+    if (strcmp(mode, "nrf52840-dongle-multinode") == 0) {
+        int extra_argc = argc - 2;
+        char **extra_argv = argv + 2;
+        int has_n = 0;
+        int firmware_count = 0;
+        for (int i = 0; i < extra_argc; i++) {
+            if ((strcmp(extra_argv[i], "-t") == 0 ||
+                 strcmp(extra_argv[i], "-n") == 0 ||
+                 strcmp(extra_argv[i], "--threads") == 0) &&
+                i + 1 < extra_argc) {
+                if (strcmp(extra_argv[i], "-n") == 0) has_n = 1;
+                i++;
             } else if (extra_argv[i][0] != '-') {
                 firmware_count++;
             }
