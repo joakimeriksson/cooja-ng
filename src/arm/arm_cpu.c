@@ -2388,14 +2388,16 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
                     cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
                 }
-            } else if ((hw1 & 0xEE00) == 0xEC00) {
-                /* Coprocessor / VFP space (Cortex-M4F) — `1110 11xx xxxx
-                 * xxxx ...`. Contiki networking firmware compiled for
-                 * cortex-m4f emits VPUSH/VPOP/VMOV around helper calls
-                 * for ABI compliance even when no float arithmetic is
-                 * performed in the call. Treat the whole space as a
-                 * silent NOP so the firmware progresses; if real FP
-                 * arithmetic ever matters we'll model it then. */
+            } else if ((hw1 & 0xEC00) == 0xEC00) {
+                /* Cortex-M4F single-precision VFP. Real implementations
+                 * live in arm_vfp.c — `arm_vfp_step` returns true if it
+                 * handled the instruction, false otherwise. On false we
+                 * loudly fault so unhandled FP arithmetic doesn't
+                 * silently produce wrong results downstream. */
+                if (!arm_vfp_step(cpu, hw1, hw2)) {
+                    fprintf(stderr, "ARM: unhandled VFP insn at PC=0x%08x: %04x %04x\n",
+                            pc, hw1, hw2);
+                }
                 (void)insn32;
             } else {
                 /* Unhandled 32-bit instruction */

@@ -150,6 +150,13 @@ typedef struct arm_cpu {
     uint32_t  sram_base,  sram_end;
     uint32_t  rom_size;     /* 0 if SoC has no ROM region (e.g. nRF52840) */
 
+    /* Cortex-M4F VFP — single-precision (32 × s0..s31). Stored as raw
+     * 32-bit words; arm_vfp.c interprets them per the IEEE 754 binary32
+     * format when arithmetic ops touch them. fpscr holds the FP status
+     * (NZCV flags from VCMP, IXC/UFC/OFC/DZC/IOC exception bits). */
+    uint32_t  vfp_s[32];
+    uint32_t  fpscr;
+
     /* Vector table offset register */
     uint32_t  vtor;
 
@@ -193,6 +200,10 @@ int64_t arm_step_micros(arm_cpu_t *cpu, int64_t jump_us, int64_t execute_us);
 void arm_stop(arm_cpu_t *cpu);
 
 /* IO region registration */
+/* Cortex-M4F VFP step — defined in arm_vfp.c. Returns true if hw1/hw2
+ * was handled, false otherwise (caller should fault loudly). */
+bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2);
+
 void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
                      arm_io_read_fn read, arm_io_write_fn write, void *data);
 

@@ -110,7 +110,52 @@ That's L4 in spirit: the firmware reaches the app process, schedules
 events, and runs them on time. CSMA/MAC layers also functional —
 they accept the TX call without spin-locking.
 
-## Multinode harness wired — both nodes boot, TX path engages, debug pending
+## L6 reached — RPL-UDP exchanges hello/response between two nrf52840 nodes
+
+```
+41.378 [Node 2/ARM] Sending request 0 to fd00::f6ce:3601:f1f4:203b
+41.459 [Node 1/ARM] Received request 'hello 0' from fd00::f6ce:3602:e3e9:4176
+41.485 [Node 1/ARM] Sending response.
+41.571 [Node 2/ARM] Received response 'hello 0' from fd00::f6ce:3601:...
+59.743 [Node 2/ARM] Sending request 1 to fd00::f6ce:3601:f1f4:203b
+```
+
+Round-trip in 193 ms simulated, ~1× real-time wall.  All 445 existing
+tests still pass (68 MSP430 + 48 ARM + 21 mock-host + 73 cc1200 +
+235 radio_medium).
+
+The four bugs that blocked convergence after the multinode harness
+landed:
+
+1. **NULL-deref in `emulated_rxfifo_available`** — was unconditionally
+   calling `arm_platform_cc2538(plat)->rfcore` for any ARM node;
+   crashed on first frame to an nrf52840 node. Fix: branch on cc2538
+   vs nrf52840 and report "always available" for nRF (EasyDMA
+   bypasses the FIFO entirely).
+2. **RADIO INTENSET bit positions wrong** — CRCOK/CRCERROR/FRAMESTART
+   were each off by 2 bits. The driver enables CRCOK+CRCERROR
+   (mask 0x3000 = bits 12+13) so the IRQ fires on every frame; with
+   the wrong positions the IRQ never fired and the receive queue
+   starved.
+3. **Cortex-M4F VFP not modelled** — Contiki's nrf52840 build emits
+   VPUSH/VPOP/VLDR/VSTR/VMOV (and a smattering of arithmetic) for
+   ABI marshalling around helper calls. Originally NOP'd; that
+   silently corrupted call frames. Now `src/arm/arm_vfp.c` implements
+   the FPv4-SP-D16 subset that real firmware uses (load/store, VMOV,
+   VADD/VSUB/VMUL/VDIV/VABS/VNEG/VSQRT, VCMP, VCVT) and faults loudly
+   on anything else.
+4. **VFP encoding masks** — initial dispatcher masks were off by a
+   bit in several places (caught by `-Wtautological-compare`); fixed.
+
+What's missing for a full L5/L6 production run:
+  - Move smoke runner into `arm-multinode-nrf` test_runner subcommand.
+  - Add `firmware/nrf52840-dongle/PROVENANCE.md` entries for the udp
+    pair (already there from the data-path commit).
+  - Add a test_runner regression line so the build stays green.
+  - Write a couple of M4 VFP correctness tests — the encoding tables
+    were tricky and a regression suite makes future changes safer.
+
+## Earlier checkpoints — multinode wiring
 
 `test_mixed_multinode.c` now recognises `.nrf52840-dongle`, branches
 `init_arm_node` on `arm_platform_cc2538` vs `arm_platform_nrf52840`,
