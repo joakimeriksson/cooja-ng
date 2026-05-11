@@ -54,13 +54,19 @@ typedef struct msp430_platform {
     msp430_usart_t  usart1;
     cc2420_t        cc2420;
     uint8_t         sfr_regs[8];
-    /* Hardware multiplier state */
-    uint16_t        mpy_op1;      /* MPY/MPYS/MAC/MACS operand 1 */
+    /* Hardware multiplier state (16-bit MPY and MPY32 on FR5xxx) */
+    uint16_t        mpy_op1;      /* MPY/MPYS/MAC/MACS operand 1 (low 16 bits) */
     uint16_t        mpy_op2;      /* OP2 (last written value, readable) */
     uint8_t         mpy_mode;     /* 0=MPY, 1=MPYS, 2=MAC, 3=MACS */
-    uint16_t        mpy_reslo;    /* RESLO */
-    uint16_t        mpy_reshi;    /* RESHI */
+    bool            mpy_op1_32;   /* true if op1 was 32-bit (MPY32L/MPYS32L/...) */
+    uint32_t        mpy_op1_word; /* 32-bit operand 1 (when MPY32 is used) */
+    uint16_t        mpy_op2_lo;   /* OP2L (low half of 32-bit op2) */
+    uint16_t        mpy_reslo;    /* RESLO == RES0 */
+    uint16_t        mpy_reshi;    /* RESHI == RES1 */
+    uint16_t        mpy_res2;     /* RES2 (high 32 bits of 64-bit result, low word) */
+    uint16_t        mpy_res3;     /* RES3 (high 32 bits of 64-bit result, high word) */
     uint16_t        mpy_sumext;   /* SUMEXT */
+    uint16_t        mpy_ctl0;     /* MPY32CTL0 (mode, fraction, saturation bits) */
     /* M25P16 SPI flash (Z1 external memory) */
     struct {
         int      state;       /* current SPI command being processed */

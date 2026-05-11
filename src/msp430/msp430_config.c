@@ -41,6 +41,8 @@ const msp430_config_t msp430f149_config = {
 
     .bcs_base         = 0x56,
     .max_dco_freq     = 4915200,
+    .clock_type       = 0,           /* BCS */
+    .hwmul_base       = 0x130,
 
     .gpio_num_ports   = 6,
     .gpio_ports       = {
@@ -89,6 +91,8 @@ const msp430_config_t msp430f1611_config = {
 
     .bcs_base         = 0x56,
     .max_dco_freq     = 4915200,
+    .clock_type       = 0,           /* BCS */
+    .hwmul_base       = 0x130,
 
     .gpio_num_ports   = 6,
     .gpio_ports       = {
@@ -137,6 +141,8 @@ const msp430_config_t msp430f2617_config = {
 
     .bcs_base         = 0x56,
     .max_dco_freq     = 9000000,       /* matches MSPSim getMaxClockSpeed() */
+    .clock_type       = 0,           /* BCS */
+    .hwmul_base       = 0x130,
 
     .gpio_num_ports   = 8,
     .gpio_ports       = {
@@ -187,6 +193,8 @@ const msp430_config_t msp430f5437_config = {
 
     .bcs_base         = 0x160,       /* UCS base for 5xxx */
     .max_dco_freq     = 25000000,
+    .clock_type       = 0,           /* BCS/UCS — register-compatible */
+    .hwmul_base       = 0x4C0,
 
     .gpio_num_ports   = 10,
     .gpio_ports       = {
@@ -239,6 +247,8 @@ const msp430_config_t cc430f5137_config = {
 
     .bcs_base         = 0x160,
     .max_dco_freq     = 25000000,
+    .clock_type       = 0,           /* BCS/UCS */
+    .hwmul_base       = 0x4C0,
 
     .gpio_num_ports   = 6,
     .gpio_ports       = {
@@ -251,6 +261,57 @@ const msp430_config_t cc430f5137_config = {
     },
 };
 
+/* MSP430FR5969: FRAM-based MSP430X with eUSCI and CS clock module.
+ * MSP-EXP430FR5969 LaunchPad target. */
+const msp430_config_t msp430fr5969_config = {
+    .name             = "MSP430FR5969",
+    .is_msp430x       = true,
+    .max_mem          = 0x100000,    /* 1MB MSP430X address space */
+    .max_mem_io       = 0x1000,      /* IO space 0x0000-0x0FFF */
+    .max_interrupt    = 63,
+
+    .ram_start        = 0x1C00,
+    .ram_size         = 2 * 1024,    /* 2KB SRAM */
+    .ram_mirror_start = 0,
+    .ram_mirror_size  = 0,
+
+    .main_flash_start = 0x4400,      /* Main FRAM: 0x4400-0xFF7F + 0x10000-0x13FFF (63KB) */
+    .main_flash_size  = 63 * 1024,   /* 63KB main FRAM (SLAS704G Table 6-6) */
+    .info_mem_start   = 0x1800,
+    .info_mem_size    = 512,
+
+    .usart0_base      = 0x5C0,       /* eUSCI_A0 */
+    .usart1_base      = 0x5E0,       /* eUSCI_A1 */
+    .usart_tx_offset  = 14,          /* TXBUF at base + 0x0E */
+
+    .timer_a_base     = 0x380,       /* Timer A1 (TA1) — used by Contiki-NG clock/rtimer */
+    .timer_a_iv       = 0x3AE,       /* TA1IV */
+    .timer_a_num_ccr  = 3,
+    .timer_a_ccr0_vec = 49,          /* TA1CCR0 (TIMER1_A0_VECTOR) */
+    .timer_a_ccr1_vec = 48,          /* TA1CCR1-2, overflow (TIMER1_A1_VECTOR) */
+
+    .timer_b_base     = 0x340,       /* Timer A0 (TA0) */
+    .timer_b_iv       = 0x36E,       /* TA0IV */
+    .timer_b_num_ccr  = 5,
+    .timer_b_ccr0_vec = 53,          /* TA0CCR0 */
+    .timer_b_ccr1_vec = 52,          /* TA0CCR1-4, overflow */
+
+    .bcs_base         = 0x160,       /* CS module base */
+    .max_dco_freq     = 24000000,
+    .clock_type       = 1,           /* CS (Clock System) */
+    .hwmul_base       = 0x4C0,
+    .is_eusci         = true,
+
+    .gpio_num_ports   = 5,
+    .gpio_ports       = {
+        { .base_addr = 0x200, .interrupt_vector = 47 },  /* P1 */
+        { .base_addr = 0x200, .interrupt_vector = 44 },  /* P2 (paired with P1) */
+        { .base_addr = 0x220, .interrupt_vector = -1 },  /* P3 */
+        { .base_addr = 0x220, .interrupt_vector = -1 },  /* P4 (paired with P3) */
+        { .base_addr = 0x320, .interrupt_vector = -1 },  /* PJ */
+    },
+};
+
 /* All known MCU configs */
 static const msp430_config_t *all_configs[] = {
     &msp430f149_config,
@@ -258,6 +319,7 @@ static const msp430_config_t *all_configs[] = {
     &msp430f2617_config,
     &msp430f5437_config,
     &cc430f5137_config,
+    &msp430fr5969_config,
     NULL
 };
 

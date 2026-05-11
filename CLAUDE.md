@@ -55,8 +55,8 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | File | Purpose |
 |------|---------|
 | `msp430_cpu.c` | Core CPU: computed-goto interpreter, event queue, interrupt service, step/step_until |
-| `msp430_config.c` | MCU configurations: F149, F1611, F2617, F5437, CC430F5137 |
-| `msp430_clock.c` | Clock module: DCO frequency from DCOCTL/BCSCTL1, ACLK/SMCLK dividers |
+| `msp430_config.c` | MCU configurations: F149, F1611, F2617, F5437, CC430F5137, FR5969 |
+| `msp430_clock.c` | Clock module: BCS (DCOCTL/BCSCTL1) and CS (FR5xxx) variants, ACLK/SMCLK dividers |
 | `msp430_timer.c` | Timer A/B: on-demand counter, CCR compare events, capture mode |
 | `msp430_usart.c` | USART: TX callback, SPI exchange (bridges to CC2420) |
 | `msp430_gpio.c` | GPIO P1-P10: IN/OUT/DIR/SEL/IFG/IES/IE, interrupt generation, output callbacks |
@@ -183,13 +183,16 @@ On-demand counter: not incremented every cycle. Instead, counter value is comput
 
 ### Clock Module
 
-DCO frequency formula (matches Java MSPSim):
+Two variants selected by `mcu->clock_type`:
+
+**BCS (classic, F1xx/F2xx; UCS on F5xxx is register-compatible)** — DCO frequency formula matches Java MSPSim:
 ```
 dco_factor = (max_dco_freq - 1000) / 2048
 freq = ((dco_freq << 5) + dco_mod + (rsel << 8)) * dco_factor + 1000
 ```
-
 Default: DCOCTL=0x60, BCSCTL1=0x84 -> ~2.69 MHz (F1611). After firmware calibration: ~3.9 MHz.
+
+**CS (FR5xxx)** — Password-protected (CSCTL0_H = 0xA5 unlocks). DCO frequency from a lookup table indexed by DCOFSEL/DCORSEL. Per-clock source select (SELA/SELS/SELM) and dividers (DIVA/DIVS/DIVM) in CSCTL2/CSCTL3.
 
 ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 
@@ -203,6 +206,7 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **wismote** | MSP430F5437 | No | USART1 | WisMote |
 | **exp5438** | MSP430F5437 | No | USART1 | MSP-EXP5438 |
 | **cc430** | CC430F5137 | No | USART0 | CC430 eval board |
+| **fr5969** | MSP430FR5969 | No | eUSCI_A0 | MSP-EXP430FR5969 LaunchPad (FRAM, CS clock) |
 | **cc2538dk** | CC2538 (ARM Cortex-M3) | Yes (on-chip) | UART0 | TI SmartRF06 + CC2538EM |
 | **openmote** | CC2538 (ARM Cortex-M3) | Yes (on-chip) | UART0 | OpenMote board (same SoC as cc2538dk) |
 | **zoul-firefly** | CC2538 (ARM Cortex-M3) | Yes (on-chip) + CC1200 (off-SoC sub-GHz) | UART0 | Zolertia Firefly — dual-band |
@@ -218,6 +222,7 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | MSP430F2617 | 1 MB | 8 KB @ 0x1100 | 92 KB @ 0x3100 | 16 MHz | Yes |
 | MSP430F5437 | 1 MB | 16 KB @ 0x1C00 | 256 KB @ 0x5C00 | 25 MHz | Yes |
 | CC430F5137 | 1 MB | 4 KB @ 0x1C00 | 32 KB @ 0x8000 | 25 MHz | Yes |
+| MSP430FR5969 | 64 KB | 2 KB @ 0x1C00 | 32 KB FRAM @ 0x4400 | 24 MHz | Yes |
 
 ## Multi-Node Simulation
 
