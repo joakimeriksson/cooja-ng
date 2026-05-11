@@ -32,7 +32,9 @@ static inline int sreg_d(uint16_t hw1, uint16_t hw2) {
     return (((hw2 >> 12) & 0xF) << 1) | ((hw1 >> 6) & 1);
 }
 static inline int sreg_n_dp(uint16_t hw1, uint16_t hw2) {
-    (void)hw2; return ((hw1 & 0xF) << 1) | ((hw1 >> 7) & 1);
+    /* For VFP data-processing, the N bit (Vn<5>) lives in hw2[7].
+     * hw1[7] is part of opc1 (the high bit of the 4-bit opcode field). */
+    return ((hw1 & 0xF) << 1) | ((hw2 >> 7) & 1);
 }
 static inline int sreg_m(uint16_t hw1, uint16_t hw2) {
     (void)hw1; return ((hw2 & 0xF) << 1) | ((hw2 >> 5) & 1);
@@ -85,7 +87,10 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
     if ((hw1 & 0xFFBF) == 0xED2D) {
         uint32_t imm8 = hw2 & 0xFF;
         int sd = sreg_d(hw1, hw2);
-        int regs = dp_alias ? (int)imm8 * 2 : (int)imm8;
+        /* imm8 is the count of single-precision regs regardless of
+         * encoding form. For coproc=B the count is always even
+         * (rounded down to align on a D-reg pair). */
+        int regs = (int)imm8;
         if (dp_alias) sd &= ~1;
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t sp = cpu->reg[13];
@@ -102,7 +107,10 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
     if ((hw1 & 0xFFBF) == 0xECBD) {
         uint32_t imm8 = hw2 & 0xFF;
         int sd = sreg_d(hw1, hw2);
-        int regs = dp_alias ? (int)imm8 * 2 : (int)imm8;
+        /* imm8 is the count of single-precision regs regardless of
+         * encoding form. For coproc=B the count is always even
+         * (rounded down to align on a D-reg pair). */
+        int regs = (int)imm8;
         if (dp_alias) sd &= ~1;
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t sp = cpu->reg[13];
@@ -151,7 +159,10 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         int rn = hw1 & 0xF;
         uint8_t imm8 = hw2 & 0xFF;
         int sd = sreg_d(hw1, hw2);
-        int regs = dp_alias ? (int)imm8 * 2 : (int)imm8;
+        /* imm8 is the count of single-precision regs regardless of
+         * encoding form. For coproc=B the count is always even
+         * (rounded down to align on a D-reg pair). */
+        int regs = (int)imm8;
         if (dp_alias) sd &= ~1;
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t base = cpu->reg[rn];
@@ -230,12 +241,12 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
                         cpu->fpscr = (cpu->fpscr & 0x0FFFFFFFu) | flags;
                         return true;
                     }
-                    case 0x8: {  /* VCVT.F32.{S,U}32 — int → float */
-                        int unsigned_op = (hw2 >> 7) & 1;
-                        if (unsigned_op) cpu->vfp_s[sd] = f_to_u32((float)cpu->vfp_s[sm]);
-                        else             cpu->vfp_s[sd] = f_to_u32((float)(int32_t)cpu->vfp_s[sm]);
+                    case 0x8:    /* VCVT.F32.S32 — signed int → float */
+                        cpu->vfp_s[sd] = f_to_u32((float)(int32_t)cpu->vfp_s[sm]);
                         return true;
-                    }
+                    case 0x9:    /* VCVT.F32.U32 — unsigned int → float */
+                        cpu->vfp_s[sd] = f_to_u32((float)cpu->vfp_s[sm]);
+                        return true;
                     case 0xC: case 0xD: {  /* VCVT.{U,S}32.F32 — float → int (round to zero) */
                         int signed_op = (opc2 == 0xD);
                         if (signed_op) {
