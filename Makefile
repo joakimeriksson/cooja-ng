@@ -39,6 +39,7 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/arm_elf.c \
               $(ARM_SRC_DIR)/arm_gdb.c \
               $(ARM_SRC_DIR)/arm_platform.c \
+              $(ARM_SRC_DIR)/arm_vfp.c \
               $(ARM_SRC_DIR)/cc2538_soc.c \
               $(ARM_SRC_DIR)/nrf52840_soc.c \
               $(ARM_SRC_DIR)/cc2538_uart.c \
