@@ -435,18 +435,20 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
 #define SHORT_PHYEND_DISABLE      (1u << 20)
 #define SHORT_PHYEND_START        (1u << 21)
 
-/* INTENSET bit positions (one per event) */
+/* INTENSET bit positions (one per event) — per nRF52840 PS v1.7 §6.20.15.21. */
 #define RADIO_INT_READY        (1u << 0)
 #define RADIO_INT_ADDRESS      (1u << 1)
 #define RADIO_INT_PAYLOAD      (1u << 2)
 #define RADIO_INT_END          (1u << 3)
 #define RADIO_INT_DISABLED     (1u << 4)
-#define RADIO_INT_FRAMESTART   (1u << 13)
-#define RADIO_INT_CRCOK        (1u << 14)
-#define RADIO_INT_CRCERROR     (1u << 15)
+#define RADIO_INT_BCMATCH      (1u << 10)
+#define RADIO_INT_CRCOK        (1u << 12)
+#define RADIO_INT_CRCERROR     (1u << 13)
+#define RADIO_INT_FRAMESTART   (1u << 14)
 #define RADIO_INT_TXREADY      (1u << 21)
 #define RADIO_INT_RXREADY      (1u << 22)
 #define RADIO_INT_MHRMATCH     (1u << 23)
+#define RADIO_INT_PHYEND       (1u << 27)
 
 /* IEEE 802.15.4 on-air framing — same convention used by cc2420 /
  * cc2538_rfcore in this tree, so radio_medium can route bytes between
@@ -822,6 +824,12 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                 radio_event(soc, &r->evt_end,      RADIO_INT_END);
                 radio_event(soc, &r->evt_phyend,   0);
                 radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
+                if (getenv("NRF_RX_TRACE")) {
+                    fprintf(stderr, "[nrf-rx] frame done off=%d packetptr=0x%08x irq_pend=%d intenset=0x%x\n",
+                            r->rx_offset, r->packetptr,
+                            soc->plat && soc->plat->cpu.nvic ? ((arm_nvic_t *)soc->plat->cpu.nvic)->has_pending : -1,
+                            r->intenset);
+                }
                 /* Driver typically transitions back to RXIDLE via END
                  * processing; mirror that to drain the parser. */
                 r->state    = NRF_RADIO_STATE_RXIDLE;
