@@ -58,6 +58,43 @@ infrastructure that benefits all platforms:
    in networking firmware but would have silently corrupted any
    firmware that uses the FPU for arithmetic.
 
+## Multinode scaling + ACK timing
+
+Two-node RPL-UDP runs clean (`hello N` exchange every ~20 s,
+~2× real-time). 5-node converges in ~30 s sim with every client
+exchanging messages with the root. 10-node converges in ~60 s sim and
+all 9 clients exchange messages — but with `CSMA_CONF_ACK_WAIT_TIME`
+at its stock Contiki default of `RTIMER_SECOND/2500` (~0.4 ms), the
+contention causes a heavy retx storm (~50 % collision rate on the
+medium).
+
+The default is tuned for radios with hardware auto-ACK. Although
+nRF52840 *can* auto-ACK via PPI + TIMER + SHORTS choreography
+(Nordic's own 802.15.4 driver does this), the Contiki nrf driver
+doesn't program that path and relies on CSMA's software ACK
+(`CSMA_SEND_SOFT_ACK` in `csma.c`). csim models the chip's
+hardware-equivalent ACK in `nrf52840_soc.c::nrf_radio_receive_byte`
+(same convention as cc2538), but bytes between nodes still cross a
+1 ms scheduler-tick boundary, so the sender's CSMA busy-wait expires
+before the ACK can return.
+
+**Recommended firmware override for clean multinode runs**
+(`project-conf.h`):
+
+```c
+#define CSMA_CONF_ACK_WAIT_TIME (RTIMER_SECOND / 40)   /* 25 ms */
+```
+
+This mirrors the upstream Firefly/CC1200 fix (`fix/zoul-cc1200-ack-wait`).
+On real hardware with software ACK it's also the right value — the
+0.4 ms stock default leaves no slack for ISR latency. Measured on 10
+nodes:
+
+| Default 0.4 ms | Bumped to 25 ms |
+|---|---|
+| 4 649 collisions (50 % of attempts) | 227 collisions (5.4 %) |
+| Up to 8 retx per frame | 1 attempt per frame, no retx |
+
 ## Out of scope
 
 Explicitly **not** part of this port:
