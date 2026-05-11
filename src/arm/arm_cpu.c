@@ -25,17 +25,17 @@ static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
 
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
-    if (addr < ARM_ROM_SIZE) {
+    if (cpu->rom && addr < cpu->rom_size) {
         return cpu->rom[addr] | (cpu->rom[addr+1]<<8) |
                (cpu->rom[addr+2]<<16) | (cpu->rom[addr+3]<<24);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8) |
                (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
     }
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8) |
                (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
     }
@@ -60,13 +60,13 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8) |
                (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8) |
                (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
     }
@@ -75,29 +75,29 @@ static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline uint16_t mem_read16(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~1u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8);
     }
     return arm_read16(cpu, addr);
 }
 
 static inline uint8_t mem_read8(arm_cpu_t *cpu, uint32_t addr) {
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1))
-        return cpu->sram[addr - ARM_SRAM_BASE];
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE)
-        return cpu->flash[addr - ARM_FLASH_BASE];
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1))
+        return cpu->sram[addr - cpu->sram_base];
+    if (addr >= cpu->flash_base && addr < cpu->flash_end)
+        return cpu->flash[addr - cpu->flash_base];
     return arm_read8(cpu, addr);
 }
 
 static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     addr &= ~3u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         cpu->sram[off+2] = (val >> 16) & 0xFF;
@@ -109,8 +109,8 @@ static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
 
 static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
     addr &= ~1u;
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         return;
@@ -119,8 +119,8 @@ static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
 }
 
 static inline void mem_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
-    if (__builtin_expect(addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE, 1)) {
-        cpu->sram[addr - ARM_SRAM_BASE] = val;
+    if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
+        cpu->sram[addr - cpu->sram_base] = val;
         return;
     }
     arm_write8(cpu, addr, val);
@@ -161,15 +161,15 @@ static inline void mem_write16_unaligned(arm_cpu_t *cpu, uint32_t addr, uint16_t
 
 uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~1u;
-    if (addr < ARM_ROM_SIZE) {
+    if (cpu->rom && addr < cpu->rom_size) {
         return cpu->rom[addr] | (cpu->rom[addr+1]<<8);
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1]<<8);
     }
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
     }
     arm_io_region_t *r = find_io_region(cpu, addr);
@@ -178,11 +178,11 @@ uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
 }
 
 uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
-    if (addr < ARM_ROM_SIZE) return cpu->rom[addr];
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE)
-        return cpu->flash[addr - ARM_FLASH_BASE];
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE)
-        return cpu->sram[addr - ARM_SRAM_BASE];
+    if (cpu->rom && addr < cpu->rom_size) return cpu->rom[addr];
+    if (addr >= cpu->flash_base && addr < cpu->flash_end)
+        return cpu->flash[addr - cpu->flash_base];
+    if (addr >= cpu->sram_base && addr < cpu->sram_end)
+        return cpu->sram[addr - cpu->sram_base];
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) return (uint8_t)r->read(r->user_data, addr);
     return 0;
@@ -190,23 +190,23 @@ uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
 
 void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     addr &= ~3u;
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         cpu->sram[off+2] = (val >> 16) & 0xFF;
         cpu->sram[off+3] = (val >> 24) & 0xFF;
         return;
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         cpu->flash[off]   = val & 0xFF;
         cpu->flash[off+1] = (val >> 8) & 0xFF;
         cpu->flash[off+2] = (val >> 16) & 0xFF;
         cpu->flash[off+3] = (val >> 24) & 0xFF;
         return;
     }
-    if (addr < ARM_ROM_SIZE) return; /* ROM is read-only */
+    if (cpu->rom && addr < cpu->rom_size) return; /* ROM is read-only */
     /* Bit-band alias for peripheral region */
     if (addr >= ARM_BITBAND_BASE && addr < ARM_BITBAND_BASE + 0x02000000) {
         uint32_t bb_off = addr - ARM_BITBAND_BASE;
@@ -225,14 +225,14 @@ void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
 
 void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
     addr &= ~1u;
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         return;
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         cpu->flash[off]   = val & 0xFF;
         cpu->flash[off+1] = (val >> 8) & 0xFF;
         return;
@@ -242,13 +242,13 @@ void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
 }
 
 void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         cpu->sram[off] = val;
         return;
     }
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        cpu->flash[addr - ARM_FLASH_BASE] = val;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        cpu->flash[addr - cpu->flash_base] = val;
         return;
     }
     arm_io_region_t *r = find_io_region(cpu, addr);
@@ -258,14 +258,14 @@ void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
 /* --- Inline fetch helpers --- */
 
 static inline uint16_t fetch16(arm_cpu_t *cpu, uint32_t addr) {
-    if (addr >= ARM_FLASH_BASE && addr < ARM_FLASH_BASE + ARM_FLASH_SIZE) {
-        uint32_t off = addr - ARM_FLASH_BASE;
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
+        uint32_t off = addr - cpu->flash_base;
         return cpu->flash[off] | (cpu->flash[off+1] << 8);
     }
-    if (addr < ARM_ROM_SIZE)
+    if (cpu->rom && addr < cpu->rom_size)
         return cpu->rom[addr] | (cpu->rom[addr+1] << 8);
-    if (addr >= ARM_SRAM_BASE && addr < ARM_SRAM_BASE + ARM_SRAM_SIZE) {
-        uint32_t off = addr - ARM_SRAM_BASE;
+    if (addr >= cpu->sram_base && addr < cpu->sram_end) {
+        uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1] << 8);
     }
     return arm_read16(cpu, addr);
@@ -278,9 +278,17 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->config = config;
     cpu->gdb_stub = NULL;
 
-    cpu->rom   = (uint8_t *)calloc(ARM_ROM_SIZE, 1);
-    cpu->flash = (uint8_t *)calloc(ARM_FLASH_SIZE, 1);
-    cpu->sram  = (uint8_t *)calloc(ARM_SRAM_SIZE, 1);
+    /* Cache memory layout from config — used by every load/store hot path. */
+    cpu->flash_base   = config->flash_base;
+    cpu->flash_end    = config->flash_base + config->flash_size;
+    cpu->sram_base    = config->sram_base;
+    cpu->sram_end     = config->sram_base + config->sram_size;
+    cpu->rom_size     = config->rom_size;
+    cpu->vtor_default = config->vtor_default;
+
+    cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
+    cpu->sram  = (uint8_t *)calloc(config->sram_size,  1);
+    cpu->rom   = (config->rom_size > 0) ? (uint8_t *)calloc(config->rom_size, 1) : NULL;
 
     cpu->next_event_cycle = INT64_MAX;
     cpu->cycle_limit = INT64_MAX;
@@ -292,7 +300,12 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->cpu_freq_hz = config->default_cpu_freq;
     cpu->interrupts_enabled = true;
 
-    /* CC2538 ROM utility function table layout:
+    /* CC2538-specific ROM utility table — only present when the SoC has
+     * an emulated ROM region (cc2538_config). nRF52840 and other ROM-less
+     * SoCs skip this entirely; firmware that doesn't try to call into ROM
+     * never notices.
+     *
+     * CC2538 ROM utility function table layout:
      * ROM[0x10] = pointer to rom_util_api struct (0x48)
      * rom_util_api struct at 0x48:
      *   offset 0x18 (addr 0x60): memset function pointer
@@ -301,23 +314,22 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
      * Firmware loads function pointers via: ldr r3, [r4, #0x60] (with r4=0)
      * We place trap addresses at those ROM locations and intercept execution there.
      */
-    cpu->rom_util_memset = 0x00000060;
-    cpu->rom_util_memcpy = 0x00000064;
-    cpu->rom_util_memcmp = 0x00000068;
-
-    /* Write self-referential function pointers into ROM (addr | 1 for Thumb bit) */
-    /* When firmware does ldr+blx, it reads the pointer, then branches to it */
+    if (cpu->rom) {
+        cpu->rom_util_memset = 0x00000060;
+        cpu->rom_util_memcpy = 0x00000064;
+        cpu->rom_util_memcmp = 0x00000068;
 #define WRITE_ROM32(off, val) do { \
     cpu->rom[(off)]   = (val) & 0xFF; \
     cpu->rom[(off)+1] = ((val) >> 8) & 0xFF; \
     cpu->rom[(off)+2] = ((val) >> 16) & 0xFF; \
     cpu->rom[(off)+3] = ((val) >> 24) & 0xFF; \
 } while(0)
-    WRITE_ROM32(0x10, 0x00000048);  /* rom_util_api table pointer */
-    WRITE_ROM32(0x60, 0x00000061);  /* memset: points to 0x60 | Thumb */
-    WRITE_ROM32(0x64, 0x00000065);  /* memcpy: points to 0x64 | Thumb */
-    WRITE_ROM32(0x68, 0x00000069);  /* memcmp: points to 0x68 | Thumb */
+        WRITE_ROM32(0x10, 0x00000048);  /* rom_util_api table pointer */
+        WRITE_ROM32(0x60, 0x00000061);  /* memset: points to 0x60 | Thumb */
+        WRITE_ROM32(0x64, 0x00000065);  /* memcpy: points to 0x64 | Thumb */
+        WRITE_ROM32(0x68, 0x00000069);  /* memcmp: points to 0x68 | Thumb */
 #undef WRITE_ROM32
+    }
 }
 
 void arm_cpu_destroy(arm_cpu_t *cpu) {
@@ -347,13 +359,21 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->micro_clock_ready = false;
     cpu->step_cycle_remainder = 0.0;
 
-    /* Find vector table via CC2538 CCA (Customer Configuration Area).
-     * CCA is at flash end - 0x2C (0x0027FFD4 for 512KB flash).
-     * CCA+8 = app_entry_point = vector table address. */
-    uint32_t cca_addr = ARM_FLASH_BASE + ARM_FLASH_SIZE - 0x2C;
-    cpu->vtor = arm_read32(cpu, cca_addr + 8);
-    if (cpu->vtor < ARM_FLASH_BASE || cpu->vtor >= ARM_FLASH_BASE + ARM_FLASH_SIZE)
-        cpu->vtor = ARM_FLASH_BASE; /* fallback */
+    /* Vector table discovery, in order of preference:
+     *   1. cpu->vtor_default (seeded from SoC config, may be overridden
+     *      by SoC init op based on platform config — e.g. nrf52840
+     *      Dongle = 0x1000, DK = 0x0).
+     *   2. CC2538 CCA at flash_end - 0x2C, where CCA+8 carries the
+     *      application entry point. CCA is a TI-specific convention.
+     *   3. Plain flash_base as a last resort. */
+    if (cpu->vtor_default != 0) {
+        cpu->vtor = cpu->vtor_default;
+    } else {
+        uint32_t cca_addr = cpu->flash_end - 0x2C;
+        cpu->vtor = arm_read32(cpu, cca_addr + 8);
+        if (cpu->vtor < cpu->flash_base || cpu->vtor >= cpu->flash_end)
+            cpu->vtor = cpu->flash_base; /* fallback */
+    }
     uint32_t sp = arm_read32(cpu, cpu->vtor);
     uint32_t pc = arm_read32(cpu, cpu->vtor + 4);
 
@@ -698,13 +718,21 @@ int arm_step(arm_cpu_t *cpu, int count) {
         if (cpu->cycles >= cpu->next_event_cycle)
             execute_events(cpu);
 
-        /* CPU off (WFI) — advance to next event or wake on interrupt */
+        /* CPU off (WFI) — advance to next event or wake on interrupt.
+         *
+         * Cortex-M WFI wakes on any pending interrupt regardless of
+         * PRIMASK. If PRIMASK is set, the IRQ stays pending and the
+         * CPU just resumes at the instruction after WFI; the IRQ
+         * fires later when PRIMASK clears. So `has_pending` always
+         * clears `cpu_off` here, even though `arm_nvic_check_pending`
+         * may decide not to take the exception yet. */
         if (cpu->cpu_off) {
             if (cpu->nvic) {
                 arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
                 if (nvic->has_pending) {
+                    cpu->cpu_off = false;
                     arm_nvic_check_pending(nvic);
-                    if (!cpu->cpu_off) continue;
+                    continue;
                 }
             }
             if (cpu->event_queue) {
@@ -2218,6 +2246,47 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         /* MLS Rd, Rn, Rm, Ra */
                         cpu->reg[rd] = cpu->reg[ra] - cpu->reg[rn] * cpu->reg[rm];
                     }
+                } else if (op_misc == 1 && (hw1 & 0x100)) {
+                    /* M4 DSP — halfword multiply (hw1=0xFB1.).
+                     * SMUL{B,T}{B,T}: ra=0xF, no accumulator.
+                     * SMLA{B,T}{B,T}: ra<0xF, 32-bit accumulator (sets Q on overflow).
+                     * op2_misc layout: 00 N M  — N selects top half of Rn, M of Rm. */
+                    if ((op2_misc & 0xC) == 0) {
+                        int n_half = (op2_misc >> 1) & 1;
+                        int m_half = op2_misc & 1;
+                        int16_t a = (int16_t)(n_half ? (cpu->reg[rn] >> 16)
+                                                     : (cpu->reg[rn] & 0xFFFF));
+                        int16_t b = (int16_t)(m_half ? (cpu->reg[rm] >> 16)
+                                                     : (cpu->reg[rm] & 0xFFFF));
+                        int32_t prod = (int32_t)a * (int32_t)b;
+                        if (ra == 0xF) {
+                            cpu->reg[rd] = (uint32_t)prod;
+                        } else {
+                            int64_t sum = (int64_t)(int32_t)cpu->reg[ra] + (int64_t)prod;
+                            cpu->reg[rd] = (uint32_t)(int32_t)sum;
+                            if (sum != (int64_t)(int32_t)sum)
+                                cpu->xpsr |= APSR_Q;
+                        }
+                    }
+                } else if (op_misc == 3 && (hw1 & 0x100)) {
+                    /* M4 DSP — SMULWB/WT and SMLAWB/WT (hw1=0xFB3.).
+                     * 32x16 → middle 32 bits of 48-bit product (bits [47:16]).
+                     * op2_misc layout: 000 M — M selects top half of Rm. */
+                    if ((op2_misc & 0xE) == 0) {
+                        int m_half = op2_misc & 1;
+                        int16_t b = (int16_t)(m_half ? (cpu->reg[rm] >> 16)
+                                                     : (cpu->reg[rm] & 0xFFFF));
+                        int64_t prod48 = (int64_t)(int32_t)cpu->reg[rn] * (int64_t)b;
+                        int32_t result = (int32_t)(prod48 >> 16);
+                        if (ra == 0xF) {
+                            cpu->reg[rd] = (uint32_t)result;
+                        } else {
+                            int64_t sum = (int64_t)(int32_t)cpu->reg[ra] + (int64_t)result;
+                            cpu->reg[rd] = (uint32_t)(int32_t)sum;
+                            if (sum != (int64_t)(int32_t)sum)
+                                cpu->xpsr |= APSR_Q;
+                        }
+                    }
                 } else if (op_misc == 8) {
                     /* SMULL RdLo, RdHi, Rn, Rm (hw1=0xFB8.)
                        hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
@@ -2284,13 +2353,32 @@ int arm_step(arm_cpu_t *cpu, int count) {
                             cpu->reg[rd] = cpu->reg[rn] / cpu->reg[rm];
                     }
                 } else if (op_misc == 0xC) {
-                    /* SMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBC.)
-                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
-                    int64_t acc = ((int64_t)(uint32_t)cpu->reg[ra]) |
-                                  ((int64_t)(int32_t)cpu->reg[rd] << 32);
-                    acc += (int64_t)(int32_t)cpu->reg[rn] * (int64_t)(int32_t)cpu->reg[rm];
-                    cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
-                    cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
+                    /* SMLAL family (hw1=0xFBC.), discriminated by op2_misc.
+                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd). */
+                    if (op2_misc == 0) {
+                        /* SMLAL RdLo, RdHi, Rn, Rm — 32x32 + 64-bit accumulator */
+                        int64_t acc = ((int64_t)(uint32_t)cpu->reg[ra]) |
+                                      ((int64_t)(int32_t)cpu->reg[rd] << 32);
+                        acc += (int64_t)(int32_t)cpu->reg[rn] * (int64_t)(int32_t)cpu->reg[rm];
+                        cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
+                        cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
+                    } else if ((op2_misc & 0xC) == 0x8) {
+                        /* M4 DSP — SMLALBB/BT/TB/TT.
+                         * op2_misc layout: 10 N M — N selects top half of Rn, M of Rm.
+                         * 16x16 sign-extended to 64, added to {RdHi:RdLo}. */
+                        int n_half = (op2_misc >> 1) & 1;
+                        int m_half = op2_misc & 1;
+                        int16_t a = (int16_t)(n_half ? (cpu->reg[rn] >> 16)
+                                                     : (cpu->reg[rn] & 0xFFFF));
+                        int16_t b = (int16_t)(m_half ? (cpu->reg[rm] >> 16)
+                                                     : (cpu->reg[rm] & 0xFFFF));
+                        int64_t prod = (int64_t)((int32_t)a * (int32_t)b);
+                        int64_t acc = ((int64_t)(uint32_t)cpu->reg[ra]) |
+                                      ((int64_t)(int32_t)cpu->reg[rd] << 32);
+                        acc += prod;
+                        cpu->reg[ra] = (uint32_t)acc;
+                        cpu->reg[rd] = (uint32_t)(acc >> 32);
+                    }
                 } else if (op_misc == 0xE) {
                     /* UMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBE.)
                        hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
@@ -2300,6 +2388,17 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
                     cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
                 }
+            } else if ((hw1 & 0xEC00) == 0xEC00) {
+                /* Cortex-M4F single-precision VFP. Real implementations
+                 * live in arm_vfp.c — `arm_vfp_step` returns true if it
+                 * handled the instruction, false otherwise. On false we
+                 * loudly fault so unhandled FP arithmetic doesn't
+                 * silently produce wrong results downstream. */
+                if (!arm_vfp_step(cpu, hw1, hw2)) {
+                    fprintf(stderr, "ARM: unhandled VFP insn at PC=0x%08x: %04x %04x\n",
+                            pc, hw1, hw2);
+                }
+                (void)insn32;
             } else {
                 /* Unhandled 32-bit instruction */
                 fprintf(stderr, "ARM: unhandled 32-bit insn at PC=0x%08x: %04x %04x\n",

@@ -1,14 +1,14 @@
 # Zoul Firefly Port — Status & Direction
 
 > Strategic doc: where the port is, where it's going, and what's
-> explicitly out of scope. For the actual operational task list see
-> [`L6-PLAN.md`](L6-PLAN.md). For the device contract see
-> [`SPEC.md`](SPEC.md).
+> explicitly out of scope. For the device contract see
+> [`SPEC.md`](SPEC.md). The original L6 investigation trail is
+> archived under [`archive/`](archive/) — all items resolved.
 
 ## Current state — short version
 
-**The port is functionally usable.** Everything except L6 RPL-UDP
-convergence works:
+**The port is complete. L6 RPL-UDP converges in csim with corrected
+Contiki-NG firmware (2026-05-06).** Everything works end-to-end:
 
 - L0–L4 single-node bring-up: green
 - L5 nullnet broadcast over CC1200: 16 RX in 20 s, both nodes converse
@@ -36,92 +36,58 @@ Firefly):
 - A 235-test radio_medium safety net to make future refactors
   bisectable.
 
-## What's not done
+## L6 RPL-UDP — resolved 2026-05-06
 
-**L6 RPL-UDP over CC1200**. Stack progresses far enough that 230
-frames per minute reach Node 1's firmware and 50 ACKs go back, but RPL
-DAG doesn't form. Detailed work-list at [`L6-PLAN.md`](L6-PLAN.md).
+After a hardware investigation on real Zolertia Firefly boards
+(see [`HARDWARE-TEST.md`](HARDWARE-TEST.md) and
+[`archive/L6-PLAN.md`](archive/L6-PLAN.md) for the full trail), **L6 was a Contiki-NG
+firmware bug, not a csim emulation gap.** Two upstream Contiki-NG
+fixes resolve it both on hardware *and* in csim:
 
-## Decision: do we keep chasing L6?
+1. **`zoul: bump CSMA_CONF_ACK_WAIT_TIME for CC1200 sub-GHz`**
+   The Zoul platform default `RTIMER_SECOND/200` (5 ms) was far below
+   the actual CC1200 ACK round-trip on the SUN FSK 50 kbps PHY
+   (measured ~12.5 ms for a 25-byte data frame on Firefly hardware).
+   Raised to `RTIMER_SECOND/40` (25 ms), with `#ifndef` guards so
+   project-conf.h can override.
 
-Three options:
+2. **`cc1200: throttle pending_packet() to avoid SPI starvation of RX IRQ`**
+   CSMA's `RTIMER_BUSYWAIT_UNTIL` polled `pending_packet()` so tightly
+   that the rapid `LOCK_SPI` / `single_read` cycle starved the cc1200
+   RX IRQ chain — the ACK was received over the air but never
+   delivered to MAC. Race threshold ~200–300 µs at the CC2538 SoC's
+   32 MHz; `clock_delay_usec(300)` resolves it. The race had been
+   masked for years by the `INFO("RF: Pending ...")` printf above the
+   throttle, which provided the same throttle as a side effect of
+   UART blocking when `DEBUG_LEVEL >= 3`.
 
-### Option A — Keep going on simulation alone
+Both fixes are scoped to upstream Contiki-NG; csim required no
+changes. The csim "fixes" originally proposed in the L6 investigation
+(rx_incoming buffering, queue depth bumps, ACK turnaround modelling
+— see [`archive/L6-PLAN.md`](archive/L6-PLAN.md) and
+[`archive/CC1200-RX-ACK-CHAIN.md`](archive/CC1200-RX-ACK-CHAIN.md))
+would have *masked* the firmware bugs and are explicitly **not**
+landing. See [`docs/porting-a-device.md`](../../docs/porting-a-device.md)
+§8 "Don't add fidelity buffers to mask firmware races." With the
+fixed firmware:
 
-Land L6-1 (CC1200 `rx_incoming[]` buffer mirror of CC2420's pattern)
-and re-test. Predicted to unblock or substantially advance L6. ~25
-lines of code. But: it asks us to commit to a fidelity-vs-convenience
-tradeoff (the CC2420 emulator already makes this same tradeoff but
-unverified) without independent confirmation.
+- 6/6 RPL-UDP hello cycles complete in 60 s in csim (was 0/6)
+- Total RF bytes 2,242 (was 101,988 — ~50× less, no retx storm)
+- 26 direct RX, 0 dropped, 0 collided (was 80 direct + 672 dropped)
+- Speed 9.4× real-time
+- Same firmware also converges on real Firefly hardware (the
+  motivating hardware test)
 
-**Cost**: ~1 focused agent session (~1 hour wall time).
-**Risk**: low if the SWRU346B p. 32-34 reading checks out; medium if
-we're just papering over a real-world tuning gap.
-**Gates after**: re-run L6, see if DAG converges. If yes: tick the
-SPEC box, port complete. If no: probably need physical hardware.
+**This means csim's CC1200 emulation was correct enough to faithfully
+expose two real upstream firmware bugs.** The items in
+[`archive/L6-PLAN.md`](archive/L6-PLAN.md) (rx_incoming buffering,
+Node 1 starvation, queue overflow) were *symptoms* of the firmware
+bugs amplified through csim's emulation, not gaps in the simulator.
+With both firmware bugs fixed, the symptoms disappear naturally.
 
-### Option B — Get physical hardware first
-
-Two Zolertia Firefly boards (~$50 each from Mouser/Crowd Supply when
-available) + a CC1200-capable sniffer (third Firefly running Sensniff
-works) + USB cables. ~half-day of setup.
-
-**Cost**: $100–200 + half-day setup.
-**Benefit**: short-circuits weeks of speculative simulation
-investigation. We can directly compare simulator behavior against
-real hardware behavior — Wireshark captures, GDO0 timing on a logic
-analyzer, etc. Also lets us answer "does Contiki RPL-UDP actually
-converge on stock Firefly hardware?" — if NO, the simulator is
-already more correct than the firmware build, and our L6 chase has
-been chasing a phantom.
-**Risk**: low. Worst case we learn something useful regardless.
-
-### Option C — Ship as-is
-
-Port is functionally complete except L6. Document L6 as ongoing,
-move on. The architectural work delivered substantial value beyond
-the immediate port. Picking L6 back up later — with hardware, with a
-fresh agent, or both — costs little because the simulator state is
-well-documented and well-tested.
-
-**Cost**: minimal. Cosmetic SPEC update.
-**Risk**: zero. Worst case L6 stays open indefinitely.
-
-### My recommendation
-
-**Option C now, Option B in parallel if hardware is easy to get.**
-
-Reasoning:
-- We've spent a lot of session time on L6. Each fix has revealed the
-  next layer; each layer has been smaller than the last; we may or
-  may not be near the bottom.
-- The rest of the port + the infrastructure improvements are
-  immediately useful to anyone doing csim work, regardless of L6.
-- L6 RPL-UDP with stock Contiki on real CC1200 hardware is known to be
-  finicky in the wild. Continuing to grind on it in simulation without
-  a hardware reference point is increasingly speculative.
-- L6-1 (Option A) is a small, well-understood fix that we *could*
-  land any time and then re-evaluate. It doesn't need to be a
-  decision-point now — it's a tactical item that can sit on the
-  L6-PLAN list.
-
-## What hardware would tell us
-
-Specifically:
-
-1. Whether the firmware ELFs we built (`udp-server-subghz` /
-   `udp-client-subghz`, both `MAKE_RADIO=cc1200`) actually converge
-   on real Firefly boards with default settings. If not, our
-   simulator is correct and the issue is firmware-side; if yes, the
-   simulator has a remaining gap we can compare against.
-2. Wireshark / Sensniff capture of the actual on-air frame sequence.
-   Compare against csim's `CSIM_TRACE_RADIO=1` output line-by-line.
-3. Logic analyzer trace of GDO0 / SPI during a typical RX→ACK cycle.
-   Compare against csim's `cc2420 node=N state X -> Y` traces.
-4. Real CCA / RSSI behavior over time during RX.
-5. Real strobe transition timing (we currently use 50–720 µs
-   approximations from the Contiki driver source rather than measured
-   silicon values).
+The two fixes are staged as upstream Contiki-NG PR branches:
+- `fix/zoul-cc1200-ack-wait` (`53d219af5`)
+- `fix/cc1200-pending-packet-race` (`de8f711e9`)
 
 ## What hardware wouldn't help with
 
@@ -151,10 +117,14 @@ These are explicitly NOT going to be tackled as part of this port:
 
 ## Files
 - [`SPEC.md`](SPEC.md) — device contract, definition of done
-- [`L6-PLAN.md`](L6-PLAN.md) — tactical work-list for the L6 gap
-- [`CC1200-RX-ACK-CHAIN.md`](CC1200-RX-ACK-CHAIN.md) — datasheet + code
-  audit of the 10-step RX→ACK chain (the diagnostic source for L6-PLAN)
+- [`HARDWARE-TEST.md`](HARDWARE-TEST.md) — real-Firefly run that
+  reframed L6 from "csim bug" to "firmware bug"
 - [`DATASHEET-FINDINGS.md`](DATASHEET-FINDINGS.md) — citations from
   CC1200 SWRU346B and CC2538 SWRU319C user guides
+- [`archive/`](archive/) — historical L6 investigation trail
+  (`L6-PLAN.md`, `CC1200-RX-ACK-CHAIN.md`); all items resolved
+- [`../../docs/porting-a-device.md`](../../docs/porting-a-device.md)
+  §8 (pitfalls), §10 (closing out a port) — the lessons distilled
+  from this port
 - [`../../docs/radio-medium.md`](../../docs/radio-medium.md) — how the
   radio medium routes bytes between nodes

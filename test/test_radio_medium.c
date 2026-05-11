@@ -1029,11 +1029,20 @@ static void test_native_mid_tick_channel_change_honored(void) {
     ASSERT(radio_medium_filter_frame_radio(&rm, 0, 0, 1, 0),
            "native sync: hopped back to ch 11 -> frame passes again");
 
-    /* Per-byte: a complete IEEE 802.15.4 frame's bytes get hopped under
-     * us mid-frame. Each byte must be matched against the channel that
-     * was current at the moment of the call — mirrors the byte-by-byte
-     * filter loop in mixed_rf_tx_handler. The frame bytes that land
-     * while we're on ch 11 deliver; the others drop. */
+    /* Per-byte: feed a complete IEEE 802.15.4 frame's bytes while
+     * toggling the receiver's channel each call. Channel match is now
+     * decided per-frame at the SFD-detection point, mirroring Cooja's
+     * RadioConnection / real-radio commitment to the TX-start channel.
+     *
+     * Outside the frame (preamble bytes 0-3): live channel comparison
+     * — even bytes (rx on ch 11) pass, odd (rx on ch 25) drop.
+     * At the SFD byte (index 4): the medium snapshots sender's channel,
+     * compares it to the receiver's current channel, caches the
+     * decision for this (sender, receiver) pair. SFD lands on i=4
+     * (even) so receiver is on ch 11 → match, decision frozen as PASS.
+     * Bytes 5-10 use the cached decision and pass regardless of the
+     * receiver's per-byte hops — this is the "chip is committed once
+     * the demod has locked" model. */
     int delivered = 0, dropped = 0;
     uint8_t frame[] = { 0x00,0x00,0x00,0x00, 0x7A, 0x05,
                         0x11,0x22,0x33,0x44,0x55 };
@@ -1045,8 +1054,10 @@ static void test_native_mid_tick_channel_change_honored(void) {
         else
             dropped++;
     }
-    ASSERT_EQ(delivered, 6, "byte-by-byte hop: 6 even-index bytes pass");
-    ASSERT_EQ(dropped, 5, "byte-by-byte hop: 5 odd-index bytes drop");
+    /* Pre-frame: i=0,2 pass (even, ch 11), i=1,3 drop (odd, ch 25).
+     * In-frame from i=4 onward (7 bytes): all pass via cached decision. */
+    ASSERT_EQ(delivered, 9, "per-frame channel: pre-frame even passes + 7 in-frame");
+    ASSERT_EQ(dropped, 2, "per-frame channel: pre-frame odd preamble drops");
 }
 
 /* ====================================================================

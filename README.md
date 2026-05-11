@@ -1,19 +1,21 @@
-# csim — Cooja-NG C emulator
+# Cooja-NG — a C-based Cooja / MSPSim re-implementation
 
-A fast, multi-architecture emulator and network simulator for Contiki-NG, written in portable C. csim is a clean-room re-implementation of the parts of Cooja and MSPSim needed to run the upstream Contiki-NG test suite headlessly, with a strong focus on simulation speed, deterministic timing, and faithful peripheral behaviour.
+A fast, multi-architecture emulator and network simulator for Contiki-NG, written in portable C. Cooja-NG (codename `csim`) is a clean-room re-implementation of the parts of Cooja and MSPSim needed to run the upstream Contiki-NG test suite headlessly, with a strong focus on simulation speed, deterministic timing, and faithful peripheral behaviour.
 
-**Status:** the full Contiki-NG Cooja test suite passes — **88 / 88** including the TUN/border-router cases. See [Test results](#test-results) below.
+**Status:** the full Contiki-NG Cooja test suite passes — **88 / 88** including the TUN/border-router cases. The Zolertia Firefly port (CC2538 + CC1200 sub-GHz) is complete with 6/6 RPL-UDP hello cycles in 60 s. See [Test results](#test-results) below.
 
 ```
                        ┌──────────────────────────────────────────┐
-                       │           csim test_runner               │
+                       │           Cooja-NG test_runner           │
                        │                                          │
    firmware/*.sky ────►│  MSP430 F1611/F2617/F5437/CC430/FR5969   │
    firmware/*.cc2538dk►│  ARM Cortex-M3 + CC2538 RF Core          │──► UART, packets,
-   firmware/*.cooja  ─►│  Native Cooja motes (dlopen)             │    timeline, UI
+   firmware/*.zoul-fly►│  ARM Cortex-M3 + CC2538 + CC1200 sub-GHz │    timeline, UI
+   firmware/*.cooja  ─►│  Native Cooja motes (dlopen)             │
                        │                                          │
-                       │  shared event queue • UDGM radio medium  │
-                       │  ns-precise time • JS-driven assertions  │
+                       │  shared event queue • per-radio medium   │
+                       │  multi-channel • ns-precise time         │
+                       │  JS-driven assertions                    │
                        └──────────────────────────────────────────┘
 ```
 
@@ -21,7 +23,7 @@ A fast, multi-architecture emulator and network simulator for Contiki-NG, writte
 
 ## Table of Contents
 
-1. [What is csim?](#what-is-csim)
+1. [What is Cooja-NG?](#what-is-cooja-ng)
 2. [Features](#features)
 3. [Quick start](#quick-start)
 4. [Building](#building)
@@ -40,15 +42,15 @@ A fast, multi-architecture emulator and network simulator for Contiki-NG, writte
 
 ---
 
-## What is csim?
+## What is Cooja-NG?
 
-csim runs Contiki-NG firmware binaries inside an emulator process and lets you connect multiple emulated nodes through a shared 802.15.4 radio medium. It is designed for three use cases:
+Cooja-NG runs Contiki-NG firmware binaries inside an emulator process and lets you connect multiple emulated nodes through a shared 802.15.4 radio medium with per-radio multi-channel support (so 2.4 GHz CC2538 and sub-GHz CC1200 can coexist on the same network without cross-band interference). It is designed for three use cases:
 
-1. **Headless CI / regression testing** — replace `Cooja --no-gui` for the upstream Contiki-NG test suite. csim consumes the same `.csc` files (via `tools/csc2json.py`) and the same JS test scripts (via the embedded QuickJS engine).
-2. **Network research** — run hundreds of emulated nodes on a single machine, mix MSP430 / ARM / native motes in the same network, script topology changes, and capture full packet timelines.
+1. **Headless CI / regression testing** — replace `Cooja --no-gui` for the upstream Contiki-NG test suite. Cooja-NG consumes the same `.csc` files (via `tools/csc2json.py`) and the same JS test scripts (via the embedded QuickJS engine).
+2. **Network research** — run hundreds of emulated nodes on a single machine, mix MSP430 / ARM / native motes (and 2.4 GHz / sub-GHz radios) in the same network, script topology changes, and capture full packet timelines.
 3. **Firmware debugging** — boot a single firmware image, watch UART, inspect register state on a wedge, and re-run with deterministic seeds.
 
-Compared to upstream Cooja + MSPSim, csim is roughly an order of magnitude faster, has no JVM dependency, and builds cleanly with `make` on Linux and macOS. It is *not* a full Cooja replacement: there is no GTK GUI, no Java plugin ecosystem, and no support for closed-source mote types.
+Compared to upstream Cooja + MSPSim, Cooja-NG is roughly an order of magnitude faster, has no JVM dependency, and builds cleanly with `make` on Linux and macOS. It is *not* a full Cooja replacement: there is no GTK GUI, no Java plugin ecosystem, and no support for closed-source mote types.
 
 ---
 
@@ -69,8 +71,9 @@ Compared to upstream Cooja + MSPSim, csim is roughly an order of magnitude faste
 - **Thumb / Thumb-2 interpreter** — full Cortex-M3 user instruction set including IT blocks, exclusive load/store stubs, bit-band region support.
 - **NVIC** — interrupt priority, pending/enable, exception entry/exit, tail-chaining.
 - **SysTick** — periodic tick generation through the shared event queue.
-- **CC2538 SoC peripherals** — UART (TX callback + status flags), GPIO ports A–D with interrupts, General Purpose Timers (one-shot / periodic / prescaler), Sleep Timer (32 kHz, compare-match interrupt), System Control (clock config, OSC32K), IO Controller (pin mux), and the on-chip RF Core (802.15.4 TX/RX, FFSM address filter, RFRND, frame interrupts).
-- **Platform** — TI SmartRF06 + CC2538EM (`cc2538dk`).
+- **CC2538 SoC peripherals** — UART (TX callback + status flags), GPIO ports A–D with interrupts, General Purpose Timers (one-shot / periodic / prescaler), Sleep Timer (32 kHz, compare-match interrupt), System Control (clock config, OSC32K), IO Controller (pin mux), SSI (SPI master, both SSI0 and SSI1), and the on-chip RF Core (802.15.4 TX/RX, FFSM address filter, RFRND, frame interrupts).
+- **Off-chip CC1200 sub-GHz radio** — TI SimpleLink CC1200 emulated as an event-driven SPI peripheral. Full software auto-ACK path, register-level fidelity, IOCFG-driven GPIO events, and 73-test mock-host suite for chip-driver compliance. Runs the upstream Contiki-NG `cc1200_802154g_863_870_fsk_50kbps` configuration.
+- **Platforms** — TI SmartRF06 + CC2538EM (`cc2538dk`), Zolertia Firefly (`zoul-firefly`, CC2538 + CC1200).
 
 ### Native Cooja motes (`src/native/`)
 
@@ -82,7 +85,7 @@ Compared to upstream Cooja + MSPSim, csim is roughly an order of magnitude faste
 
 - **Time-stepped event loop** — all nodes share a single ns-precise simulation clock; each step advances every node to the same target.
 - **Per-node CPU frequencies** handled correctly across DCO calibration.
-- **UDGM radio medium** — Unit Disk Graph with separate transmission and interference ranges, configurable TX/RX success ratios, deterministic seed.
+- **Per-radio radio medium** — each radio chip registers its own slot in a multi-channel medium. Frames are routed by `(channel, band)` so 2.4 GHz CC2538 and sub-GHz CC1200 networks coexist without cross-band leakage. UDGM (Unit Disk Graph with separate transmission and interference ranges, configurable TX/RX success ratios, deterministic seed) is the default propagation model. 235-test safety-net suite makes future refactors bisectable. See [`docs/radio-medium.md`](docs/radio-medium.md).
 - **Per-byte RF delivery** matching Cooja's wire-level model — bytes are streamed into receivers as they arrive on the medium, not as full frames.
 - **Packet analyzer** that decodes 802.15.4 / 6LoWPAN / IPv6 / RPL / UDP frames at runtime for human-readable logs.
 - **Timeline recorder** — every radio TX/RX event is timestamped and can be exported to JSON for offline analysis.
@@ -92,7 +95,7 @@ Compared to upstream Cooja + MSPSim, csim is roughly an order of magnitude faste
 
 - **JSON config files** describing nodes, topology, radio medium, timed actions (move, send, remove, add), assertion steps, fail-on patterns, and aggregate validators. See [`docs/test-format.md`](docs/test-format.md) for the full schema.
 - **Embedded QuickJS engine** that runs Cooja-style JavaScript test scripts inline (`TIMEOUT`, `WAIT_UNTIL`, `log.testOK`, `log.testFailed`).
-- **`csc2json.py`** auto-converts Cooja `.csc` files (and most of their JS scripts) to csim JSON.
+- **`csc2json.py`** auto-converts Cooja `.csc` files (and most of their JS scripts) to Cooja-NG JSON.
 - **`run-cooja-tests.sh`** drives the entire upstream Contiki-NG test suite headlessly, with PASS / FAIL / SKIP reporting and auto-build of missing firmware.
 
 ### Web UI (optional)
@@ -106,9 +109,9 @@ Compared to upstream Cooja + MSPSim, csim is roughly an order of magnitude faste
 
 ```sh
 # 1. Clone with the Contiki-NG sibling for firmware builds
-git clone https://github.com/your-org/csim.git
+git clone https://github.com/joakimeriksson/cooja-ng.git
 git clone https://github.com/contiki-ng/contiki-ng.git
-cd csim
+cd cooja-ng
 
 # 2. Build (auto-detects GNU Lightning for JIT)
 make
@@ -144,7 +147,7 @@ make cooja-tests VERBOSE=1
 | **GNU Lightning** | MSP430 JIT compiler | `pkg-config --libs lightning` (silent fallback to interpreter if missing) |
 | **QuickJS** | JS test scripts | Bundled under `lib/quickjs/` — built automatically |
 | **cJSON, cbor** | Config / serialization | Bundled under `lib/` |
-| **Contiki-NG** | Test firmware sources | `csim.conf`, `CONTIKI_DIR` env var, or `../contiki-ng` |
+| **Contiki-NG** | Test firmware sources | `csim.conf` (legacy filename), `CONTIKI_DIR` env var, or `../contiki-ng` |
 
 There are no other runtime dependencies besides libc, libm, libpthread, and (on Linux for the TUN tests) `iproute2` + `tunslip6`.
 
@@ -204,9 +207,11 @@ Node platform is auto-detected from the firmware extension:
 
 | Extension | Platform |
 |---|---|
-| `.sky` | MSP430 (Tmote Sky + CC2420) — also the default for `.z1`, `.esb`, `.wismote`, `.exp5438` |
+| `.sky` | MSP430 (Tmote Sky + CC2420) |                                                                                                                              
+| `.z1` | MSP430 (Zolertia Z1 + CC2420) |                                                                                                                               
 | `.msp430fr5969` | MSP430 (MSP-EXP430FR5969 LaunchPad, FRAM, no radio) |
 | `.cc2538dk` | ARM Cortex-M3 (CC2538 + on-chip 802.15.4) |
+| `.zoul-firefly` | ARM Cortex-M3 (Zolertia Firefly: CC2538 + CC1200 sub-GHz) |
 | `.cooja` | Native Cooja shared library |
 
 ### Multi-node options
@@ -222,7 +227,7 @@ Node platform is auto-detected from the firmware extension:
 
 ### The Cooja test suite
 
-This is the most thorough validation csim has against real Contiki-NG behaviour. It runs every test in `contiki-ng/tests/` headlessly using csim instead of `Cooja --no-gui`.
+This is the most thorough validation Cooja-NG has against real Contiki-NG behaviour. It runs every test in `contiki-ng/tests/` headlessly using Cooja-NG instead of `Cooja --no-gui`.
 
 ```sh
 # One-time setup
@@ -415,11 +420,21 @@ while (sim_ns < end_ns) {
 }
 ```
 
-Per-byte RF delivery is the key fidelity choice: instead of dropping a whole frame at the receiver in one go (which is wrong for byte-level firmware that polls SPI / FIFO between bytes), csim hands receivers one symbol at a time at the exact ns when it would arrive on a real link. This is what makes TSCH and tight CSMA timing actually work.
+Per-byte RF delivery is the key fidelity choice: instead of dropping a whole frame at the receiver in one go (which is wrong for byte-level firmware that polls SPI / FIFO between bytes), Cooja-NG hands receivers one symbol at a time at the exact ns when it would arrive on a real link. This is what makes TSCH and tight CSMA timing actually work.
+
+### Per-radio multi-channel medium
+
+Every radio chip (CC2420, CC2538 RF Core, CC1200) registers its own slot in the radio medium and pushes channel changes synchronously. The medium routes frames by `(band, channel)` so that:
+
+- 2.4 GHz CC2538 and sub-GHz CC1200 networks coexist on the same simulation without cross-band leakage.
+- TSCH channel hops correctly affect what each receiver hears.
+- New radio drivers register a slot rather than touching the medium itself.
+
+A 235-test safety-net suite (`./build/test_runner radio-medium`) makes future refactors bisectable. See [`docs/radio-medium.md`](docs/radio-medium.md) for the routing model and [`docs/porting-a-device.md`](docs/porting-a-device.md) §8 for the chip-driver event model.
 
 ### Cooja test wrapper
 
-`tools/run-cooja-tests.sh` is the bridge between csim and the upstream Contiki-NG test infrastructure. It treats csim as a drop-in replacement for `java -jar Cooja.jar --no-gui`, runs the same `.csc` topologies, parses the same Cooja JS scripts via `csc2json.py`, and reports compatible PASS/FAIL output. This is how csim claims compatibility — every fix is validated against the upstream test suite, not a private regression set.
+`tools/run-cooja-tests.sh` is the bridge between Cooja-NG and the upstream Contiki-NG test infrastructure. It treats Cooja-NG as a drop-in replacement for `java -jar Cooja.jar --no-gui`, runs the same `.csc` topologies, parses the same Cooja JS scripts via `csc2json.py`, and reports compatible PASS/FAIL output. This is how Cooja-NG claims compatibility — every fix is validated against the upstream test suite, not a private regression set.
 
 ---
 
@@ -438,7 +453,7 @@ Per-byte RF delivery is the key fidelity choice: instead of dropping a whole fra
 ## Project layout
 
 ```
-csim/
+cooja-ng/
 ├── src/
 │   ├── msp430/                MSP430 CPU, peripherals, JIT, CC2420
 │   ├── arm/                   ARM Cortex-M3 CPU, NVIC, CC2538 SoC peripherals
@@ -460,6 +475,8 @@ csim/
 │   ├── test_arm_firmware.c    ARM firmware integration
 │   ├── test_benchmark.c       Performance benchmarks
 │   ├── test_mixed_multinode.c Multi-node sim driver (MSP430 + ARM + native)
+│   ├── test_cc1200.c          CC1200 chip-driver mock-host suite (73 tests)
+│   ├── test_radio_medium.c    Radio-medium routing/multi-channel suite (235 tests)
 │   └── test_timeline.c        Timeline serializer unit tests
 ├── configs/                   Example JSON simulation configs
 ├── docs/test-format.md        Full JSON config / test scripting reference
@@ -467,9 +484,12 @@ csim/
 │   ├── sky/                   Tmote Sky (MSP430F1611)
 │   ├── z1/                    Zolertia Z1 (MSP430F2617)
 │   ├── cc2538dk/              CC2538DK (ARM Cortex-M3)
+│   ├── zoul-firefly/          Zolertia Firefly (CC2538 + CC1200 sub-GHz)
 │   └── cooja/                 Native Cooja mote .so libraries
+├── devices/                   Per-device port docs (SPEC, STATUS, hw test plan)
+│   └── zoul-firefly/          Zolertia Firefly port narrative + L6 resolution
 ├── tools/
-│   ├── csc2json.py            Cooja .csc → csim JSON converter
+│   ├── csc2json.py            Cooja .csc → Cooja-NG JSON converter
 │   ├── run-cooja-tests.sh     Run upstream Contiki-NG test suite
 │   ├── build-test-firmware.sh Auto-build firmware needed by tests
 │   └── ...                    Debug/timing utilities
@@ -496,8 +516,11 @@ Last verified run on Linux x86-64 with `make` (release, JIT auto-detected):
 | `correctness` (MSP430 instructions) | **68 / 68 PASS** |
 | `arm-correctness` (ARM instructions) | **33 / 33 PASS** |
 | `timeline` (event serializer) | **76 / 76 PASS** |
+| `cc1200-mock-host` (CC1200 chip driver) | **73 / 73 PASS** |
+| `radio-medium` (per-radio multi-channel routing) | **235 / 235 PASS** |
 | `firmware` (`cputest.sky`, `timertest.sky`) | **2 / 2 PASS** |
-| `arm-firmware` (`hello-world.cc2538dk`) | **PASS** (boots Contiki-NG cleanly) |
+| `arm-firmware` (`hello-world.cc2538dk`, `bringup.zoul-firefly`) | **PASS** (boots Contiki-NG cleanly) |
+| `zoul-firefly-multinode` RPL-UDP | **6 / 6 hello cycles** in 60 s, 9.4× real-time |
 | `bench` | runs cleanly, ~430 MIPS micro avg |
 
 ### Cooja test suite

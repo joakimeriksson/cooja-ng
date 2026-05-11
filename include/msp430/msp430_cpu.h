@@ -168,6 +168,14 @@ typedef struct msp430_cpu {
     /* Nanosecond simulation time */
     int64_t         sim_time_ns;       /* current simulation time in nanoseconds */
     uint32_t        cpu_freq_hz;       /* current CPU frequency (for ns<->cycle conversion) */
+    /* Anchor for cycle->ns conversion. Updated on every set_frequency:
+     *   sim_time_ns = anchor_sim_time_ns + (cycles - anchor_cycles) / freq * 1e9
+     * Without this, execute_events would re-divide ALL cycles by the
+     * current freq even when earlier cycles accumulated at a different
+     * freq (DCO calibration), causing sim_time_ns to drift behind
+     * (or ahead) of scheduler time. */
+    int64_t         anchor_cycles;
+    int64_t         anchor_sim_time_ns;
 
     /* Config */
     const msp430_config_t *config;
