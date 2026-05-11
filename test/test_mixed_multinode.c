@@ -831,15 +831,24 @@ static int emulated_rxfifo_available(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return 128 - nodes[idx].plat.msp.cc2420.rx_fifo_len;
     else if (nodes[idx].type == NODE_ARM) {
-        cc2538_soc_t *soc = arm_platform_cc2538(&nodes[idx].plat.arm);
-        cc2538_rfcore_t *rf = &soc->rfcore;
-        int avail = RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
-        const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
-        if (pcfg && pcfg->has_cc1200) {
-            int cc1200_avail = 128 - soc->cc1200.rx_count;
-            if (cc1200_avail < avail) avail = cc1200_avail;
+        cc2538_soc_t   *cc_soc  = arm_platform_cc2538(&nodes[idx].plat.arm);
+        nrf52840_soc_t *nrf_soc = arm_platform_nrf52840(&nodes[idx].plat.arm);
+        if (cc_soc) {
+            cc2538_rfcore_t *rf = &cc_soc->rfcore;
+            int avail = RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
+            const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
+            if (pcfg && pcfg->has_cc1200) {
+                int cc1200_avail = 128 - cc_soc->cc1200.rx_count;
+                if (cc1200_avail < avail) avail = cc1200_avail;
+            }
+            return avail;
         }
-        return avail;
+        if (nrf_soc) {
+            /* nRF EasyDMA writes directly to PACKETPTR-pointed RAM; no
+             * shared fixed-size FIFO. Treat as always-available — the
+             * receive parser drops bytes when not in RX state. */
+            return 128;
+        }
     }
     return 0;
 }
