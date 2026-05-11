@@ -110,7 +110,59 @@ That's L4 in spirit: the firmware reaches the app process, schedules
 events, and runs them on time. CSMA/MAC layers also functional —
 they accept the TX call without spin-locking.
 
-## Data path + RNG + FICR landed; multinode harness next
+## Multinode harness wired — both nodes boot, TX path engages, debug pending
+
+`test_mixed_multinode.c` now recognises `.nrf52840-dongle`, branches
+`init_arm_node` on `arm_platform_cc2538` vs `arm_platform_nrf52840`,
+and routes `mixed_deliver_rf_bytes` to the right chip per-platform.
+For nRF nodes:
+
+  - TX listener installed via `nrf_radio_set_tx_listener` (slot 0)
+  - RX delivery via `nrf_radio_receive_byte` from the medium
+  - `soc->ficr.deviceaddr0/1` and `soc->rng.prng_state` seeded with a
+    per-node hash for unique IEEE EUI-64 + distinct CSMA backoff
+
+Plus a fix to the RADIO state machine: `TASKS_TXEN` / `TASKS_RXEN` are
+now accepted from any state except their own ramp-up/active state
+(real Contiki driver triggers TXEN directly from RXIDLE after a STOP,
+relying on hardware to handle the implicit transition). And a
+correction to two SHORTS bit positions: `TXREADY_START` is bit 18
+(was 19), `RXREADY_START` is bit 19 (was 20) — confirmed against
+`nrf52840_bitfields.h`.
+
+Two-node `udp-server.nrf52840-dongle + udp-client.nrf52840-dongle`
+result:
+
+  - Both nodes boot with **distinct IEEE link addresses**:
+      Node 1 = `fe80::f6ce:3601:f1f4:203b`
+      Node 2 = `fe80::f6ce:3602:e3e9:4176`
+  - Radio state machine engages: `TASKS_RXEN → RXIDLE → SHORT
+    RXREADY_START → TASKS_START → RX`, periodically interleaved with
+    `TASKS_TXEN → TXIDLE → SHORT TXREADY_START → TASKS_START → TX
+    (radio_emit_tx walks PACKETPTR, emits 4×0x00 + 0x7A SFD + frame
+    + CRC) → TXIDLE`.
+  - 1–6 sim seconds: clean. 7+ sim seconds: **segfault**, location
+    not yet pinpointed.
+
+Possibilities to investigate next session:
+  - Some state path lets `radio_emit_tx` be called with a stale
+    `PACKETPTR` that the (already added) bounds check doesn't catch.
+  - SHORTS chain recursion overflowing the stack on a particular
+    sequence (TX → END → END_DISABLE → DISABLED → DISABLED_TXEN → …).
+  - Mismatch between the cc2538 `mixed_rf_tx_handler_radio` spectrum
+    routing and the unregistered nRF radio slot.
+
+Single-node `udp-client.nrf52840-dongle` runs cleanly for 30+ sim
+seconds (unaffected — segfault is only in the two-node harness path).
+CC2538 RPL-UDP regression: 26 direct RX in 60 s sim, 11.4× real-time
+— no impact on existing platforms.
+
+Once the segfault is fixed, the next obvious checkpoints are:
+  - DIO arrival on Node 2 (RX path verification)
+  - DAO + DODAG formation
+  - First UDP packet delivered → "Sending request" / "Received reply"
+
+## Earlier — data path + RNG + FICR landed
 
   - **PACKETPTR EasyDMA in RADIO** (TX): on TASKS_START in TX state,
     `radio_emit_tx()` walks the buffer at PACKETPTR (PHR + payload),
