@@ -2704,6 +2704,7 @@ static int init_msp430_node(int idx, const char *firmware_path, int node_id) {
         else if (strcmp(dot, ".esb") == 0) plat_name = "esb";
         else if (strcmp(dot, ".wismote") == 0) plat_name = "wismote";
         else if (strcmp(dot, ".exp5438") == 0) plat_name = "exp5438";
+        else if (strcmp(dot, ".msp430fr5969") == 0) plat_name = "fr5969";
     }
     const msp430_platform_config_t *pcfg = msp430_platform_find(plat_name);
     if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }
@@ -3201,10 +3202,21 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
 
-    printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
-           node->type == NODE_MSP430 ? "MSP430/Sky" :
-           node->type == NODE_ARM ? "ARM/CC2538DK" :
-           node->type == NODE_JS ? "JS/QuickJS" : "Native/Cooja");
+    const char *type_label = "Native/Cooja";
+    if (node->type == NODE_MSP430) {
+        const char *dot = strrchr(firmware_path, '.');
+        if (dot && strcmp(dot, ".z1") == 0)              type_label = "MSP430/Z1";
+        else if (dot && strcmp(dot, ".esb") == 0)        type_label = "MSP430/ESB";
+        else if (dot && strcmp(dot, ".wismote") == 0)    type_label = "MSP430/WisMote";
+        else if (dot && strcmp(dot, ".exp5438") == 0)    type_label = "MSP430/exp5438";
+        else if (dot && strcmp(dot, ".msp430fr5969") == 0) type_label = "MSP430/FR5969";
+        else                                              type_label = "MSP430/Sky";
+    } else if (node->type == NODE_ARM) {
+        type_label = "ARM/CC2538DK";
+    } else if (node->type == NODE_JS) {
+        type_label = "JS/QuickJS";
+    }
+    printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path, type_label);
 
     if (node->type == NODE_MSP430)
         return init_msp430_node(idx, firmware_path, node_id);

@@ -19,6 +19,19 @@
 #define USART_UTCTL_OFFSET  1
 #define USART_TXEPT         0x01  /* Transmitter empty (shift register empty) */
 
+/*
+ * eUSCI_A register offsets (FR5xxx):
+ *   +0x00: UCAxCTLW0   +0x06: UCAxBRW    +0x08: UCAxMCTLW   +0x0A: UCAxSTATW
+ *   +0x0C: UCAxRXBUF   +0x0E: UCAxTXBUF  +0x1A: UCAxIE      +0x1C: UCAxIFG
+ *   +0x1E: UCAxIV
+ */
+#define EUSCI_STATW_OFFSET  0x0A
+#define EUSCI_IE_OFFSET     0x1A
+#define EUSCI_IFG_OFFSET    0x1C
+#define EUSCI_IV_OFFSET     0x1E
+#define EUSCI_UCTXIFG       0x0002
+#define EUSCI_UCRXIFG       0x0001
+
 /* IO callback for USART reads */
 static int usart_read(void *user_data, uint32_t addr, bool word, int64_t cycles) {
     msp430_usart_t *usart = (msp430_usart_t *)user_data;
@@ -26,20 +39,50 @@ static int usart_read(void *user_data, uint32_t addr, bool word, int64_t cycles)
 
     uint32_t offset = addr - usart->base_addr;
 
-    /* UTCTL: return TXEPT=1 (transmitter always ready, we process instantly).
-     * Only for classic USART — on USCI, offset 1 is UCxCTL1 (not UTCTL),
-     * and TX readiness is signaled via IFG, not a status register bit. */
-    if (offset == USART_UTCTL_OFFSET && !usart->is_usci) {
+    if (usart->is_eusci) {
+        if (offset == EUSCI_IFG_OFFSET) return usart->eusci_ifg;
+        if (offset == EUSCI_IE_OFFSET)  return usart->eusci_ie;
+        if (offset == EUSCI_STATW_OFFSET) return 0;  /* UCBUSY=0 */
+        if (offset == EUSCI_IV_OFFSET) {
+            /* UCAxIV: return highest-priority pending+enabled interrupt
+             * (RX > TX), and clear that flag.  Used by the standard
+             * `__even_in_range(UCA0IV, ...)` ISR dispatch pattern. */
+            uint16_t pending = usart->eusci_ifg & usart->eusci_ie;
+            if (pending & EUSCI_UCRXIFG) {
+                usart->eusci_ifg &= ~EUSCI_UCRXIFG;
+                msp430_usart_update_interrupts(usart);
+                return 0x02;
+            }
+            if (pending & EUSCI_UCTXIFG) {
+                usart->eusci_ifg &= ~EUSCI_UCTXIFG;
+                msp430_usart_update_interrupts(usart);
+                return 0x04;
+            }
+            return 0x00;
+        }
+    } else if (offset == USART_UTCTL_OFFSET && !usart->is_usci) {
+        /* UTCTL: return TXEPT=1 (transmitter always ready, we process instantly).
+         * Only for classic USART — on USCI, offset 1 is UCxCTL1 (not UTCTL),
+         * and TX readiness is signaled via IFG, not a status register bit. */
         return USART_TXEPT;
     }
 
     /* Return SPI RX buffer when RX register is read.
      * On USCI, reading RXBUF (offset 6) clears RXIFG.
-     * On classic USART, rx_offset is set via set_spi(). */
-    uint32_t rx_off = usart->rx_offset ? usart->rx_offset : 6;
+     * On classic USART, rx_offset is set via set_spi().
+     * On eUSCI, RXBUF is at offset 0x0C and clears UCRXIFG in eusci_ifg. */
+    uint32_t rx_off;
+    if (usart->is_eusci) {
+        rx_off = 0x0C;
+    } else {
+        rx_off = usart->rx_offset ? usart->rx_offset : 6;
+    }
     if (offset == rx_off) {
-        if (usart->ifg_ptr)
+        if (usart->is_eusci) {
+            usart->eusci_ifg &= ~EUSCI_UCRXIFG;
+        } else if (usart->ifg_ptr) {
             *usart->ifg_ptr &= ~usart->ifg_rx_mask;
+        }
         msp430_usart_update_interrupts(usart);
         return usart->rx_buf;
     }
@@ -52,10 +95,28 @@ static void usart_write(void *user_data, uint32_t addr, int value, bool word, in
     msp430_usart_t *usart = (msp430_usart_t *)user_data;
     (void)word; (void)cycles;
 
+    uint32_t offset = addr - usart->base_addr;
+
+    /* eUSCI: handle internal IE/IFG writes.  Firmware can clear flags
+     * by writing 0 to the corresponding bit; we keep UCTXIFG asserted
+     * since our TX is always ready. */
+    if (usart->is_eusci) {
+        if (offset == EUSCI_IE_OFFSET) {
+            usart->eusci_ie = (uint16_t)value;
+            msp430_usart_update_interrupts(usart);
+            return;
+        }
+        if (offset == EUSCI_IFG_OFFSET) {
+            usart->eusci_ifg = (uint16_t)value | EUSCI_UCTXIFG;
+            msp430_usart_update_interrupts(usart);
+            return;
+        }
+    }
+
     /* USCI: track UCSWRST and baud rate.  TX is disabled while
      * UCSWRST=1 or baud rate is 0 (not configured). */
     if (usart->is_usci) {
-        uint32_t off = addr - usart->base_addr;
+        uint32_t off = offset;
         if (off == 1) {
             bool was_reset = usart->ucswrst;
             usart->ucswrst = (value & 0x01) != 0;
@@ -74,7 +135,7 @@ static void usart_write(void *user_data, uint32_t addr, int value, bool word, in
     }
 
     /* Check if this is the TX register */
-    if (addr == usart->base_addr + usart->tx_offset) {
+    if (offset == usart->tx_offset) {
         /* Don't fire console TX callback while USCI is in reset or
          * baud rate not set.  SPI exchange always proceeds (it uses
          * the SPI clock, not the baud rate generator). */
@@ -97,7 +158,10 @@ static void usart_write(void *user_data, uint32_t addr, int value, bool word, in
         }
         /* Set IFG flags: TXIFG always (TX buffer ready for next byte).
          * RXIFG only if a device responded (SPI completed). */
-        if (usart->ifg_ptr) {
+        if (usart->is_eusci) {
+            usart->eusci_ifg |= EUSCI_UCTXIFG;
+            if (spi_responded) usart->eusci_ifg |= EUSCI_UCRXIFG;
+        } else if (usart->ifg_ptr) {
             *usart->ifg_ptr |= usart->ifg_tx_mask;
             if (spi_responded || !usart->spi_exchange)
                 *usart->ifg_ptr |= usart->ifg_rx_mask;
@@ -108,20 +172,28 @@ static void usart_write(void *user_data, uint32_t addr, int value, bool word, in
 }
 
 void msp430_usart_init(msp430_usart_t *usart, msp430_cpu_t *cpu,
-                        uint32_t base_addr, uint32_t tx_offset) {
+                        uint32_t base_addr, uint32_t tx_offset,
+                        bool is_eusci) {
     memset(usart, 0, sizeof(*usart));
     usart->cpu = cpu;
     usart->base_addr = base_addr;
     usart->tx_offset = tx_offset;
+    usart->is_eusci = is_eusci;
     /* USCI defaults to UCSWRST=1 after POR — TX blocked until firmware
      * clears it.  This prevents garbage output during USCI configuration.
      * is_usci is set later by platform_init; ucswrst is checked in
      * usart_write only when is_usci is true. */
     usart->ucswrst = true;
 
-    /* Register IO range — 8 bytes for classic USART, 16 for USCI */
-    uint32_t size = 16;
+    /* Register IO range — 16 bytes for classic USART/USCI,
+     * 32 for eUSCI (covers UCAxIE/UCAxIFG/UCAxIV up to base+0x1E). */
+    uint32_t size = is_eusci ? 32 : 16;
     msp430_register_io(cpu, base_addr, size, usart_read, usart_write, usart);
+
+    if (is_eusci) {
+        /* TX is always ready in our stub */
+        usart->eusci_ifg = EUSCI_UCTXIFG;
+    }
 }
 
 void msp430_usart_set_callback(msp430_usart_t *usart,
@@ -159,8 +231,11 @@ void msp430_usart_set_ie(msp430_usart_t *usart, uint8_t *ie_ptr,
 
 void msp430_usart_receive_byte(msp430_usart_t *usart, uint8_t byte) {
     usart->rx_buf = byte;
-    if (usart->ifg_ptr)
+    if (usart->is_eusci) {
+        usart->eusci_ifg |= EUSCI_UCRXIFG;
+    } else if (usart->ifg_ptr) {
         *usart->ifg_ptr |= usart->ifg_rx_mask;
+    }
 
     /* If DMA is configured for this USART's RX trigger, fire it.
      * DMA transfer happens before the CPU interrupt — the DMA controller
@@ -177,7 +252,20 @@ void msp430_usart_receive_byte(msp430_usart_t *usart, uint8_t byte) {
 }
 
 void msp430_usart_update_interrupts(msp430_usart_t *usart) {
-    if (!usart->ie_ptr || !usart->ifg_ptr || !usart->cpu) return;
+    if (!usart->cpu) return;
+
+    if (usart->is_eusci) {
+        /* eUSCI uses internal IE/IFG.  Both TX and RX share a single
+         * interrupt vector per module (UCAxIV ISR dispatches inside). */
+        uint16_t pending = usart->eusci_ifg & usart->eusci_ie;
+        if (usart->rx_vector >= 0) {
+            msp430_flag_interrupt(usart->cpu, usart->rx_vector, usart, NULL,
+                                   pending != 0);
+        }
+        return;
+    }
+
+    if (!usart->ie_ptr || !usart->ifg_ptr) return;
 
     uint8_t ie = *usart->ie_ptr;
     uint8_t ifg = *usart->ifg_ptr;
