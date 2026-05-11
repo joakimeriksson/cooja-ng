@@ -11,6 +11,7 @@ A fast, multi-architecture emulator and network simulator for Contiki-NG, writte
    firmware/*.sky ────►│  MSP430 F1611/F2617/F5437/CC430/FR5969   │
    firmware/*.cc2538dk►│  ARM Cortex-M3 + CC2538 RF Core          │──► UART, packets,
    firmware/*.zoul-fly►│  ARM Cortex-M3 + CC2538 + CC1200 sub-GHz │    timeline, UI
+   firmware/*.nrf52840►│  ARM Cortex-M4F + Nordic 802.15.4 radio  │
    firmware/*.cooja  ─►│  Native Cooja motes (dlopen)             │
                        │                                          │
                        │  shared event queue • per-radio medium   │
@@ -212,6 +213,8 @@ Node platform is auto-detected from the firmware extension:
 | `.msp430fr5969` | MSP430 (MSP-EXP430FR5969 LaunchPad, FRAM, no radio) |
 | `.cc2538dk` | ARM Cortex-M3 (CC2538 + on-chip 802.15.4) |
 | `.zoul-firefly` | ARM Cortex-M3 (Zolertia Firefly: CC2538 + CC1200 sub-GHz) |
+| `.nrf52840-dongle` | ARM Cortex-M4F (Nordic nRF52840 USB Dongle PCA10059) |
+| `.nrf52840-dk` | ARM Cortex-M4F (Nordic nRF52840 Development Kit PCA10056) |
 | `.cooja` | Native Cooja shared library |
 
 ### Multi-node options
