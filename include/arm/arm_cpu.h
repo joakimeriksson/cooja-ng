@@ -149,6 +149,12 @@ typedef struct arm_cpu {
     uint32_t  flash_base, flash_end;
     uint32_t  sram_base,  sram_end;
     uint32_t  rom_size;     /* 0 if SoC has no ROM region (e.g. nRF52840) */
+    /* Effective default vector table address used at reset. Seeded
+     * from `config->vtor_default` by arm_cpu_init; can be overridden
+     * by the SoC init op from the platform config (e.g. nrf52840
+     * Dongle = 0x1000, DK = 0). 0 → use SoC-specific discovery
+     * (CC2538 CCA) or fall back to flash_base. */
+    uint32_t  vtor_default;
 
     /* Cortex-M4F VFP — single-precision (32 × s0..s31). Stored as raw
      * 32-bit words; arm_vfp.c interprets them per the IEEE 754 binary32

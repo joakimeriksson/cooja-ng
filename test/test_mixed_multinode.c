@@ -2678,8 +2678,10 @@ static node_type_t detect_node_type(const char *path) {
     /* Zolertia Firefly: same CC2538 SoC as cc2538dk, different board glue. */
     if (dot && strcmp(dot, ".zoul-firefly") == 0)
         return NODE_ARM;
-    /* Nordic nRF52840 USB Dongle. */
+    /* Nordic nRF52840 (Dongle PCA10059 or Development Kit PCA10056). */
     if (dot && strcmp(dot, ".nrf52840-dongle") == 0)
+        return NODE_ARM;
+    if (dot && strcmp(dot, ".nrf52840-dk") == 0)
         return NODE_ARM;
     if (dot && strcmp(dot, ".cooja") == 0)
         return NODE_NATIVE;
@@ -2901,6 +2903,8 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         plat_name = "zoul-firefly";
     else if (dot && strcmp(dot, ".nrf52840-dongle") == 0)
         plat_name = "nrf52840-dongle";
+    else if (dot && strcmp(dot, ".nrf52840-dk") == 0)
+        plat_name = "nrf52840-dk";
 
     const arm_platform_config_t *pcfg = arm_platform_find(plat_name);
     if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }

@@ -60,14 +60,43 @@ static const arm_platform_config_t platform_zoul_firefly = {
 };
 
 /* Nordic nRF52840 USB Dongle (PCA10059, TARGET=nrf52840 BOARD=dongle).
- * Single-chip SoC — no off-SoC peripherals on this board. Console pinout
- * (UART0 on dongle pads) and LED/button wiring will be filled in once the
- * corresponding peripherals are modelled. See devices/nrf52840-dongle/. */
+ * Reserves 0x0..0xfff for the Open Bootloader so the application
+ * vector table sits at 0x1000.
+ *   LED1 (mono green) = P0.6                    active-low
+ *   LED2 R / G / B    = P0.8 / P1.9 / P0.12     active-low
+ *   SW1 USER button   = P1.6                    active-low pull-up */
 static const arm_platform_config_t platform_nrf52840_dongle = {
     .name          = "nrf52840-dongle",
     .soc           = &nrf52840_config,
     .soc_ops       = &nrf52840_soc_ops,
     .console_uart  = 0,
+    .leds = {
+        { .port = 0, .pin = 6,  .active_low = true },   /* LD1 green   P0.6  */
+        { .port = 0, .pin = 8,  .active_low = true },   /* LD2 red     P0.8  */
+        { .port = 0, .pin = 12, .active_low = true },   /* LD2 blue    P0.12 */
+    },
+    .button        = { .port = 1, .pin = 6, .active_low = true },  /* SW1 P1.6 */
+    .vtor_override = 0x00001000,
+};
+
+/* Nordic nRF52840 Development Kit (PCA10056, TARGET=nrf52840 BOARD=dk).
+ * No bootloader region — firmware is flashed via SEGGER J-Link directly
+ * to flash base, so the vector table is at 0x0.
+ *   LED1..4   = P0.13 / P0.14 / P0.15 / P0.16   active-low
+ *   BUTTON1..4 = P0.11 / P0.12 / P0.24 / P0.25  active-low pull-up
+ *   Console  = UARTE0 (legacy register window) to SEGGER USB-CDC */
+static const arm_platform_config_t platform_nrf52840_dk = {
+    .name          = "nrf52840-dk",
+    .soc           = &nrf52840_config,
+    .soc_ops       = &nrf52840_soc_ops,
+    .console_uart  = 0,
+    .leds = {
+        { .port = 0, .pin = 13, .active_low = true },   /* LED1 P0.13 */
+        { .port = 0, .pin = 14, .active_low = true },   /* LED2 P0.14 */
+        { .port = 0, .pin = 15, .active_low = true },   /* LED3 P0.15 */
+    },
+    .button        = { .port = 0, .pin = 11, .active_low = true },  /* BUTTON1 P0.11 */
+    .vtor_override = 0,                                              /* VTOR = flash_base = 0x0 */
 };
 
 static const arm_platform_config_t *all_arm_platforms[] = {
@@ -75,6 +104,7 @@ static const arm_platform_config_t *all_arm_platforms[] = {
     &platform_openmote,
     &platform_zoul_firefly,
     &platform_nrf52840_dongle,
+    &platform_nrf52840_dk,
     NULL
 };
 
