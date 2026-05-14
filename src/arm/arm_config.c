@@ -32,6 +32,43 @@ const arm_config_t cc2538_config = {
  * cover the common path. M4-only opcodes are added on demand once
  * firmware traps on them.
  */
+/* Nordic nRF54L15 (Cortex-M33).
+ *
+ * Per nRF54L15 Product Specification (Nordic) and the Contiki-NG
+ * port at `arch/cpu/nrf/nrf54l15/`:
+ *   - Cortex-M33 @ 128 MHz (HFXO 32 MHz × 4 PLL).
+ *   - 1.5 MiB flash @ 0x00000000.
+ *   - 192 KiB SRAM @ 0x20000000 (256 KiB on some variants — confirm
+ *     against PS / linker script per board).
+ *   - Peripheral region at 0x50000000 (NOT 0x40000000 — different
+ *     from nRF52). NVIC + system peripherals in 0xE0000000 common
+ *     Cortex-M space.
+ *   - ~50 IRQs in the application-core vector table (count TBD;
+ *     confirm against nrfx mdk header nrf54l15_application.h).
+ *
+ * No `rom_size` — like nRF52840, the chip's factory data (FICR/UICR)
+ * lives in flash/info pages and is read through the regular memory
+ * map.
+ *
+ * ARMv8-M Mainline ISA. The existing arm_cpu.c Thumb-2 interpreter
+ * (and arm_vfp.c FPv4-SP-D16) covers the common path; ARMv8-M-only
+ * additions (MSPLIM/PSPLIM, BTI, TrustZone-M) are added on demand
+ * when firmware traps. Contiki-NG's nrf54l15 build is soft-float
+ * ABI and non-secure-only by default, so the L0–L6 path is expected
+ * to stay within the M3/M4-compatible subset.
+ */
+const arm_config_t nrf54l15_config = {
+    .name             = "nRF54L15",
+    .rom_size         = 0,
+    .flash_size       = 1536 * 1024,
+    .flash_base       = 0x00000000,
+    .sram_size        = 192 * 1024,
+    .sram_base        = 0x20000000,
+    .default_cpu_freq = 128000000,    /* 128 MHz */
+    .num_irqs         = 64,           /* upper bound; tighten once PS is in hand */
+    .vtor_default     = 0,            /* vector table at flash base */
+};
+
 const arm_config_t nrf52840_config = {
     .name            = "nRF52840",
     .rom_size        = 0,

@@ -33,5 +33,6 @@ typedef struct arm_config {
 /* Pre-defined configurations */
 extern const arm_config_t cc2538_config;
 extern const arm_config_t nrf52840_config;
+extern const arm_config_t nrf54l15_config;
 
 #endif /* ARM_CONFIG_H */
