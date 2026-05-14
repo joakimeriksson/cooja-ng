@@ -970,6 +970,139 @@ static void test_m4_vfp(void) {
 /* ===================================================================
  * Run all tests
  * =================================================================== */
+/* ===================================================================
+ * Bit field instruction tests — BFI / BFC / SBFX / UBFX
+ *
+ * Regression cover for the nrf54l15 channel bitfield bug: BFI's op=0x16
+ * was previously matched with `(op & 0x1C) == 0x18`, which captures
+ * 0x18..0x1B but NOT 0x16, so every BFI silently fell through to the
+ * SBFX path (0x14..0x17) and corrupted any bitfield write.  Caught
+ * because Nordic's `nrf_802154` PIB stores the IEEE 802.15.4 channel
+ * as `uint8_t channel : 5` and the channel-setter compiles to
+ *   bfi r2, r0, #3, #5
+ * which silently became sbfx, leaving the channel at 0 in SRAM and
+ * tripping `NRF_802154_ASSERT(channel >= 11 && channel <= 26)` at
+ * trx_enable time.
+ * =================================================================== */
+static void test_bit_field_ops(void) {
+    printf("--- Bit-field instruction tests ---\n");
+
+    /* BFI R2, R0, #3, #5
+     * Insert 5 bits from R0 at bit position 3 of R2.
+     * Encoding: hw1=0xF360 (op=0x16, Rn=R0)
+     *           hw2 = (imm3=0)<<12 | (Rd=R2)<<8 | (imm2=3)<<6 | (msb=7) = 0x02C7
+     */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x201A); pc += 2;   /* MOVS R0, #26 */
+        write_thumb16(&cpu, pc, 0x2207); pc += 2;   /* MOVS R2, #7  (preserve low 3 bits) */
+        write_thumb32(&cpu, pc, 0xF360, 0x02C7); pc += 4; /* BFI R2, R0, #3, #5 */
+        arm_step(&cpu, 3);
+        /* expected: R2 = (7 & 0x07) | ((26 << 3) & 0xF8) = 7 | 0xD0 = 0xD7 */
+        assert_eq("BFI R2, R0, #3, #5  (26 into 5-bit field)", 0xD7, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* BFC R2, #4, #4 — clear 4 bits of R2 starting at bit 4
+     * lsb=4 → imm3=1, imm2=0.  msb=lsb+width-1=7.
+     * Encoding: hw1 = 0xF36F (op=0x16, Rn=PC=0xF marks BFC)
+     *           hw2 = (imm3=1)<<12 | (Rd=R2)<<8 | (imm2=0)<<6 | (msb=7) = 0x1207
+     */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x22FF); pc += 2;   /* MOVS R2, #0xFF */
+        write_thumb32(&cpu, pc, 0xF36F, 0x1207); pc += 4; /* BFC R2, #4, #4 */
+        arm_step(&cpu, 2);
+        assert_eq("BFC R2, #4, #4 (clear bits 4..7 of 0xFF)", 0x0F, cpu.reg[2]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* UBFX R1, R0, #3, #5 — unsigned extract 5 bits at bit 3
+     * Encoding: hw1 = 0xF3C0 (op=0x1C, Rn=R0)
+     *           hw2 = (imm3=0)<<12 | (Rd=R1)<<8 | (imm2=3)<<6 | (widthm1=4) = 0x01C4
+     */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x20D0); pc += 2;   /* MOVS R0, #0xD0 */
+        write_thumb32(&cpu, pc, 0xF3C0, 0x01C4); pc += 4; /* UBFX R1, R0, #3, #5 */
+        arm_step(&cpu, 2);
+        /* expected: (0xD0 >> 3) & 0x1F = 0x1A = 26 */
+        assert_eq("UBFX R1, R0, #3, #5  (extract 5 bits at offset 3)", 26, cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SBFX R1, R0, #3, #5 — signed extract 5 bits at bit 3
+     * Encoding: hw1 = 0xF340 (op=0x14, Rn=R0)
+     *           hw2 = same shape as UBFX = 0x01C4
+     */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x2080); pc += 2;   /* MOVS R0, #0x80 (bit 7 set) */
+        write_thumb32(&cpu, pc, 0xF340, 0x01C4); pc += 4; /* SBFX R1, R0, #3, #5 */
+        arm_step(&cpu, 2);
+        /* extract bits 3..7 of 0x80 = 0b10000 = 16, sign-extend (top bit is 1)
+         * → 0xFFFFFFF0 */
+        assert_eq("SBFX R1, R0, #3, #5  (sign-extend extracted negative)",
+                  0xFFFFFFF0u, cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
+ * ARMv8-M atomic acquire/release exclusive — LDAEX / STLEX
+ *
+ * Regression cover for the nrf54l15 GRTC tick handler bug: Nordic's
+ * `nrfx_atomic_u32_fetch_and` uses
+ *   LDAEX r0, [r3] ; ... ; STLEX ip, r2, [r3]
+ * to read-modify-write a 32-bit flag.  Without LDAEX/STLEX decoding,
+ * the interpreter mis-decoded the instructions and ended up jumping
+ * to PC=0, which silently wiped SRAM during the IRQ handler path.
+ * =================================================================== */
+static void test_ldaex_stlex(void) {
+    printf("--- ARMv8-M LDAEX / STLEX tests ---\n");
+
+    /* Set up R3 = 0x20001000 directly via cpu->reg, then run the
+     * exclusive instructions.  Saves the headache of encoding
+     * MOVW/MOVT by hand. */
+
+    /* LDAEX R0, [R3]
+     * Encoding: hw1=0xE8D3 (LDAEX with Rn=R3), hw2=0x0FEF (Rt=R0, marker). */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, 0x20001000, 0xDEADBEEFu);
+        cpu.reg[3] = 0x20001000;
+        write_thumb32(&cpu, CODE_BASE, 0xE8D3, 0x0FEF);
+        arm_step(&cpu, 1);
+        assert_eq("LDAEX R0, [R3] (R0 = *0x20001000)", 0xDEADBEEFu, cpu.reg[0]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* STLEX IP, R2, [R3]
+     * Encoding: hw1=0xE8C3 (STLEX with Rn=R3), hw2=0x2FEC (Rt=R2, marker, Rd=R12=IP). */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[3] = 0x20001000;
+        cpu.reg[2] = 0x12345678;
+        cpu.reg[12] = 0xFFFFFFFF;   /* will be cleared to 0 on success */
+        write_thumb32(&cpu, CODE_BASE, 0xE8C3, 0x2FEC);
+        arm_step(&cpu, 1);
+        assert_eq("STLEX IP = 0 (always succeeds in csim)", 0u, cpu.reg[12]);
+        assert_eq("STLEX wrote *0x20001000 = R2", 0x12345678u,
+                  arm_read32(&cpu, 0x20001000));
+        arm_cpu_destroy(&cpu);
+    }
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -985,6 +1118,8 @@ int run_arm_correctness_tests(int v) {
     test_branch();
     test_extensions();
     test_adc_sbc();
+    test_bit_field_ops();
+    test_ldaex_stlex();
     test_m4_dsp_halfword_multiply();
     test_m4_vfp();
 

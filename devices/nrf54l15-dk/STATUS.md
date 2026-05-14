@@ -6,24 +6,59 @@
 
 ## Current state — short version
 
-**L3 reached — firmware prints over emulated UARTE.** Foundation
-(`nrf54l15_config`) + SoC scaffolding + GLOBAL_CLOCK + UARTE20 EasyDMA
-in three commits.
-
-Visible output (the line below is the *emulated* nrf54l15-dk firmware
-hitting an assert and routing it via printf → nrfx_uarte_tx →
-TASKS_DMA.TX.START → byte-by-byte through the SoC's set_console
-callback to the host's stdout):
+**L3 reached — full Contiki banner prints on emulated nrf54l15-dk.**
 
 ```
-A! nrf_802154_trx.c:424
-A! nrf_802154_trx.c:424
-A! nrf_802154_trx.c:424
+[INFO: Main      ] Starting Contiki-NG-release/v5.1-164-gf15d82e66
+[INFO: Main      ] - Routing: RPL Lite
+[INFO: Main      ] - Net: sicslowpan
+[INFO: Main      ] - MAC: CSMA
+[INFO: Main      ] - 802.15.4 PANID: 0xabcd
+[INFO: Main      ] - 802.15.4 Default channel: 26
+[INFO: Main      ] Node ID: 0
+[INFO: Main      ] Link-layer address: f4ce.3600.0000.0000
+[INFO: Main      ] Tentative link-local IPv6 address: fe80::f6ce:3600:0:0
+Hello, world
 ```
 
-That's Contiki's `printf("A! %s:%d\n", file, line)` from the
-Nordic 802.15.4 driver's `NRFX_ASSERT`. The assert fires because
-the RADIO peripheral isn't modelled yet — exactly the next item.
+End-to-end: hello-world.nrf54l15-dk runs through libc init, nrfx
+clock startup, GRTC, Nordic 802.15.4 driver init, Contiki netstack
+init, autostart, and into the `hello-world` process — all
+peripherals it touches modelled or accepted as no-ops, all bytes
+delivered via UARTE20 EasyDMA.
+
+### The BFI bug that gated this
+
+The biggest blocker turned out to be a Thumb-2 interpreter bug,
+NOT a missing peripheral.
+
+Nordic's `nrf_802154` driver stores the IEEE 802.15.4 channel as a
+**5-bit bitfield** (`uint8_t channel : 5`).  The setter compiles to
+
+    bfi r2, r0, #3, #5
+
+`BFI`'s op-code in the ARMv7-M plain-binary-immediate group is
+`op[4:0] = 10110 = 0x16`.  Our interpreter routed it with
+`(op & 0x1C) == 0x18`, a mask that captures 0x18..0x1B but **misses
+0x16** — so every BFI fell through to the SBFX path (0x14..0x17,
+since 0x16 & 0x1C = 0x14), which extracted bits instead of
+inserting them.  The store-back wrote garbage to the bitfield byte.
+
+Result: `nrf_802154_pib_channel_set(26)` silently left
+`m_data.channel = 0` in SRAM.  Later, `nrf_802154_trx_enable` read
+`nrf_802154_pib_channel_get() = 0` and called
+`channel_set(0)`, tripping
+`NRF_802154_ASSERT(channel >= 11U && channel <= 26U)`.
+
+Fix: route the plain-binary-immediate sub-opcodes by *exact* op
+value (BFI=0x16, SBFX=0x14, BFC=0x16+Rn=PC, UBFX=0x1C), with a
+mask of `& 0x1E` for the SSAT/USAT pairs.  Locked in by four
+regression tests in `test/test_arm_correctness.c::test_bit_field_ops`.
+
+This silently broke any C code on csim that touched bitfields
+wider than 1 bit at a non-zero offset.  It just happened to be
+the nrf54l15 port that hit it first because Nordic's 802.15.4
+driver packs PIB fields tightly.
 
 The Thumb-2 interpreter has run >10 M instructions of
 `hello-world.nrf54l15-dk` end-to-end without a single `undef`. Track
@@ -46,75 +81,13 @@ through libc init, nrfx setup, GRTC start, and into `main()`.
   6. **`main()` reached** — firmware enters the Contiki main loop and
      attempts to printf the boot banner.
 
-**Where the firmware parks now**: boot path is fully complete; the
-Contiki main process is alive, the radio process is alive, but
-nothing on-air happens.  The radio init writes ~127 RADIO config
-registers at `0x5008_A000`, configures DPPI subscriptions
-(`*[0x104] = 0x80000017` — channel 23 subscribing to RADIO event
-4), then **waits for DPPI channels to publish events**.  No
-`TASKS_TXEN` / `TASKS_RXEN` ever fires.
-
-### Address aliasing — the 0x5xxx window
-
-Contiki's nrf54l15 build addresses every peripheral via the
-**`0x5xxx_xxxx` alias**, NOT the `0x4xxx_xxxx` non-secure base
-that the SVD lists first.  Confirmed by literal-pool dumps of the
-firmware:
-
-| Peripheral        | csim base       | SVD "_NS"       | SVD "_S"        |
-| ----------------- | --------------- | --------------- | --------------- |
-| GLOBAL_CLOCK      | `0x5010_E000`   | `0x4010_E000`   | `0x5010_E000`   |
-| UARTE20           | `0x500C_6000`   | `0x400C_6000`   | `0x500C_6000`   |
-| GRTC              | `0x500E_2000`   | `0x400E_2000`   | `0x500E_2000`   |
-| RADIO             | `0x5008_A000`   | `0x4008_A000`   | `0x5008_A000`   |
-
-Every new peripheral added to this port must use the 0x5xxx base.
-
-### Why RADIO needs DPPI before it engages
-
-Nordic's `nrf_802154` driver is built around the **DPPI** fabric:
-peripheral A *publishes* an event on a DPPI channel, peripheral B
-*subscribes* that channel to one of its tasks.  The actual radio
-ramp-up / TX kick is driven by GRTC compare → DPPI channel →
-`TASKS_TXEN`, **never by the CPU writing the task register
-directly**.
-
-That's why even with the GRTC modelled and ticks firing, RADIO
-sees no new task triggers: the GRTC compare event has nowhere to
-go without a DPPI channel routing it.
-
-**DPPI fabric is now in place** (collapsed to one 32-channel global
-state aliased across DPPIC00/10/20/30 at `0x5004_2000`, `0x5008_2000`,
-`0x500C_2000`, `0x5010_2000`).  Confirmed via instrumented run:
-udp-server's boot path writes `CHENSET=0x000045f8` and
-`CHENSET=0x00800000` to DPPIC10 — enabling channels 3..8, 10, 14,
-plus channel 23 which RADIO subscribed to via `SUBSCRIBE_RXEN`.
-
-GRTC compare-fire now publishes on its configured channel via
-`PUBLISH_COMPARE[n]` (bit 31 = EN, bits 4..0 = channel id) →
-`nrf54l_dppi_publish`.  No publishes log yet because MPSL only
-programs `PUBLISH_COMPARE` when an active radio operation is
-requested, and that's gated on a RADIO model existing.
-
-Subscribers (e.g. future RADIO SUBSCRIBE_TXEN/_RXEN) register via
-`nrf54l_dppi_subscribe(soc->dppi, channel, callback, user)`.
-
-### Order of work for real RX/TX
-
-1. ~~**DPPI**~~ ✅ — `nrf54l_dppi_state_t` + 4 DPPIC IO regions +
-   `subscribe/publish` API + GRTC compare-fire hooked through.
-2. **RADIO** state machine: `DISABLED ↔ TXRU/TXIDLE/TX ↔
-   RXRU/RXIDLE/RX`, SHORTS auto-chaining, EVENTS_END/READY/etc.
-   `SUBSCRIBE_TXEN/RXEN/START/STOP` writes → `dppi_subscribe`;
-   `PUBLISH_*` writes set per-event channel; state transitions
-   latch matching `EVENTS_*` and route through DPPI.
-3. **EasyDMA frame transfer** (PACKETPTR + radio_medium TX
-   listener + RX byte injection).
-4. **FFSM filter, CRC, auto-ACK** — exactly mirror the nrf52840
-   model's behaviour at different register offsets.
-5. **Multinode harness wiring** for `test_mixed_multinode.c`.
-
-This is real multi-commit work and not a one-shot.
+**Where the firmware parks now**: the boot path is complete.  The
+Contiki main process is alive, the radio process is alive, but no
+real radio TX/RX happens because **RADIO is not modelled yet** —
+all reads of `0x4008_A000` return 0, all writes are dropped.  The
+radio driver runs its config registers into the void without
+asserting.  Next step: bring up a real RADIO model so frames
+actually traverse the simulated medium.
 
 The Contiki-NG nrf54l15 port (`arch/cpu/nrf/nrf54l15/` +
 `arch/platform/nrf/nrf54l15/dk/`) merged recently — author has
