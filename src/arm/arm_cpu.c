@@ -694,10 +694,76 @@ static int handle_rom_trap(arm_cpu_t *cpu) {
 
 /* --- Main execution loop --- */
 
+/* ============================================================
+ * Single-step instruction trace facility.
+ *
+ * Disabled by default (zero perf hit — one bool check per step).
+ * Enable with ARM_TRACE_PC=1.  Optional filters:
+ *   ARM_TRACE_FROM=<cycle>   start cycle (default 0)
+ *   ARM_TRACE_TO=<cycle>     end cycle (default INT64_MAX)
+ *   ARM_TRACE_MAX=<count>    max lines (default 5000)
+ *   ARM_TRACE_NODE=<sram>    only trace cpu whose sram_base hash
+ *                            matches the low 32 bits of this value;
+ *                            otherwise trace all nodes
+ *
+ * Each line: PC, SP, LR, r0-r3, xPSR for one executed instruction.
+ * Designed to be cross-referenced with `arm-none-eabi-objdump -d
+ * <firmware> --start-address=<pc> --stop-address=<pc+8>`.
+ * ============================================================ */
+static int   arm_trace_state = -1;   /* -1 = not yet probed */
+static int64_t arm_trace_from = 0;
+static int64_t arm_trace_to   = INT64_MAX;
+static int   arm_trace_max    = 5000;
+static int   arm_trace_node   = 0;   /* 0 = any */
+static int   arm_trace_count  = 0;
+
+static void arm_trace_probe(void) {
+    const char *v = getenv("ARM_TRACE_PC");
+    arm_trace_state = (v && *v && *v != '0') ? 1 : 0;
+    if (!arm_trace_state) return;
+    const char *f = getenv("ARM_TRACE_FROM");
+    const char *t = getenv("ARM_TRACE_TO");
+    const char *m = getenv("ARM_TRACE_MAX");
+    const char *n = getenv("ARM_TRACE_NODE");
+    if (f) arm_trace_from = strtoll(f, NULL, 0);
+    if (t) arm_trace_to   = strtoll(t, NULL, 0);
+    if (m) arm_trace_max  = atoi(m);
+    if (n) arm_trace_node = (int)strtoul(n, NULL, 0);
+    fprintf(stderr, "[arm_trace ON from=%lld to=%lld max=%d node=0x%x]\n",
+            (long long)arm_trace_from, (long long)arm_trace_to,
+            arm_trace_max, arm_trace_node);
+}
+
+static inline void arm_trace_step(arm_cpu_t *cpu) {
+    if (__builtin_expect(arm_trace_state == 0, 1)) return;
+    if (arm_trace_state < 0) {
+        arm_trace_probe();
+        if (!arm_trace_state) return;
+    }
+    if (cpu->cycles < arm_trace_from || cpu->cycles > arm_trace_to) return;
+    /* Node filter: low 16 bits of cpu pointer give an unstable but
+     * unique-enough per-instance ID.  User picks a value that matches
+     * the node they want to trace by trial and error, or 0 for all. */
+    if (arm_trace_node) {
+        int node_tag = (int)((uintptr_t)cpu & 0xFFFF);
+        if (node_tag != (arm_trace_node & 0xFFFF)) return;
+    }
+    if (arm_trace_count >= arm_trace_max) return;
+    arm_trace_count++;
+    fprintf(stderr,
+            "[t#%d cyc=%lld pc=0x%08x sp=0x%08x lr=0x%08x "
+            "r0=%08x r1=%08x r2=%08x r3=%08x xpsr=%08x cpu=%p]\n",
+            arm_trace_count, (long long)cpu->cycles,
+            cpu->reg[15] & ~1u, cpu->reg[13], cpu->reg[14],
+            cpu->reg[0], cpu->reg[1], cpu->reg[2], cpu->reg[3],
+            cpu->xpsr, (void*)cpu);
+}
+
 int arm_step(arm_cpu_t *cpu, int count) {
     int remaining = count;
 
     while (remaining > 0 && !cpu->stopping) {
+        arm_trace_step(cpu);
         /* GDB stub: check breakpoint at current PC, then poll for halt
          * commands. If halted, stop the inner loop so the multinode
          * driver can pump the stub's command processor. */
@@ -1578,7 +1644,47 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 int W = (hw1 >> 5) & 1;
                 int L = (hw1 >> 4) & 1;
 
-                if ((hw2 & 0xFFE0) == 0xF000) {
+                if (U == 1 && (hw2 & 0x0FC0) == 0x0FC0) {
+                    /* ARMv8-M LDAEX{B,H} / STLEX{B,H} family — load-acquire
+                     * / store-release exclusive.  Encoding T1:
+                     *
+                     *   hw1 1110 1000 110L Rn   (L=1 load, L=0 store)
+                     *   hw2 Rt 1111 110S 1111   (LDAEX{B/H},
+                     *                            S=00 byte, 01 halfword, 10 word)
+                     *   hw2 Rt 1111 110S Rd     (STLEX{B/H} — Rd at bits 3:0)
+                     *
+                     * The U bit (hw1[7]) distinguishes the acquire/release
+                     * variants from plain LDREX/STREX (U=0).  hw2[5:4] selects
+                     * byte (00), halfword (01), or word (10) — the discriminator
+                     * is the `0x0FC0` mask matching the high half of the hw2
+                     * low byte at positions [11:6] = 0xFC, with [5:4] varying.
+                     *
+                     * Used by Nordic's nrf_802154 atomic ops via
+                     * `nrfx_atomic_u32_fetch_*` (word variant).  Byte/halfword
+                     * variants haven't shown up in nrf54l15 firmware yet but
+                     * are cheap to support.
+                     *
+                     * No exclusive-monitor model — single-CPU simulation,
+                     * the store always succeeds (returns Rd = 0). */
+                    int sz = (hw2 >> 4) & 0x3;   /* 00=B, 01=H, 10=W */
+                    uint32_t addr = cpu->reg[rn];
+                    if (L) {
+                        switch (sz) {
+                            case 0:  cpu->reg[rt] = mem_read8(cpu, addr);  break;
+                            case 1:  cpu->reg[rt] = mem_read16(cpu, addr); break;
+                            default: cpu->reg[rt] = mem_read32(cpu, addr); break;
+                        }
+                    } else {
+                        int rd = hw2 & 0xF;
+                        switch (sz) {
+                            case 0:  mem_write8 (cpu, addr, cpu->reg[rt] & 0xFF);   break;
+                            case 1:  mem_write16(cpu, addr, cpu->reg[rt] & 0xFFFF); break;
+                            default: mem_write32(cpu, addr, cpu->reg[rt]);          break;
+                        }
+                        cpu->reg[rd] = 0;
+                    }
+                    cpu->cycles += 2;
+                } else if ((hw2 & 0xFFE0) == 0xF000) {
                     /* TBB / TBH (Table Branch Byte / Halfword) */
                     int H = (hw2 >> 4) & 1;
                     int rm = hw2 & 0xF;
@@ -1598,14 +1704,27 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     uint32_t addr = U ? base + imm8 : base - imm8;
                     cpu->reg[rt]  = mem_read32(cpu, addr);
                     cpu->reg[rt2] = mem_read32(cpu, addr + 4);
-                } else if (op2_2 == 0 && !P && !U && !L) {
-                    /* STREX (only when P=0, U=0) */
+                } else if (!P && !U && !L && (hw2 & 0x0F00) != 0x0F00) {
+                    /* STREX T1: hw1 = 1110_1000_0100_Rn, hw2 = Rt_Rd_imm8.
+                     * Distinguished from LDRD/STRD by hw1 bit 8 = 0.
+                     * Distinguished from LDREX by L = 0. */
                     int rd = (hw2 >> 8) & 0xF;
                     uint32_t addr = cpu->reg[rn] + imm8;
                     mem_write32(cpu, addr, cpu->reg[rt]);
                     cpu->reg[rd] = 0; /* Always succeed */
-                } else if (op2_2 == 0 && !P && !U && L) {
-                    /* LDREX (only when P=0, U=0) */
+                } else if (!P && !U && L && (hw2 & 0x0F00) == 0x0F00) {
+                    /* LDREX T1: hw1 = 1110_1000_0101_Rn, hw2 = Rt_1111_imm8.
+                     * Distinguished from LDRD/STRD by hw1 bit 8 = 0
+                     * (bit 8 set → LDRD/LDREXB/LDREXH branches).
+                     * hw2[11:8] == 0xF means no Rt2 register.
+                     *
+                     * The old decode used op2_2 == 0, but op2_2 = hw1[5:4]
+                     * is 0b01 for LDREX (L=1), so the check always failed
+                     * and we fell through to LDRD — which then loaded
+                     * mem[rn+4] into rt2 = hw2[11:8] = 0xF = PC.  Nordic
+                     * nrf_802154 uses LDREX in nrfx_atomic_u32_fetch_*;
+                     * that LDRD-misdecode wrote a stale stack value into
+                     * PC, sending the firmware into BSS data. */
                     uint32_t addr = cpu->reg[rn] + imm8;
                     cpu->reg[rt] = mem_read32(cpu, addr);
                 } else {
@@ -1877,31 +1996,37 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 } else if ((op_imm & 0x1A) == 0x0A) {
                     /* SUBW Rd, Rn, #imm12 */
                     cpu->reg[rd] = cpu->reg[rn] - imm12;
-                } else if ((op_imm & 0x1C) == 0x10) {
-                    /* SSAT - saturate signed (simplified) */
-                    cpu->reg[rd] = cpu->reg[rn]; /* Simplified */
-                } else if ((op_imm & 0x1C) == 0x14) {
-                    /* SBFX */
+                } else if ((op_imm & 0x1E) == 0x10) {
+                    /* SSAT / SSAT16 — saturate signed (simplified). op=0x10,0x12. */
+                    cpu->reg[rd] = cpu->reg[rn];
+                } else if (op_imm == 0x14) {
+                    /* SBFX — signed bit field extract. Encoding T1: op=10100. */
                     int lsb = imm3 * 4 + ((hw2 >> 6) & 3);
                     int widthm1 = hw2 & 0x1F;
                     int32_t val = (int32_t)(cpu->reg[rn] << (31 - lsb - widthm1));
                     cpu->reg[rd] = (uint32_t)(val >> (31 - widthm1));
-                } else if ((op_imm & 0x1C) == 0x18) {
-                    /* BFI / BFC */
+                } else if (op_imm == 0x16) {
+                    /* BFI / BFC — bit field insert (Rn != PC) / clear (Rn == PC).
+                     * Encoding T1: op=10110.  Must be matched exactly — the
+                     * earlier `(op_imm & 0x1C) == 0x18` form misrouted BFI
+                     * (op=0x16, which `& 0x1C` gives 0x14) into the SBFX path,
+                     * silently corrupting any 5-bit bitfield write (e.g.
+                     * `uint8_t channel : 5` in nrf_802154's PIB struct). */
                     int lsb = imm3 * 4 + ((hw2 >> 6) & 3);
                     int msb = hw2 & 0x1F;
                     int width = msb - lsb + 1;
                     uint32_t mask = ((1u << width) - 1) << lsb;
                     if (rn == 0xF) {
-                        /* BFC: clear bit field */
                         cpu->reg[rd] &= ~mask;
                     } else {
-                        /* BFI: insert bit field */
                         cpu->reg[rd] = (cpu->reg[rd] & ~mask) |
                                        ((cpu->reg[rn] << lsb) & mask);
                     }
-                } else if ((op_imm & 0x1C) == 0x1C) {
-                    /* UBFX */
+                } else if ((op_imm & 0x1E) == 0x18) {
+                    /* USAT / USAT16 — saturate unsigned (simplified). op=0x18,0x1A. */
+                    cpu->reg[rd] = cpu->reg[rn];
+                } else if (op_imm == 0x1C) {
+                    /* UBFX — unsigned bit field extract. */
                     int lsb = imm3 * 4 + ((hw2 >> 6) & 3);
                     int widthm1 = hw2 & 0x1F;
                     cpu->reg[rd] = (cpu->reg[rn] >> lsb) & ((1u << (widthm1 + 1)) - 1);

@@ -575,23 +575,6 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
                     NRF54L_UARTE20_BASE, NRF54L_UARTE20_SIZE,
                     nrf54l_uarte_read, nrf54l_uarte_write, &soc->uarte20);
 
-    /* DPPI fabric — single 32-channel state aliased by all four
-     * DPPIC base addresses (DPPIC00/10/20/30).  Subscribers register
-     * via nrf54l_dppi_subscribe(); publishers call nrf54l_dppi_publish().
-     * No state to initialise — channels start disabled, subs list empty. */
-    for (size_t i = 0; i < sizeof(nrf54l_dppic_bases) / sizeof(nrf54l_dppic_bases[0]); i++) {
-        arm_register_io(&plat->cpu,
-                        nrf54l_dppic_bases[i], NRF54L_DPPIC_SIZE,
-                        nrf54l_dppic_read, nrf54l_dppic_write, &soc->dppi);
-    }
-
-    /* GRTC — Contiki tick source + MPSL timeslot timer. */
-    soc->grtc.plat    = plat;
-    soc->grtc.dppi    = &soc->dppi;
-    soc->grtc.irq_num = NRF54L_GRTC_IRQ;
-    arm_register_io(&plat->cpu,
-                    NRF54L_GRTC_BASE, NRF54L_GRTC_SIZE,
-                    nrf54l_grtc_read, nrf54l_grtc_write, &soc->grtc);
 }
 
 static void nrf54l15_soc_destroy(arm_platform_t *plat) {
