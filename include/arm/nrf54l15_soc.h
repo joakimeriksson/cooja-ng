@@ -159,13 +159,131 @@ typedef struct nrf54l_grtc_state {
     int                  irq_num;        /* GRTC_2_IRQn = 228 */
 } nrf54l_grtc_state_t;
 
+/* RADIO at 0x5008_A000 — 2.4 GHz 802.15.4 transceiver.
+ *
+ * Register layout (per nrf54lv10a_enga_application.svd) is DRAMATICALLY
+ * different from nRF52840.  Key offset shifts:
+ *
+ *   nRF52840              nrf54l15
+ *   --------              --------
+ *   TASKS:    0x000+      TASKS:        0x000+
+ *   EVENTS:   0x100+      SUBSCRIBE:    0x100+
+ *   SHORTS:   0x200       EVENTS:       0x200+
+ *   INTENSET: 0x304       PUBLISH:      0x300+
+ *   PACKETPTR:0x504       SHORTS:       0x400
+ *   FREQUENCY:0x508       INTENSET00:   0x488
+ *   PCNF0:    0x514       INTENSET10:   0x4A8 (second IRQ line)
+ *   STATE:    0x550       MODE:         0x500, STATE: 0x520
+ *                         FREQUENCY:    0x708
+ *                         PCNF0:        0xE20
+ *                         PACKETPTR:    0xED0
+ *
+ * Plus nrf54l15 routes its task triggers via DPPI exclusively —
+ * Nordic's nrf_802154 driver doesn't write TASKS_TXEN directly.  Each
+ * SUBSCRIBE_<task> register binds a DPPI channel; when something
+ * publishes on that channel (typically GRTC compare or a previous
+ * RADIO event via PUBLISH_<event>), the corresponding task fires.
+ */
+#define NRF54L_RADIO_NUM_SUBSCRIBES 12   /* TXEN..CCASTOP, contiguous 4-byte slots */
+#define NRF54L_RADIO_NUM_PUBLISHES  24   /* READY..CTEPRESENT */
+
+typedef struct nrf54l_radio_state {
+    arm_platform_t      *plat;
+    nrf54l_dppi_state_t *dppi;
+    int                  irq_num_0;   /* RADIO_0 IRQn = 138 */
+    int                  irq_num_1;   /* RADIO_1 IRQn = 139 */
+
+    uint32_t state;                   /* 0=DISABLED, 2=RXIDLE, 3=RX, 10=TXIDLE, 11=TX */
+    uint32_t shorts;
+    uint32_t intenset00;
+    uint32_t intenset10;
+
+    /* Config — kept verbatim for read-back; only a few are interpreted. */
+    uint32_t mode, frequency, txpower, timing;
+    uint32_t pcnf0, pcnf1, crccnf, crcpoly, crcinit;
+    uint32_t txaddress, rxaddresses;
+    uint32_t bcc;                     /* bit-counter compare (in bits, not bytes) */
+    uint32_t packetptr;
+
+    /* SUBSCRIBE channels (one per task slot 0..11, value 0 = disabled, else
+     * 0x80000000 | channel_id).  We also track the bound channel
+     * separately so we can unsubscribe before re-subscribing. */
+    uint32_t subscribe[NRF54L_RADIO_NUM_SUBSCRIBES];
+    int      sub_channel[NRF54L_RADIO_NUM_SUBSCRIBES];   /* -1 = unbound */
+
+    /* PUBLISH channels (one per event slot 0..23). */
+    uint32_t publish[NRF54L_RADIO_NUM_PUBLISHES];
+
+    /* Latched events.  Each evt_<x> is 1 after the event fires until
+     * firmware writes 0 to the corresponding offset. */
+    uint32_t evt_ready, evt_txready, evt_rxready;
+    uint32_t evt_address, evt_framestart, evt_payload;
+    uint32_t evt_end,    evt_phyend,    evt_disabled;
+    uint32_t evt_devmatch, evt_devmiss;
+    uint32_t evt_crcok,  evt_crcerror, evt_bcmatch;
+    uint32_t evt_edend,  evt_edstopped;
+    uint32_t evt_ccaidle, evt_ccabusy, evt_ccastopped;
+    uint32_t evt_rateboost, evt_mhrmatch, evt_sync;
+    uint32_t evt_ctepresent;
+
+    /* RX byte-stream parser state. */
+    int rx_phase;
+    int rx_remaining;
+    int rx_offset;
+
+    /* TX byte listener — installed by the multinode harness. */
+    void (*tx_cb)(void *user, uint8_t byte);
+    void  *tx_user;
+} nrf54l_radio_state_t;
+
+/* EGU (Event Generator Unit) — 16-channel software-triggerable
+ * event source.  nrf_802154 uses it as the "kick" point for the
+ * ramp-up DPPI chain: CPU writes TASKS_TRIGGER[n] → EVENTS_TRIGGERED[n]
+ * fires → PUBLISH_TRIGGERED[n] publishes on its bound channel →
+ * RADIO.SUBSCRIBE_RXEN (or TXEN) is gated on that channel → state
+ * machine starts.
+ *
+ * One csim model instance covers all four EGU bases (00/10/20/30);
+ * they share the global DPPI fabric like everything else.
+ */
+#define NRF54L_EGU_NUM_CHANNELS 16
+
+typedef struct nrf54l_egu_state {
+    arm_platform_t      *plat;
+    nrf54l_dppi_state_t *dppi;
+    uint32_t             events[NRF54L_EGU_NUM_CHANNELS];
+    uint32_t             publish[NRF54L_EGU_NUM_CHANNELS];
+    uint32_t             subscribe[NRF54L_EGU_NUM_CHANNELS];
+    int                  sub_channel[NRF54L_EGU_NUM_CHANNELS];
+    uint32_t             inten;
+    int                  irq_num;
+} nrf54l_egu_state_t;
+
 typedef struct nrf54l15_soc {
     nrf54l_global_clock_state_t global_clock;
     nrf54l_uarte_state_t        uarte20;
     nrf54l_grtc_state_t         grtc;
     nrf54l_dppi_state_t         dppi;
+    nrf54l_radio_state_t        radio;
+    /* Three EGU instances at 0x5001_5000 (EGU00), 0x5008_7000 (EGU10),
+     * 0x500C_7000 (EGU20).  Channel allocation across instances is
+     * domain-local on real HW; csim collapses to the global DPPI. */
+    nrf54l_egu_state_t          egu00;
+    nrf54l_egu_state_t          egu10;
+    nrf54l_egu_state_t          egu20;
     arm_platform_t             *plat;
 } nrf54l15_soc_t;
+
+/* nrf54l15 RADIO STATE enum (from SVD). */
+#define NRF54L_RADIO_STATE_DISABLED   0
+#define NRF54L_RADIO_STATE_RXRU       1
+#define NRF54L_RADIO_STATE_RXIDLE     2
+#define NRF54L_RADIO_STATE_RX         3
+#define NRF54L_RADIO_STATE_RXDISABLE  4
+#define NRF54L_RADIO_STATE_TXRU       9
+#define NRF54L_RADIO_STATE_TXIDLE     10
+#define NRF54L_RADIO_STATE_TX         11
+#define NRF54L_RADIO_STATE_TXDISABLE  12
 
 /* Public DPPI API for other peripherals to wire publish/subscribe. */
 void nrf54l_dppi_subscribe(nrf54l_dppi_state_t *d, int channel,
@@ -173,6 +291,13 @@ void nrf54l_dppi_subscribe(nrf54l_dppi_state_t *d, int channel,
 void nrf54l_dppi_unsubscribe(nrf54l_dppi_state_t *d, int channel,
                              nrf54l_dppi_sub_cb cb, void *user);
 void nrf54l_dppi_publish(nrf54l_dppi_state_t *d, int channel);
+
+/* Public radio hooks for the multinode harness. */
+typedef void (*nrf54l_radio_tx_listener_t)(void *user, uint8_t byte);
+void nrf54l_radio_set_tx_listener(nrf54l15_soc_t *soc,
+                                   nrf54l_radio_tx_listener_t cb, void *user);
+void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte);
+
 
 extern const arm_soc_ops_t nrf54l15_soc_ops;
 
