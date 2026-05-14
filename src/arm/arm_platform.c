@@ -10,6 +10,7 @@
 #include "arm_elf.h"
 #include "cc2538_soc.h"
 #include "nrf52840_soc.h"
+#include "nrf54l15_soc.h"
 #include <ctype.h>
 #include <string.h>
 
@@ -99,12 +100,38 @@ static const arm_platform_config_t platform_nrf52840_dk = {
     .vtor_override = 0,                                              /* VTOR = flash_base = 0x0 */
 };
 
+/* Nordic nRF54L15 Development Kit (PCA10156, TARGET=nrf TARGET_BOARD=dk
+ * with the nrf54l15 SoC in the Contiki-NG port). Cortex-M33, no
+ * bootloader region → vector table at flash base (VTOR = 0).
+ *   LED1..4   = P2.9 / P1.10 / P2.7 / P1.14
+ *   BUTTON1..4 = P1.13 / P1.9 / P1.8 / P0.4
+ *   Console  = UARTE20 (P1.4 TX / P1.5 RX) via SEGGER JLink VCP
+ *
+ * The peripheral set here is intentionally minimal — GLOBAL_CLOCK
+ * only — and grows as L0–L6 progress. LED/button wiring is recorded
+ * for future GPIO-output-callback fan-out; the underlying GPIO
+ * peripheral isn't modelled yet. */
+static const arm_platform_config_t platform_nrf54l15_dk = {
+    .name          = "nrf54l15-dk",
+    .soc           = &nrf54l15_config,
+    .soc_ops       = &nrf54l15_soc_ops,
+    .console_uart  = 0,
+    .leds = {
+        { .port = 2, .pin = 9,  .active_low = true },   /* LED1 P2.9  */
+        { .port = 1, .pin = 10, .active_low = true },   /* LED2 P1.10 */
+        { .port = 2, .pin = 7,  .active_low = true },   /* LED3 P2.7  */
+    },
+    .button        = { .port = 1, .pin = 13, .active_low = true },  /* BUTTON1 P1.13 */
+    .vtor_override = 0,
+};
+
 static const arm_platform_config_t *all_arm_platforms[] = {
     &platform_cc2538dk,
     &platform_openmote,
     &platform_zoul_firefly,
     &platform_nrf52840_dongle,
     &platform_nrf52840_dk,
+    &platform_nrf54l15_dk,
     NULL
 };
 
