@@ -81,13 +81,103 @@ through libc init, nrfx setup, GRTC start, and into `main()`.
   6. **`main()` reached** — firmware enters the Contiki main loop and
      attempts to printf the boot banner.
 
-**Where the firmware parks now**: the boot path is complete.  The
-Contiki main process is alive, the radio process is alive, but no
-real radio TX/RX happens because **RADIO is not modelled yet** —
-all reads of `0x4008_A000` return 0, all writes are dropped.  The
-radio driver runs its config registers into the void without
-asserting.  Next step: bring up a real RADIO model so frames
-actually traverse the simulated medium.
+**Where the firmware parks now**: boot path is fully complete; the
+Contiki main process is alive, the radio process is alive, but
+nothing on-air happens.  The radio init writes ~127 RADIO config
+registers at `0x5008_A000`, configures DPPI subscriptions
+(`*[0x104] = 0x80000017` — channel 23 subscribing to RADIO event
+4), then **waits for DPPI channels to publish events**.  No
+`TASKS_TXEN` / `TASKS_RXEN` ever fires.
+
+### Address aliasing — the 0x5xxx window
+
+Contiki's nrf54l15 build addresses every peripheral via the
+**`0x5xxx_xxxx` alias**, NOT the `0x4xxx_xxxx` non-secure base
+that the SVD lists first.  Confirmed by literal-pool dumps of the
+firmware:
+
+| Peripheral        | csim base       | SVD "_NS"       | SVD "_S"        |
+| ----------------- | --------------- | --------------- | --------------- |
+| GLOBAL_CLOCK      | `0x5010_E000`   | `0x4010_E000`   | `0x5010_E000`   |
+| UARTE20           | `0x500C_6000`   | `0x400C_6000`   | `0x500C_6000`   |
+| GRTC              | `0x500E_2000`   | `0x400E_2000`   | `0x500E_2000`   |
+| RADIO             | `0x5008_A000`   | `0x4008_A000`   | `0x5008_A000`   |
+
+Every new peripheral added to this port must use the 0x5xxx base.
+
+### Why RADIO needs DPPI before it engages
+
+Nordic's `nrf_802154` driver is built around the **DPPI** fabric:
+peripheral A *publishes* an event on a DPPI channel, peripheral B
+*subscribes* that channel to one of its tasks.  The actual radio
+ramp-up / TX kick is driven by GRTC compare → DPPI channel →
+`TASKS_TXEN`, **never by the CPU writing the task register
+directly**.
+
+That's why even with the GRTC modelled and ticks firing, RADIO
+sees no new task triggers: the GRTC compare event has nowhere to
+go without a DPPI channel routing it.
+
+**DPPI fabric is now in place** (collapsed to one 32-channel global
+state aliased across DPPIC00/10/20/30 at `0x5004_2000`, `0x5008_2000`,
+`0x500C_2000`, `0x5010_2000`).  Confirmed via instrumented run:
+udp-server's boot path writes `CHENSET=0x000045f8` and
+`CHENSET=0x00800000` to DPPIC10 — enabling channels 3..8, 10, 14,
+plus channel 23 which RADIO subscribed to via `SUBSCRIBE_RXEN`.
+
+GRTC compare-fire now publishes on its configured channel via
+`PUBLISH_COMPARE[n]` (bit 31 = EN, bits 4..0 = channel id) →
+`nrf54l_dppi_publish`.  No publishes log yet because MPSL only
+programs `PUBLISH_COMPARE` when an active radio operation is
+requested, and that's gated on a RADIO model existing.
+
+Subscribers (e.g. future RADIO SUBSCRIBE_TXEN/_RXEN) register via
+`nrf54l_dppi_subscribe(soc->dppi, channel, callback, user)`.
+
+### Order of work for real RX/TX
+
+1. ~~**DPPI**~~ ✅ — fabric with publish/subscribe.
+2. ~~**RADIO**~~ ✅ — state machine + EasyDMA + DPPI integration.
+3. ~~**EGU**~~ ✅ — software-trigger source for the DPPI fabric.
+   Discovered while tracing: Nordic's nrf_802154 driver uses
+   EGU10.TASKS_TRIGGER[n] → EGU10.PUBLISH_TRIGGERED[n] → DPPI ch →
+   RADIO.SUBSCRIBE_RXEN as its "kick" point for radio ramp-up.
+4. ~~**Multinode harness wiring**~~ ✅ — `.nrf54l15-dk` extension
+   detection, TX listener install, byte delivery to
+   `nrf54l_radio_receive_byte`.
+5. ⚠️  **Tick rate** — much improved, but still blocked.  Multiple
+   GRTC modelling bugs fixed this iteration, in order of how badly
+   they broke things:
+
+   - **`CPSIE i` / `MSR PRIMASK` didn't re-evaluate pending IRQs.**
+     A bug in the Thumb-2 interpreter, not GRTC: when PRIMASK
+     cleared, our interpreter set the flag but never called
+     `arm_nvic_check_pending`, so any IRQ that pended during a
+     critical section stayed deferred forever (until the next
+     unrelated `set_pending`).  Fixed in src/arm/arm_cpu.c.
+   - **Contiki reads SYSCOUNTER[2] (application core), not [0].**
+     The cluster is at offset 0x720 with 4 entries (one per CPU
+     view) of stride 0x10.  Our model only handled offset 0x724
+     (SYSCOUNTER[0].H).  Contiki reads 0x744 (SYSCOUNTER[2].H).
+     Now collapses all 4 entries onto the same logical counter.
+   - **SYSCOUNTERH.LOADED is bit 29, not bit 31.**  Setting bit
+     31 (OVERFLOW) instead made nrfx think the counter overflowed
+     every read.
+   - **GRTC INTPEND2 not modelled.**  The dispatcher at
+     `GRTC_2_IRQHandler` reads `INTPEND2` (offset 0x32C) to find
+     which CC fired.  Returning 0 made the dispatcher exit
+     without calling the user handler; returning the correct
+     pending&enabled bitmap fixes dispatch.
+
+   Despite all these fixes, the IRQ handler **still does not
+   re-arm the CC after the first tick** — `nrfx_grtc_syscounter_cc_relative_set`
+   apparently still returns an error.  Likely some nrfx-internal
+   SRAM state we don't initialise (channel allocator bitmap,
+   active-flag bookkeeping, etc.).  Next session: instrument
+   the actual return value of nrfx_grtc_syscounter_cc_relative_set
+   to see which error branch it takes.
+
+Once tick rate is fully fixed, RPL-UDP should work end-to-end.
 
 The Contiki-NG nrf54l15 port (`arch/cpu/nrf/nrf54l15/` +
 `arch/platform/nrf/nrf54l15/dk/`) merged recently — author has
@@ -244,13 +334,17 @@ state" above. Outcome:
   - **First peripheral known**: GLOBAL_CLOCK at `0x5010e000`, polling
     `EVENTS_HFXOSTARTED` at offset `0x100`.
 
-**Next commit unit**: RADIO state machine + EasyDMA frame transfer.
-With DPPI in place, `SUBSCRIBE_TXEN/RXEN` writes from the
-nrf_802154 driver can now route to a real state machine in the
-model, and `PUBLISH_*` writes from RADIO events can drive
-auto-ACK / inter-frame timing through the DPPI fabric.
+**Next commit unit**: fix the GRTC compare-fire interval so
+Contiki etimers actually fire fast enough for RPL Trickle.  The
+RADIO model is in place and gets TASKS_RXEN triggered correctly
+via the EGU → DPPI chain, so once etimers advance at the expected
+~128 Hz, the netstack should start TXing DIO packets and the
+medium delivery + auto-ACK paths take over.
 
-The 802.15.4 driver lives in
-`arch/cpu/nrf/lib/sdk-nrfxlib/nrf_802154/` — that's the canonical
-reference for which radio registers must be accepted, what
-semantics they need, and which DPPI channels the driver assigns.
+Diagnosis hint: the symptom is `[grtc compare[6] fired]` at 7 ms,
+406 ms, 800 ms, 1195 ms (~395 ms intervals on 2 nodes; ~200 ms
+per node).  CCADD=7813 should produce ~7.8 ms intervals.  Either
+the sim_time_ns at the IRQ handler's re-arm point has drifted
+forward (multinode time-coordination issue), or the
+`arm_schedule_event_ns` event-queue path is clamping minimum
+delay.

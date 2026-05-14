@@ -1424,10 +1424,18 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     break;
                 }
                 case 0x6: { /* CPS (CPSIE/CPSID) */
-                    if (hw1 & (1 << 4))
+                    if (hw1 & (1 << 4)) {
                         cpu->primask = 1; /* CPSID i */
-                    else
+                    } else {
                         cpu->primask = 0; /* CPSIE i */
+                        /* Re-evaluate any IRQs that pended while PRIMASK was 1.
+                         * Without this, an IRQ that pends during a critical
+                         * section is deferred until the next set_pending call
+                         * — for the nrf54l15 GRTC tick that meant ~390 ms
+                         * between handler runs instead of ~7.8 ms. */
+                        if (cpu->nvic && ((arm_nvic_t *)cpu->nvic)->has_pending)
+                            arm_nvic_check_pending((arm_nvic_t *)cpu->nvic);
+                    }
                     break;
                 }
                 case 0xA: { /* REV, REV16, REVSH */
@@ -2114,7 +2122,15 @@ int arm_step(arm_cpu_t *cpu, int count) {
                                 break;
                             case 8: cpu->msp = val; cpu->reg[ARM_SP] = val; break;
                             case 9: cpu->psp = val; break;
-                            case 16: cpu->primask = val & 1; break;
+                            case 16:
+                                cpu->primask = val & 1;
+                                /* Like CPSIE i above — when PRIMASK clears,
+                                 * re-evaluate pending IRQs that may have been
+                                 * deferred during the critical section. */
+                                if (cpu->primask == 0 && cpu->nvic &&
+                                    ((arm_nvic_t *)cpu->nvic)->has_pending)
+                                    arm_nvic_check_pending((arm_nvic_t *)cpu->nvic);
+                                break;
                             case 17: cpu->basepri = val & 0xFF; break;
                             case 19: cpu->faultmask = val & 1; break;
                             case 20: /* CONTROL */

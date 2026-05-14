@@ -63,7 +63,8 @@ int main(int argc, char **argv) {
         printf("MSP430 modes: correctness, bench, firmware, multinode\n");
         printf("ARM modes:    arm-correctness, arm-firmware, arm-multinode,\n");
         printf("              zoul-firefly-multinode,\n");
-        printf("              nrf52840-dongle-multinode, nrf52840-dk-multinode\n");
+        printf("              nrf52840-dongle-multinode, nrf52840-dk-multinode,\n");
+        printf("              nrf54l15-dk-multinode\n");
         printf("Mixed:        mixed-multinode\n");
         printf("Chip drivers: cc1200-mock-host\n");
         printf("Radio medium: radio-medium\n");
@@ -176,6 +177,37 @@ int main(int argc, char **argv) {
      * 2-nodes convenience as the Firefly wrapper so the SPEC's example
      * commands match the binary verbatim. */
     if (strcmp(mode, "nrf52840-dongle-multinode") == 0) {
+        int extra_argc = argc - 2;
+        char **extra_argv = argv + 2;
+        int has_n = 0;
+        int firmware_count = 0;
+        for (int i = 0; i < extra_argc; i++) {
+            if ((strcmp(extra_argv[i], "-t") == 0 ||
+                 strcmp(extra_argv[i], "-n") == 0 ||
+                 strcmp(extra_argv[i], "--threads") == 0) &&
+                i + 1 < extra_argc) {
+                if (strcmp(extra_argv[i], "-n") == 0) has_n = 1;
+                i++;
+            } else if (extra_argv[i][0] != '-') {
+                firmware_count++;
+            }
+        }
+        if (!has_n && firmware_count == 1) {
+            int new_argc = extra_argc + 2;
+            char **new_argv = malloc((new_argc + 1) * sizeof(char *));
+            for (int i = 0; i < extra_argc; i++) new_argv[i] = extra_argv[i];
+            new_argv[extra_argc]     = (char *)"-n";
+            new_argv[extra_argc + 1] = (char *)"2";
+            new_argv[new_argc] = NULL;
+            failures += run_mixed_multinode_test(new_argc, new_argv);
+            free(new_argv);
+        } else {
+            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+        }
+    }
+
+    /* Nordic nRF54L15 Development Kit (PCA10156) multinode wrapper. */
+    if (strcmp(mode, "nrf54l15-dk-multinode") == 0) {
         int extra_argc = argc - 2;
         char **extra_argv = argv + 2;
         int has_n = 0;

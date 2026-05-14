@@ -19,6 +19,7 @@
 #include "arm_platform.h"
 #include "cc2538_soc.h"
 #include "nrf52840_soc.h"
+#include "nrf54l15_soc.h"
 #include "arm_systick.h"
 #include "arm_elf.h"
 #include "native_node.h"
@@ -831,8 +832,9 @@ static int emulated_rxfifo_available(int idx) {
     if (nodes[idx].type == NODE_MSP430)
         return 128 - nodes[idx].plat.msp.cc2420.rx_fifo_len;
     else if (nodes[idx].type == NODE_ARM) {
-        cc2538_soc_t   *cc_soc  = arm_platform_cc2538(&nodes[idx].plat.arm);
-        nrf52840_soc_t *nrf_soc = arm_platform_nrf52840(&nodes[idx].plat.arm);
+        cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&nodes[idx].plat.arm);
+        nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&nodes[idx].plat.arm);
+        nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&nodes[idx].plat.arm);
         if (cc_soc) {
             cc2538_rfcore_t *rf = &cc_soc->rfcore;
             int avail = RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
@@ -843,10 +845,10 @@ static int emulated_rxfifo_available(int idx) {
             }
             return avail;
         }
-        if (nrf_soc) {
-            /* nRF EasyDMA writes directly to PACKETPTR-pointed RAM; no
-             * shared fixed-size FIFO. Treat as always-available — the
-             * receive parser drops bytes when not in RX state. */
+        if (nrf_soc || nrfl_soc) {
+            /* Both nRF chips use EasyDMA — no shared fixed-size FIFO,
+             * just a PACKETPTR-pointed RAM buffer. The receive parser
+             * drops bytes when not in RX state. */
             return 128;
         }
     }
@@ -1096,24 +1098,22 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
          * arrive on the chip its NETSTACK_RADIO points at. */
         const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
         bool has_cc1200 = pcfg && pcfg->has_cc1200;
-        cc2538_soc_t   *cc_soc  = arm_platform_cc2538(&nodes[idx].plat.arm);
-        nrf52840_soc_t *nrf_soc = arm_platform_nrf52840(&nodes[idx].plat.arm);
+        cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&nodes[idx].plat.arm);
+        nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&nodes[idx].plat.arm);
+        nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&nodes[idx].plat.arm);
         if (cc_soc) {
             cc_soc->rfcore.rx_rssi = rssi;
             if (has_cc1200) cc_soc->cc1200.rx_rssi = rssi;
         }
         int64_t last_byte_ns = air_time_ns;
         if (idx == ticking_node_idx) {
-            /* Deliver in place — we're already inside this node's tick,
-             * so full sync would recurse.  Drop bytes straight into the
-             * RF Core; the current tick's remaining budget lets the CPU
-             * process them before returning to the scheduler. */
             for (int j = 0; j < len; j++) {
                 if (cc_soc) {
                     cc2538_rfcore_receive_byte(&cc_soc->rfcore, data[j]);
                     if (has_cc1200) cc1200_receive_byte(&cc_soc->cc1200, data[j]);
                 }
-                if (nrf_soc) nrf_radio_receive_byte(nrf_soc, data[j]);
+                if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, data[j]);
+                if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, data[j]);
             }
         } else {
             for (int j = 0; j < len; j++) {
@@ -1133,7 +1133,8 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
                     cc2538_rfcore_receive_byte(&cc_soc->rfcore, data[j]);
                     if (has_cc1200) cc1200_receive_byte(&cc_soc->cc1200, data[j]);
                 }
-                if (nrf_soc) nrf_radio_receive_byte(nrf_soc, data[j]);
+                if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, data[j]);
+                if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, data[j]);
                 last_byte_ns = byte_time_ns;
             }
         }
@@ -2683,6 +2684,9 @@ static node_type_t detect_node_type(const char *path) {
         return NODE_ARM;
     if (dot && strcmp(dot, ".nrf52840-dk") == 0)
         return NODE_ARM;
+    /* Nordic nRF54L15 (Development Kit PCA10156). */
+    if (dot && strcmp(dot, ".nrf54l15-dk") == 0)
+        return NODE_ARM;
     if (dot && strcmp(dot, ".cooja") == 0)
         return NODE_NATIVE;
     if (dot && strcmp(dot, ".js") == 0)
@@ -2906,6 +2910,8 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         plat_name = "nrf52840-dongle";
     else if (dot && strcmp(dot, ".nrf52840-dk") == 0)
         plat_name = "nrf52840-dk";
+    else if (dot && strcmp(dot, ".nrf54l15-dk") == 0)
+        plat_name = "nrf54l15-dk";
 
     const arm_platform_config_t *pcfg = arm_platform_find(plat_name);
     if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }
@@ -2921,8 +2927,9 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     plat->host.radio_user_data  = node;
     plat->host.radio_set_channel = mixed_host_radio_set_channel;
 
-    cc2538_soc_t  *cc_soc  = arm_platform_cc2538(plat);
-    nrf52840_soc_t *nrf_soc = arm_platform_nrf52840(plat);
+    cc2538_soc_t   *cc_soc   = arm_platform_cc2538(plat);
+    nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(plat);
+    nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(plat);
 
     if (cc_soc) {
         /* CC2538-class platform (cc2538dk / openmote / zoul-firefly). */
@@ -2992,6 +2999,20 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
             printf("  Node %d [nrf52840]: ficr=%08x:%08x prng=%08x\n",
                    node_id, nrf_soc->ficr.deviceaddr1, nrf_soc->ficr.deviceaddr0,
                    nrf_soc->rng.prng_state);
+    } else if (nrfl_soc) {
+        /* nRF54L15 (DK).  Single on-die 2.4 GHz radio, slot 0.  TX
+         * bytes flow out through the radio listener; RX bytes flow in
+         * via nrf54l_radio_receive_byte (see mixed_deliver_rf_bytes). */
+        rf_ctx_slot0[idx].node_idx  = idx;
+        rf_ctx_slot0[idx].radio_idx = 0;
+        nrf54l_radio_set_tx_listener(nrfl_soc, mixed_rf_tx_chip_cb,
+                                      &rf_ctx_slot0[idx]);
+
+        /* Contiki nrf54l15 patches `linkaddr_node_addr` per node (handled
+         * below at the generic la_addr patching path), so no equivalent
+         * of FICR.DEVICEADDR seeding is needed here. */
+        if (verbose)
+            printf("  Node %d [nrf54l15]: TX listener installed\n", node_id);
     }
 
     arm_cpu_reset(&plat->cpu);
