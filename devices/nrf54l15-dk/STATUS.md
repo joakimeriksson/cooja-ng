@@ -348,3 +348,121 @@ the sim_time_ns at the IRQ handler's re-arm point has drifted
 forward (multinode time-coordination issue), or the
 `arm_schedule_event_ns` event-queue path is clamping minimum
 delay.
+
+## HW validation 2026-05-15 — ground-truth from real PCA10156 + PCA10059
+
+Paired-hardware run on a real **nRF54L15-DK (PCA10156, SN 1057753281)**
++ **nRF52840-Dongle (PCA10059)**, flashed with the *exact* csim ELFs
+from `firmware/nrf54l15-dk/udp-server.nrf54l15-dk` and
+`firmware/nrf52840-dongle/udp-client.nrf52840-dongle`:
+
+- The firmware **interoperates end-to-end on real hardware** — DAG
+  forms, UDP round-trips work, `[INFO: App] Received request 'hello N'
+  from fd00::f6ce:3669:7f15:52cd` cycles at the dongle's
+  `SEND_INTERVAL = 10 * CLOCK_SECOND = 10 wall-clock seconds`.
+- So the csim "0 RF bytes in 60 s sim time" blocker is **purely an
+  emulator GRTC issue**, not a firmware issue. Fixing csim's GRTC is
+  necessary and sufficient.
+
+To get a wall-clock-anchored tick-rate baseline, an instrumented
+`udp-server-instr.nrf54l15-dk` (see `firmware/nrf54l15-dk/PROVENANCE.md`)
+prints a `[T]` line per `etimer_set(CLOCK_SECOND)`. Reference real-HW
+output:
+
+```
+[CFG] RTIMER_SECOND=62500 CLOCK_SECOND=128 boot_rt=2462743845
+[T] uptime=1s clock_time=136 rtimer_now=2463749547 rt_delta=1005704
+[T] uptime=2s clock_time=264 rtimer_now=2464754832 rt_delta=2010989
+[INFO: App      ] Received request 'hello 226' from fd00::f6ce:3669:7f15:52cd
+[T] uptime=3s clock_time=392 rtimer_now=2465760178 rt_delta=3016334
+...
+[T] uptime=33s clock_time=4232 rtimer_now=2495913217 rt_delta=33169373
+```
+
+Three confirmations from this:
+
+1. **GRTC syscounter ticks at 1 MHz on real HW.**
+   `rt_delta` grows by ~1,005,300 per `[T]` line. The firmware's
+   `clock-arch.c:34` declares `GRTC_TICK_FREQUENCY_HZ = 1_000_000UL`
+   and `nrfx_grtc_syscounter_get()` returns the raw GRTC SYSCOUNTER
+   — so 1,005,000 ticks per CLOCK_SECOND of firmware time matches
+   1 MHz exactly.
+2. **etimer is correctly calibrated on real HW.**
+   `clock-arch.c:133` sets `tick_interval_us = 1_000_000 / 128 = 7813`
+   and schedules each etimer tick via
+   `nrfx_grtc_syscounter_cc_relative_set(channel, 7813, …,
+   NRFX_GRTC_CC_RELATIVE_SYSCOUNTER)`. The dongle emits 3 hello
+   cycles in 30 uptime-seconds with `SEND_INTERVAL = 10 s` —
+   confirming **uptime-seconds = wall-clock seconds**.
+3. **There is also a separate upstream Contiki bug** (orthogonal to
+   csim): `arch/cpu/nrf/nrf-def.h:82` declares
+   `RTIMER_ARCH_SECOND = 62500` (legacy nrf52840 TIMER value), but
+   `arch/cpu/nrf/nrf54l15/rtimer-arch.c:74-77` returns the raw 1 MHz
+   GRTC SYSCOUNTER → rtimer is 16× too fast in wall-clock. Affects
+   CSMA ACK_WAIT_TIME, TSCH slot timing, `RTIMER_BUSYWAIT_UNTIL`
+   loops. Doesn't break simple RPL-UDP because that path is
+   etimer-driven. **Not a blocker for csim work — file as a separate
+   upstream PR.**
+
+## Next concrete step (post-HW)
+
+The csim GRTC model already declares the right SYSCOUNTER rate
+(`NRF54L_GRTC_TICK_NS = 1000`, src/arm/nrf54l15_soc.c:355) and arms
+CC events at `cpu.sim_time_ns + ccadd * 1000` ns (line 381–383). The
+~395 ms-vs-7.8 ms discrepancy is **the same pattern as the cc2538
+sleeptimer bug** documented in CLAUDE.md "Key Bug Fixes": `sim_time_ns`
+is only updated at the END of `arm_step` / `arm_step_until` (per
+"sim_time_ns sync points"), so when the firmware re-arms inside the
+GRTC IRQ handler, `nrf54l_grtc_arm_cc()` reads a *stale*
+`cpu.sim_time_ns` (frozen at the start of the current step).
+
+In a 2-node multinode harness with ~200 ms steps:
+
+1. Step N begins; `sim_time_ns` snapshot = `S`.
+2. Inside the step, GRTC compare event fires (due from a previous
+   re-arm). CPU jumps to `GRTC_2_IRQHandler` → nrfx → Contiki
+   `clock_update()` → `schedule_next_tick()` →
+   `nrfx_grtc_syscounter_cc_relative_set(7813)` → csim
+   `nrf54l_grtc_arm_cc()`.
+3. `nrf54l_grtc_arm_cc()` computes `fire_ns = cpu.sim_time_ns +
+   7813 * 1000 = S + 7.813 ms`.
+4. Step ends; `sim_time_ns` rolls forward to `S + 200 ms`.
+5. The event scheduled at `S + 7.813 ms` is now overdue. The next
+   step processes it immediately at `S + 200 ms`. The firmware
+   re-arms again at `S + 200 ms + 7.813 ms ≈ S + 207.8 ms` — but
+   from the stale view, so the next compare lands at `S + 400 ms`,
+   then `600 ms`, etc.
+
+**Fix (same as cc2538_sleeptimer)**: in `nrf54l_grtc_arm_cc()`
+(src/arm/nrf54l15_soc.c:368), compute the *live* "now" from CPU
+cycles rather than reading the stale `cpu.sim_time_ns`. Existing
+helper: `arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz)`. The CC
+event's `fire_ns` should be `live_now_ns + ccadd * 1000`. The same
+correction should be applied wherever csim's GRTC-side code uses
+`cpu.sim_time_ns` to compute a *future* time inside a step
+(currently `nrf54l_grtc_arm_cc()` and `grtc_counter_now()` —
+double-check the latter since it's used to compute SYSCOUNTER reads
+during firmware execution).
+
+### Validation plan
+
+1. Build csim (host has GNU Lightning auto-detected; macOS build also
+   works for this firmware-validation purpose).
+2. Run the instrumented firmware solo:
+   `./build/test_runner nrf54l15-dk-multinode firmware/nrf54l15-dk/udp-server-instr.nrf54l15-dk -t 35000 -n 1 -v`
+3. Pre-fix pass criteria:
+   - Capture the actual sim-time interval between successive
+     `[grtc compare … fired]` log lines. **STATUS.md observed
+     ~395 ms; expected 7.813 ms; drift factor ≈ 50×** (note: 25× is
+     the STATUS.md figure for the radio-side symptom; the raw GRTC
+     interval is closer to 50× because of the two-node alternation —
+     either way the magnitude is consistent with one-step-of-staleness
+     per re-arm).
+4. Post-fix pass criteria:
+   - `[T] uptime=Ns` lines appear at ~1 s sim_time intervals.
+   - `rt_delta` grows by ~1,000,000 per `[T]` line (matches 1 MHz
+     SYSCOUNTER).
+   - `Received request 'hello N'` cycles at ~10 s sim_time intervals
+     (this needs the udp-client emulated peer — multinode harness
+     wiring already validated per "Order of work" item 4).
+5. Cross-check against the reference real-HW log captured above.
