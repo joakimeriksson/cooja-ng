@@ -199,11 +199,11 @@ void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
         return;
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) {
-        uint32_t off = addr - cpu->flash_base;
-        cpu->flash[off]   = val & 0xFF;
-        cpu->flash[off+1] = (val >> 8) & 0xFF;
-        cpu->flash[off+2] = (val >> 16) & 0xFF;
-        cpu->flash[off+3] = (val >> 24) & 0xFF;
+        /* Flash is treated as read-only.  Real nrf MCUs require an
+         * NVMC/RRAMC unlock before flash writes; csim doesn't model
+         * the flash controller, and stray writes through wild pointers
+         * (r3=0 in an early-boot ISR) would otherwise corrupt the
+         * firmware image and cause unrecoverable PC jumps. */
         return;
     }
     if (cpu->rom && addr < cpu->rom_size) return; /* ROM is read-only */
@@ -231,12 +231,7 @@ void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
         cpu->sram[off+1] = (val >> 8) & 0xFF;
         return;
     }
-    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
-        uint32_t off = addr - cpu->flash_base;
-        cpu->flash[off]   = val & 0xFF;
-        cpu->flash[off+1] = (val >> 8) & 0xFF;
-        return;
-    }
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) r->write(r->user_data, addr, val);
 }
@@ -247,10 +242,7 @@ void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
         cpu->sram[off] = val;
         return;
     }
-    if (addr >= cpu->flash_base && addr < cpu->flash_end) {
-        cpu->flash[addr - cpu->flash_base] = val;
-        return;
-    }
+    if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) r->write(r->user_data, addr, val);
 }
@@ -604,6 +596,85 @@ static inline uint32_t thumb_expand_imm_c(uint16_t imm12, int *carry_out, int ca
     return ror_c(val, rot, carry_out);
 }
 
+/* --- SP-balance auditor (ARM_SP_AUDIT) ---
+ * On every BL/BLX, push (return_pc, sp_before_call, callee_pc, in_exc).
+ * On every step, if PC matches the top entry's return_pc, pop and report
+ * SP delta if non-zero — the callee returned with SP unbalanced.
+ *
+ * Cheap to leave compiled in; the per-call env-var check is cached on
+ * first hit so the hot-path overhead is one inlined branch when the
+ * diagnostic is off.
+ */
+static int arm_sp_audit_enabled = -1;
+static const char *arm_bl_probe_str;
+
+static void arm_audit_probe_env(void) {
+    arm_sp_audit_enabled = getenv("ARM_SP_AUDIT") ? 1 : 0;
+    arm_bl_probe_str = getenv("ARM_BL_PROBE");
+}
+
+static inline void arm_sp_audit_push(arm_cpu_t *cpu, uint32_t return_pc,
+                                       uint32_t callee_pc) {
+    if (__builtin_expect(arm_sp_audit_enabled < 0, 0)) arm_audit_probe_env();
+    /* ARM_BL_PROBE=<callee_pc>:<sram_addr> — when bl jumps to <callee_pc>,
+     * dump byte at <sram_addr>.  Lets us watch a state variable just
+     * before a function reads it. */
+    if (__builtin_expect(arm_bl_probe_str != NULL, 0)) {
+        const char *e = arm_bl_probe_str;
+        const char *colon = strchr(e, ':');
+        if (colon) {
+            uint32_t want_callee = (uint32_t)strtoul(e, NULL, 0) & ~1u;
+            uint32_t addr = (uint32_t)strtoul(colon + 1, NULL, 0);
+            if ((callee_pc & ~1u) == want_callee &&
+                addr >= cpu->sram_base && addr + 1 <= cpu->sram_end) {
+                static int n = 0;
+                if (n++ < 30) {
+                    uint8_t v = cpu->sram[addr - cpu->sram_base];
+                    fprintf(stderr,
+                            "[BL_PROBE cpu=%p callee=0x%08x mem[0x%08x]=0x%02x "
+                            "sp=0x%08x lr=0x%08x cyc=%lld]\n",
+                            (void*)cpu, callee_pc & ~1u, addr, v,
+                            cpu->reg[ARM_SP], cpu->reg[ARM_LR],
+                            (long long)cpu->cycles);
+                }
+            }
+        }
+    }
+    if (__builtin_expect(!arm_sp_audit_enabled, 1)) return;
+    if (cpu->sp_audit_top >= ARM_SP_AUDIT_DEPTH) {
+        cpu->sp_audit_overflow++;
+        return;
+    }
+    int i = cpu->sp_audit_top++;
+    cpu->sp_audit[i].return_pc    = return_pc & ~1u;
+    cpu->sp_audit[i].saved_sp     = cpu->reg[ARM_SP];
+    cpu->sp_audit[i].callee_pc    = callee_pc & ~1u;
+    cpu->sp_audit[i].in_exception = (cpu->xpsr & 0x1FF) != 0 ? 1 : 0;
+}
+
+static inline void arm_sp_audit_check(arm_cpu_t *cpu) {
+    if (__builtin_expect(arm_sp_audit_enabled <= 0, 1)) return;
+    while (cpu->sp_audit_top > 0) {
+        int i = cpu->sp_audit_top - 1;
+        uint32_t pc = cpu->reg[ARM_PC] & ~1u;
+        if (pc != cpu->sp_audit[i].return_pc) return;
+        uint32_t expected_sp = cpu->sp_audit[i].saved_sp;
+        uint32_t actual_sp = cpu->reg[ARM_SP];
+        if (expected_sp != actual_sp) {
+            static int n = 0;
+            if (n++ < 30)
+                fprintf(stderr,
+                        "[SP_AUDIT cpu=%p callee=0x%08x return_pc=0x%08x "
+                        "saved_sp=0x%08x sp_now=0x%08x delta=%d cyc=%lld]\n",
+                        (void*)cpu, cpu->sp_audit[i].callee_pc,
+                        cpu->sp_audit[i].return_pc,
+                        expected_sp, actual_sp, (int)(actual_sp - expected_sp),
+                        (long long)cpu->cycles);
+        }
+        cpu->sp_audit_top--;
+    }
+}
+
 /* --- ROM utility trap handler --- */
 static int handle_fw_trap(arm_cpu_t *cpu) {
     uint32_t pc = cpu->reg[ARM_PC];
@@ -810,6 +881,27 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         uint32_t pc = cpu->reg[ARM_PC];
 
+        arm_sp_audit_check(cpu);
+
+        /* Wild-jump detector: catch the first time PC lands in SRAM
+         * (anywhere code shouldn't be executing — XN region on real HW
+         * faults).  One-shot per-CPU; dump enough register state to
+         * reverse-engineer which prior instruction redirected PC.
+         * Enabled via ARM_WILD_TRAP. */
+        if (getenv("ARM_WILD_TRAP") && pc >= cpu->sram_base && pc < cpu->sram_end) {
+            if (!cpu->wild_trapped) {
+                cpu->wild_trapped = 1;
+                fprintf(stderr,
+                        "[WILD JUMP cpu=%p cyc=%lld pc=0x%08x sp=0x%08x lr=0x%08x "
+                        "r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x "
+                        "r8=%08x r9=%08x r10=%08x r11=%08x r12=%08x xpsr=%08x]\n",
+                        (void*)cpu, (long long)cpu->cycles, pc, cpu->reg[ARM_SP], cpu->reg[ARM_LR],
+                        cpu->reg[0], cpu->reg[1], cpu->reg[2], cpu->reg[3],
+                        cpu->reg[4], cpu->reg[5], cpu->reg[6], cpu->reg[7],
+                        cpu->reg[8], cpu->reg[9], cpu->reg[10], cpu->reg[11], cpu->reg[12],
+                        cpu->xpsr);
+            }
+        }
 
         /* ROM utility traps */
         if (handle_fw_trap(cpu)) {
@@ -1191,6 +1283,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (hw1 & (1 << 7)) {
                             /* BLX Rm */
                             cpu->reg[ARM_LR] = (cpu->reg[ARM_PC]) | 1;
+                            arm_sp_audit_push(cpu, cpu->reg[ARM_PC], cpu->reg[m]);
                             cpu->reg[ARM_PC] = cpu->reg[m] & ~1u;
                         } else {
                             /* BX Rm */
@@ -2074,6 +2167,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     if (S) offset |= (int32_t)0xFE000000;
                     cpu->reg[ARM_LR] = (pc + 4) | 1;
                     cpu->reg[ARM_PC] = pc + 4 + offset;
+                    arm_sp_audit_push(cpu, pc + 4, cpu->reg[ARM_PC]);
                 } else if ((op2_br & 5) == 1) {
                     /* B.W — unconditional branch */
                     int S = (hw1 >> 10) & 1;
@@ -2563,6 +2657,28 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         cpu->instructions++;
         remaining--;
+
+        /* LR-write trap: dump the instruction that set LR to a target
+         * value.  Useful for tracing where bogus return addresses come
+         * from when chasing wild-PC bugs.  Set ARM_LR_WATCH=<value>
+         * (e.g. 0x20003bb9) — checks against `value` and `value^1`
+         * (with/without thumb bit).  One-shot per-CPU. */
+        if (getenv("ARM_LR_WATCH") && !cpu->lr_trapped) {
+            uint32_t want = (uint32_t)strtoul(getenv("ARM_LR_WATCH"), NULL, 0);
+            uint32_t lr = cpu->reg[ARM_LR];
+            if (lr == want || lr == (want ^ 1u)) {
+                cpu->lr_trapped = 1;
+                fprintf(stderr,
+                        "[LR_WATCH cpu=%p cyc=%lld src_pc=0x%08x lr=0x%08x sp=0x%08x "
+                        "r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x "
+                        "r8=%08x r9=%08x r10=%08x r11=%08x r12=%08x next_pc=0x%08x]\n",
+                        (void*)cpu, (long long)cpu->cycles, pc, lr, cpu->reg[ARM_SP],
+                        cpu->reg[0], cpu->reg[1], cpu->reg[2], cpu->reg[3],
+                        cpu->reg[4], cpu->reg[5], cpu->reg[6], cpu->reg[7],
+                        cpu->reg[8], cpu->reg[9], cpu->reg[10], cpu->reg[11], cpu->reg[12],
+                        cpu->reg[ARM_PC]);
+            }
+        }
 
         /* PC trace callback */
         if (cpu->pc_callback)
