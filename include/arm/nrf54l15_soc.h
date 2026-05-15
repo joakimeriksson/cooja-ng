@@ -142,7 +142,10 @@ typedef struct nrf54l_grtc_cc {
     uint32_t cch;
     uint32_t ccadd;
     uint32_t ccen;
-    void    *event;       /* cpu_event_t* — null if not armed */
+    void    *event;        /* cpu_event_t* — null if not armed */
+    int64_t  scheduled_ns; /* absolute fire_ns of the currently armed event;
+                            * used to anchor RELATIVE_COMPARE re-arms (CCADD
+                            * bit 31 == 0). 0 = no prior fire reference. */
 } nrf54l_grtc_cc_t;
 
 typedef struct nrf54l_grtc_state {
