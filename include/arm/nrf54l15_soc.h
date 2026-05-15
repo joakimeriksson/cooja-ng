@@ -259,6 +259,36 @@ typedef struct nrf54l_egu_state {
     int                  irq_num;
 } nrf54l_egu_state_t;
 
+/* TIMER (instances TIMER00/10/20/21/22/23/24).  Up to 6 CC channels.
+ * Backing model: 32-bit counter at 16 MHz / 2^PRESCALER, derived from
+ * sim_time_ns when needed.  Compare events fire from the CPU event queue. */
+#define NRF54L_TIMER_NUM_CC  6
+typedef struct nrf54l_timer_state {
+    arm_platform_t      *plat;
+    nrf54l_dppi_state_t *dppi;
+    uint32_t             cc[NRF54L_TIMER_NUM_CC];
+    uint32_t             events_compare[NRF54L_TIMER_NUM_CC];
+    uint32_t             publish_compare[NRF54L_TIMER_NUM_CC];
+    uint32_t             subscribe_capture[NRF54L_TIMER_NUM_CC];
+    int                  sub_capture_ch[NRF54L_TIMER_NUM_CC];
+    uint32_t             subscribe_start;
+    uint32_t             subscribe_stop;
+    uint32_t             subscribe_count;
+    uint32_t             subscribe_clear;
+    uint32_t             shorts;
+    uint32_t             inten;
+    uint32_t             mode;
+    uint32_t             bitmode;          /* 0=16, 1=8, 2=24, 3=32 */
+    uint32_t             prescaler;        /* counter clock = 16 MHz >> prescaler */
+    uint32_t             counter;          /* used in Counter mode */
+    int64_t              t0_ns;            /* sim_time_ns when started/cleared */
+    uint32_t             snapshot;         /* counter at last stop */
+    bool                 running;
+    int                  irq_num;
+    arm_event_t          ev_compare[NRF54L_TIMER_NUM_CC];
+    uint32_t             base_addr;        /* for IO routing */
+} nrf54l_timer_state_t;
+
 typedef struct nrf54l15_soc {
     nrf54l_global_clock_state_t global_clock;
     nrf54l_uarte_state_t        uarte20;
@@ -271,6 +301,10 @@ typedef struct nrf54l15_soc {
     nrf54l_egu_state_t          egu00;
     nrf54l_egu_state_t          egu10;
     nrf54l_egu_state_t          egu20;
+    /* TIMER instances.  TIMER10/20 are the ones used by the nrf_802154
+     * lptimer backend. */
+    nrf54l_timer_state_t        timer10;
+    nrf54l_timer_state_t        timer20;
     arm_platform_t             *plat;
 } nrf54l15_soc_t;
 
