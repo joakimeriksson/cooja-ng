@@ -168,9 +168,9 @@ static void nrf54l_uarte_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF54L_UARTE_TASKS_DMA_TX_START:
             /* Kick TX: stream MAXCNT bytes from SRAM at PTR through the
              * console callback, then latch both EVENTS_DMA.TX.END and
-             * EVENTS_TXSTOPPED (because firmware programs
-             * SHORTS_ENDTX_STOPTX → STOPTX fires on END). */
-            if (value == 1 && u->plat) {
+             * EVENTS_TXSTOPPED.  Trigger on any bit-0 write; nrfx
+             * sometimes writes non-1 values (e.g. flag bits via fp). */
+            if ((value & 1) && u->plat) {
                 for (uint32_t i = 0; i < u->tx_maxcnt; i++) {
                     uint8_t b = arm_read8(&u->plat->cpu, u->tx_ptr + i);
                     if (u->tx_cb) u->tx_cb(u->tx_user, b);
@@ -183,7 +183,7 @@ static void nrf54l_uarte_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF54L_UARTE_TASKS_DMA_TX_STOP:
             /* Defensive STOP after START.  Latch TXSTOPPED so a
              * stop-then-poll firmware path also escapes its loop. */
-            if (value == 1) u->evt_txstopped = 1;
+            if (value & 1) u->evt_txstopped = 1;
             break;
         case NRF54L_UARTE_EVENTS_TXSTOPPED:   u->evt_txstopped  = value & 1; break;
         case NRF54L_UARTE_EVENTS_DMA_TX_END:  u->evt_dma_tx_end = value & 1; break;
@@ -790,15 +790,35 @@ static void nrf54l_egu_write(void *user_data, uint32_t addr, uint32_t value) {
 #define R_CRCSTATUS                    0xE0C
 #define R_RXMATCH                      0xE10
 
-/* INTENSET bit positions (per the SVD field ordering — bits are
- * assigned in event-list order starting at bit 0). */
+/* INTENSET bit positions per the SVD.  Note bit 13 is reserved
+ * (intentional gap), so BCMATCH is at bit 14 — confirmed against
+ * nrf54l15_application.svd.  Get this wrong and BCMATCH interrupts
+ * never fire (and the bit-13 EDEND would fire spuriously). */
 enum {
-    INT_READY = 0,    INT_TXREADY,  INT_RXREADY,  INT_ADDRESS,
-    INT_FRAMESTART,   INT_PAYLOAD,  INT_END,      INT_PHYEND,
-    INT_DISABLED,     INT_DEVMATCH, INT_DEVMISS,  INT_CRCOK,
-    INT_CRCERROR,     INT_BCMATCH,  INT_EDEND,    INT_EDSTOPPED,
-    INT_CCAIDLE,      INT_CCABUSY,  INT_CCASTOPPED,
-    INT_RATEBOOST,    INT_MHRMATCH, INT_SYNC,     INT_CTEPRESENT,
+    INT_READY      = 0,
+    INT_TXREADY    = 1,
+    INT_RXREADY    = 2,
+    INT_ADDRESS    = 3,
+    INT_FRAMESTART = 4,
+    INT_PAYLOAD    = 5,
+    INT_END        = 6,
+    INT_PHYEND     = 7,
+    INT_DISABLED   = 8,
+    INT_DEVMATCH   = 9,
+    INT_DEVMISS    = 10,
+    INT_CRCOK      = 11,
+    INT_CRCERROR   = 12,
+    /* bit 13 reserved */
+    INT_BCMATCH    = 14,
+    INT_EDEND      = 15,
+    INT_EDSTOPPED  = 16,
+    INT_CCAIDLE    = 17,
+    INT_CCABUSY    = 18,
+    INT_CCASTOPPED = 19,
+    INT_RATEBOOST  = 20,
+    INT_MHRMATCH   = 21,
+    INT_SYNC       = 26,
+    INT_CTEPRESENT = 27,
 };
 
 /* PUBLISH index ↔ event mapping.  Both clusters are indexed by the
@@ -882,17 +902,102 @@ static uint16_t nrf54l_crc_add(uint16_t crc, uint8_t data) {
     return n & 0xffff;
 }
 
+/* NRF54L_RADIO_TRACE=1 — driver-level trace of radio activity (state
+ * transitions, tasks, events, IRQs).  Cached on first call.  Optionally
+ * filter by node tag (low 16 bits of cpu pointer) via NRF54L_RADIO_NODE. */
+static int nrf54l_radio_trace_enabled = -1;
+static uint32_t nrf54l_radio_trace_node = 0;
+static void nrf54l_radio_trace_probe(void) {
+    const char *e = getenv("NRF54L_RADIO_TRACE");
+    nrf54l_radio_trace_enabled = (e && *e && *e != '0') ? 1 : 0;
+    const char *n = getenv("NRF54L_RADIO_NODE");
+    if (n) nrf54l_radio_trace_node = (uint32_t)strtoul(n, NULL, 0);
+}
+static inline int nrf54l_radio_trace_active(nrf54l_radio_state_t *r) {
+    if (nrf54l_radio_trace_enabled < 0) nrf54l_radio_trace_probe();
+    if (!nrf54l_radio_trace_enabled) return 0;
+    if (nrf54l_radio_trace_node) {
+        uint32_t tag = (uint32_t)((uintptr_t)&r->plat->cpu & 0xFFFF);
+        if (tag != nrf54l_radio_trace_node) return 0;
+    }
+    return 1;
+}
+static const char *nrf54l_radio_state_name(uint32_t s) {
+    switch (s) {
+        case NRF54L_RADIO_STATE_DISABLED:  return "DISABLED";
+        case NRF54L_RADIO_STATE_RXRU:      return "RXRU";
+        case NRF54L_RADIO_STATE_RXIDLE:    return "RXIDLE";
+        case NRF54L_RADIO_STATE_RX:        return "RX";
+        case NRF54L_RADIO_STATE_RXDISABLE: return "RXDISABLE";
+        case NRF54L_RADIO_STATE_TXRU:      return "TXRU";
+        case NRF54L_RADIO_STATE_TXIDLE:    return "TXIDLE";
+        case NRF54L_RADIO_STATE_TX:        return "TX";
+        case NRF54L_RADIO_STATE_TXDISABLE: return "TXDISABLE";
+        default:                            return "?";
+    }
+}
+static const char *nrf54l_radio_event_name(int int_bit) {
+    switch (int_bit) {
+        case INT_READY:      return "READY";
+        case INT_TXREADY:    return "TXREADY";
+        case INT_RXREADY:    return "RXREADY";
+        case INT_ADDRESS:    return "ADDRESS";
+        case INT_FRAMESTART: return "FRAMESTART";
+        case INT_PAYLOAD:    return "PAYLOAD";
+        case INT_END:        return "END";
+        case INT_PHYEND:     return "PHYEND";
+        case INT_DISABLED:   return "DISABLED";
+        case INT_DEVMATCH:   return "DEVMATCH";
+        case INT_DEVMISS:    return "DEVMISS";
+        case INT_CRCOK:      return "CRCOK";
+        case INT_CRCERROR:   return "CRCERROR";
+        case INT_BCMATCH:    return "BCMATCH";
+        case INT_EDEND:      return "EDEND";
+        case INT_CCAIDLE:    return "CCAIDLE";
+        case INT_CCABUSY:    return "CCABUSY";
+        default:              return "?";
+    }
+}
+static const char *nrf54l_radio_task_name(uint32_t off) {
+    switch (off) {
+        case R_TASKS_TXEN:      return "TXEN";
+        case R_TASKS_RXEN:      return "RXEN";
+        case R_TASKS_START:     return "START";
+        case R_TASKS_STOP:      return "STOP";
+        case R_TASKS_DISABLE:   return "DISABLE";
+        case R_TASKS_RSSISTART: return "RSSISTART";
+        case R_TASKS_BCSTART:   return "BCSTART";
+        case R_TASKS_BCSTOP:    return "BCSTOP";
+        case R_TASKS_CCASTART:  return "CCASTART";
+        default:                 return "?";
+    }
+}
+
 /* Fire an event: latch the bit, raise IRQs whose INTENSET matches, and
  * publish on the configured DPPI channel.  `pub_idx` is the PUBLISH
  * cluster index (PUB_READY..PUB_CTEPRESENT). */
 static void nrf54l_radio_fire_event(nrf54l_radio_state_t *r,
                                      uint32_t *evt, int int_bit, int pub_idx) {
     *evt = 1;
-    if (r->intenset00 & (1u << int_bit))
+    int irq_raised = 0;
+    if (r->intenset00 & (1u << int_bit)) {
         arm_nvic_set_pending(&r->plat->nvic, r->irq_num_0);
-    if (r->intenset10 & (1u << int_bit))
+        irq_raised |= 1;
+    }
+    if (r->intenset10 & (1u << int_bit)) {
         arm_nvic_set_pending(&r->plat->nvic, r->irq_num_1);
+        irq_raised |= 2;
+    }
     nrf54l_radio_publish_event(r, pub_idx);
+    if (nrf54l_radio_trace_active(r)) {
+        uint32_t pub = (pub_idx >= 0 && pub_idx < NRF54L_RADIO_NUM_PUBLISHES)
+                       ? r->publish[pub_idx] : 0;
+        fprintf(stderr, "[radio cpu=0x%04x cyc=%lld EVENT %-10s irq=%d pub=0x%x state=%s]\n",
+                (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                (long long)r->plat->cpu.cycles,
+                nrf54l_radio_event_name(int_bit), irq_raised, pub,
+                nrf54l_radio_state_name(r->state));
+    }
 }
 
 static void nrf54l_radio_publish_event(nrf54l_radio_state_t *r, int pub_idx) {
@@ -928,6 +1033,13 @@ static void nrf54l_radio_apply_shorts(nrf54l_radio_state_t *r, uint32_t after_ev
 }
 
 static void nrf54l_radio_set_state(nrf54l_radio_state_t *r, uint32_t new_state) {
+    if (nrf54l_radio_trace_active(r) && new_state != r->state) {
+        fprintf(stderr, "[radio cpu=0x%04x cyc=%lld STATE  %-10s -> %s]\n",
+                (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                (long long)r->plat->cpu.cycles,
+                nrf54l_radio_state_name(r->state),
+                nrf54l_radio_state_name(new_state));
+    }
     r->state = new_state;
     switch (new_state) {
         case NRF54L_RADIO_STATE_RXIDLE:
@@ -960,21 +1072,12 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
     static int depth = 0;
     if (depth >= 8) return;
     depth++;
-    if (getenv("NRF54L_RADIO_TASK_TRACE")) {
-        static int n = 0;
-        if (n++ < 100) {
-            const char *name = "?";
-            switch (task_off) {
-                case R_TASKS_TXEN: name = "TXEN"; break;
-                case R_TASKS_RXEN: name = "RXEN"; break;
-                case R_TASKS_START: name = "START"; break;
-                case R_TASKS_STOP: name = "STOP"; break;
-                case R_TASKS_DISABLE: name = "DISABLE"; break;
-                case R_TASKS_CCASTART: name = "CCASTART"; break;
-            }
-            fprintf(stderr, "[radio task %s state=%u cyc=%lld]\n",
-                    name, r->state, (long long)r->plat->cpu.cycles);
-        }
+    if (nrf54l_radio_trace_active(r)) {
+        fprintf(stderr, "[radio cpu=0x%04x cyc=%lld TASK   %-10s state=%s]\n",
+                (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                (long long)r->plat->cpu.cycles,
+                nrf54l_radio_task_name(task_off),
+                nrf54l_radio_state_name(r->state));
     }
     switch (task_off) {
         case R_TASKS_TXEN:
@@ -1097,6 +1200,16 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
             arm_write8(cpu, r->packetptr + (uint32_t)r->rx_offset, byte);
             r->rx_offset++;
             r->rx_remaining--;
+            /* BCMATCH fires when BCC bits have been received.  BCC is in
+             * bits and the Nordic 802154 driver programs successive
+             * milestones (e.g. PHR + FCF + DST + ...) to inspect headers
+             * as bytes arrive.  Total bits received = rx_offset * 8. */
+            if (r->bcc != 0 && (uint32_t)(r->rx_offset * 8) >= r->bcc) {
+                /* Clear bcc so we only fire once per milestone — driver
+                 * re-arms BCC in the ISR. */
+                r->bcc = 0;
+                nrf54l_radio_fire_event(r, &r->evt_bcmatch, INT_BCMATCH, PUB_BCMATCH);
+            }
             if (r->rx_remaining == 0) {
                 nrf54l_radio_fire_event(r, &r->evt_payload,  INT_PAYLOAD,  PUB_PAYLOAD);
                 nrf54l_radio_fire_event(r, &r->evt_end,      INT_END,      PUB_END);
@@ -1275,6 +1388,320 @@ static void nrf54l_radio_write(void *user_data, uint32_t addr, uint32_t value) {
         default: return;
     }
 }
+/* ============================================================
+ * TIMER (TIMER00/10/20/21/22/23/24)
+ *
+ * Minimal model targeting the nrf_802154 lptimer backend, which uses
+ * TIMER20 at 1 MHz in Timer mode and reads CC[0] via TASKS_CAPTURE[0].
+ * We back the counter with sim_time_ns; compare matches schedule a CPU
+ * event that fires EVENTS_COMPARE[n], optionally publishing on DPPI.
+ *
+ * Register layout (from SVD, derived from GLOBAL_TIMER00_NS):
+ *   0x000 TASKS_START   0x004 STOP   0x008 COUNT   0x00C CLEAR
+ *   0x040+4n  TASKS_CAPTURE[n]
+ *   0x080+4n  SUBSCRIBE_<START/STOP/COUNT/CLEAR>
+ *   0x0C0+4n  SUBSCRIBE_CAPTURE[n]
+ *   0x140+4n  EVENTS_COMPARE[n]
+ *   0x1C0+4n  PUBLISH_COMPARE[n]
+ *   0x200     SHORTS
+ *   0x300/304/308  INTEN/INTENSET/INTENCLR
+ *   0x504 MODE   0x508 BITMODE   0x510 PRESCALER
+ *   0x540+4n  CC[n]
+ * ============================================================ */
+#define NRF54L_TIMER10_BASE  0x50085000u
+#define NRF54L_TIMER20_BASE  0x500CA000u
+#define NRF54L_TIMER_SIZE    0x1000u
+
+/* IRQ numbers from SVD interrupts blocks (nrf54l15_application.svd). */
+#define NRF54L_TIMER10_IRQ   133
+#define NRF54L_TIMER20_IRQ   164
+
+/* Base TIMER clock on nrf54l15 is 16 MHz; PRESCALER divides by 2^PRESCALER. */
+#define NRF54L_TIMER_BASE_HZ  16000000u
+
+static inline uint64_t nrf54l_timer_tick_ns(nrf54l_timer_state_t *t) {
+    uint32_t pres = t->prescaler & 0xF;
+    /* tick_ns = 1e9 / (16e6 / 2^pres) = (1<<pres) * 1000 / 16 */
+    return ((uint64_t)(1u << pres) * 1000u) / 16u;
+}
+
+static inline uint32_t nrf54l_timer_mask(nrf54l_timer_state_t *t) {
+    switch (t->bitmode & 3) {
+        case 0: return 0x0000FFFFu;  /* 16-bit */
+        case 1: return 0x000000FFu;  /* 8-bit  */
+        case 2: return 0x00FFFFFFu;  /* 24-bit */
+        default: return 0xFFFFFFFFu; /* 32-bit */
+    }
+}
+
+static uint32_t nrf54l_timer_counter_now(nrf54l_timer_state_t *t) {
+    if (!t->running) return t->snapshot & nrf54l_timer_mask(t);
+    int64_t now = t->plat->cpu.sim_time_ns;
+    uint64_t tn = nrf54l_timer_tick_ns(t);
+    if (tn == 0) return 0;
+    uint64_t ticks = (uint64_t)(now - t->t0_ns) / tn + t->snapshot;
+    return (uint32_t)(ticks & nrf54l_timer_mask(t));
+}
+
+static void nrf54l_timer_compare_fired(void *user, cpu_event_t *ev) {
+    (void)ev;
+    struct { nrf54l_timer_state_t *t; int n; } *ctx = user;
+    nrf54l_timer_state_t *t = ctx->t;
+    int n = ctx->n;
+    t->events_compare[n] = 1;
+    int irq_fired = (t->inten & (1u << (16 + n))) && t->irq_num >= 0;
+    if (irq_fired)
+        arm_nvic_set_pending(&t->plat->nvic, t->irq_num);
+    uint32_t pub = t->publish_compare[n];
+    int published = ((pub & 0x80000000u) && t->dppi);
+    if (published)
+        nrf54l_dppi_publish(t->dppi, (int)(pub & 0x1Fu));
+    if (getenv("NRF54L_TIMER_TRACE")) {
+        fprintf(stderr, "[timer cpu=0x%04x cyc=%lld base=0x%x CC[%d]=%u irq=%d pub=0x%x]\n",
+                (unsigned)((uintptr_t)&t->plat->cpu & 0xFFFF),
+                (long long)t->plat->cpu.cycles,
+                t->base_addr, n, t->cc[n], irq_fired, pub);
+    }
+    /* SHORTS: COMPARE_CLEAR (bit n), COMPARE_STOP (bit 8+n). */
+    if (t->shorts & (1u << n)) {
+        t->snapshot = 0;
+        t->t0_ns = t->plat->cpu.sim_time_ns;
+    }
+    if (t->shorts & (1u << (8 + n))) {
+        if (t->running) t->snapshot = nrf54l_timer_counter_now(t);
+        t->running = false;
+    }
+}
+
+/* Per-CC firing context lives in the event's user pointer. */
+static struct timer_cc_ctx { nrf54l_timer_state_t *t; int n; }
+    timer_cc_ctx[2 /* timers */][NRF54L_TIMER_NUM_CC];
+
+static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
+    arm_cancel_event(&t->plat->cpu, &t->ev_compare[n]);
+    if (!t->running) return;
+    /* Skip CCs that the firmware hasn't programmed (CC=0 with no INTEN
+     * and no PUBLISH wired up).  Spurious fires waste cycles and confuse
+     * the driver. */
+    bool inten   = (t->inten & (1u << (16 + n))) != 0;
+    bool publish = (t->publish_compare[n] & 0x80000000u) != 0;
+    bool shorts  = (t->shorts & ((1u << n) | (1u << (8 + n)))) != 0;
+    if (!inten && !publish && !shorts) return;
+    uint32_t now = nrf54l_timer_counter_now(t);
+    uint32_t target = t->cc[n] & nrf54l_timer_mask(t);
+    uint32_t delta = (target - now) & nrf54l_timer_mask(t);
+    if (delta == 0) delta = nrf54l_timer_mask(t) + 1u;  /* full wrap */
+    uint64_t tn = nrf54l_timer_tick_ns(t);
+    int64_t fire_ns = t->plat->cpu.sim_time_ns + (int64_t)(delta * tn);
+    arm_schedule_event_ns(&t->plat->cpu, &t->ev_compare[n], fire_ns);
+}
+
+static void nrf54l_timer_capture(nrf54l_timer_state_t *t, int n) {
+    if (n < 0 || n >= NRF54L_TIMER_NUM_CC) return;
+    t->cc[n] = nrf54l_timer_counter_now(t);
+}
+
+static void nrf54l_timer_task(nrf54l_timer_state_t *t, uint32_t off) {
+    switch (off) {
+        case 0x000: /* START */
+            if (!t->running) {
+                t->t0_ns   = t->plat->cpu.sim_time_ns;
+                t->running = true;
+                for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++)
+                    nrf54l_timer_schedule_cc(t, n);
+            }
+            break;
+        case 0x004: /* STOP */
+            if (t->running) {
+                t->snapshot = nrf54l_timer_counter_now(t);
+                t->running  = false;
+            }
+            for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++)
+                arm_cancel_event(&t->plat->cpu, &t->ev_compare[n]);
+            break;
+        case 0x008: /* COUNT */
+            if (t->mode == 1 /* Counter */ || t->mode == 2 /* LowPowerCounter */) {
+                t->counter = (t->counter + 1) & nrf54l_timer_mask(t);
+                for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++) {
+                    if (t->counter == (t->cc[n] & nrf54l_timer_mask(t)))
+                        nrf54l_timer_compare_fired(
+                            (void *)&timer_cc_ctx[t->base_addr == NRF54L_TIMER10_BASE ? 0 : 1][n],
+                            NULL);
+                }
+            }
+            break;
+        case 0x00C: /* CLEAR */
+            t->snapshot = 0;
+            t->t0_ns    = t->plat->cpu.sim_time_ns;
+            t->counter  = 0;
+            for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++)
+                if (t->running) nrf54l_timer_schedule_cc(t, n);
+            break;
+        default:
+            if (off >= 0x040 && off < 0x040 + 4 * NRF54L_TIMER_NUM_CC)
+                nrf54l_timer_capture(t, (off - 0x040) / 4);
+            break;
+    }
+}
+
+static void timer_capture_sub_cb(void *user) {
+    struct timer_cc_ctx *ctx = (struct timer_cc_ctx *)user;
+    nrf54l_timer_capture(ctx->t, ctx->n);
+}
+static void timer_start_sub_cb(void *user) {
+    nrf54l_timer_task((nrf54l_timer_state_t *)user, 0x000);
+}
+static void timer_stop_sub_cb(void *user) {
+    nrf54l_timer_task((nrf54l_timer_state_t *)user, 0x004);
+}
+static void timer_clear_sub_cb(void *user) {
+    nrf54l_timer_task((nrf54l_timer_state_t *)user, 0x00C);
+}
+static void timer_count_sub_cb(void *user) {
+    nrf54l_timer_task((nrf54l_timer_state_t *)user, 0x008);
+}
+
+static int nrf54l_timer_read(void *user_data, uint32_t addr) {
+    nrf54l_timer_state_t *t = (nrf54l_timer_state_t *)user_data;
+    uint32_t off = addr & 0xFFFu;
+    if (off >= 0x140 && off < 0x140 + 4 * NRF54L_TIMER_NUM_CC)
+        return (int)t->events_compare[(off - 0x140) / 4];
+    if (off >= 0x1C0 && off < 0x1C0 + 4 * NRF54L_TIMER_NUM_CC)
+        return (int)t->publish_compare[(off - 0x1C0) / 4];
+    if (off >= 0x540 && off < 0x540 + 4 * NRF54L_TIMER_NUM_CC)
+        return (int)t->cc[(off - 0x540) / 4];
+    if (off >= 0x0C0 && off < 0x0C0 + 4 * NRF54L_TIMER_NUM_CC)
+        return (int)t->subscribe_capture[(off - 0x0C0) / 4];
+    switch (off) {
+        case 0x080: return (int)t->subscribe_start;
+        case 0x084: return (int)t->subscribe_stop;
+        case 0x088: return (int)t->subscribe_count;
+        case 0x08C: return (int)t->subscribe_clear;
+        case 0x200: return (int)t->shorts;
+        case 0x300:
+        case 0x304:
+        case 0x308: return (int)t->inten;
+        case 0x504: return (int)t->mode;
+        case 0x508: return (int)t->bitmode;
+        case 0x510: return (int)t->prescaler;
+        default:    return 0;
+    }
+}
+
+static void nrf54l_timer_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf54l_timer_state_t *t = (nrf54l_timer_state_t *)user_data;
+    uint32_t off = addr & 0xFFFu;
+    if (getenv("NRF54L_TIMER_TRACE")) {
+        const char *kind = "?";
+        if (off < 0x80) kind = "TASK";
+        else if (off >= 0x140 && off < 0x180) kind = "EVENTS_COMPARE";
+        else if (off >= 0x540 && off < 0x560) kind = "CC";
+        else if (off == 0x510) kind = "PRESCALER";
+        else if (off == 0x508) kind = "BITMODE";
+        else if (off == 0x504) kind = "MODE";
+        else if (off == 0x200) kind = "SHORTS";
+        else if (off >= 0x300 && off <= 0x308) kind = "INTEN*";
+        else kind = "other";
+        fprintf(stderr, "[timerW cpu=0x%04x cyc=%lld base=0x%x off=0x%x val=0x%x (%s)]\n",
+                (unsigned)((uintptr_t)&t->plat->cpu & 0xFFFF),
+                (long long)t->plat->cpu.cycles,
+                t->base_addr, off, value, kind);
+    }
+    /* Tasks region. */
+    if (off < 0x080) {
+        if (value == 1) nrf54l_timer_task(t, off);
+        return;
+    }
+    /* SUBSCRIBE for START/STOP/COUNT/CLEAR. */
+    if (off >= 0x080 && off <= 0x08C) {
+        nrf54l_dppi_sub_cb cb = NULL;
+        switch (off) {
+            case 0x080: t->subscribe_start = value; cb = timer_start_sub_cb; break;
+            case 0x084: t->subscribe_stop  = value; cb = timer_stop_sub_cb;  break;
+            case 0x088: t->subscribe_count = value; cb = timer_count_sub_cb; break;
+            case 0x08C: t->subscribe_clear = value; cb = timer_clear_sub_cb; break;
+        }
+        if ((value & 0x80000000u) && t->dppi)
+            nrf54l_dppi_subscribe(t->dppi, (int)(value & 0x1Fu), cb, t);
+        return;
+    }
+    if (off >= 0x0C0 && off < 0x0C0 + 4 * NRF54L_TIMER_NUM_CC) {
+        int n = (off - 0x0C0) / 4;
+        if (t->sub_capture_ch[n] >= 0)
+            nrf54l_dppi_unsubscribe(t->dppi, t->sub_capture_ch[n],
+                                     timer_capture_sub_cb,
+                                     &timer_cc_ctx[t->base_addr == NRF54L_TIMER10_BASE ? 0 : 1][n]);
+        t->subscribe_capture[n] = value;
+        t->sub_capture_ch[n] = -1;
+        if ((value & 0x80000000u) && t->dppi) {
+            int ch = (int)(value & 0x1Fu);
+            t->sub_capture_ch[n] = ch;
+            nrf54l_dppi_subscribe(t->dppi, ch, timer_capture_sub_cb,
+                                   &timer_cc_ctx[t->base_addr == NRF54L_TIMER10_BASE ? 0 : 1][n]);
+        }
+        return;
+    }
+    if (off >= 0x140 && off < 0x140 + 4 * NRF54L_TIMER_NUM_CC) {
+        t->events_compare[(off - 0x140) / 4] = value & 1;
+        return;
+    }
+    if (off >= 0x1C0 && off < 0x1C0 + 4 * NRF54L_TIMER_NUM_CC) {
+        int n = (off - 0x1C0) / 4;
+        t->publish_compare[n] = value;
+        if (t->running) nrf54l_timer_schedule_cc(t, n);
+        return;
+    }
+    if (off >= 0x540 && off < 0x540 + 4 * NRF54L_TIMER_NUM_CC) {
+        int n = (off - 0x540) / 4;
+        t->cc[n] = value;
+        if (t->running) nrf54l_timer_schedule_cc(t, n);
+        return;
+    }
+    switch (off) {
+        case 0x200: t->shorts = value;
+                    if (t->running)
+                        for (int n=0; n<NRF54L_TIMER_NUM_CC; n++) nrf54l_timer_schedule_cc(t, n);
+                    return;
+        case 0x300: t->inten  = value;
+                    if (t->running)
+                        for (int n=0; n<NRF54L_TIMER_NUM_CC; n++) nrf54l_timer_schedule_cc(t, n);
+                    return;
+        case 0x304: t->inten |= value;
+                    if (t->running)
+                        for (int n=0; n<NRF54L_TIMER_NUM_CC; n++) nrf54l_timer_schedule_cc(t, n);
+                    return;
+        case 0x308: t->inten &= ~value; return;
+        case 0x504: t->mode   = value; return;
+        case 0x508:
+            t->bitmode = value;
+            return;
+        case 0x510:
+            t->prescaler = value & 0xF;
+            return;
+        default: return;
+    }
+}
+
+static void nrf54l_timer_setup(nrf54l_timer_state_t *t, arm_platform_t *plat,
+                                nrf54l_dppi_state_t *dppi, uint32_t base,
+                                int irq_num, int slot) {
+    t->plat      = plat;
+    t->dppi      = dppi;
+    t->irq_num   = irq_num;
+    t->base_addr = base;
+    t->bitmode   = 0; /* 16-bit default per SVD */
+    for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++) {
+        t->sub_capture_ch[n] = -1;
+        timer_cc_ctx[slot][n].t = t;
+        timer_cc_ctx[slot][n].n = n;
+        t->ev_compare[n].callback  = nrf54l_timer_compare_fired;
+        t->ev_compare[n].user_data = &timer_cc_ctx[slot][n];
+    }
+    arm_register_io(&plat->cpu, base, NRF54L_TIMER_SIZE,
+                    nrf54l_timer_read, nrf54l_timer_write, t);
+}
+
+
 
 /* ============================================================
  * SoC lifecycle
@@ -1352,6 +1779,12 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
         arm_register_io(&plat->cpu, bases[i], NRF54L_EGU_SIZE,
                         nrf54l_egu_read, nrf54l_egu_write, egus[i]);
     }
+
+    /* TIMER10/20 — used by nrf_802154 lptimer backend (TIMER20). */
+    nrf54l_timer_setup(&soc->timer10, plat, &soc->dppi,
+                       NRF54L_TIMER10_BASE, NRF54L_TIMER10_IRQ, 0);
+    nrf54l_timer_setup(&soc->timer20, plat, &soc->dppi,
+                       NRF54L_TIMER20_BASE, NRF54L_TIMER20_IRQ, 1);
 }
 
 static void nrf54l15_soc_destroy(arm_platform_t *plat) {
