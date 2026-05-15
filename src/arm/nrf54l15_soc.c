@@ -355,9 +355,21 @@ static void nrf54l_dppic_write(void *user_data, uint32_t addr, uint32_t value) {
 #define NRF54L_GRTC_TICK_NS               1000    /* 1 MHz syscounter */
 #define NRF54L_GRTC_IRQ                   228     /* GRTC_2_IRQn on app core */
 
+/* Live "now" in ns derived from CPU cycles. cpu->sim_time_ns is only
+ * synced at arm_step / arm_step_until boundaries, so reads from
+ * within an IRQ handler (e.g. nrfx GRTC re-arming the next compare)
+ * see the value frozen at the start of the current step — making
+ * every fire_ns we compute one-step-of-staleness late, which on the
+ * multinode harness manifests as a ~50× tick-rate slowdown.
+ * Same root cause as the cc2538 sleeptimer fix. */
+static inline int64_t grtc_now_ns(nrf54l_grtc_state_t *grtc) {
+    arm_cpu_t *cpu = &grtc->plat->cpu;
+    return arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+}
+
 static uint64_t grtc_counter_now(nrf54l_grtc_state_t *grtc) {
     if (!grtc->running) return 0;
-    int64_t elapsed = grtc->plat->cpu.sim_time_ns - grtc->start_anchor_ns;
+    int64_t elapsed = grtc_now_ns(grtc) - grtc->start_anchor_ns;
     if (elapsed < 0) elapsed = 0;
     return (uint64_t)elapsed / NRF54L_GRTC_TICK_NS;
 }
@@ -375,11 +387,28 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
         ((cpu_event_t *)cc->event)->user_data = grtc;
     }
     arm_cancel_event(&grtc->plat->cpu, (arm_event_t *)cc->event);
-    /* CCADD bit 31 selects the reference (SYSCOUNTER vs CC value) and
-     * must not be folded into the delay. */
+    /* CCADD bit 31 selects the reference:
+     *   1 (NRFX_GRTC_CC_RELATIVE_SYSCOUNTER) → fire at now + delay
+     *   0 (NRFX_GRTC_CC_RELATIVE_COMPARE)    → fire at last_scheduled + delay
+     * The COMPARE mode is drift-free: it ignores IRQ-handler latency
+     * between the previous fire and this re-arm. Critical for the
+     * Contiki etimer tick (clock-arch.c re-arms every 7813 µs in
+     * COMPARE mode); using SYSCOUNTER semantics for it stretches the
+     * effective tick by the IRQ overhead and slows wall-clock by ~1.7×. */
     uint32_t delay_ticks = cc->ccadd & 0x7FFFFFFFu;
-    int64_t fire_ns = grtc->plat->cpu.sim_time_ns +
-                      (int64_t)delay_ticks * NRF54L_GRTC_TICK_NS;
+    int64_t  delay_ns    = (int64_t)delay_ticks * NRF54L_GRTC_TICK_NS;
+    int64_t  now_ns      = grtc_now_ns(grtc);
+    int64_t  fire_ns;
+    if ((cc->ccadd & 0x80000000u) || cc->scheduled_ns == 0) {
+        fire_ns = now_ns + delay_ns;
+    } else {
+        fire_ns = cc->scheduled_ns + delay_ns;
+        /* If the firmware fell behind by more than the delay (IRQ
+         * starved or the medium ate cycles), don't schedule in the
+         * past — clamp to "now" so we still tick forward. */
+        if (fire_ns <= now_ns) fire_ns = now_ns + delay_ns;
+    }
+    cc->scheduled_ns = fire_ns;
     arm_schedule_event_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
 }
 
@@ -440,14 +469,19 @@ static int nrf54l_grtc_read(void *user_data, uint32_t addr) {
      * counter in our model.  Offsets 0x720..0x75F. */
     if (off >= NRF54L_GRTC_SYSCOUNTER_BASE && off < NRF54L_GRTC_SYSCOUNTER_END) {
         int sub = (off - NRF54L_GRTC_SYSCOUNTER_BASE) % 0x10;
+        /* SYSCOUNTERL/H always return the live 1 MHz counter. nrfx
+         * issues an atomic L→H read pair; we don't model the
+         * roll-over hazard since both halves come from the same
+         * grtc_counter_now() snapshot in 64-bit. The captured_lo/hi
+         * scratch slots are populated by the capture-trigger write
+         * (sub == 0x8) but never gate reads — earlier code did and
+         * pinned SYSCOUNTERL to the boot-time capture, breaking
+         * every nrfx_grtc_syscounter_get() after the first one. */
         if (sub == 0x0) {  /* SYSCOUNTERL */
-            if (grtc->captured_lo || grtc->captured_hi) return (int)grtc->captured_lo;
             uint64_t c = grtc_counter_now(grtc);
             return (int)(uint32_t)c;
         }
-        if (sub == 0x4) {  /* SYSCOUNTERH */
-            if (grtc->captured_lo || grtc->captured_hi)
-                return (int)((grtc->captured_hi & 0xFFFFFu) | (1u << 29));
+        if (sub == 0x4) {  /* SYSCOUNTERH (LOADED bit at 29) */
             uint64_t c = grtc_counter_now(grtc);
             return (int)(((uint32_t)(c >> 32) & 0xFFFFFu) | (1u << 29));
         }
@@ -538,7 +572,7 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF54L_GRTC_TASKS_START:
             if (value == 1) {
                 grtc->running = true;
-                grtc->start_anchor_ns = grtc->plat->cpu.sim_time_ns;
+                grtc->start_anchor_ns = grtc_now_ns(grtc);
                 /* Re-arm any pre-loaded CCs. */
                 for (int i = 0; i < NRF54L_GRTC_NUM_CC; i++)
                     if (grtc->cc[i].ccen) nrf54l_grtc_arm_cc(grtc, i);
@@ -554,7 +588,7 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
             }
             break;
         case NRF54L_GRTC_TASKS_CLEAR:
-            if (value == 1) grtc->start_anchor_ns = grtc->plat->cpu.sim_time_ns;
+            if (value == 1) grtc->start_anchor_ns = grtc_now_ns(grtc);
             break;
         case NRF54L_GRTC_INTEN2:    grtc->inten  = value;          break;
         case NRF54L_GRTC_INTENSET2: grtc->inten |= value;          break;
