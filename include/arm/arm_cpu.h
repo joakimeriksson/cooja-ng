@@ -118,6 +118,8 @@ typedef struct arm_cpu {
     bool      interrupts_enabled;
     bool      cpu_off;            /* WFI sleep */
     bool      stopping;
+    uint8_t   wild_trapped;       /* ARM_WILD_TRAP one-shot diagnostic */
+    uint8_t   lr_trapped;         /* ARM_LR_WATCH one-shot diagnostic */
 
     /* IO dispatch */
     arm_io_region_t io_regions[ARM_MAX_IO_REGIONS];
@@ -190,6 +192,21 @@ typedef struct arm_cpu {
      * before each instruction. Untyped here so the header doesn't need
      * to pull in gdb_stub.h for non-debug builds. */
     void     *gdb_stub;
+
+    /* ARM_SP_AUDIT shadow call stack: every BL/BLX pushes
+     * (return_pc, sp_before_call, callee_pc); every observed PC match
+     * pops + checks SP delta.  Catches sub-functions whose push/pop are
+     * unbalanced — including stmdb/ldmia with mismatched reglists.
+     * Placed last so it doesn't perturb existing struct field offsets. */
+#define ARM_SP_AUDIT_DEPTH 64
+    struct {
+        uint32_t return_pc;
+        uint32_t saved_sp;
+        uint32_t callee_pc;
+        uint8_t  in_exception;
+    } sp_audit[ARM_SP_AUDIT_DEPTH];
+    int       sp_audit_top;
+    int       sp_audit_overflow;
 } arm_cpu_t;
 
 /* --- Public API --- */

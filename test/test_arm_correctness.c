@@ -30,13 +30,22 @@ static void assert_true(const char *name, int condition) {
     }
 }
 
-/* Helper: set up CPU with code at flash base */
+/* Helper: set up CPU with code at flash base.  Writes the vector table
+ * directly into the flash array; flash is read-only via arm_write32. */
+static void write_flash32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
+    uint32_t off = addr - ARM_FLASH_BASE;
+    cpu->flash[off]     = val & 0xFF;
+    cpu->flash[off + 1] = (val >> 8) & 0xFF;
+    cpu->flash[off + 2] = (val >> 16) & 0xFF;
+    cpu->flash[off + 3] = (val >> 24) & 0xFF;
+}
+
 static void setup_arm(arm_cpu_t *cpu) {
     arm_cpu_init(cpu, &cc2538_config);
     /* Set initial SP */
-    arm_write32(cpu, ARM_FLASH_BASE, ARM_SRAM_BASE + ARM_SRAM_SIZE);
+    write_flash32(cpu, ARM_FLASH_BASE, ARM_SRAM_BASE + ARM_SRAM_SIZE);
     /* Set initial PC (entry point) - with thumb bit */
-    arm_write32(cpu, ARM_FLASH_BASE + 4, ARM_FLASH_BASE + 0x100 + 1);
+    write_flash32(cpu, ARM_FLASH_BASE + 4, ARM_FLASH_BASE + 0x100 + 1);
     arm_cpu_reset(cpu);
 }
 
