@@ -434,11 +434,22 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
     if ((cc->ccadd & 0x80000000u) || cc->scheduled_ns == 0) {
         fire_ns = now_ns + delay_ns;
     } else {
+        /* RELATIVE_COMPARE: fire at scheduled_ns + delay regardless of
+         * whether that time is already in the past. Real HW behaviour:
+         * if the new compare target has already been passed by the
+         * SYSCOUNTER, the comparator matches immediately and the IRQ
+         * fires "back-to-back" with the previous one. Earlier code
+         * clamped past targets forward to `now + delay`, which silently
+         * dropped clock-tick events whenever an IRQ handler ran long.
+         * That manifested as Contiki's CLOCK_SECOND counter advancing
+         * at 56% of sim time and the udp-client etimer never reaching
+         * its 10 s SEND_INTERVAL.
+         *
+         * arm_schedule_event_ns will fire the event on the next event
+         * check after the CPU's cycle passes `fire_ns`, so handing it a
+         * past timestamp just means "fire ASAP" — which is what real
+         * comparator-already-matched semantics produce. */
         fire_ns = cc->scheduled_ns + delay_ns;
-        /* If the firmware fell behind by more than the delay (IRQ
-         * starved or the medium ate cycles), don't schedule in the
-         * past — clamp to "now" so we still tick forward. */
-        if (fire_ns <= now_ns) fire_ns = now_ns + delay_ns;
     }
     cc->scheduled_ns = fire_ns;
     arm_schedule_event_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
