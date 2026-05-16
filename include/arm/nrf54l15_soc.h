@@ -241,6 +241,16 @@ typedef struct nrf54l_radio_state {
      * drops every payload byte after the first BCMATCH and the upper
      * layers never see the full DIO. */
     int rx_disable_pending;
+    /* BCC value that has already triggered a BCMATCH in this frame.
+     * On real HW the BCC register retains its programmed value after
+     * a BCMATCH — the comparator just doesn't re-fire until the
+     * firmware writes a new (higher) BCC. Earlier code zeroed
+     * `r->bcc` on fire, which made `nrf_radio_bcc_get()` return 0 in
+     * the IRQ handler; the driver then called the parser with
+     * valid_data_len=0 and the parser bailed → abort. Tracking the
+     * last-fired BCC separately lets us suppress re-fires while
+     * preserving the register value the driver reads back. */
+    uint32_t bcc_last_fired;
 
     /* TX byte listener — installed by the multinode harness. */
     void (*tx_cb)(void *user, uint8_t byte);
