@@ -233,6 +233,14 @@ typedef struct nrf54l_radio_state {
     int rx_phase;
     int rx_remaining;
     int rx_offset;
+    /* "Disable when frame ends." nrf_802154 issues TASKS_DISABLE from
+     * its BCMATCH IRQ once the header has been parsed; on real HW the
+     * in-flight bytes still finish their DMA write before the radio
+     * actually stops. We mirror that by deferring the state change
+     * until the byte parser reaches end-of-frame. Without this, csim
+     * drops every payload byte after the first BCMATCH and the upper
+     * layers never see the full DIO. */
+    int rx_disable_pending;
 
     /* TX byte listener — installed by the multinode harness. */
     void (*tx_cb)(void *user, uint8_t byte);
@@ -292,12 +300,27 @@ typedef struct nrf54l_timer_state {
     uint32_t             base_addr;        /* for IO routing */
 } nrf54l_timer_state_t;
 
+/* FICR.INFO.DEVICEID at 0x00FFC304/0x00FFC308 (FICR base 0x00FFC000,
+ * INFO at +0x300, DEVICEID at +0x004). Contiki's
+ * arch/cpu/nrf/sys/linkaddr-arch.c reads these two 32-bit words and
+ * combines them with the Nordic OUI (f4:ce:36) to produce the EUI-64
+ * stored in linkaddr_node_addr. Without per-node values, every
+ * simulated node ends up with identical link-layer + IPv6 addresses
+ * — RPL/6LoWPAN treats incoming DIOs as self-frames and drops them,
+ * so no DAG ever forms. The harness seeds these per-node before the
+ * firmware runs populate_link_address(). */
+typedef struct nrf54l_ficr_state {
+    uint32_t deviceid0;     /* INFO.DEVICEID[0] @ 0x00FFC304 */
+    uint32_t deviceid1;     /* INFO.DEVICEID[1] @ 0x00FFC308 */
+} nrf54l_ficr_state_t;
+
 typedef struct nrf54l15_soc {
     nrf54l_global_clock_state_t global_clock;
     nrf54l_uarte_state_t        uarte20;
     nrf54l_grtc_state_t         grtc;
     nrf54l_dppi_state_t         dppi;
     nrf54l_radio_state_t        radio;
+    nrf54l_ficr_state_t         ficr;
     /* Three EGU instances at 0x5001_5000 (EGU00), 0x5008_7000 (EGU10),
      * 0x500C_7000 (EGU20).  Channel allocation across instances is
      * domain-local on real HW; csim collapses to the global DPPI. */
