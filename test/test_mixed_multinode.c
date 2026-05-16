@@ -1862,7 +1862,17 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                     ack_tx_emitted = 1;
                 }
                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
-                if (emulated_rxfifo_available(j) >= ack_payload + 1)
+                /* ACK for the data frame's sender (j == sender_idx) goes via
+                 * the rx_queue: synchronous emu_deliver_bytes takes the
+                 * ticking-node fast path (no time advance), so bytes arrive
+                 * at the sender while its radio is still TX/DISABLED. The
+                 * drain at end-of-tick delivers via the time-advancing path
+                 * after the driver had a chance to switch back to RX. */
+                if (j == sender_idx)
+                    emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
+                                      -50, ack_start, coll_end,
+                                      tx_asm[sender_idx].subghz);
+                else if (emulated_rxfifo_available(j) >= ack_payload + 1)
                     emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count,
                                       -50, ack_start, tx_asm[sender_idx].subghz);
                 else
@@ -2065,8 +2075,14 @@ static void emu_rx_queue_drain(int idx) {
         memset(emu_rx_end_ns, 0, sizeof(emu_rx_end_ns));
 
         /* Deliver frame bytes to radio — preserve the original frame's
-         * sub-GHz flag so re-delivery uses the correct byte timing. */
-        emu_deliver_bytes(idx, f->data, f->len, f->rssi, current_sim_ns,
+         * sub-GHz flag so re-delivery uses the correct byte timing.
+         * Use max(arrival_ns, current_sim_ns) so deferred ACKs queued
+         * with a future arrival_ns (192µs turnaround past the data
+         * frame's tx-end) still advance the receiver's CPU forward
+         * by the turnaround before bytes hit the radio. */
+        int64_t deliver_ns = f->arrival_ns > current_sim_ns
+                                ? f->arrival_ns : current_sim_ns;
+        emu_deliver_bytes(idx, f->data, f->len, f->rssi, deliver_ns,
                           f->subghz);
         stat_emu_rx_drained++;
 
