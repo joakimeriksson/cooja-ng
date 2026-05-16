@@ -1159,6 +1159,10 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
     }
     switch (task_off) {
         case R_TASKS_TXEN:
+            /* Arm BEFORE set_state — set_state fires READY/TXREADY → can
+             * synchronously trigger TASKS_START via shorts, which must
+             * see tx_armed=1 to actually emit. */
+            r->tx_armed = 1;
             if (r->state != NRF54L_RADIO_STATE_TX &&
                 r->state != NRF54L_RADIO_STATE_TXRU)
                 nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_TXIDLE);
@@ -1169,7 +1173,10 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
                 nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_RXIDLE);
             break;
         case R_TASKS_START:
-            if (r->state == NRF54L_RADIO_STATE_TXIDLE) {
+            if (r->state == NRF54L_RADIO_STATE_TXIDLE && r->tx_armed &&
+                r->plat->cpu.cycles != r->last_tx_emit_cycle) {
+                r->tx_armed = 0;
+                r->last_tx_emit_cycle = r->plat->cpu.cycles;
                 r->state = NRF54L_RADIO_STATE_TX;
                 nrf54l_radio_emit_tx(r);
                 nrf54l_radio_fire_event(r, &r->evt_address,    INT_ADDRESS,    PUB_ADDRESS);

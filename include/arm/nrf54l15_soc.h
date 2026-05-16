@@ -241,6 +241,17 @@ typedef struct nrf54l_radio_state {
      * drops every payload byte after the first BCMATCH and the upper
      * layers never see the full DIO. */
     int rx_disable_pending;
+    /* TASKS_START debounce. nrf_802154 fans TASKS_TXEN AND
+     * TASKS_START out through multiple DPPI subscribers; in csim
+     * those all fire in the same cycle, each re-arming and re-emitting
+     * the TX frame so the on-air traffic gets tripled. Real HW gates
+     * this naturally because the radio is in TX state through the
+     * entire transmission (10s of µs) and the trigger is edge-
+     * sensitive on TXIDLE entry. We mirror that by remembering the
+     * CPU cycle of the last emit and refusing to emit a second time
+     * within the same cycle. */
+    int      tx_armed;
+    int64_t  last_tx_emit_cycle;
     /* BCC value that has already triggered a BCMATCH in this frame.
      * On real HW the BCC register retains its programmed value after
      * a BCMATCH — the comparator just doesn't re-fire until the
