@@ -2092,11 +2092,24 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     /* MOVT Rd, #imm16 */
                     cpu->reg[rd] = (cpu->reg[rd] & 0xFFFF) | (imm16 << 16);
                 } else if ((op_imm & 0x1A) == 0x00) {
-                    /* ADDW Rd, Rn, #imm12 */
-                    cpu->reg[rd] = cpu->reg[rn] + imm12;
+                    /* ADDW Rd, Rn, #imm12 / ADR Rd, label (T3 when Rn==PC).
+                     * For Rn == PC the architecture mandates Align(PC, 4) as
+                     * the base, where PC = InstructionAddr + 4. Without the
+                     * alignment a non-word-aligned ADDW (e.g. dio_input's
+                     * `addw ip, pc, #8` at an odd-halfword PC) returns a
+                     * base off by 2 → the subsequent jump-table LDR reads
+                     * a misaligned word → PC jumps to garbage and the CPU
+                     * walks SRAM. */
+                    if (rn == 0xF)
+                        cpu->reg[rd] = ((pc + 4) & ~3u) + imm12;
+                    else
+                        cpu->reg[rd] = cpu->reg[rn] + imm12;
                 } else if ((op_imm & 0x1A) == 0x0A) {
-                    /* SUBW Rd, Rn, #imm12 */
-                    cpu->reg[rd] = cpu->reg[rn] - imm12;
+                    /* SUBW Rd, Rn, #imm12 (ADR T2 when Rn==PC). */
+                    if (rn == 0xF)
+                        cpu->reg[rd] = ((pc + 4) & ~3u) - imm12;
+                    else
+                        cpu->reg[rd] = cpu->reg[rn] - imm12;
                 } else if ((op_imm & 0x1E) == 0x10) {
                     /* SSAT / SSAT16 — saturate signed (simplified). op=0x10,0x12. */
                     cpu->reg[rd] = cpu->reg[rn];
