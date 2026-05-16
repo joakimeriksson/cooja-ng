@@ -2683,6 +2683,22 @@ int arm_step(arm_cpu_t *cpu, int count) {
         cpu->instructions++;
         remaining--;
 
+        /* Service any IRQ that became pending mid-instruction.  Peripherals
+         * (radio, timer, etc.) call arm_nvic_set_pending → check_pending,
+         * which would normally take the exception immediately — but if
+         * PRIMASK was set at that moment, the IRQ stays pending until
+         * PRIMASK is later cleared (CPSIE i / MSR PRIMASK).  Some driver
+         * loops (e.g. nrf_802154's wait_for_flag using __WFE — a NOP for
+         * us) never touch PRIMASK while waiting, leaving the IRQ pending
+         * for the entire spin.  A per-instruction check is what real
+         * Cortex-M does between every instruction; gate on has_pending so
+         * the common no-IRQ-pending path stays O(1). */
+        if (cpu->nvic) {
+            arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
+            if (nvic->has_pending && (cpu->primask & 1) == 0)
+                arm_nvic_check_pending(nvic);
+        }
+
         /* LR-write trap: dump the instruction that set LR to a target
          * value.  Useful for tracing where bogus return addresses come
          * from when chasing wild-PC bugs.  Set ARM_LR_WATCH=<value>
