@@ -252,6 +252,8 @@ typedef struct nrf54l_radio_state {
      * within the same cycle. */
     int      tx_armed;
     int64_t  last_tx_emit_cycle;
+    int64_t  last_txen_cycle;
+    int64_t  last_rxen_cycle;
     /* BCC value that has already triggered a BCMATCH in this frame.
      * On real HW the BCC register retains its programmed value after
      * a BCMATCH — the comparator just doesn't re-fire until the

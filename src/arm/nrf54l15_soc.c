@@ -1159,6 +1159,13 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
     }
     switch (task_off) {
         case R_TASKS_TXEN:
+            /* DPPI fans TXEN out the same way it does START — multiple
+             * subscribers fire in one cycle. Dedup so a second TXEN in
+             * the same cycle doesn't clobber a state the firmware just
+             * settled (e.g. DISABLED post-PHYEND_DISABLE). */
+            if (r->plat->cpu.cycles == r->last_txen_cycle)
+                break;
+            r->last_txen_cycle = r->plat->cpu.cycles;
             /* Arm BEFORE set_state — set_state fires READY/TXREADY → can
              * synchronously trigger TASKS_START via shorts, which must
              * see tx_armed=1 to actually emit. */
@@ -1168,6 +1175,9 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
                 nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_TXIDLE);
             break;
         case R_TASKS_RXEN:
+            if (r->plat->cpu.cycles == r->last_rxen_cycle)
+                break;
+            r->last_rxen_cycle = r->plat->cpu.cycles;
             if (r->state != NRF54L_RADIO_STATE_RX &&
                 r->state != NRF54L_RADIO_STATE_RXRU)
                 nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_RXIDLE);
@@ -1264,7 +1274,13 @@ void nrf54l_radio_set_tx_listener(nrf54l15_soc_t *soc,
 
 void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
     nrf54l_radio_state_t *r = &soc->radio;
-    if (r->state != NRF54L_RADIO_STATE_RX) return;
+    if (r->state != NRF54L_RADIO_STATE_RX) {
+        if (getenv("NRF54L_RX_DROP_TRACE"))
+            fprintf(stderr, "[RX_DROP cpu=0x%04x cyc=%lld state=%d byte=0x%02x]\n",
+                    (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                    (long long)r->plat->cpu.cycles, r->state, byte);
+        return;
+    }
     arm_cpu_t *cpu = &r->plat->cpu;
     if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)
         return;
