@@ -1529,9 +1529,19 @@ static inline uint32_t nrf54l_timer_mask(nrf54l_timer_state_t *t) {
     }
 }
 
+/* Live "now" in ns from CPU cycles — same rationale as GRTC: a busy-wait
+ * inside the firmware (e.g. nrf_802154_time_get + wait_for_flag) calls
+ * this from within an arm_step batch; reading cpu.sim_time_ns would see
+ * the value frozen at the start of the step, so the deadline never
+ * advances and the busy-wait spins until the wall-clock timeout. */
+static inline int64_t nrf54l_timer_now_ns(nrf54l_timer_state_t *t) {
+    arm_cpu_t *cpu = &t->plat->cpu;
+    return arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+}
+
 static uint32_t nrf54l_timer_counter_now(nrf54l_timer_state_t *t) {
     if (!t->running) return t->snapshot & nrf54l_timer_mask(t);
-    int64_t now = t->plat->cpu.sim_time_ns;
+    int64_t now = nrf54l_timer_now_ns(t);
     uint64_t tn = nrf54l_timer_tick_ns(t);
     if (tn == 0) return 0;
     uint64_t ticks = (uint64_t)(now - t->t0_ns) / tn + t->snapshot;
@@ -1560,7 +1570,7 @@ static void nrf54l_timer_compare_fired(void *user, cpu_event_t *ev) {
     /* SHORTS: COMPARE_CLEAR (bit n), COMPARE_STOP (bit 8+n). */
     if (t->shorts & (1u << n)) {
         t->snapshot = 0;
-        t->t0_ns = t->plat->cpu.sim_time_ns;
+        t->t0_ns = nrf54l_timer_now_ns(t);
     }
     if (t->shorts & (1u << (8 + n))) {
         if (t->running) t->snapshot = nrf54l_timer_counter_now(t);
@@ -1587,7 +1597,7 @@ static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
     uint32_t delta = (target - now) & nrf54l_timer_mask(t);
     if (delta == 0) delta = nrf54l_timer_mask(t) + 1u;  /* full wrap */
     uint64_t tn = nrf54l_timer_tick_ns(t);
-    int64_t fire_ns = t->plat->cpu.sim_time_ns + (int64_t)(delta * tn);
+    int64_t fire_ns = nrf54l_timer_now_ns(t) + (int64_t)(delta * tn);
     arm_schedule_event_ns(&t->plat->cpu, &t->ev_compare[n], fire_ns);
 }
 
@@ -1600,7 +1610,7 @@ static void nrf54l_timer_task(nrf54l_timer_state_t *t, uint32_t off) {
     switch (off) {
         case 0x000: /* START */
             if (!t->running) {
-                t->t0_ns   = t->plat->cpu.sim_time_ns;
+                t->t0_ns   = nrf54l_timer_now_ns(t);
                 t->running = true;
                 for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++)
                     nrf54l_timer_schedule_cc(t, n);
@@ -1627,7 +1637,7 @@ static void nrf54l_timer_task(nrf54l_timer_state_t *t, uint32_t off) {
             break;
         case 0x00C: /* CLEAR */
             t->snapshot = 0;
-            t->t0_ns    = t->plat->cpu.sim_time_ns;
+            t->t0_ns    = nrf54l_timer_now_ns(t);
             t->counter  = 0;
             for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++)
                 if (t->running) nrf54l_timer_schedule_cc(t, n);
