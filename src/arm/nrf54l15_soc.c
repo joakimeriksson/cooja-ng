@@ -130,6 +130,38 @@ static void nrf54l_global_clock_write(void *user_data, uint32_t addr, uint32_t v
 }
 
 /* ============================================================
+ * FICR (0x00FFC000) — INFO.DEVICEID is the only field firmware
+ * reads on the boot path. linkaddr-arch.c combines it with the
+ * Nordic OUI (f4:ce:36) to derive the link-layer EUI-64. The two
+ * 32-bit DEVICEID words sit at offsets 0x304 / 0x308 (FICR.INFO
+ * starts at 0x300, DEVICEID is at +4 inside INFO). Other FICR
+ * fields read 0xFFFFFFFF on real HW (the reset value of unprogrammed
+ * factory cells); we return the same so any code that gates on
+ * "value != 0xFFFFFFFF" doesn't mistake silence for a programmed
+ * value.
+ * ============================================================ */
+#define NRF54L_FICR_BASE                  0x00FFC000u
+#define NRF54L_FICR_SIZE                  0x1000u
+#define NRF54L_FICR_INFO_DEVICEID0        0x304
+#define NRF54L_FICR_INFO_DEVICEID1        0x308
+
+static int nrf54l_ficr_read(void *user_data, uint32_t addr) {
+    nrf54l_ficr_state_t *ficr = (nrf54l_ficr_state_t *)user_data;
+    uint32_t off = addr - NRF54L_FICR_BASE;
+    switch (off) {
+        case NRF54L_FICR_INFO_DEVICEID0: return (int)ficr->deviceid0;
+        case NRF54L_FICR_INFO_DEVICEID1: return (int)ficr->deviceid1;
+        default:                          return -1; /* 0xFFFFFFFF */
+    }
+}
+
+static void nrf54l_ficr_write(void *user_data, uint32_t addr, uint32_t value) {
+    /* FICR is read-only on real HW; the harness writes via the
+     * struct directly, firmware never traps here. */
+    (void)user_data; (void)addr; (void)value;
+}
+
+/* ============================================================
  * UARTE20 EasyDMA (0x500C_6000)
  *
  * Offsets confirmed from nrf54lv10a_enga_application.svd in
@@ -1147,7 +1179,17 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
             if (r->state == NRF54L_RADIO_STATE_TX) r->state = NRF54L_RADIO_STATE_TXIDLE;
             break;
         case R_TASKS_DISABLE:
-            nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_DISABLED);
+            /* If a frame is mid-flight on RX, defer the actual state
+             * change until the parser hits end-of-frame — see the
+             * rx_disable_pending comment in the header. Anything else
+             * disables immediately. */
+            if (r->state == NRF54L_RADIO_STATE_RX &&
+                r->rx_phase != NRF54L_RX_WAIT_PREAMBLE &&
+                r->rx_phase != NRF54L_RX_WAIT_SFD) {
+                r->rx_disable_pending = 1;
+            } else {
+                nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_DISABLED);
+            }
             break;
         case R_TASKS_CCASTART:
             /* No interference model — always idle. */
@@ -1229,6 +1271,15 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
             r->rx_remaining = byte;
             r->rx_offset    = 1;
             r->rx_phase     = NRF54L_RX_READ_PAYLOAD;
+            /* nrf_802154 typically programs BCC=8 (after FRAMESTART) so it
+             * gets a BCMATCH the moment PHR is in the buffer. The check
+             * lives both here and in READ_PAYLOAD so the milestone fires
+             * at the exact rx_offset the driver expects (1 = PHR boundary,
+             * higher = subsequent header milestones the IRQ re-arms for). */
+            if (r->bcc != 0 && (uint32_t)(r->rx_offset * 8) >= r->bcc) {
+                r->bcc = 0;
+                nrf54l_radio_fire_event(r, &r->evt_bcmatch, INT_BCMATCH, PUB_BCMATCH);
+            }
             break;
         case NRF54L_RX_READ_PAYLOAD:
             arm_write8(cpu, r->packetptr + (uint32_t)r->rx_offset, byte);
@@ -1282,6 +1333,10 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
                 nrf54l_radio_apply_shorts(r, R_SHORT_END_START);
                 nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
+                if (r->rx_disable_pending) {
+                    r->rx_disable_pending = 0;
+                    nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_DISABLED);
+                }
             }
             break;
     }
@@ -1418,7 +1473,7 @@ static void nrf54l_radio_write(void *user_data, uint32_t addr, uint32_t value) {
         case R_CRCPOLY:             r->crcpoly   = value;    return;
         case R_CRCINIT:             r->crcinit   = value;    return;
         case R_PACKETPTR:           r->packetptr = value;    return;
-        case R_BCC:                 r->bcc       = value;    return;
+        case R_BCC:           r->bcc       = value;    return;
         default: return;
     }
 }
@@ -1762,6 +1817,13 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
                     NRF54L_GLOBAL_CLOCK_BASE, NRF54L_GLOBAL_CLOCK_SIZE,
                     nrf54l_global_clock_read, nrf54l_global_clock_write,
                     &soc->global_clock);
+
+    /* FICR — INFO.DEVICEID for the link-layer EUI-64. Default to
+     * 0 here; the multinode harness overwrites with per-node values
+     * before populate_link_address() runs. */
+    arm_register_io(&plat->cpu,
+                    NRF54L_FICR_BASE, NRF54L_FICR_SIZE,
+                    nrf54l_ficr_read, nrf54l_ficr_write, &soc->ficr);
 
     /* UARTE20 — pure EasyDMA console. */
     soc->uarte20.plat = plat;

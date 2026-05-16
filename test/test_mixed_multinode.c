@@ -3008,11 +3008,24 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         nrf54l_radio_set_tx_listener(nrfl_soc, mixed_rf_tx_chip_cb,
                                       &rf_ctx_slot0[idx]);
 
-        /* Contiki nrf54l15 patches `linkaddr_node_addr` per node (handled
-         * below at the generic la_addr patching path), so no equivalent
-         * of FICR.DEVICEADDR seeding is needed here. */
+        /* FICR.INFO.DEVICEID per-node — Contiki's linkaddr-arch.c
+         * combines these two 32-bit words with the Nordic OUI
+         * (f4:ce:36) into the EUI-64 stored in linkaddr_node_addr.
+         * Every node booting from the same FICR snapshot ends up with
+         * the same MAC, RPL drops incoming DIOs as self-frames, and
+         * the DAG never forms. Seed with the same per-node hash the
+         * nRF52840 path uses for FICR.DEVICEADDR. */
+        uint32_t h = (uint32_t)node_id;
+        h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+        h *= 2654435761u;
+        h ^= h >> 16;
+        nrfl_soc->ficr.deviceid0 = h;
+        nrfl_soc->ficr.deviceid1 = (uint32_t)node_id;
+
         if (verbose)
-            printf("  Node %d [nrf54l15]: TX listener installed\n", node_id);
+            printf("  Node %d [nrf54l15]: TX listener installed, "
+                   "ficr deviceid=%08x:%08x\n",
+                   node_id, nrfl_soc->ficr.deviceid1, nrfl_soc->ficr.deviceid0);
     }
 
     arm_cpu_reset(&plat->cpu);
