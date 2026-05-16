@@ -1275,12 +1275,19 @@ void nrf54l_radio_set_tx_listener(nrf54l15_soc_t *soc,
 void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
     nrf54l_radio_state_t *r = &soc->radio;
     if (r->state != NRF54L_RADIO_STATE_RX) {
-        if (getenv("NRF54L_RX_DROP_TRACE"))
-            fprintf(stderr, "[RX_DROP cpu=0x%04x cyc=%lld state=%d byte=0x%02x]\n",
+        if (nrf54l_radio_trace_active(r) || getenv("NRF54L_RX_DROP_TRACE"))
+            fprintf(stderr, "[radio cpu=0x%04x cyc=%lld RX_DROP state=%s byte=0x%02x]\n",
                     (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
-                    (long long)r->plat->cpu.cycles, r->state, byte);
+                    (long long)r->plat->cpu.cycles,
+                    nrf54l_radio_state_name(r->state), byte);
         return;
     }
+    if (nrf54l_radio_trace_active(r) && byte != 0x00 &&
+        r->rx_phase == NRF54L_RX_WAIT_PREAMBLE)
+        fprintf(stderr, "[radio cpu=0x%04x cyc=%lld RX_BYTE state=%s phase=%d byte=0x%02x]\n",
+                (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                (long long)r->plat->cpu.cycles,
+                nrf54l_radio_state_name(r->state), r->rx_phase, byte);
     arm_cpu_t *cpu = &r->plat->cpu;
     if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)
         return;
@@ -1343,7 +1350,18 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
 
                 /* Hardware-style auto-ACK — same logic and rationale
                  * as nrf52840's radio model. PACKETPTR layout:
-                 * [PHR][FCF0][FCF1][DSN][...]. */
+                 * [PHR][FCF0][FCF1][DSN][...].
+                 *
+                 * The Nordic 802.15.4 driver does schedule its own ACK
+                 * transmission via TIMER+PPI in response to CRCOK with
+                 * AR bit set, but the TIMER+PPI plumbing in our model is
+                 * approximate (no real ramp-up time, current_sim_ns is
+                 * anchored to the tick's start time rather than the
+                 * actual emit_tx moment), which means the driver's ACK
+                 * is delivered at the wrong sim time and the sender
+                 * misses it. Emitting one synchronously from the chip
+                 * matches what real hardware does in a deterministic
+                 * way the harness can deliver on time. */
                 if (r->tx_cb && r->rx_offset > 4) {
                     uint8_t fcf0       = arm_read8(cpu, r->packetptr + 1);
                     uint8_t dsn        = arm_read8(cpu, r->packetptr + 3);
@@ -1499,8 +1517,22 @@ static void nrf54l_radio_write(void *user_data, uint32_t addr, uint32_t value) {
         case R_EVENTS_CCABUSY:      r->evt_ccabusy    = value & 1; return;
 
         case R_SHORTS:              r->shorts       = value; return;
-        case R_INTENSET00:          r->intenset00  |= value; return;
-        case R_INTENCLR00:          r->intenset00 &= ~value; return;
+        case R_INTENSET00:
+            r->intenset00 |= value;
+            if (nrf54l_radio_trace_active(r))
+                fprintf(stderr, "[radio cpu=0x%04x cyc=%lld INTSET00 +0x%x => 0x%x state=%s]\n",
+                        (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                        (long long)r->plat->cpu.cycles, value, r->intenset00,
+                        nrf54l_radio_state_name(r->state));
+            return;
+        case R_INTENCLR00:
+            r->intenset00 &= ~value;
+            if (nrf54l_radio_trace_active(r))
+                fprintf(stderr, "[radio cpu=0x%04x cyc=%lld INTCLR00 -0x%x => 0x%x state=%s]\n",
+                        (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                        (long long)r->plat->cpu.cycles, value, r->intenset00,
+                        nrf54l_radio_state_name(r->state));
+            return;
         case R_INTENSET10:          r->intenset10  |= value; return;
         case R_INTENCLR10:          r->intenset10 &= ~value; return;
         case R_MODE:                r->mode      = value;    return;
