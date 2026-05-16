@@ -651,6 +651,7 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
  * ============================================================ */
 #define NRF54L_EGU00_BASE  0x50015000u
 #define NRF54L_EGU10_BASE  0x50087000u
+#define NRF54L_EGU10_IRQ   135    /* EGU10_IRQn — SWI dispatch for nrf_802154 */
 #define NRF54L_EGU20_BASE  0x500C7000u
 #define NRF54L_EGU_SIZE    0x1000u
 
@@ -1172,6 +1173,7 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
             } else if (r->state == NRF54L_RADIO_STATE_RXIDLE) {
                 r->state    = NRF54L_RADIO_STATE_RX;
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
+                r->bcc_last_fired = 0;
             }
             break;
         case R_TASKS_STOP:
@@ -1275,9 +1277,12 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
              * gets a BCMATCH the moment PHR is in the buffer. The check
              * lives both here and in READ_PAYLOAD so the milestone fires
              * at the exact rx_offset the driver expects (1 = PHR boundary,
-             * higher = subsequent header milestones the IRQ re-arms for). */
-            if (r->bcc != 0 && (uint32_t)(r->rx_offset * 8) >= r->bcc) {
-                r->bcc = 0;
+             * higher = subsequent header milestones the IRQ re-arms for).
+             * `bcc_last_fired` suppresses re-fires for the same BCC value
+             * while leaving `r->bcc` intact for firmware read-back. */
+            if (r->bcc != 0 && r->bcc != r->bcc_last_fired &&
+                (uint32_t)(r->rx_offset * 8) >= r->bcc) {
+                r->bcc_last_fired = r->bcc;
                 nrf54l_radio_fire_event(r, &r->evt_bcmatch, INT_BCMATCH, PUB_BCMATCH);
             }
             break;
@@ -1288,11 +1293,12 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
             /* BCMATCH fires when BCC bits have been received.  BCC is in
              * bits and the Nordic 802154 driver programs successive
              * milestones (e.g. PHR + FCF + DST + ...) to inspect headers
-             * as bytes arrive.  Total bits received = rx_offset * 8. */
-            if (r->bcc != 0 && (uint32_t)(r->rx_offset * 8) >= r->bcc) {
-                /* Clear bcc so we only fire once per milestone — driver
-                 * re-arms BCC in the ISR. */
-                r->bcc = 0;
+             * as bytes arrive. Use `bcc_last_fired` instead of clearing
+             * `r->bcc` so the driver can still read it via the BCC
+             * register in its IRQ handler. */
+            if (r->bcc != 0 && r->bcc != r->bcc_last_fired &&
+                (uint32_t)(r->rx_offset * 8) >= r->bcc) {
+                r->bcc_last_fired = r->bcc;
                 nrf54l_radio_fire_event(r, &r->evt_bcmatch, INT_BCMATCH, PUB_BCMATCH);
             }
             if (r->rx_remaining == 0) {
@@ -1862,14 +1868,18 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
                     nrf54l_radio_read, nrf54l_radio_write, &soc->radio);
 
     /* EGU00/10/20 — software-trigger sources for the DPPI fabric.
-     * EGU10 is the one nrf_802154 uses to kick radio ramp-up. IRQs
-     * unused by Contiki, so irq_num = -1 (no NVIC pending). */
-    nrf54l_egu_state_t *egus[3]   = { &soc->egu00, &soc->egu10, &soc->egu20 };
-    uint32_t            bases[3]  = { NRF54L_EGU00_BASE, NRF54L_EGU10_BASE, NRF54L_EGU20_BASE };
+     * EGU10 dispatches the nrf_802154 SWI handler: the driver maps
+     * RADIO.EVENTS_DISABLED → DPPI → EGU10.SUBSCRIBE_TRIGGER →
+     * EGU10.EVENTS_TRIGGERED → IRQ 135 → SWI_IRQHandler → rxframe
+     * notification. Without an actual NVIC pending bit the SWI
+     * never runs and the upper layer never sees received frames. */
+    nrf54l_egu_state_t *egus[3]    = { &soc->egu00, &soc->egu10, &soc->egu20 };
+    uint32_t            bases[3]   = { NRF54L_EGU00_BASE, NRF54L_EGU10_BASE, NRF54L_EGU20_BASE };
+    int                 irqs[3]    = { -1, NRF54L_EGU10_IRQ, -1 };
     for (int i = 0; i < 3; i++) {
         egus[i]->plat    = plat;
         egus[i]->dppi    = &soc->dppi;
-        egus[i]->irq_num = -1;
+        egus[i]->irq_num = irqs[i];
         for (int n = 0; n < NRF54L_EGU_NUM_CHANNELS; n++)
             egus[i]->sub_channel[n] = -1;
         arm_register_io(&plat->cpu, bases[i], NRF54L_EGU_SIZE,
