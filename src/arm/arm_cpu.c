@@ -1260,34 +1260,46 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     }
                 }
             } else {
-                /* Special data / branch-exchange */
+                /* Special data / branch-exchange.
+                 *
+                 * When PC is used as a source register here, the
+                 * architecturally-visible R[15] is `ProcessorPC` =
+                 * InstructionAddr + 4. Our `cpu->reg[15]` only updates
+                 * at the END of an instruction, so reading it raw
+                 * returns the current instruction's address. Read PC+4
+                 * explicitly for any source = 15. Same rule applies to
+                 * BX/BLX with Rm=PC (uncommon but architecturally
+                 * defined). */
                 int opcode = (hw1 >> 8) & 3;
                 int d = ((hw1 >> 4) & 8) | (hw1 & 7); /* High bit from bit 7 */
                 int m = (hw1 >> 3) & 0xF;
 
+                uint32_t m_val = (m == ARM_PC) ? (pc + 4) : cpu->reg[m];
+                uint32_t d_val = (d == ARM_PC) ? (pc + 4) : cpu->reg[d];
+
                 switch (opcode) {
                     case 0: /* ADD Rd, Rm (high registers) */
-                        cpu->reg[d] += cpu->reg[m];
+                        cpu->reg[d] = d_val + m_val;
                         if (d == ARM_PC) cpu->reg[ARM_PC] &= ~1u;
                         break;
                     case 1: { /* CMP Rn, Rm (high registers) */
-                        uint64_t result = (uint64_t)cpu->reg[d] - cpu->reg[m];
-                        set_sub_flags(cpu, cpu->reg[d], cpu->reg[m], result);
+                        uint64_t result = (uint64_t)d_val - m_val;
+                        set_sub_flags(cpu, d_val, m_val, result);
                         break;
                     }
                     case 2: /* MOV Rd, Rm (high registers) */
-                        cpu->reg[d] = cpu->reg[m];
+                        cpu->reg[d] = m_val;
                         if (d == ARM_PC) cpu->reg[ARM_PC] &= ~1u;
                         break;
                     case 3: /* BX / BLX */
                         if (hw1 & (1 << 7)) {
                             /* BLX Rm */
                             cpu->reg[ARM_LR] = (cpu->reg[ARM_PC]) | 1;
-                            arm_sp_audit_push(cpu, cpu->reg[ARM_PC], cpu->reg[m]);
-                            cpu->reg[ARM_PC] = cpu->reg[m] & ~1u;
+                            arm_sp_audit_push(cpu, cpu->reg[ARM_PC], m_val);
+                            cpu->reg[ARM_PC] = m_val & ~1u;
                         } else {
                             /* BX Rm */
-                            uint32_t target = cpu->reg[m];
+                            uint32_t target = m_val;
                             /* Check for exception return */
                             if ((target & 0xF0000000) == 0xF0000000) {
                                 exception_return(cpu, target);
