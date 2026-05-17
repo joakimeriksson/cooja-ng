@@ -2,22 +2,23 @@
 
 A fast, multi-architecture emulator and network simulator for Contiki-NG, written in portable C. Cooja-NG (codename `csim`) is a clean-room re-implementation of the parts of Cooja and MSPSim needed to run the upstream Contiki-NG test suite headlessly, with a strong focus on simulation speed, deterministic timing, and faithful peripheral behaviour.
 
-**Status:** the full Contiki-NG Cooja test suite passes — **88 / 88** including the TUN/border-router cases. The Zolertia Firefly port (CC2538 + CC1200 sub-GHz) is complete with 6/6 RPL-UDP hello cycles in 60 s. See [Test results](#test-results) below.
+**Status:** the full Contiki-NG Cooja test suite passes — **89 / 89** including the TUN/border-router cases.  Supported SoCs cover MSP430 (F149/F1611/F2617/F5437/CC430F5137/FR5969), ARM Cortex-M3 (TI CC2538, Zolertia Firefly with off-SoC CC1200 sub-GHz), Cortex-M4F (Nordic nRF52840), and Cortex-M33 (Nordic nRF54L15) — plus native Cooja motes (`dlopen`) for full mixed-platform networks.  See [Test results](#test-results) below.
 
 ```
-                       ┌──────────────────────────────────────────┐
-                       │           Cooja-NG test_runner           │
-                       │                                          │
-   firmware/*.sky ────►│  MSP430 F1611/F2617/F5437/CC430/FR5969   │
-   firmware/*.cc2538dk►│  ARM Cortex-M3 + CC2538 RF Core          │──► UART, packets,
-   firmware/*.zoul-fly►│  ARM Cortex-M3 + CC2538 + CC1200 sub-GHz │    timeline, UI
-   firmware/*.nrf52840►│  ARM Cortex-M4F + Nordic 802.15.4 radio  │
-   firmware/*.cooja  ─►│  Native Cooja motes (dlopen)             │
-                       │                                          │
-                       │  shared event queue • per-radio medium   │
-                       │  multi-channel • ns-precise time         │
-                       │  JS-driven assertions                    │
-                       └──────────────────────────────────────────┘
+                          ┌──────────────────────────────────────────────┐
+                          │             Cooja-NG test_runner             │
+                          │                                              │
+firmware/*.sky / .z1 ────►│  MSP430 F149/F1611/F2617/F5437/CC430/FR5969  │
+firmware/*.cc2538dk    ──►│  ARM Cortex-M3 + CC2538 RF Core (on-chip)    │──► UART, packets,
+firmware/*.zoul-firefly►──│  ARM Cortex-M3 + CC2538 + CC1200 sub-GHz     │    timeline,
+firmware/*.nrf52840-dk ──►│  ARM Cortex-M4F + Nordic 802.15.4 radio      │    web UI,
+firmware/*.nrf54l15-dk ──►│  ARM Cortex-M33 + Nordic 802.15.4 + DPPI/GRTC│    COOJA.testlog
+firmware/*.cooja       ──►│  Native Cooja motes (dlopen)                 │
+                          │                                              │
+                          │  shared event queue • per-radio medium       │
+                          │  multi-channel • ns-precise time             │
+                          │  JS-driven assertions                        │
+                          └──────────────────────────────────────────────┘
 ```
 
 ---
@@ -67,14 +68,17 @@ Compared to upstream Cooja + MSPSim, Cooja-NG is roughly an order of magnitude f
 - **Platforms** — Tmote Sky (F1611), ETH ESB (F149), Zolertia Z1 (F2617), WisMote / EXP5438 (F5437), CC430F5137 eval board, MSP-EXP430FR5969 LaunchPad (FR5969 with FRAM and eUSCI).
 - **Debug helpers** — ELF loader with symbol lookup, instruction-level tracing hooks, JIT cache inspection.
 
-### ARM Cortex-M3 emulator (`src/arm/`)
+### ARM emulator (`src/arm/`)
 
-- **Thumb / Thumb-2 interpreter** — full Cortex-M3 user instruction set including IT blocks, exclusive load/store stubs, bit-band region support.
-- **NVIC** — interrupt priority, pending/enable, exception entry/exit, tail-chaining.
+- **Thumb / Thumb-2 interpreter** — full Cortex-M3 / M4F / M33 user instruction set including IT blocks, hi-reg ADD/MOV/CMP, ADR T2/T3, exclusive load/store stubs, bit-band region.  Optional FPv4-SP-D16 VFP for M4F (`src/arm/arm_vfp.c`).
+- **NVIC** — interrupt priority, pending/enable, exception entry/exit, tail-chaining.  Per-instruction pending check so peripherals raising IRQs mid-instruction don't sit behind a never-cleared PRIMASK.
 - **SysTick** — periodic tick generation through the shared event queue.
 - **CC2538 SoC peripherals** — UART (TX callback + status flags), GPIO ports A–D with interrupts, General Purpose Timers (one-shot / periodic / prescaler), Sleep Timer (32 kHz, compare-match interrupt), System Control (clock config, OSC32K), IO Controller (pin mux), SSI (SPI master, both SSI0 and SSI1), and the on-chip RF Core (802.15.4 TX/RX, FFSM address filter, RFRND, frame interrupts).
 - **Off-chip CC1200 sub-GHz radio** — TI SimpleLink CC1200 emulated as an event-driven SPI peripheral. Full software auto-ACK path, register-level fidelity, IOCFG-driven GPIO events, and 73-test mock-host suite for chip-driver compliance. Runs the upstream Contiki-NG `cc1200_802154g_863_870_fsk_50kbps` configuration.
-- **Platforms** — TI SmartRF06 + CC2538EM (`cc2538dk`), Zolertia Firefly (`zoul-firefly`, CC2538 + CC1200).
+- **Nordic nRF52840** — CLOCK/HFCLK/LFCLK, RTC0/1/2, TIMER0–4, GPIO, GPIOTE, PPI, RNG, NVMC, FICR (per-node DEVICEID), UARTE EasyDMA, and a full 802.15.4 RADIO model (PACKETPTR EasyDMA, SHORTS, INTENSET, BCMATCH, hardware-style auto-ACK).  Boards: PCA10059 USB Dongle (`nrf52840-dongle`), PCA10056 DK (`nrf52840-dk`).
+- **Nordic nRF54L15** — newer Cortex-M33 family with GRTC (1 MHz syscounter, RELATIVE_COMPARE + RELATIVE_SYSCOUNTER modes), DPPI (32-channel publish/subscribe fabric), EGU (software-event source bridging to NVIC), TIMER10/20/21–24 (live-cycles-derived counter), per-node FICR.DEVICEID, UARTE20 EasyDMA, and an 802.15.4 RADIO with deferred PHYEND so the driver's NVIC-disabling critical section exits before the IRQ fires.  Board: PCA10156 DK (`nrf54l15-dk`).  2-node RPL-UDP exchanges request/response over RPL/6LoWPAN/CSMA end-to-end.
+- **Shared helpers** — `include/common/ieee_802154.h` (PHY constants + CCITT-16 FCS used by all four 802.15.4 radios) and `arm/nrf_radio_common.h` (one shared `nrf_radio_emit_ieee802154_frame()` for both nRF radios).
+- **Platforms** — TI SmartRF06 + CC2538EM (`cc2538dk`), Zolertia Firefly (`zoul-firefly`, CC2538 + CC1200), Nordic PCA10059/PCA10056 (`nrf52840-{dongle,dk}`), Nordic PCA10156 (`nrf54l15-dk`).
 
 ### Native Cooja motes (`src/native/`)
 
@@ -118,14 +122,16 @@ cd cooja-ng
 make
 
 # 3. Run the unit tests (~5 seconds)
-./build/test_runner correctness     # 68 MSP430 instruction tests
-./build/test_runner arm-correctness  # 33 ARM instruction tests
+./build/test_runner correctness         # 68 MSP430 instruction tests
+./build/test_runner arm-correctness     # 81 ARM Cortex-M3/M4F/M33 tests (Thumb-2 + DSP + VFP)
+./build/test_runner cc1200-mock-host    # 73 CC1200 chip-driver tests
+./build/test_runner radio-medium        # 235 radio-medium routing tests
 
 # 4. Run a real RPL-UDP simulation: 60 simulated seconds in ~250 ms wall-clock
 ./build/test_runner mixed-multinode \
     firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
 
-# 5. Run the full Contiki-NG Cooja test suite (88 tests)
+# 5. Run the full Contiki-NG Cooja test suite (89 tests, ~30–45 min cold, ~10–15 min warm)
 make configure CONTIKI_DIR=$(pwd)/../contiki-ng
 make cooja-tests VERBOSE=1
 ```
@@ -171,11 +177,13 @@ This is only needed if you want to (re)build firmware or run `make cooja-tests`.
 | Command | What it does |
 |---|---|
 | `./build/test_runner correctness [-v]` | 68 MSP430 instruction-level tests (MOV, ADD, jumps, MSP430X MOVA/ADDA/SUBA, cycle counts, byte mode, CALL/RET, CMP flags…) |
-| `./build/test_runner arm-correctness [-v]` | 33 ARM Cortex-M3 instruction tests (MOV, ADD, CMP, logic, shifts, load/store, branches, extensions, ADC/SBC) |
+| `./build/test_runner arm-correctness [-v]` | 81 ARM tests — Cortex-M3 Thumb-2 + M4 DSP halfword multiply + M4 VFP (FPv4-SP-D16), ADR T2/T3 alignment, hi-reg ADD/MOV/CMP, ARMv8-M LDAEX/STLEX stubs |
 | `./build/test_runner timeline [-v]` | 76 unit tests for the radio event timeline serializer |
+| `./build/test_runner cc1200-mock-host` | 73 CC1200 chip-driver compliance tests (register-level, IOCFG, auto-ACK) |
+| `./build/test_runner radio-medium` | 235 radio-medium tests (per-radio multi-channel routing, UDGM, band coexistence) |
 | `./build/test_runner firmware [-v]` | Boots `cputest.sky` and `timertest.sky` to completion |
 | `./build/test_runner arm-firmware [-v]` | Boots `hello-world.cc2538dk` (full Contiki-NG init + UART output) |
-| `./build/test_runner bench` | 7 micro-benchmarks + 2 firmware benchmarks, prints MIPS |
+| `./build/test_runner bench` | Micro-benchmarks + firmware benchmarks, prints MIPS |
 | `./build/test_runner all [-v]` | All of the above except multi-node |
 
 ### Multi-node simulations
@@ -208,13 +216,17 @@ Node platform is auto-detected from the firmware extension:
 
 | Extension | Platform |
 |---|---|
-| `.sky` | MSP430 (Tmote Sky + CC2420) |                                                                                                                              
-| `.z1` | MSP430 (Zolertia Z1 + CC2420) |                                                                                                                               
+| `.sky` | MSP430 (Tmote Sky + CC2420) |
+| `.esb` | MSP430 (ETH ESB) |
+| `.z1` | MSP430 (Zolertia Z1 + CC2420) |
+| `.wismote` / `.exp5438` | MSP430 (MSP-EXP430F5438 LaunchPad / WisMote, F5437) |
+| `.cc430` | MSP430 (CC430F5137 eval board) |
 | `.msp430fr5969` | MSP430 (MSP-EXP430FR5969 LaunchPad, FRAM, no radio) |
-| `.cc2538dk` | ARM Cortex-M3 (CC2538 + on-chip 802.15.4) |
+| `.cc2538dk` | ARM Cortex-M3 (TI CC2538 + on-chip 802.15.4) |
 | `.zoul-firefly` | ARM Cortex-M3 (Zolertia Firefly: CC2538 + CC1200 sub-GHz) |
 | `.nrf52840-dongle` | ARM Cortex-M4F (Nordic nRF52840 USB Dongle PCA10059) |
 | `.nrf52840-dk` | ARM Cortex-M4F (Nordic nRF52840 Development Kit PCA10056) |
+| `.nrf54l15-dk` | ARM Cortex-M33 (Nordic nRF54L15 Development Kit PCA10156) |
 | `.cooja` | Native Cooja shared library |
 
 ### Multi-node options
@@ -236,7 +248,7 @@ This is the most thorough validation Cooja-NG has against real Contiki-NG behavi
 # One-time setup
 make configure CONTIKI_DIR=/path/to/contiki-ng
 
-# Run all 88 tests, with the 7 TUN border-router tests skipped (no sudo needed)
+# Run the 81 non-TUN tests (no sudo needed) — ~10–15 min warm, longer if firmware must be rebuilt
 make cooja-tests
 make cooja-tests VERBOSE=1                  # show per-test output
 
@@ -245,9 +257,19 @@ make cooja-tests PATTERN='07-simulation-base/26-tsch-drift-z1'
 make cooja-tests PATTERN='14-rpl-lite*'
 make cooja-tests PATTERN='19-cooja-rpl-tsch'
 
-# Include the TUN/border-router tests (needs sudo for tun0 + tunslip6)
+# Force a fresh build from current Contiki sources (wipes firmware/{cooja,sky,z1}/* first)
+./tools/run-cooja-tests.sh --clean
+
+# Include the 8 TUN/border-router tests
+# Recommended: setcap once so tunslip6 doesn't need sudo per-run:
+sudo setcap cap_net_admin+eip ../contiki-ng/tools/serial-io/tunslip6
+./tools/run-cooja-tests.sh --with-tun -v 2>&1 | tee cooja-tests-tun.log
+
+# Alternative: cache sudo + keep alive for the run
 sudo -v
-sudo ./tools/run-cooja-tests.sh --with-tun -v 2>&1 | tee cooja-tests-tun.log
+( while true; do sudo -nv 2>/dev/null; sleep 60; done ) &
+./tools/run-cooja-tests.sh --with-tun -v 2>&1 | tee cooja-tests-tun.log
+kill %1
 
 # Rebuild the test firmware (only needed if Contiki-NG sources changed)
 make build-firmware
@@ -358,11 +380,15 @@ Measured on Apple Silicon (M-series, PGO build):
 
 On Linux x86-64 (release build, no PGO) you can reproducibly expect ~250× real-time on the 2-node RPL-UDP test — your mileage will depend heavily on the host CPU and whether GNU Lightning is available.
 
-### ARM Cortex-M3 (interpreter only — no JIT yet)
+### ARM (interpreter only — no JIT yet)
 
-| Benchmark | Speed |
-|---|---|
-| 2-node RPL-UDP (60 s sim) | ~4× real-time |
+| Platform | Benchmark | Speed |
+|---|---|---|
+| CC2538DK | 2-node RPL-UDP (60 s sim) | ~4× real-time |
+| nRF52840 (PCA10059/PCA10056) | 2-node RPL-UDP (60 s sim) | ~9× real-time |
+| nRF54L15 (PCA10156) | 2-node RPL-UDP (60 s sim, deferred PHYEND) | ~0.1× real-time |
+
+The nrf54l15 number is slow because the GRTC is modeled at full 1 MHz resolution and every TX defers PHYEND through the event queue — both are correctness-over-speed choices.  Speed is the next optimization target once the RPL-UDP regression has stabilised.
 
 ### Reproducing the numbers
 
@@ -459,13 +485,19 @@ A 235-test safety-net suite (`./build/test_runner radio-medium`) makes future re
 cooja-ng/
 ├── src/
 │   ├── msp430/                MSP430 CPU, peripherals, JIT, CC2420
-│   ├── arm/                   ARM Cortex-M3 CPU, NVIC, CC2538 SoC peripherals
+│   ├── arm/                   ARM CPU (M3/M4F/M33), NVIC, SoC peripherals:
+│   │                            cc2538_soc + cc2538_{uart,gpio,gptimer,...}
+│   │                            cc1200 (off-SoC sub-GHz)
+│   │                            nrf52840_soc (CLOCK/RTC/TIMER/RADIO/…)
+│   │                            nrf54l15_soc (GRTC/DPPI/EGU/TIMER/RADIO)
+│   │                            nrf_radio_common (shared emit_frame helper)
 │   ├── native/                Native Cooja mote loader
 │   ├── common/                Shared ELF loader, radio medium, event queue,
-│   │                          timeline, packet analyzer, JS test engine
+│   │                          timeline, packet analyzer, JS test engine,
+│   │                          ieee_802154.h (PHY constants + CCITT-16 FCS)
 │   └── ui/                    WebSocket server + sim state serializer
 ├── include/
-│   ├── msp430/  arm/  native/  common/  ui/    Public headers per subsystem
+│   ├── msp430/ arm/ native/ common/ ui/   Public headers per subsystem
 ├── lib/
 │   ├── cJSON.{c,h}            JSON parser
 │   ├── cbor.{c,h}             CBOR encoder
@@ -473,21 +505,25 @@ cooja-ng/
 ├── test/
 │   ├── test_main.c            Test runner entry point
 │   ├── test_correctness.c     MSP430 instruction tests
-│   ├── test_arm_correctness.c ARM instruction tests
+│   ├── test_arm_correctness.c ARM Cortex-M3/M4F/M33 instruction tests
 │   ├── test_firmware.c        MSP430 firmware integration
 │   ├── test_arm_firmware.c    ARM firmware integration
 │   ├── test_benchmark.c       Performance benchmarks
 │   ├── test_mixed_multinode.c Multi-node sim driver (MSP430 + ARM + native)
 │   ├── test_cc1200.c          CC1200 chip-driver mock-host suite (73 tests)
 │   ├── test_radio_medium.c    Radio-medium routing/multi-channel suite (235 tests)
+│   ├── test_mock_host.c       sim_host_t vtable tests for chip drivers
 │   └── test_timeline.c        Timeline serializer unit tests
 ├── configs/                   Example JSON simulation configs
-├── docs/test-format.md        Full JSON config / test scripting reference
+├── docs/                      test-format.md, radio-medium.md, architecture.md,
+│                              porting-a-device.md
 ├── firmware/                  Pre-built Contiki-NG firmware
-│   ├── sky/                   Tmote Sky (MSP430F1611)
-│   ├── z1/                    Zolertia Z1 (MSP430F2617)
+│   ├── sky/  z1/              MSP430 (Tmote Sky F1611, Zolertia Z1 F2617)
 │   ├── cc2538dk/              CC2538DK (ARM Cortex-M3)
 │   ├── zoul-firefly/          Zolertia Firefly (CC2538 + CC1200 sub-GHz)
+│   ├── nrf52840-dongle/       Nordic PCA10059 USB Dongle (Cortex-M4F)
+│   ├── nrf52840-dk/           Nordic PCA10056 DK (Cortex-M4F)
+│   ├── nrf54l15-dk/           Nordic PCA10156 DK (Cortex-M33)
 │   └── cooja/                 Native Cooja mote .so libraries
 ├── devices/                   Per-device port docs (SPEC, STATUS, hw test plan)
 │   └── zoul-firefly/          Zolertia Firefly port narrative + L6 resolution
@@ -495,6 +531,7 @@ cooja-ng/
 │   ├── csc2json.py            Cooja .csc → Cooja-NG JSON converter
 │   ├── run-cooja-tests.sh     Run upstream Contiki-NG test suite
 │   ├── build-test-firmware.sh Auto-build firmware needed by tests
+│   ├── build-device-firmware.sh  Docker-or-host firmware builder for new ports
 │   └── ...                    Debug/timing utilities
 ├── ui/index.html              Embedded UI page
 ├── csim.conf                  CONTIKI_DIR config (created by `make configure`)
@@ -517,21 +554,23 @@ Last verified run on Linux x86-64 with `make` (release, JIT auto-detected):
 | Suite | Result |
 |---|---|
 | `correctness` (MSP430 instructions) | **68 / 68 PASS** |
-| `arm-correctness` (ARM instructions) | **33 / 33 PASS** |
+| `arm-correctness` (ARM Cortex-M3/M4F/M33 instructions, incl. DSP + VFP) | **81 / 81 PASS** |
 | `timeline` (event serializer) | **76 / 76 PASS** |
 | `cc1200-mock-host` (CC1200 chip driver) | **73 / 73 PASS** |
 | `radio-medium` (per-radio multi-channel routing) | **235 / 235 PASS** |
 | `firmware` (`cputest.sky`, `timertest.sky`) | **2 / 2 PASS** |
-| `arm-firmware` (`hello-world.cc2538dk`, `bringup.zoul-firefly`) | **PASS** (boots Contiki-NG cleanly) |
-| `zoul-firefly-multinode` RPL-UDP | **6 / 6 hello cycles** in 60 s, 9.4× real-time |
+| `arm-firmware` (`hello-world.cc2538dk` + nRF bring-up) | **PASS** (boots Contiki-NG cleanly) |
+| `zoul-firefly-multinode` RPL-UDP | **6 / 6 hello cycles** in 60 s, ~9× real-time |
+| `nrf52840-dongle-multinode` RPL-UDP | UDP request/response round-trip @ ~9× real-time |
+| `nrf54l15-dk-multinode` RPL-UDP | UDP request/response round-trip end-to-end (slow, ~0.1× real-time) |
 | `bench` | runs cleanly, ~430 MIPS micro avg |
 
 ### Cooja test suite
 
 ```
 === Cooja Test Suite (csim) ===
-Total:  88
-Passed: 88
+Total:  89
+Passed: 89
 Failed:  0
 Skipped: 0
 Errors:  0
@@ -542,27 +581,29 @@ That includes:
 - All 27 `07-simulation-base/*` cases (RPL-Lite, TSCH, Orchestra variants, multicast, IPv6, stack guard, data structures), including the previously stubborn `26-tsch-drift-z1` (16 s).
 - All 12 `09-ipv6/*` ping permutations (CSMA / TSCH × LLA / ULA × with / without RPL).
 - All 9 `13-ieee802154/*` 6top tests.
-- All 11 `14-rpl-lite/*` and 18 `15-rpl-classic/*` cases, including the long-running 28-hour simulated DAG stability tests.
-- All 7 `17-tun-rpl-br/*` border-router tests with real `tun0` + `tunslip6`, including `01-border-router-cooja` (94 s).
+- All 14 `14-rpl-lite/*` and 19 `15-rpl-classic/*` cases, including the long-running 28-hour simulated DAG stability tests.
+- All 8 `17-tun-rpl-br/*` border-router tests with real `tun0` + `tunslip6`, including `01-border-router-cooja` (94 s) and `10-native-nat64-cooja` (214 s, UDP+TCP echo through the NAT64 gateway).
 
 The exact log is in `cooja-tests-tun.log` after running:
 
 ```sh
-sudo -v
-sudo ./tools/run-cooja-tests.sh --with-tun -v 2>&1 | tee cooja-tests-tun.log
+sudo setcap cap_net_admin+eip ../contiki-ng/tools/serial-io/tunslip6     # one-time
+./tools/run-cooja-tests.sh --with-tun -v 2>&1 | tee cooja-tests-tun.log
 ```
 
 ---
 
 ## Known issues
 
-These are real, currently reproducible bugs in the *standalone CLI shortcuts* — they do not affect the Cooja test wrapper path, the JSON-config flow, or any production use.
+These are real, currently reproducible quirks in the *standalone CLI shortcuts* — they do not affect the Cooja test wrapper path, the JSON-config flow, or any production use.
 
 1. **`./build/test_runner multinode` (no firmware) hangs.** The default-firmware shortcut routes to `firmware/sky/nullnet-broadcast.sky` and gets stuck after init. Workaround: use a JSON config or explicit firmware pair, e.g. `./build/test_runner mixed-multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000`.
 
-2. **`arm-multinode` with CC2538 firmware reports zero CPU progress.** The `arm-multinode` and ARM-only `mixed-multinode` shortcuts exit "successfully" without actually running the ARM CPU after `main`. Workaround: drive ARM nodes through a JSON config (e.g. `configs/rpl-udp-cc2538dk.json`) or through the Cooja test wrapper, both of which work correctly.
+2. **nRF54L15 RPL-UDP convergence is slow (~30 s sim).** End-to-end works (DIO → DAO → DAO-ACK → UDP request/response), but RPL takes longer to settle than on nrf52840 because of the deferred-PHYEND model and the 1 MHz GRTC fidelity.  CSMA retransmits visible in the packet log; cosmetic.
 
 3. **`test_firmware.c` reports `timertest.sky` as PASS** even when the firmware itself prints `FW: FAIL: count > 10 failed at timertest.c:166`. The runner only matches `EXIT`. Cosmetic, but worth tightening.
+
+4. **The same defer-PHYEND fix that unblocked nRF54L15 has not been applied to nrf52840** — that platform works today, but the same critical-section-during-TX scenario would surface if a faster RPL config exercises it.
 
 The active development state and any new regressions are tracked in [`PLAN.md`](PLAN.md). The most recently verified totals live in [`STATUS.txt`](STATUS.txt).
 
