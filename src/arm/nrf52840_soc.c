@@ -20,6 +20,7 @@
 #include "arm_cpu.h"
 #include "arm_nvic.h"
 #include "ieee_802154.h"
+#include "nrf_radio_common.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -720,43 +721,13 @@ static void nrf_radio_write(void *user_data, uint32_t addr, uint32_t value) {
     }
 }
 
-/* Walk the buffer at PACKETPTR, compute IEEE 802.15.4 FCS, and emit
- * the on-air byte sequence (4×preamble + SFD + PHR + payload + CRC).
- * Called when the radio enters TX state via TASKS_START. */
+/* Emit the on-air byte sequence (4×preamble + SFD + PHR + payload + CRC)
+ * by reading the buffer at PACKETPTR.  Called when the radio enters TX
+ * state via TASKS_START.  Body lives in nrf_radio_common — shared with
+ * nrf54l15 RADIO. */
 static void radio_emit_tx(nrf52840_soc_t *soc) {
-    nrf_radio_state_t *r = &soc->radio;
-    if (!soc->radio_tx_cb) return;
-    arm_cpu_t *cpu = &soc->plat->cpu;
-
-    /* PACKETPTR must point into SRAM. Real EasyDMA silently fails
-     * otherwise; we drop the TX and warn. */
-    if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)
-        return;
-
-    uint8_t phr = arm_read8(cpu, r->packetptr);
-    if (phr < 2 || phr > 127) return;       /* malformed; drop silently */
-
-    /* Driver layout: PACKETPTR[0]=PHR; PACKETPTR[1..PHR-2]=payload
-     * (PHR-2 bytes); PACKETPTR[PHR-1..PHR]=FCS slot the hardware fills
-     * in. We compute the FCS over PHR-2 payload bytes and append. */
-    uint8_t payload[125];
-    int payload_len = (int)phr - 2;
-    for (int i = 0; i < payload_len; i++)
-        payload[i] = arm_read8(cpu, r->packetptr + 1 + (uint32_t)i);
-
-    /* IEEE 802.15.4 FCS is computed over MPDU only (NOT including PHR). */
-    uint16_t crc = 0;
-    for (int i = 0; i < payload_len; i++) crc = nrf_crc_add(crc, payload[i]);
-
-    nrf_radio_tx_listener_t cb = soc->radio_tx_cb;
-    void *ud = soc->radio_tx_user;
-    for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
-        cb(ud, IEEE802154_PREAMBLE_BYTE);
-    cb(ud, IEEE802154_SFD);
-    cb(ud, phr);
-    for (int i = 0; i < payload_len; i++) cb(ud, payload[i]);
-    cb(ud, (uint8_t)(crc & 0xFF));
-    cb(ud, (uint8_t)((crc >> 8) & 0xFF));
+    nrf_radio_emit_ieee802154_frame(&soc->plat->cpu, soc->radio.packetptr,
+                                     soc->radio_tx_cb, soc->radio_tx_user);
 }
 
 void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, void *user_data) {
