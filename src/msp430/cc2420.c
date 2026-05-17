@@ -6,6 +6,7 @@
  * address filtering, auto-CRC, auto-ACK, and GPIO pin driving.
  */
 #include "cc2420.h"
+#include "ieee_802154.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,37 +55,23 @@ static const char *cc2420_state_str(cc2420_radio_state_t s) {
     }
 }
 
-/* SHR (Synchronization Header): 4 preamble bytes + SFD */
-static const uint8_t SHR[5] = { 0x00, 0x00, 0x00, 0x00, 0x7A };
+/* SHR (Synchronization Header): 4 preamble bytes + SFD.
+ * Layout matches every IEEE 802.15.4 2.4 GHz radio in this tree
+ * (cc2538_rfcore, nrf52840, nrf54l15 all emit the same SHR). */
+static const uint8_t SHR[5] = {
+    IEEE802154_PREAMBLE_BYTE, IEEE802154_PREAMBLE_BYTE,
+    IEEE802154_PREAMBLE_BYTE, IEEE802154_PREAMBLE_BYTE,
+    IEEE802154_SFD
+};
 
 /* Broadcast address */
 static const uint8_t BC_ADDRESS[2] = { 0xFF, 0xFF };
 
-/* ================================================================
- * CRC — CCITT with bit reversal (matches Java CCITT_CRC exactly)
- * ================================================================ */
-
-static uint8_t bitrev(uint8_t data) {
-    return (uint8_t)(
-        ((data << 7) & 0x80) | ((data << 5) & 0x40) |
-        ((data << 3) & 0x20) | ((data << 1) & 0x10) |
-        ((data >> 7) & 0x01) | ((data >> 5) & 0x02) |
-        ((data >> 3) & 0x04) | ((data >> 1) & 0x08)
-    );
-}
-
-static uint16_t crc_add(uint16_t crc, uint8_t data) {
-    uint16_t newcrc = ((crc >> 8) & 0xff) | ((crc << 8) & 0xffff);
-    newcrc ^= data;
-    newcrc ^= (newcrc & 0xff) >> 4;
-    newcrc ^= (newcrc << 12) & 0xffff;
-    newcrc ^= (newcrc & 0xff) << 5;
-    return newcrc & 0xffff;
-}
-
-static uint16_t crc_add_bitrev(uint16_t crc, uint8_t data) {
-    return crc_add(crc, bitrev(data));
-}
+/* CRC/bitrev helpers used to live here verbatim; they're shared with
+ * cc2538_rfcore / nrf radios via ieee_802154.h. */
+#define bitrev(data)              ieee802154_bitrev((data))
+#define crc_add(crc, data)        ieee802154_crc_add((crc), (data))
+#define crc_add_bitrev(crc, data) ieee802154_crc_add_bitrev((crc), (data))
 
 /* ================================================================
  * RXFIFO helpers (circular buffer in memory[0x80..0xFF])

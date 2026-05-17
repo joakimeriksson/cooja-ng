@@ -19,6 +19,7 @@
 #include "nrf52840_soc.h"
 #include "arm_cpu.h"
 #include "arm_nvic.h"
+#include "ieee_802154.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -452,18 +453,16 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
 
 /* IEEE 802.15.4 on-air framing — same convention used by cc2420 /
  * cc2538_rfcore in this tree, so radio_medium can route bytes between
- * nrf52840 and cc2538dk nodes if anyone tries it. */
-#define IEEE802154_PREAMBLE_BYTE  0x00
-#define IEEE802154_PREAMBLE_LEN   4
-#define IEEE802154_SFD            0x7A
+ * nrf52840 and cc2538dk nodes if anyone tries it.
+ * Constants (PREAMBLE_BYTE/LEN/SFD) and the CCITT-16 step now live in
+ * include/common/ieee_802154.h. */
 
-/* RX byte parser phase for incoming on-air bytes. */
-enum nrf_rx_phase {
-    NRF_RX_WAIT_PREAMBLE = 0,
-    NRF_RX_WAIT_SFD,
-    NRF_RX_READ_PHR,
-    NRF_RX_READ_PAYLOAD
-};
+/* RX byte parser phase aliases (kept so existing case labels don't
+ * have to churn; underlying values come from the shared enum). */
+#define NRF_RX_WAIT_PREAMBLE IEEE802154_RX_WAIT_PREAMBLE
+#define NRF_RX_WAIT_SFD      IEEE802154_RX_WAIT_SFD
+#define NRF_RX_READ_PHR      IEEE802154_RX_READ_PHR
+#define NRF_RX_READ_PAYLOAD  IEEE802154_RX_READ_PAYLOAD
 
 /* Forward decls */
 static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off);
@@ -471,15 +470,7 @@ static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state);
 static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask);
 static void radio_emit_tx(nrf52840_soc_t *soc);
 
-/* CCITT-16 CRC, matches IEEE 802.15.4 FCS. Same algorithm as cc2420.c. */
-static uint16_t nrf_crc_add(uint16_t crc, uint8_t data) {
-    uint16_t newcrc = ((crc >> 8) & 0xff) | ((crc << 8) & 0xffff);
-    newcrc ^= data;
-    newcrc ^= (newcrc & 0xff) >> 4;
-    newcrc ^= (newcrc << 12) & 0xffff;
-    newcrc ^= (newcrc & 0xff) << 5;
-    return newcrc & 0xffff;
-}
+#define nrf_crc_add(crc, data) ieee802154_crc_add((crc), (data))
 
 /* Raise IRQ if any of the latched events have INTENSET bit set. */
 static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask) {
