@@ -498,6 +498,15 @@ static pid_t ss_child_pid = -1;  /* PID of external command */
 static int ss_child_exited = 0;  /* set when child exits */
 static int ss_child_status = -1; /* child exit status */
 
+/* Cooja-compatibility test log.  Bash test drivers (e.g.
+ * tests/17-tun-rpl-br/test-native-nat64.sh) grep $THIS_DIR/COOJA.testlog
+ * for mote-side markers like "UDP_ECHO_OK node=2".  In real Cooja the
+ * .csc's JS plugin writes that file via `log.log(...)`; csc2json strips
+ * that JS away, so csim has to produce the file itself.  When a
+ * serial_socket.command is configured we open this in the same
+ * directory as the script and tee every mote console line to it. */
+static FILE *cooja_testlog = NULL;
+
 /* TX ring buffer: UART output from bridged mote → TCP socket */
 /* Border-router tests can burst multi-fragment SLIP traffic, especially when
  * native border-router mode forwards large IPv6 packets. Keep enough buffered
@@ -2110,6 +2119,14 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
         test_check_line(node->id, node->line_buf, ns);
         if (ui_server)
             ui_add_console_line(nidx, ns, node->line_buf);
+        if (cooja_testlog) {
+            /* Match Cooja's `log.log(time + " " + id + " " + msg + "\n")`
+             * format so existing bash test drivers grep the file the
+             * same way they would against Cooja's output. */
+            fprintf(cooja_testlog, "%lld %d %s\n",
+                    (long long)(ns / 1000000LL), node->id, node->line_buf);
+            fflush(cooja_testlog);
+        }
         node->line_pos = 0;
     } else if (byte == '\r') {
         /* ignore */
@@ -2395,6 +2412,7 @@ static void ss_cleanup(void) {
         waitpid(ss_child_pid, NULL, 0);
         ss_child_pid = -1;
     }
+    if (cooja_testlog) { fclose(cooja_testlog); cooja_testlog = NULL; }
 }
 
 /* --- Threaded callbacks (write only to sender's own buffers) --- */
@@ -4093,6 +4111,32 @@ sim_restart:
             if (ss_listen_fd < 0) {
                 fprintf(stderr, "serial_socket: failed to create listener\n");
             } else if (config.serial_socket_command[0]) {
+                /* Open COOJA.testlog in the script's directory before we
+                 * launch the script — bash drivers (test-native-nat64.sh
+                 * et al) `tail -F` or grep this file as the run unfolds.
+                 * First whitespace-separated token in the command line is
+                 * the script path. */
+                char script_path[1024];
+                snprintf(script_path, sizeof(script_path), "%s",
+                         config.serial_socket_command);
+                char *space = strchr(script_path, ' ');
+                if (space) *space = '\0';
+                char *slash = strrchr(script_path, '/');
+                if (slash) {
+                    *slash = '\0';
+                    char logpath[1100];
+                    snprintf(logpath, sizeof(logpath), "%s/COOJA.testlog",
+                             script_path);
+                    cooja_testlog = fopen(logpath, "w");
+                    if (cooja_testlog) {
+                        printf("  Serial socket: writing COOJA.testlog "
+                               "to %s\n", logpath);
+                    } else {
+                        fprintf(stderr,
+                                "serial_socket: cannot open %s: %s\n",
+                                logpath, strerror(errno));
+                    }
+                }
                 /* Launch the external command */
                 ss_child_pid = ss_launch_command(config.serial_socket_command);
             }
