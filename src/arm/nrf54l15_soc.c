@@ -965,6 +965,7 @@ static const uint32_t radio_sub_task_off[NRF54L_RADIO_NUM_SUBSCRIBES] = {
 
 /* Forward declarations. */
 static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off);
+static void nrf54l_radio_tx_end_cb(void *user, arm_event_t *ev);
 static void nrf54l_radio_apply_shorts(nrf54l_radio_state_t *r, uint32_t after_event_bit);
 static void nrf54l_radio_publish_event(nrf54l_radio_state_t *r, int pub_idx);
 static void nrf54l_radio_set_state(nrf54l_radio_state_t *r, uint32_t new_state);
@@ -1185,19 +1186,35 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
         case R_TASKS_START:
             if (r->state == NRF54L_RADIO_STATE_TXIDLE && r->tx_armed &&
                 r->plat->cpu.cycles != r->last_tx_emit_cycle) {
+                arm_cpu_t *cpu = &r->plat->cpu;
                 r->tx_armed = 0;
-                r->last_tx_emit_cycle = r->plat->cpu.cycles;
+                r->last_tx_emit_cycle = cpu->cycles;
                 r->state = NRF54L_RADIO_STATE_TX;
+                /* Defer PHYEND by a small fixed delay — just enough for
+                 * the driver's TX-setup critical section to exit and
+                 * re-enable the RADIO IRQ in NVIC.  Using the full
+                 * on-air duration (preamble+SFD+PHR+payload+FCS) * 32 µs
+                 * would more closely match real hardware, but the
+                 * multinode harness delivers bytes between nodes at
+                 * synchronous (tx-start-anchored) timestamps — so a
+                 * full-air-time defer leaves Node A's radio still in TX
+                 * state when Node B's ACK arrives.  100 µs is well
+                 * above the driver's typical critical-section length
+                 * and well below the 192 µs ACK turnaround. */
+                int64_t air_dur_ns = 100000LL;
                 nrf54l_radio_emit_tx(r);
                 nrf54l_radio_fire_event(r, &r->evt_address,    INT_ADDRESS,    PUB_ADDRESS);
                 nrf54l_radio_fire_event(r, &r->evt_framestart, INT_FRAMESTART, PUB_FRAMESTART);
-                nrf54l_radio_fire_event(r, &r->evt_payload,    INT_PAYLOAD,    PUB_PAYLOAD);
-                nrf54l_radio_fire_event(r, &r->evt_end,        INT_END,        PUB_END);
-                nrf54l_radio_fire_event(r, &r->evt_phyend,     INT_PHYEND,     PUB_PHYEND);
-                r->state = NRF54L_RADIO_STATE_TXIDLE;
-                nrf54l_radio_apply_shorts(r, R_SHORT_END_START);
-                nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_START);
-                nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
+                /* Defer PAYLOAD/END/PHYEND + state→TXIDLE + END/PHYEND
+                 * shorts to actual air-time end.  See the tx_end_event
+                 * comment in the header for why this matters. */
+                if (r->tx_end_scheduled)
+                    arm_cancel_event(cpu, &r->tx_end_event);
+                r->tx_end_event.callback  = nrf54l_radio_tx_end_cb;
+                r->tx_end_event.user_data = r;
+                r->tx_end_scheduled = 1;
+                int64_t now_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+                arm_schedule_event_ns(cpu, &r->tx_end_event, now_ns + air_dur_ns);
             } else if (r->state == NRF54L_RADIO_STATE_RXIDLE) {
                 r->state    = NRF54L_RADIO_STATE_RX;
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
@@ -1240,6 +1257,32 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
 static void radio_sub_cb(void *user) {
     radio_sub_binding_t *b = (radio_sub_binding_t *)user;
     nrf54l_radio_trigger_task(b->radio, b->task_off);
+}
+
+/* Fired (frame_air_dur) ns after TASKS_START — see the tx_end_event
+ * field comment in the header.  Handles the END / PHYEND firing and
+ * the TX→TXIDLE→(DISABLED) state dance that used to be inline in
+ * R_TASKS_START.  Real hardware fires PHYEND at on-air completion;
+ * doing the same here gives the driver's TX setup (still inside its
+ * NVIC-disabling critical section when emit_tx ran) time to finish
+ * and re-enable the RADIO IRQ before PHYEND triggers it. */
+static void nrf54l_radio_tx_end_cb(void *user, arm_event_t *ev) {
+    (void)ev;
+    nrf54l_radio_state_t *r = (nrf54l_radio_state_t *)user;
+    r->tx_end_scheduled = 0;
+    /* Clear tx_armed before applying END_START / PHYEND_START shorts —
+     * those trigger TASKS_START, and we must not let a stale tx_armed
+     * (from some TXEN that fired while the TX was in flight) re-emit
+     * the same frame.  Real HW edge-triggers the START off TXREADY,
+     * not off END/PHYEND; chained TX needs a fresh TXREADY cycle. */
+    r->tx_armed = 0;
+    nrf54l_radio_fire_event(r, &r->evt_payload, INT_PAYLOAD, PUB_PAYLOAD);
+    nrf54l_radio_fire_event(r, &r->evt_end,     INT_END,     PUB_END);
+    nrf54l_radio_fire_event(r, &r->evt_phyend,  INT_PHYEND,  PUB_PHYEND);
+    r->state = NRF54L_RADIO_STATE_TXIDLE;
+    nrf54l_radio_apply_shorts(r, R_SHORT_END_START);
+    nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_START);
+    nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
 }
 
 static void nrf54l_radio_emit_tx(nrf54l_radio_state_t *r) {
@@ -1348,45 +1391,13 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
                 nrf54l_radio_fire_event(r, &r->evt_phyend,   INT_PHYEND,   PUB_PHYEND);
                 nrf54l_radio_fire_event(r, &r->evt_crcok,    INT_CRCOK,    PUB_CRCOK);
 
-                /* Hardware-style auto-ACK — same logic and rationale
-                 * as nrf52840's radio model. PACKETPTR layout:
-                 * [PHR][FCF0][FCF1][DSN][...].
-                 *
-                 * The Nordic 802.15.4 driver does schedule its own ACK
-                 * transmission via TIMER+PPI in response to CRCOK with
-                 * AR bit set, but the TIMER+PPI plumbing in our model is
-                 * approximate (no real ramp-up time, current_sim_ns is
-                 * anchored to the tick's start time rather than the
-                 * actual emit_tx moment), which means the driver's ACK
-                 * is delivered at the wrong sim time and the sender
-                 * misses it. Emitting one synchronously from the chip
-                 * matches what real hardware does in a deterministic
-                 * way the harness can deliver on time. */
-                if (r->tx_cb && r->rx_offset > 4) {
-                    uint8_t fcf0       = arm_read8(cpu, r->packetptr + 1);
-                    uint8_t dsn        = arm_read8(cpu, r->packetptr + 3);
-                    int     frame_type = fcf0 & 0x07;
-                    int     ack_req    = (fcf0 >> 5) & 1;
-                    if (frame_type == 0x1 && ack_req) {
-                        uint8_t ack_fcf0 = 0x02;
-                        uint8_t ack_fcf1 = 0x00;
-                        uint16_t crc = 0;
-                        crc = nrf54l_crc_add(crc, ack_fcf0);
-                        crc = nrf54l_crc_add(crc, ack_fcf1);
-                        crc = nrf54l_crc_add(crc, dsn);
-                        void (*cb)(void *, uint8_t) = r->tx_cb;
-                        void *ud = r->tx_user;
-                        for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
-                            cb(ud, IEEE802154_PREAMBLE_BYTE);
-                        cb(ud, IEEE802154_SFD);
-                        cb(ud, 5);
-                        cb(ud, ack_fcf0);
-                        cb(ud, ack_fcf1);
-                        cb(ud, dsn);
-                        cb(ud, (uint8_t)(crc & 0xFF));
-                        cb(ud, (uint8_t)((crc >> 8) & 0xFF));
-                    }
-                }
+                /* No hardware-style auto-ACK: the Nordic 802.15.4 driver
+                 * schedules its own ACK via TIMER+PPI in response to
+                 * CRCOK with AR bit set, and now that emit_tx defers
+                 * PHYEND to actual air-time end the driver has time to
+                 * exit its critical section and arm the ACK on time.
+                 * Emitting one from the chip too produces a duplicate
+                 * ACK frame at the sender. */
                 r->state    = NRF54L_RADIO_STATE_RXIDLE;
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
                 nrf54l_radio_apply_shorts(r, R_SHORT_END_START);
