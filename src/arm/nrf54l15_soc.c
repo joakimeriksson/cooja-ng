@@ -17,6 +17,7 @@
 #include "nrf54l15_soc.h"
 #include "arm_cpu.h"
 #include "arm_nvic.h"
+#include "ieee_802154.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -932,22 +933,14 @@ enum {
 #define R_SHORT_PHYEND_DISABLE       (1u << 19)
 #define R_SHORT_PHYEND_START         (1u << 20)
 
-#define IEEE802154_PREAMBLE_BYTE  0x00
-#define IEEE802154_PREAMBLE_LEN   4
-#define IEEE802154_SFD            0x7A   /* Standard IEEE 802.15.4 SFD value
-                                          * (matches nrf52840_soc, cc2538_rfcore,
-                                          * and the multinode medium's PCAP
-                                          * writer).  An earlier "0xA7 reversed"
-                                          * value silently broke cross-node
-                                          * frame delivery. */
-
-/* RX byte parser phases. */
-enum nrf54l_rx_phase {
-    NRF54L_RX_WAIT_PREAMBLE = 0,
-    NRF54L_RX_WAIT_SFD,
-    NRF54L_RX_READ_PHR,
-    NRF54L_RX_READ_PAYLOAD
-};
+/* IEEE 802.15.4 PHY constants (PREAMBLE_BYTE/LEN/SFD) and the RX
+ * phase enum live in include/common/ieee_802154.h — shared with cc2420,
+ * cc2538_rfcore, nrf52840.  Local NRF54L_RX_* aliases avoid churn in
+ * the existing switch statements. */
+#define NRF54L_RX_WAIT_PREAMBLE IEEE802154_RX_WAIT_PREAMBLE
+#define NRF54L_RX_WAIT_SFD      IEEE802154_RX_WAIT_SFD
+#define NRF54L_RX_READ_PHR      IEEE802154_RX_READ_PHR
+#define NRF54L_RX_READ_PAYLOAD  IEEE802154_RX_READ_PAYLOAD
 
 /* SUBSCRIBE-slot binding — one per task-index 0..11, lives inside
  * the radio state.  DPPI subscriber callback receives a pointer to
@@ -971,15 +964,9 @@ static void nrf54l_radio_publish_event(nrf54l_radio_state_t *r, int pub_idx);
 static void nrf54l_radio_set_state(nrf54l_radio_state_t *r, uint32_t new_state);
 static void nrf54l_radio_emit_tx(nrf54l_radio_state_t *r);
 
-/* CCITT-16 CRC matching IEEE 802.15.4 FCS (same as cc2420.c / nrf52840). */
-static uint16_t nrf54l_crc_add(uint16_t crc, uint8_t data) {
-    uint16_t n = ((crc >> 8) & 0xff) | ((crc << 8) & 0xffff);
-    n ^= data;
-    n ^= (n & 0xff) >> 4;
-    n ^= (n << 12) & 0xffff;
-    n ^= (n & 0xff) << 5;
-    return n & 0xffff;
-}
+/* CCITT-16 CRC matching IEEE 802.15.4 FCS — shared with cc2420 /
+ * cc2538_rfcore / nrf52840 via ieee_802154.h. */
+#define nrf54l_crc_add(crc, data) ieee802154_crc_add((crc), (data))
 
 /* NRF54L_RADIO_TRACE=1 — driver-level trace of radio activity (state
  * transitions, tasks, events, IRQs).  Cached on first call.  Optionally
