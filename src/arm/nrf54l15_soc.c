@@ -18,6 +18,7 @@
 #include "arm_cpu.h"
 #include "arm_nvic.h"
 #include "ieee_802154.h"
+#include "nrf_radio_common.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1272,28 +1273,11 @@ static void nrf54l_radio_tx_end_cb(void *user, arm_event_t *ev) {
     nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
 }
 
+/* Emit the on-air byte sequence from PACKETPTR.  Body lives in
+ * nrf_radio_common — shared with nrf52840 RADIO. */
 static void nrf54l_radio_emit_tx(nrf54l_radio_state_t *r) {
-    if (!r->tx_cb) return;
-    arm_cpu_t *cpu = &r->plat->cpu;
-    if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)
-        return;
-    uint8_t phr = arm_read8(cpu, r->packetptr);
-    if (phr < 2 || phr > 127) return;
-    uint8_t payload[125];
-    int payload_len = (int)phr - 2;
-    for (int i = 0; i < payload_len; i++)
-        payload[i] = arm_read8(cpu, r->packetptr + 1 + (uint32_t)i);
-    uint16_t crc = 0;
-    for (int i = 0; i < payload_len; i++) crc = nrf54l_crc_add(crc, payload[i]);
-    void (*cb)(void *, uint8_t) = r->tx_cb;
-    void *ud = r->tx_user;
-    for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
-        cb(ud, IEEE802154_PREAMBLE_BYTE);
-    cb(ud, IEEE802154_SFD);
-    cb(ud, phr);
-    for (int i = 0; i < payload_len; i++) cb(ud, payload[i]);
-    cb(ud, (uint8_t)(crc & 0xFF));
-    cb(ud, (uint8_t)((crc >> 8) & 0xFF));
+    nrf_radio_emit_ieee802154_frame(&r->plat->cpu, r->packetptr,
+                                     r->tx_cb, r->tx_user);
 }
 
 void nrf54l_radio_set_tx_listener(nrf54l15_soc_t *soc,
