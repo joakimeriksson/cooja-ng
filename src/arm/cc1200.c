@@ -19,12 +19,8 @@
 #include "cc1200.h"
 #include <string.h>
 
-/* Convenience accessors for the host vtable. */
-#define HOST_NOW_NS(c)             ((c)->host->now_ns((c)->host->cpu))
-#define HOST_SCHEDULE_NS(c, ev, t) ((c)->host->schedule_ns((c)->host->cpu, (ev), (t)))
-#define HOST_CANCEL(c, ev)         ((c)->host->cancel((c)->host->cpu, (ev)))
-#define HOST_SET_PIN(c, p, n, v)   ((c)->host->set_input_pin((c)->host->gpio, (p), (n), (v)))
-#define HOST_FORCE_IRQ(c, p, n, e) ((c)->host->force_irq_edge((c)->host->gpio, (p), (n), (e)))
+/* HOST_* convenience accessors live in include/common/sim_host.h —
+ * shared with cc2420 / any future off-SoC chip driver. */
 
 /* ------------------------------------------------------------------ */
 /* Air-side bit-stream timing — 50 kbps 2-FSK as configured by Contiki  */

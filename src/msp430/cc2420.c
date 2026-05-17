@@ -11,14 +11,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Convenience accessors for the CPU-agnostic host vtable. The CC2420
- * driver never touches msp430_cpu_t / msp430_gpio_t directly so the same
- * driver can sit on a different SoC in the future. */
-#define HOST_NOW_NS(r)             ((r)->host->now_ns((r)->host->cpu))
-#define HOST_SCHEDULE_NS(r, ev, t) ((r)->host->schedule_ns((r)->host->cpu, (ev), (t)))
-#define HOST_CANCEL(r, ev)         ((r)->host->cancel((r)->host->cpu, (ev)))
-#define HOST_SET_PIN(r, p, n, v)   ((r)->host->set_input_pin((r)->host->gpio, (p), (n), (v)))
-#define HOST_FORCE_IRQ(r, p, n, e) ((r)->host->force_irq_edge((r)->host->gpio, (p), (n), (e)))
+/* HOST_* convenience accessors for the sim_host_t vtable now live in
+ * include/common/sim_host.h — shared with cc1200 and any future
+ * off-SoC chip driver.  CC2420 never touches msp430_cpu_t / GPIO
+ * directly, so the same driver can sit on a different SoC in the
+ * future. */
 
 static int trace_tsch_ack = -1;
 static int trace_tsch_ack_lines = 0;

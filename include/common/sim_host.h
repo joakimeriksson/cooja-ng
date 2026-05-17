@@ -26,6 +26,17 @@
 #include <stdbool.h>
 #include "cpu_event.h"
 
+/* Convenience accessors for any chip driver whose state struct has a
+ * `host` field of type `const sim_host_t *`.  The argument `c` is the
+ * chip struct (cc2420_t, cc1200_t, …); the macros expand to the right
+ * vtable calls.  Hoisted here so off-SoC chip drivers don't each
+ * re-define the same five wrappers. */
+#define HOST_NOW_NS(c)             ((c)->host->now_ns((c)->host->cpu))
+#define HOST_SCHEDULE_NS(c, ev, t) ((c)->host->schedule_ns((c)->host->cpu, (ev), (t)))
+#define HOST_CANCEL(c, ev)         ((c)->host->cancel((c)->host->cpu, (ev)))
+#define HOST_SET_PIN(c, p, n, v)   ((c)->host->set_input_pin((c)->host->gpio, (p), (n), (v)))
+#define HOST_FORCE_IRQ(c, p, n, e) ((c)->host->force_irq_edge((c)->host->gpio, (p), (n), (e)))
+
 typedef struct sim_host {
     /* Opaque handles bound at platform init */
     void *cpu;
