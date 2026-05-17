@@ -268,6 +268,21 @@ typedef struct nrf54l_radio_state {
     /* TX byte listener — installed by the multinode harness. */
     void (*tx_cb)(void *user, uint8_t byte);
     void  *tx_user;
+
+    /* Deferred TX completion.  On real hardware a TX takes
+     * (preamble+SFD+PHR+payload+FCS) bytes * 32 us, and PHYEND fires at
+     * that air-time boundary — long after the driver has finished its
+     * critical-section setup and exited wait_for_flag.  csim's emit_tx
+     * runs synchronously, so firing PHYEND in the same cycle drops the
+     * IRQ inside the driver's still-active critical section (RADIO IRQ
+     * disabled in NVIC), delaying it by milliseconds.  Schedule PHYEND
+     * for the real air-time end so the driver gets it in normal context.
+     *
+     * The event also drives END/PHYEND-triggered SHORTS (END_START,
+     * PHYEND_START, PHYEND_DISABLE) and the TX→TXIDLE→(DISABLED) state
+     * dance that used to happen inline at TASKS_START. */
+    arm_event_t  tx_end_event;
+    int          tx_end_scheduled;
 } nrf54l_radio_state_t;
 
 /* EGU (Event Generator Unit) — 16-channel software-triggerable
