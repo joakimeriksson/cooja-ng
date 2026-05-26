@@ -8,6 +8,8 @@
  */
 #include "sim_runtime.h"
 
+#include "sim_event_queue.h"
+
 #include <string.h>
 
 void sim_runtime_init(sim_runtime_t *sim) {
@@ -27,4 +29,29 @@ void sim_runtime_destroy(sim_runtime_t *sim) {
     sim->run_state = SIM_RUN_STOPPED;
     sim->now_ns = 0;
     sim->end_ns = 0;
+}
+
+/* ============================================================
+ * Scheduling wrappers — milestone 3.  Thin pass-throughs to sim_eq_*.
+ * ============================================================ */
+
+void sim_schedule_mote_wakeup(sim_runtime_t *sim, int mote_index,
+                              int64_t time_ns) {
+    sim_eq_schedule(&sim->event_queue, mote_index, time_ns);
+}
+
+void sim_schedule_mote_wakeup_if_earlier(sim_runtime_t *sim, int mote_index,
+                                          int64_t time_ns) {
+    sim_eq_schedule_if_earlier(&sim->event_queue, mote_index, time_ns);
+}
+
+void sim_schedule_radio_byte(sim_runtime_t *sim, int receiver_mote,
+                             int sender_mote, uint8_t byte, int8_t rssi,
+                             int64_t time_ns) {
+    sim_eq_schedule_rx_byte(&sim->event_queue, receiver_mote, sender_mote,
+                            byte, rssi, time_ns);
+}
+
+void sim_cancel_mote_events(sim_runtime_t *sim, int mote_index) {
+    sim_eq_remove_node(&sim->event_queue, mote_index);
 }

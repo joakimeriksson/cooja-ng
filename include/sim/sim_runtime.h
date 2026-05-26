@@ -50,10 +50,41 @@ void sim_runtime_init(sim_runtime_t *sim);
 void sim_runtime_destroy(sim_runtime_t *sim);
 
 /* Accessor for the current simulation time.  Milestone 2 makes this the
- * canonical reader; until then it just returns `sim->now_ns`. */
+ * canonical reader. */
 static inline int64_t sim_runtime_now_ns(const sim_runtime_t *sim) {
     return sim->now_ns;
 }
+
+/* ============================================================
+ * Scheduling wrappers — Phase 1 milestone 3.
+ *
+ * Thin wrappers around the existing sim_eq_* API.  Same semantics, just
+ * keyed on `sim_runtime_t *` so call sites speak the kernel API instead
+ * of touching the event queue directly.  Inline so there's no extra call
+ * overhead vs. the previous direct sim_eq_* calls.
+ *
+ * Coalescing rules (§3.8 of the refactor plan):
+ *   - mote_wakeup:           one pending event per mote; reschedule replaces
+ *   - mote_wakeup_if_earlier: only schedules if strictly earlier than the
+ *                            existing pending wakeup for that mote
+ *   - radio_byte:            never coalesced; multiple in flight allowed
+ * ============================================================ */
+
+void sim_schedule_mote_wakeup(sim_runtime_t *sim, int mote_index,
+                              int64_t time_ns);
+
+void sim_schedule_mote_wakeup_if_earlier(sim_runtime_t *sim, int mote_index,
+                                          int64_t time_ns);
+
+void sim_schedule_radio_byte(sim_runtime_t *sim, int receiver_mote,
+                             int sender_mote, uint8_t byte, int8_t rssi,
+                             int64_t time_ns);
+
+/* Drop every pending event targeting `mote_index` (wakeups + RX bytes).
+ * Used on mote remove / reboot.  Milestone 4 adds generation counters
+ * so most queued events become drop-on-dispatch instead — this stays as
+ * the explicit-purge path. */
+void sim_cancel_mote_events(sim_runtime_t *sim, int mote_index);
 
 #ifdef __cplusplus
 }
