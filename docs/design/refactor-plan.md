@@ -153,9 +153,15 @@ Mote type
 Mote instance
   One node in a simulation: mote type + firmware + id + position + runtime state.
 
-Service / plugin
+Service
   Optional behavior around the simulation: UI, PCAP, GDB, serial socket,
-  packet analyzer, timeline, test engine, custom radio medium.
+  packet analyzer, timeline, test engine, custom radio medium. All built-in
+  components are services. The kernel calls them through `sim_service_ops_t`.
+
+Plugin
+  A *service* (or other registry entry) loaded dynamically via `dlopen`. This
+  is the Phase 9+ extension model. Until then, "plugin" appears only in
+  forward-looking design notes; everything built-in is a "service".
 ```
 
 The important distinction: a board is not a CPU, and a mote type is not a
@@ -496,6 +502,9 @@ static void sim_dispatch_event(sim_runtime_t *sim, const sim_event_t *ev) {
     case SIM_EVENT_RADIO_BYTE:
         sim_radio_bus_deliver_byte(sim, ev);
         break;
+    case SIM_EVENT_RADIO_FRAME_END:
+        sim_radio_bus_deliver_frame_end(sim, ev);
+        break;
     case SIM_EVENT_SERIAL_INPUT:
         sim_dispatch_serial_input(sim, ev);
         break;
@@ -628,7 +637,8 @@ The kernel should provide one observer stream for services:
 typedef enum sim_observer_event_kind {
     SIM_OBS_MOTE_ADDED,
     SIM_OBS_MOTE_REMOVED,
-    SIM_OBS_MOTE_LOG,
+    SIM_OBS_MOTE_UART_BYTE,    /* raw byte off the console UART       */
+    SIM_OBS_MOTE_LOG_LINE,     /* line-assembled "\n"-terminated text */
     SIM_OBS_LED_CHANGED,
     SIM_OBS_RADIO_TX_START,
     SIM_OBS_RADIO_TX_END,
@@ -639,6 +649,11 @@ typedef enum sim_observer_event_kind {
     SIM_OBS_SIM_STOP,
 } sim_observer_event_kind_t;
 ```
+
+UART-byte vs log-line distinction matters: TUN/serial-socket consumers need the
+raw byte stream, JS test scripts and `COOJA.testlog` need line-assembled
+output, and PCAP wants neither. Keeping them separate avoids a service having
+to undo line-assembly to get bytes.
 
 Services subscribe to observer events. They do not become hard-coded calls in
 the main loop.
@@ -671,10 +686,16 @@ Rules:
 The event-driven single-threaded kernel is the reference semantics.
 
 The current optional `--threads N` path is a batch stepping optimization and
-does not have the same clean event semantics. Keep it working during migration,
-but do not let it define the core API.
+does not have the same clean event semantics. Decision (committed):
 
-Target approach:
+- Through Phase 5 (radio bus extraction): keep `--threads N` working as a
+  separate code path; do not let it define the core API.
+- After Phase 5: re-implement `--threads N` behind a second
+  `sim_scheduler_ops_t` entry (`batch`) sitting on top of the new
+  mote/radio/service APIs. If that proves more invasive than expected, retire
+  the threaded path instead of letting two divergent schedulers persist.
+
+The choice is "port or retire by Phase 6" — not "keep both forever."
 
 ```c
 typedef struct sim_scheduler_ops {
@@ -685,11 +706,10 @@ typedef struct sim_scheduler_ops {
 
 Built-in scheduler policies:
 
-- `event`: deterministic Cooja-style single event queue; reference scheduler
-- `batch`: future parallel/batched scheduler for large topologies
-
-The batch scheduler must use the same mote/radio/service APIs. It may trade
-some fidelity for throughput only when explicitly selected.
+- `event`: deterministic Cooja-style single event queue; reference scheduler.
+- `batch`: parallel/batched scheduler for large topologies; uses the same
+  mote/radio/service APIs; may trade some fidelity for throughput only when
+  explicitly selected.
 
 ### 3.14 Kernel invariants
 
@@ -707,9 +727,43 @@ These are non-negotiable:
 - The reference scheduler is deterministic for a fixed config and seed.
 - CPU-local cycle queues remain inside mote/platform implementations.
 
-### 3.15 Kernel extraction milestones
+### 3.14.1 Performance budget
 
-Use these smaller milestones before the broader phases below:
+The kernel introduces an extra layer between chip TX callback and chip RX
+callback. Budget (per-phase regression vs. the immediately-preceding tag on the
+2-node Sky `udp-server.sky` + `udp-client.sky` 60 s run, release build):
+
+- Phases 1-2 (runtime struct + mote vtable around existing helpers): ≤5% wall.
+- Phases 3-5 (platform/boot/radio-bus extraction): ≤10% wall combined.
+- Phases 6-10 (services + plugins): ≤5% additional wall.
+
+Total cumulative slowdown over the whole refactor: ≤20% on the Sky baseline.
+If a phase exceeds its budget, profile and inline the hot path (typically:
+`sim_radio_bus_deliver_byte` and `sim_dispatch_mote_execute`) before merging.
+
+### 3.14.2 Error and panic policy
+
+The kernel commits to:
+
+- `mote->ops->execute()` returning non-zero: log + drop that mote's wakeup +
+  continue. No automatic sim abort.
+- Event queue empty AND no service `keepalive()` requesting more time: clean
+  exit with `exit_code = 0`.
+- Service callback returning failure during init: refuse to start sim. During
+  run: log + disable that service, continue.
+- Out-of-memory in kernel paths: log + `abort()`. The kernel does not attempt
+  partial-state recovery.
+- Mote API violations (motes calling `sim_runtime_set_now_ns` etc.): assert
+  in debug builds, log + ignore in release.
+
+Services that need different policies (e.g. JS test engine wanting
+"first failed assertion stops sim") must request that explicitly through
+`sim_runtime_request_stop()` rather than `_exit()`-ing inline.
+
+### 3.15 Kernel extraction milestones (canonical Phase 1 task list)
+
+These 10 milestones are the canonical Phase 1 task list — §9 Phase 1 points
+back here. Land them in order, one PR per milestone where practical:
 
 1. Create `sim_runtime_t` with `now_ns`, `end_ns`, `run_state`, `event_queue`,
    and `radio_medium`.
@@ -829,6 +883,22 @@ plugins only after the static API is stable.
 
 ## 5. Smart CPU / Platform Model
 
+**Why this section exists.** MSP430 and ARM today carry parallel but
+non-unified platform models. MSP430 has `msp430_platform_t` / `msp430_config_t`
+flat-bound to MCU variants; ARM has `arm_platform_t` / `arm_soc_ops_t` /
+`arm_platform_config_t` already split into SoC-ops + board-config. Adding a new
+board today requires touching the runner *and* the per-arch platform table —
+two unrelated places. The goal of §5 is to converge both architectures on the
+ARM-style split (SoC descriptor + board descriptor + mote-type) so each new
+board is *data registered into the registry*, not new platform-init code.
+
+**Multi-radio per node.** Each mote owns 0..N radio endpoints, identified by
+`(mote_index, radio_idx)`. Single-radio motes use radio_idx=0; Firefly today is
+the only 2-radio platform (slot 0 = CC2538, slot 1 = CC1200), and future dual-
+band ports follow the same pattern. The mote ops, radio bus, and observer
+events all key on `(mote_index, radio_idx)`; this is an invariant, not a
+per-platform choice.
+
 ### 5.1 CPU architecture
 
 The CPU architecture layer owns instruction execution and register/memory
@@ -852,6 +922,13 @@ typedef struct sim_cpu_arch {
 
 Do not add new board-specific code to CPU files unless the instruction set or
 core exception model truly requires it.
+
+**JIT placement.** The MSPSim JIT (`src/msp430/msp430_jit.c`) is behavior-
+affecting performance state with a global compiled cache and per-block
+execution counters. It lives at the CPU-arch layer — owned by the MSP430 CPU,
+shared across all MSP430 mote instances on the same SoC family. Threshold/
+debug tuning stays on `MSPSIM_JIT_*` env vars; nothing in the kernel, mote,
+or platform layer should know the JIT exists.
 
 ### 5.2 MCU / SoC
 
@@ -981,13 +1058,16 @@ Preserve these during every extraction:
 - Receiver RX-enabled gating must remain enforced.
 - The medium never owns chip pointers.
 
-## 7. Plugin Model
+## 7. Service & Plugin Model
 
-The plugin architecture starts as a static in-process registry. That gives
-Cooja-NG plugin-shaped extension points without committing to an external ABI
-while the kernel is still being extracted.
+The extension architecture starts as a static in-process registry of
+**services** (built-in, statically linked). **Plugins** — dynamically loaded
+services via `dlopen` — come later (§7.2) once the static API has proven stable.
 
-### 7.1 Plugin v1: static registry
+The §2.1 glossary fixes the terminology: every built-in observer/contributor
+is a "service"; "plugin" is reserved for the Phase 9+ `dlopen` case.
+
+### 7.1 Service v1: static registry
 
 Built-in components register at process startup:
 
@@ -1007,26 +1087,26 @@ V1 rules:
 - register mote types, platforms, SoCs, radio media, and services
 - used by runtime creation and config normalization
 
-Static plugin categories:
+Static registry categories (all registered as services or descriptors):
 
 - mote types
 - platforms/boards
 - SoCs/MCUs
 - radio media
-- services
+- services (observers/contributors)
 - packet analyzers
 - test action providers
 - UI state providers
 
-### 7.2 Plugin v2: dynamic loading
+### 7.2 Plugins (dynamic loading)
 
-Dynamic plugin loading is optional and later:
+Plugin loading is optional and later:
 
 - only after the static registry is stable
 - likely starts with observer/service plugins
 - dynamic mote/platform/radio plugins require a stricter ABI and come later
 - plugin ABI must expose handles and functions, not internal structs
-- the simulator must keep working with only built-ins
+- the simulator must keep working with only built-in services
 
 Sketch for the later ABI:
 
@@ -1110,14 +1190,22 @@ Example:
 
 ### 8.3 Config parser migration
 
+Strategy (committed): introduce one normalized internal config struct
+(`sim_normalized_config_t`) that both v1 and v2 parsers populate. Runtime
+creation consumes only the normalized struct, never the raw JSON layout.
+Adding a v3 later means writing a v3→normalized adapter, not editing
+`sim_runtime_init`.
+
 Steps:
 
-1. Add `version` field detection.
-2. Keep `sim_config_load` as the legacy parser.
-3. Add `sim_config_v2_load` or extend `sim_config_load` with a normalized
-   output structure.
-4. Normalize both v1 and v2 into the same runtime creation API.
-5. Keep `tools/csc2json.py` emitting legacy v1 until v2 is stable.
+1. Add `version` field detection in the existing `sim_config_load`.
+2. Define `sim_normalized_config_t` (mote types, nodes, medium, services,
+   plugins, test actions, etc.) decoupled from JSON shape.
+3. Convert the existing v1 path to produce `sim_normalized_config_t` instead of
+   today's `sim_config_t`.
+4. Add a v2 parser path producing the same `sim_normalized_config_t`.
+5. Update `sim_runtime_init` to consume normalized config.
+6. Keep `tools/csc2json.py` emitting v1 until v2 is stable.
 
 ## 9. Refactor Phases
 
@@ -1168,37 +1256,17 @@ Stop condition:
 Goal: move global simulation state into a struct while keeping the runner as the
 entry point.
 
+The canonical task list is §3.15 above (10 numbered milestones). Land them in
+order, one PR per milestone where practical. The earlier looser version of this
+phase has been removed in favor of §3.15 — they were the same idea stated
+twice.
+
 Candidate files:
 
 - Add `include/sim/sim_runtime.h`
 - Add `src/sim/sim_runtime.c`
 - Update `Makefile`
 - Edit `test/test_mixed_multinode.c` incrementally
-
-State to move first:
-
-- `num_nodes`
-- `nodes`
-- `radio_medium`
-- `current_sim_ns`
-- `sim_eq`
-- RF pending buffers
-- per-node start times
-- stats counters
-- timeline/node state arrays
-
-Do this in small slices. The first slice can define:
-
-```c
-typedef struct sim_runtime {
-    int node_count;
-    int64_t current_time_ns;
-    sim_event_queue_t event_queue;
-    radio_medium_t radio_medium;
-} sim_runtime_t;
-```
-
-Then move fields gradually.
 
 Validation:
 
@@ -1386,11 +1454,30 @@ Services to extract:
 - packet analyzer
 - PCAP writer
 - WebSocket UI
-- serial socket bridge
+- serial socket bridge *(special case — see notes)*
 - GDB stub
-- JS test engine
+- JS test engine *(special case — see notes)*
 - JSON test actions/validators
 - progress/stat printing
+
+**Serial-socket caveat.** Today's `serial_socket` block interleaves TCP
+listen/accept, child-process management (`test-border-router.sh`, etc.),
+per-mote UART callback rewriting, `COOJA.testlog` tee-writing, and signal
+handling on shutdown. Treat it as **two services** to avoid reproducing the
+tangle:
+
+- `serial_bridge_service`: pure TCP↔UART byte plumbing for the bridged mote.
+  Subscribes to `SIM_OBS_MOTE_UART_BYTE` for the bridged node, schedules
+  `SIM_EVENT_SERIAL_INPUT` from socket reads.
+- `external_command_service`: forks/manages the bash test driver and the
+  `COOJA.testlog` file. Subscribes to `SIM_OBS_MOTE_LOG_LINE` for tee-writing.
+
+**JS test engine caveat.** The engine mutates sim state inside dispatched
+events (`log.testFailed` → stop sim; `WAIT_UNTIL` → resume from line callback).
+The new service implementation must route those through
+`sim_runtime_request_stop()` and a deferred-resume queue, not by calling
+kernel APIs that re-enter dispatch. Observer callbacks must be re-entrancy-
+safe by construction.
 
 Service ops sketch:
 
@@ -1546,7 +1633,7 @@ Use the smallest test that covers the change.
 | Scheduler/event queue | all unit tests plus at least Sky and CC2538 multinode |
 | Platform registry | one test per platform family touched |
 
-Recommended broad gate before merging a large phase:
+### Broad gate (mandatory before merging a phase)
 
 ```sh
 make
@@ -1554,7 +1641,37 @@ make
 ./build/test_runner multinode -t 20000 -q
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000 -q
 ./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/nullnet-broadcast-subghz.zoul-firefly -t 20000 -q
+
+# Cooja regression — non-TUN tests must stay 81/81 green at every phase boundary.
+# Phases that legitimately need to break this temporarily (e.g. mid-Phase 5
+# radio-bus extraction) must call that out explicitly in the PR description.
+make cooja-tests
+
+# Determinism reproducibility — run the same config twice with the same seed,
+# compare timelines.  Any per-phase divergence is a bug, not a "minor refactor
+# side effect".
+./build/test_runner mixed-multinode configs/test-4node-chain.json -t 10000 -q \
+    --timeline-out /tmp/run-a.json
+./build/test_runner mixed-multinode configs/test-4node-chain.json -t 10000 -q \
+    --timeline-out /tmp/run-b.json
+diff /tmp/run-a.json /tmp/run-b.json     # must be empty
 ```
+
+(If `--timeline-out` doesn't exist yet, Phase 0 adds it. Determinism check is
+worthless without it.)
+
+### Performance regression check
+
+After each phase, on a quiet machine, repeat:
+
+```sh
+./build/test_runner mixed-multinode \
+    firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000 -q
+```
+
+Record the `Wall-clock time` and compare to the immediately preceding tag.
+Budget per §3.14.1. If exceeded, profile (`perf`/`Instruments`) on
+`sim_radio_bus_deliver_byte` and `sim_dispatch_mote_execute` before merging.
 
 ## 11. Agent Instructions
 
@@ -1602,6 +1719,23 @@ Stop and ask for review when:
 - Tests fail in a way unrelated to the current extraction.
 - A patch exceeds roughly 1500-2000 lines without a green test.
 - A new platform requires CPU emulator changes not described by its SPEC.
+- A phase's perf budget (§3.14.1) is exceeded by more than 2×.
+- The Cooja non-TUN suite (`make cooja-tests`) drops below 81/81 and you are
+  not in a phase that explicitly authorizes it.
+
+### 11.5 Rolling back
+
+If a merged phase introduces a regression that escapes the broad gate (e.g. a
+subtle ACK-timing bug that only shows up in `tools/run-cooja-tests.sh --with-tun`):
+
+1. **Revert by default.** `git revert <merge>` the offending phase as a single
+   commit. Don't try to fix forward unless the fix is one-line obvious.
+2. **Open a follow-up branch** with the same phase number plus a suffix
+   (`phase-5-radio-bus-v2`). Address the regression in the branch with a new
+   test that catches it.
+3. **Re-merge** only after the new test is in the gate.
+
+This is cheaper than living with a bisect-hostile head while debugging.
 
 ## 12. Immediate Next Steps
 
@@ -1625,9 +1759,42 @@ This sequence gives structure early while keeping the hardest correctness areas
 -- radio byte timing and platform boot patching -- intact until the runtime and
 mote boundaries are ready.
 
+## Decisions Log
+
+Architectural choices made in this doc that should not be silently reversed in
+implementation patches. If a phase needs to revisit one, update this list in
+the same patch.
+
+- **Phase 1 task list is §3.15 (10 numbered milestones).** §9 Phase 1 points at
+  it; do not re-invent a parallel list.
+- **`--threads N` is "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
+  (§3.13). Two divergent schedulers persisting indefinitely is not an option.
+- **Performance budget**: ≤5% Phases 1–2, ≤10% Phases 3–5 combined, ≤5% Phases
+  6–10, ≤20% cumulative on the 2-node Sky baseline (§3.14.1).
+- **Error policy**: mote execute failure → drop wakeup, continue. Service init
+  failure → refuse to start. Service runtime failure → disable + continue.
+  OOM in kernel → `abort()` (§3.14.2).
+- **Config v2 migration uses a single normalized internal struct that both v1
+  and v2 parsers populate** (§8.3). Not "v2 parser OR extend v1 parser."
+- **Terminology**: "service" for built-in components via `sim_service_ops_t`,
+  "plugin" for dynamic-loaded services only (§2.1).
+- **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.
+- **Multi-radio per node is `(mote_index, radio_idx)` everywhere** (§5).
+- **Observer events distinguish UART bytes vs log lines** (§3.11).
+- **Serial-socket extracts as two services** (`serial_bridge_service` +
+  `external_command_service`), not one (§9 Phase 6).
+- **JS test engine observer callbacks route stop-requests through
+  `sim_runtime_request_stop()`**, never re-enter dispatch (§9 Phase 6).
+- **Cooja non-TUN suite (`make cooja-tests`) is a per-phase gate**; drops below
+  81/81 require explicit authorization (§10, §11.4).
+- **Determinism reproducibility check is in the broad gate** (§10).
+- **Rolling back a regressed phase is revert + follow-up branch**, not fix-
+  forward by default (§11.5).
+
 ## Doc Status
 
 This plan intentionally documents architecture direction before implementation.
 The first implementation branch should be small and behavior-preserving:
 introduce `sim_runtime_t` and wrappers, then run existing tests before moving
-radio or platform logic.
+radio or platform logic. Decisions in the §Decisions Log are binding for
+implementation patches unless updated in the same patch.
