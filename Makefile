@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto
 LDFLAGS = -lm -lpthread -flto
 
 # Auto-detect GNU Lightning
@@ -7,6 +7,7 @@ LIGHTNING_CFLAGS := $(shell pkg-config --cflags lightning 2>/dev/null)
 LIGHTNING_LIBS := $(shell pkg-config --libs lightning 2>/dev/null)
 
 COMMON_SRC_DIR = src/common
+SIM_SRC_DIR = src/sim
 MSP430_SRC_DIR = src/msp430
 ARM_SRC_DIR = src/arm
 NATIVE_SRC_DIR = src/native
@@ -15,6 +16,7 @@ LIB_SRC_DIR = lib
 TEST_DIR = test
 BUILD_DIR = build
 COMMON_BUILD_DIR = build/common
+SIM_BUILD_DIR = build/sim
 MSP430_BUILD_DIR = build/msp430
 ARM_BUILD_DIR = build/arm
 NATIVE_BUILD_DIR = build/native
@@ -65,6 +67,9 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/pcap_writer.c \
                  $(COMMON_SRC_DIR)/mock_sim_host.c
 
+# Simulation kernel — see docs/design/refactor-plan.md.
+SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c
+
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
                  $(NATIVE_SRC_DIR)/sim_config.c \
@@ -94,6 +99,7 @@ ifneq ($(LIGHTNING_LIBS),)
 endif
 
 COMMON_OBJECTS = $(patsubst $(COMMON_SRC_DIR)/%.c, $(COMMON_BUILD_DIR)/%.o, $(COMMON_SOURCES))
+SIM_OBJECTS = $(patsubst $(SIM_SRC_DIR)/%.c, $(SIM_BUILD_DIR)/%.o, $(SIM_SOURCES))
 OBJECTS = $(patsubst $(MSP430_SRC_DIR)/%.c, $(MSP430_BUILD_DIR)/%.o, $(SOURCES))
 ARM_OBJECTS = $(patsubst $(ARM_SRC_DIR)/%.c, $(ARM_BUILD_DIR)/%.o, $(ARM_SOURCES))
 NATIVE_OBJECTS = $(patsubst $(NATIVE_SRC_DIR)/%.c, $(NATIVE_BUILD_DIR)/%.o, $(NATIVE_SOURCES))
@@ -142,6 +148,9 @@ $(UI_BUILD_DIR):
 $(COMMON_BUILD_DIR):
 	mkdir -p $(COMMON_BUILD_DIR)
 
+$(SIM_BUILD_DIR):
+	mkdir -p $(SIM_BUILD_DIR)
+
 $(LIB_BUILD_DIR):
 	mkdir -p $(LIB_BUILD_DIR)
 
@@ -149,6 +158,9 @@ $(QUICKJS_BUILD_DIR):
 	mkdir -p $(QUICKJS_BUILD_DIR)
 
 $(COMMON_BUILD_DIR)/%.o: $(COMMON_SRC_DIR)/%.c | $(COMMON_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(SIM_BUILD_DIR)/%.o: $(SIM_SRC_DIR)/%.c | $(SIM_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(MSP430_BUILD_DIR)/%.o: $(MSP430_SRC_DIR)/%.c | $(MSP430_BUILD_DIR)
@@ -173,7 +185,7 @@ $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 test: $(BUILD_DIR)/test_runner
@@ -205,12 +217,12 @@ configure:
 	@echo "Wrote csim.conf: CONTIKI_DIR=$(CONTIKI_DIR)"
 
 # Debug build
-debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -DDEBUG
+debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -DDEBUG
 debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
 # Profile-guided optimization (Apple Clang)
-PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native
+PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native
 PGO_LDFLAGS = -lm -lpthread
 ifneq ($(LIGHTNING_LIBS),)
   PGO_CFLAGS += $(LIGHTNING_CFLAGS) -DHAVE_LIGHTNING

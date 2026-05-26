@@ -34,6 +34,7 @@
 #include "cJSON.h"
 #include "js_test_engine.h"
 #include "sim_event_queue.h"
+#include "sim_runtime.h"
 #include "gdb_stub.h"
 #include "arm_gdb.h"
 #include "pcap_writer.h"
@@ -292,10 +293,21 @@ static tx_frame_capture_t tx_cap[MAX_NODES]; /* sender-side full-frame capture *
 static emu_rx_queue_t emu_rx_queue[MAX_NODES]; /* per-receiver frame queue */
 static int64_t emu_rx_end_ns[MAX_NODES];      /* end time of last RX for each emulated receiver */
 static int rf_byte_count = 0;
-static sim_event_queue_t sim_eq;              /* unified event queue: mote wakeups + RX byte deliveries */
 static int uart_byte_count = 0;
-static radio_medium_t radio_medium;
-static int64_t current_sim_ns = 0;
+
+/* Simulation kernel container — Phase 1 milestone 1 of the refactor (see
+ * docs/design/refactor-plan.md §3.15).  This bundles the unified event queue,
+ * the radio medium, and the current simulation time that were previously
+ * three separate file-scope globals.  The legacy names (`sim_eq`,
+ * `radio_medium`, `current_sim_ns`) are #define-aliased onto the matching
+ * runtime fields so every call site keeps compiling unchanged — a fully
+ * behavior-preserving structural reorg.  Subsequent milestones in §3.15
+ * migrate call sites onto kernel APIs (sim_runtime_now_ns, sim_schedule_*,
+ * etc.) and drop the aliases. */
+static sim_runtime_t sim_rt;
+#define sim_eq          (sim_rt.event_queue)
+#define radio_medium    (sim_rt.radio_medium)
+#define current_sim_ns  (sim_rt.now_ns)
 
 /* ============================================================
  * CSIM_TRACE_RADIO — channel + TX + filter trace for debugging
@@ -3713,6 +3725,12 @@ static int is_json_file(const char *path) {
 }
 
 int run_mixed_multinode_test(int argc, char **argv) {
+    /* Phase 1 milestone 1: initialize the sim_runtime container.  Zeros the
+     * fields and sets run_state to STOPPED.  The event-queue and
+     * radio-medium init still happen at their existing call sites below,
+     * just through the runtime fields. */
+    sim_runtime_init(&sim_rt);
+
     static const char *firmware_paths[MAX_NODES] = { NULL };
     static char firmware_bufs[MAX_NODES][256]; /* storage for config-loaded paths */
     int firmware_count = 0;
