@@ -39,6 +39,11 @@ typedef struct {
     int      sender_idx;
     uint8_t  byte;
     int8_t   rssi;
+    /* Generation observed at schedule time.  Dispatch drops events whose
+     * generation no longer matches the slot — see sim_runtime_event_is_current.
+     * Value 0 means "untracked" (legacy sim_eq_* direct callers); such events
+     * are never dropped by the generation check. */
+    uint32_t target_generation;
 } sim_event_t;
 
 typedef struct {
@@ -52,17 +57,29 @@ typedef struct {
 void sim_eq_init(sim_event_queue_t *q);
 
 /* Schedule a node wakeup at time_ns. Replaces any existing wakeup for
- * this node (matches Cooja scheduleNextWakeup semantics). */
+ * this node (matches Cooja scheduleNextWakeup semantics).
+ * The non-_gen variants stamp target_generation=0 ("untracked"); the _gen
+ * variants stamp the caller-provided generation so dispatch can drop
+ * stale events after slot removal/reboot. */
 void sim_eq_schedule(sim_event_queue_t *q, int node_idx, int64_t time_ns);
+void sim_eq_schedule_gen(sim_event_queue_t *q, int node_idx, int64_t time_ns,
+                          uint32_t target_generation);
 
 /* Schedule a node wakeup, but only if the new time is EARLIER than any
  * existing wakeup for this node. */
 void sim_eq_schedule_if_earlier(sim_event_queue_t *q, int node_idx, int64_t time_ns);
+void sim_eq_schedule_if_earlier_gen(sim_event_queue_t *q, int node_idx,
+                                     int64_t time_ns,
+                                     uint32_t target_generation);
 
 /* Schedule an RX byte delivery to (node_idx) at time_ns. Multiple
  * pending entries per node are allowed; never deduped. */
 void sim_eq_schedule_rx_byte(sim_event_queue_t *q, int node_idx, int sender_idx,
                              uint8_t byte, int8_t rssi, int64_t time_ns);
+void sim_eq_schedule_rx_byte_gen(sim_event_queue_t *q, int node_idx,
+                                  int sender_idx, uint8_t byte, int8_t rssi,
+                                  int64_t time_ns,
+                                  uint32_t target_generation);
 
 /* Pop the earliest event. Returns event with node_idx=-1 if empty. */
 sim_event_t sim_eq_pop(sim_event_queue_t *q);

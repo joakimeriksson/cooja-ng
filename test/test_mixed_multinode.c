@@ -3280,6 +3280,7 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
     sim_eq_remove_node(&sim_eq, idx);
+    sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
 
@@ -3335,10 +3336,13 @@ static int reboot_node(int idx) {
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
     sim_eq_remove_node(&sim_eq, idx);
+    sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
 
-    /* Destroy and reinitialize */
+    /* Destroy and reinitialize.  init_node bumps generation again — fine;
+     * what matters is that any events queued between this point and the
+     * old slot's last activity are guaranteed to miss the new generation. */
     destroy_node(idx);
     return init_node(idx, fw, node_id);
 }
