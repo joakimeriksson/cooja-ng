@@ -57,7 +57,10 @@ typedef struct sim_observer_event {
             int channel;
             int8_t rssi;
         } radio;
-        struct { const void *info; } frame;
+        struct {
+            bool is_tx;             /* true = sender side, false = receiver side */
+            const char *summary;    /* packet-analyzer summary text; NULL if none */
+        } frame;
     } u;
 } sim_observer_event_t;
 
