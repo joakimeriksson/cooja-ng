@@ -39,6 +39,15 @@ typedef struct sim_runtime {
     sim_run_state_t    run_state;     /* lifecycle state, see enum above     */
     sim_event_queue_t  event_queue;   /* unified event queue                 */
     radio_medium_t     radio_medium;  /* per-node radio routing/policy       */
+
+    /* Per-mote slot generation counters — milestone 4.  Bumped on mote
+     * remove/reboot via sim_runtime_bump_mote_generation().  The sim_schedule_*
+     * wrappers stamp the current generation onto each event; dispatchers call
+     * sim_runtime_event_is_current() to drop stale events.  Initial value is
+     * 1, so legacy events with target_generation==0 (untracked) never match
+     * the slot and are never dropped by the generation check — they are
+     * dispatched as before. */
+    uint32_t           mote_generation[SIM_EQ_MAX_NODES];
 } sim_runtime_t;
 
 /* Zero-initialize the runtime; does NOT init the event queue or radio medium
@@ -81,10 +90,40 @@ void sim_schedule_radio_byte(sim_runtime_t *sim, int receiver_mote,
                              int64_t time_ns);
 
 /* Drop every pending event targeting `mote_index` (wakeups + RX bytes).
- * Used on mote remove / reboot.  Milestone 4 adds generation counters
- * so most queued events become drop-on-dispatch instead — this stays as
- * the explicit-purge path. */
+ * Physical purge of the queue, used on mote remove / reboot together with
+ * sim_runtime_bump_mote_generation().  Generation-aware dispatch
+ * (sim_runtime_event_is_current) handles any late-scheduled stragglers. */
 void sim_cancel_mote_events(sim_runtime_t *sim, int mote_index);
+
+/* ============================================================
+ * Mote slot generation — milestone 4.
+ *
+ * Each mote slot has a monotonic generation counter that bumps every time
+ * the slot is removed/rebooted.  Events scheduled via the sim_schedule_*
+ * wrappers carry the generation observed at schedule time
+ * (target_generation in sim_event_t).  Dispatchers must call
+ * sim_runtime_event_is_current() before executing a popped event and skip
+ * any that no longer match.
+ *
+ * Generation 0 is reserved for "untracked" events scheduled directly via
+ * sim_eq_* without going through the wrappers.  These are never dropped
+ * by the check (the runner's pre-milestone-5 call sites still take this
+ * path, so this is the compatibility escape).
+ * ============================================================ */
+
+/* Current generation for mote_index, or 0 if out of range. */
+uint32_t sim_runtime_mote_generation(const sim_runtime_t *sim, int mote_index);
+
+/* Bump the generation for mote_index.  Call this from node remove/reboot
+ * paths so any stragglers (or future late-arriving events scheduled
+ * pre-bump) get filtered at dispatch. */
+void sim_runtime_bump_mote_generation(sim_runtime_t *sim, int mote_index);
+
+/* True if `ev` should still be dispatched against its target mote slot.
+ * Returns true for untracked (target_generation == 0) and for events
+ * whose stamped generation still matches the slot. */
+bool sim_runtime_event_is_current(const sim_runtime_t *sim,
+                                   const sim_event_t *ev);
 
 #ifdef __cplusplus
 }
