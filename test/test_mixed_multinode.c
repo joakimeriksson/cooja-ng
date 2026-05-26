@@ -295,19 +295,20 @@ static int64_t emu_rx_end_ns[MAX_NODES];      /* end time of last RX for each em
 static int rf_byte_count = 0;
 static int uart_byte_count = 0;
 
-/* Simulation kernel container — Phase 1 milestone 1 of the refactor (see
+/* Simulation kernel container — Phase 1 of the refactor (see
  * docs/design/refactor-plan.md §3.15).  This bundles the unified event queue,
  * the radio medium, and the current simulation time that were previously
- * three separate file-scope globals.  The legacy names (`sim_eq`,
- * `radio_medium`, `current_sim_ns`) are #define-aliased onto the matching
- * runtime fields so every call site keeps compiling unchanged — a fully
- * behavior-preserving structural reorg.  Subsequent milestones in §3.15
- * migrate call sites onto kernel APIs (sim_runtime_now_ns, sim_schedule_*,
- * etc.) and drop the aliases. */
+ * three separate file-scope globals.
+ *
+ * Milestone 1: introduce the container, alias the legacy globals.
+ * Milestone 2 (this commit): readers go through sim_runtime_now_ns(&sim_rt);
+ *   the `current_sim_ns` alias is gone.  Writers use `sim_rt.now_ns = X`
+ *   directly until milestone 3 introduces scheduling wrappers.
+ * Subsequent milestones migrate sim_eq_* / radio_medium accesses onto
+ * sim_schedule_* / radio bus APIs and drop the remaining aliases. */
 static sim_runtime_t sim_rt;
 #define sim_eq          (sim_rt.event_queue)
 #define radio_medium    (sim_rt.radio_medium)
-#define current_sim_ns  (sim_rt.now_ns)
 
 /* ============================================================
  * CSIM_TRACE_RADIO — channel + TX + filter trace for debugging
@@ -333,7 +334,7 @@ int csim_radio_trace_enabled(void) {
 #define RTRACE(fmt, ...) do { \
     if (csim_radio_trace_enabled()) \
         fprintf(stderr, "[t=%.6fs] " fmt "\n", \
-                (double)current_sim_ns / 1e9, ##__VA_ARGS__); \
+                (double)sim_runtime_now_ns(&sim_rt) / 1e9, ##__VA_ARGS__); \
 } while (0)
 
 void csim_radio_trace_filter(int s, int sr, int rcv, int rr,
@@ -411,12 +412,12 @@ static const char *cc2420_state_str(cc2420_radio_state_t s) {
 
 static void trace_tsch_ack_log(const char *fmt, ...) {
     if (!trace_tsch_ack_enabled() || trace_tsch_ack_lines >= TRACE_TSCH_ACK_MAX_LINES ||
-        current_sim_ns < TRACE_TSCH_ACK_START_NS ||
-        current_sim_ns > TRACE_TSCH_ACK_END_NS)
+        sim_runtime_now_ns(&sim_rt) < TRACE_TSCH_ACK_START_NS ||
+        sim_runtime_now_ns(&sim_rt) > TRACE_TSCH_ACK_END_NS)
         return;
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "  [TRACE] %7.3f ", (double)current_sim_ns / 1e9);
+    fprintf(stderr, "  [TRACE] %7.3f ", (double)sim_runtime_now_ns(&sim_rt) / 1e9);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
@@ -484,7 +485,7 @@ static int64_t node_tx_busy_until_ns[MAX_NODES];
 static int64_t node_start_ns[MAX_NODES];  /* 0 = start immediately */
 
 static inline int node_active(int idx) {
-    return current_sim_ns >= node_start_ns[idx];
+    return sim_runtime_now_ns(&sim_rt) >= node_start_ns[idx];
 }
 
 /* --- WebSocket UI state --- */
@@ -610,7 +611,7 @@ static void update_radio_state(int idx) {
             case SIM_RADIO_INTF: etype = TL_RADIO_INTF; break;
             default:             etype = TL_RADIO_OFF;   break;
             }
-            tl_radio_event(&timeline, nodes[idx].id, current_sim_ns, etype);
+            tl_radio_event(&timeline, nodes[idx].id, sim_runtime_now_ns(&sim_rt), etype);
         }
     }
 }
@@ -634,7 +635,7 @@ static void update_led_state(int idx) {
         if (leds[l] != node_states[idx].led[l]) {
             node_states[idx].led[l] = leds[l];
             if (ui_server)
-                tl_led_event(&timeline, nodes[idx].id, current_sim_ns, l, leds[l]);
+                tl_led_event(&timeline, nodes[idx].id, sim_runtime_now_ns(&sim_rt), l, leds[l]);
         }
     }
 }
@@ -990,8 +991,8 @@ static inline int64_t byte_period_ns(bool subghz) {
 
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
     /* Cap to global sim time — no node should advance past it (Cooja invariant) */
-    if (sim_ns > current_sim_ns)
-        sim_ns = current_sim_ns;
+    if (sim_ns > sim_runtime_now_ns(&sim_rt))
+        sim_ns = sim_runtime_now_ns(&sim_rt);
     msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
     int64_t t_us = sim_ns / 1000LL;
     int64_t jump_us = 0;
@@ -1315,7 +1316,7 @@ static bool mixed_cc1200_channel_busy(void *user_data) {
     for (int k = 0; k < n; k++) {
         int j = nbrs->neighbors[k];
         if (j == idx) continue;
-        if (node_tx_busy_until_ns[j] <= current_sim_ns) continue;
+        if (node_tx_busy_until_ns[j] <= sim_runtime_now_ns(&sim_rt)) continue;
         /* Cross-band check: 2.4 GHz neighbors don't affect sub-GHz CCA. */
         int their_ch = radio_medium.nodes[j].channel;
         if (my_ch >= 0 && their_ch >= 0) {
@@ -1329,7 +1330,7 @@ static bool mixed_cc1200_channel_busy(void *user_data) {
     if (!nbrs) {
         for (int j = 0; j < num_nodes; j++) {
             if (j == idx) continue;
-            if (node_tx_busy_until_ns[j] > current_sim_ns)
+            if (node_tx_busy_until_ns[j] > sim_runtime_now_ns(&sim_rt))
                 return true;
         }
     }
@@ -1432,7 +1433,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
         /* Match Cooja's radio callbacks: outgoing bytes are observed at the
          * current scheduler time, not from a mote-local sim_time that may
          * have advanced within the current execute slice. */
-        tx_asm[sender_idx].first_byte_ns = current_sim_ns;
+        tx_asm[sender_idx].first_byte_ns = sim_runtime_now_ns(&sim_rt);
         tx_cap[sender_idx].len = 0;
     }
     /* Per-sender byte period — sub-GHz CC1200 frames take 5x longer per
@@ -1491,7 +1492,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                  * lagged the scheduler, byte_time_ns can fall in the
                  * past — sim_eq must stay monotonic. */
                 { int64_t bt = byte_time_ns;
-                  if (bt < current_sim_ns) bt = current_sim_ns;
+                  if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
                   sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
             } else {
                 rf_buffer_t *buf = &rf_pending[i];
@@ -1529,11 +1530,11 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
             if (sender_idx >= 0 && sender_idx < num_nodes &&
                 nodes[sender_idx].id == 2 && nodes[i].id == 1)
                 stat_msp_byte_push_2_to_1++;
-            /* Spread bytes by on-air timing; clamp to current_sim_ns
+            /* Spread bytes by on-air timing; clamp to sim_runtime_now_ns(&sim_rt)
              * to keep the queue monotonic when byte_time_ns falls
              * behind scheduler. */
             { int64_t bt = byte_time_ns;
-              if (bt < current_sim_ns) bt = current_sim_ns;
+              if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
               sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
         } else {
             rf_buffer_t *buf = &rf_pending[i];
@@ -1608,7 +1609,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
      * path sees (which is what trips the receiver's MARC_RX gating). */
     int64_t busy_until = accurate_tx_end;
     if (tx_asm[sender_idx].subghz)
-        busy_until = current_sim_ns + frame_air_dur;
+        busy_until = sim_runtime_now_ns(&sim_rt) + frame_air_dur;
     if (busy_until > node_tx_busy_until_ns[sender_idx])
         node_tx_busy_until_ns[sender_idx] = busy_until;
 
@@ -1712,7 +1713,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
     if (verbose) {
         fprintf(stderr, "  [RF] Node %d TX frame (%d bytes) @ %.3f s -> receivers:",
                 nodes[sender_idx].id, tx_asm[sender_idx].expected_len,
-                (double)current_sim_ns / 1e9);
+                (double)sim_runtime_now_ns(&sim_rt) / 1e9);
         for (int i = 0; i < num_nodes; i++) {
             if (i == sender_idx || nodes[i].type == NODE_NATIVE || !node_active(i))
                 continue;
@@ -1773,8 +1774,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
         int64_t coll_start = accurate_tx_start;
         int64_t coll_end = accurate_tx_end;
         if (tx_asm[sender_idx].subghz) {
-            coll_start = current_sim_ns;
-            coll_end = current_sim_ns + frame_air_dur;
+            coll_start = sim_runtime_now_ns(&sim_rt);
+            coll_end = sim_runtime_now_ns(&sim_rt) + frame_air_dur;
         }
 
         /* Collision check: does this frame overlap with a previously
@@ -1822,7 +1823,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
              * for many seconds.  Anchor sub-GHz delivery to current_sim_ns
              * so the receiver's wake-up event is always near "now". */
             int64_t delivery_start = tx_asm[sender_idx].subghz
-                ? current_sim_ns : accurate_tx_start;
+                ? sim_runtime_now_ns(&sim_rt) : accurate_tx_start;
             if (trace_tsch_ack_enabled() &&
                 sender->type == NODE_MSP430 && nodes[sender_idx].id == 2 &&
                 nodes[i].type == NODE_MSP430 && nodes[i].id == 1 &&
@@ -1910,8 +1911,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
      * as collided if a TX-range or interference-range neighbor transmitted. */
     if (radio_medium.type != RADIO_MEDIUM_NONE) {
         neighbor_list_t *inl = &radio_medium.interference_neighbors[sender_idx];
-        int64_t int_start = current_sim_ns;
-        int64_t int_end = current_sim_ns + TIME_STEP_NS;
+        int64_t int_start = sim_runtime_now_ns(&sim_rt);
+        int64_t int_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) continue;  /* native handled elsewhere */
@@ -1950,7 +1951,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 
     stat_rf_frames++;
     channels_dirty = true;  /* TX happened, channels may have changed */
-    node_last_tx_ns[sender_idx] = current_sim_ns;
+    node_last_tx_ns[sender_idx] = sim_runtime_now_ns(&sim_rt);
     /* Native sender: snap current channel into the medium before the
      * neighbour-loop filter calls. */
     sync_native_node_channel(sender_idx);
@@ -1974,18 +1975,18 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                         /* Set packet timestamp (TSCH uses this for sync) */
                         if (rcv->simLastPacketTimestamp)
                             *rcv->simLastPacketTimestamp =
-                                (uint64_t)(current_sim_ns / 1000LL);
+                                (uint64_t)(sim_runtime_now_ns(&sim_rt) / 1000LL);
                     } else {
                         native_deliver_frame(rcv, frame, len,
-                                             current_sim_ns, sender_idx);
+                                             sim_runtime_now_ns(&sim_rt), sender_idx);
                     }
                     stat_rx_frames_queued++;
                 }
             } else if (nodes[i].type == NODE_JS) {
                 if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
                     js_node_deliver_frame(&nodes[i].plat.js, frame, len,
-                                          current_sim_ns);
-                    sim_eq_schedule_if_earlier(&sim_eq, i, current_sim_ns);
+                                          sim_runtime_now_ns(&sim_rt));
+                    sim_eq_schedule_if_earlier(&sim_eq, i, sim_runtime_now_ns(&sim_rt));
                     stat_rx_frames_queued++;
                 }
             }
@@ -1994,7 +1995,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 
         /* Interference-range neighbors: mark overlapping frames as collided */
         neighbor_list_t *inl = &radio_medium.interference_neighbors[sender_idx];
-        int64_t tx_start = current_sim_ns;
+        int64_t tx_start = sim_runtime_now_ns(&sim_rt);
         int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
@@ -2032,12 +2033,12 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                 if (q->count >= NATIVE_RX_QUEUE_SIZE)
                     stat_rx_frames_queue_full++;
                 native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                     current_sim_ns, sender_idx);
+                                     sim_runtime_now_ns(&sim_rt), sender_idx);
                 stat_rx_frames_queued++;
             } else if (nodes[i].type == NODE_JS) {
                 js_node_deliver_frame(&nodes[i].plat.js, frame, len,
-                                      current_sim_ns);
-                sim_eq_schedule_if_earlier(&sim_eq, i, current_sim_ns);
+                                      sim_runtime_now_ns(&sim_rt));
+                sim_eq_schedule_if_earlier(&sim_eq, i, sim_runtime_now_ns(&sim_rt));
                 stat_rx_frames_queued++;
             }
         }
@@ -2051,7 +2052,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 static void mixed_deliver_rf_bytes(int idx) {
     rf_buffer_t *buf = &rf_pending[idx];
     if (buf->count == 0) return;
-    emu_deliver_bytes(idx, buf->bytes, buf->count, 0, current_sim_ns,
+    emu_deliver_bytes(idx, buf->bytes, buf->count, 0, sim_runtime_now_ns(&sim_rt),
                       /*subghz=*/false);
     buf->count = 0;
 }
@@ -2101,8 +2102,8 @@ static void emu_rx_queue_drain(int idx) {
          * with a future arrival_ns (192µs turnaround past the data
          * frame's tx-end) still advance the receiver's CPU forward
          * by the turnaround before bytes hit the radio. */
-        int64_t deliver_ns = f->arrival_ns > current_sim_ns
-                                ? f->arrival_ns : current_sim_ns;
+        int64_t deliver_ns = f->arrival_ns > sim_runtime_now_ns(&sim_rt)
+                                ? f->arrival_ns : sim_runtime_now_ns(&sim_rt);
         emu_deliver_bytes(idx, f->data, f->len, f->rssi, deliver_ns,
                           f->subghz);
         stat_emu_rx_drained++;
@@ -2439,7 +2440,7 @@ static void threaded_rf_tx_handler(void *user_data, uint8_t byte) {
     node_thread_state_t *ts = &thread_state[sender_idx];
     ts->rf_byte_count++;
     ts->channels_dirty = true;
-    ts->last_tx_ns = current_sim_ns;
+    ts->last_tx_ns = sim_runtime_now_ns(&sim_rt);
 
     rf_outgoing_t *out = &rf_outgoing[sender_idx];
     if (out->count < RF_BUF_SIZE)
@@ -2456,7 +2457,7 @@ static void threaded_rf_frame_handler(void *user_data, const uint8_t *frame, int
     node_thread_state_t *ts = &thread_state[sender_idx];
     ts->rf_frame_count++;
     ts->channels_dirty = true;
-    ts->last_tx_ns = current_sim_ns;
+    ts->last_tx_ns = sim_runtime_now_ns(&sim_rt);
 
     frame_outgoing_t *out = &frame_outgoing[sender_idx];
     if (out->count < MAX_OUTGOING_FRAMES && len <= 128) {
@@ -2535,8 +2536,8 @@ static void distribute_rf_outgoing(void) {
                         rf_buffer_t *buf = &rf_pending[i];
                         if (buf->count == 0 || nodes[i].type == NODE_NATIVE)
                             continue;
-                        int64_t tx_start = current_sim_ns;
-                        int64_t tx_end = current_sim_ns + TIME_STEP_NS;
+                        int64_t tx_start = sim_runtime_now_ns(&sim_rt);
+                        int64_t tx_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
 
                         /* Collision check against previously delivered frame */
                         if (tx_start < emu_rx_end_ns[i]) {
@@ -2566,7 +2567,7 @@ static void distribute_rf_outgoing(void) {
 
                     /* Flush auto-ACK bytes generated by this delivery */
                     {
-                        int64_t native_ack_start = current_sim_ns + 192000LL;
+                        int64_t native_ack_start = sim_runtime_now_ns(&sim_rt) + 192000LL;
                         for (int j = 0; j < num_nodes; j++) {
                             if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
                                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
@@ -2575,8 +2576,8 @@ static void distribute_rf_outgoing(void) {
                                                       -50, native_ack_start, /*subghz=*/false);
                                 else
                                     emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                                      -50, current_sim_ns,
-                                                      current_sim_ns + TIME_STEP_NS,
+                                                      -50, sim_runtime_now_ns(&sim_rt),
+                                                      sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS,
                                                       /*subghz=*/false);
                                 rf_pending[j].count = 0;
                             }
@@ -2586,8 +2587,8 @@ static void distribute_rf_outgoing(void) {
                     /* Interference check for emulated nodes */
                     if (radio_medium.type != RADIO_MEDIUM_NONE) {
                         neighbor_list_t *inl = &radio_medium.interference_neighbors[sender];
-                        int64_t int_start = current_sim_ns;
-                        int64_t int_end = current_sim_ns + TIME_STEP_NS;
+                        int64_t int_start = sim_runtime_now_ns(&sim_rt);
+                        int64_t int_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
                         for (int n = 0; n < inl->count; n++) {
                             int i = inl->neighbors[n];
                             if (nodes[i].type == NODE_NATIVE) continue;
@@ -2627,14 +2628,14 @@ static void distribute_rf_outgoing(void) {
                             if (q->count >= NATIVE_RX_QUEUE_SIZE)
                                 stat_rx_frames_queue_full++;
                             native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                                 current_sim_ns, sender);
+                                                 sim_runtime_now_ns(&sim_rt), sender);
                             stat_rx_frames_queued++;
                         }
                     }
                 }
                 /* Interference collision detection */
                 neighbor_list_t *inl = &radio_medium.interference_neighbors[sender];
-                int64_t tx_start = current_sim_ns;
+                int64_t tx_start = sim_runtime_now_ns(&sim_rt);
                 int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
                 for (int n = 0; n < inl->count; n++) {
                     int i = inl->neighbors[n];
@@ -2669,7 +2670,7 @@ static void distribute_rf_outgoing(void) {
                         if (q->count >= NATIVE_RX_QUEUE_SIZE)
                             stat_rx_frames_queue_full++;
                         native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                             current_sim_ns, sender);
+                                             sim_runtime_now_ns(&sim_rt), sender);
                         stat_rx_frames_queued++;
                     }
                 }
@@ -2706,11 +2707,11 @@ static void flush_pending_output(void) {
             int nidx = ts->node_idx[l];
             int nid = ts->node_id[l];
             if (verbose)
-                printf("  %7.3f [Node %d/%s] %s\n", (double)current_sim_ns / 1e9,
+                printf("  %7.3f [Node %d/%s] %s\n", (double)sim_runtime_now_ns(&sim_rt) / 1e9,
                        nid, node_type_str(nidx), ts->lines[l]);
-            test_check_line(nid, ts->lines[l], current_sim_ns);
+            test_check_line(nid, ts->lines[l], sim_runtime_now_ns(&sim_rt));
             if (ui_server)
-                ui_add_console_line(nidx, current_sim_ns, ts->lines[l]);
+                ui_add_console_line(nidx, sim_runtime_now_ns(&sim_rt), ts->lines[l]);
         }
         ts->count = 0;
     }
@@ -3572,7 +3573,7 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
 
 /* Schedule an emulated node's next wakeup */
 static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
-    /* Use current_sim_ns as the wall-clock baseline. cpu->sim_time_ns is
+    /* Use sim_runtime_now_ns(&sim_rt) as the wall-clock baseline. cpu->sim_time_ns is
      * cycle-derived and gets transiently rolled back inside execute_events
      * callbacks (the cpu's sim_time_ns is recomputed from cycles each time
      * an event fires, even when the surrounding tick had pinned it to the
@@ -3586,16 +3587,16 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
     if (emu_rx_queue[idx].count > 0) {
         /* Match Cooja requestImmediateWakeup(): re-run the mote at the
          * current simulation time, not one microsecond later. */
-        next = current_sim_ns;
+        next = sim_runtime_now_ns(&sim_rt);
         sim_eq_schedule_if_earlier(eq, idx, next);
         return;
     }
     if (nodes[idx].type == NODE_ARM) {
         arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
         if (cpu->next_event_cycle <= cpu->cycles)
-            next = current_sim_ns;
+            next = sim_runtime_now_ns(&sim_rt);
         else
-            next = current_sim_ns + arm_cycles_to_ns(
+            next = sim_runtime_now_ns(&sim_rt) + arm_cycles_to_ns(
                 cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
     } else {
         msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
@@ -3603,9 +3604,9 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
              cpu->serviced_interrupt == -1 &&
              cpu->interrupt_max >= 0) ||
             cpu->next_event_cycle <= cpu->cycles) {
-            next = current_sim_ns;
+            next = sim_runtime_now_ns(&sim_rt);
         } else {
-            next = current_sim_ns + msp430_cycles_to_ns(
+            next = sim_runtime_now_ns(&sim_rt) + msp430_cycles_to_ns(
                 cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
         }
     }
@@ -4348,7 +4349,7 @@ sim_restart:
             if (max_ns <= sim_ns) max_ns = sim_ns + 1000;  /* min 1µs advance */
             sim_ns = max_ns;
         }
-        current_sim_ns = sim_ns;
+        sim_rt.now_ns = sim_ns;
 
         /* Cooja model: each node schedules its own next wakeup via sim_eq.
          * No explicit "step all nodes" — the event queue ensures all active
@@ -4681,7 +4682,7 @@ sim_restart:
                 /* Match Cooja's simulation.getSimulationTime(): callbacks
                  * fired from the current event observe the exact event time,
                  * not the coarser outer stepping horizon. */
-                current_sim_ns = next_ev_time;
+                sim_rt.now_ns = next_ev_time;
                 if (trace_event_spin_enabled()) {
                     if (next_ev_time == spin_trace_time_ns) {
                         spin_trace_count++;
@@ -5071,7 +5072,7 @@ sim_restart:
         /* Reset all global state */
         rf_byte_count = 0;
         uart_byte_count = 0;
-        current_sim_ns = 0;
+        sim_rt.now_ns = 0;
         sim_eq_init(&sim_eq);
         stat_rf_frames = 0;
         stat_emu_rx_direct = 0;
