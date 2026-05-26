@@ -540,6 +540,67 @@ static sim_node_state_t prev_node_states[MAX_NODES]; /* previous delta state for
 static int64_t prev_last_tx_ns[MAX_NODES];           /* previous TX timestamps for change detection */
 static int suppress_state_callback = 0; /* suppress during synchronous delivery */
 
+/* Timeline observer — Phase 1 milestone 7.  Subscribed to the runtime via
+ * sim_runtime_subscribe() at startup; translates each kernel-emitted
+ * sim_observer_event_t into the equivalent tl_*_event() call.
+ *
+ * This commit migrates the frame-level events (TX/RX start/end,
+ * interference, packet frame, LED change).  The two radio-state-tracking
+ * call sites in update_radio_state() still call tl_radio_event() directly
+ * because they emit chip-state transitions (ON/OFF/INTF/TX/RX) that
+ * don't have a clean 1:1 mapping to the plan's START/END observer kinds. */
+static void timeline_observer_cb(void *user, const sim_observer_event_t *ev) {
+    timeline_t *tl = (timeline_t *)user;
+    if (!tl || ev->mote_index < 0 || ev->mote_index >= MAX_NODES) return;
+    int node_id = nodes[ev->mote_index].id;
+    switch (ev->kind) {
+    case SIM_OBS_RADIO_TX_START:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_TX);   break;
+    case SIM_OBS_RADIO_TX_END:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_ON);   break;
+    case SIM_OBS_RADIO_RX_START:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_RX);   break;
+    case SIM_OBS_RADIO_RX_END:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_ON);   break;
+    case SIM_OBS_RADIO_INTERFERENCE:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_INTF); break;
+    case SIM_OBS_LED_CHANGED:
+        tl_led_event(tl, node_id, ev->time_ns,
+                     ev->u.led.led_index, ev->u.led.on ? 1 : 0);  break;
+    case SIM_OBS_PACKET_FRAME:
+        tl_frame_event(tl, node_id, ev->time_ns,
+                       ev->u.frame.is_tx ? 1 : 0,
+                       ev->u.frame.summary);                       break;
+    default:
+        break;
+    }
+}
+
+/* Helpers to keep the call-site changes one-liners and visually close to the
+ * legacy tl_*_event() forms they replace. */
+static inline void emit_radio_obs(int mote_index, int64_t time_ns,
+                                   sim_observer_kind_t kind) {
+    sim_observer_event_t ev = { .kind = kind, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = 0 };
+    sim_runtime_emit(&sim_rt, &ev);
+}
+static inline void emit_frame_obs(int mote_index, int64_t time_ns,
+                                   bool is_tx, const char *summary) {
+    sim_observer_event_t ev = { .kind = SIM_OBS_PACKET_FRAME, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = 0 };
+    ev.u.frame.is_tx = is_tx;
+    ev.u.frame.summary = summary;
+    sim_runtime_emit(&sim_rt, &ev);
+}
+static inline void emit_led_obs(int mote_index, int64_t time_ns,
+                                 int led_index, bool on) {
+    sim_observer_event_t ev = { .kind = SIM_OBS_LED_CHANGED, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = -1 };
+    ev.u.led.led_index = led_index;
+    ev.u.led.on = on;
+    sim_runtime_emit(&sim_rt, &ev);
+}
+
 /* RF state change callback — fires during CPU step for real-time timeline tracking.
  * TX and RX events are handled by explicit timeline events in the TX/delivery
  * handlers (with proper frame duration). This callback handles radio ON/OFF
@@ -635,7 +696,7 @@ static void update_led_state(int idx) {
         if (leds[l] != node_states[idx].led[l]) {
             node_states[idx].led[l] = leds[l];
             if (ui_server)
-                tl_led_event(&timeline, nodes[idx].id, sim_runtime_now_ns(&sim_rt), l, leds[l]);
+                emit_led_obs(idx, sim_runtime_now_ns(&sim_rt), l, leds[l] ? true : false);
         }
     }
 }
@@ -1044,8 +1105,8 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
      * (derived from the sender's TX timing) for consistency. */
     if (ui_server && len > 0) {
         int64_t rx_dur = (int64_t)len * byte_ns;
-        tl_radio_event(&timeline, nodes[idx].id, air_time_ns, TL_RADIO_RX);
-        tl_radio_event(&timeline, nodes[idx].id, air_time_ns + rx_dur, TL_RADIO_ON);
+        emit_radio_obs(idx, air_time_ns, SIM_OBS_RADIO_RX_START);
+        emit_radio_obs(idx, air_time_ns + rx_dur, SIM_OBS_RADIO_RX_END);
         node_states[idx].radio_state = SIM_RADIO_ON;
     }
     if (nodes[idx].type == NODE_MSP430) {
@@ -1625,8 +1686,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
 
     /* Emit explicit TX timeline event */
     if (ui_server) {
-        tl_radio_event(&timeline, nodes[sender_idx].id, accurate_tx_start, TL_RADIO_TX);
-        tl_radio_event(&timeline, nodes[sender_idx].id, accurate_tx_end, TL_RADIO_ON);
+        emit_radio_obs(sender_idx, accurate_tx_start, SIM_OBS_RADIO_TX_START);
+        emit_radio_obs(sender_idx, accurate_tx_end,   SIM_OBS_RADIO_TX_END);
         node_states[sender_idx].radio_state = SIM_RADIO_ON;
     }
 
@@ -1685,8 +1746,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                 }
             }
             if (ui_server)
-                tl_frame_event(&timeline, nodes[sender_idx].id,
-                               accurate_tx_start, 1, pinfo.summary);
+                emit_frame_obs(sender_idx, accurate_tx_start, true,
+                               pinfo.summary);
         }
     }
 
@@ -1792,8 +1853,11 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
             /* Emit interference event on the receiver's timeline */
             if (ui_server) {
                 int64_t intf_dur = (int64_t)frame_snap_len[i] * sender_byte_ns;
-                tl_radio_event(&timeline, nodes[i].id, accurate_tx_start, TL_RADIO_INTF);
-                tl_radio_event(&timeline, nodes[i].id, accurate_tx_start + intf_dur, TL_RADIO_ON);
+                emit_radio_obs(i, accurate_tx_start, SIM_OBS_RADIO_INTERFERENCE);
+                /* Pair the interference with an RX_END to clear the lane back
+                 * to TL_RADIO_ON — same semantics as the legacy direct call. */
+                emit_radio_obs(i, accurate_tx_start + intf_dur,
+                               SIM_OBS_RADIO_RX_END);
             }
             continue;
         }
@@ -1855,8 +1919,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                     pkt_info_t rxinfo;
                     pkt_analyze(frame_snap[i] + fstart,
                                 frame_snap_len[i] - fstart, &rxinfo);
-                    tl_frame_event(&timeline, nodes[i].id,
-                                   accurate_tx_start, 0, rxinfo.summary);
+                    emit_frame_obs(i, accurate_tx_start, false, rxinfo.summary);
                 }
             }
         } else {
@@ -1879,8 +1942,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                     /* ACKs follow the same PHY as the data frame they
                      * acknowledge — CC1200 ACK = sub-GHz timing too. */
                     int64_t ack_dur = (int64_t)rf_pending[j].count * sender_byte_ns;
-                    tl_radio_event(&timeline, nodes[i].id, ack_start, TL_RADIO_TX);
-                    tl_radio_event(&timeline, nodes[i].id, ack_start + ack_dur, TL_RADIO_ON);
+                    emit_radio_obs(i, ack_start, SIM_OBS_RADIO_TX_START);
+                    emit_radio_obs(i, ack_start + ack_dur, SIM_OBS_RADIO_TX_END);
                     ack_tx_emitted = 1;
                 }
                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
@@ -4069,6 +4132,10 @@ sim_restart:
 
     /* Initialize timeline and node state tracking */
     tl_init(&timeline);
+    /* Milestone 7: timeline becomes the first observer subscriber.  All
+     * frame-level / LED / interference events now flow through
+     * sim_runtime_emit() instead of direct tl_*_event() calls. */
+    sim_runtime_subscribe(&sim_rt, timeline_observer_cb, &timeline);
     memset(node_states, 0, sizeof(node_states));
     memset(prev_node_states, 0, sizeof(prev_node_states));
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
