@@ -93,3 +93,47 @@ bool sim_runtime_event_is_current(const sim_runtime_t *sim,
     if (ev->node_idx < 0 || ev->node_idx >= SIM_EQ_MAX_NODES) return true;
     return ev->target_generation == sim->mote_generation[ev->node_idx];
 }
+
+/* ============================================================
+ * Observer subscriptions — milestone 6.  Fan-out is a simple linear
+ * walk; subscriber count is bounded by SIM_RUNTIME_MAX_OBSERVERS.
+ *
+ * Unsubscribe writes NULL to the slot; emit skips NULL slots.  Slots
+ * are never compacted, so handles stay stable across the lifetime of
+ * the runtime — important if a service stashes its handle for later.
+ * ============================================================ */
+
+int sim_runtime_subscribe(sim_runtime_t *sim,
+                          sim_observer_callback_t cb, void *user) {
+    if (!sim || !cb) return -1;
+    /* Reuse first empty slot ≤ observer_count, else append. */
+    for (int i = 0; i < sim->observer_count; i++) {
+        if (sim->observers[i].cb == NULL) {
+            sim->observers[i].cb = cb;
+            sim->observers[i].user = user;
+            return i;
+        }
+    }
+    if (sim->observer_count >= SIM_RUNTIME_MAX_OBSERVERS) return -1;
+    int h = sim->observer_count++;
+    sim->observers[h].cb = cb;
+    sim->observers[h].user = user;
+    return h;
+}
+
+void sim_runtime_unsubscribe(sim_runtime_t *sim, int handle) {
+    if (!sim || handle < 0 || handle >= sim->observer_count) return;
+    sim->observers[handle].cb = NULL;
+    sim->observers[handle].user = NULL;
+}
+
+void sim_runtime_emit(sim_runtime_t *sim, const sim_observer_event_t *ev) {
+    if (!sim || !ev) return;
+    /* Snapshot count so a callback subscribing mid-emission doesn't get
+     * called for the event that triggered its subscription. */
+    int count = sim->observer_count;
+    for (int i = 0; i < count; i++) {
+        sim_observer_callback_t cb = sim->observers[i].cb;
+        if (cb) cb(sim->observers[i].user, ev);
+    }
+}

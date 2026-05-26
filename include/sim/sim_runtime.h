@@ -19,6 +19,7 @@
 
 #include "radio_medium.h"
 #include "sim_event_queue.h"
+#include "sim_observer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +49,17 @@ typedef struct sim_runtime {
      * the slot and are never dropped by the generation check — they are
      * dispatched as before. */
     uint32_t           mote_generation[SIM_EQ_MAX_NODES];
+
+    /* Observer subscribers — milestone 6.  Up to SIM_RUNTIME_MAX_OBSERVERS
+     * services subscribe via sim_runtime_subscribe().  Fan-out happens in
+     * sim_runtime_emit() in insertion order.  Empty array today; milestone
+     * 7 wires timeline as the first subscriber. */
+#define SIM_RUNTIME_MAX_OBSERVERS 16
+    struct {
+        sim_observer_callback_t cb;
+        void                   *user;
+    }                  observers[SIM_RUNTIME_MAX_OBSERVERS];
+    int                observer_count;
 } sim_runtime_t;
 
 /* Zero-initialize the runtime; does NOT init the event queue or radio medium
@@ -124,6 +136,34 @@ void sim_runtime_bump_mote_generation(sim_runtime_t *sim, int mote_index);
  * whose stamped generation still matches the slot. */
 bool sim_runtime_event_is_current(const sim_runtime_t *sim,
                                    const sim_event_t *ev);
+
+/* ============================================================
+ * Observer subscriptions — milestone 6.
+ *
+ * Services subscribe a `(callback, user)` pair.  On every kernel emission
+ * the callback fires with a `const sim_observer_event_t *` whose payload
+ * is stack-allocated by the emitter; callbacks must not retain it past
+ * the call.  Callbacks must not re-enter kernel dispatch APIs (use
+ * sim_runtime_request_stop() for graceful exit).
+ *
+ * Subscription order is fan-out order.  No priority, no filtering — a
+ * service that only cares about LED events just ignores other kinds.
+ * ============================================================ */
+
+/* Subscribe.  Returns the subscriber index ≥ 0, or -1 if the table is
+ * full.  Pass the returned index back to sim_runtime_unsubscribe(). */
+int  sim_runtime_subscribe(sim_runtime_t *sim,
+                            sim_observer_callback_t cb, void *user);
+
+/* Unsubscribe.  Safe to call from inside a callback; the callback's own
+ * slot becomes empty after the current emission loop completes. */
+void sim_runtime_unsubscribe(sim_runtime_t *sim, int handle);
+
+/* Emit one observer event.  Fan-out to every subscribed callback in
+ * insertion order.  Safe to call with `observer_count == 0` — no-op.
+ * The emitter retains ownership of `ev` and any pointed-to data; the
+ * call returns before the event goes out of scope. */
+void sim_runtime_emit(sim_runtime_t *sim, const sim_observer_event_t *ev);
 
 #ifdef __cplusplus
 }
