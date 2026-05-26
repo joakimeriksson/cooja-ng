@@ -844,7 +844,7 @@ static const char *node_type_str(int idx) {
 /* Forward declarations */
 static void mixed_deliver_rf_bytes(int idx);
 static void step_node_until(int idx, int64_t target);
-static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx);
+static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx);
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns);
 
 /* Check available RXFIFO space for an emulated node. Firefly nodes have
@@ -969,8 +969,8 @@ static void deliver_msp430_rx_byte(const sim_event_t *ev) {
          * execute(t, 0) first, then receivedByte(), then a same-time mote
          * wakeup request. Also retain the next wakeup returned by execute. */
         int64_t next_ns = ev->time_ns + returned_us * 1000LL;
-        sim_eq_schedule_if_earlier(&sim_eq, ev->node_idx, next_ns);
-        sim_eq_schedule_if_earlier(&sim_eq, ev->node_idx, ev->time_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, next_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, ev->time_ns);
     }
 }
 
@@ -1101,7 +1101,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         /* Request immediate wakeup after the delivered byte burst so the
          * receiver gets CPU time to process FIFOP/ISR work. */
         if (num_threads == 0) {
-            sim_eq_schedule_if_earlier(&sim_eq, idx, last_byte_ns);
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
         }
     } else if (nodes[idx].type == NODE_ARM) {
         /* Mirror the MSP430 RX path: pre-sync the receiver to the byte's
@@ -1162,7 +1162,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         }
 
         if (num_threads == 0) {
-            sim_eq_schedule_if_earlier(&sim_eq, idx, last_byte_ns);
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
         }
     }
 }
@@ -1493,7 +1493,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                  * past — sim_eq must stay monotonic. */
                 { int64_t bt = byte_time_ns;
                   if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
-                  sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
+                  sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt); }
             } else {
                 rf_buffer_t *buf = &rf_pending[i];
                 if (buf->count < RF_BUF_SIZE)
@@ -1535,7 +1535,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
              * behind scheduler. */
             { int64_t bt = byte_time_ns;
               if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
-              sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
+              sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt); }
         } else {
             rf_buffer_t *buf = &rf_pending[i];
             if (buf->count < RF_BUF_SIZE)
@@ -1936,7 +1936,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
      * rather than a coarse fixed delay; enhanced ACK reception depends
      * on the sender re-entering RX on the normal CC2420 turnaround path. */
     if (nodes[sender_idx].type == NODE_MSP430 && num_threads == 0) {
-        schedule_emulated_wakeup(&sim_eq, sender_idx);
+        schedule_emulated_wakeup(&sim_rt, sender_idx);
     }
 }
 
@@ -1986,7 +1986,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                 if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
                     js_node_deliver_frame(&nodes[i].plat.js, frame, len,
                                           sim_runtime_now_ns(&sim_rt));
-                    sim_eq_schedule_if_earlier(&sim_eq, i, sim_runtime_now_ns(&sim_rt));
+                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_runtime_now_ns(&sim_rt));
                     stat_rx_frames_queued++;
                 }
             }
@@ -2038,7 +2038,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
             } else if (nodes[i].type == NODE_JS) {
                 js_node_deliver_frame(&nodes[i].plat.js, frame, len,
                                       sim_runtime_now_ns(&sim_rt));
-                sim_eq_schedule_if_earlier(&sim_eq, i, sim_runtime_now_ns(&sim_rt));
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_runtime_now_ns(&sim_rt));
                 stat_rx_frames_queued++;
             }
         }
@@ -2291,7 +2291,7 @@ static void ss_inject_serial(void) {
                 int64_t wake_ns = nat->sim_time_ns;
                 if (node_start_ns[ss_node_idx] > wake_ns)
                     wake_ns = node_start_ns[ss_node_idx];
-                sim_eq_schedule_if_earlier(&sim_eq, ss_node_idx, wake_ns);
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
             }
             return;
         }
@@ -2317,7 +2317,7 @@ static void ss_inject_serial(void) {
             int64_t wake_ns = nat->sim_time_ns;
             if (node_start_ns[ss_node_idx] > wake_ns)
                 wake_ns = node_start_ns[ss_node_idx];
-            sim_eq_schedule_if_earlier(&sim_eq, ss_node_idx, wake_ns);
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
         }
     } else if (node->type == NODE_MSP430) {
         /* Match MSPSim's MspSerial: inject ALL pending bytes at baud-rate
@@ -2364,7 +2364,7 @@ static void ss_inject_serial(void) {
             cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
                 cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
             if (num_threads == 0)
-                schedule_emulated_wakeup(&sim_eq, ss_node_idx);
+                schedule_emulated_wakeup(&sim_rt, ss_node_idx);
         }
     } else if (node->type == NODE_ARM) {
         cc2538_soc_t *soc = arm_platform_cc2538(&node->plat.arm);
@@ -3279,7 +3279,7 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
-    sim_eq_remove_node(&sim_eq, idx);
+    sim_cancel_mote_events(&sim_rt, idx);
     sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
@@ -3335,7 +3335,7 @@ static int reboot_node(int idx) {
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
-    sim_eq_remove_node(&sim_eq, idx);
+    sim_cancel_mote_events(&sim_rt, idx);
     sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
@@ -3518,7 +3518,7 @@ static void tick_one_native(int idx, int64_t sim_ns) {
 
 /* Schedule a native node's next wakeup in the event queue.
  * Exactly matches COOJA's ContikiClock.doActionsAfterTick(). */
-static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
+static void schedule_native_wakeup(sim_runtime_t *sim, int idx) {
     native_node_t *nat = &nodes[idx].plat.native;
     int64_t now = nat->sim_time_ns;
 
@@ -3540,7 +3540,7 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
     if (nat->radio_tx_finished) {
         next = now;
         nat->radio_tx_finished = false;
-        sim_eq_schedule_if_earlier(eq, idx, next);
+        sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
         return;
     }
     if (nat->radio_is_transmitting) {
@@ -3572,11 +3572,11 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
         if (rx_next < next) next = rx_next;
     }
 
-    sim_eq_schedule_if_earlier(eq, idx, next);
+    sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
 }
 
 /* Schedule an emulated node's next wakeup */
-static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
+static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx) {
     /* Use sim_runtime_now_ns(&sim_rt) as the wall-clock baseline. cpu->sim_time_ns is
      * cycle-derived and gets transiently rolled back inside execute_events
      * callbacks (the cpu's sim_time_ns is recomputed from cycles each time
@@ -3592,7 +3592,7 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
         /* Match Cooja requestImmediateWakeup(): re-run the mote at the
          * current simulation time, not one microsecond later. */
         next = sim_runtime_now_ns(&sim_rt);
-        sim_eq_schedule_if_earlier(eq, idx, next);
+        sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
         return;
     }
     if (nodes[idx].type == NODE_ARM) {
@@ -3614,7 +3614,7 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
                 cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
         }
     }
-    sim_eq_schedule_if_earlier(eq, idx, next);
+    sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
 }
 
 /* Check if a native node has pending work at the given sim time */
@@ -4313,7 +4313,7 @@ sim_restart:
     if (num_threads == 0) {
         for (int i = 0; i < node_count; i++) {
             if (node_start_ns[i] >= INT64_MAX) continue;  /* removed node */
-            sim_eq_schedule(&sim_eq, i, node_start_ns[i]);
+            sim_schedule_mote_wakeup(&sim_rt, i, node_start_ns[i]);
         }
     }
 
@@ -4584,7 +4584,7 @@ sim_restart:
                         node_start_ns[i] = sim_ns;
                         /* Schedule the rebooted node in the event queue
                          * so it gets ticked immediately */
-                        sim_eq_schedule_if_earlier(&sim_eq, i, sim_ns);
+                        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_ns);
                     }
                 } else if (act->type == TEST_ACTION_MOVE) {
                     for (int i = 0; i < node_count; i++) {
@@ -4713,6 +4713,13 @@ sim_restart:
 
                 sim_event_t ev = sim_eq_pop(&sim_eq);
 
+                /* Milestone 4/5 generation check: drop events whose target
+                 * slot has been removed/rebooted since the event was queued.
+                 * Untracked events (target_generation == 0) are always
+                 * allowed through — see sim_runtime_event_is_current. */
+                if (!sim_runtime_event_is_current(&sim_rt, &ev))
+                    continue;
+
                 /* RX byte deliveries: dispatch to receiver chip and continue. */
                 if (ev.kind == SIM_EV_RX_BYTE) {
                     deliver_msp430_rx_byte(&ev);
@@ -4748,14 +4755,14 @@ sim_restart:
                     js_node_step_until_ns(&nodes[i].plat.js, ev_time);
                     int64_t nxt = js_node_next_wakeup_ns(&nodes[i].plat.js);
                     if (nxt < INT64_MAX)
-                        sim_eq_schedule_if_earlier(&sim_eq, i, nxt);
+                        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, nxt);
                 } else if (nodes[i].type == NODE_NATIVE) {
                     /* Single tick at event time */
                     tick_one_native(i, ev_time);
                     sender_had_tx = native_had_tx[i];
 
                     /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
-                    schedule_native_wakeup(&sim_eq, i);
+                    schedule_native_wakeup(&sim_rt, i);
                 } else if (nodes[i].type == NODE_MSP430) {
                     /* MSP430 RF delivery is frame-assembled on the sender
                      * side and then delivered from the complete-frame path
@@ -4769,7 +4776,7 @@ sim_restart:
                     /* Match Cooja's MspMote.execute(t, 1): this slice
                      * schedules the mote's next normal wakeup itself. */
                     int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
-                    sim_eq_schedule_if_earlier(&sim_eq, i, next_ns);
+                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
                 } else {
                     /* Emulated ARM: use the same Cooja-style tick as MSP430
                      * so peripheral events are anchored to the scheduler's
@@ -4783,7 +4790,7 @@ sim_restart:
                         gdb_stub_poll(&gdb_stubs[i]);
                         if (gdb_stubs[i].halted) {
                             nodes[i].plat.arm.cpu.stopping = false;
-                            sim_eq_schedule_if_earlier(&sim_eq, i, ev_time + 1000LL);
+                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
                             /* Continue to RF delivery / next event */
                             goto arm_tick_done;
                         }
@@ -4800,7 +4807,7 @@ sim_restart:
                         nodes[i].plat.arm.cpu.stopping = false;
                         if (gdb_stubs[i].halted) {
                             /* Reschedule sooner so we poll the stub again. */
-                            sim_eq_schedule_if_earlier(&sim_eq, i, ev_time + 1000LL);
+                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
                             goto arm_tick_done;
                         }
                     }
@@ -4808,7 +4815,7 @@ sim_restart:
                     /* Match MspMote.execute(t, 1): schedule the next normal
                      * wakeup based on the step_micros lead hint. */
                     int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
-                    sim_eq_schedule_if_earlier(&sim_eq, i, next_ns);
+                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
                     arm_tick_done: ;
                 }
 
@@ -4824,7 +4831,7 @@ sim_restart:
                             *nodes[r].plat.native.simInSize > insize_before[r];
                         if (got_frame) {
                             *nodes[r].plat.native.simReceiving = 1;
-                            sim_eq_schedule_if_earlier(&sim_eq, r, ev_time);
+                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, r, ev_time);
                         }
                         /* Set signal strength on in-range neighbors so CCA
                          * detects the channel as busy. Only for nodes within
