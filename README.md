@@ -4,6 +4,11 @@ A fast, multi-architecture emulator and network simulator for Contiki-NG, writte
 
 **Status:** the full Contiki-NG Cooja test suite passes — **89 / 89** including the TUN/border-router cases.  See [Test results](#test-results).
 
+Architecture and refactor direction are tracked in
+[`docs/design/refactor-plan.md`](docs/design/refactor-plan.md), including the
+internal simulation kernel boundary, static plugin registry model, and staged
+runner extraction plan.
+
 ```
                           ┌──────────────────────────────────────────────┐
                           │             Cooja-NG test_runner             │
