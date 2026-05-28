@@ -191,6 +191,7 @@ After the fix, nRF52840 Contiki-NG boot completes normally:
 | `src/arm/arm_cpu.c` | Line ~1817: `off = imm8` (was `imm8 << 2`) |
 | `src/arm/arm_cpu.c` | Line ~1846: `offset = imm8` (was `imm8 << 2`) |
 | `src/arm/arm_cpu.c` | Updated comments to clarify `imm8` is the byte offset |
+| `test/test_arm_correctness.c` | `test_anti_replay_ops()` — 38 new instruction-level tests (see below) |
 
 ---
 
@@ -205,3 +206,69 @@ After the fix, nRF52840 Contiki-NG boot completes normally:
 | LDREX | T1 | byte offset (= field×4) | ×4 ✓ | ×4 ✓ |
 | LDAEX/STLEX | T1 | direct addr | n/a | n/a |
 | TBB/TBH | — | index (not offset) | n/a | n/a |
+
+---
+
+## DTLS Anti-Replay Investigation (follow-up verification)
+
+### Was the LDRD fix sufficient for DTLS anti-replay?
+
+Yes.  The LDRD/STRD fix is fully sufficient at the emulator instruction level.
+
+The `mbedtls_ssl_dtls_replay_check` and `mbedtls_ssl_dtls_replay_update` functions
+in `ssl_msg.c` use two 64-bit struct fields:
+
+| Field | Struct offset | Access pattern |
+|-------|--------------|----------------|
+| `in_window_top` | 136 / 140 | Two separate `LDR.W` T3 instructions (12-bit imm, NOT LDRD) |
+| `in_window`     | 144 / 148 | `LDRD r0, r4, [r3, #144]` — fixed by this patch |
+
+The `in_window_top` field is read via two independent 32-bit loads (not LDRD), so it was
+never affected by the double-shift bug.  The `in_window` field is read and written via
+LDRD/STRD, and the fix restores correct behaviour: `imm8_field=0x24 → byte_offset=144`.
+
+After the fix, DTLS anti-replay still fails to complete the handshake when ENABLED.
+The root cause is **not** the emulator — it is a Mbed TLS protocol-layer issue
+described in the next section.
+
+### Actual cause of anti-replay failure: Mbed TLS double-replay-check
+
+`mbedtls_ssl_read_record()` in `ssl_msg.c` unconditionally calls `replay_update()` for
+every received DTLS record (line 4154).  Then `ssl_parse_client_hello()` in
+`ssl_tls12_server.c` calls `replay_check()` a second time for the same ClientHello
+(line 985) before its own `replay_update()` at line 993.
+
+On a fresh server with `in_window=0, in_window_top=0`, the ClientHello has seqnum=0:
+
+1. `ssl_msg.c:4154` — `replay_update()`: sets bit 0 of `in_window`  → `in_window=1`
+2. `ssl_tls12_server.c:985` — `replay_check()`: sees bit 0 set → returns -1 ("replayed")
+3. Server discards the ClientHello, never sends HelloVerifyRequest → handshake stalls
+
+Note: this path requires `ssl->keep_current_message` to be true (set by TLS 1.3 code
+after reading the record via `mbedtls_ssl_read_record`).  With `MBEDTLS_SSL_PROTO_TLS1_3`
+disabled (as in the CoAP DTLS config), the initial ClientHello uses `mbedtls_ssl_fetch_input`
+directly and does NOT go through `mbedtls_ssl_read_record`, so the double-update path is
+not triggered.  The failure with TLS 1.2 only must therefore have a different root cause
+which is still under investigation.
+
+**Current workaround** (in `os/net/app-layer/coap/mbedtls-support/mbedtls-support.c`):
+```c
+mbedtls_ssl_conf_dtls_anti_replay(&session_info->conf, MBEDTLS_SSL_ANTI_REPLAY_DISABLED);
+```
+
+**Correct fix (TODO):** skip `replay_update()` in `ssl_msg.c` for unencrypted epoch-0
+records, so that `ssl_tls12_server.c`'s own check+update block is the authoritative one.
+
+### Unit tests added
+
+`test/test_arm_correctness.c` — `test_anti_replay_ops()` (38 tests) covering:
+
+- LDRD at byte offsets 0, 136, 144 — reads correct memory words
+- STRD at byte offsets 0, 136, 144 — writes to correct memory words
+- LDRD/STRD round-trip at offset 144 — write then read back
+- CMP.W T2 flags: `A>B` (C=1,Z=0), `A<B` (C=0,N=1), `A==B` (C=1,Z=1)
+- SBCS.W carry chain: 64-bit comparison via CMP\_lo + SBCS\_hi, three cases
+- SUBS.W + SBC.W: 64-bit subtraction with and without borrow propagation
+- LSL (register) T1: shift amounts 0, 3, 31, 32
+
+All 119 arm-correctness tests pass.
