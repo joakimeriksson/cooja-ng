@@ -614,7 +614,8 @@ static int nrf_radio_read(void *user_data, uint32_t addr) {
     nrf_radio_state_t *r = &soc->radio;
     uint32_t off = addr - NRF_RADIO_BASE;
     switch (off) {
-        case RADIO_STATE:        return (int)r->state;
+        case RADIO_STATE:
+            return (int)r->state;
         case RADIO_EVENTS_READY:        return (int)r->evt_ready;
         case RADIO_EVENTS_ADDRESS:      return (int)r->evt_address;
         case RADIO_EVENTS_PAYLOAD:      return (int)r->evt_payload;
@@ -895,7 +896,11 @@ static void nrf_rng_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF_RNG_TASKS_STOP:
             if (value == 1) rng->running = false;
             break;
-        case NRF_RNG_EVENTS_VALRDY: rng->evt_valrdy = value & 1; break;
+        case NRF_RNG_EVENTS_VALRDY:
+            /* Firmware acks VALRDY by writing 0.  If the RNG is still running,
+             * immediately re-set it — our PRNG delivers bytes instantly. */
+            rng->evt_valrdy = (value & 1) ? 1 : (rng->running ? 1 : 0);
+            break;
         case NRF_RNG_SHORTS:        rng->shorts     = value;     break;
         case NRF_RNG_INTENSET:      rng->intenset  |= value;     break;
         case NRF_RNG_INTENCLR:      rng->intenset  &= ~value;    break;
