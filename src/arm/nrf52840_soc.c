@@ -566,6 +566,9 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 /* Walk PACKETPTR, build the on-air frame, push bytes
                  * out via the TX listener (multinode harness installs
                  * one). Then fire post-TX events and return to TXIDLE. */
+                /* Drop any buffered RX bytes — they pre-date our own TX
+                 * and are stale. */
+                r->rx_incoming_len = 0;
                 r->state = NRF_RADIO_STATE_TX;
                 radio_emit_tx(soc);
                 radio_event(soc, &r->evt_address,    RADIO_INT_ADDRESS);
@@ -583,6 +586,17 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                  * nrf_radio_receive_byte). Reset the byte parser. */
                 r->state    = NRF_RADIO_STATE_RX;
                 r->rx_phase = NRF_RX_WAIT_PREAMBLE;
+                /* Drain bytes that arrived while we were not in RX
+                 * (auto-ACK landing after our own TX, before driver
+                 * finished its TXIDLE → DISABLED → RX state walk). */
+                if (r->rx_incoming_len > 0) {
+                    int len = r->rx_incoming_len;
+                    uint8_t buf[256];
+                    memcpy(buf, r->rx_incoming, (size_t)len);
+                    r->rx_incoming_len = 0;
+                    for (int i = 0; i < len; i++)
+                        nrf_radio_receive_byte(soc, buf[i]);
+                }
             }
             break;
         case RADIO_TASKS_STOP:
@@ -742,8 +756,16 @@ void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, 
  * delivers a byte to this node. */
 void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
     nrf_radio_state_t *r = &soc->radio;
-    /* Only when actually in RX. */
-    if (r->state != NRF_RADIO_STATE_RX) return;
+    /* Outside RX: buffer the byte for replay on next RX entry.  This
+     * catches auto-ACK bytes that arrive 192 µs after our own TX,
+     * before the driver has finished the TXIDLE → DISABLED → RXEN →
+     * RXIDLE → RX state walk.  Buffer is cleared on TX entry so we
+     * never carry stale bytes across a TX cycle. */
+    if (r->state != NRF_RADIO_STATE_RX) {
+        if (r->rx_incoming_len < (int)sizeof(r->rx_incoming))
+            r->rx_incoming[r->rx_incoming_len++] = byte;
+        return;
+    }
     arm_cpu_t *cpu = &soc->plat->cpu;
     /* Bounds-check PACKETPTR — must point into SRAM. */
     if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)

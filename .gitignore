@@ -23,6 +23,9 @@ __pycache__/
 # Local config
 csim.conf
 
+# Claude Code session/local-settings state (per-developer)
+.claude/
+
 # Test logs
 *.testlog
 cooja-tests*.log

@@ -149,6 +149,13 @@ typedef struct nrf_radio_state {
     int      rx_phase;         /* nrf_rx_phase_t enum */
     int      rx_remaining;
     int      rx_offset;
+    /* Cooja-style per-byte delivery: an auto-ACK arriving 192 µs after
+     * our own TX can land before the driver has flipped state back to
+     * RX.  Buffer bytes received outside RX state and replay them when
+     * the radio transitions to RX.  Cleared on TX entry so the buffer
+     * never carries stale bytes across a TX cycle. */
+    uint8_t  rx_incoming[256];
+    int      rx_incoming_len;
 } nrf_radio_state_t;
 
 /* TIMER0..4 at 0x40008000 / 0x40009000 / 0x4000A000 / 0x4001A000 / 0x4001B000.

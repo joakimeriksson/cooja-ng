@@ -283,6 +283,60 @@ typedef struct nrf54l_radio_state {
      * dance that used to happen inline at TASKS_START. */
     arm_event_t  tx_end_event;
     int          tx_end_scheduled;
+
+    /* Force-complete a deferred TASKS_DISABLE if the byte parser stalls.
+     * When the firmware triggers TASKS_DISABLE mid-frame we usually want
+     * to let the parser finish the in-flight bytes (so upper layers see
+     * the full frame — see rx_disable_pending comment above). But in a
+     * 3-node chain test, RX collisions can leave the parser stuck: the
+     * peer aborts its TX mid-frame, no more bytes arrive, the parser
+     * never fires end-of-frame, and the driver's
+     * wait_until_radio_is_disabled() busy-wait at trx.c:328 asserts
+     * after ~250 µs (MAX_RAMPDOWN_CYCLES = 50 * cpu_MHz).
+     *
+     * Real HW completes the rampdown either via end-of-frame or an
+     * internal timeout — the driver's wait loop always sees DISABLED.
+     * Mirror that here: schedule a fallback event when we set
+     * rx_disable_pending, fires ~100 µs later, and force-completes the
+     * disable if the parser hasn't already done so. */
+    arm_event_t  rx_disable_timeout_event;
+    int          rx_disable_timeout_scheduled;
+
+    /* Frame-stall watchdog. Sibling of rx_disable_timeout but for the
+     * OTHER stuck-parser path: the firmware enters the RADIO peripheral
+     * via TASKS_RXEN/START and sits in RX, waiting for an inbound frame
+     * to complete via PHYEND + the PHYEND_DISABLE SHORTS chain. If the
+     * peer aborts mid-frame the byte parser stalls in READ_PHR /
+     * READ_PAYLOAD, PHYEND never fires, the SHORTS chain never
+     * triggers, and the driver eventually enters
+     * wait_until_radio_is_disabled() with state=RX and pending=0 → the
+     * same trx.c:360 assert as the deferred-disable path, but unreachable
+     * by the rx_disable_pending mechanism because the firmware never
+     * issued an explicit TASKS_DISABLE here.
+     *
+     * Real HW recovers via signal-loss detection / preamble timeout in
+     * the analog front-end. We mirror that with a 50 µs deadline (≈ 1.5
+     * IEEE 802.15.4 byte periods) re-armed on every received byte while
+     * past WAIT_SFD. If the deadline elapses, reset the parser to
+     * WAIT_PREAMBLE and fire PHYEND so the SHORTS chain disables the
+     * radio the way real HW would. */
+    arm_event_t  rx_stall_event;
+    int          rx_stall_scheduled;
+
+    /* Deferred DISABLED-event fire. Real nRF54L15 takes ~250 ns
+     * (~32 cpu cycles) between TASKS_DISABLE triggering and EVENTS_DISABLED
+     * firing (rampdown latency). csim previously fired the event
+     * synchronously inside the TASKS_DISABLE handler, which made the IRQ
+     * pending immediately. The CPU then dispatched the IRQ before the
+     * firmware could enter wait_until_radio_is_disabled(); the IRQ
+     * handler re-armed shorts and triggered TASKS_RXEN, taking the
+     * radio back to RX. By the time the wait ran, state was RX → the
+     * trx.c:360 assert. Deferring the event a small number of cycles
+     * gives the firmware a window to enter the wait first; it reads
+     * state=DISABLED (set synchronously), returns success, and only
+     * then does the IRQ for DISABLED dispatch. */
+    arm_event_t  disabled_event_defer;
+    int          disabled_event_defer_scheduled;
 } nrf54l_radio_state_t;
 
 /* EGU (Event Generator Unit) — 16-channel software-triggerable

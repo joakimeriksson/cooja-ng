@@ -182,6 +182,10 @@ typedef struct cc2538_rfcore {
     uint8_t     rx_dsn;             /* Data Sequence Number */
     bool        rx_ack_request;     /* ACK requested in received frame */
     bool        rx_overflow;        /* RXFIFO overflowed during current frame */
+    /* FSMSTAT1.FIFOP — hardware "frame complete" signal.  Real CC2538
+     * sets it when the last byte of a frame lands in RXFIFO; cleared
+     * by ISFLUSHRX or full RXFIFO drain. */
+    bool        fifop_signal;
 
     /* RF TX callback */
     cc2538_rf_tx_fn  tx_callback;
