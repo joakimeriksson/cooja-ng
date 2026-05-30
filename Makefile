@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto -MMD -MP
 LDFLAGS = -lm -lpthread -flto
 
 # Auto-detect GNU Lightning
@@ -126,7 +126,7 @@ ifeq ($(CONTIKI_DIR),)
   CONTIKI_DIR = ../contiki-ng
 endif
 
-.PHONY: all clean test bench test-firmware test-arm cooja-tests build-firmware configure
+.PHONY: all clean test bench test-firmware test-arm cooja-tests chain-tests build-firmware configure
 
 all: $(BUILD_DIR)/test_runner
 
@@ -188,6 +188,15 @@ $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+# Auto-generated header dependencies (from -MMD). Catches the case where
+# editing a header doesn't trigger a rebuild of every TU that includes
+# it — bit us once with nrf54l_radio_state_t shifting the ficr offset
+# inside nrf54l15_soc_t after a field add, leaving test_mixed_multinode.o
+# writing per-node ficr at the OLD struct offset while the runtime read
+# handler dereferenced the NEW one (returned zeros). -include suppresses
+# the warning on the first build before any .d files exist.
+-include $(shell find $(BUILD_DIR) -name '*.d' 2>/dev/null)
+
 test: $(BUILD_DIR)/test_runner
 	./$(BUILD_DIR)/test_runner correctness -v
 
@@ -206,6 +215,14 @@ clean:
 # Run Contiki-NG Cooja test suite
 cooja-tests: $(BUILD_DIR)/test_runner
 	CONTIKI_DIR=$(CONTIKI_DIR) ./tools/run-cooja-tests.sh $(PATTERN) $(if $(VERBOSE),-v)
+
+# Run per-platform RPL-UDP chain tests (one per platform with a radio).
+# Usage:
+#   make chain-tests
+#   make chain-tests PLATFORM=sky
+#   make chain-tests PLATFORM="sky cc2538dk"
+chain-tests: $(BUILD_DIR)/test_runner
+	./tools/run-chain-tests.sh $(PLATFORM)
 
 # Build firmware for Cooja tests
 build-firmware:

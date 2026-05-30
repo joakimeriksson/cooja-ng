@@ -907,6 +907,7 @@ static void mixed_deliver_rf_bytes(int idx);
 static void step_node_until(int idx, int64_t target);
 static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx);
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns);
+static int64_t sync_arm_to_time(int idx, int64_t sim_ns);
 
 /* Check available RXFIFO space for an emulated node. Firefly nodes have
  * two radios; we report the more constrained side so back-pressure
@@ -1035,6 +1036,39 @@ static void deliver_msp430_rx_byte(const sim_event_t *ev) {
     }
 }
 
+/* ARM equivalent of deliver_msp430_rx_byte — Cooja MspMoteTimeEvent pattern:
+ * advance receiver CPU to byte's air time, feed byte to on-die radio,
+ * request immediate wakeup. */
+static void deliver_arm_rx_byte(const sim_event_t *ev) {
+    if (ev->node_idx < 0 || ev->node_idx >= num_nodes ||
+        !node_active(ev->node_idx) || nodes[ev->node_idx].type != NODE_ARM)
+        return;
+    int64_t returned_us = sync_arm_to_time(ev->node_idx, ev->time_ns);
+
+    const arm_platform_config_t *pcfg = nodes[ev->node_idx].plat.arm.config;
+    bool has_cc1200 = pcfg && pcfg->has_cc1200;
+    cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&nodes[ev->node_idx].plat.arm);
+    nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&nodes[ev->node_idx].plat.arm);
+    nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&nodes[ev->node_idx].plat.arm);
+
+    if (cc_soc) {
+        cc_soc->rfcore.rx_rssi = ev->rssi;
+        cc2538_rfcore_receive_byte(&cc_soc->rfcore, ev->byte);
+        if (has_cc1200) {
+            cc_soc->cc1200.rx_rssi = ev->rssi;
+            cc1200_receive_byte(&cc_soc->cc1200, ev->byte);
+        }
+    }
+    if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, ev->byte);
+    if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, ev->byte);
+
+    if (num_threads == 0) {
+        int64_t next_ns = ev->time_ns + returned_us * 1000LL;
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, next_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, ev->time_ns);
+    }
+}
+
 /* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
  * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. The
  * `subghz` flag set by the per-sender frame assembler picks which one
@@ -1081,6 +1115,36 @@ static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
      * than leaving peripheral event scheduling anchored to a cycle-derived
      * local time that may have drifted ahead. Keep the CPU's event-time view
      * pinned to the byte-delivery timestamp after a zero-duration sync. */
+    cpu->sim_time_ns = sim_ns;
+    cpu->last_execute_us = t_us;
+    if (deviation != 1.0 && returned_us > 0)
+        returned_us = (int64_t)((double)returned_us / deviation);
+    return returned_us;
+}
+
+/* ARM equivalent of sync_msp430_to_time — Cooja MspMoteTimeEvent.execute
+ * pattern: advance CPU to event time before feeding chip-level byte. */
+static int64_t sync_arm_to_time(int idx, int64_t sim_ns) {
+    if (sim_ns > sim_runtime_now_ns(&sim_rt))
+        sim_ns = sim_runtime_now_ns(&sim_rt);
+    arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
+    int64_t t_us = sim_ns / 1000LL;
+    int64_t jump_us = 0;
+    if (cpu->last_execute_us >= 0) {
+        jump_us = t_us - cpu->last_execute_us;
+        if (jump_us < 0) jump_us = 0;
+    }
+    double deviation = nodes[idx].clock_deviation;
+    if (deviation != 1.0 && jump_us > 0) {
+        double exact = (double)jump_us * deviation;
+        jump_us = (int64_t)exact;
+        cpu->step_cycle_remainder += exact - (double)jump_us;
+        if (cpu->step_cycle_remainder > 1.0) {
+            jump_us++;
+            cpu->step_cycle_remainder -= 1.0;
+        }
+    }
+    int64_t returned_us = arm_step_micros(cpu, jump_us, 0);
     cpu->sim_time_ns = sim_ns;
     cpu->last_execute_us = t_us;
     if (deviation != 1.0 && returned_us > 0)
@@ -1530,35 +1594,39 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                 continue;
             if (nodes[i].type == NODE_NATIVE) {
                 native_rx_assembler_feed(&nodes[i].plat.native, byte);
-            } else if (nodes[i].type == NODE_MSP430) {
-                int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
-                if (trace_tsch_ack_enabled() &&
-                    sender->type == NODE_MSP430 &&
-                    nodes[sender_idx].id == 1 && nodes[i].id == 2) {
-                    trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
-                                       byte,
-                                       cc2420_state_str(nodes[i].plat.msp.cc2420.state),
-                                       (double)nodes[i].plat.msp.cpu.sim_time_ns / 1e9);
-                }
-                /* Match Cooja CustomDataRadio delivery: each transmitted byte
-                 * is forwarded at the sender's current simulation time. */
-                stat_msp_byte_push[i]++;
-                if (sender_idx >= 0 && sender_idx < num_nodes &&
-                    nodes[sender_idx].id == 2 && nodes[i].id == 1)
-                    stat_msp_byte_push_2_to_1++;
-                /* Spread bytes by their on-air timing within the frame
-                 * (first_byte_ns + byte_index * byte_period), matching
-                 * Cooja's Msp802154Radio per-byte schedule. Clamp to
-                 * current_sim_ns: if the sender's cycle progression
-                 * lagged the scheduler, byte_time_ns can fall in the
-                 * past — sim_eq must stay monotonic. */
-                { int64_t bt = byte_time_ns;
-                  if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
-                  sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt); }
             } else {
-                rf_buffer_t *buf = &rf_pending[i];
-                if (buf->count < RF_BUF_SIZE)
-                    buf->bytes[buf->count++] = byte;
+                int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
+                if (nodes[i].type == NODE_MSP430) {
+                    if (trace_tsch_ack_enabled() &&
+                        sender->type == NODE_MSP430 &&
+                        nodes[sender_idx].id == 1 && nodes[i].id == 2) {
+                        trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
+                                           byte,
+                                           cc2420_state_str(nodes[i].plat.msp.cc2420.state),
+                                           (double)nodes[i].plat.msp.cpu.sim_time_ns / 1e9);
+                    }
+                    stat_msp_byte_push[i]++;
+                    if (sender_idx >= 0 && sender_idx < num_nodes &&
+                        nodes[sender_idx].id == 2 && nodes[i].id == 1)
+                        stat_msp_byte_push_2_to_1++;
+                }
+                /* Per-byte (Cooja Msp802154Radio.receiveCustomData) for
+                 * MSP430/CC2420 and ARM/cc2538_rfcore — both carry an
+                 * rx_incoming buffer + state guard.  nrf receivers
+                 * currently fall back to batched delivery until their
+                 * buffer/replay hook is tuned. */
+                bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
+                                   (nodes[i].type == NODE_ARM &&
+                                    arm_platform_cc2538(&nodes[i].plat.arm) != NULL);
+                if (per_byte_ok) {
+                    int64_t bt = byte_time_ns;
+                    if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
+                    sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt);
+                } else {
+                    rf_buffer_t *buf = &rf_pending[i];
+                    if (buf->count < RF_BUF_SIZE)
+                        buf->bytes[buf->count++] = byte;
+                }
             }
         }
         return;
@@ -1582,25 +1650,28 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
             continue;
         if (nodes[i].type == NODE_NATIVE) {
             native_rx_assembler_feed(&nodes[i].plat.native, byte);
-        } else if (nodes[i].type == NODE_MSP430) {
-            int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
-            /* Match Cooja CustomDataRadio delivery: per-byte receive events
-             * are scheduled at the current simulation time of the sender's
-             * transmit callback, not with an extra receiver-side byte delay. */
-            stat_msp_byte_push[i]++;
-            if (sender_idx >= 0 && sender_idx < num_nodes &&
-                nodes[sender_idx].id == 2 && nodes[i].id == 1)
-                stat_msp_byte_push_2_to_1++;
-            /* Spread bytes by on-air timing; clamp to sim_runtime_now_ns(&sim_rt)
-             * to keep the queue monotonic when byte_time_ns falls
-             * behind scheduler. */
-            { int64_t bt = byte_time_ns;
-              if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
-              sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt); }
         } else {
-            rf_buffer_t *buf = &rf_pending[i];
-            if (buf->count < RF_BUF_SIZE)
-                buf->bytes[buf->count++] = byte;
+            int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
+            if (nodes[i].type == NODE_MSP430) {
+                stat_msp_byte_push[i]++;
+                if (sender_idx >= 0 && sender_idx < num_nodes &&
+                    nodes[sender_idx].id == 2 && nodes[i].id == 1)
+                    stat_msp_byte_push_2_to_1++;
+            }
+            /* Per-byte for chips with rx_incoming buffer; batched for
+             * chips that drop bytes outside RX. */
+            bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
+                               (nodes[i].type == NODE_ARM &&
+                                arm_platform_cc2538(&nodes[i].plat.arm) != NULL);
+            if (per_byte_ok) {
+                int64_t bt = byte_time_ns;
+                if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
+                sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt);
+            } else {
+                rf_buffer_t *buf = &rf_pending[i];
+                if (buf->count < RF_BUF_SIZE)
+                    buf->bytes[buf->count++] = byte;
+            }
         }
     }
 
@@ -3136,6 +3207,65 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
             printf("  Node %d [nrf54l15]: TX listener installed, "
                    "ficr deviceid=%08x:%08x\n",
                    node_id, nrfl_soc->ficr.deviceid1, nrfl_soc->ficr.deviceid0);
+
+        /* Short-circuit platform_idle's spin loop. Contiki's
+         * arch/platform/nrf/lpm.h replaces __WFI() with a 1000-iter
+         * busy-wait NOP loop on nrf54l15 (workaround for an upstream
+         * "GRTC won't wake from WFI after soft-reset" bug). It runs
+         * inside critical_enter (PRIMASK set), so a true WFI substitute
+         * doesn't help — Cortex-M wakes on pending IRQs regardless of
+         * PRIMASK, so the loop body still executes 1000× per call.
+         * Instead, patch the trailing BLT to a NOP — the loop runs
+         * exactly one iteration and then falls through. The "tiny
+         * delay" the workaround intends is preserved in spirit;
+         * emulator throughput improves ~7×. */
+        uint32_t pi_addr = arm_elf_find_symbol(firmware_path, "platform_idle");
+        if (pi_addr) {
+            pi_addr &= ~1u;
+            /* Scan for the loop signature:
+             *   bf00 (nop)         <- start of body
+             *   9b01 (ldr r3, [sp,#4])
+             *   3301 (adds r3, #1)
+             *   9301 (str r3, [sp,#4])
+             *   9b01 (ldr r3, [sp,#4])
+             *   f5b3 7f7a (cmp.w r3, #1000)
+             *   dbf7 (blt.n back-9)  <- patch this to bf00
+             * Found at offset 0x1e from platform_idle start in the
+             * current build, but search 80 bytes to be robust. */
+            for (uint32_t off = 0; off < 80; off += 2) {
+                uint32_t a = pi_addr + off;
+                uint16_t w0 = (uint16_t)arm_read16(&plat->cpu, a);
+                uint16_t w1 = (uint16_t)arm_read16(&plat->cpu, a + 2);
+                uint16_t w2 = (uint16_t)arm_read16(&plat->cpu, a + 4);
+                if (w0 == 0xbf00 && w1 == 0x9b01 && w2 == 0x3301) {
+                    /* Patch the leading NOP to WFI AND patch the
+                     * trailing BLT to NOP. The WFI sleeps the CPU
+                     * to next event (arm_cpu's cpu_off handler now
+                     * skips ahead even with PRIMASK-masked pending
+                     * IRQs). The NOP-at-BLT ensures the loop exits
+                     * after one iteration so platform_idle returns
+                     * cleanly afterward.
+                     *
+                     * arm_write16 refuses writes into the flash
+                     * region (read-only protection against wild
+                     * pointers); poke the backing array directly. */
+                    arm_cpu_t *c = &plat->cpu;
+                    if (a >= c->flash_base && a + 16 <= c->flash_end) {
+                        uint32_t off = a - c->flash_base;
+                        c->flash[off+0]  = 0x30;  /* WFI low byte  */
+                        c->flash[off+1]  = 0xbf;  /* WFI high byte */
+                        c->flash[off+14] = 0x00;  /* NOP low byte  */
+                        c->flash[off+15] = 0xbf;  /* NOP high byte */
+                    }
+                    if (verbose)
+                        printf("  Node %d [nrf54l15]: patched "
+                               "platform_idle spin loop @ 0x%08x "
+                               "(NOP->WFI, BLT->NOP)\n",
+                               node_id, a);
+                    break;
+                }
+            }
+        }
     }
 
     arm_cpu_reset(&plat->cpu);
@@ -4787,9 +4917,15 @@ sim_restart:
                 if (!sim_runtime_event_is_current(&sim_rt, &ev))
                     continue;
 
-                /* RX byte deliveries: dispatch to receiver chip and continue. */
+                /* RX byte deliveries: dispatch to receiver chip and continue.
+                 * Cooja-style per-byte delivery — same MspMoteTimeEvent
+                 * pattern for MSP430 and ARM receivers. */
                 if (ev.kind == SIM_EV_RX_BYTE) {
-                    deliver_msp430_rx_byte(&ev);
+                    if (ev.node_idx >= 0 && ev.node_idx < node_count &&
+                        nodes[ev.node_idx].type == NODE_ARM)
+                        deliver_arm_rx_byte(&ev);
+                    else
+                        deliver_msp430_rx_byte(&ev);
                     continue;
                 }
 
@@ -5435,9 +5571,13 @@ sim_restart:
     int64_t total_node_cycles = 0;
     int64_t total_node_instructions = 0;
     for (int i = 0; i < node_count; i++) {
-        printf("  Node %d [%s]: %lld cycles, %lld instructions\n",
+        uint32_t cur_pc = 0;
+        if (nodes[i].type == NODE_MSP430)
+            cur_pc = nodes[i].plat.msp.cpu.reg[MSP430_PC];
+        printf("  Node %d [%s]: %lld cycles, %lld instructions, PC=0x%04x\n",
                nodes[i].id, node_type_str(i),
-               (long long)node_cycles(i), (long long)node_instructions(i));
+               (long long)node_cycles(i), (long long)node_instructions(i),
+               cur_pc);
         total_node_cycles += node_cycles(i);
         total_node_instructions += node_instructions(i);
         destroy_node(i);
