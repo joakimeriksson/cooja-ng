@@ -4808,6 +4808,15 @@ sim_restart:
                         }
                     }
 
+                    /* Drain any frames queued for this node (mirrors the
+                     * MSP430 path above).  For nRF52840, the pending_rx
+                     * buffer inside the radio model handles delivery when
+                     * the radio was not in RX state at delivery time; this
+                     * drain covers the emu_rx_queue path which fires when
+                     * direct delivery was deferred to a later tick. */
+                    if (emu_rx_queue[i].count > 0)
+                        emu_rx_queue_drain(i);
+
                     /* Match MspMote.execute(t, 1): schedule the next normal
                      * wakeup based on the step_micros lead hint. */
                     int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;

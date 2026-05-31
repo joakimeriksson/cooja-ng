@@ -583,6 +583,19 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                  * nrf_radio_receive_byte). Reset the byte parser. */
                 r->state    = NRF_RADIO_STATE_RX;
                 r->rx_phase = NRF_RX_WAIT_PREAMBLE;
+                /* Replay bytes that arrived while the radio was busy
+                 * (TX, CCA backoff, ACK turnaround, etc.).  Clear the
+                 * buffer BEFORE the replay loop so any auto-ACK emitted
+                 * during frame completion doesn't see stale pending data
+                 * if it re-enters this path through a SHORT chain. */
+                if (r->pending_rx_len > 0) {
+                    int n = r->pending_rx_len;
+                    uint8_t tmp[NRF_PENDING_RX_MAX];
+                    __builtin_memcpy(tmp, r->pending_rx_data, (size_t)n);
+                    r->pending_rx_len = 0;
+                    for (int pi = 0; pi < n; pi++)
+                        nrf_radio_receive_byte(soc, tmp[pi]);
+                }
             }
             break;
         case RADIO_TASKS_STOP:
@@ -743,8 +756,17 @@ void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, 
  * delivers a byte to this node. */
 void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
     nrf_radio_state_t *r = &soc->radio;
-    /* Only when actually in RX. */
-    if (r->state != NRF_RADIO_STATE_RX) return;
+    /* Only when actually in RX.
+     *
+     * When the radio is busy (TX, TXIDLE, DISABLED, RXIDLE) we buffer the
+     * incoming byte stream and replay it the next time TASKS_START fires
+     * from RXIDLE, approximating the real nRF52840's EasyDMA ring buffers
+     * which capture frames independently of the CPU's MAC state. */
+    if (r->state != NRF_RADIO_STATE_RX) {
+        if (r->pending_rx_len < NRF_PENDING_RX_MAX)
+            r->pending_rx_data[r->pending_rx_len++] = byte;
+        return;
+    }
     arm_cpu_t *cpu = &soc->plat->cpu;
     /* Bounds-check PACKETPTR — must point into SRAM. */
     if (r->packetptr < cpu->sram_base || r->packetptr + 128 > cpu->sram_end)
