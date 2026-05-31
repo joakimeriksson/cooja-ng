@@ -149,6 +149,21 @@ typedef struct nrf_radio_state {
     int      rx_phase;         /* nrf_rx_phase_t enum */
     int      rx_remaining;
     int      rx_offset;
+
+    /* Pending RX buffer: bytes delivered by the harness while the radio
+     * is not in NRF_RADIO_STATE_RX (e.g. during CSMA TX or backoff).
+     * On real nRF52840 hardware, the 802.15.4 driver configures EasyDMA
+     * ring buffers so frames are captured independently of the CPU.  In
+     * simulation the radio is half-duplex (TX blocks RX), so we buffer
+     * the raw on-air byte stream here and replay it the next time the
+     * radio enters NRF_RADIO_STATE_RX via TASKS_START.
+     *
+     * Sized for two maximum-length 802.15.4 air frames:
+     *   2 × (4 preamble + 1 SFD + 1 PHR + 127 payload) = 266 bytes, round
+     *   up to 280 for comfort. */
+#define NRF_PENDING_RX_MAX 280
+    uint8_t  pending_rx_data[NRF_PENDING_RX_MAX];
+    int      pending_rx_len;  /* 0 = empty */
 } nrf_radio_state_t;
 
 /* TIMER0..4 at 0x40008000 / 0x40009000 / 0x4000A000 / 0x4001A000 / 0x4001B000.
