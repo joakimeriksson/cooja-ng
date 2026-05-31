@@ -1,0 +1,19 @@
+{
+  "title": "C509 DTLS cross-platform: slip-radio (node 1) + nRF52840 C509 client (node 2)",
+  "timeout_ms": 600000,
+  "speed": 1.0,
+  "serial_socket": {
+    "node": 1,
+    "port": 60001
+  },
+  "nodes": [
+    {
+      "id": 1,
+      "firmware": "/home/joel/gemini_workspace/contiki-ng/examples/slip-radio/build/cooja/slip-radio.cooja"
+    },
+    {
+      "id": 2,
+      "firmware": "/home/joel/gemini_workspace/contiki-ng/examples/c509-hw-test-client-border/build/nrf52840/dk/c509-client-border.nrf52840"
+    }
+  ]
+}
