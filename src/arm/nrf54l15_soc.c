@@ -543,9 +543,17 @@ static int nrf54l_grtc_read(void *user_data, uint32_t addr) {
             uint64_t c = grtc_counter_now(grtc);
             return (int)(uint32_t)c;
         }
-        if (sub == 0x4) {  /* SYSCOUNTERH (LOADED bit at 29) */
+        if (sub == 0x4) {  /* SYSCOUNTERH — bits[19:0] VALUE, bit 30 BUSY,
+                            * bit 31 OVERFLOW. We keep BUSY=0/OVERFLOW=0
+                            * and return just the masked VALUE bits.
+                            * An earlier draft set bit 29 with a stale
+                            * "LOADED" label, but no such bit exists on
+                            * nrf54l15 silicon; firmware code that doesn't
+                            * mask the read (e.g. the Contiki
+                            * clock_arch_get_syscounter loop) would
+                            * interpret it as a ~2.3×10^18 counter. */
             uint64_t c = grtc_counter_now(grtc);
-            return (int)(((uint32_t)(c >> 32) & 0xFFFFFu) | (1u << 29));
+            return (int)((uint32_t)(c >> 32) & 0xFFFFFu);
         }
         if (sub == 0x8) return 1;  /* CAPTURE control — always ready */
         return 0;
