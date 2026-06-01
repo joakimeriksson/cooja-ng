@@ -867,6 +867,20 @@ int arm_step(arm_cpu_t *cpu, int count) {
             if (cpu->nvic) {
                 arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
                 if (nvic->has_pending) {
+                    /* IRQ pending + PRIMASK set ⇒ firmware is genuinely
+                     * idle (waiting for the critical section to exit so
+                     * the IRQ can fire). Fast-forward to the next
+                     * scheduled event provided no peripheral has
+                     * cycle-tight state in flight. */
+                    if (cpu->primask && cpu->event_queue &&
+                        cpu->wfi_skip_guard &&
+                        !cpu->wfi_skip_guard(cpu->wfi_skip_user)) {
+                        int64_t target = cpu->event_queue->fire_cycle;
+                        if (target > cpu->cycle_limit) target = cpu->cycle_limit;
+                        if (target > cpu->cycles) cpu->cycles = target;
+                        cpu->cpu_off = false;
+                        continue;
+                    }
                     cpu->cpu_off = false;
                     arm_nvic_check_pending(nvic);
                     continue;

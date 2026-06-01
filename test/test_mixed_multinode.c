@@ -3207,65 +3207,6 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
             printf("  Node %d [nrf54l15]: TX listener installed, "
                    "ficr deviceid=%08x:%08x\n",
                    node_id, nrfl_soc->ficr.deviceid1, nrfl_soc->ficr.deviceid0);
-
-        /* Short-circuit platform_idle's spin loop. Contiki's
-         * arch/platform/nrf/lpm.h replaces __WFI() with a 1000-iter
-         * busy-wait NOP loop on nrf54l15 (workaround for an upstream
-         * "GRTC won't wake from WFI after soft-reset" bug). It runs
-         * inside critical_enter (PRIMASK set), so a true WFI substitute
-         * doesn't help — Cortex-M wakes on pending IRQs regardless of
-         * PRIMASK, so the loop body still executes 1000× per call.
-         * Instead, patch the trailing BLT to a NOP — the loop runs
-         * exactly one iteration and then falls through. The "tiny
-         * delay" the workaround intends is preserved in spirit;
-         * emulator throughput improves ~7×. */
-        uint32_t pi_addr = arm_elf_find_symbol(firmware_path, "platform_idle");
-        if (pi_addr) {
-            pi_addr &= ~1u;
-            /* Scan for the loop signature:
-             *   bf00 (nop)         <- start of body
-             *   9b01 (ldr r3, [sp,#4])
-             *   3301 (adds r3, #1)
-             *   9301 (str r3, [sp,#4])
-             *   9b01 (ldr r3, [sp,#4])
-             *   f5b3 7f7a (cmp.w r3, #1000)
-             *   dbf7 (blt.n back-9)  <- patch this to bf00
-             * Found at offset 0x1e from platform_idle start in the
-             * current build, but search 80 bytes to be robust. */
-            for (uint32_t off = 0; off < 80; off += 2) {
-                uint32_t a = pi_addr + off;
-                uint16_t w0 = (uint16_t)arm_read16(&plat->cpu, a);
-                uint16_t w1 = (uint16_t)arm_read16(&plat->cpu, a + 2);
-                uint16_t w2 = (uint16_t)arm_read16(&plat->cpu, a + 4);
-                if (w0 == 0xbf00 && w1 == 0x9b01 && w2 == 0x3301) {
-                    /* Patch the leading NOP to WFI AND patch the
-                     * trailing BLT to NOP. The WFI sleeps the CPU
-                     * to next event (arm_cpu's cpu_off handler now
-                     * skips ahead even with PRIMASK-masked pending
-                     * IRQs). The NOP-at-BLT ensures the loop exits
-                     * after one iteration so platform_idle returns
-                     * cleanly afterward.
-                     *
-                     * arm_write16 refuses writes into the flash
-                     * region (read-only protection against wild
-                     * pointers); poke the backing array directly. */
-                    arm_cpu_t *c = &plat->cpu;
-                    if (a >= c->flash_base && a + 16 <= c->flash_end) {
-                        uint32_t off = a - c->flash_base;
-                        c->flash[off+0]  = 0x30;  /* WFI low byte  */
-                        c->flash[off+1]  = 0xbf;  /* WFI high byte */
-                        c->flash[off+14] = 0x00;  /* NOP low byte  */
-                        c->flash[off+15] = 0xbf;  /* NOP high byte */
-                    }
-                    if (verbose)
-                        printf("  Node %d [nrf54l15]: patched "
-                               "platform_idle spin loop @ 0x%08x "
-                               "(NOP->WFI, BLT->NOP)\n",
-                               node_id, a);
-                    break;
-                }
-            }
-        }
     }
 
     arm_cpu_reset(&plat->cpu);

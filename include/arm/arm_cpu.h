@@ -180,6 +180,18 @@ typedef struct arm_cpu {
     /* Back-pointer to NVIC (set by arm_nvic_init) */
     void     *nvic;
 
+    /* WFI fast-forward guard. When WFI is hit with PRIMASK set and an
+     * IRQ pending, the firmware is genuinely idle on real silicon — the
+     * CPU sleeps until PRIMASK clears. csim can mirror that by advancing
+     * cycles to the next scheduled event, except some peripherals have
+     * state that *must* tick instruction-by-instruction (radio mid-TX,
+     * mid-RX frame parse, channel-busy windows in the medium model).
+     * The chip layer registers a guard via arm_set_wfi_skip_guard()
+     * returning non-zero whenever such state is in flight; the WFI
+     * handler then runs at full speed instead of skipping ahead. */
+    int     (*wfi_skip_guard)(void *user);
+    void     *wfi_skip_user;
+
     /* Debug: non-zero enables debug tracing */
     int       debug_flags;
 
@@ -229,6 +241,14 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2);
 
 void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
                      arm_io_read_fn read, arm_io_write_fn write, void *data);
+
+/* Install the WFI fast-forward guard. See wfi_skip_guard in arm_cpu_t. */
+static inline void arm_set_wfi_skip_guard(arm_cpu_t *cpu,
+                                           int (*guard)(void *user),
+                                           void *user) {
+    cpu->wfi_skip_guard = guard;
+    cpu->wfi_skip_user  = user;
+}
 
 /* Memory access (for external use / tests / peripherals) */
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr);
