@@ -9,6 +9,17 @@
 #include <string.h>
 #include <stdio.h>
 
+uint64_t arm_wfi_total, arm_wfi_pending, arm_wfi_skipped, arm_wfi_blocked, arm_wfi_noirq;
+__attribute__((destructor,used)) static void arm_wfi_dump(void) {
+    if (!getenv("ARM_WFI_STATS")) return;
+    fprintf(stderr, "WFI-STATS: total=%llu pending=%llu skipped=%llu blocked=%llu noirq=%llu\n",
+        (unsigned long long)arm_wfi_total,
+        (unsigned long long)arm_wfi_pending,
+        (unsigned long long)arm_wfi_skipped,
+        (unsigned long long)arm_wfi_blocked,
+        (unsigned long long)arm_wfi_noirq);
+}
+
 /* --- Memory access helpers --- */
 
 static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
@@ -864,9 +875,11 @@ int arm_step(arm_cpu_t *cpu, int count) {
          * clears `cpu_off` here, even though `arm_nvic_check_pending`
          * may decide not to take the exception yet. */
         if (cpu->cpu_off) {
+            extern uint64_t arm_wfi_total, arm_wfi_pending, arm_wfi_skipped, arm_wfi_blocked, arm_wfi_noirq;
             if (cpu->nvic) {
                 arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
                 if (nvic->has_pending) {
+                    arm_wfi_pending++;
                     /* IRQ pending + PRIMASK set ⇒ firmware is genuinely
                      * idle (waiting for the critical section to exit so
                      * the IRQ can fire). Fast-forward to the next
@@ -879,14 +892,17 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (target > cpu->cycle_limit) target = cpu->cycle_limit;
                         if (target > cpu->cycles) cpu->cycles = target;
                         cpu->cpu_off = false;
+                        arm_wfi_skipped++;
                         continue;
                     }
+                    arm_wfi_blocked++;
                     cpu->cpu_off = false;
                     arm_nvic_check_pending(nvic);
                     continue;
                 }
             }
             if (cpu->event_queue) {
+                arm_wfi_noirq++;
                 cpu->cycles = cpu->event_queue->fire_cycle;
                 continue;
             }
@@ -1617,11 +1633,24 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         cpu->it_state = hw1 & 0xFF;
                     } else {
                         /* Hints: NOP, YIELD, WFE, WFI, SEV */
-                        if ((hw1 & 0xFF) == 0x30) {
+                        uint8_t hint = hw1 & 0xFF;
+                        if (hint == 0x30) {
                             /* WFI */
+                            arm_wfi_total++;
                             cpu->cpu_off = true;
+                        } else if (hint == 0x20) {
+                            /* WFE — wait for event. Consume the event latch
+                             * if set; otherwise sleep like WFI. */
+                            if (cpu->event_latch) {
+                                cpu->event_latch = 0;
+                            } else {
+                                cpu->cpu_off = true;
+                            }
+                        } else if (hint == 0x40) {
+                            /* SEV — set event latch (wakes the next WFE). */
+                            cpu->event_latch = 1;
                         }
-                        /* Other hints: NOP */
+                        /* Other hints (NOP, YIELD): no effect */
                     }
                     break;
                 }
