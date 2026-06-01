@@ -109,6 +109,10 @@ typedef struct arm_cpu {
     uint32_t  faultmask;
     uint32_t  basepri;
 
+    /* WFE event latch: set by SEV / by exception entry / by external event,
+     * consumed (cleared) by the first WFE encountered. */
+    uint8_t   event_latch;
+
     /* Memory — separate regions */
     uint8_t  *rom;                /* ROM_SIZE bytes */
     uint8_t  *flash;              /* FLASH_SIZE bytes */
