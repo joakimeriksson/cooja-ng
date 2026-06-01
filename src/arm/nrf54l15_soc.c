@@ -1408,6 +1408,33 @@ static void nrf54l_radio_rx_stall_cb(void *user, arm_event_t *ev) {
     nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
 }
 
+/* WFI fast-forward guard. Returns non-zero when the radio holds state
+ * that has to advance instruction-by-instruction:
+ *   - Mid-frame RX (parser past WAIT_SFD): skipping would let the
+ *     stall watchdog fire before the bytes arrive.
+ *   - TX in progress / tx_armed: skipping would let the firmware
+ *     observe TX-done before the air time has elapsed, breaking the
+ *     channel-busy window in the medium model.
+ * Anything else (DISABLED, RXIDLE, RX-WAIT_PREAMBLE) is genuinely idle
+ * from the CPU's point of view and the WFI can fast-forward to the
+ * next scheduled CPU event. */
+int nrf54l_wfi_skip_guard(void *user) {
+    nrf54l15_soc_t *soc = (nrf54l15_soc_t *)user;
+    nrf54l_radio_state_t *r = &soc->radio;
+    if (r->state == NRF54L_RADIO_STATE_TX ||
+        r->state == NRF54L_RADIO_STATE_TXRU ||
+        r->state == NRF54L_RADIO_STATE_TXDISABLE)
+        return 1;
+    if (r->tx_armed)
+        return 1;
+    if (r->state == NRF54L_RADIO_STATE_RX &&
+        r->rx_phase != NRF54L_RX_WAIT_PREAMBLE)
+        return 1;
+    if (r->rx_disable_pending || r->rx_stall_scheduled)
+        return 1;
+    return 0;
+}
+
 void nrf54l_radio_set_tx_listener(nrf54l15_soc_t *soc,
                                    nrf54l_radio_tx_listener_t cb, void *user) {
     soc->radio.tx_cb   = cb;
@@ -2012,6 +2039,13 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
     plat->host.now_ns      = nrf54l_host_now_ns;
     plat->host.schedule_ns = nrf54l_host_schedule_ns;
     plat->host.cancel      = nrf54l_host_cancel;
+
+    /* WFI fast-forward guard. See arm_set_wfi_skip_guard / the WFI
+     * handler in arm_cpu.c::arm_step. Returns non-zero whenever the
+     * radio has cycle-tight state in flight; the WFI handler then
+     * stays at full speed so CSMA / collision timing stay accurate. */
+    extern int nrf54l_wfi_skip_guard(void *user);
+    arm_set_wfi_skip_guard(&plat->cpu, nrf54l_wfi_skip_guard, soc);
 
     /* GLOBAL_CLOCK — first peripheral firmware touches after reset. */
     arm_register_io(&plat->cpu,
