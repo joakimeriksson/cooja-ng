@@ -429,10 +429,27 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
      * Contiki etimer tick (clock-arch.c re-arms every 7813 µs in
      * COMPARE mode); using SYSCOUNTER semantics for it stretches the
      * effective tick by the IRQ overhead and slows wall-clock by ~1.7×. */
-    uint32_t delay_ticks = cc->ccadd & 0x7FFFFFFFu;
-    int64_t  delay_ns    = (int64_t)delay_ticks * NRF54L_GRTC_TICK_NS;
     int64_t  now_ns      = grtc_now_ns(grtc);
     int64_t  fire_ns;
+    if (cc->absolute_mode) {
+        /* Absolute mode: CCL/CCH form a 52-bit syscounter target.
+         * Convert to ns from the GRTC start anchor and let
+         * arm_schedule_event_ns figure out the fire cycle. If the
+         * target is already in the past relative to now, the firmware
+         * scheduled it past-due; fire on the next event check, which
+         * is what real-HW comparator-already-matched semantics
+         * produce. */
+        uint64_t target = (uint64_t)cc->ccl |
+                          ((uint64_t)(cc->cch & 0x000FFFFFu) << 32);
+        fire_ns = grtc->start_anchor_ns +
+                  (int64_t)(target * (uint64_t)NRF54L_GRTC_TICK_NS);
+        if (fire_ns < now_ns) fire_ns = now_ns;
+        cc->scheduled_ns = fire_ns;
+        arm_schedule_event_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
+        return;
+    }
+    uint32_t delay_ticks = cc->ccadd & 0x7FFFFFFFu;
+    int64_t  delay_ns    = (int64_t)delay_ticks * NRF54L_GRTC_TICK_NS;
     if ((cc->ccadd & 0x80000000u) || cc->scheduled_ns == 0) {
         fire_ns = now_ns + delay_ns;
     } else {
@@ -594,10 +611,17 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
         int idx = (off - NRF54L_GRTC_CC_BASE) / NRF54L_GRTC_CC_STRIDE;
         int sub = (off - NRF54L_GRTC_CC_BASE) % NRF54L_GRTC_CC_STRIDE;
         switch (sub) {
-            case 0x0: grtc->cc[idx].ccl   = value; break;
-            case 0x4: grtc->cc[idx].cch   = value; break;
+            case 0x0:
+                grtc->cc[idx].ccl = value;
+                grtc->cc[idx].absolute_mode = 1;
+                break;
+            case 0x4:
+                grtc->cc[idx].cch = value;
+                grtc->cc[idx].absolute_mode = 1;
+                break;
             case 0x8:
                 grtc->cc[idx].ccadd = value;
+                grtc->cc[idx].absolute_mode = 0;
                 if (grtc->cc[idx].ccen && grtc->running)
                     nrf54l_grtc_arm_cc(grtc, idx);
                 break;

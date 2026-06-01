@@ -142,6 +142,12 @@ typedef struct nrf54l_grtc_cc {
     uint32_t cch;
     uint32_t ccadd;
     uint32_t ccen;
+    /* Which of {absolute CC, relative CCADD} was written most recently.
+     * `nrfx_grtc_syscounter_cc_absolute_set` writes CCL/CCH (52-bit
+     * absolute target) then sets CCEN; `_cc_relative_set` writes CCADD
+     * then CCEN. The arm_cc routine picks fire_ns from whichever was
+     * last touched. */
+    int      absolute_mode;
     void    *event;        /* cpu_event_t* — null if not armed */
     int64_t  scheduled_ns; /* absolute fire_ns of the currently armed event;
                             * used to anchor RELATIVE_COMPARE re-arms (CCADD
