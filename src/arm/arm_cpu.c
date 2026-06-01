@@ -1090,30 +1090,36 @@ int arm_step(arm_cpu_t *cpu, int count) {
             int sub_op = (hw1 >> 9) & 3;
             int rd = hw1 & 7;
             int rn = (hw1 >> 3) & 7;
+            /* Snapshot operands before writing rd — when rd == rn (e.g.
+             * `subs r3, r3, r2`) the flag computation must use the
+             * *original* rn value, not the just-written result. */
+            uint32_t n_val = cpu->reg[rn];
             if (sub_op == 0) {
                 /* ADD Rd, Rn, Rm */
                 int rm = (hw1 >> 6) & 7;
-                uint64_t result = (uint64_t)cpu->reg[rn] + cpu->reg[rm];
+                uint32_t m_val = cpu->reg[rm];
+                uint64_t result = (uint64_t)n_val + m_val;
                 cpu->reg[rd] = (uint32_t)result;
-                set_add_flags(cpu, cpu->reg[rn], cpu->reg[rm], result);
+                set_add_flags(cpu, n_val, m_val, result);
             } else if (sub_op == 1) {
                 /* SUB Rd, Rn, Rm */
                 int rm = (hw1 >> 6) & 7;
-                uint64_t result = (uint64_t)cpu->reg[rn] - cpu->reg[rm];
+                uint32_t m_val = cpu->reg[rm];
+                uint64_t result = (uint64_t)n_val - m_val;
                 cpu->reg[rd] = (uint32_t)result;
-                set_sub_flags(cpu, cpu->reg[rn], cpu->reg[rm], result);
+                set_sub_flags(cpu, n_val, m_val, result);
             } else if (sub_op == 2) {
                 /* ADD Rd, Rn, #imm3 */
                 uint32_t imm3 = (hw1 >> 6) & 7;
-                uint64_t result = (uint64_t)cpu->reg[rn] + imm3;
+                uint64_t result = (uint64_t)n_val + imm3;
                 cpu->reg[rd] = (uint32_t)result;
-                set_add_flags(cpu, cpu->reg[rn], imm3, result);
+                set_add_flags(cpu, n_val, imm3, result);
             } else {
                 /* SUB Rd, Rn, #imm3 */
                 uint32_t imm3 = (hw1 >> 6) & 7;
-                uint64_t result = (uint64_t)cpu->reg[rn] - imm3;
+                uint64_t result = (uint64_t)n_val - imm3;
                 cpu->reg[rd] = (uint32_t)result;
-                set_sub_flags(cpu, cpu->reg[rn], imm3, result);
+                set_sub_flags(cpu, n_val, imm3, result);
             }
             goto insn_done;
         }
@@ -1253,9 +1259,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         break;
                     }
                     case 0x9: { /* RSB (NEG) Rd, Rm, #0 */
-                        uint64_t result = (uint64_t)0 - cpu->reg[rm];
+                        uint32_t m_val = cpu->reg[rm];
+                        uint64_t result = (uint64_t)0 - m_val;
                         cpu->reg[rd] = (uint32_t)result;
-                        set_sub_flags(cpu, 0, cpu->reg[rm], result);
+                        set_sub_flags(cpu, 0, m_val, result);
                         break;
                     }
                     case 0xA: { /* CMP */
@@ -1920,6 +1927,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 int shift_n = (imm3 << 2) | imm2;
 
                 uint32_t rm_val = cpu->reg[rm];
+                /* Snapshot rn before any rd write — flag formulas below
+                 * read rn after the write, which is wrong when rd == rn
+                 * (e.g. `subs r3, r3, r2`). */
+                uint32_t rn_val = cpu->reg[rn];
                 int carry_out = (cpu->xpsr & APSR_C) ? 1 : 0;
 
                 /* Apply shift */
@@ -1945,12 +1956,12 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 uint32_t result;
                 switch (op_dp) {
                     case 0x0: /* AND / TST */
-                        result = cpu->reg[rn] & rm_val;
+                        result = rn_val & rm_val;
                         if (rd != 0xF) cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
                     case 0x1: /* BIC */
-                        result = cpu->reg[rn] & ~rm_val;
+                        result = rn_val & ~rm_val;
                         cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
@@ -1958,7 +1969,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (rn == 0xF) {
                             result = rm_val; /* MOV */
                         } else {
-                            result = cpu->reg[rn] | rm_val; /* ORR */
+                            result = rn_val | rm_val; /* ORR */
                         }
                         cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
@@ -1967,59 +1978,59 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (rn == 0xF) {
                             result = ~rm_val; /* MVN */
                         } else {
-                            result = cpu->reg[rn] | ~rm_val; /* ORN */
+                            result = rn_val | ~rm_val; /* ORN */
                         }
                         cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
                     case 0x4: /* EOR / TEQ */
-                        result = cpu->reg[rn] ^ rm_val;
+                        result = rn_val ^ rm_val;
                         if (rd != 0xF) cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
                     case 0x8: { /* ADD / CMN */
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] + rm_val;
+                        uint64_t r64 = (uint64_t)rn_val + rm_val;
                         result = (uint32_t)r64;
                         if (rd != 0xF) cpu->reg[rd] = result;
-                        if (S) set_add_flags(cpu, cpu->reg[rn], rm_val, r64);
+                        if (S) set_add_flags(cpu, rn_val, rm_val, r64);
                         break;
                     }
                     case 0xA: { /* ADC */
                         int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] + rm_val + ci;
+                        uint64_t r64 = (uint64_t)rn_val + rm_val + ci;
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
-                        if (S) set_add_flags(cpu, cpu->reg[rn], rm_val + ci, r64);
+                        if (S) set_add_flags(cpu, rn_val, rm_val + ci, r64);
                         break;
                     }
                     case 0xB: { /* SBC */
                         int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - rm_val - (1 - ci);
+                        uint64_t r64 = (uint64_t)rn_val - rm_val - (1 - ci);
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
                         if (S) {
                             cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
                             if (result == 0) cpu->xpsr |= APSR_Z;
                             if (result & 0x80000000) cpu->xpsr |= APSR_N;
-                            if ((uint64_t)cpu->reg[rn] >= (uint64_t)rm_val + (1 - ci))
+                            if ((uint64_t)rn_val >= (uint64_t)rm_val + (1 - ci))
                                 cpu->xpsr |= APSR_C;
-                            if (((cpu->reg[rn] ^ rm_val) & (cpu->reg[rn] ^ result)) >> 31)
+                            if (((rn_val ^ rm_val) & (rn_val ^ result)) >> 31)
                                 cpu->xpsr |= APSR_V;
                         }
                         break;
                     }
                     case 0xD: { /* SUB / CMP */
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - rm_val;
+                        uint64_t r64 = (uint64_t)rn_val - rm_val;
                         result = (uint32_t)r64;
                         if (rd != 0xF) cpu->reg[rd] = result;
-                        if (S) set_sub_flags(cpu, cpu->reg[rn], rm_val, r64);
+                        if (S) set_sub_flags(cpu, rn_val, rm_val, r64);
                         break;
                     }
                     case 0xE: { /* RSB */
-                        uint64_t r64 = (uint64_t)rm_val - cpu->reg[rn];
+                        uint64_t r64 = (uint64_t)rm_val - rn_val;
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
-                        if (S) set_sub_flags(cpu, rm_val, cpu->reg[rn], r64);
+                        if (S) set_sub_flags(cpu, rm_val, rn_val, r64);
                         break;
                     }
                     default:
@@ -2041,16 +2052,19 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
                 int carry_out = (cpu->xpsr & APSR_C) ? 1 : 0;
                 uint32_t imm_val = thumb_expand_imm_c(imm12, &carry_out, carry_out);
+                /* Snapshot rn — see same-named comment in shifted-register
+                 * dispatch above. */
+                uint32_t rn_val = (rn == 0xF) ? 0 : cpu->reg[rn];
 
                 uint32_t result;
                 switch (op_dp) {
                     case 0x0: /* AND / TST */
-                        result = cpu->reg[rn] & imm_val;
+                        result = rn_val & imm_val;
                         if (rd != 0xF) cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
                     case 0x1: /* BIC */
-                        result = cpu->reg[rn] & ~imm_val;
+                        result = rn_val & ~imm_val;
                         cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
@@ -2058,7 +2072,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (rn == 0xF) {
                             result = imm_val;
                         } else {
-                            result = cpu->reg[rn] | imm_val;
+                            result = rn_val | imm_val;
                         }
                         cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
@@ -2067,59 +2081,59 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (rn == 0xF) {
                             result = ~imm_val;
                         } else {
-                            result = cpu->reg[rn] | ~imm_val;
+                            result = rn_val | ~imm_val;
                         }
                         cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
                     case 0x4: /* EOR / TEQ */
-                        result = cpu->reg[rn] ^ imm_val;
+                        result = rn_val ^ imm_val;
                         if (rd != 0xF) cpu->reg[rd] = result;
                         if (S) set_nzc(cpu, result, carry_out);
                         break;
                     case 0x8: { /* ADD / CMN */
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] + imm_val;
+                        uint64_t r64 = (uint64_t)rn_val + imm_val;
                         result = (uint32_t)r64;
                         if (rd != 0xF) cpu->reg[rd] = result;
-                        if (S) set_add_flags(cpu, cpu->reg[rn], imm_val, r64);
+                        if (S) set_add_flags(cpu, rn_val, imm_val, r64);
                         break;
                     }
                     case 0xA: { /* ADC */
                         int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] + imm_val + ci;
+                        uint64_t r64 = (uint64_t)rn_val + imm_val + ci;
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
-                        if (S) set_add_flags(cpu, cpu->reg[rn], imm_val + ci, r64);
+                        if (S) set_add_flags(cpu, rn_val, imm_val + ci, r64);
                         break;
                     }
                     case 0xB: { /* SBC */
                         int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - imm_val - (1 - ci);
+                        uint64_t r64 = (uint64_t)rn_val - imm_val - (1 - ci);
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
                         if (S) {
                             cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
                             if (result == 0) cpu->xpsr |= APSR_Z;
                             if (result & 0x80000000) cpu->xpsr |= APSR_N;
-                            if ((uint64_t)cpu->reg[rn] >= (uint64_t)imm_val + (1 - ci))
+                            if ((uint64_t)rn_val >= (uint64_t)imm_val + (1 - ci))
                                 cpu->xpsr |= APSR_C;
-                            if (((cpu->reg[rn] ^ imm_val) & (cpu->reg[rn] ^ result)) >> 31)
+                            if (((rn_val ^ imm_val) & (rn_val ^ result)) >> 31)
                                 cpu->xpsr |= APSR_V;
                         }
                         break;
                     }
                     case 0xD: { /* SUB / CMP */
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - imm_val;
+                        uint64_t r64 = (uint64_t)rn_val - imm_val;
                         result = (uint32_t)r64;
                         if (rd != 0xF) cpu->reg[rd] = result;
-                        if (S) set_sub_flags(cpu, cpu->reg[rn], imm_val, r64);
+                        if (S) set_sub_flags(cpu, rn_val, imm_val, r64);
                         break;
                     }
                     case 0xE: { /* RSB */
-                        uint64_t r64 = (uint64_t)imm_val - cpu->reg[rn];
+                        uint64_t r64 = (uint64_t)imm_val - rn_val;
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
-                        if (S) set_sub_flags(cpu, imm_val, cpu->reg[rn], r64);
+                        if (S) set_sub_flags(cpu, imm_val, rn_val, r64);
                         break;
                     }
                     default:
