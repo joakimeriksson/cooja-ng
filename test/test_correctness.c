@@ -882,6 +882,45 @@ static void test_msp430x(void) {
         assert_true("CMPA equal: Z=1", (cpu.reg[MSP430_SR] & SR_Z) != 0);
         cleanup_cpu(&cpu);
     }
+
+    /* PUSHX.A #imm + RETA round-trip.
+     *
+     * Reproduces the Z1 RPL-UDP boot bug: PUSHX.A only adjusted SP by 2
+     * (writing 16 bits) instead of 4 (writing 20 bits), so the next reta
+     * popped 2 bytes of pushed value plus 2 bytes of unrelated stack as
+     * the return-address word. Verify here that SP moves by 4 and that a
+     * RETA round-trip restores the expected PC.
+     *
+     * Program: pushx.a #0x12345 ; reta
+     * Layout in flash (little-endian words):
+     *   0x5c00: 0x1880  ext word (A/L=0 -> .A mode, src/dst hi nibbles 0)
+     *   0x5c02: 0x1230  push.b @r0+ (PUSH with immediate via PC autoinc;
+     *                                 BW bit is set but the ext word .A
+     *                                 mode forces 20-bit operation)
+     *   0x5c04: 0x2345  low 16 bits of immediate
+     *   0x5c06: 0x0110  RETA (= MOVA @SP+, PC)
+     */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f5437_config, 0x5c00);
+        cpu.reg[MSP430_SP] = 0x2000;
+        int pc = 0x5c00;
+        WW(pc, 0x1801); pc += 2;  /* ext word: A/L=0 (.A), dst_hi=1 -> imm = 0x12345 */
+        WW(pc, 0x1230); pc += 2;  /* push #imm (PC autoinc, .A via ext) */
+        WW(pc, 0x2345); pc += 2;  /* low 16 bits */
+        WW(pc, 0x0110); pc += 2;  /* RETA */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 1);
+        assert_eq("PUSHX.A SP -= 4", 0x1FFC, (long)cpu.reg[MSP430_SP]);
+        assert_eq("PUSHX.A wrote 20-bit immediate",
+                  0x12345,
+                  (long)(msp430_read_word(&cpu, 0x1FFC) |
+                         ((msp430_read_word(&cpu, 0x1FFE) & 0xf) << 16)));
+        msp430_step(&cpu, 1);
+        assert_eq("RETA after PUSHX.A jumps to 0x12345", 0x12345, (long)cpu.reg[MSP430_PC]);
+        assert_eq("RETA after PUSHX.A SP back to 0x2000", 0x2000, (long)cpu.reg[MSP430_SP]);
+        cleanup_cpu(&cpu);
+    }
 }
 
 /* ===================================================================
