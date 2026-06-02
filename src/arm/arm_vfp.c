@@ -120,23 +120,40 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         return true;
     }
 
-    /* ---- VLDR.32 / VSTR.32 (immediate) ----
+    /* ---- VLDR / VSTR (immediate) ----
      * hw1 = 1110_1101_UD0L_Rn  (U=hw1[7], D=hw1[6], L=hw1[4])
-     * hw2 = Vd<3:0>:1010:imm8
+     * hw2 = Vd<3:0>:coproc:imm8  coproc=0xA→single, 0xB→double
      * Pre-indexed, no writeback.
+     *
+     * For double-precision (coproc==0xB), the d-register d_n maps to
+     * single-precision registers s_{2n} and s_{2n+1}.  sreg_d() returns
+     * s_{2n} already (sd = 2*d_n), so we also touch sd+1 for the high word.
      */
-    /* VLDR/VSTR T1: hw1 = 1110_1101_UD0L_Rn — bits 15..8 = 11101101,
-     * bit 5 must be 0. Mask 0xFF20 covers high byte + bit 5. */
     if ((hw1 & 0xFF20) == 0xED00) {
         int U  = (hw1 >> 7) & 1;
         int L  = (hw1 >> 4) & 1;
         int rn = hw1 & 0xF;
         uint32_t imm32 = (uint32_t)(hw2 & 0xFF) << 2;
         int sd = sreg_d(hw1, hw2);
-        uint32_t base = (rn == 15) ? ((cpu->reg[15] & ~3u) - 4) : cpu->reg[rn];
+        /* For PC-relative (Rn=15): cpu->reg[15] already holds pc+4 (set by
+         * the 32-bit instruction dispatcher before arm_vfp_step is called),
+         * so Align(PC,4) = cpu->reg[15] & ~3u — no further subtraction. */
+        uint32_t base = (rn == 15) ? (cpu->reg[15] & ~3u) : cpu->reg[rn];
         uint32_t addr = U ? base + imm32 : base - imm32;
-        if (L) cpu->vfp_s[sd] = arm_read32(cpu, addr);
-        else   arm_write32(cpu, addr, cpu->vfp_s[sd]);
+        if (coproc == 0xB) {
+            /* Double-precision: 8-byte transfer spanning vfp_s[sd] and vfp_s[sd+1] */
+            if (L) {
+                cpu->vfp_s[sd]     = arm_read32(cpu, addr);
+                cpu->vfp_s[sd + 1] = arm_read32(cpu, addr + 4);
+            } else {
+                arm_write32(cpu, addr,     cpu->vfp_s[sd]);
+                arm_write32(cpu, addr + 4, cpu->vfp_s[sd + 1]);
+            }
+        } else {
+            /* Single-precision: 4-byte transfer */
+            if (L) cpu->vfp_s[sd] = arm_read32(cpu, addr);
+            else   arm_write32(cpu, addr, cpu->vfp_s[sd]);
+        }
         return true;
     }
 
