@@ -1617,7 +1617,9 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                  * buffer/replay hook is tuned. */
                 bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
                                    (nodes[i].type == NODE_ARM &&
-                                    arm_platform_cc2538(&nodes[i].plat.arm) != NULL);
+                                    (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
+                                     arm_platform_nrf52840(&nodes[i].plat.arm) != NULL ||
+                                     arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL));
                 if (per_byte_ok) {
                     int64_t bt = byte_time_ns;
                     if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
@@ -1662,7 +1664,9 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
              * chips that drop bytes outside RX. */
             bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
                                (nodes[i].type == NODE_ARM &&
-                                arm_platform_cc2538(&nodes[i].plat.arm) != NULL);
+                                (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
+                                 arm_platform_nrf52840(&nodes[i].plat.arm) != NULL ||
+                                 arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL));
             if (per_byte_ok) {
                 int64_t bt = byte_time_ns;
                 if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
