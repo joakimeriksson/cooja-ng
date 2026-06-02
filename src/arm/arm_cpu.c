@@ -1067,23 +1067,26 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 cpu->reg[rd] = (uint32_t)result;
                 set_add_flags(cpu, cpu->reg[rn], cpu->reg[rm], result);
             } else if (sub_op == 1) {
-                /* SUB Rd, Rn, Rm */
+                /* SUB Rd, Rn, Rm — capture Rn before Rd write (Rd may alias Rn) */
                 int rm = (hw1 >> 6) & 7;
-                uint64_t result = (uint64_t)cpu->reg[rn] - cpu->reg[rm];
+                uint32_t old_rn = cpu->reg[rn], old_rm = cpu->reg[rm];
+                uint64_t result = (uint64_t)old_rn - old_rm;
                 cpu->reg[rd] = (uint32_t)result;
-                set_sub_flags(cpu, cpu->reg[rn], cpu->reg[rm], result);
+                set_sub_flags(cpu, old_rn, old_rm, result);
             } else if (sub_op == 2) {
                 /* ADD Rd, Rn, #imm3 */
                 uint32_t imm3 = (hw1 >> 6) & 7;
-                uint64_t result = (uint64_t)cpu->reg[rn] + imm3;
+                uint32_t old_rn = cpu->reg[rn];
+                uint64_t result = (uint64_t)old_rn + imm3;
                 cpu->reg[rd] = (uint32_t)result;
-                set_add_flags(cpu, cpu->reg[rn], imm3, result);
+                set_add_flags(cpu, old_rn, imm3, result);
             } else {
-                /* SUB Rd, Rn, #imm3 */
+                /* SUB Rd, Rn, #imm3 — capture Rn before Rd write */
                 uint32_t imm3 = (hw1 >> 6) & 7;
-                uint64_t result = (uint64_t)cpu->reg[rn] - imm3;
+                uint32_t old_rn = cpu->reg[rn];
+                uint64_t result = (uint64_t)old_rn - imm3;
                 cpu->reg[rd] = (uint32_t)result;
-                set_sub_flags(cpu, cpu->reg[rn], imm3, result);
+                set_sub_flags(cpu, old_rn, imm3, result);
             }
             goto insn_done;
         }
@@ -1950,27 +1953,29 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (S) set_add_flags(cpu, cpu->reg[rn], rm_val + ci, r64);
                         break;
                     }
-                    case 0xB: { /* SBC */
+                    case 0xB: { /* SBC — capture Rn before Rd write (Rd may alias Rn) */
                         int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - rm_val - (1 - ci);
+                        uint32_t old_rn = cpu->reg[rn];
+                        uint64_t r64 = (uint64_t)old_rn - rm_val - (1 - ci);
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
                         if (S) {
                             cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
                             if (result == 0) cpu->xpsr |= APSR_Z;
                             if (result & 0x80000000) cpu->xpsr |= APSR_N;
-                            if ((uint64_t)cpu->reg[rn] >= (uint64_t)rm_val + (1 - ci))
+                            if ((uint64_t)old_rn >= (uint64_t)rm_val + (1 - ci))
                                 cpu->xpsr |= APSR_C;
-                            if (((cpu->reg[rn] ^ rm_val) & (cpu->reg[rn] ^ result)) >> 31)
+                            if (((old_rn ^ rm_val) & (old_rn ^ result)) >> 31)
                                 cpu->xpsr |= APSR_V;
                         }
                         break;
                     }
-                    case 0xD: { /* SUB / CMP */
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - rm_val;
+                    case 0xD: { /* SUB / CMP — capture Rn before Rd write (Rd may alias Rn) */
+                        uint32_t old_rn = cpu->reg[rn];
+                        uint64_t r64 = (uint64_t)old_rn - rm_val;
                         result = (uint32_t)r64;
                         if (rd != 0xF) cpu->reg[rd] = result;
-                        if (S) set_sub_flags(cpu, cpu->reg[rn], rm_val, r64);
+                        if (S) set_sub_flags(cpu, old_rn, rm_val, r64);
                         break;
                     }
                     case 0xE: { /* RSB */
@@ -2050,27 +2055,29 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         if (S) set_add_flags(cpu, cpu->reg[rn], imm_val + ci, r64);
                         break;
                     }
-                    case 0xB: { /* SBC */
+                    case 0xB: { /* SBC — capture Rn before Rd write */
                         int ci = (cpu->xpsr & APSR_C) ? 1 : 0;
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - imm_val - (1 - ci);
+                        uint32_t old_rn = cpu->reg[rn];
+                        uint64_t r64 = (uint64_t)old_rn - imm_val - (1 - ci);
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
                         if (S) {
                             cpu->xpsr &= ~(APSR_N | APSR_Z | APSR_C | APSR_V);
                             if (result == 0) cpu->xpsr |= APSR_Z;
                             if (result & 0x80000000) cpu->xpsr |= APSR_N;
-                            if ((uint64_t)cpu->reg[rn] >= (uint64_t)imm_val + (1 - ci))
+                            if ((uint64_t)old_rn >= (uint64_t)imm_val + (1 - ci))
                                 cpu->xpsr |= APSR_C;
-                            if (((cpu->reg[rn] ^ imm_val) & (cpu->reg[rn] ^ result)) >> 31)
+                            if (((old_rn ^ imm_val) & (old_rn ^ result)) >> 31)
                                 cpu->xpsr |= APSR_V;
                         }
                         break;
                     }
-                    case 0xD: { /* SUB / CMP */
-                        uint64_t r64 = (uint64_t)cpu->reg[rn] - imm_val;
+                    case 0xD: { /* SUB / CMP — capture Rn before Rd write */
+                        uint32_t old_rn = cpu->reg[rn];
+                        uint64_t r64 = (uint64_t)old_rn - imm_val;
                         result = (uint32_t)r64;
                         if (rd != 0xF) cpu->reg[rd] = result;
-                        if (S) set_sub_flags(cpu, cpu->reg[rn], imm_val, r64);
+                        if (S) set_sub_flags(cpu, old_rn, imm_val, r64);
                         break;
                     }
                     case 0xE: { /* RSB */

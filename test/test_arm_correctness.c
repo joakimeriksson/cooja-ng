@@ -457,6 +457,111 @@ static void test_adc_sbc(void) {
 }
 
 /* ===================================================================
+ * UMULL (unsigned 64-bit multiply) tests
+ *
+ * Encoding: UMULL RdLo, RdHi, Rn, Rm  (T1)
+ *   hw1 = 0xFBA0 | Rn
+ *   hw2 = (RdLo<<12) | (RdHi<<8) | 0x0000 | Rm
+ *
+ * Used heavily in uECC's FAST_MULT_ASM multi-precision field arithmetic.
+ * =================================================================== */
+static void test_umull(void) {
+    printf("--- UMULL (unsigned 64-bit multiply) tests ---\n");
+
+    /* Basic: 3 * 7 = 21, fits in low word */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x2003); pc += 2; /* MOVS r0, #3 */
+        write_thumb16(&cpu, pc, 0x2107); pc += 2; /* MOVS r1, #7 */
+        /* UMULL r2, r3, r0, r1 — hw1=0xFBA0 (Rn=r0), hw2=0x2301 (RdLo=r2,RdHi=r3,Rm=r1) */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x2301); pc += 4;
+        arm_step(&cpu, 3);
+        assert_eq("UMULL r2,r3,r0,r1: lo=21", 21, cpu.reg[2]);
+        assert_eq("UMULL r2,r3,r0,r1: hi=0",   0, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Overflow into high word: 0xFFFFFFFF * 0xFFFFFFFF */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        /* MOVS r0, #1; MVN r0, r0 → r0 = 0xFFFFFFFE; not clean. Use MOV.W instead */
+        /* MVN r0, #0 sets r0 = 0xFFFFFFFF */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0000); pc += 4; /* MVN r0, #0 → r0=0xFFFFFFFF */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0100); pc += 4; /* MVN r1, #0 → r1=0xFFFFFFFF */
+        /* UMULL r2, r3, r0, r1 */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x2301); pc += 4;
+        arm_step(&cpu, 3);
+        /* 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE_00000001 */
+        assert_eq("UMULL 0xFFFFFF*0xFFFFFF: lo=1",          0x00000001, cpu.reg[2]);
+        assert_eq("UMULL 0xFFFFFF*0xFFFFFF: hi=0xFFFFFFFE", 0xFFFFFFFE, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Source and destination register aliasing: UMULL r0, r1, r0, r1
+     * Reads r0 and r1 first, then writes — must not corrupt inputs before compute */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x2064); pc += 2; /* MOVS r0, #100 */
+        write_thumb16(&cpu, pc, 0x2132); pc += 2; /* MOVS r1, #50  */
+        /* UMULL r0, r1, r0, r1 — RdLo=r0,RdHi=r1,Rn=r0,Rm=r1 */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x0101); pc += 4;
+        arm_step(&cpu, 3);
+        /* 100 * 50 = 5000 = 0x1388 */
+        assert_eq("UMULL r0,r1,r0,r1 (aliased): lo=5000", 5000, cpu.reg[0]);
+        assert_eq("UMULL r0,r1,r0,r1 (aliased): hi=0",      0,   cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* UMULL with high-register destination: r8 (RdLo), r9 (RdHi) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x2006); pc += 2; /* MOVS r0, #6  */
+        write_thumb16(&cpu, pc, 0x2107); pc += 2; /* MOVS r1, #7  */
+        /* UMULL r8, r9, r0, r1 — hw1=0xFBA0 (Rn=r0), hw2=(8<<12)|(9<<8)|1=0x8901 */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x8901); pc += 4;
+        arm_step(&cpu, 3);
+        assert_eq("UMULL r8,r9,r0,r1: lo=42", 42, cpu.reg[8]);
+        assert_eq("UMULL r8,r9,r0,r1: hi=0",   0, cpu.reg[9]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ADC carry chain after UMULL+ADDS+ADCS (matches FAST_MULT_ASM pattern) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        /* c0=0, c1=0, c2=0 → multiply t0,t1 = 0xFFFFFFFF * 0xFFFFFFFF, add to accumulators */
+        write_thumb32(&cpu, pc, 0xF04F, 0x0300); pc += 4; /* MOV r3, #0   (c0) */
+        write_thumb32(&cpu, pc, 0xF04F, 0x0400); pc += 4; /* MOV r4, #0   (c1) */
+        write_thumb32(&cpu, pc, 0xF04F, 0x0500); pc += 4; /* MOV r5, #0   (c2) */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0600); pc += 4; /* MVN r6, #0   (t0 source = 0xFFFFFFFF) */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0700); pc += 4; /* MVN r7, #0   (t1 source = 0xFFFFFFFF) */
+        /* UMULL r6, r7, r6, r7 → (t0,t1) = 0xFFFFFFFE_00000001 */
+        write_thumb32(&cpu, pc, 0xFBA6, 0x6707); pc += 4;
+        /* ADDS r3, r3, r6 → c0 += t0_lo; sets carry */
+        write_thumb32(&cpu, pc, 0xEB13, 0x0306); pc += 4;
+        /* ADCS r4, r4, r7 → c1 += t0_hi + carry */
+        write_thumb32(&cpu, pc, 0xEB54, 0x0407); pc += 4;
+        /* ADC r5, r5, #0 → c2 += carry (modified-imm T1: hw1=0xF145,hw2=0x0500) */
+        write_thumb32(&cpu, pc, 0xF145, 0x0500); pc += 4;
+        arm_step(&cpu, 9);
+        /* c0 = 0x00000001, c1 = 0xFFFFFFFE, c2 = 0 */
+        assert_eq("FAST_MULT pattern: c0=1",          0x00000001, cpu.reg[3]);
+        assert_eq("FAST_MULT pattern: c1=0xFFFFFFFE", 0xFFFFFFFE, cpu.reg[4]);
+        assert_eq("FAST_MULT pattern: c2=0",          0,          cpu.reg[5]);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
  * Cortex-M4 DSP extension — halfword multiply family
  *
  * Encoding reference: ARMv7-M Architecture Reference Manual, A7.7.121–
@@ -1502,6 +1607,168 @@ static void test_anti_replay_ops(void) {
     }
 }
 
+/* ===================================================================
+ * SUBS/SBCS Rd==Rn carry correctness (regression for rd-aliases-rn bug).
+ *
+ * The bug: when rd==rn, the register was updated BEFORE set_sub_flags
+ * read it, so the C flag was derived from the NEW value instead of the
+ * original — corrupting borrow propagation in multi-word subtraction.
+ * =================================================================== */
+static void test_subs_rd_eq_rn(void) {
+    printf("--- SUBS/SBCS Rd==Rn carry tests ---\n");
+
+    /* 16-bit SUBS r5, r5, r6 (T1: rd=rn=5, rm=6): 2 - 3, should set C=0 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[5] = 2;
+        cpu.reg[6] = 3;
+        /* SUBS r5, r5, r6: 0001 101 110 101 101 = 0x1BAD */
+        write_thumb16(&cpu, CODE_BASE, 0x1BAD);
+        arm_step(&cpu, 1);
+        assert_eq("SUBS r5,r5,r6 (2-3) result", (uint32_t)-1, cpu.reg[5]);
+        assert_true("SUBS r5,r5,r6 (2-3) C=0 (borrow)", (cpu.xpsr & APSR_C) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SUBS r5, r5, r6 (T1): 5 - 3, should set C=1 (no borrow) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[5] = 5;
+        cpu.reg[6] = 3;
+        write_thumb16(&cpu, CODE_BASE, 0x1BAD);
+        arm_step(&cpu, 1);
+        assert_eq("SUBS r5,r5,r6 (5-3) result", 2, cpu.reg[5]);
+        assert_true("SUBS r5,r5,r6 (5-3) C=1 (no borrow)", (cpu.xpsr & APSR_C) != 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* 32-bit SUBS.W r3, r3, r2 (Rd==Rn=3, Rm=2): 1 - 2, C=0 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[3] = 1;
+        cpu.reg[2] = 2;
+        /* SUBS.W r3, r3, r2: hw1=0xEBB3 (S=1, Rn=r3), hw2=0x0302 (Rd=r3, Rm=r2) */
+        write_thumb32(&cpu, CODE_BASE, 0xEBB3, 0x0302);
+        arm_step(&cpu, 1);
+        assert_eq("SUBS.W r3,r3,r2 (1-2) result", (uint32_t)-1, cpu.reg[3]);
+        assert_true("SUBS.W r3,r3,r2 (1-2) C=0", (cpu.xpsr & APSR_C) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
+ * VFP double-precision VLDR/VSTR tests (regression for 4-byte-only bug).
+ * =================================================================== */
+static void test_vfp_double(void) {
+    printf("--- VFP double-precision VLDR/VSTR tests ---\n");
+
+    /* VSTR d7, [r0, #0] should write 8 bytes */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* Set d7 = {s14, s15} = {0xDEADBEEF, 0x12345678} */
+        cpu.vfp_s[14] = 0xDEADBEEF;
+        cpu.vfp_s[15] = 0x12345678;
+        uint32_t addr = cpu.sram_base + 64;
+        cpu.reg[0] = addr;
+        /* VSTR d7, [r0]: hw1=0xED80 (U=1,D=0,L=0,Rn=0), hw2=0x7B00 (Vd=7,coproc=B,imm8=0) */
+        write_thumb32(&cpu, CODE_BASE, 0xED80, 0x7B00);
+        arm_step(&cpu, 1);
+        assert_eq("VSTR d7 low  word", 0xDEADBEEFu, arm_read32(&cpu, addr));
+        assert_eq("VSTR d7 high word", 0x12345678u, arm_read32(&cpu, addr + 4));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* VLDR d7, [r0, #0] should read 8 bytes */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t addr = cpu.sram_base + 64;
+        arm_write32(&cpu, addr,     0xAABBCCDD);
+        arm_write32(&cpu, addr + 4, 0x11223344);
+        cpu.reg[0] = addr;
+        /* VLDR d7, [r0]: hw1=0xED90, hw2=0x7B00 (L=1) */
+        write_thumb32(&cpu, CODE_BASE, 0xED90, 0x7B00);
+        arm_step(&cpu, 1);
+        assert_eq("VLDR d7 low  word → s14", 0xAABBCCDDu, cpu.vfp_s[14]);
+        assert_eq("VLDR d7 high word → s15", 0x11223344u, cpu.vfp_s[15]);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
+ * LDRD / STRD (load/store double register) tests
+ * Used heavily in SHA-256 transform for loading state and W[] values.
+ * =================================================================== */
+static void test_ldrd_strd(void) {
+    printf("--- LDRD/STRD instruction tests ---\n");
+
+    /* STRD / LDRD round-trip via SRAM */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* Store two values via STRD r0, r1, [r2, #0]
+         * hw1 = 0xE9C2 (STRD, P=1, U=1, W=0, Rn=r2)
+         * hw2 = 0x0100 (Rt=r0, Rt2=r1, imm8=0) */
+        uint32_t sram_addr = cpu.sram_base + 64;
+        cpu.reg[0] = 0xDEADBEEF;
+        cpu.reg[1] = 0x12345678;
+        cpu.reg[2] = sram_addr;
+        /* STRD r0, r1, [r2, #0]: P=1,U=1,W=0 → hw1=0xE9C2, hw2=0x0100 */
+        write_thumb32(&cpu, CODE_BASE, 0xE9C2, 0x0100);
+        /* LDRD r3, r4, [r2, #0] */
+        write_thumb32(&cpu, CODE_BASE + 4, 0xE9D2, 0x3400);
+        arm_step(&cpu, 2);
+        assert_eq("STRD/LDRD round-trip: word0", 0xDEADBEEFu, cpu.reg[3]);
+        assert_eq("STRD/LDRD round-trip: word1", 0x12345678u, cpu.reg[4]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* LDRD with immediate offset: [sp, #124] as in SHA-256 transform.
+     * SHA-256 allocates 372 bytes on stack first (sub sp, #372).
+     * Here we subtract 512 bytes to make room for the offset access. */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* SUB SP, #512 (0x200) to allocate stack space */
+        write_thumb16(&cpu, CODE_BASE + 0, 0xB082); /* SUB SP, #8 (placeholder — use direct reg write) */
+        /* Easier: adjust SP directly, then write test values */
+        cpu.reg[ARM_SP] -= 512;
+        uint32_t sp = cpu.reg[ARM_SP];
+        arm_write32(&cpu, sp + 124, 0xAABBCCDD);
+        arm_write32(&cpu, sp + 128, 0x11223344);
+        /* LDRD r6, r11, [sp, #124]: P=1,U=1,W=0,L=1,Rn=13=sp
+         * hw1 = 0xE9DD, hw2 = (6<<12)|(11<<8)|(31) = 0x6B1F */
+        write_thumb32(&cpu, CODE_BASE, 0xE9DD, 0x6B1F);
+        arm_step(&cpu, 1);
+        assert_eq("LDRD [sp,#124]: r6", 0xAABBCCDDu, cpu.reg[6]);
+        assert_eq("LDRD [sp,#124]: r11", 0x11223344u, cpu.reg[11]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* STRD r3, r2, [sp, #28] — stores h and g in SHA-256 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[3] = 0x5BE0CD19u;  /* SHA-256 initial h */
+        cpu.reg[2] = 0x1F83D9ABu;  /* SHA-256 initial g */
+        cpu.reg[ARM_SP] -= 512;
+        uint32_t sp = cpu.reg[ARM_SP];
+        /* STRD r3, r2, [sp, #28]: P=1,U=1,W=0,L=0,Rn=13=sp
+         * hw1 = 0xE9CD, hw2 = (3<<12)|(2<<8)|7 = 0x3207 */
+        write_thumb32(&cpu, CODE_BASE, 0xE9CD, 0x3207);
+        arm_step(&cpu, 1);
+        assert_eq("STRD [sp,#28]: first word", 0x5BE0CD19u,
+                  arm_read32(&cpu, sp + 28));
+        assert_eq("STRD [sp,#28]: second word", 0x1F83D9ABu,
+                  arm_read32(&cpu, sp + 32));
+        arm_cpu_destroy(&cpu);
+    }
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -1517,6 +1784,10 @@ int run_arm_correctness_tests(int v) {
     test_branch();
     test_extensions();
     test_adc_sbc();
+    test_umull();
+    test_subs_rd_eq_rn();
+    test_vfp_double();
+    test_ldrd_strd();
     test_bit_field_ops();
     test_ldaex_stlex();
     test_m4_dsp_halfword_multiply();
