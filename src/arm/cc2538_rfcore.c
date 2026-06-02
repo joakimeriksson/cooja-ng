@@ -92,12 +92,22 @@ static void rfcore_tx_done(void *user_data, arm_event_t *ev) {
         rfcore_set_state(rf, RF_STATE_SFD_WAIT);
         rf->rx_frame_state = RF_RX_PREAMBLE;
         rf->zero_symbols = 0;
-        /* Discard bytes that arrived during TX — on real hardware these
-         * are collisions (can't TX and RX simultaneously).  The auto-ACK
-         * is already injected into RXFIFO by the ISTXON handler. */
-        rf->rx_incoming_len = 0;
+        /* Replay bytes that arrived during TX (typically a returning
+         * auto-ACK landing 192 µs after data RX-end — arrives before our
+         * tx_event fires in the per-byte delivery model).  Process them
+         * through the frame parser now that the chip is back in
+         * SFD_WAIT — single source of truth for RX state. */
+        if (rf->rx_incoming_len > 0) {
+            int len = rf->rx_incoming_len;
+            uint8_t buf[256];
+            memcpy(buf, rf->rx_incoming, (size_t)len);
+            rf->rx_incoming_len = 0;
+            for (int i = 0; i < len; i++)
+                cc2538_rfcore_receive_byte(rf, buf[i]);
+        }
     } else {
         rfcore_set_state(rf, RF_STATE_IDLE);
+        rf->rx_incoming_len = 0;
     }
 }
 
@@ -236,6 +246,7 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
             rf->rxfifo_len = 0;
             rf->rxfifo_rd = 0;
             rf->rx_overflow = false;
+            rf->fifop_signal = false;
             /* Do NOT clear rx_incoming here: those are bytes from future
              * transmissions buffered because the radio was busy.  They
              * will be delivered when ISRXON is next called. */
@@ -351,11 +362,10 @@ static int xreg_read(void *user_data, uint32_t addr) {
              * firmware detects this and does ISFLUSHRX to recover. */
             if (rf->rxfifo_rd < rf->rxfifo_len && !rf->rx_overflow)
                 val |= (1 << 7);
-            /* FIFOP (bit 6): live status — complete frame available in FIFO.
-             * Unlike the RFIRQF0.FIFOP interrupt flag (which gets cleared by
-             * the ISR), this hardware signal stays high as long as there are
-             * unread bytes in the RXFIFO.  Stays high during overflow. */
-            if (rf->rxfifo_rd < rf->rxfifo_len)
+            /* FSMSTAT1.FIFOP — hardware "frame complete" signal.  Set on
+             * RX_PAYLOAD complete (or FIFOPCTRL threshold), cleared when
+             * the firmware drains the RXFIFO or strobes ISFLUSHRX. */
+            if (rf->fifop_signal)
                 val |= (1 << 6);
             /* CCA (bit 4): always set — channel clear for simulation */
             val |= (1 << 4);
@@ -503,6 +513,7 @@ static int sfr_read(void *user_data, uint32_t addr) {
                 if (rf->rxfifo_rd >= rf->rxfifo_len) {
                     rf->rxfifo_rd = 0;
                     rf->rxfifo_len = 0;
+                    rf->fifop_signal = false;
                 }
                 return b;
             }
@@ -768,6 +779,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                 }
 
                 rf->rfirqf0 |= RFIRQF0_RXPKTDONE | RFIRQF0_FIFOP;
+                rf->fifop_signal = true;
                 rfcore_check_interrupts(rf);
 
                 /* Auto-ACK: if FRMCTRL0.AUTOACK (bit 5) is set and the

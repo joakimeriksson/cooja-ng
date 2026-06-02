@@ -90,7 +90,8 @@ void sim_eq_init(sim_event_queue_t *q) {
         q->node_heap_idx[i] = -1;
 }
 
-void sim_eq_schedule(sim_event_queue_t *q, int node_idx, int64_t time_ns) {
+void sim_eq_schedule_gen(sim_event_queue_t *q, int node_idx, int64_t time_ns,
+                          uint32_t target_generation) {
     if (node_idx < 0 || node_idx >= SIM_EQ_MAX_NODES) {
         fprintf(stderr, "WARNING: invalid event node index %d\n", node_idx);
         return;
@@ -115,11 +116,18 @@ void sim_eq_schedule(sim_event_queue_t *q, int node_idx, int64_t time_ns) {
     q->heap[i].sender_idx = -1;
     q->heap[i].byte = 0;
     q->heap[i].rssi = 0;
+    q->heap[i].target_generation = target_generation;
     q->node_heap_idx[node_idx] = i;
     heap_sift_up(q, i);
 }
 
-void sim_eq_schedule_if_earlier(sim_event_queue_t *q, int node_idx, int64_t time_ns) {
+void sim_eq_schedule(sim_event_queue_t *q, int node_idx, int64_t time_ns) {
+    sim_eq_schedule_gen(q, node_idx, time_ns, 0u);
+}
+
+void sim_eq_schedule_if_earlier_gen(sim_event_queue_t *q, int node_idx,
+                                     int64_t time_ns,
+                                     uint32_t target_generation) {
     if (node_idx < 0 || node_idx >= SIM_EQ_MAX_NODES) {
         fprintf(stderr, "WARNING: invalid event node index %d\n", node_idx);
         return;
@@ -127,11 +135,17 @@ void sim_eq_schedule_if_earlier(sim_event_queue_t *q, int node_idx, int64_t time
     int i = q->node_heap_idx[node_idx];
     if (i >= 0 && q->heap[i].time_ns <= time_ns)
         return;  /* already scheduled earlier — ignore */
-    sim_eq_schedule(q, node_idx, time_ns);
+    sim_eq_schedule_gen(q, node_idx, time_ns, target_generation);
 }
 
-void sim_eq_schedule_rx_byte(sim_event_queue_t *q, int node_idx, int sender_idx,
-                             uint8_t byte, int8_t rssi, int64_t time_ns) {
+void sim_eq_schedule_if_earlier(sim_event_queue_t *q, int node_idx, int64_t time_ns) {
+    sim_eq_schedule_if_earlier_gen(q, node_idx, time_ns, 0u);
+}
+
+void sim_eq_schedule_rx_byte_gen(sim_event_queue_t *q, int node_idx,
+                                  int sender_idx, uint8_t byte, int8_t rssi,
+                                  int64_t time_ns,
+                                  uint32_t target_generation) {
     if (node_idx < 0 || node_idx >= SIM_EQ_MAX_NODES) {
         fprintf(stderr, "WARNING: invalid rx-byte node index %d\n", node_idx);
         return;
@@ -149,9 +163,15 @@ void sim_eq_schedule_rx_byte(sim_event_queue_t *q, int node_idx, int sender_idx,
     q->heap[i].sender_idx = sender_idx;
     q->heap[i].byte = byte;
     q->heap[i].rssi = rssi;
+    q->heap[i].target_generation = target_generation;
     /* RX_BYTE events do not update node_heap_idx[] — that index tracks
      * only the single pending NODE_WAKEUP per node. */
     heap_sift_up(q, i);
+}
+
+void sim_eq_schedule_rx_byte(sim_event_queue_t *q, int node_idx, int sender_idx,
+                             uint8_t byte, int8_t rssi, int64_t time_ns) {
+    sim_eq_schedule_rx_byte_gen(q, node_idx, sender_idx, byte, rssi, time_ns, 0u);
 }
 
 sim_event_t sim_eq_pop(sim_event_queue_t *q) {

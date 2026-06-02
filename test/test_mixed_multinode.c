@@ -34,6 +34,7 @@
 #include "cJSON.h"
 #include "js_test_engine.h"
 #include "sim_event_queue.h"
+#include "sim_runtime.h"
 #include "gdb_stub.h"
 #include "arm_gdb.h"
 #include "pcap_writer.h"
@@ -292,10 +293,22 @@ static tx_frame_capture_t tx_cap[MAX_NODES]; /* sender-side full-frame capture *
 static emu_rx_queue_t emu_rx_queue[MAX_NODES]; /* per-receiver frame queue */
 static int64_t emu_rx_end_ns[MAX_NODES];      /* end time of last RX for each emulated receiver */
 static int rf_byte_count = 0;
-static sim_event_queue_t sim_eq;              /* unified event queue: mote wakeups + RX byte deliveries */
 static int uart_byte_count = 0;
-static radio_medium_t radio_medium;
-static int64_t current_sim_ns = 0;
+
+/* Simulation kernel container — Phase 1 of the refactor (see
+ * docs/design/refactor-plan.md §3.15).  This bundles the unified event queue,
+ * the radio medium, and the current simulation time that were previously
+ * three separate file-scope globals.
+ *
+ * Milestone 1: introduce the container, alias the legacy globals.
+ * Milestone 2 (this commit): readers go through sim_runtime_now_ns(&sim_rt);
+ *   the `current_sim_ns` alias is gone.  Writers use `sim_rt.now_ns = X`
+ *   directly until milestone 3 introduces scheduling wrappers.
+ * Subsequent milestones migrate sim_eq_* / radio_medium accesses onto
+ * sim_schedule_* / radio bus APIs and drop the remaining aliases. */
+static sim_runtime_t sim_rt;
+#define sim_eq          (sim_rt.event_queue)
+#define radio_medium    (sim_rt.radio_medium)
 
 /* ============================================================
  * CSIM_TRACE_RADIO — channel + TX + filter trace for debugging
@@ -321,7 +334,7 @@ int csim_radio_trace_enabled(void) {
 #define RTRACE(fmt, ...) do { \
     if (csim_radio_trace_enabled()) \
         fprintf(stderr, "[t=%.6fs] " fmt "\n", \
-                (double)current_sim_ns / 1e9, ##__VA_ARGS__); \
+                (double)sim_runtime_now_ns(&sim_rt) / 1e9, ##__VA_ARGS__); \
 } while (0)
 
 void csim_radio_trace_filter(int s, int sr, int rcv, int rr,
@@ -399,12 +412,12 @@ static const char *cc2420_state_str(cc2420_radio_state_t s) {
 
 static void trace_tsch_ack_log(const char *fmt, ...) {
     if (!trace_tsch_ack_enabled() || trace_tsch_ack_lines >= TRACE_TSCH_ACK_MAX_LINES ||
-        current_sim_ns < TRACE_TSCH_ACK_START_NS ||
-        current_sim_ns > TRACE_TSCH_ACK_END_NS)
+        sim_runtime_now_ns(&sim_rt) < TRACE_TSCH_ACK_START_NS ||
+        sim_runtime_now_ns(&sim_rt) > TRACE_TSCH_ACK_END_NS)
         return;
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "  [TRACE] %7.3f ", (double)current_sim_ns / 1e9);
+    fprintf(stderr, "  [TRACE] %7.3f ", (double)sim_runtime_now_ns(&sim_rt) / 1e9);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
@@ -472,7 +485,7 @@ static int64_t node_tx_busy_until_ns[MAX_NODES];
 static int64_t node_start_ns[MAX_NODES];  /* 0 = start immediately */
 
 static inline int node_active(int idx) {
-    return current_sim_ns >= node_start_ns[idx];
+    return sim_runtime_now_ns(&sim_rt) >= node_start_ns[idx];
 }
 
 /* --- WebSocket UI state --- */
@@ -526,6 +539,67 @@ static sim_node_state_t node_states[MAX_NODES];
 static sim_node_state_t prev_node_states[MAX_NODES]; /* previous delta state for change detection */
 static int64_t prev_last_tx_ns[MAX_NODES];           /* previous TX timestamps for change detection */
 static int suppress_state_callback = 0; /* suppress during synchronous delivery */
+
+/* Timeline observer — Phase 1 milestone 7.  Subscribed to the runtime via
+ * sim_runtime_subscribe() at startup; translates each kernel-emitted
+ * sim_observer_event_t into the equivalent tl_*_event() call.
+ *
+ * This commit migrates the frame-level events (TX/RX start/end,
+ * interference, packet frame, LED change).  The two radio-state-tracking
+ * call sites in update_radio_state() still call tl_radio_event() directly
+ * because they emit chip-state transitions (ON/OFF/INTF/TX/RX) that
+ * don't have a clean 1:1 mapping to the plan's START/END observer kinds. */
+static void timeline_observer_cb(void *user, const sim_observer_event_t *ev) {
+    timeline_t *tl = (timeline_t *)user;
+    if (!tl || ev->mote_index < 0 || ev->mote_index >= MAX_NODES) return;
+    int node_id = nodes[ev->mote_index].id;
+    switch (ev->kind) {
+    case SIM_OBS_RADIO_TX_START:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_TX);   break;
+    case SIM_OBS_RADIO_TX_END:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_ON);   break;
+    case SIM_OBS_RADIO_RX_START:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_RX);   break;
+    case SIM_OBS_RADIO_RX_END:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_ON);   break;
+    case SIM_OBS_RADIO_INTERFERENCE:
+        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_INTF); break;
+    case SIM_OBS_LED_CHANGED:
+        tl_led_event(tl, node_id, ev->time_ns,
+                     ev->u.led.led_index, ev->u.led.on ? 1 : 0);  break;
+    case SIM_OBS_PACKET_FRAME:
+        tl_frame_event(tl, node_id, ev->time_ns,
+                       ev->u.frame.is_tx ? 1 : 0,
+                       ev->u.frame.summary);                       break;
+    default:
+        break;
+    }
+}
+
+/* Helpers to keep the call-site changes one-liners and visually close to the
+ * legacy tl_*_event() forms they replace. */
+static inline void emit_radio_obs(int mote_index, int64_t time_ns,
+                                   sim_observer_kind_t kind) {
+    sim_observer_event_t ev = { .kind = kind, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = 0 };
+    sim_runtime_emit(&sim_rt, &ev);
+}
+static inline void emit_frame_obs(int mote_index, int64_t time_ns,
+                                   bool is_tx, const char *summary) {
+    sim_observer_event_t ev = { .kind = SIM_OBS_PACKET_FRAME, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = 0 };
+    ev.u.frame.is_tx = is_tx;
+    ev.u.frame.summary = summary;
+    sim_runtime_emit(&sim_rt, &ev);
+}
+static inline void emit_led_obs(int mote_index, int64_t time_ns,
+                                 int led_index, bool on) {
+    sim_observer_event_t ev = { .kind = SIM_OBS_LED_CHANGED, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = -1 };
+    ev.u.led.led_index = led_index;
+    ev.u.led.on = on;
+    sim_runtime_emit(&sim_rt, &ev);
+}
 
 /* RF state change callback — fires during CPU step for real-time timeline tracking.
  * TX and RX events are handled by explicit timeline events in the TX/delivery
@@ -598,7 +672,7 @@ static void update_radio_state(int idx) {
             case SIM_RADIO_INTF: etype = TL_RADIO_INTF; break;
             default:             etype = TL_RADIO_OFF;   break;
             }
-            tl_radio_event(&timeline, nodes[idx].id, current_sim_ns, etype);
+            tl_radio_event(&timeline, nodes[idx].id, sim_runtime_now_ns(&sim_rt), etype);
         }
     }
 }
@@ -622,7 +696,7 @@ static void update_led_state(int idx) {
         if (leds[l] != node_states[idx].led[l]) {
             node_states[idx].led[l] = leds[l];
             if (ui_server)
-                tl_led_event(&timeline, nodes[idx].id, current_sim_ns, l, leds[l]);
+                emit_led_obs(idx, sim_runtime_now_ns(&sim_rt), l, leds[l] ? true : false);
         }
     }
 }
@@ -831,8 +905,9 @@ static const char *node_type_str(int idx) {
 /* Forward declarations */
 static void mixed_deliver_rf_bytes(int idx);
 static void step_node_until(int idx, int64_t target);
-static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx);
+static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx);
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns);
+static int64_t sync_arm_to_time(int idx, int64_t sim_ns);
 
 /* Check available RXFIFO space for an emulated node. Firefly nodes have
  * two radios; we report the more constrained side so back-pressure
@@ -956,8 +1031,41 @@ static void deliver_msp430_rx_byte(const sim_event_t *ev) {
          * execute(t, 0) first, then receivedByte(), then a same-time mote
          * wakeup request. Also retain the next wakeup returned by execute. */
         int64_t next_ns = ev->time_ns + returned_us * 1000LL;
-        sim_eq_schedule_if_earlier(&sim_eq, ev->node_idx, next_ns);
-        sim_eq_schedule_if_earlier(&sim_eq, ev->node_idx, ev->time_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, next_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, ev->time_ns);
+    }
+}
+
+/* ARM equivalent of deliver_msp430_rx_byte — Cooja MspMoteTimeEvent pattern:
+ * advance receiver CPU to byte's air time, feed byte to on-die radio,
+ * request immediate wakeup. */
+static void deliver_arm_rx_byte(const sim_event_t *ev) {
+    if (ev->node_idx < 0 || ev->node_idx >= num_nodes ||
+        !node_active(ev->node_idx) || nodes[ev->node_idx].type != NODE_ARM)
+        return;
+    int64_t returned_us = sync_arm_to_time(ev->node_idx, ev->time_ns);
+
+    const arm_platform_config_t *pcfg = nodes[ev->node_idx].plat.arm.config;
+    bool has_cc1200 = pcfg && pcfg->has_cc1200;
+    cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&nodes[ev->node_idx].plat.arm);
+    nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&nodes[ev->node_idx].plat.arm);
+    nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&nodes[ev->node_idx].plat.arm);
+
+    if (cc_soc) {
+        cc_soc->rfcore.rx_rssi = ev->rssi;
+        cc2538_rfcore_receive_byte(&cc_soc->rfcore, ev->byte);
+        if (has_cc1200) {
+            cc_soc->cc1200.rx_rssi = ev->rssi;
+            cc1200_receive_byte(&cc_soc->cc1200, ev->byte);
+        }
+    }
+    if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, ev->byte);
+    if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, ev->byte);
+
+    if (num_threads == 0) {
+        int64_t next_ns = ev->time_ns + returned_us * 1000LL;
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, next_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, ev->time_ns);
     }
 }
 
@@ -978,8 +1086,8 @@ static inline int64_t byte_period_ns(bool subghz) {
 
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
     /* Cap to global sim time — no node should advance past it (Cooja invariant) */
-    if (sim_ns > current_sim_ns)
-        sim_ns = current_sim_ns;
+    if (sim_ns > sim_runtime_now_ns(&sim_rt))
+        sim_ns = sim_runtime_now_ns(&sim_rt);
     msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
     int64_t t_us = sim_ns / 1000LL;
     int64_t jump_us = 0;
@@ -1014,6 +1122,36 @@ static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
     return returned_us;
 }
 
+/* ARM equivalent of sync_msp430_to_time — Cooja MspMoteTimeEvent.execute
+ * pattern: advance CPU to event time before feeding chip-level byte. */
+static int64_t sync_arm_to_time(int idx, int64_t sim_ns) {
+    if (sim_ns > sim_runtime_now_ns(&sim_rt))
+        sim_ns = sim_runtime_now_ns(&sim_rt);
+    arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
+    int64_t t_us = sim_ns / 1000LL;
+    int64_t jump_us = 0;
+    if (cpu->last_execute_us >= 0) {
+        jump_us = t_us - cpu->last_execute_us;
+        if (jump_us < 0) jump_us = 0;
+    }
+    double deviation = nodes[idx].clock_deviation;
+    if (deviation != 1.0 && jump_us > 0) {
+        double exact = (double)jump_us * deviation;
+        jump_us = (int64_t)exact;
+        cpu->step_cycle_remainder += exact - (double)jump_us;
+        if (cpu->step_cycle_remainder > 1.0) {
+            jump_us++;
+            cpu->step_cycle_remainder -= 1.0;
+        }
+    }
+    int64_t returned_us = arm_step_micros(cpu, jump_us, 0);
+    cpu->sim_time_ns = sim_ns;
+    cpu->last_execute_us = t_us;
+    if (deviation != 1.0 && returned_us > 0)
+        returned_us = (int64_t)((double)returned_us / deviation);
+    return returned_us;
+}
+
 /* Deliver buffered bytes directly to an emulated node's radio.
  * Emits explicit RX timeline events with computed frame air time.
  * For MSP430, advance the receiver's internal clock before each byte to
@@ -1031,8 +1169,8 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
      * (derived from the sender's TX timing) for consistency. */
     if (ui_server && len > 0) {
         int64_t rx_dur = (int64_t)len * byte_ns;
-        tl_radio_event(&timeline, nodes[idx].id, air_time_ns, TL_RADIO_RX);
-        tl_radio_event(&timeline, nodes[idx].id, air_time_ns + rx_dur, TL_RADIO_ON);
+        emit_radio_obs(idx, air_time_ns, SIM_OBS_RADIO_RX_START);
+        emit_radio_obs(idx, air_time_ns + rx_dur, SIM_OBS_RADIO_RX_END);
         node_states[idx].radio_state = SIM_RADIO_ON;
     }
     if (nodes[idx].type == NODE_MSP430) {
@@ -1088,7 +1226,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         /* Request immediate wakeup after the delivered byte burst so the
          * receiver gets CPU time to process FIFOP/ISR work. */
         if (num_threads == 0) {
-            sim_eq_schedule_if_earlier(&sim_eq, idx, last_byte_ns);
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
         }
     } else if (nodes[idx].type == NODE_ARM) {
         /* Mirror the MSP430 RX path: pre-sync the receiver to the byte's
@@ -1149,7 +1287,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         }
 
         if (num_threads == 0) {
-            sim_eq_schedule_if_earlier(&sim_eq, idx, last_byte_ns);
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
         }
     }
 }
@@ -1303,7 +1441,7 @@ static bool mixed_cc1200_channel_busy(void *user_data) {
     for (int k = 0; k < n; k++) {
         int j = nbrs->neighbors[k];
         if (j == idx) continue;
-        if (node_tx_busy_until_ns[j] <= current_sim_ns) continue;
+        if (node_tx_busy_until_ns[j] <= sim_runtime_now_ns(&sim_rt)) continue;
         /* Cross-band check: 2.4 GHz neighbors don't affect sub-GHz CCA. */
         int their_ch = radio_medium.nodes[j].channel;
         if (my_ch >= 0 && their_ch >= 0) {
@@ -1317,7 +1455,7 @@ static bool mixed_cc1200_channel_busy(void *user_data) {
     if (!nbrs) {
         for (int j = 0; j < num_nodes; j++) {
             if (j == idx) continue;
-            if (node_tx_busy_until_ns[j] > current_sim_ns)
+            if (node_tx_busy_until_ns[j] > sim_runtime_now_ns(&sim_rt))
                 return true;
         }
     }
@@ -1420,7 +1558,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
         /* Match Cooja's radio callbacks: outgoing bytes are observed at the
          * current scheduler time, not from a mote-local sim_time that may
          * have advanced within the current execute slice. */
-        tx_asm[sender_idx].first_byte_ns = current_sim_ns;
+        tx_asm[sender_idx].first_byte_ns = sim_runtime_now_ns(&sim_rt);
         tx_cap[sender_idx].len = 0;
     }
     /* Per-sender byte period — sub-GHz CC1200 frames take 5x longer per
@@ -1456,35 +1594,39 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                 continue;
             if (nodes[i].type == NODE_NATIVE) {
                 native_rx_assembler_feed(&nodes[i].plat.native, byte);
-            } else if (nodes[i].type == NODE_MSP430) {
-                int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
-                if (trace_tsch_ack_enabled() &&
-                    sender->type == NODE_MSP430 &&
-                    nodes[sender_idx].id == 1 && nodes[i].id == 2) {
-                    trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
-                                       byte,
-                                       cc2420_state_str(nodes[i].plat.msp.cc2420.state),
-                                       (double)nodes[i].plat.msp.cpu.sim_time_ns / 1e9);
-                }
-                /* Match Cooja CustomDataRadio delivery: each transmitted byte
-                 * is forwarded at the sender's current simulation time. */
-                stat_msp_byte_push[i]++;
-                if (sender_idx >= 0 && sender_idx < num_nodes &&
-                    nodes[sender_idx].id == 2 && nodes[i].id == 1)
-                    stat_msp_byte_push_2_to_1++;
-                /* Spread bytes by their on-air timing within the frame
-                 * (first_byte_ns + byte_index * byte_period), matching
-                 * Cooja's Msp802154Radio per-byte schedule. Clamp to
-                 * current_sim_ns: if the sender's cycle progression
-                 * lagged the scheduler, byte_time_ns can fall in the
-                 * past — sim_eq must stay monotonic. */
-                { int64_t bt = byte_time_ns;
-                  if (bt < current_sim_ns) bt = current_sim_ns;
-                  sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
             } else {
-                rf_buffer_t *buf = &rf_pending[i];
-                if (buf->count < RF_BUF_SIZE)
-                    buf->bytes[buf->count++] = byte;
+                int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
+                if (nodes[i].type == NODE_MSP430) {
+                    if (trace_tsch_ack_enabled() &&
+                        sender->type == NODE_MSP430 &&
+                        nodes[sender_idx].id == 1 && nodes[i].id == 2) {
+                        trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
+                                           byte,
+                                           cc2420_state_str(nodes[i].plat.msp.cc2420.state),
+                                           (double)nodes[i].plat.msp.cpu.sim_time_ns / 1e9);
+                    }
+                    stat_msp_byte_push[i]++;
+                    if (sender_idx >= 0 && sender_idx < num_nodes &&
+                        nodes[sender_idx].id == 2 && nodes[i].id == 1)
+                        stat_msp_byte_push_2_to_1++;
+                }
+                /* Per-byte (Cooja Msp802154Radio.receiveCustomData) for
+                 * MSP430/CC2420 and ARM/cc2538_rfcore — both carry an
+                 * rx_incoming buffer + state guard.  nrf receivers
+                 * currently fall back to batched delivery until their
+                 * buffer/replay hook is tuned. */
+                bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
+                                   (nodes[i].type == NODE_ARM &&
+                                    arm_platform_cc2538(&nodes[i].plat.arm) != NULL);
+                if (per_byte_ok) {
+                    int64_t bt = byte_time_ns;
+                    if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
+                    sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt);
+                } else {
+                    rf_buffer_t *buf = &rf_pending[i];
+                    if (buf->count < RF_BUF_SIZE)
+                        buf->bytes[buf->count++] = byte;
+                }
             }
         }
         return;
@@ -1508,25 +1650,28 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
             continue;
         if (nodes[i].type == NODE_NATIVE) {
             native_rx_assembler_feed(&nodes[i].plat.native, byte);
-        } else if (nodes[i].type == NODE_MSP430) {
-            int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
-            /* Match Cooja CustomDataRadio delivery: per-byte receive events
-             * are scheduled at the current simulation time of the sender's
-             * transmit callback, not with an extra receiver-side byte delay. */
-            stat_msp_byte_push[i]++;
-            if (sender_idx >= 0 && sender_idx < num_nodes &&
-                nodes[sender_idx].id == 2 && nodes[i].id == 1)
-                stat_msp_byte_push_2_to_1++;
-            /* Spread bytes by on-air timing; clamp to current_sim_ns
-             * to keep the queue monotonic when byte_time_ns falls
-             * behind scheduler. */
-            { int64_t bt = byte_time_ns;
-              if (bt < current_sim_ns) bt = current_sim_ns;
-              sim_eq_schedule_rx_byte(&sim_eq, i, sender_idx, byte, rssi, bt); }
         } else {
-            rf_buffer_t *buf = &rf_pending[i];
-            if (buf->count < RF_BUF_SIZE)
-                buf->bytes[buf->count++] = byte;
+            int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
+            if (nodes[i].type == NODE_MSP430) {
+                stat_msp_byte_push[i]++;
+                if (sender_idx >= 0 && sender_idx < num_nodes &&
+                    nodes[sender_idx].id == 2 && nodes[i].id == 1)
+                    stat_msp_byte_push_2_to_1++;
+            }
+            /* Per-byte for chips with rx_incoming buffer; batched for
+             * chips that drop bytes outside RX. */
+            bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
+                               (nodes[i].type == NODE_ARM &&
+                                arm_platform_cc2538(&nodes[i].plat.arm) != NULL);
+            if (per_byte_ok) {
+                int64_t bt = byte_time_ns;
+                if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
+                sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt);
+            } else {
+                rf_buffer_t *buf = &rf_pending[i];
+                if (buf->count < RF_BUF_SIZE)
+                    buf->bytes[buf->count++] = byte;
+            }
         }
     }
 
@@ -1596,7 +1741,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
      * path sees (which is what trips the receiver's MARC_RX gating). */
     int64_t busy_until = accurate_tx_end;
     if (tx_asm[sender_idx].subghz)
-        busy_until = current_sim_ns + frame_air_dur;
+        busy_until = sim_runtime_now_ns(&sim_rt) + frame_air_dur;
     if (busy_until > node_tx_busy_until_ns[sender_idx])
         node_tx_busy_until_ns[sender_idx] = busy_until;
 
@@ -1612,8 +1757,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
 
     /* Emit explicit TX timeline event */
     if (ui_server) {
-        tl_radio_event(&timeline, nodes[sender_idx].id, accurate_tx_start, TL_RADIO_TX);
-        tl_radio_event(&timeline, nodes[sender_idx].id, accurate_tx_end, TL_RADIO_ON);
+        emit_radio_obs(sender_idx, accurate_tx_start, SIM_OBS_RADIO_TX_START);
+        emit_radio_obs(sender_idx, accurate_tx_end,   SIM_OBS_RADIO_TX_END);
         node_states[sender_idx].radio_state = SIM_RADIO_ON;
     }
 
@@ -1672,8 +1817,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                 }
             }
             if (ui_server)
-                tl_frame_event(&timeline, nodes[sender_idx].id,
-                               accurate_tx_start, 1, pinfo.summary);
+                emit_frame_obs(sender_idx, accurate_tx_start, true,
+                               pinfo.summary);
         }
     }
 
@@ -1700,7 +1845,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
     if (verbose) {
         fprintf(stderr, "  [RF] Node %d TX frame (%d bytes) @ %.3f s -> receivers:",
                 nodes[sender_idx].id, tx_asm[sender_idx].expected_len,
-                (double)current_sim_ns / 1e9);
+                (double)sim_runtime_now_ns(&sim_rt) / 1e9);
         for (int i = 0; i < num_nodes; i++) {
             if (i == sender_idx || nodes[i].type == NODE_NATIVE || !node_active(i))
                 continue;
@@ -1761,8 +1906,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
         int64_t coll_start = accurate_tx_start;
         int64_t coll_end = accurate_tx_end;
         if (tx_asm[sender_idx].subghz) {
-            coll_start = current_sim_ns;
-            coll_end = current_sim_ns + frame_air_dur;
+            coll_start = sim_runtime_now_ns(&sim_rt);
+            coll_end = sim_runtime_now_ns(&sim_rt) + frame_air_dur;
         }
 
         /* Collision check: does this frame overlap with a previously
@@ -1779,8 +1924,11 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
             /* Emit interference event on the receiver's timeline */
             if (ui_server) {
                 int64_t intf_dur = (int64_t)frame_snap_len[i] * sender_byte_ns;
-                tl_radio_event(&timeline, nodes[i].id, accurate_tx_start, TL_RADIO_INTF);
-                tl_radio_event(&timeline, nodes[i].id, accurate_tx_start + intf_dur, TL_RADIO_ON);
+                emit_radio_obs(i, accurate_tx_start, SIM_OBS_RADIO_INTERFERENCE);
+                /* Pair the interference with an RX_END to clear the lane back
+                 * to TL_RADIO_ON — same semantics as the legacy direct call. */
+                emit_radio_obs(i, accurate_tx_start + intf_dur,
+                               SIM_OBS_RADIO_RX_END);
             }
             continue;
         }
@@ -1810,7 +1958,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
              * for many seconds.  Anchor sub-GHz delivery to current_sim_ns
              * so the receiver's wake-up event is always near "now". */
             int64_t delivery_start = tx_asm[sender_idx].subghz
-                ? current_sim_ns : accurate_tx_start;
+                ? sim_runtime_now_ns(&sim_rt) : accurate_tx_start;
             if (trace_tsch_ack_enabled() &&
                 sender->type == NODE_MSP430 && nodes[sender_idx].id == 2 &&
                 nodes[i].type == NODE_MSP430 && nodes[i].id == 1 &&
@@ -1842,8 +1990,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                     pkt_info_t rxinfo;
                     pkt_analyze(frame_snap[i] + fstart,
                                 frame_snap_len[i] - fstart, &rxinfo);
-                    tl_frame_event(&timeline, nodes[i].id,
-                                   accurate_tx_start, 0, rxinfo.summary);
+                    emit_frame_obs(i, accurate_tx_start, false, rxinfo.summary);
                 }
             }
         } else {
@@ -1868,7 +2015,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
          * perpetual CSMA retransmissions.  Matching the native-sender path
          * (distribute_rf_outgoing uses current_sim_ns + 192000 for the same
          * reason). */
-        int64_t sender_ack_start = current_sim_ns + 192000LL;
+        int64_t sender_ack_start = sim_runtime_now_ns(&sim_rt) + 192000LL;
         int ack_tx_emitted = 0;
         for (int j = 0; j < num_nodes; j++) {
             if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
@@ -1876,8 +2023,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                     /* ACKs follow the same PHY as the data frame they
                      * acknowledge — CC1200 ACK = sub-GHz timing too. */
                     int64_t ack_dur = (int64_t)rf_pending[j].count * sender_byte_ns;
-                    tl_radio_event(&timeline, nodes[i].id, ack_start, TL_RADIO_TX);
-                    tl_radio_event(&timeline, nodes[i].id, ack_start + ack_dur, TL_RADIO_ON);
+                    emit_radio_obs(i, ack_start, SIM_OBS_RADIO_TX_START);
+                    emit_radio_obs(i, ack_start + ack_dur, SIM_OBS_RADIO_TX_END);
                     ack_tx_emitted = 1;
                 }
                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
@@ -1910,8 +2057,8 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
      * as collided if a TX-range or interference-range neighbor transmitted. */
     if (radio_medium.type != RADIO_MEDIUM_NONE) {
         neighbor_list_t *inl = &radio_medium.interference_neighbors[sender_idx];
-        int64_t int_start = current_sim_ns;
-        int64_t int_end = current_sim_ns + TIME_STEP_NS;
+        int64_t int_start = sim_runtime_now_ns(&sim_rt);
+        int64_t int_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
             if (nodes[i].type == NODE_NATIVE) continue;  /* native handled elsewhere */
@@ -1935,7 +2082,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
      * rather than a coarse fixed delay; enhanced ACK reception depends
      * on the sender re-entering RX on the normal CC2420 turnaround path. */
     if (nodes[sender_idx].type == NODE_MSP430 && num_threads == 0) {
-        schedule_emulated_wakeup(&sim_eq, sender_idx);
+        schedule_emulated_wakeup(&sim_rt, sender_idx);
     }
 }
 
@@ -1950,7 +2097,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 
     stat_rf_frames++;
     channels_dirty = true;  /* TX happened, channels may have changed */
-    node_last_tx_ns[sender_idx] = current_sim_ns;
+    node_last_tx_ns[sender_idx] = sim_runtime_now_ns(&sim_rt);
     /* Native sender: snap current channel into the medium before the
      * neighbour-loop filter calls. */
     sync_native_node_channel(sender_idx);
@@ -1974,18 +2121,18 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                         /* Set packet timestamp (TSCH uses this for sync) */
                         if (rcv->simLastPacketTimestamp)
                             *rcv->simLastPacketTimestamp =
-                                (uint64_t)(current_sim_ns / 1000LL);
+                                (uint64_t)(sim_runtime_now_ns(&sim_rt) / 1000LL);
                     } else {
                         native_deliver_frame(rcv, frame, len,
-                                             current_sim_ns, sender_idx);
+                                             sim_runtime_now_ns(&sim_rt), sender_idx);
                     }
                     stat_rx_frames_queued++;
                 }
             } else if (nodes[i].type == NODE_JS) {
                 if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
                     js_node_deliver_frame(&nodes[i].plat.js, frame, len,
-                                          current_sim_ns);
-                    sim_eq_schedule_if_earlier(&sim_eq, i, current_sim_ns);
+                                          sim_runtime_now_ns(&sim_rt));
+                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_runtime_now_ns(&sim_rt));
                     stat_rx_frames_queued++;
                 }
             }
@@ -1994,7 +2141,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 
         /* Interference-range neighbors: mark overlapping frames as collided */
         neighbor_list_t *inl = &radio_medium.interference_neighbors[sender_idx];
-        int64_t tx_start = current_sim_ns;
+        int64_t tx_start = sim_runtime_now_ns(&sim_rt);
         int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
@@ -2032,12 +2179,12 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                 if (q->count >= NATIVE_RX_QUEUE_SIZE)
                     stat_rx_frames_queue_full++;
                 native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                     current_sim_ns, sender_idx);
+                                     sim_runtime_now_ns(&sim_rt), sender_idx);
                 stat_rx_frames_queued++;
             } else if (nodes[i].type == NODE_JS) {
                 js_node_deliver_frame(&nodes[i].plat.js, frame, len,
-                                      current_sim_ns);
-                sim_eq_schedule_if_earlier(&sim_eq, i, current_sim_ns);
+                                      sim_runtime_now_ns(&sim_rt));
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_runtime_now_ns(&sim_rt));
                 stat_rx_frames_queued++;
             }
         }
@@ -2051,7 +2198,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
 static void mixed_deliver_rf_bytes(int idx) {
     rf_buffer_t *buf = &rf_pending[idx];
     if (buf->count == 0) return;
-    emu_deliver_bytes(idx, buf->bytes, buf->count, 0, current_sim_ns,
+    emu_deliver_bytes(idx, buf->bytes, buf->count, 0, sim_runtime_now_ns(&sim_rt),
                       /*subghz=*/false);
     buf->count = 0;
 }
@@ -2101,8 +2248,8 @@ static void emu_rx_queue_drain(int idx) {
          * with a future arrival_ns (192µs turnaround past the data
          * frame's tx-end) still advance the receiver's CPU forward
          * by the turnaround before bytes hit the radio. */
-        int64_t deliver_ns = f->arrival_ns > current_sim_ns
-                                ? f->arrival_ns : current_sim_ns;
+        int64_t deliver_ns = f->arrival_ns > sim_runtime_now_ns(&sim_rt)
+                                ? f->arrival_ns : sim_runtime_now_ns(&sim_rt);
         emu_deliver_bytes(idx, f->data, f->len, f->rssi, deliver_ns,
                           f->subghz);
         stat_emu_rx_drained++;
@@ -2290,7 +2437,7 @@ static void ss_inject_serial(void) {
                 int64_t wake_ns = nat->sim_time_ns;
                 if (node_start_ns[ss_node_idx] > wake_ns)
                     wake_ns = node_start_ns[ss_node_idx];
-                sim_eq_schedule_if_earlier(&sim_eq, ss_node_idx, wake_ns);
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
             }
             return;
         }
@@ -2316,7 +2463,7 @@ static void ss_inject_serial(void) {
             int64_t wake_ns = nat->sim_time_ns;
             if (node_start_ns[ss_node_idx] > wake_ns)
                 wake_ns = node_start_ns[ss_node_idx];
-            sim_eq_schedule_if_earlier(&sim_eq, ss_node_idx, wake_ns);
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
         }
     } else if (node->type == NODE_MSP430) {
         /* Match MSPSim's MspSerial: inject ALL pending bytes at baud-rate
@@ -2363,7 +2510,7 @@ static void ss_inject_serial(void) {
             cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
                 cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
             if (num_threads == 0)
-                schedule_emulated_wakeup(&sim_eq, ss_node_idx);
+                schedule_emulated_wakeup(&sim_rt, ss_node_idx);
         }
     } else if (node->type == NODE_ARM) {
         cc2538_soc_t *soc = arm_platform_cc2538(&node->plat.arm);
@@ -2439,7 +2586,7 @@ static void threaded_rf_tx_handler(void *user_data, uint8_t byte) {
     node_thread_state_t *ts = &thread_state[sender_idx];
     ts->rf_byte_count++;
     ts->channels_dirty = true;
-    ts->last_tx_ns = current_sim_ns;
+    ts->last_tx_ns = sim_runtime_now_ns(&sim_rt);
 
     rf_outgoing_t *out = &rf_outgoing[sender_idx];
     if (out->count < RF_BUF_SIZE)
@@ -2456,7 +2603,7 @@ static void threaded_rf_frame_handler(void *user_data, const uint8_t *frame, int
     node_thread_state_t *ts = &thread_state[sender_idx];
     ts->rf_frame_count++;
     ts->channels_dirty = true;
-    ts->last_tx_ns = current_sim_ns;
+    ts->last_tx_ns = sim_runtime_now_ns(&sim_rt);
 
     frame_outgoing_t *out = &frame_outgoing[sender_idx];
     if (out->count < MAX_OUTGOING_FRAMES && len <= 128) {
@@ -2535,8 +2682,8 @@ static void distribute_rf_outgoing(void) {
                         rf_buffer_t *buf = &rf_pending[i];
                         if (buf->count == 0 || nodes[i].type == NODE_NATIVE)
                             continue;
-                        int64_t tx_start = current_sim_ns;
-                        int64_t tx_end = current_sim_ns + TIME_STEP_NS;
+                        int64_t tx_start = sim_runtime_now_ns(&sim_rt);
+                        int64_t tx_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
 
                         /* Collision check against previously delivered frame */
                         if (tx_start < emu_rx_end_ns[i]) {
@@ -2566,7 +2713,7 @@ static void distribute_rf_outgoing(void) {
 
                     /* Flush auto-ACK bytes generated by this delivery */
                     {
-                        int64_t native_ack_start = current_sim_ns + 192000LL;
+                        int64_t native_ack_start = sim_runtime_now_ns(&sim_rt) + 192000LL;
                         for (int j = 0; j < num_nodes; j++) {
                             if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
                                 int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
@@ -2575,8 +2722,8 @@ static void distribute_rf_outgoing(void) {
                                                       -50, native_ack_start, /*subghz=*/false);
                                 else
                                     emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                                      -50, current_sim_ns,
-                                                      current_sim_ns + TIME_STEP_NS,
+                                                      -50, sim_runtime_now_ns(&sim_rt),
+                                                      sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS,
                                                       /*subghz=*/false);
                                 rf_pending[j].count = 0;
                             }
@@ -2586,8 +2733,8 @@ static void distribute_rf_outgoing(void) {
                     /* Interference check for emulated nodes */
                     if (radio_medium.type != RADIO_MEDIUM_NONE) {
                         neighbor_list_t *inl = &radio_medium.interference_neighbors[sender];
-                        int64_t int_start = current_sim_ns;
-                        int64_t int_end = current_sim_ns + TIME_STEP_NS;
+                        int64_t int_start = sim_runtime_now_ns(&sim_rt);
+                        int64_t int_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
                         for (int n = 0; n < inl->count; n++) {
                             int i = inl->neighbors[n];
                             if (nodes[i].type == NODE_NATIVE) continue;
@@ -2627,14 +2774,14 @@ static void distribute_rf_outgoing(void) {
                             if (q->count >= NATIVE_RX_QUEUE_SIZE)
                                 stat_rx_frames_queue_full++;
                             native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                                 current_sim_ns, sender);
+                                                 sim_runtime_now_ns(&sim_rt), sender);
                             stat_rx_frames_queued++;
                         }
                     }
                 }
                 /* Interference collision detection */
                 neighbor_list_t *inl = &radio_medium.interference_neighbors[sender];
-                int64_t tx_start = current_sim_ns;
+                int64_t tx_start = sim_runtime_now_ns(&sim_rt);
                 int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
                 for (int n = 0; n < inl->count; n++) {
                     int i = inl->neighbors[n];
@@ -2669,7 +2816,7 @@ static void distribute_rf_outgoing(void) {
                         if (q->count >= NATIVE_RX_QUEUE_SIZE)
                             stat_rx_frames_queue_full++;
                         native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                             current_sim_ns, sender);
+                                             sim_runtime_now_ns(&sim_rt), sender);
                         stat_rx_frames_queued++;
                     }
                 }
@@ -2706,11 +2853,11 @@ static void flush_pending_output(void) {
             int nidx = ts->node_idx[l];
             int nid = ts->node_id[l];
             if (verbose)
-                printf("  %7.3f [Node %d/%s] %s\n", (double)current_sim_ns / 1e9,
+                printf("  %7.3f [Node %d/%s] %s\n", (double)sim_runtime_now_ns(&sim_rt) / 1e9,
                        nid, node_type_str(nidx), ts->lines[l]);
-            test_check_line(nid, ts->lines[l], current_sim_ns);
+            test_check_line(nid, ts->lines[l], sim_runtime_now_ns(&sim_rt));
             if (ui_server)
-                ui_add_console_line(nidx, current_sim_ns, ts->lines[l]);
+                ui_add_console_line(nidx, sim_runtime_now_ns(&sim_rt), ts->lines[l]);
         }
         ts->count = 0;
     }
@@ -3292,7 +3439,8 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
-    sim_eq_remove_node(&sim_eq, idx);
+    sim_cancel_mote_events(&sim_rt, idx);
+    sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
 
@@ -3347,11 +3495,14 @@ static int reboot_node(int idx) {
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
-    sim_eq_remove_node(&sim_eq, idx);
+    sim_cancel_mote_events(&sim_rt, idx);
+    sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
     tx_frame_asm_reset(&tx_asm[idx]);
 
-    /* Destroy and reinitialize */
+    /* Destroy and reinitialize.  init_node bumps generation again — fine;
+     * what matters is that any events queued between this point and the
+     * old slot's last activity are guaranteed to miss the new generation. */
     destroy_node(idx);
     return init_node(idx, fw, node_id);
 }
@@ -3527,7 +3678,7 @@ static void tick_one_native(int idx, int64_t sim_ns) {
 
 /* Schedule a native node's next wakeup in the event queue.
  * Exactly matches COOJA's ContikiClock.doActionsAfterTick(). */
-static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
+static void schedule_native_wakeup(sim_runtime_t *sim, int idx) {
     native_node_t *nat = &nodes[idx].plat.native;
     int64_t now = nat->sim_time_ns;
 
@@ -3549,7 +3700,7 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
     if (nat->radio_tx_finished) {
         next = now;
         nat->radio_tx_finished = false;
-        sim_eq_schedule_if_earlier(eq, idx, next);
+        sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
         return;
     }
     if (nat->radio_is_transmitting) {
@@ -3581,12 +3732,12 @@ static void schedule_native_wakeup(sim_event_queue_t *eq, int idx) {
         if (rx_next < next) next = rx_next;
     }
 
-    sim_eq_schedule_if_earlier(eq, idx, next);
+    sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
 }
 
 /* Schedule an emulated node's next wakeup */
-static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
-    /* Use current_sim_ns as the wall-clock baseline. cpu->sim_time_ns is
+static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx) {
+    /* Use sim_runtime_now_ns(&sim_rt) as the wall-clock baseline. cpu->sim_time_ns is
      * cycle-derived and gets transiently rolled back inside execute_events
      * callbacks (the cpu's sim_time_ns is recomputed from cycles each time
      * an event fires, even when the surrounding tick had pinned it to the
@@ -3600,16 +3751,16 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
     if (emu_rx_queue[idx].count > 0) {
         /* Match Cooja requestImmediateWakeup(): re-run the mote at the
          * current simulation time, not one microsecond later. */
-        next = current_sim_ns;
-        sim_eq_schedule_if_earlier(eq, idx, next);
+        next = sim_runtime_now_ns(&sim_rt);
+        sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
         return;
     }
     if (nodes[idx].type == NODE_ARM) {
         arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
         if (cpu->next_event_cycle <= cpu->cycles)
-            next = current_sim_ns;
+            next = sim_runtime_now_ns(&sim_rt);
         else
-            next = current_sim_ns + arm_cycles_to_ns(
+            next = sim_runtime_now_ns(&sim_rt) + arm_cycles_to_ns(
                 cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
     } else {
         msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
@@ -3617,13 +3768,13 @@ static void schedule_emulated_wakeup(sim_event_queue_t *eq, int idx) {
              cpu->serviced_interrupt == -1 &&
              cpu->interrupt_max >= 0) ||
             cpu->next_event_cycle <= cpu->cycles) {
-            next = current_sim_ns;
+            next = sim_runtime_now_ns(&sim_rt);
         } else {
-            next = current_sim_ns + msp430_cycles_to_ns(
+            next = sim_runtime_now_ns(&sim_rt) + msp430_cycles_to_ns(
                 cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
         }
     }
-    sim_eq_schedule_if_earlier(eq, idx, next);
+    sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
 }
 
 /* Check if a native node has pending work at the given sim time */
@@ -3739,6 +3890,12 @@ static int is_json_file(const char *path) {
 }
 
 int run_mixed_multinode_test(int argc, char **argv) {
+    /* Phase 1 milestone 1: initialize the sim_runtime container.  Zeros the
+     * fields and sets run_state to STOPPED.  The event-queue and
+     * radio-medium init still happen at their existing call sites below,
+     * just through the runtime fields. */
+    sim_runtime_init(&sim_rt);
+
     static const char *firmware_paths[MAX_NODES] = { NULL };
     static char firmware_bufs[MAX_NODES][256]; /* storage for config-loaded paths */
     int firmware_count = 0;
@@ -4072,6 +4229,10 @@ sim_restart:
 
     /* Initialize timeline and node state tracking */
     tl_init(&timeline);
+    /* Milestone 7: timeline becomes the first observer subscriber.  All
+     * frame-level / LED / interference events now flow through
+     * sim_runtime_emit() instead of direct tl_*_event() calls. */
+    sim_runtime_subscribe(&sim_rt, timeline_observer_cb, &timeline);
     memset(node_states, 0, sizeof(node_states));
     memset(prev_node_states, 0, sizeof(prev_node_states));
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
@@ -4316,7 +4477,7 @@ sim_restart:
     if (num_threads == 0) {
         for (int i = 0; i < node_count; i++) {
             if (node_start_ns[i] >= INT64_MAX) continue;  /* removed node */
-            sim_eq_schedule(&sim_eq, i, node_start_ns[i]);
+            sim_schedule_mote_wakeup(&sim_rt, i, node_start_ns[i]);
         }
     }
 
@@ -4356,7 +4517,7 @@ sim_restart:
             if (max_ns <= sim_ns) max_ns = sim_ns + 1000;  /* min 1µs advance */
             sim_ns = max_ns;
         }
-        current_sim_ns = sim_ns;
+        sim_rt.now_ns = sim_ns;
 
         /* Cooja model: each node schedules its own next wakeup via sim_eq.
          * No explicit "step all nodes" — the event queue ensures all active
@@ -4587,7 +4748,7 @@ sim_restart:
                         node_start_ns[i] = sim_ns;
                         /* Schedule the rebooted node in the event queue
                          * so it gets ticked immediately */
-                        sim_eq_schedule_if_earlier(&sim_eq, i, sim_ns);
+                        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_ns);
                     }
                 } else if (act->type == TEST_ACTION_MOVE) {
                     for (int i = 0; i < node_count; i++) {
@@ -4689,7 +4850,7 @@ sim_restart:
                 /* Match Cooja's simulation.getSimulationTime(): callbacks
                  * fired from the current event observe the exact event time,
                  * not the coarser outer stepping horizon. */
-                current_sim_ns = next_ev_time;
+                sim_rt.now_ns = next_ev_time;
                 if (trace_event_spin_enabled()) {
                     if (next_ev_time == spin_trace_time_ns) {
                         spin_trace_count++;
@@ -4716,9 +4877,22 @@ sim_restart:
 
                 sim_event_t ev = sim_eq_pop(&sim_eq);
 
-                /* RX byte deliveries: dispatch to receiver chip and continue. */
+                /* Milestone 4/5 generation check: drop events whose target
+                 * slot has been removed/rebooted since the event was queued.
+                 * Untracked events (target_generation == 0) are always
+                 * allowed through — see sim_runtime_event_is_current. */
+                if (!sim_runtime_event_is_current(&sim_rt, &ev))
+                    continue;
+
+                /* RX byte deliveries: dispatch to receiver chip and continue.
+                 * Cooja-style per-byte delivery — same MspMoteTimeEvent
+                 * pattern for MSP430 and ARM receivers. */
                 if (ev.kind == SIM_EV_RX_BYTE) {
-                    deliver_msp430_rx_byte(&ev);
+                    if (ev.node_idx >= 0 && ev.node_idx < node_count &&
+                        nodes[ev.node_idx].type == NODE_ARM)
+                        deliver_arm_rx_byte(&ev);
+                    else
+                        deliver_msp430_rx_byte(&ev);
                     continue;
                 }
 
@@ -4751,14 +4925,14 @@ sim_restart:
                     js_node_step_until_ns(&nodes[i].plat.js, ev_time);
                     int64_t nxt = js_node_next_wakeup_ns(&nodes[i].plat.js);
                     if (nxt < INT64_MAX)
-                        sim_eq_schedule_if_earlier(&sim_eq, i, nxt);
+                        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, nxt);
                 } else if (nodes[i].type == NODE_NATIVE) {
                     /* Single tick at event time */
                     tick_one_native(i, ev_time);
                     sender_had_tx = native_had_tx[i];
 
                     /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
-                    schedule_native_wakeup(&sim_eq, i);
+                    schedule_native_wakeup(&sim_rt, i);
                 } else if (nodes[i].type == NODE_MSP430) {
                     /* MSP430 RF delivery is frame-assembled on the sender
                      * side and then delivered from the complete-frame path
@@ -4772,7 +4946,7 @@ sim_restart:
                     /* Match Cooja's MspMote.execute(t, 1): this slice
                      * schedules the mote's next normal wakeup itself. */
                     int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
-                    sim_eq_schedule_if_earlier(&sim_eq, i, next_ns);
+                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
                 } else {
                     /* Emulated ARM: use the same Cooja-style tick as MSP430
                      * so peripheral events are anchored to the scheduler's
@@ -4786,7 +4960,7 @@ sim_restart:
                         gdb_stub_poll(&gdb_stubs[i]);
                         if (gdb_stubs[i].halted) {
                             nodes[i].plat.arm.cpu.stopping = false;
-                            sim_eq_schedule_if_earlier(&sim_eq, i, ev_time + 1000LL);
+                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
                             /* Continue to RF delivery / next event */
                             goto arm_tick_done;
                         }
@@ -4803,7 +4977,7 @@ sim_restart:
                         nodes[i].plat.arm.cpu.stopping = false;
                         if (gdb_stubs[i].halted) {
                             /* Reschedule sooner so we poll the stub again. */
-                            sim_eq_schedule_if_earlier(&sim_eq, i, ev_time + 1000LL);
+                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
                             goto arm_tick_done;
                         }
                     }
@@ -4820,7 +4994,7 @@ sim_restart:
                     /* Match MspMote.execute(t, 1): schedule the next normal
                      * wakeup based on the step_micros lead hint. */
                     int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
-                    sim_eq_schedule_if_earlier(&sim_eq, i, next_ns);
+                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
                     arm_tick_done: ;
                 }
 
@@ -4836,7 +5010,7 @@ sim_restart:
                             *nodes[r].plat.native.simInSize > insize_before[r];
                         if (got_frame) {
                             *nodes[r].plat.native.simReceiving = 1;
-                            sim_eq_schedule_if_earlier(&sim_eq, r, ev_time);
+                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, r, ev_time);
                         }
                         /* Set signal strength on in-range neighbors so CCA
                          * detects the channel as busy. Only for nodes within
@@ -5088,7 +5262,7 @@ sim_restart:
         /* Reset all global state */
         rf_byte_count = 0;
         uart_byte_count = 0;
-        current_sim_ns = 0;
+        sim_rt.now_ns = 0;
         sim_eq_init(&sim_eq);
         stat_rf_frames = 0;
         stat_emu_rx_direct = 0;
@@ -5373,9 +5547,13 @@ sim_restart:
     int64_t total_node_cycles = 0;
     int64_t total_node_instructions = 0;
     for (int i = 0; i < node_count; i++) {
-        printf("  Node %d [%s]: %lld cycles, %lld instructions\n",
+        uint32_t cur_pc = 0;
+        if (nodes[i].type == NODE_MSP430)
+            cur_pc = nodes[i].plat.msp.cpu.reg[MSP430_PC];
+        printf("  Node %d [%s]: %lld cycles, %lld instructions, PC=0x%04x\n",
                nodes[i].id, node_type_str(i),
-               (long long)node_cycles(i), (long long)node_instructions(i));
+               (long long)node_cycles(i), (long long)node_instructions(i),
+               cur_pc);
         total_node_cycles += node_cycles(i);
         total_node_instructions += node_instructions(i);
         destroy_node(i);

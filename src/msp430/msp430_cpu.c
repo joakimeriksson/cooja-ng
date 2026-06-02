@@ -100,7 +100,6 @@ static inline void mem_write(msp430_cpu_t *cpu, uint32_t addr, int val, bool wor
     }
     addr = resolve_mirror(cpu, addr);
     if (addr >= cpu->max_mem) return;
-    /* no debug */
     if (word) {
         write_word(cpu, addr, (uint16_t)val);
     } else {
@@ -1468,18 +1467,20 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
              * compute the wrong address. */
             int sext = cpu->ext_word;
             uint32_t sext_dst_hi = 0;
+            bool is_addr_mode = false;
             if (sext) {
                 sext_dst_hi = sext & 0xf;  /* bits 3:0: operand 19:16 */
                 /* A/L and BW interaction same as two-op */
                 bool al = (sext >> 6) & 1;  /* bit 6: A/L per MSPSim */
                 if (!al) {
-                    bw = false;  /* A/L=0: .A mode (20-bit) per MSPSim */
+                    is_addr_mode = true;  /* A/L=0: .A mode (20-bit) per MSPSim */
+                    bw = false;
                 }
             }
 
-            uint32_t mask = bw ? 0xff : 0xffff;
-            uint32_t msb = bw ? 0x80 : 0x8000;
-            int mode_bytes = bw ? 1 : 2;
+            uint32_t mask = is_addr_mode ? 0xfffff : (bw ? 0xff : 0xffff);
+            uint32_t msb = is_addr_mode ? 0x80000 : (bw ? 0x80 : 0x8000);
+            int mode_bytes = is_addr_mode ? 4 : (bw ? 1 : 2);
 
             pc += 2;
 
@@ -1601,7 +1602,17 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
                 msb = 0x8000;
                 break;
             case OP_PUSH:
-                mem_write(cpu, sp, dst, !bw);
+                if (is_addr_mode) {
+                    /* PUSHX.A: 20-bit push. The pre-decrement above already
+                     * moved SP down by 2. Drop another 2 so that the 4-byte
+                     * write covers SP..SP+3 — matches MSPSim's PUSH handler
+                     * when AccessMode.WORD20 is used. */
+                    sp -= 2;
+                    reg[MSP430_SP] = sp;
+                    mem_write_mode(cpu, sp, dst, 2);
+                } else {
+                    mem_write(cpu, sp, dst, !bw);
+                }
                 cpu->cycles += (ad == AM_REG || ad == AM_IND_AUTOINC) ? 2 : 1;
                 write_back = false;
                 update_status = false;
