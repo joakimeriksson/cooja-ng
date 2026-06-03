@@ -1175,8 +1175,17 @@ static void nrf54l_radio_set_state(nrf54l_radio_state_t *r, uint32_t new_state) 
                 r->disabled_event_defer.callback  = nrf54l_radio_disabled_event_fire_cb;
                 r->disabled_event_defer.user_data = r;
                 r->disabled_event_defer_scheduled = 1;
+                /* Defer ~8 µs: long enough that the firmware's PHYEND ISR
+                 * can write SUBSCRIBE_TXEN=0 and tear down the
+                 * DISABLED→TIMER10→TXEN DPPI chain before our model
+                 * collapses-and-fires it. With the previous 32-cycle defer
+                 * (~250 ns) the chain fired in a single synchronous burst
+                 * before the ISR even got to its first instruction, so
+                 * every broadcast TX produced two on-air frames from the
+                 * same PACKETPTR — corrupting the receiver's parser and
+                 * breaking 2-node RPL-UDP entirely. */
                 arm_schedule_event(cpu, &r->disabled_event_defer,
-                                   cpu->cycles + 32);
+                                   cpu->cycles + 1000);
             }
             break;
         default: break;
