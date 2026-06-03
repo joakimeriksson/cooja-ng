@@ -1384,6 +1384,19 @@ static void nrf54l_radio_rx_disable_timeout_cb(void *user, arm_event_t *ev) {
     if (!r->rx_disable_pending) return;        /* parser already completed */
     r->rx_disable_pending = 0;
     r->rx_phase           = NRF54L_RX_WAIT_PREAMBLE;
+    /* Fire PHYEND before snapping to DISABLED. The deferred-disable path
+     * is reached only when the parser was past WAIT_SFD when TASKS_DISABLE
+     * arrived (see TASKS_DISABLE handler above) — which means BCMATCH
+     * already fired and the nrf_802154 driver flipped its
+     * `psdu_being_received` flag to true. Without a matching PHYEND/END
+     * to drive the driver back into `rxframe_finish_psdu_is_not_being_
+     * received()`, that flag stays set forever, and every later
+     * `nrf_802154_transmit_raw` returns `BUSY_CHANNEL` from
+     * current_operation_terminate -> can_terminate_current_operation
+     * (psdu_being_received_now). On Node 3 of the 3-node chain — where
+     * we deliver bytes from two neighbours continuously — that translates
+     * to "Node 3 can never TX" and breaks RPL convergence past 2 hops. */
+    nrf54l_radio_fire_event(r, &r->evt_phyend, INT_PHYEND, PUB_PHYEND);
     nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_DISABLED);
 }
 
