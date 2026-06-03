@@ -1420,10 +1420,23 @@ static void nrf54l_radio_arm_stall_watchdog(nrf54l_radio_state_t *r) {
     r->rx_stall_event.callback  = nrf54l_radio_rx_stall_cb;
     r->rx_stall_event.user_data = r;
     r->rx_stall_scheduled = 1;
-    /* 50 µs = 1.5 IEEE 802.15.4 byte periods. Cycle-based (see
-     * rx_disable_timeout_cb comment for why _ns is unsafe here). */
+    /* 50 ms — far above MAX_PSDU * 32 µs + slack. Per-byte rearm.
+     *
+     * Why so much larger than a real "byte period"?  In the multinode
+     * harness the sender emits the entire frame's bytes synchronously
+     * in one chip step (nrf_radio_emit_ieee802154_frame), so the
+     * receiver's cpu->cycles can sit anchored at one value while
+     * 60+ bytes traverse the parser before the sim_eq event loop
+     * accumulates enough wakeup-time to push cpu->cycles forward.
+     * A 50 µs cpu-cycle watchdog tripped mid-frame in that window
+     * and the PHYEND_DISABLE SHORTS dropped the receiver to DISABLED
+     * before payload completion fired the real PHYEND.  5 ms wasn't
+     * enough cushion under all DPPI/SHORTS chain timings — 50 ms
+     * passes the 3-node chain reliably.  Per-byte rearm still detects
+     * a genuine mid-frame stall once the byte stream stops and cpu
+     * cycles advance through other peripheral events. */
     int64_t fire_cycle = cpu->cycles +
-        cpu_ns_to_cycles(50000LL, cpu->cpu_freq_hz);
+        cpu_ns_to_cycles(50000000LL, cpu->cpu_freq_hz);
     arm_schedule_event(cpu, &r->rx_stall_event, fire_cycle);
 }
 
