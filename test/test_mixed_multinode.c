@@ -1612,13 +1612,16 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                 }
                 /* Per-byte (Cooja Msp802154Radio.receiveCustomData) for
                  * MSP430/CC2420 and ARM/cc2538_rfcore — both carry an
-                 * rx_incoming buffer + state guard.  nrf receivers
-                 * currently fall back to batched delivery until their
-                 * buffer/replay hook is tuned. */
+                 * rx_incoming buffer + state guard.  nrf54l15 also needs
+                 * per-byte (its 50 µs RX-stall watchdog tripped on the
+                 * old batched gap — see commit 2dc7686).  nrf52840 stays
+                 * batched: its DMA-style RADIO model expects whole-frame
+                 * delivery into PACKETPTR and the per-byte path regressed
+                 * 4-node RPL convergence (no traffic ever reached the
+                 * server) — see investigation in 9ebe99a..HEAD memory. */
                 bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
                                    (nodes[i].type == NODE_ARM &&
                                     (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
-                                     arm_platform_nrf52840(&nodes[i].plat.arm) != NULL ||
                                      arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL));
                 if (per_byte_ok) {
                     int64_t bt = byte_time_ns;
@@ -1661,11 +1664,11 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                     stat_msp_byte_push_2_to_1++;
             }
             /* Per-byte for chips with rx_incoming buffer; batched for
-             * chips that drop bytes outside RX. */
+             * chips that drop bytes outside RX. nrf52840 stays batched —
+             * see comment on the reentrant branch above (line ~1613). */
             bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
                                (nodes[i].type == NODE_ARM &&
                                 (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
-                                 arm_platform_nrf52840(&nodes[i].plat.arm) != NULL ||
                                  arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL));
             if (per_byte_ok) {
                 int64_t bt = byte_time_ns;
