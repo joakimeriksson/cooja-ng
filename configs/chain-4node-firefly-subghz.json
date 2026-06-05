@@ -11,13 +11,13 @@
         "success_ratio_rx": 1.0
     },
     "nodes": [
-        { "firmware": "firmware/zoul-firefly/udp-server-subghz.zoul-firefly", "id": 1, "x":   0.0, "y": 0.0 },
-        { "firmware": "firmware/zoul-firefly/udp-client-subghz.zoul-firefly", "id": 2, "x":  50.0, "y": 0.0 },
-        { "firmware": "firmware/zoul-firefly/udp-client-subghz.zoul-firefly", "id": 3, "x": 100.0, "y": 0.0 },
-        { "firmware": "firmware/zoul-firefly/udp-client-subghz.zoul-firefly", "id": 4, "x": 150.0, "y": 0.0 }
+        { "firmware": "firmware/zoul-firefly/udp-server-subghz-fixed.zoul-firefly", "id": 1, "x":   0.0, "y": 0.0 },
+        { "firmware": "firmware/zoul-firefly/udp-client-subghz-fixed.zoul-firefly", "id": 2, "x":  50.0, "y": 0.0 },
+        { "firmware": "firmware/zoul-firefly/udp-client-subghz-fixed.zoul-firefly", "id": 3, "x": 100.0, "y": 0.0 },
+        { "firmware": "firmware/zoul-firefly/udp-client-subghz-fixed.zoul-firefly", "id": 4, "x": 150.0, "y": 0.0 }
     ],
     "test": {
-        "description": "Verify RPL-UDP convergence over 3 hops on Firefly sub-GHz (CC1200 802.15.4g 50 kbps). Longer timeout reflects the lower bit rate.",
+        "description": "Verify RPL-UDP convergence over 3 hops on Firefly sub-GHz (CC1200 802.15.4g 50 kbps). Uses the -subghz-fixed firmware variants (longer CSMA ACK_WAIT and pending_packet busy-wait fixes — see devices/zoul-firefly/STATUS.md). Longer timeout reflects the lower bit rate.",
         "validators": [
             { "pattern": "Received request",  "node": 1, "min_count": 1 },
             { "pattern": "Received response", "node": 4, "min_count": 1 }
