@@ -291,9 +291,18 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     /* On-air after sync: PHR(2) + payload(5) + auto-CRC(2). The chip
      * pushes PHR + payload to the RX FIFO, consumes the 2 CRC bytes
      * silently (medium owns loss), then appends 2 status bytes
-     * (RSSI, CRC_OK | LQI) per APPEND_STATUS=1 semantics. */
+     * (RSSI, CRC_OK | LQI) per APPEND_STATUS=1 semantics.
+     *
+     * Contiki's CC1200 driver encodes PHR as `payload_len + crc_len`
+     * (see arch/dev/radio/cc1200/cc1200.c:copy_header_to_tx_fifo
+     * and the matching `payload_len -= 2` in cc1200_rx_interrupt for
+     * the 16-bit-CRC default). So for 5 bytes of MAC payload + a
+     * 2-byte CRC, PHR encodes 7. The wire then carries 5 payload
+     * bytes followed by 2 CRC bytes (= 7 total after PHR), and the
+     * chip's air decoder strips the trailing 2 as CRC before
+     * pushing the 5 payload bytes into the RX FIFO. */
     cc1200_receive_byte(&chip, 0x00);  /* phra: upper bits of length, no CRC flag */
-    cc1200_receive_byte(&chip, 0x05);  /* phrb: payload length = 5 */
+    cc1200_receive_byte(&chip, 0x07);  /* phrb: payload_len(5) + crc_len(2) = 7 */
     cc1200_receive_byte(&chip, 0xAA);
     cc1200_receive_byte(&chip, 0xBB);
     cc1200_receive_byte(&chip, 0xCC);
@@ -322,7 +331,7 @@ static void test_sfd_detect_and_gdo0_edge(void) {
     uint8_t phr[2];
     spi_burst_read(&chip, CC1200_DIRECT_FIFO, phr, 2);
     ASSERT_EQ(phr[0] & 0x07, 0, "PHR phra upper bits");
-    ASSERT_EQ(phr[1], 0x05, "PHR phrb lower bits");
+    ASSERT_EQ(phr[1], 0x07, "PHR phrb lower bits (5 payload + 2 CRC)");
 
     /* Read payload (5 bytes — the actual MAC bytes are intact). */
     uint8_t pl[5];

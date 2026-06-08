@@ -347,11 +347,25 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             c->air_payload_total |= byte;
             c->air_phr_count++;
         }
-        /* Validate length and arm payload reception. PHR-byte budget
-         * already covers payload only; the 2 auto-CRC bytes that
-         * follow on the wire are tracked separately in air_crc_remaining
-         * so we don't push them into the RX FIFO. */
-        if (c->air_payload_total == 0 ||
+        /* Validate length and arm payload reception. Contiki's CC1200
+         * driver (arch/dev/radio/cc1200/cc1200.c:copy_header_to_tx_fifo)
+         * encodes the PHR length field as `payload_len + crc_len`, i.e.
+         * total bytes on the wire AFTER the PHR — including the CRC the
+         * chip auto-appends. So the wire layout after PHR is:
+         *
+         *     [air_payload_total] bytes = [payload] + [CRC]
+         *
+         * For the on-air-byte budget we account for the CRC as the
+         * tail of air_payload_total; the FIFO push loop in
+         * AIR_PAYLOAD knows to peel the last 2 bytes off so they
+         * don't end up in the receiver's RX_FIFO (which the driver
+         * reads as length = PHR - 2 in 16-bit CRC mode). The previous
+         * code treated air_payload_total as payload-only and then
+         * tried to read 2 ADDITIONAL CRC bytes off the wire — over-
+         * shooting every frame by 2 bytes and stealing bytes from
+         * whatever came next, which on a quiet channel was the next
+         * frame's preamble and on a busy channel was garbage. */
+        if (c->air_payload_total < 2 ||
             c->air_payload_total > CC1200_FIFO_SIZE - (fg_mode ? 4 : 3)) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
@@ -360,7 +374,10 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
             return;
         }
-        c->air_payload_remaining = c->air_payload_total;
+        /* air_payload_total = payload_bytes + crc_bytes. Track payload
+         * and CRC separately so we know when to stop pushing into the
+         * RX FIFO. */
+        c->air_payload_remaining = c->air_payload_total - 2;
         c->air_crc_remaining = 2;
         c->air_state = CC1200_AIR_PAYLOAD;
         break;
