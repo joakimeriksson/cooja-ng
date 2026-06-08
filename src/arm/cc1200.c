@@ -17,6 +17,8 @@
  *    TX-started, deasserts on packet-end). We drive only those edges.
  */
 #include "cc1200.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* HOST_* convenience accessors live in include/common/sim_host.h —
@@ -449,6 +451,7 @@ static void start_tx(cc1200_t *c) {
      * stays in TX for the right wall-clock duration; firmware that
      * polls MARCSTATE between TX and RX gets the same end-of-TX
      * timing it would on real hardware. */
+    int saved_tx_count = c->tx_count;   /* before fifo_pop_tx drains it */
     if (c->rf_tx_callback) {
         for (int i = 0; i < 4; i++)
             c->rf_tx_callback(c->rf_tx_user_data, 0x55);
@@ -468,17 +471,17 @@ static void start_tx(cc1200_t *c) {
         while (c->tx_count > 0) (void)fifo_pop_tx(c);
     }
 
-    /* Schedule TX-end so MARCSTATE returns to RX after the air time
-     * elapses. Total air bytes already emitted: 4 + 4 + (original tx
-     * count). Use the tx_count BEFORE we drained it; we overwrote it
-     * during emission, so reconstruct from rf_tx_callback emit count
-     * via the tx_emit_total slot.
-     *
-     * Simpler: use the residual now (tx_count is 0) but track the
-     * total via stat_tx_packets bookkeeping below. We just need a
-     * non-zero air time; pick a constant per-frame proxy that's bigger
-     * than a single byte but bounded so RX-after-TX comes back fast
-     * enough for back-to-back transmissions. */
+    /* Schedule TX-end (GPIO0 / PKT_SYNC_RXTX falling edge + MARCSTATE
+     * return to RX) at a 1 byte-period proxy. We deliberately do NOT
+     * use the actual air time here: the multinode harness delivers
+     * the entire frame's bytes synchronously into the receiver at the
+     * sender's TX-start instant (batched mode for cc1200), so the
+     * receiver finishes RX and emits its ACK immediately. If we then
+     * delayed sender's TX-end by the full ~17 ms air time, the ACK
+     * would land before CSMA had even started its ACK_WAIT timer —
+     * the sender would miss every ACK. The 160 µs proxy keeps the
+     * window aligned with how bytes actually flow in this model. */
+    (void)saved_tx_count;
     int64_t fire = HOST_NOW_NS(c) + CC1200_BYTE_PERIOD_NS;
     HOST_SCHEDULE_NS(c, &c->tx_byte_event, fire);
 }
