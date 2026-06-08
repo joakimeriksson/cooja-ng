@@ -347,25 +347,22 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             c->air_payload_total |= byte;
             c->air_phr_count++;
         }
-        /* Validate length and arm payload reception. Contiki's CC1200
-         * driver (arch/dev/radio/cc1200/cc1200.c:copy_header_to_tx_fifo)
-         * encodes the PHR length field as `payload_len + crc_len`, i.e.
-         * total bytes on the wire AFTER the PHR — including the CRC the
-         * chip auto-appends. So the wire layout after PHR is:
-         *
-         *     [air_payload_total] bytes = [payload] + [CRC]
-         *
-         * For the on-air-byte budget we account for the CRC as the
-         * tail of air_payload_total; the FIFO push loop in
-         * AIR_PAYLOAD knows to peel the last 2 bytes off so they
-         * don't end up in the receiver's RX_FIFO (which the driver
-         * reads as length = PHR - 2 in 16-bit CRC mode). The previous
-         * code treated air_payload_total as payload-only and then
-         * tried to read 2 ADDITIONAL CRC bytes off the wire — over-
-         * shooting every frame by 2 bytes and stealing bytes from
-         * whatever came next, which on a quiet channel was the next
-         * frame's preamble and on a busy channel was garbage. */
-        if (c->air_payload_total < 2 ||
+        /* Validate length and arm payload reception. The PHR length
+         * convention differs between the two modes Contiki's cc1200
+         * driver supports (arch/dev/radio/cc1200/cc1200.c:
+         * copy_header_to_tx_fifo):
+         *   - 802.15.4g (FG_MODE=1, 2-byte PHR): PHR encodes
+         *       payload_len + crc_len  (firmware does payload_len += 2
+         *       before splitting into phra/phrb).
+         *   - Standard CC120x (FG_MODE=0, 1-byte PHR): PHR encodes
+         *       payload_len only (the chip auto-appends CRC; firmware
+         *       does NOT pre-add it to the length byte).
+         * The wire is always `[PHR] [payload] [CRC]`; only the PHR
+         * value's interpretation differs. Account for that here so
+         * `air_payload_remaining` is the FIFO-push count and
+         * `air_crc_remaining` is the consume-silently count. */
+        int min_total = fg_mode ? 2 : 1;
+        if (c->air_payload_total < min_total ||
             c->air_payload_total > CC1200_FIFO_SIZE - (fg_mode ? 4 : 3)) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
@@ -374,11 +371,15 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
             return;
         }
-        /* air_payload_total = payload_bytes + crc_bytes. Track payload
-         * and CRC separately so we know when to stop pushing into the
-         * RX FIFO. */
-        c->air_payload_remaining = c->air_payload_total - 2;
-        c->air_crc_remaining = 2;
+        if (fg_mode) {
+            /* 15.4g: PHR includes CRC bytes. Peel them off the tail. */
+            c->air_payload_remaining = c->air_payload_total - 2;
+            c->air_crc_remaining = 2;
+        } else {
+            /* Standard mode: PHR is payload only; CRC follows separately. */
+            c->air_payload_remaining = c->air_payload_total;
+            c->air_crc_remaining = 2;
+        }
         c->air_state = CC1200_AIR_PAYLOAD;
         break;
     }
