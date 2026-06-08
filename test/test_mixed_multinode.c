@@ -1539,22 +1539,19 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
     /* Record first byte time for accurate TX start computation and track
      * subsequent bytes on the sender's on-air byte clock.
      *
-     * NOTE: this only fires for IEEE 802.15.4 frames (0x00 preamble).
-     * CC1200 frames (0x55 preamble) inherit whatever first_byte_ns
-     * happened to be set previously — typically 0 from init.  Adding
-     * the 0x55 arm makes accurate_tx_start/end correct on paper, but
-     * the test runner then delivers bytes at exactly the same simulated
-     * time as the receiver's own CSMA prepare()→idle() transition; the
-     * receiver chip is briefly in MARC_IDLE and silently drops the
-     * incoming bytes, breaking L5.  The collision math therefore stays
-     * approximate for sub-GHz traffic — see devices/zoul-firefly/SPEC.md.
-     *
-     * The node_tx_busy_until_ns calculation below applies a sub-GHz
-     * fixup that anchors busy-until to current_sim_ns (CCA accuracy)
-     * without disturbing the byte-delivery air_time_ns.  This lets CCA
-     * detect in-progress sub-GHz transmissions without flipping the
-     * receiver's chip into IDLE/TX during byte delivery. */
-    if (tx_asm[sender_idx].state == TX_ASM_PREAMBLE && tx_asm[sender_idx].zero_count == 0 && byte == 0x00) {
+     * Fires for either preamble flavour: 0x00 (IEEE 802.15.4 2.4 GHz)
+     * or 0x55 (CC1200 802.15.4g sub-GHz). Without arming for 0x55, the
+     * per-byte schedule fell back to first_byte_ns=0 → bytes clamped
+     * to sim_now → whole frame dumped into the receiver in one batch.
+     * That short-circuited the ~16 ms real air time to ~5 ms and
+     * pushed the receiver's ACK ~10 ms ahead of the firmware-tuned
+     * CSMA_ACK_WAIT envelope. The 0x55 arm is paired with the
+     * receive-side MARC_IDLE-tolerance fix in cc1200_receive_byte
+     * (without that, bytes arriving the same sim_ns as the receiver's
+     * CSMA prepare()→SIDLE→SRX transition were silently dropped). */
+    if (tx_asm[sender_idx].state == TX_ASM_PREAMBLE &&
+        tx_asm[sender_idx].zero_count == 0 &&
+        (byte == 0x00 || byte == 0x55)) {
         /* Match Cooja's radio callbacks: outgoing bytes are observed at the
          * current scheduler time, not from a mote-local sim_time that may
          * have advanced within the current execute slice. */

@@ -277,8 +277,19 @@ static void air_reset(cc1200_t *c) {
 }
 
 void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
-    /* Bytes only count when chip is in RX */
-    if (c->marcstate != CC1200_MARC_RX) return;
+    /* Bytes only count when the chip is in (or transitioning into) RX.
+     *
+     * The marc_pending check matters when the firmware's CSMA
+     * prepare() fires SIDLE → SRX at the exact sim_ns a frame is
+     * about to start hitting our air decoder. Without it, we observe
+     * marcstate=IDLE for one byte, drop it silently, then the chip
+     * lands in RX too late to spot the sync word — every frame is
+     * effectively invisible. Real silicon doesn't have this race
+     * because IDLE→RX settling holds the front end "open" during
+     * the transition; allowing bytes while marc_pending==RX models
+     * the same behaviour. */
+    if (c->marcstate != CC1200_MARC_RX &&
+        c->marc_pending != CC1200_MARC_RX) return;
 
     switch (c->air_state) {
     case CC1200_AIR_HUNT: {
