@@ -483,17 +483,22 @@ static void start_tx(cc1200_t *c) {
     }
 
     /* Schedule TX-end (GPIO0 / PKT_SYNC_RXTX falling edge + MARCSTATE
-     * return to RX) at a 1 byte-period proxy. We deliberately do NOT
-     * use the actual air time here: the multinode harness delivers
-     * the entire frame's bytes synchronously into the receiver at the
-     * sender's TX-start instant (batched mode for cc1200), so the
-     * receiver finishes RX and emits its ACK immediately. If we then
-     * delayed sender's TX-end by the full ~17 ms air time, the ACK
-     * would land before CSMA had even started its ACK_WAIT timer —
-     * the sender would miss every ACK. The 160 µs proxy keeps the
-     * window aligned with how bytes actually flow in this model. */
-    (void)saved_tx_count;
-    int64_t fire = HOST_NOW_NS(c) + CC1200_BYTE_PERIOD_NS;
+     * return to RX) at the actual on-air completion time:
+     *   4 preamble + 4 sync + saved_tx_count (= PHR + payload) + 2 CRC.
+     *
+     * This pairs with the per-byte delivery fix (first_byte_ns armed
+     * for the 0x55 preamble in test_mixed_multinode.c). Real hardware:
+     *   - sender TX-end fires at +air_time
+     *   - receiver finishes RX at +air_time
+     *   - CSMA ACK_WAIT (5 ms default) starts at +air_time
+     *   - ACK arrives at sender at +air_time + ~few ms, INSIDE window
+     * With the old 1 byte-period proxy here, sender's TX-end fired at
+     * +160 µs but receiver's RX (now correctly paced) didn't finish
+     * until +16 ms, so ACK_WAIT expired ~11 ms before the receiver
+     * could even read the frame. */
+    int air_bytes = 4 + 4 + saved_tx_count + 2;
+    int64_t fire = HOST_NOW_NS(c) +
+        (int64_t)air_bytes * CC1200_BYTE_PERIOD_NS;
     HOST_SCHEDULE_NS(c, &c->tx_byte_event, fire);
 }
 
