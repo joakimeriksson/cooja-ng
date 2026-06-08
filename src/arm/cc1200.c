@@ -77,6 +77,7 @@ static uint8_t marcstate_to_status_top(uint8_t marc) {
     case CC1200_MARC_SLEEP:
     case CC1200_MARC_IDLE:        return CC1200_STATUS_IDLE;
     case CC1200_MARC_RX:          return CC1200_STATUS_RX;
+    case CC1200_MARC_FSTXON:      return CC1200_STATUS_FSTXON;
     case CC1200_MARC_TX:          return CC1200_STATUS_TX;
     case CC1200_MARC_RX_FIFO_ERR: return CC1200_STATUS_RX_FIFO_ERR;
     case CC1200_MARC_TX_FIFO_ERR: return CC1200_STATUS_TX_FIFO_ERR;
@@ -706,12 +707,20 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
          * bytes at the wrong simulated instant (zero settling time),
          * which both desynchronises sub-GHz byte timing on the
          * receiver side and prevents any inbound frame from being
-         * received during the receiver's own RX→TX turnaround. */
+         * received during the receiver's own RX→TX turnaround.
+         *
+         * From FSTXON the synthesizer is already locked — Contiki uses
+         * SFSTXON before STX precisely so the STX → TX transition is
+         * ~25 µs instead of ~200 µs. Accept FSTXON as a valid entry
+         * state and skip the long CAL window. */
         if (c->marcstate != CC1200_MARC_RX &&
-            c->marcstate != CC1200_MARC_IDLE) break;
+            c->marcstate != CC1200_MARC_IDLE &&
+            c->marcstate != CC1200_MARC_FSTXON) break;
         schedule_marc_transition(c, CC1200_MARC_TX,
                                   CC1200_STATUS_CAL,
-                                  CC1200_STX_DELAY_NS);
+                                  c->marcstate == CC1200_MARC_FSTXON
+                                      ? 25000LL
+                                      : CC1200_STX_DELAY_NS);
         break;
     case CC1200_STROBE_SFRX:
         /* FIFO flush — instantaneous, no MARC change. */
@@ -752,14 +761,23 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
         c->sig_rssi_valid = c->sig_cs_valid = c->sig_carrier_sense = false;
         break;
     case CC1200_STROBE_SFSTXON:
-        /* Fast TX-on: settled but not actually transmitting. Same
-         * settling delay as STX, but the target is TX (close enough —
-         * Contiki's USE_SFSTXON path immediately follows with STX). */
-        HOST_CANCEL(c, &c->marcstate_event);
-        c->marcstate = CC1200_MARC_TX;
-        c->marc_pending = CC1200_MARC_TX;
-        c->marc_transit_status = 0xFF;
-        c->sig_rssi_valid = c->sig_cs_valid = c->sig_carrier_sense = false;
+        /* Fast TX-on: synthesizer settles, NOT transmitting yet. The
+         * subsequent STX transitions FSTXON → TX in ~25 µs. Contiki's
+         * cc1200 driver (PR #3141 restoring the strobe — commit
+         * 8630d2be1) busy-waits for STATE_FSTXON via the status byte
+         * (state() = strobe(SNOP) & 0x70), so we must transition
+         * marcstate to MARC_FSTXON (0x12) — not MARC_TX — so the
+         * status top nibble returns STATUS_FSTXON (0x30). The old
+         * synchronous jump-to-TX kept the busy-wait stuck for the full
+         * 10 ms RTIMER_BUSYWAIT timeout, then dropped the subsequent
+         * STX strobe (marc was already TX, fell off the IDLE/RX
+         * guard). With this fix the busy-wait exits at ~200 µs and
+         * STX from FSTXON completes in ~25 µs. */
+        if (c->marcstate != CC1200_MARC_IDLE &&
+            c->marcstate != CC1200_MARC_RX) break;
+        schedule_marc_transition(c, CC1200_MARC_FSTXON,
+                                  CC1200_STATUS_CAL,
+                                  CC1200_STX_DELAY_NS);
         break;
     default:
         break;

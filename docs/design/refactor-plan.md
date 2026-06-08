@@ -446,6 +446,19 @@ For emulated MSP430/ARM motes, `execute(now_ns)` wraps the current
 4. run the CPU for the Cooja-style execution slice
 5. return a next wakeup hint based on CPU events/interrupts
 
+**Timing hazard: cpu->cycles ≠ sim_time.** Step 3 pins `sim_time_ns` to the
+event's `now_ns` even when that goes backward relative to the mote's last
+execution slice. The mote's cycle counter never goes backward, so a receiver
+whose CPU was WFI-fast-forwarded ahead of the byte stream's sim_time will
+process dozens of consecutive byte events at the same `cpu->cycles` value
+before the local accumulator (`last_micros_delta`) catches up. Any chip-level
+timer scheduled in cpu-cycle coordinates — stall watchdog, ACK turnaround,
+TX-end defer — that needs to track "wall-clock since last RF byte" must
+therefore be anchored in sim-time (`SIM_EVENT_*` in the global queue) and
+not in the chip's cpu-event-queue. The historical `nrf54l_radio_rx_stall_event`
+was the first place this bit us; section 6.3 makes it an invariant going
+forward.
+
 For native Cooja motes, `execute(now_ns)` wraps the current `tick_one_native`
 behavior.
 
@@ -1057,6 +1070,15 @@ Preserve these during every extraction:
 - Multi-radio nodes must not leak cross-band traffic.
 - Receiver RX-enabled gating must remain enforced.
 - The medium never owns chip pointers.
+- **RF-derived timers anchor in sim-time, not cpu-cycles.** Any timer that
+  measures "elapsed wall-clock since the last RF event" — frame-stall
+  watchdogs, ACK-wait timeouts, TX air-time defers, byte-period gates —
+  must be scheduled as a `SIM_EVENT_*` in the global queue. Scheduling
+  them in a chip's cpu-event-queue (e.g. `arm_schedule_event(cpu, …,
+  cpu->cycles + N)`) silently breaks under the bulk-delivery pattern from
+  §3.6: many byte events fire at the same `cpu->cycles`, the watchdog's
+  fire_cycle never moves with the byte stream, and it trips mid-frame.
+  The radio bus owns RF-derived scheduling for exactly this reason.
 
 ## 7. Service & Plugin Model
 
@@ -1427,6 +1449,15 @@ Recommended order:
 2. Pass `sim_runtime_t *` instead of using globals.
 3. Replace direct chip calls with mote radio endpoint ops.
 4. Move scheduling of radio byte events into the global simulation queue.
+5. Migrate existing chip-internal RF-derived timers off `cpu_event_queue` and
+   onto sim-time events the bus owns. Current known cases:
+   - `nrf54l15` RX stall watchdog (`nrf54l_radio_rx_stall_event`) — today
+     hacked around with a 50 ms cpu-cycle delay; the principled fix is
+     "fire 50 µs of *sim-time* after the last RF byte for this receiver,"
+     which only the bus can express.
+   - `nrf52840` / `cc2538` ACK turnaround windows — currently survive on
+     ns-based event scheduling, but the same hazard applies if any future
+     chip adds a "no byte received in N µs → abort" timer.
 
 Validation:
 

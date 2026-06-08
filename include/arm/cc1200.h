@@ -57,11 +57,12 @@
 /* FIFO addresses */
 #define CC1200_DIRECT_FIFO      0x3F   /* same address for TX (write) and RX (read) */
 
-/* MARCSTATE values (low 5 bits) */
+/* MARCSTATE values (low 5 bits) — per datasheet SWRS123 §3.2.1 */
 #define CC1200_MARC_SLEEP        0x00
 #define CC1200_MARC_IDLE         0x01
 #define CC1200_MARC_RX           0x0D
 #define CC1200_MARC_RX_FIFO_ERR  0x11
+#define CC1200_MARC_FSTXON       0x12
 #define CC1200_MARC_TX           0x13
 #define CC1200_MARC_TX_FIFO_ERR  0x16
 

@@ -97,3 +97,25 @@
 - **Built**: 2026-06-08T17:40:23Z by Joakim Eriksson
 - **Build command**: `tools/build-device-firmware.sh --target zoul --board firefly --example examples/rpl-udp --output firmware/zoul-firefly/udp-server-subghz-fixed.zoul-firefly --source-file udp-server --make-args "MAKE_RADIO=cc1200"`
 
+## udp-server-subghz-fixed.zoul-firefly
+
+- **Source**: contiki-ng commit `9aa6ecb055182fa8511df68d0ff1f7edc31ed4a9`
+- **Source path**: `examples/rpl-udp` (file: `udp-server.c`)
+- **TARGET**: `zoul`
+- **BOARD**: `firefly`
+- **Make args**: `DEFINES=ZOUL_CONF_USE_CC1200_RADIO=1`
+- **Toolchain**: Docker contiker/contiki-ng:latest
+- **Built**: 2026-06-08T19:23:45Z by Joakim Eriksson
+- **Build command**: `tools/build-device-firmware.sh --target zoul --board firefly --example examples/rpl-udp --output firmware/zoul-firefly/udp-server-subghz-fixed.zoul-firefly --source-file udp-server --make-args "DEFINES=ZOUL_CONF_USE_CC1200_RADIO=1"`
+
+## udp-client-subghz-fixed.zoul-firefly
+
+- **Source**: contiki-ng commit `9aa6ecb055182fa8511df68d0ff1f7edc31ed4a9`
+- **Source path**: `examples/rpl-udp` (file: `udp-client.c`)
+- **TARGET**: `zoul`
+- **BOARD**: `firefly`
+- **Make args**: `DEFINES=ZOUL_CONF_USE_CC1200_RADIO=1`
+- **Toolchain**: Docker contiker/contiki-ng:latest
+- **Built**: 2026-06-08T19:23:50Z by Joakim Eriksson
+- **Build command**: `tools/build-device-firmware.sh --target zoul --board firefly --example examples/rpl-udp --output firmware/zoul-firefly/udp-client-subghz-fixed.zoul-firefly --source-file udp-client --make-args "DEFINES=ZOUL_CONF_USE_CC1200_RADIO=1"`
+
