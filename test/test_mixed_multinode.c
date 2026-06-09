@@ -35,6 +35,7 @@
 #include "js_test_engine.h"
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
+#include "sim_serial_bridge.h"
 #include "gdb_stub.h"
 #include "arm_gdb.h"
 #include "pcap_writer.h"
@@ -503,9 +504,14 @@ static int ui_paused = 0;             /* play/pause state */
 static int ui_full_state_requested = 1; /* send full state on first broadcast */
 static int ui_restart_requested = 0;   /* restart simulation from UI */
 
-/* --- Serial socket (TCP bridge for border-router tests) --- */
-static int ss_listen_fd = -1;    /* listening socket */
-static int ss_client_fd = -1;    /* accepted client connection */
+/* --- Serial socket (TCP bridge for border-router tests) ---
+ *
+ * Milestone 8.1: socket + ring-buffer plumbing lives in the
+ * sim_serial_bridge kernel service.  The runner keeps the bridged-node
+ * index (the inject callback is mote-type-specific until the Phase 2
+ * mote vtable lands) and the external-command management (milestone
+ * 8.2's external_command_service). */
+static sim_serial_bridge_t serial_bridge;
 static int ss_node_idx = -1;     /* index of the bridged node */
 static pid_t ss_child_pid = -1;  /* PID of external command */
 static int ss_child_exited = 0;  /* set when child exits */
@@ -519,19 +525,6 @@ static int ss_child_status = -1; /* child exit status */
  * serial_socket.command is configured we open this in the same
  * directory as the script and tee every mote console line to it. */
 static FILE *cooja_testlog = NULL;
-
-/* TX ring buffer: UART output from bridged mote → TCP socket */
-/* Border-router tests can burst multi-fragment SLIP traffic, especially when
- * native border-router mode forwards large IPv6 packets. Keep enough buffered
- * data to absorb those bursts without silently dropping bytes. */
-#define SS_TX_BUF_SIZE 65536
-static uint8_t ss_tx_buf[SS_TX_BUF_SIZE];
-static int ss_tx_head = 0, ss_tx_count = 0;
-
-/* RX ring buffer: TCP socket → bridged mote serial input */
-#define SS_RX_BUF_SIZE 65536
-static uint8_t ss_rx_buf[SS_RX_BUF_SIZE];
-static int ss_rx_head = 0, ss_rx_count = 0;
 
 /* --- Timeline and packet analyzer state --- */
 static timeline_t timeline;
@@ -2270,7 +2263,19 @@ static void emu_rx_queue_drain(int idx) {
 static void mixed_uart_callback(void *user_data, uint8_t byte) {
     mixed_node_t *node = (mixed_node_t *)user_data;
     uart_byte_count++;
-    /* UART byte received */
+
+    /* Kernel observer stream: every console byte, every node.  The
+     * serial bridge service filters on its bridged mote; other
+     * subscribers (timeline) ignore the kind.  See refactor plan §3.11
+     * for why raw bytes and assembled lines are separate kinds. */
+    {
+        int nidx = (int)(node - nodes);
+        sim_observer_event_t ev = { .kind = SIM_OBS_MOTE_UART_BYTE,
+                                    .time_ns = node_sim_time_ns(nidx),
+                                    .mote_index = nidx, .radio_idx = -1 };
+        ev.u.uart.byte = byte;
+        sim_runtime_emit(&sim_rt, &ev);
+    }
 
     if (byte == '\n') {
         node->line_buf[node->line_pos] = '\0';
@@ -2298,140 +2303,35 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
     }
 }
 
-/* Serial socket UART callback: same as mixed_uart_callback but also buffers
- * bytes for TCP transmission to the external process (tunslip6). */
-static void serial_socket_uart_callback(void *user_data, uint8_t byte) {
-    /* Normal UART processing (console, test matching) */
-    mixed_uart_callback(user_data, byte);
+/* --- Serial bridge inject callback ---
+ *
+ * Socket + ring plumbing lives in sim_serial_bridge (milestone 8.1);
+ * this callback is the mote-type-specific injection half the bridge
+ * drains its RX ring through.  It stays in the runner because native
+ * injection touches the shared-memory serial buffer, MSP430 injection
+ * steps the CPU at baud-rate intervals, and ARM injection feeds the
+ * CC2538 UART directly — all of which need node internals until the
+ * Phase 2 mote vtable provides a serial-input op. */
 
-    /* Buffer byte for TCP transmission */
-    if (ss_client_fd >= 0 && ss_tx_count < SS_TX_BUF_SIZE) {
-        int tail = (ss_tx_head + ss_tx_count) % SS_TX_BUF_SIZE;
-        ss_tx_buf[tail] = byte;
-        ss_tx_count++;
-    }
-}
-
-/* --- Serial socket TCP helpers --- */
-
-static int ss_create_listener(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("serial_socket: socket");
-        return -1;
-    }
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons((uint16_t)port);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("serial_socket: bind");
-        close(fd);
-        return -1;
-    }
-    if (listen(fd, 1) < 0) {
-        perror("serial_socket: listen");
-        close(fd);
-        return -1;
-    }
-
-    /* Non-blocking */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-
-    printf("  Serial socket listening on port %d\n", port);
-    return fd;
-}
-
-static void ss_accept(void) {
-    if (ss_listen_fd < 0 || ss_client_fd >= 0) return;
-
-    int fd = accept(ss_listen_fd, NULL, NULL);
-    if (fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
-            perror("serial_socket: accept");
-        return;
-    }
-
-    /* Set non-blocking */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-    ss_client_fd = fd;
-    printf("  Serial socket: client connected\n");
-}
-
-/* Flush buffered TX bytes to TCP socket */
-static void ss_flush_tx(void) {
-    if (ss_client_fd < 0 || ss_tx_count == 0) return;
-
-    while (ss_tx_count > 0) {
-        /* Contiguous chunk from head */
-        int chunk = ss_tx_count;
-        if (ss_tx_head + chunk > SS_TX_BUF_SIZE)
-            chunk = SS_TX_BUF_SIZE - ss_tx_head;
-
-        ssize_t n = write(ss_client_fd, ss_tx_buf + ss_tx_head, (size_t)chunk);
-        if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                break;
-            /* Connection closed or error */
-            printf("  Serial socket: client disconnected (write)\n");
-            close(ss_client_fd);
-            ss_client_fd = -1;
-            ss_tx_count = 0;
-            ss_tx_head = 0;
-            return;
-        }
-        ss_tx_head = (ss_tx_head + (int)n) % SS_TX_BUF_SIZE;
-        ss_tx_count -= (int)n;
-    }
-}
-
-/* Read TCP data into RX buffer */
-static void ss_read_tcp(void) {
-    if (ss_client_fd < 0) return;
-
-    /* Read into ring buffer */
-    while (ss_rx_count < SS_RX_BUF_SIZE) {
-        int tail = (ss_rx_head + ss_rx_count) % SS_RX_BUF_SIZE;
-        int space = SS_RX_BUF_SIZE - ss_rx_count;
-        /* Contiguous chunk from tail */
-        int chunk = SS_RX_BUF_SIZE - tail;
-        if (chunk > space) chunk = space;
-
-        ssize_t n = read(ss_client_fd, ss_rx_buf + tail, (size_t)chunk);
-        if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                return;
-            printf("  Serial socket: client disconnected (read)\n");
-            close(ss_client_fd);
-            ss_client_fd = -1;
-            return;
-        }
-        ss_rx_count += (int)n;
-        break;  /* one read per poll */
-    }
-}
-
-/* Drain RX buffer into bridged mote's serial input.
- * For native motes: only inject when simSerialReceivingFlag==0 (mote consumed
- * previous batch). For emulated motes: inject byte-by-byte via UART RX. */
-static void ss_inject_serial(void) {
-    if (ss_node_idx < 0 || ss_rx_count == 0) return;
+/* Inject buf[0..len) into the bridged mote's serial input; returns the
+ * number of bytes consumed (0 = mote not ready, bridge retries next poll).
+ * For native motes: append into the mote's pending serial buffer (the
+ * cooja rs232 backend has a fixed 2048-byte receive buffer).  For
+ * emulated motes: inject byte-by-byte via UART RX. */
+static int ss_inject_into_node(void *user, const uint8_t *buf, int len) {
+    (void)user;
+    if (ss_node_idx < 0 || len <= 0) return 0;
 
     mixed_node_t *node = &nodes[ss_node_idx];
     if (node->type == NODE_NATIVE) {
         native_node_t *nat = &node->plat.native;
         if (!nat->simSerialReceivingData ||
             !nat->simSerialReceivingLength ||
-            !nat->simSerialReceivingFlag) return;
+            !nat->simSerialReceivingFlag) return 0;
 
         /* Match COOJA ContikiRS232: append new bytes into the mote's pending
          * serial buffer even when simSerialReceivingFlag is already set, then
-         * request an immediate wakeup so the mote drains that buffer. The
-         * cooja rs232 backend has a fixed 2048-byte receive buffer. */
+         * request an immediate wakeup so the mote drains that buffer. */
         int old_size = *nat->simSerialReceivingLength;
         if (old_size < 0) old_size = 0;
         if (old_size > 2048) old_size = 2048;
@@ -2443,21 +2343,16 @@ static void ss_inject_serial(void) {
                     wake_ns = node_start_ns[ss_node_idx];
                 sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
             }
-            return;
+            return 0;
         }
 
-        int to_send = ss_rx_count;
+        int to_send = len;
         if (to_send > space) to_send = space;
-        for (int i = 0; i < to_send; i++) {
-            nat->simSerialReceivingData[old_size + i] =
-                (char)ss_rx_buf[(ss_rx_head + i) % SS_RX_BUF_SIZE];
-        }
+        memcpy(nat->simSerialReceivingData + old_size, buf, (size_t)to_send);
         *nat->simSerialReceivingLength = old_size + to_send;
         *nat->simSerialReceivingFlag = 1;
         if (nat->simProcessRunValue)
             *nat->simProcessRunValue = 1;
-        ss_rx_head = (ss_rx_head + to_send) % SS_RX_BUF_SIZE;
-        ss_rx_count -= to_send;
         /* Match COOJA's external serial delivery contract: once serial data
          * is injected, the mote must be re-run at the current simulation
          * time rather than waiting for a stale timer-based wakeup. This is
@@ -2469,6 +2364,7 @@ static void ss_inject_serial(void) {
                 wake_ns = node_start_ns[ss_node_idx];
             sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
         }
+        return to_send;
     } else if (node->type == NODE_MSP430) {
         /* Match MSPSim's MspSerial: inject ALL pending bytes at baud-rate
          * intervals (69µs = 115200 baud), stepping CPU between each byte.
@@ -2485,21 +2381,21 @@ static void ss_inject_serial(void) {
         if (!has_dma) {
             if (!console->ie_ptr ||
                 !(*console->ie_ptr & console->ie_rx_mask))
-                return;  /* firmware hasn't enabled UART RX yet */
+                return 0;  /* firmware hasn't enabled UART RX yet */
         }
         int baud_cycles = (int)((int64_t)node_freq(ss_node_idx) * 69 / 1000000);
         if (baud_cycles < 200) baud_cycles = 200;
+        int consumed = 0;
         ticking_node_idx = ss_node_idx;
-        while (ss_rx_count > 0) {
+        while (consumed < len) {
             if (!has_dma) {
                 /* Wait for RXIFG clear (firmware consumed previous byte) */
                 if (console->ifg_ptr &&
                     (*console->ifg_ptr & console->ifg_rx_mask))
                     break;  /* try again next poll */
             }
-            msp430_usart_receive_byte(console, ss_rx_buf[ss_rx_head]);
-            ss_rx_head = (ss_rx_head + 1) % SS_RX_BUF_SIZE;
-            ss_rx_count--;
+            msp430_usart_receive_byte(console, buf[consumed]);
+            consumed++;
             step_node_until(ss_node_idx,
                 node_cycles(ss_node_idx) + baud_cycles);
         }
@@ -2509,21 +2405,21 @@ static void ss_inject_serial(void) {
          * trickle timer / other events scheduled during injection
          * won't fire until the old wakeup time.  Matches Cooja's
          * requestImmediateWakeup() after serial byte delivery. */
-        {
+        if (consumed > 0) {
             msp430_cpu_t *cpu = &node->plat.msp.cpu;
             cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
                 cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
             if (num_threads == 0)
                 schedule_emulated_wakeup(&sim_rt, ss_node_idx);
         }
+        return consumed;
     } else if (node->type == NODE_ARM) {
         cc2538_soc_t *soc = arm_platform_cc2538(&node->plat.arm);
-        while (ss_rx_count > 0) {
-            cc2538_uart_receive_byte(&soc->uart0, ss_rx_buf[ss_rx_head]);
-            ss_rx_head = (ss_rx_head + 1) % SS_RX_BUF_SIZE;
-            ss_rx_count--;
-        }
+        for (int i = 0; i < len; i++)
+            cc2538_uart_receive_byte(&soc->uart0, buf[i]);
+        return len;
     }
+    return len;  /* unknown node type — swallow so the ring drains */
 }
 
 /* Launch external command as child process */
@@ -2566,8 +2462,7 @@ static void ss_check_child(void) {
 }
 
 static void ss_cleanup(void) {
-    if (ss_client_fd >= 0) { close(ss_client_fd); ss_client_fd = -1; }
-    if (ss_listen_fd >= 0) { close(ss_listen_fd); ss_listen_fd = -1; }
+    sim_serial_bridge_stop(&serial_bridge);
     if (ss_child_pid > 0 && !ss_child_exited) {
         kill(ss_child_pid, SIGTERM);
         usleep(100000);
@@ -3899,6 +3794,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * radio-medium init still happen at their existing call sites below,
      * just through the runtime fields. */
     sim_runtime_init(&sim_rt);
+    /* fd fields must be -1, not 0, before any sim_serial_bridge_active()
+     * check — a zeroed static struct would read as "listener open". */
+    sim_serial_bridge_init(&serial_bridge);
 
     static const char *firmware_paths[MAX_NODES] = { NULL };
     static char firmware_bufs[MAX_NODES][256]; /* storage for config-loaded paths */
@@ -4285,21 +4183,13 @@ sim_restart:
             fprintf(stderr, "serial_socket: node %d not found\n",
                     config.serial_socket_node);
         } else {
-            /* Replace the UART callback for this node with the TCP-bridging one */
-            mixed_node_t *sn = &nodes[ss_node_idx];
-            if (sn->type == NODE_NATIVE) {
-                sn->plat.native.log_callback = serial_socket_uart_callback;
-            } else if (sn->type == NODE_MSP430) {
-                msp430_platform_set_console(&sn->plat.msp,
-                    serial_socket_uart_callback, sn);
-            } else if (sn->type == NODE_ARM) {
-                arm_platform_set_console(&sn->plat.arm,
-                    serial_socket_uart_callback, sn);
-            }
-
-            /* Create TCP server */
-            ss_listen_fd = ss_create_listener(config.serial_socket_port);
-            if (ss_listen_fd < 0) {
+            /* The bridge taps the bridged node's UART bytes off the
+             * kernel observer stream (SIM_OBS_MOTE_UART_BYTE emitted in
+             * mixed_uart_callback) — no per-node callback swap needed. */
+            if (sim_serial_bridge_start(&serial_bridge, &sim_rt,
+                                        ss_node_idx,
+                                        config.serial_socket_port,
+                                        ss_inject_into_node, NULL) < 0) {
                 fprintf(stderr, "serial_socket: failed to create listener\n");
             } else if (config.serial_socket_command[0]) {
                 /* Open COOJA.testlog in the script's directory before we
@@ -4494,7 +4384,8 @@ sim_restart:
     double t_start = get_time_ms();
 
     int ss_has_command = (ss_child_pid > 0);
-    while (sim_ns < end_ns || ui_server || (ss_listen_fd >= 0 && ss_has_command)) {
+    while (sim_ns < end_ns || ui_server ||
+           (sim_serial_bridge_active(&serial_bridge) && ss_has_command)) {
         /* Check for restart request from UI */
         if (ui_restart_requested) break;
 
@@ -4515,7 +4406,7 @@ sim_restart:
         } else {
             int64_t next_event = sim_eq_peek_time(&sim_eq);
             int64_t max_ns = ui_server ? sim_ns + 100LL * MS_TO_NS
-                : ss_listen_fd >= 0 ? sim_ns + TIME_STEP_NS
+                : sim_serial_bridge_active(&serial_bridge) ? sim_ns + TIME_STEP_NS
                 : end_ns;
             if (next_event < max_ns) max_ns = next_event;
             if (max_ns <= sim_ns) max_ns = sim_ns + 1000;  /* min 1µs advance */
@@ -4775,14 +4666,10 @@ sim_restart:
                 break;
         }
 
-        /* Serial socket: accept connections, read/write TCP, check child */
-        if (ss_listen_fd >= 0 || (ss_child_pid > 0 && !ss_child_exited)) {
-            if (ss_listen_fd >= 0) {
-                ss_accept();
-                ss_flush_tx();
-                ss_read_tcp();
-                ss_inject_serial();
-            }
+        /* Serial bridge service tick + external-command child check */
+        if (sim_serial_bridge_active(&serial_bridge) ||
+            (ss_child_pid > 0 && !ss_child_exited)) {
+            sim_serial_bridge_poll(&serial_bridge);
             ss_check_child();
             if (ss_child_exited)
                 break;
@@ -5225,7 +5112,7 @@ sim_restart:
 
         /* Real-time pacing for serial socket mode (no UI server needed).
          * Throttle simulation to match wall-clock time at ui_speed_ratio. */
-        if (ss_listen_fd >= 0 && !ui_server) {
+        if (sim_serial_bridge_active(&serial_bridge) && !ui_server) {
             double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
             double wall_elapsed = get_time_ms() - t_start;
             double target_wall = sim_elapsed_ms / ui_speed_ratio;

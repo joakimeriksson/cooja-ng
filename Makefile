@@ -68,7 +68,8 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/mock_sim_host.c
 
 # Simulation kernel — see docs/design/refactor-plan.md.
-SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c
+SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
+              $(SIM_SRC_DIR)/sim_serial_bridge.c
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
