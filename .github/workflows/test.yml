@@ -11,63 +11,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build the MSP430 firmware that lives outside the repo. The .sky/.z1
-  # binaries used by `firmware`/`multinode` tests are intentionally NOT
-  # committed (see 1089e7d: "remove stale prebuilt binaries"). CI rebuilds
-  # them via the contiker/contiki-ng:latest toolchain image and uploads
-  # them as an artifact for the test jobs to download.
-  #
-  # The cc2538dk, zoul-firefly, nrf52840-dk, nrf54l15-dk, nrf52840-dongle
-  # ARM firmware *is* committed (each board's PROVENANCE.md records the
-  # provenance), so this job only has to rebuild MSP430 binaries.
-  build-msp430-firmware:
-    name: build msp430 firmware
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # actions/checkout@v4 rejects `path: '../contiki-ng'` (outside the
-      # workspace). Clone into the workspace and pass an absolute path to
-      # build-device-firmware.sh's --contiki-dir so Docker can mount it.
-      - name: Checkout Contiki-NG (workspace dir)
-        uses: actions/checkout@v4
-        with:
-          repository: contiki-ng/contiki-ng
-          submodules: recursive
-          path: contiki-ng-src
-
-      - name: Pull contiker image
-        run: docker pull contiker/contiki-ng:latest
-
-      - name: Build firmware/sky/nullnet-broadcast.sky
-        run: |
-          ./tools/build-device-firmware.sh \
-              --target sky \
-              --example examples/nullnet \
-              --source-file nullnet-broadcast \
-              --output firmware/sky/nullnet-broadcast.sky \
-              --contiki-dir "$GITHUB_WORKSPACE/contiki-ng-src" \
-              --no-provenance
-
-      # Other MSP430 fixtures (`cputest.sky`, `timertest.sky`) used by the
-      # `firmware` boot-test step are not in upstream Contiki-NG — the boot
-      # test silently skips them when absent (see test/test_firmware.c).
-      # If/when they land upstream, add `--example examples/dev/cpu-test`
-      # and `--example examples/dev/timer-test` build steps here.
-
-      - name: Show built firmware
-        run: ls -la firmware/sky/
-
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: msp430-firmware
-          path: firmware/sky/*.sky
-          retention-days: 1
-
   test:
     name: ${{ matrix.label }}
-    needs: build-msp430-firmware
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -77,12 +22,6 @@ jobs:
           - { os: macos-latest,  label: "macos / clang" }
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download MSP430 firmware
-        uses: actions/download-artifact@v4
-        with:
-          name: msp430-firmware
-          path: firmware/sky/
 
       - name: Build
         run: make
