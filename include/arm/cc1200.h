@@ -249,14 +249,6 @@ typedef struct cc1200 {
     /* Events */
     cpu_event_t tx_byte_event;
     cpu_event_t reset_done_event;
-    /* Deferred end-of-frame event for the RX path. The last on-air CRC
-     * byte schedules this one byte-period later; the callback drops
-     * GDO0/GDO2 (asserting the firmware-visible "packet complete"
-     * falling edge) and clears the air-decoder. Putting this on sim_eq
-     * is what guarantees the main loop steps the receiver CPU forward
-     * in time so the IRQ actually runs — see docs/porting-a-device.md
-     * §8 ("Synchronous side effects in chip-driver byte handlers"). */
-    cpu_event_t frame_done_event;
 
     /* Deferred MARCSTATE transition for SIDLE / SRX / STX / SCAL.
      * Real silicon takes ~50 µs to leave RX/TX and ~150 µs of PLL

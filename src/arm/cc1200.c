@@ -60,15 +60,13 @@
 #define CC1200_SCAL_DELAY_NS     720000   /* 720 µs full PLL calibration */
 
 /* Defer end-of-frame GDO0 fall by one byte-period. The chip's
- * PKT_SYNC_RXTX falling edge marks the end of a received packet —
- * firmware ISR reads the FIFO + appendix on this edge. Real chip
- * timing has the edge fire about one symbol after the last on-air
- * byte; one byte-period (8 symbols at 50 kbps) is well within that
- * envelope and matches the CC2420 SFD-clear pattern (one symbol).
- * Critically, scheduling this on sim_eq forces the simulator's main
- * loop to advance the receiver CPU to the event time so the IRQ
- * actually runs before the sender's ACK_WAIT timer expires. */
-#define CC1200_FRAME_DONE_NS     CC1200_BYTE_PERIOD_NS
+/* End-of-frame PKT_SYNC_RXTX falling edge is fired SYNCHRONOUSLY from
+ * cc1200_receive_byte (matching CC2420 set_fifop / CC2538 RFCore
+ * RFIRQF0_RXPKTDONE / nRF52840 EVENTS_END). The harness's per-byte
+ * RX path syncs the receiver CPU to the byte's air-time before each
+ * call to cc1200_receive_byte (see emu_deliver_bytes in
+ * test_mixed_multinode.c), so pending the IRQ here is serviced on
+ * the receiver's very next instruction — no defer needed. */
 
 /* ------------------------------------------------------------------ */
 /* Status byte / MARCSTATE helpers                                      */
@@ -239,19 +237,12 @@ static uint8_t fifo_pop_tx(cc1200_t *c) {
 /* End-of-frame deferred event                                          */
 /* ------------------------------------------------------------------ */
 
-/* Drop GDO0/GDO2 to mark the firmware-visible "packet complete" edge.
- * Scheduled one byte-period after the last on-air CRC byte arrives so
- * the sim_eq main loop advances the receiver CPU to this point (and
- * thus runs the IRQ handler) before returning to the sender. Doing
- * this synchronously inside cc1200_receive_byte() would pend an IRQ
- * the receiver can't service until its next periodic wakeup, by which
- * time the sender's MAC ACK_WAIT timer has often already expired. */
-static void frame_done_event_cb(void *user_data, cpu_event_t *ev) {
-    (void)ev;
-    cc1200_t *c = (cc1200_t *)user_data;
-    /* Packet ended — PKT_SYNC_RXTX falls.  Any GDO pin selecting
-     * signal 6 sees the falling edge here.  Pins selecting MARC_2PIN
-     * or other signals are unchanged. */
+/* Drop PKT_SYNC_RXTX synchronously to mark the firmware-visible
+ * "packet complete" edge. Called inline from cc1200_receive_byte's
+ * end-of-frame paths — same pattern as CC2420's set_fifop(true),
+ * CC2538 RFCore's rfcore_check_interrupts(RFIRQF0_RXPKTDONE), and
+ * nRF52840's radio_event(&evt_end). */
+static void frame_done_now(cc1200_t *c) {
     if (getenv("CC1200_TIMING_PROBE"))
         fprintf(stderr, "[t=%lld cc1200@%p RX_DONE GPIO0↓ rx_count=%d]\n",
                 (long long)HOST_NOW_NS(c), (void*)c, c->rx_count);
@@ -326,14 +317,10 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
             /* RX FIFO overflow → MARCSTATE leaves RX (SETTLING/IDLE per
-             * 2-pin map) and PKT_SYNC_RXTX must drop.  propagate_signals
-             * recomputes both pins from the new marcstate; the
-             * frame_done event still defers the PKT_SYNC_RXTX drop by
-             * one byte-period so the receiver CPU has time to run its
-             * end-of-frame ISR (see docs/porting-a-device.md §8). */
+             * 2-pin map) and PKT_SYNC_RXTX drops synchronously, same as
+             * a clean end-of-frame (CC2420 set_fifop / CC2538 RXPKTDONE). */
             propagate_signals(c);
-            int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
-            HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
+            frame_done_now(c);
             return;
         }
         bool fg_mode = (c->regs[CC1200_REG_PKT_CFG2] &
@@ -370,8 +357,7 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
             c->marcstate = CC1200_MARC_RX_FIFO_ERR;
             air_reset(c);
             propagate_signals(c);
-            int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
-            HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
+            frame_done_now(c);
             return;
         }
         if (fg_mode) {
@@ -392,8 +378,7 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
                 c->marcstate = CC1200_MARC_RX_FIFO_ERR;
                 air_reset(c);
                 propagate_signals(c);
-                int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
-                HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
+                frame_done_now(c);
                 return;
             }
             c->air_payload_remaining--;
@@ -418,14 +403,13 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
                 }
                 c->stat_rx_packets++;
                 air_reset(c);
-                /* Defer the GDO0/GDO2 falling edge: the firmware's
-                 * end-of-packet ISR triggers off this edge and needs
-                 * to actually run before the sender's MAC ACK_WAIT
-                 * fires. Scheduling the drop on sim_eq forces the
-                 * main loop to step the receiver CPU forward to this
-                 * time. See docs/porting-a-device.md §8. */
-                int64_t fire = HOST_NOW_NS(c) + CC1200_FRAME_DONE_NS;
-                HOST_SCHEDULE_NS(c, &c->frame_done_event, fire);
+                /* Drop PKT_SYNC_RXTX synchronously — receiver CPU has
+                 * been stepped to this byte's air time by the harness
+                 * before cc1200_receive_byte was called, so pending
+                 * the IRQ now lands on its very next instruction.
+                 * Same pattern as CC2420 set_fifop(true), CC2538
+                 * RFCore RFIRQF0_RXPKTDONE, nRF52840 EVENTS_END. */
+                frame_done_now(c);
             }
         }
         break;
@@ -671,7 +655,6 @@ static void chip_reset(cc1200_t *c) {
 
     HOST_CANCEL(c, &c->tx_byte_event);
     HOST_CANCEL(c, &c->reset_done_event);
-    HOST_CANCEL(c, &c->frame_done_event);
     HOST_CANCEL(c, &c->marcstate_event);
     /* SRES → IDLE after a small delay */
     int64_t fire = HOST_NOW_NS(c) + CC1200_RESET_TIME_NS;
@@ -729,10 +712,8 @@ static void handle_strobe(cc1200_t *c, uint8_t strobe) {
             break;
         }
         /* Cancel any in-flight TX byte emission — SIDLE aborts TX.
-         * Do NOT touch frame_done_event: a frame already mid-RX whose
-         * end-of-frame edge is queued must still surface, otherwise
-         * the RX FIFO+appendix written by the air decoder is
-         * orphaned and the firmware never reads it. */
+         * (End-of-frame is now synchronous, so there is no queued
+         * frame_done event to worry about racing with.) */
         c->tx_active = false;
         HOST_CANCEL(c, &c->tx_byte_event);
         schedule_marc_transition(c, CC1200_MARC_IDLE,
@@ -1101,7 +1082,6 @@ void cc1200_set_reset(cc1200_t *c, bool low) {
         c->tx_active = false;
         HOST_CANCEL(c, &c->tx_byte_event);
         HOST_CANCEL(c, &c->reset_done_event);
-        HOST_CANCEL(c, &c->frame_done_event);
         HOST_CANCEL(c, &c->marcstate_event);
         air_reset(c);
         /* Reset clears all internal signals → propagate drives both
@@ -1131,8 +1111,6 @@ void cc1200_init(cc1200_t *c, const sim_host_t *host) {
     c->tx_byte_event.user_data = c;
     c->reset_done_event.callback = reset_done_event_cb;
     c->reset_done_event.user_data = c;
-    c->frame_done_event.callback = frame_done_event_cb;
-    c->frame_done_event.user_data = c;
     c->marcstate_event.callback = marcstate_event_cb;
     c->marcstate_event.user_data = c;
 
