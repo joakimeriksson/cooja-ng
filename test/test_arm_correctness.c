@@ -669,7 +669,7 @@ static void test_m4_dsp_halfword_multiply(void) {
         arm_step(&cpu, 1);
         /* Sum = 0x7FFFFFFF + 0x3FFF0001 overflows int32 → Q sticky */
         assert_eq("SMLATT R2 = wrapped sum",
-                  (uint32_t)(0x7FFFFFFF + 0x3FFF0001), cpu.reg[2]);
+                  (uint32_t)0x7FFFFFFF + (uint32_t)0x3FFF0001, cpu.reg[2]);
         assert_true("SMLATT overflow sets Q", (cpu.xpsr & APSR_Q) != 0);
         arm_cpu_destroy(&cpu);
     }

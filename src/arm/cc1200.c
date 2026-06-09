@@ -60,7 +60,6 @@
 #define CC1200_SCAL_DELAY_NS     720000   /* 720 µs full PLL calibration */
 #define CC1200_SETTLING_DELAY_NS 100000   /* 100 µs auto TX → SETTLING → RX hop */
 
-/* Defer end-of-frame GDO0 fall by one byte-period. The chip's
 /* End-of-frame PKT_SYNC_RXTX falling edge is fired SYNCHRONOUSLY from
  * cc1200_receive_byte (matching CC2420 set_fifop / CC2538 RFCore
  * RFIRQF0_RXPKTDONE / nRF52840 EVENTS_END). The harness's per-byte

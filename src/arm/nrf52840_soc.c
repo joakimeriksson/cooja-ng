@@ -23,6 +23,7 @@
 #include "nrf_radio_common.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* sim_host shims — the host vtable used by off-SoC chip drivers.
  * The dongle has none, but anything that consults plat->host should
