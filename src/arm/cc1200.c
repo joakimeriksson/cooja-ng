@@ -58,6 +58,7 @@
 #define CC1200_SRX_DELAY_NS      200000   /* 200 µs cal + settling into RX */
 #define CC1200_STX_DELAY_NS      200000   /* 200 µs cal + settling into TX */
 #define CC1200_SCAL_DELAY_NS     720000   /* 720 µs full PLL calibration */
+#define CC1200_SETTLING_DELAY_NS 100000   /* 100 µs auto TX → SETTLING → RX hop */
 
 /* Defer end-of-frame GDO0 fall by one byte-period. The chip's
 /* End-of-frame PKT_SYNC_RXTX falling edge is fired SYNCHRONOUSLY from
@@ -423,6 +424,8 @@ void cc1200_receive_byte(cc1200_t *c, uint8_t byte) {
 /* ------------------------------------------------------------------ */
 
 static void tx_byte_event_cb(void *user_data, cpu_event_t *ev);
+static void schedule_marc_transition(cc1200_t *c, uint8_t target_marc,
+                                      uint8_t transit_status, int64_t delay_ns);
 
 static void start_tx(cc1200_t *c) {
     if (c->tx_count == 0) {
@@ -514,22 +517,35 @@ static void tx_byte_event_cb(void *user_data, cpu_event_t *ev) {
 
     /* All on-air bytes were emitted synchronously inside start_tx; this
      * event just finalises TX state (RX-on, GDO0 falling edge,
-     * MARCSTATE=RX). The stat counter increments here so each STX
-     * → start_tx → tx_byte_event_cb sequence is visible to unit tests. */
+     * MARCSTATE=RX via SETTLING).  The stat counter increments here so
+     * each STX → start_tx → tx_byte_event_cb sequence is visible to
+     * unit tests. */
     c->tx_active = false;
     c->stat_tx_packets++;
-    /* TX done → PKT_SYNC_RXTX falls; MARCSTATE returns to RX (so
-     * MARC_2PIN goes from TX(01) to RX(11) — bit1 rises, bit0 stays
-     * high).  RSSI/CS valid become true on RX entry; we don't model
-     * the AGC settling delay here (immediate on RX entry, matching the
-     * existing CCA approach in reg_read RSSI0). */
+    /* TX done → PKT_SYNC_RXTX falls.  MARCSTATE must walk TX → SETTLING
+     * → RX (RFEND_CFG0.TXOFF_MODE=RX), NOT TX → RX directly.  The
+     * Contiki cc1200 driver reconfigures GPIO0 to MARC_2PIN_STATUS_0
+     * (signal 38, = bit0 of marc_2pin_state) for the duration of
+     * transmit() and busy-waits for it to go low to detect TX-end
+     * (see arch/dev/radio/cc1200/cc1200.c:1970, :2111).  In our 2-pin
+     * encoding bit0 is HIGH for both TX(01) and RX(11) but LOW for
+     * SETTLING(00) — so a direct TX → RX hop never produces a
+     * falling edge on signal 38, the driver hits its tx_pkt_lifetime
+     * (~50 ms for 50 kbps) timeout, and returns RADIO_TX_ERR.
+     *
+     * Schedule the SETTLING → RX hop ~100 µs later via marcstate_event
+     * so the visible state walk is TX → SETTLING (now) → RX (+100 µs).
+     * That gives signal 38 a clean 1 → 0 → 1 trajectory that matches
+     * what real silicon does post-TX with RFEND_CFG0.TXOFF_MODE=RX. */
     c->sig_pkt_sync_rxtx = false;
-    c->marcstate = CC1200_MARC_RX;
+    c->marcstate = CC1200_MARC_SETTLING;
     c->sig_rssi_valid = true;
     c->sig_cs_valid = true;
     air_reset(c);
     refresh_status(c);
     propagate_signals(c);
+    schedule_marc_transition(c, CC1200_MARC_RX, CC1200_STATUS_SETTLING,
+                              CC1200_SETTLING_DELAY_NS);
 }
 
 /* ------------------------------------------------------------------ */

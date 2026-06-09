@@ -61,6 +61,7 @@
 #define CC1200_MARC_SLEEP        0x00
 #define CC1200_MARC_IDLE         0x01
 #define CC1200_MARC_RX           0x0D
+#define CC1200_MARC_SETTLING     0x10  /* generic settling sub-state — bit0=0 in marc_2pin */
 #define CC1200_MARC_RX_FIFO_ERR  0x11
 #define CC1200_MARC_FSTXON       0x12
 #define CC1200_MARC_TX           0x13
