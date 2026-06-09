@@ -457,6 +457,111 @@ static void test_adc_sbc(void) {
 }
 
 /* ===================================================================
+ * UMULL (unsigned 64-bit multiply) tests
+ *
+ * Encoding: UMULL RdLo, RdHi, Rn, Rm  (T1)
+ *   hw1 = 0xFBA0 | Rn
+ *   hw2 = (RdLo<<12) | (RdHi<<8) | 0x0000 | Rm
+ *
+ * Used heavily in uECC's FAST_MULT_ASM multi-precision field arithmetic.
+ * =================================================================== */
+static void test_umull(void) {
+    printf("--- UMULL (unsigned 64-bit multiply) tests ---\n");
+
+    /* Basic: 3 * 7 = 21, fits in low word */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x2003); pc += 2; /* MOVS r0, #3 */
+        write_thumb16(&cpu, pc, 0x2107); pc += 2; /* MOVS r1, #7 */
+        /* UMULL r2, r3, r0, r1 — hw1=0xFBA0 (Rn=r0), hw2=0x2301 (RdLo=r2,RdHi=r3,Rm=r1) */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x2301); pc += 4;
+        arm_step(&cpu, 3);
+        assert_eq("UMULL r2,r3,r0,r1: lo=21", 21, cpu.reg[2]);
+        assert_eq("UMULL r2,r3,r0,r1: hi=0",   0, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Overflow into high word: 0xFFFFFFFF * 0xFFFFFFFF */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        /* MOVS r0, #1; MVN r0, r0 → r0 = 0xFFFFFFFE; not clean. Use MOV.W instead */
+        /* MVN r0, #0 sets r0 = 0xFFFFFFFF */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0000); pc += 4; /* MVN r0, #0 → r0=0xFFFFFFFF */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0100); pc += 4; /* MVN r1, #0 → r1=0xFFFFFFFF */
+        /* UMULL r2, r3, r0, r1 */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x2301); pc += 4;
+        arm_step(&cpu, 3);
+        /* 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE_00000001 */
+        assert_eq("UMULL 0xFFFFFF*0xFFFFFF: lo=1",          0x00000001, cpu.reg[2]);
+        assert_eq("UMULL 0xFFFFFF*0xFFFFFF: hi=0xFFFFFFFE", 0xFFFFFFFE, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Source and destination register aliasing: UMULL r0, r1, r0, r1
+     * Reads r0 and r1 first, then writes — must not corrupt inputs before compute */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x2064); pc += 2; /* MOVS r0, #100 */
+        write_thumb16(&cpu, pc, 0x2132); pc += 2; /* MOVS r1, #50  */
+        /* UMULL r0, r1, r0, r1 — RdLo=r0,RdHi=r1,Rn=r0,Rm=r1 */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x0101); pc += 4;
+        arm_step(&cpu, 3);
+        /* 100 * 50 = 5000 = 0x1388 */
+        assert_eq("UMULL r0,r1,r0,r1 (aliased): lo=5000", 5000, cpu.reg[0]);
+        assert_eq("UMULL r0,r1,r0,r1 (aliased): hi=0",      0,   cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* UMULL with high-register destination: r8 (RdLo), r9 (RdHi) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        write_thumb16(&cpu, pc, 0x2006); pc += 2; /* MOVS r0, #6  */
+        write_thumb16(&cpu, pc, 0x2107); pc += 2; /* MOVS r1, #7  */
+        /* UMULL r8, r9, r0, r1 — hw1=0xFBA0 (Rn=r0), hw2=(8<<12)|(9<<8)|1=0x8901 */
+        write_thumb32(&cpu, pc, 0xFBA0, 0x8901); pc += 4;
+        arm_step(&cpu, 3);
+        assert_eq("UMULL r8,r9,r0,r1: lo=42", 42, cpu.reg[8]);
+        assert_eq("UMULL r8,r9,r0,r1: hi=0",   0, cpu.reg[9]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ADC carry chain after UMULL+ADDS+ADCS (matches FAST_MULT_ASM pattern) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t pc = CODE_BASE;
+        /* c0=0, c1=0, c2=0 → multiply t0,t1 = 0xFFFFFFFF * 0xFFFFFFFF, add to accumulators */
+        write_thumb32(&cpu, pc, 0xF04F, 0x0300); pc += 4; /* MOV r3, #0   (c0) */
+        write_thumb32(&cpu, pc, 0xF04F, 0x0400); pc += 4; /* MOV r4, #0   (c1) */
+        write_thumb32(&cpu, pc, 0xF04F, 0x0500); pc += 4; /* MOV r5, #0   (c2) */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0600); pc += 4; /* MVN r6, #0   (t0 source = 0xFFFFFFFF) */
+        write_thumb32(&cpu, pc, 0xF06F, 0x0700); pc += 4; /* MVN r7, #0   (t1 source = 0xFFFFFFFF) */
+        /* UMULL r6, r7, r6, r7 → (t0,t1) = 0xFFFFFFFE_00000001 */
+        write_thumb32(&cpu, pc, 0xFBA6, 0x6707); pc += 4;
+        /* ADDS r3, r3, r6 → c0 += t0_lo; sets carry */
+        write_thumb32(&cpu, pc, 0xEB13, 0x0306); pc += 4;
+        /* ADCS r4, r4, r7 → c1 += t0_hi + carry */
+        write_thumb32(&cpu, pc, 0xEB54, 0x0407); pc += 4;
+        /* ADC r5, r5, #0 → c2 += carry (modified-imm T1: hw1=0xF145,hw2=0x0500) */
+        write_thumb32(&cpu, pc, 0xF145, 0x0500); pc += 4;
+        arm_step(&cpu, 9);
+        /* c0 = 0x00000001, c1 = 0xFFFFFFFE, c2 = 0 */
+        assert_eq("FAST_MULT pattern: c0=1",          0x00000001, cpu.reg[3]);
+        assert_eq("FAST_MULT pattern: c1=0xFFFFFFFE", 0xFFFFFFFE, cpu.reg[4]);
+        assert_eq("FAST_MULT pattern: c2=0",          0,          cpu.reg[5]);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
  * Cortex-M4 DSP extension — halfword multiply family
  *
  * Encoding reference: ARMv7-M Architecture Reference Manual, A7.7.121–
@@ -1112,6 +1217,558 @@ static void test_ldaex_stlex(void) {
     }
 }
 
+/* ===================================================================
+ * LDRD/STRD and 64-bit arithmetic tests
+ *
+ * These exercise the instruction patterns used by the Mbed TLS DTLS
+ * anti-replay window (mbedtls_ssl_dtls_replay_check/update):
+ *
+ *   - LDRD/STRD at byte offsets 136 (in_window_top) and 144 (in_window)
+ *     in the mbedtls_ssl_context struct.
+ *   - CMP.W + SBCS.W for 64-bit unsigned comparison (rec_seqnum > in_window_top).
+ *   - SUBS.W + SBC.W for 64-bit subtraction (bit = in_window_top - rec_seqnum).
+ *   - LSL (register) for variable 64-bit window shift (in_window <<= shift).
+ *
+ * The ARM emulator had an LDRD/STRD double-shift bug: the decode block
+ * pre-multiplied the field by 4 to get a byte offset, then the LDRD/STRD
+ * sub-case multiplied again, giving offset*4 instead of offset.  The fix
+ * sets `offset = imm8` (not `imm8 << 2`) in both LDRD-literal and
+ * LDRD/STRD-immediate sub-cases of arm_cpu.c.
+ * =================================================================== */
+
+/* APSR flag bits in xpsr */
+#define APSR_N_BIT (1u << 31)
+#define APSR_Z_BIT (1u << 30)
+#define APSR_C_BIT (1u << 29)
+#define APSR_V_BIT (1u << 28)
+
+static void test_anti_replay_ops(void) {
+    printf("--- LDRD/STRD and 64-bit arithmetic (anti-replay) tests ---\n");
+
+    /* ----------------------------------------------------------------
+     * LDRD at offset 0 — sanity check that the base case works
+     * LDRD R0, R1, [R2, #0]: hw1=0xE9D2, hw2=0x0100 (imm8_field=0)
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, ARM_SRAM_BASE + 0, 0xAABBCCDD);
+        arm_write32(&cpu, ARM_SRAM_BASE + 4, 0x11223344);
+        cpu.reg[2] = ARM_SRAM_BASE;
+        write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0100);
+        arm_step(&cpu, 1);
+        assert_eq("LDRD offset=0: R0=mem[base+0]", 0xAABBCCDD, cpu.reg[0]);
+        assert_eq("LDRD offset=0: R1=mem[base+4]", 0x11223344, cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * LDRD at offset 136 (in_window_top in mbedtls_ssl_context)
+     * LDRD R0, R1, [R2, #136]: imm8_field=34=0x22, hw2=0x0122
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, ARM_SRAM_BASE + 136, 0xDEADBEEF);
+        arm_write32(&cpu, ARM_SRAM_BASE + 140, 0x0000000F);
+        cpu.reg[2] = ARM_SRAM_BASE;
+        write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0122);
+        arm_step(&cpu, 1);
+        assert_eq("LDRD offset=136: R0=mem[base+136]", 0xDEADBEEF, cpu.reg[0]);
+        assert_eq("LDRD offset=136: R1=mem[base+140]", 0x0000000F, cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * LDRD at offset 144 (in_window in mbedtls_ssl_context)
+     * LDRD R0, R1, [R2, #144]: imm8_field=36=0x24, hw2=0x0124
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, ARM_SRAM_BASE + 144, 0xCAFEBABE);
+        arm_write32(&cpu, ARM_SRAM_BASE + 148, 0x12345678);
+        cpu.reg[2] = ARM_SRAM_BASE;
+        write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0124);
+        arm_step(&cpu, 1);
+        assert_eq("LDRD offset=144: R0=mem[base+144]", 0xCAFEBABE, cpu.reg[0]);
+        assert_eq("LDRD offset=144: R1=mem[base+148]", 0x12345678, cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * STRD at offset 0 — sanity check
+     * STRD R0, R1, [R2, #0]: hw1=0xE9C2, hw2=0x0100
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0xFEEDFACE;
+        cpu.reg[1] = 0xBAADF00D;
+        cpu.reg[2] = ARM_SRAM_BASE;
+        write_thumb32(&cpu, CODE_BASE, 0xE9C2, 0x0100);
+        arm_step(&cpu, 1);
+        assert_eq("STRD offset=0: mem[base+0]=R0", 0xFEEDFACE, arm_read32(&cpu, ARM_SRAM_BASE + 0));
+        assert_eq("STRD offset=0: mem[base+4]=R1", 0xBAADF00D, arm_read32(&cpu, ARM_SRAM_BASE + 4));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * STRD at offset 136 (in_window_top)
+     * STRD R0, R1, [R2, #136]: hw1=0xE9C2, hw2=0x0122
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00000005;  /* in_window_top low word = seqnum 5 */
+        cpu.reg[1] = 0x00000000;  /* in_window_top high word = 0 */
+        cpu.reg[2] = ARM_SRAM_BASE;
+        write_thumb32(&cpu, CODE_BASE, 0xE9C2, 0x0122);
+        arm_step(&cpu, 1);
+        assert_eq("STRD offset=136: mem[base+136]=R0", 0x00000005, arm_read32(&cpu, ARM_SRAM_BASE + 136));
+        assert_eq("STRD offset=136: mem[base+140]=R1", 0x00000000, arm_read32(&cpu, ARM_SRAM_BASE + 140));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * STRD at offset 144 (in_window)
+     * STRD R0, R1, [R2, #144]: hw1=0xE9C2, hw2=0x0124
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0x00000001;  /* in_window low word = bit 0 set */
+        cpu.reg[1] = 0x00000000;  /* in_window high word = 0 */
+        cpu.reg[2] = ARM_SRAM_BASE;
+        write_thumb32(&cpu, CODE_BASE, 0xE9C2, 0x0124);
+        arm_step(&cpu, 1);
+        assert_eq("STRD offset=144: mem[base+144]=R0", 0x00000001, arm_read32(&cpu, ARM_SRAM_BASE + 144));
+        assert_eq("STRD offset=144: mem[base+148]=R1", 0x00000000, arm_read32(&cpu, ARM_SRAM_BASE + 148));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * LDRD round-trip: write via STRD, read back via LDRD (offset 144)
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0xABCD1234;
+        cpu.reg[1] = 0x9876FEDC;
+        cpu.reg[2] = ARM_SRAM_BASE;
+        /* STRD R0, R1, [R2, #144] */
+        write_thumb32(&cpu, CODE_BASE + 0, 0xE9C2, 0x0124);
+        /* Clear R0 and R1 */
+        write_thumb16(&cpu, CODE_BASE + 4, 0x2000);  /* MOVS R0, #0 */
+        write_thumb16(&cpu, CODE_BASE + 6, 0x2100);  /* MOVS R1, #0 */
+        /* LDRD R0, R1, [R2, #144] */
+        write_thumb32(&cpu, CODE_BASE + 8, 0xE9D2, 0x0124);
+        arm_step(&cpu, 4);
+        assert_eq("LDRD/STRD round-trip offset=144: R0", 0xABCD1234, cpu.reg[0]);
+        assert_eq("LDRD/STRD round-trip offset=144: R1", 0x9876FEDC, cpu.reg[1]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * CMP.W flags: A > B (unsigned 32-bit comparison)
+     * CMP.W R0, R1: hw1=0xEBB0, hw2=0x0F01
+     * Tests the building block for 64-bit high-word comparison.
+     * A=5 > B=3: expect C=1, Z=0, N=0
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 5;
+        cpu.reg[1] = 3;
+        write_thumb32(&cpu, CODE_BASE, 0xEBB0, 0x0F01);
+        arm_step(&cpu, 1);
+        assert_true("CMP.W 5>3: C=1", (cpu.xpsr & APSR_C_BIT) != 0);
+        assert_true("CMP.W 5>3: Z=0", (cpu.xpsr & APSR_Z_BIT) == 0);
+        assert_true("CMP.W 5>3: N=0", (cpu.xpsr & APSR_N_BIT) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* CMP.W: A < B: expect C=0 (borrow), N=1 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 3;
+        cpu.reg[1] = 5;
+        write_thumb32(&cpu, CODE_BASE, 0xEBB0, 0x0F01);
+        arm_step(&cpu, 1);
+        assert_true("CMP.W 3<5: C=0", (cpu.xpsr & APSR_C_BIT) == 0);
+        assert_true("CMP.W 3<5: N=1", (cpu.xpsr & APSR_N_BIT) != 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* CMP.W: A == B: expect C=1, Z=1 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 7;
+        cpu.reg[1] = 7;
+        write_thumb32(&cpu, CODE_BASE, 0xEBB0, 0x0F01);
+        arm_step(&cpu, 1);
+        assert_true("CMP.W 7==7: C=1", (cpu.xpsr & APSR_C_BIT) != 0);
+        assert_true("CMP.W 7==7: Z=1", (cpu.xpsr & APSR_Z_BIT) != 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * SBCS.W: carry chain for 64-bit comparison
+     * Pattern: CMP.W A_lo, B_lo; SBCS R5, A_hi, B_hi
+     * Tests that C flag from CMP flows correctly into SBCS.
+     *
+     * Encoding:
+     *   CMP.W R0, R2:  hw1=0xEBB0, hw2=0x0F02
+     *   SBCS  R5, R3, R4: hw1=0xEB73, hw2=0x0504
+     *     (op_dp=0xB=SBC, S=1, Rn=R3; Rd=5, Rm=4)
+     *
+     * Case 1: A={R3:R0}={0:5}, B={R4:R2}={0:3} → A > B (low differs)
+     *   CMP.W 5, 3: C=1 (no borrow), Z=0
+     *   SBCS R5, 0, 0: 0-0-0=0, C=1, Z=1
+     *   → combined: C=1 (A >= B)
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 5;   /* A_lo */
+        cpu.reg[3] = 0;   /* A_hi */
+        cpu.reg[2] = 3;   /* B_lo */
+        cpu.reg[4] = 0;   /* B_hi */
+        /* CMP.W R0, R2 */
+        write_thumb32(&cpu, CODE_BASE + 0, 0xEBB0, 0x0F02);
+        /* SBCS R5, R3, R4 */
+        write_thumb32(&cpu, CODE_BASE + 4, 0xEB73, 0x0504);
+        arm_step(&cpu, 2);
+        assert_eq("SBCS 64-bit A>B (lo differs): R5=0", 0u, cpu.reg[5]);
+        assert_true("SBCS 64-bit A>B (lo differs): C=1", (cpu.xpsr & APSR_C_BIT) != 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Case 2: A={0:1}, B={0:2} → A < B
+     *   CMP.W 1, 2: C=0 (borrow), N=1
+     *   SBCS R5, 0, 0: 0-0-1(borrow)=0xFFFFFFFF, C=0
+     *   → C=0 (A < B) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 1;
+        cpu.reg[3] = 0;
+        cpu.reg[2] = 2;
+        cpu.reg[4] = 0;
+        write_thumb32(&cpu, CODE_BASE + 0, 0xEBB0, 0x0F02);
+        write_thumb32(&cpu, CODE_BASE + 4, 0xEB73, 0x0504);
+        arm_step(&cpu, 2);
+        assert_eq("SBCS 64-bit A<B (lo differs): R5=0xFFFFFFFF",
+                  0xFFFFFFFFu, cpu.reg[5]);
+        assert_true("SBCS 64-bit A<B: C=0", (cpu.xpsr & APSR_C_BIT) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Case 3: A={1:0}, B={0:0} → A > B (high word differs)
+     *   CMP.W A_lo=0, B_lo=0: C=1, Z=1
+     *   SBCS R5, A_hi=1, B_hi=0: 1-0-0=1, C=1, Z=0
+     *   → C=1, Z=0 (A > B) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0;   /* A_lo */
+        cpu.reg[3] = 1;   /* A_hi */
+        cpu.reg[2] = 0;   /* B_lo */
+        cpu.reg[4] = 0;   /* B_hi */
+        write_thumb32(&cpu, CODE_BASE + 0, 0xEBB0, 0x0F02);
+        write_thumb32(&cpu, CODE_BASE + 4, 0xEB73, 0x0504);
+        arm_step(&cpu, 2);
+        assert_eq("SBCS 64-bit A>B (hi differs): R5=1", 1u, cpu.reg[5]);
+        assert_true("SBCS 64-bit A>B (hi differs): C=1",
+                    (cpu.xpsr & APSR_C_BIT) != 0);
+        assert_true("SBCS 64-bit A>B (hi differs): Z=0",
+                    (cpu.xpsr & APSR_Z_BIT) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * SUBS.W + SBC.W: 64-bit unsigned subtraction
+     * Computes {R5:R4} = {R3:R0} - {R4:R2} (64-bit)
+     *
+     * Encoding:
+     *   SUBS.W R4, R0, R2: hw1=0xEBB0, hw2=0x0402
+     *   SBC.W  R5, R3, R3_copy... need separate regs.
+     *
+     * Use: A_lo in R0, A_hi in R1, B_lo in R2, B_hi in R3
+     *      Result_lo in R4, Result_hi in R5
+     *   SUBS.W R4, R0, R2: hw1=0xEBB0, hw2=0x0402 (Rd=4, Rn=0, Rm=2)
+     *   SBC.W  R5, R1, R3: hw1=0xEB61, hw2=0x0503 (S=0, Rd=5, Rn=1, Rm=3)
+     *
+     * Case 1: A={0:5} - B={0:3} = {0:2}
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 5;   /* A_lo */
+        cpu.reg[1] = 0;   /* A_hi */
+        cpu.reg[2] = 3;   /* B_lo */
+        cpu.reg[3] = 0;   /* B_hi */
+        /* SUBS.W R4, R0, R2 */
+        write_thumb32(&cpu, CODE_BASE + 0, 0xEBB0, 0x0402);
+        /* SBC.W R5, R1, R3 (no S flag update needed) */
+        write_thumb32(&cpu, CODE_BASE + 4, 0xEB61, 0x0503);
+        arm_step(&cpu, 2);
+        assert_eq("64-bit SUBS/SBC: 5-3 low", 2u, cpu.reg[4]);
+        assert_eq("64-bit SUBS/SBC: 5-3 high", 0u, cpu.reg[5]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Case 2: A={0:1} - B={0:0} = {0:1} (seqnum=1, in_window_top=0, bit=1) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 1;   /* A_lo = rec_seqnum_lo */
+        cpu.reg[1] = 0;   /* A_hi */
+        cpu.reg[2] = 0;   /* B_lo = in_window_top_lo */
+        cpu.reg[3] = 0;   /* B_hi */
+        write_thumb32(&cpu, CODE_BASE + 0, 0xEBB0, 0x0402);
+        write_thumb32(&cpu, CODE_BASE + 4, 0xEB61, 0x0503);
+        arm_step(&cpu, 2);
+        assert_eq("64-bit SUBS/SBC: 1-0 low (bit index)", 1u, cpu.reg[4]);
+        assert_eq("64-bit SUBS/SBC: 1-0 high", 0u, cpu.reg[5]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Case 3: Borrow propagation — A={0:0} - B={0:1} = {0xFFFFFFFF:0xFFFFFFFF}
+     * Simulates what happens when replay_check reads bit index wrongly. */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[0] = 0;   /* A_lo */
+        cpu.reg[1] = 0;   /* A_hi */
+        cpu.reg[2] = 1;   /* B_lo */
+        cpu.reg[3] = 0;   /* B_hi */
+        write_thumb32(&cpu, CODE_BASE + 0, 0xEBB0, 0x0402);
+        write_thumb32(&cpu, CODE_BASE + 4, 0xEB61, 0x0503);
+        arm_step(&cpu, 2);
+        assert_eq("64-bit borrow: 0-1 low = 0xFFFFFFFF", 0xFFFFFFFFu, cpu.reg[4]);
+        assert_eq("64-bit borrow: 0-1 high = 0xFFFFFFFF", 0xFFFFFFFFu, cpu.reg[5]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* ----------------------------------------------------------------
+     * LSL (register) T1: variable shift for 64-bit window update
+     * LSLS R0, R1 (T1 Thumb-16): 0x4088 (op=0x02, Rm=R1, Rdn=R0)
+     * Tests that `in_window <<= shift` doesn't lose bits.
+     * ---------------------------------------------------------------- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* Set R0=1, R1=3 → LSLS R0, R1 → R0 = 1 << 3 = 8 */
+        write_thumb16(&cpu, CODE_BASE + 0, 0x2001);  /* MOVS R0, #1 */
+        write_thumb16(&cpu, CODE_BASE + 2, 0x2103);  /* MOVS R1, #3 */
+        write_thumb16(&cpu, CODE_BASE + 4, 0x4088);  /* LSLS R0, R1 */
+        arm_step(&cpu, 3);
+        assert_eq("LSL(reg): 1 << 3 = 8", 8u, cpu.reg[0]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* LSL by 31 (shift to MSB) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        write_thumb16(&cpu, CODE_BASE + 0, 0x2001);  /* MOVS R0, #1 */
+        write_thumb16(&cpu, CODE_BASE + 2, 0x211F);  /* MOVS R1, #31 */
+        write_thumb16(&cpu, CODE_BASE + 4, 0x4088);  /* LSLS R0, R1 */
+        arm_step(&cpu, 3);
+        assert_eq("LSL(reg): 1 << 31 = 0x80000000", 0x80000000u, cpu.reg[0]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* LSL by 32 — all bits shifted out, result = 0 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        write_thumb16(&cpu, CODE_BASE + 0, 0x2001);  /* MOVS R0, #1 */
+        write_thumb16(&cpu, CODE_BASE + 2, 0x2120);  /* MOVS R1, #32 */
+        write_thumb16(&cpu, CODE_BASE + 4, 0x4088);  /* LSLS R0, R1 */
+        arm_step(&cpu, 3);
+        assert_eq("LSL(reg): 1 << 32 = 0", 0u, cpu.reg[0]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* LSL by 0 — identity */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        write_thumb16(&cpu, CODE_BASE + 0, 0x20AB);  /* MOVS R0, #0xAB */
+        write_thumb16(&cpu, CODE_BASE + 2, 0x2100);  /* MOVS R1, #0 */
+        write_thumb16(&cpu, CODE_BASE + 4, 0x4088);  /* LSLS R0, R1 */
+        arm_step(&cpu, 3);
+        assert_eq("LSL(reg): 0xAB << 0 = 0xAB", 0xABu, cpu.reg[0]);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
+ * SUBS/SBCS Rd==Rn carry correctness (regression for rd-aliases-rn bug).
+ *
+ * The bug: when rd==rn, the register was updated BEFORE set_sub_flags
+ * read it, so the C flag was derived from the NEW value instead of the
+ * original — corrupting borrow propagation in multi-word subtraction.
+ * =================================================================== */
+static void test_subs_rd_eq_rn(void) {
+    printf("--- SUBS/SBCS Rd==Rn carry tests ---\n");
+
+    /* 16-bit SUBS r5, r5, r6 (T1: rd=rn=5, rm=6): 2 - 3, should set C=0 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[5] = 2;
+        cpu.reg[6] = 3;
+        /* SUBS r5, r5, r6: 0001 101 110 101 101 = 0x1BAD */
+        write_thumb16(&cpu, CODE_BASE, 0x1BAD);
+        arm_step(&cpu, 1);
+        assert_eq("SUBS r5,r5,r6 (2-3) result", (uint32_t)-1, cpu.reg[5]);
+        assert_true("SUBS r5,r5,r6 (2-3) C=0 (borrow)", (cpu.xpsr & APSR_C) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SUBS r5, r5, r6 (T1): 5 - 3, should set C=1 (no borrow) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[5] = 5;
+        cpu.reg[6] = 3;
+        write_thumb16(&cpu, CODE_BASE, 0x1BAD);
+        arm_step(&cpu, 1);
+        assert_eq("SUBS r5,r5,r6 (5-3) result", 2, cpu.reg[5]);
+        assert_true("SUBS r5,r5,r6 (5-3) C=1 (no borrow)", (cpu.xpsr & APSR_C) != 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* 32-bit SUBS.W r3, r3, r2 (Rd==Rn=3, Rm=2): 1 - 2, C=0 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[3] = 1;
+        cpu.reg[2] = 2;
+        /* SUBS.W r3, r3, r2: hw1=0xEBB3 (S=1, Rn=r3), hw2=0x0302 (Rd=r3, Rm=r2) */
+        write_thumb32(&cpu, CODE_BASE, 0xEBB3, 0x0302);
+        arm_step(&cpu, 1);
+        assert_eq("SUBS.W r3,r3,r2 (1-2) result", (uint32_t)-1, cpu.reg[3]);
+        assert_true("SUBS.W r3,r3,r2 (1-2) C=0", (cpu.xpsr & APSR_C) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
+ * VFP double-precision VLDR/VSTR tests (regression for 4-byte-only bug).
+ * =================================================================== */
+static void test_vfp_double(void) {
+    printf("--- VFP double-precision VLDR/VSTR tests ---\n");
+
+    /* VSTR d7, [r0, #0] should write 8 bytes */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* Set d7 = {s14, s15} = {0xDEADBEEF, 0x12345678} */
+        cpu.vfp_s[14] = 0xDEADBEEF;
+        cpu.vfp_s[15] = 0x12345678;
+        uint32_t addr = cpu.sram_base + 64;
+        cpu.reg[0] = addr;
+        /* VSTR d7, [r0]: hw1=0xED80 (U=1,D=0,L=0,Rn=0), hw2=0x7B00 (Vd=7,coproc=B,imm8=0) */
+        write_thumb32(&cpu, CODE_BASE, 0xED80, 0x7B00);
+        arm_step(&cpu, 1);
+        assert_eq("VSTR d7 low  word", 0xDEADBEEFu, arm_read32(&cpu, addr));
+        assert_eq("VSTR d7 high word", 0x12345678u, arm_read32(&cpu, addr + 4));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* VLDR d7, [r0, #0] should read 8 bytes */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        uint32_t addr = cpu.sram_base + 64;
+        arm_write32(&cpu, addr,     0xAABBCCDD);
+        arm_write32(&cpu, addr + 4, 0x11223344);
+        cpu.reg[0] = addr;
+        /* VLDR d7, [r0]: hw1=0xED90, hw2=0x7B00 (L=1) */
+        write_thumb32(&cpu, CODE_BASE, 0xED90, 0x7B00);
+        arm_step(&cpu, 1);
+        assert_eq("VLDR d7 low  word → s14", 0xAABBCCDDu, cpu.vfp_s[14]);
+        assert_eq("VLDR d7 high word → s15", 0x11223344u, cpu.vfp_s[15]);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
+ * LDRD / STRD (load/store double register) tests
+ * Used heavily in SHA-256 transform for loading state and W[] values.
+ * =================================================================== */
+static void test_ldrd_strd(void) {
+    printf("--- LDRD/STRD instruction tests ---\n");
+
+    /* STRD / LDRD round-trip via SRAM */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* Store two values via STRD r0, r1, [r2, #0]
+         * hw1 = 0xE9C2 (STRD, P=1, U=1, W=0, Rn=r2)
+         * hw2 = 0x0100 (Rt=r0, Rt2=r1, imm8=0) */
+        uint32_t sram_addr = cpu.sram_base + 64;
+        cpu.reg[0] = 0xDEADBEEF;
+        cpu.reg[1] = 0x12345678;
+        cpu.reg[2] = sram_addr;
+        /* STRD r0, r1, [r2, #0]: P=1,U=1,W=0 → hw1=0xE9C2, hw2=0x0100 */
+        write_thumb32(&cpu, CODE_BASE, 0xE9C2, 0x0100);
+        /* LDRD r3, r4, [r2, #0] */
+        write_thumb32(&cpu, CODE_BASE + 4, 0xE9D2, 0x3400);
+        arm_step(&cpu, 2);
+        assert_eq("STRD/LDRD round-trip: word0", 0xDEADBEEFu, cpu.reg[3]);
+        assert_eq("STRD/LDRD round-trip: word1", 0x12345678u, cpu.reg[4]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* LDRD with immediate offset: [sp, #124] as in SHA-256 transform.
+     * SHA-256 allocates 372 bytes on stack first (sub sp, #372).
+     * Here we subtract 512 bytes to make room for the offset access. */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        /* SUB SP, #512 (0x200) to allocate stack space */
+        write_thumb16(&cpu, CODE_BASE + 0, 0xB082); /* SUB SP, #8 (placeholder — use direct reg write) */
+        /* Easier: adjust SP directly, then write test values */
+        cpu.reg[ARM_SP] -= 512;
+        uint32_t sp = cpu.reg[ARM_SP];
+        arm_write32(&cpu, sp + 124, 0xAABBCCDD);
+        arm_write32(&cpu, sp + 128, 0x11223344);
+        /* LDRD r6, r11, [sp, #124]: P=1,U=1,W=0,L=1,Rn=13=sp
+         * hw1 = 0xE9DD, hw2 = (6<<12)|(11<<8)|(31) = 0x6B1F */
+        write_thumb32(&cpu, CODE_BASE, 0xE9DD, 0x6B1F);
+        arm_step(&cpu, 1);
+        assert_eq("LDRD [sp,#124]: r6", 0xAABBCCDDu, cpu.reg[6]);
+        assert_eq("LDRD [sp,#124]: r11", 0x11223344u, cpu.reg[11]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* STRD r3, r2, [sp, #28] — stores h and g in SHA-256 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.reg[3] = 0x5BE0CD19u;  /* SHA-256 initial h */
+        cpu.reg[2] = 0x1F83D9ABu;  /* SHA-256 initial g */
+        cpu.reg[ARM_SP] -= 512;
+        uint32_t sp = cpu.reg[ARM_SP];
+        /* STRD r3, r2, [sp, #28]: P=1,U=1,W=0,L=0,Rn=13=sp
+         * hw1 = 0xE9CD, hw2 = (3<<12)|(2<<8)|7 = 0x3207 */
+        write_thumb32(&cpu, CODE_BASE, 0xE9CD, 0x3207);
+        arm_step(&cpu, 1);
+        assert_eq("STRD [sp,#28]: first word", 0x5BE0CD19u,
+                  arm_read32(&cpu, sp + 28));
+        assert_eq("STRD [sp,#28]: second word", 0x1F83D9ABu,
+                  arm_read32(&cpu, sp + 32));
+        arm_cpu_destroy(&cpu);
+    }
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -1127,10 +1784,15 @@ int run_arm_correctness_tests(int v) {
     test_branch();
     test_extensions();
     test_adc_sbc();
+    test_umull();
+    test_subs_rd_eq_rn();
+    test_vfp_double();
+    test_ldrd_strd();
     test_bit_field_ops();
     test_ldaex_stlex();
     test_m4_dsp_halfword_multiply();
     test_m4_vfp();
+    test_anti_replay_ops();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

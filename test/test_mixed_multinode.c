@@ -2006,6 +2006,16 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
          * ACK timing: ACK starts after data frame ends + 192µs turnaround
          * (12 symbol periods per 802.15.4). */
         int64_t ack_start = accurate_tx_end + 192000LL;
+        /* For the sender's ACK, use current_sim_ns + 192µs turnaround rather
+         * than accurate_tx_end + 192µs.  TX is instantaneous in the emulator,
+         * so the firmware's ACK-wait timer starts at current_sim_ns.
+         * accurate_tx_end is current_sim_ns + full frame air-time (e.g. 4ms
+         * for a 125-byte frame), putting the ACK delivery well past the
+         * firmware's ~2.5ms RTIMER_BUSYWAIT_UNTIL timeout and causing
+         * perpetual CSMA retransmissions.  Matching the native-sender path
+         * (distribute_rf_outgoing uses current_sim_ns + 192000 for the same
+         * reason). */
+        int64_t sender_ack_start = sim_runtime_now_ns(&sim_rt) + 192000LL;
         int ack_tx_emitted = 0;
         for (int j = 0; j < num_nodes; j++) {
             if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
@@ -2023,10 +2033,12 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
                  * ticking-node fast path (no time advance), so bytes arrive
                  * at the sender while its radio is still TX/DISABLED. The
                  * drain at end-of-tick delivers via the time-advancing path
-                 * after the driver had a chance to switch back to RX. */
+                 * after the driver had a chance to switch back to RX.
+                 * Use sender_ack_start (current_sim_ns + 192µs) so the ACK
+                 * arrives within the firmware's ACK-wait window. */
                 if (j == sender_idx)
                     emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                      -50, ack_start, coll_end,
+                                      -50, sender_ack_start, coll_end,
                                       tx_asm[sender_idx].subghz);
                 else if (emulated_rxfifo_available(j) >= ack_payload + 1)
                     emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count,
@@ -2865,6 +2877,9 @@ static node_type_t detect_node_type(const char *path) {
         return NODE_ARM;
     if (dot && strcmp(dot, ".nrf52840-dk") == 0)
         return NODE_ARM;
+    /* .nrf52840 without board suffix: built with BOARD=dk (the default board). */
+    if (dot && strcmp(dot, ".nrf52840") == 0)
+        return NODE_ARM;
     /* Nordic nRF54L15 (Development Kit PCA10156). */
     if (dot && strcmp(dot, ".nrf54l15-dk") == 0)
         return NODE_ARM;
@@ -3091,6 +3106,9 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         plat_name = "nrf52840-dongle";
     else if (dot && strcmp(dot, ".nrf52840-dk") == 0)
         plat_name = "nrf52840-dk";
+    /* .nrf52840 without board suffix: built with BOARD=dk (the default). */
+    else if (dot && strcmp(dot, ".nrf52840") == 0)
+        plat_name = "nrf52840-dk";
     else if (dot && strcmp(dot, ".nrf54l15-dk") == 0)
         plat_name = "nrf54l15-dk";
 
@@ -3264,6 +3282,14 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         while ((int64_t)plat->cpu.cycles < limit) {
             arm_step_until(&plat->cpu, plat->cpu.cycles + 10000);
             if (plat->cpu.event_queue != NULL) break;
+        }
+        /* Run past the first scheduled event so that early-boot stack
+         * initialization (stack_check_init) completes before the multinode
+         * simulation starts.  Without this, format_str_v reads 0xCDCDCDCD
+         * from an uninitialized stack slot and loops for ~3.4B iterations. */
+        if (plat->cpu.event_queue != NULL &&
+            plat->cpu.next_event_cycle > (int64_t)plat->cpu.cycles) {
+            arm_step_until(&plat->cpu, plat->cpu.next_event_cycle + 100000);
         }
     }
 
@@ -4955,6 +4981,15 @@ sim_restart:
                             goto arm_tick_done;
                         }
                     }
+
+                    /* Drain any frames queued for this node (mirrors the
+                     * MSP430 path above).  For nRF52840, the pending_rx
+                     * buffer inside the radio model handles delivery when
+                     * the radio was not in RX state at delivery time; this
+                     * drain covers the emu_rx_queue path which fires when
+                     * direct delivery was deferred to a later tick. */
+                    if (emu_rx_queue[i].count > 0)
+                        emu_rx_queue_drain(i);
 
                     /* Match MspMote.execute(t, 1): schedule the next normal
                      * wakeup based on the step_micros lead hint. */

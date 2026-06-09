@@ -1862,9 +1862,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         cpu->reg[ARM_PC] = pc + 4 + idx * 2;
                     }
                 } else if (rn == 0xF && L) {
-                    /* LDRD (literal) */
+                    /* LDRD (literal): imm8 already holds the byte offset (field << 2). */
                     uint32_t base = (pc + 4) & ~3u;
-                    uint32_t addr = U ? base + imm8 : base - imm8;
+                    uint32_t off  = imm8;
+                    uint32_t addr = U ? base + off : base - off;
                     cpu->reg[rt]  = mem_read32(cpu, addr);
                     cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                 } else if (!P && !U && !L && (hw2 & 0x0F00) != 0x0F00) {
@@ -1891,7 +1892,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     uint32_t addr = cpu->reg[rn] + imm8;
                     cpu->reg[rt] = mem_read32(cpu, addr);
                 } else {
-                    /* LDRD / STRD (immediate) */
+                    /* LDRD / STRD (immediate): imm8 already holds the byte offset (field << 2). */
                     uint32_t offset = imm8;
                     uint32_t addr;
                     if (P) {
@@ -2697,13 +2698,24 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         cpu->reg[rd] = (uint32_t)(acc >> 32);
                     }
                 } else if (op_misc == 0xE) {
-                    /* UMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBE.)
-                       hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
-                    uint64_t acc = ((uint64_t)cpu->reg[ra]) |
-                                   ((uint64_t)cpu->reg[rd] << 32);
-                    acc += (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm];
-                    cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
-                    cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
+                    int op2_misc = (hw2 >> 4) & 0xF;
+                    if (op2_misc == 0x6) {
+                        /* UMAAL RdLo, RdHi, Rn, Rm (hw1=0xFBE., hw2[7:4]=0110)
+                           {RdHi:RdLo} = Rn*Rm + RdLo + RdHi  (all unsigned 32-bit addends) */
+                        uint64_t result = (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm]
+                                        + (uint64_t)cpu->reg[ra]
+                                        + (uint64_t)cpu->reg[rd];
+                        cpu->reg[ra] = (uint32_t)result;          /* RdLo */
+                        cpu->reg[rd] = (uint32_t)(result >> 32);  /* RdHi */
+                    } else {
+                        /* UMLAL RdLo, RdHi, Rn, Rm (hw1=0xFBE., hw2[7:4]=0000)
+                           {RdHi:RdLo} += Rn*Rm */
+                        uint64_t acc = ((uint64_t)cpu->reg[ra]) |
+                                       ((uint64_t)cpu->reg[rd] << 32);
+                        acc += (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm];
+                        cpu->reg[ra] = (uint32_t)acc;          /* RdLo */
+                        cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
+                    }
                 }
             } else if ((hw1 & 0xEC00) == 0xEC00) {
                 /* Cortex-M4F single-precision VFP. Real implementations

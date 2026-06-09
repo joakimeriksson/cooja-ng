@@ -1,0 +1,42 @@
+{
+  "title": "C509 DTLS 3-hop: slip-radio(cooja) + BR(nRF) + I(nRF) + C(nRF) client, Storing mode",
+  "timeout_ms": 900000,
+  "speed": 1.0,
+  "radiomedium": {
+    "type": "udgm",
+    "tx_range": 50.0,
+    "interference_range": 100.0,
+    "success_ratio_tx": 1.0,
+    "success_ratio_rx": 1.0
+  },
+  "serial_socket": {
+    "node": 1,
+    "port": 60001
+  },
+  "nodes": [
+    {
+      "id": 1,
+      "firmware": "/home/joel/gemini_workspace/contiki-ng/examples/slip-radio/build/cooja/slip-radio.cooja",
+      "x": 0.0,
+      "y": 0.0
+    },
+    {
+      "id": 2,
+      "firmware": "/home/joel/gemini_workspace/contiki-ng/examples/c509-rpl-router/build/nrf52840/dk/c509-rpl-router.nrf52840",
+      "x": 30.0,
+      "y": 0.0
+    },
+    {
+      "id": 3,
+      "firmware": "/home/joel/gemini_workspace/contiki-ng/examples/c509-rpl-router/build/nrf52840/dk/c509-rpl-router.nrf52840",
+      "x": 60.0,
+      "y": 0.0
+    },
+    {
+      "id": 4,
+      "firmware": "/home/joel/gemini_workspace/contiki-ng/examples/c509-hw-test-client-3hop/build/nrf52840/dk/c509-client-border.nrf52840",
+      "x": 90.0,
+      "y": 0.0
+    }
+  ]
+}
