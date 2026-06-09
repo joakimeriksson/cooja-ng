@@ -252,6 +252,9 @@ static void frame_done_event_cb(void *user_data, cpu_event_t *ev) {
     /* Packet ended — PKT_SYNC_RXTX falls.  Any GDO pin selecting
      * signal 6 sees the falling edge here.  Pins selecting MARC_2PIN
      * or other signals are unchanged. */
+    if (getenv("CC1200_TIMING_PROBE"))
+        fprintf(stderr, "[t=%lld cc1200@%p RX_DONE GPIO0↓ rx_count=%d]\n",
+                (long long)HOST_NOW_NS(c), (void*)c, c->rx_count);
     c->sig_pkt_sync_rxtx = false;
     propagate_signals(c);
 }
@@ -574,6 +577,9 @@ static void marcstate_event_cb(void *user_data, cpu_event_t *ev) {
     (void)ev;
     cc1200_t *c = (cc1200_t *)user_data;
     uint8_t target = c->marc_pending;
+    if (getenv("CC1200_TIMING_PROBE"))
+        fprintf(stderr, "[t=%lld cc1200@%p MARC_FIRE 0x%02x→0x%02x]\n",
+                (long long)HOST_NOW_NS(c), (void*)c, c->marcstate, target);
     c->marcstate = target;
     c->marc_transit_status = 0xFF;
 
@@ -674,6 +680,28 @@ static void chip_reset(cc1200_t *c) {
 
 static void handle_strobe(cc1200_t *c, uint8_t strobe) {
     c->stat_strobe_count++;
+    if (getenv("CC1200_TIMING_PROBE")) {
+        const char *name;
+        switch (strobe) {
+        case CC1200_STROBE_SRES:    name = "SRES";    break;
+        case CC1200_STROBE_SFSTXON: name = "SFSTXON"; break;
+        case CC1200_STROBE_SXOFF:   name = "SXOFF";   break;
+        case CC1200_STROBE_SCAL:    name = "SCAL";    break;
+        case CC1200_STROBE_SRX:     name = "SRX";     break;
+        case CC1200_STROBE_STX:     name = "STX";     break;
+        case CC1200_STROBE_SIDLE:   name = "SIDLE";   break;
+        case CC1200_STROBE_SPWD:    name = "SPWD";    break;
+        case CC1200_STROBE_SFRX:    name = "SFRX";    break;
+        case CC1200_STROBE_SFTX:    name = "SFTX";    break;
+        case CC1200_STROBE_SNOP:    name = "SNOP";    break;
+        default:                    name = "?";       break;
+        }
+        /* Skip SNOP — it's the polling loop probe and would flood. */
+        if (strobe != CC1200_STROBE_SNOP)
+            fprintf(stderr, "[t=%lld cc1200@%p STROBE %s marc=0x%02x pend=0x%02x]\n",
+                    (long long)HOST_NOW_NS(c), (void*)c, name,
+                    c->marcstate, c->marc_pending);
+    }
     switch (strobe) {
     case CC1200_STROBE_SRES:
         chip_reset(c);
