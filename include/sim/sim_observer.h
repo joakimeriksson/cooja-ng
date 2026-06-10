@@ -49,7 +49,13 @@ typedef struct sim_observer_event {
     int      radio_idx;      /* -1 for non-radio events                   */
     union {
         struct { uint8_t  byte; } uart;
-        struct { const char *line; int len; } log_line;
+        struct {
+            const char *line;
+            int len;
+            int node_id;   /* Cooja node ID (≠ mote_index) — testlog/JS
+                            * consumers key on this, matching Cooja's
+                            * log.log(time + " " + id + " " + msg) */
+        } log_line;
         struct { int led_index; bool on; } led;
         struct {
             const uint8_t *data;

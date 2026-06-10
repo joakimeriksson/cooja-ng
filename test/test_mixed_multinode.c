@@ -36,6 +36,7 @@
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
 #include "sim_serial_bridge.h"
+#include "sim_external_command.h"
 #include "gdb_stub.h"
 #include "arm_gdb.h"
 #include "pcap_writer.h"
@@ -513,18 +514,11 @@ static int ui_restart_requested = 0;   /* restart simulation from UI */
  * 8.2's external_command_service). */
 static sim_serial_bridge_t serial_bridge;
 static int ss_node_idx = -1;     /* index of the bridged node */
-static pid_t ss_child_pid = -1;  /* PID of external command */
-static int ss_child_exited = 0;  /* set when child exits */
-static int ss_child_status = -1; /* child exit status */
 
-/* Cooja-compatibility test log.  Bash test drivers (e.g.
- * tests/17-tun-rpl-br/test-native-nat64.sh) grep $THIS_DIR/COOJA.testlog
- * for mote-side markers like "UDP_ECHO_OK node=2".  In real Cooja the
- * .csc's JS plugin writes that file via `log.log(...)`; csc2json strips
- * that JS away, so csim has to produce the file itself.  When a
- * serial_socket.command is configured we open this in the same
- * directory as the script and tee every mote console line to it. */
-static FILE *cooja_testlog = NULL;
+/* External test-driver process + COOJA.testlog tee — milestone 8.2
+ * service (sim_external_command).  The testlog tee rides the
+ * SIM_OBS_MOTE_LOG_LINE observer stream. */
+static sim_external_command_t external_cmd;
 
 /* --- Timeline and packet analyzer state --- */
 static timeline_t timeline;
@@ -2287,13 +2281,16 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
         test_check_line(node->id, node->line_buf, ns);
         if (ui_server)
             ui_add_console_line(nidx, ns, node->line_buf);
-        if (cooja_testlog) {
-            /* Match Cooja's `log.log(time + " " + id + " " + msg + "\n")`
-             * format so existing bash test drivers grep the file the
-             * same way they would against Cooja's output. */
-            fprintf(cooja_testlog, "%lld %d %s\n",
-                    (long long)(ns / 1000000LL), node->id, node->line_buf);
-            fflush(cooja_testlog);
+        /* Kernel observer stream: assembled console line.  The
+         * external-command service tees this into COOJA.testlog. */
+        {
+            sim_observer_event_t lev = { .kind = SIM_OBS_MOTE_LOG_LINE,
+                                         .time_ns = ns,
+                                         .mote_index = nidx, .radio_idx = -1 };
+            lev.u.log_line.line = node->line_buf;
+            lev.u.log_line.len = node->line_pos;
+            lev.u.log_line.node_id = node->id;
+            sim_runtime_emit(&sim_rt, &lev);
         }
         node->line_pos = 0;
     } else if (byte == '\r') {
@@ -2422,55 +2419,9 @@ static int ss_inject_into_node(void *user, const uint8_t *buf, int len) {
     return len;  /* unknown node type — swallow so the ring drains */
 }
 
-/* Launch external command as child process */
-static pid_t ss_launch_command(const char *command) {
-    if (!command || !command[0]) return -1;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("serial_socket: fork");
-        return -1;
-    }
-    if (pid == 0) {
-        /* Child: exec the command via shell */
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
-        perror("serial_socket: exec");
-        _exit(127);
-    }
-
-    printf("  Serial socket: launched command (pid %d): %s\n", pid, command);
-    return pid;
-}
-
-/* Check if child process has exited (non-blocking) */
-static void ss_check_child(void) {
-    if (ss_child_pid <= 0 || ss_child_exited) return;
-
-    int status;
-    pid_t res = waitpid(ss_child_pid, &status, WNOHANG);
-    if (res > 0) {
-        ss_child_exited = 1;
-        if (WIFEXITED(status)) {
-            ss_child_status = WEXITSTATUS(status);
-            printf("  Serial socket: command exited with status %d\n",
-                   ss_child_status);
-        } else {
-            ss_child_status = 1;
-            printf("  Serial socket: command killed by signal\n");
-        }
-    }
-}
-
 static void ss_cleanup(void) {
     sim_serial_bridge_stop(&serial_bridge);
-    if (ss_child_pid > 0 && !ss_child_exited) {
-        kill(ss_child_pid, SIGTERM);
-        usleep(100000);
-        kill(ss_child_pid, SIGKILL);
-        waitpid(ss_child_pid, NULL, 0);
-        ss_child_pid = -1;
-    }
-    if (cooja_testlog) { fclose(cooja_testlog); cooja_testlog = NULL; }
+    sim_external_command_stop(&external_cmd);
 }
 
 /* --- Threaded callbacks (write only to sender's own buffers) --- */
@@ -2757,6 +2708,15 @@ static void flush_pending_output(void) {
             test_check_line(nid, ts->lines[l], sim_runtime_now_ns(&sim_rt));
             if (ui_server)
                 ui_add_console_line(nidx, sim_runtime_now_ns(&sim_rt), ts->lines[l]);
+            {
+                sim_observer_event_t lev = { .kind = SIM_OBS_MOTE_LOG_LINE,
+                                             .time_ns = sim_runtime_now_ns(&sim_rt),
+                                             .mote_index = nidx, .radio_idx = -1 };
+                lev.u.log_line.line = ts->lines[l];
+                lev.u.log_line.len = (int)strlen(ts->lines[l]);
+                lev.u.log_line.node_id = nid;
+                sim_runtime_emit(&sim_rt, &lev);
+            }
         }
         ts->count = 0;
     }
@@ -3794,9 +3754,10 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * radio-medium init still happen at their existing call sites below,
      * just through the runtime fields. */
     sim_runtime_init(&sim_rt);
-    /* fd fields must be -1, not 0, before any sim_serial_bridge_active()
-     * check — a zeroed static struct would read as "listener open". */
+    /* fd/pid fields must be -1, not 0, before any _active()/_launched()
+     * check — zeroed static structs would read as live. */
     sim_serial_bridge_init(&serial_bridge);
+    sim_external_command_init(&external_cmd);
 
     static const char *firmware_paths[MAX_NODES] = { NULL };
     static char firmware_bufs[MAX_NODES][256]; /* storage for config-loaded paths */
@@ -4192,34 +4153,10 @@ sim_restart:
                                         ss_inject_into_node, NULL) < 0) {
                 fprintf(stderr, "serial_socket: failed to create listener\n");
             } else if (config.serial_socket_command[0]) {
-                /* Open COOJA.testlog in the script's directory before we
-                 * launch the script — bash drivers (test-native-nat64.sh
-                 * et al) `tail -F` or grep this file as the run unfolds.
-                 * First whitespace-separated token in the command line is
-                 * the script path. */
-                char script_path[1024];
-                snprintf(script_path, sizeof(script_path), "%s",
-                         config.serial_socket_command);
-                char *space = strchr(script_path, ' ');
-                if (space) *space = '\0';
-                char *slash = strrchr(script_path, '/');
-                if (slash) {
-                    *slash = '\0';
-                    char logpath[1100];
-                    snprintf(logpath, sizeof(logpath), "%s/COOJA.testlog",
-                             script_path);
-                    cooja_testlog = fopen(logpath, "w");
-                    if (cooja_testlog) {
-                        printf("  Serial socket: writing COOJA.testlog "
-                               "to %s\n", logpath);
-                    } else {
-                        fprintf(stderr,
-                                "serial_socket: cannot open %s: %s\n",
-                                logpath, strerror(errno));
-                    }
-                }
-                /* Launch the external command */
-                ss_child_pid = ss_launch_command(config.serial_socket_command);
+                /* COOJA.testlog tee + child launch live in the
+                 * external-command service (milestone 8.2). */
+                sim_external_command_start(&external_cmd, &sim_rt,
+                                           config.serial_socket_command);
             }
         }
     }
@@ -4383,7 +4320,7 @@ sim_restart:
 
     double t_start = get_time_ms();
 
-    int ss_has_command = (ss_child_pid > 0);
+    int ss_has_command = sim_external_command_launched(&external_cmd);
     while (sim_ns < end_ns || ui_server ||
            (sim_serial_bridge_active(&serial_bridge) && ss_has_command)) {
         /* Check for restart request from UI */
@@ -4668,10 +4605,10 @@ sim_restart:
 
         /* Serial bridge service tick + external-command child check */
         if (sim_serial_bridge_active(&serial_bridge) ||
-            (ss_child_pid > 0 && !ss_child_exited)) {
+            sim_external_command_running(&external_cmd)) {
             sim_serial_bridge_poll(&serial_bridge);
-            ss_check_child();
-            if (ss_child_exited)
+            sim_external_command_poll(&external_cmd);
+            if (sim_external_command_exited(&external_cmd))
                 break;
         }
 
@@ -5455,13 +5392,14 @@ sim_restart:
         sim_thread_pool_destroy(&thread_pool);
 
     /* Serial socket: use child exit status as test result */
-    if (ss_child_exited) {
+    if (sim_external_command_exited(&external_cmd)) {
+        int st = sim_external_command_status(&external_cmd);
         printf("\n--- Serial Socket Test Results ---\n");
-        if (ss_child_status == 0) {
+        if (st == 0) {
             printf("  TEST PASSED (external command exited 0)\n");
         } else {
-            printf("  TEST FAILED (external command exited %d)\n", ss_child_status);
-            test_exit_code = ss_child_status;
+            printf("  TEST FAILED (external command exited %d)\n", st);
+            test_exit_code = st;
         }
     }
     ss_cleanup();
