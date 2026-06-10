@@ -10,6 +10,8 @@
 
 #include "sim_event_queue.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void sim_runtime_init(sim_runtime_t *sim) {
@@ -142,5 +144,78 @@ void sim_runtime_emit(sim_runtime_t *sim, const sim_observer_event_t *ev) {
     for (int i = 0; i < count; i++) {
         sim_observer_callback_t cb = sim->observers[i].cb;
         if (cb) cb(sim->observers[i].user, ev);
+    }
+}
+
+/* ============================================================
+ * Kernel event pump — milestone 10.
+ * ============================================================ */
+
+void sim_runtime_request_stop(sim_runtime_t *sim) {
+    if (!sim) return;
+    sim->run_state = SIM_RUN_STOP_REQUESTED;
+}
+
+/* Same-time event-spin diagnostics (CSIM_TRACE_EVENT_SPIN=1): warn when
+ * the pump dispatches a very large number of events at one sim instant —
+ * the signature of a scheduling loop that never advances time. */
+static int trace_event_spin = -1;
+
+static bool trace_event_spin_enabled(void) {
+    if (trace_event_spin < 0) {
+        const char *env = getenv("CSIM_TRACE_EVENT_SPIN");
+        trace_event_spin = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return trace_event_spin != 0;
+}
+
+void sim_runtime_run_until(sim_runtime_t *sim, int64_t end_ns,
+                           sim_event_dispatch_fn dispatch, void *user) {
+    static int64_t spin_time_ns = INT64_MIN;
+    static uint64_t spin_count = 0;
+
+    if (!sim || !dispatch) return;
+    if (sim->run_state != SIM_RUN_STOP_REQUESTED)
+        sim->run_state = SIM_RUN_RUNNING;
+
+    for (;;) {
+        if (sim->run_state == SIM_RUN_STOP_REQUESTED)
+            return;
+        int64_t next_ev_time = sim_eq_peek_time(&sim->event_queue);
+        if (next_ev_time > end_ns)
+            return;  /* queue drained past the horizon (or empty) */
+
+        /* Match Cooja's simulation.getSimulationTime(): callbacks fired
+         * from the current event observe the exact event time, not the
+         * coarser outer stepping horizon.  Set before the generation
+         * check so even dropped events advance the clock. */
+        sim->now_ns = next_ev_time;
+
+        if (trace_event_spin_enabled()) {
+            if (next_ev_time == spin_time_ns) {
+                spin_count++;
+            } else {
+                spin_time_ns = next_ev_time;
+                spin_count = 1;
+            }
+            if (spin_count == 1000000ULL) {
+                sim_event_t peek = sim_eq_peek(&sim->event_queue);
+                fprintf(stderr,
+                        "  [SPIN] t=%.6f kind=%d node=%d sender=%d seq=%llu\n",
+                        (double)next_ev_time / 1e9,
+                        (int)peek.kind, peek.node_idx, peek.sender_idx,
+                        (unsigned long long)peek.seq);
+            }
+        }
+
+        sim_event_t ev = sim_eq_pop(&sim->event_queue);
+
+        /* Generation check (milestones 4/5): drop events whose target
+         * slot has been removed/rebooted since the event was queued.
+         * Untracked events (target_generation == 0) always pass. */
+        if (!sim_runtime_event_is_current(sim, &ev))
+            continue;
+
+        dispatch(user, &ev);
     }
 }

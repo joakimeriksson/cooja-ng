@@ -196,7 +196,6 @@ static uint64_t stat_msp_byte_push_2_to_1 = 0;
 static uint64_t stat_msp_byte_pop_2_to_1 = 0;
 static int trace_tsch_ack = -1;
 static int trace_tsch_ack_lines = 0;
-static int trace_event_spin = -1;
 #define TRACE_TSCH_ACK_START_NS 12000000000LL
 #define TRACE_TSCH_ACK_END_NS   16000000000LL
 #define TRACE_TSCH_ACK_MAX_LINES 2000
@@ -207,14 +206,6 @@ static bool trace_tsch_ack_enabled(void) {
         trace_tsch_ack = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return trace_tsch_ack != 0;
-}
-
-static bool trace_event_spin_enabled(void) {
-    if (trace_event_spin < 0) {
-        const char *env = getenv("CSIM_TRACE_EVENT_SPIN");
-        trace_event_spin = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
-    }
-    return trace_event_spin != 0;
 }
 
 static const char *cc2420_state_str(cc2420_radio_state_t s) {
@@ -837,6 +828,42 @@ static const mote_radio_ops_t js_radio_ops = {
     js_radio_receive_byte, native_radio_rxfifo_available,
     native_radio_rx_busy, NULL /* rx_stall */
 };
+
+/* Register node idx's radio endpoint + delivery mode on the bus.
+ * Called from init_node() after platform init, so dynamically added
+ * motes (JS ADD actions creating new nodes) register too.  Modes:
+ * chips with an rx_incoming buffer + state guard (CC2420,
+ * cc2538_rfcore, nrf54l15) take one kernel RX_BYTE event per on-air
+ * byte; nrf52840's DMA-style RADIO needs whole frames (per-byte
+ * regressed 4-node RPL convergence — see 9ebe99a investigation), so it
+ * stays BATCH; natives are fed synchronously; JS motes stage like
+ * BATCH (frame path delivers). */
+static void register_node_radio_ops(int idx) {
+    switch (nodes[idx].type) {
+    case NODE_MSP430:
+        sim_radio_bus_register(&radio_bus, idx, &msp_radio_ops, &nodes[idx],
+                               SIM_RADIO_DELIVERY_PER_BYTE);
+        break;
+    case NODE_ARM: {
+        bool nrf54l = arm_platform_nrf54l15(&nodes[idx].plat.arm) != NULL;
+        sim_radio_delivery_mode_t mode =
+            (nrf54l || arm_platform_cc2538(&nodes[idx].plat.arm) != NULL)
+            ? SIM_RADIO_DELIVERY_PER_BYTE : SIM_RADIO_DELIVERY_BATCH;
+        sim_radio_bus_register(&radio_bus, idx,
+                               nrf54l ? &arm54l_radio_ops : &arm_radio_ops,
+                               &nodes[idx], mode);
+        break;
+    }
+    case NODE_NATIVE:
+        sim_radio_bus_register(&radio_bus, idx, &native_radio_ops,
+                               &nodes[idx], SIM_RADIO_DELIVERY_SYNC);
+        break;
+    case NODE_JS:
+        sim_radio_bus_register(&radio_bus, idx, &js_radio_ops, &nodes[idx],
+                               SIM_RADIO_DELIVERY_BATCH);
+        break;
+    }
+}
 
 static int emulated_rxfifo_available(int idx) {
     if (radio_bus.ops[idx])
@@ -3077,14 +3104,23 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     }
     printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path, type_label);
 
+    int rc;
     if (node->type == NODE_MSP430)
-        return init_msp430_node(idx, firmware_path, node_id);
+        rc = init_msp430_node(idx, firmware_path, node_id);
     else if (node->type == NODE_ARM)
-        return init_arm_node(idx, firmware_path, node_id);
+        rc = init_arm_node(idx, firmware_path, node_id);
     else if (node->type == NODE_JS)
-        return init_js_node_wrapper(idx, firmware_path, node_id);
+        rc = init_js_node_wrapper(idx, firmware_path, node_id);
     else
-        return init_native_node(idx, firmware_path, node_id);
+        rc = init_native_node(idx, firmware_path, node_id);
+    if (rc != 0)
+        return rc;
+
+    /* M9.3/9.4: radio endpoint ops + delivery mode onto the bus.  Done
+     * here (not in a one-shot loop in main) so reboots and dynamically
+     * added motes stay registered. */
+    register_node_radio_ops(idx);
+    return 0;
 }
 
 /* --- Destroy node --- */
@@ -3246,6 +3282,12 @@ static int64_t tick_one_arm(int idx, int64_t sim_ns) {
 /* Track whether the last tick had a TX (for distinguishing TX yield
  * from TSCH busywait in schedule_native_wakeup). */
 static bool native_had_tx[MAX_NODES];
+
+/* GDB stub state (file scope so the kernel-pump event dispatcher can
+ * poll stubs from dispatch_mote_wakeup — M10).  gdb_node[i] is the TCP
+ * port to bind for node i, or 0 = no stub. */
+static int gdb_node[MAX_NODES];
+static gdb_stub_t gdb_stubs[MAX_NODES];
 
 static void tick_one_native(int idx, int64_t sim_ns) {
     native_node_t *nat = &nodes[idx].plat.native;
@@ -3507,6 +3549,195 @@ static int is_json_file(const char *path) {
     return dot && strcmp(dot, ".json") == 0;
 }
 
+/* ============================================================
+ * Kernel-pump event dispatch (M10).
+ *
+ * sim_runtime_run_until() owns the pop/peek ordering, the now_ns
+ * advance to each event's exact time, and the generation check;
+ * everything below is runner-side dispatch policy per event kind.
+ * Bodies move behind the mote vtable in Phase 2.
+ * ============================================================ */
+
+/* NODE_WAKEUP: tick one mote, then run the post-tick RF distribution
+ * (receiver wakeups, queued-frame drains, native assembler delivery) —
+ * the Cooja requestImmediateWakeup() + connection-finish equivalents. */
+static void dispatch_mote_wakeup(const sim_event_t *ev) {
+    int i = ev->node_idx;
+    if (i < 0 || i >= num_nodes || !node_active(i))
+        return;
+
+    int64_t ev_time = ev->time_ns;
+
+    /* Snapshot ALL nodes' state to detect frame delivery.
+     * Must be fresh for each event — ACK chains require
+     * detecting frames delivered during the current event. */
+    int rx_before[MAX_NODES];
+    int insize_before[MAX_NODES];
+    for (int r = 0; r < num_nodes; r++) {
+        if (nodes[r].type == NODE_NATIVE) {
+            rx_before[r] = nodes[r].plat.native.rx_queue.count;
+            insize_before[r] = *nodes[r].plat.native.simInSize;
+        } else {
+            rx_before[r] = 0;
+            insize_before[r] = 0;
+        }
+    }
+
+    bool sender_had_tx = false;
+    if (nodes[i].type == NODE_JS) {
+        /* Run the JS node up to event time; this fires execute()
+         * and dispatches any RX frames scheduled at <= ev_time. */
+        js_node_step_until_ns(&nodes[i].plat.js, ev_time);
+        int64_t nxt = js_node_next_wakeup_ns(&nodes[i].plat.js);
+        if (nxt < INT64_MAX)
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, nxt);
+    } else if (nodes[i].type == NODE_NATIVE) {
+        /* Single tick at event time */
+        tick_one_native(i, ev_time);
+        sender_had_tx = native_had_tx[i];
+
+        /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
+        schedule_native_wakeup(&sim_rt, i);
+    } else if (nodes[i].type == NODE_MSP430) {
+        /* MSP430 RF delivery is frame-assembled on the sender
+         * side and then delivered from the complete-frame path
+         * below. Consuming rf_pending here can split an in-flight
+         * frame and corrupt the receiver-side buffer state. */
+        ticking_node_idx = i;
+        int64_t returned_us = tick_one_msp430(i, ev_time);
+        ticking_node_idx = -1;
+        if (emu_rx_queue[i].count > 0)
+            emu_rx_queue_drain(i);
+        /* Match Cooja's MspMote.execute(t, 1): this slice
+         * schedules the mote's next normal wakeup itself. */
+        int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
+    } else {
+        /* Emulated ARM: use the same Cooja-style tick as MSP430
+         * so peripheral events are anchored to the scheduler's
+         * event time and the CPU accumulates cycle time with the
+         * MSPSim stepMicros accuracy bound. */
+
+        /* GDB stub: poll for incoming commands; if the CPU is
+         * halted at a breakpoint, skip the tick and reschedule
+         * a wakeup so we keep checking the stub at sim_ns time. */
+        if (gdb_node[i] != 0) {
+            gdb_stub_poll(&gdb_stubs[i]);
+            if (gdb_stubs[i].halted) {
+                nodes[i].plat.arm.cpu.stopping = false;
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
+                /* Continue to RF delivery / next event */
+                goto arm_tick_done;
+            }
+        }
+
+        ticking_node_idx = i;
+        int64_t returned_us = tick_one_arm(i, ev_time);
+        ticking_node_idx = -1;
+
+        /* GDB stub: a breakpoint may have fired during the tick.
+         * Clear the cpu->stopping flag set by gdb_stub_check_breakpoint
+         * so subsequent ticks (after `continue`) can run again. */
+        if (gdb_node[i] != 0) {
+            nodes[i].plat.arm.cpu.stopping = false;
+            if (gdb_stubs[i].halted) {
+                /* Reschedule sooner so we poll the stub again. */
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
+                goto arm_tick_done;
+            }
+        }
+
+        /* Drain any frames queued for this node (mirrors the
+         * MSP430 path above).  For nRF52840, the pending_rx
+         * buffer inside the radio model handles delivery when
+         * the radio was not in RX state at delivery time; this
+         * drain covers the emu_rx_queue path which fires when
+         * direct delivery was deferred to a later tick. */
+        if (emu_rx_queue[i].count > 0)
+            emu_rx_queue_drain(i);
+
+        /* Match MspMote.execute(t, 1): schedule the next normal
+         * wakeup based on the step_micros lead hint. */
+        int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
+        arm_tick_done: ;
+    }
+
+    /* RF delivery: if this node TX'd, schedule receivers
+     * and set signal strength on ALL in-range neighbors
+     * (like COOJA's signalReceptionStart + createConnections).
+     * This prevents simultaneous TX via CCA. */
+    for (int r = 0; r < num_nodes; r++) {
+        if (r == i || !node_active(r)) continue;
+        if (nodes[r].type == NODE_NATIVE) {
+            bool got_frame =
+                nodes[r].plat.native.rx_queue.count > rx_before[r] ||
+                *nodes[r].plat.native.simInSize > insize_before[r];
+            if (got_frame) {
+                *nodes[r].plat.native.simReceiving = 1;
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, r, ev_time);
+            }
+            /* Set signal strength on in-range neighbors so CCA
+             * detects the channel as busy. Only for nodes within
+             * interference range (matching COOJA's signalReceptionStart).
+             * Setting on ALL nodes causes CCA poisoning where out-of-range
+             * nodes permanently see channel busy, breaking SMRF/ESMRF. */
+            if (sender_had_tx && got_frame &&
+                nodes[r].plat.native.simSignalStrength)
+                *nodes[r].plat.native.simSignalStrength = -60;
+        }
+    }
+
+    /* Drain emulated RX queues. After delivery, step receivers
+     * with enough cycles for the FIFOP ISR + process_run() to
+     * read the RXFIFO. In Cooja, requestImmediateWakeup() gives
+     * the receiver a full tick at the current sim time. We give
+     * 1ms of CPU time (~4000 cycles at 4MHz) which covers ISR +
+     * one process_run() iteration. */
+    for (int r = 0; r < num_nodes; r++) {
+        if (!node_active(r) || nodes[r].type == NODE_NATIVE) continue;
+        emu_rx_queue_drain(r);
+    }
+
+    /* Deliver pending bytes to native assemblers */
+    for (int r = 0; r < num_nodes; r++) {
+        if (!node_active(r) || nodes[r].type != NODE_NATIVE) continue;
+        mixed_deliver_rf_bytes(r);
+    }
+
+    /* (debug stepping removed — was causing cascade on Node 1
+     * via unguarded step_node_until on Node 2) */
+}
+
+static void mixed_dispatch_event(void *user, const sim_event_t *ev) {
+    (void)user;
+    switch (ev->kind) {
+    case SIM_EV_TEST_ACTION:
+        /* Timed test-action marker (milestone 8.3b): its sole job was
+         * to make the outer time-advance land exactly on a GENERATE_MSG
+         * instant.  The JS gen-msg check + action drain in the outer
+         * loop run with sim_ns == marker time and inject the scripted
+         * serial input on the dot. */
+        return;
+    case SIM_EV_RX_BYTE:
+        /* Cooja-style per-byte delivery — same MspMoteTimeEvent pattern
+         * for MSP430 and ARM receivers. */
+        if (ev->node_idx >= 0 && ev->node_idx < num_nodes &&
+            nodes[ev->node_idx].type == NODE_ARM)
+            deliver_arm_rx_byte(ev);
+        else
+            deliver_msp430_rx_byte(ev);
+        return;
+    case SIM_EV_RADIO_TIMER:
+        /* Radio-bus RF timer (M9.5): RX-stall deadline. */
+        deliver_radio_timer(ev);
+        return;
+    case SIM_EV_NODE_WAKEUP:
+        dispatch_mote_wakeup(ev);
+        return;
+    }
+}
+
 int run_mixed_multinode_test(int argc, char **argv) {
     /* Phase 1 milestone 1: initialize the sim_runtime container.  Zeros the
      * fields and sets run_state to STOPPED.  The event-queue and
@@ -3518,6 +3749,19 @@ int run_mixed_multinode_test(int argc, char **argv) {
     sim_serial_bridge_init(&serial_bridge);
     sim_external_command_init(&external_cmd);
     sim_rt.radio_bus = &radio_bus;
+    /* M9.4: runner host hooks for the bus TX path (per-node ops register
+     * in init_node via register_node_radio_ops). */
+    {
+        static const sim_radio_bus_host_t mixed_bus_host = {
+            .user = NULL,
+            .node_active = bus_host_node_active,
+            .sync_channel = bus_host_sync_channel,
+            .on_tx_byte = bus_host_on_tx_byte,
+            .on_byte_accepted = bus_host_on_byte_accepted,
+            .frame_complete = bus_host_frame_complete,
+        };
+        sim_radio_bus_set_host(&radio_bus, &mixed_bus_host);
+    }
     /* Milestone 8.3: JS/JSON test engines consume console lines off the
      * observer stream instead of a hardwired call in the UART path. */
     sim_runtime_subscribe(&sim_rt, test_engine_observer, NULL);
@@ -3530,9 +3774,6 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int sim_ms_set = 0;  /* track if -t was given (overrides config) */
     int ui_enabled = 0;
     int ui_port = 8080;
-    /* GDB stub: optional debugger attachment per node.
-     * gdb_node[i] is the TCP port to bind for node i, or 0 = no stub. */
-    int gdb_node[MAX_NODES] = { 0 };
     int gdb_wait = 0;  /* if true, block on first connect before starting sim */
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
@@ -3678,7 +3919,6 @@ sim_restart:
 
     /* GDB stubs: bind one TCP listener per --gdb-tagged node, attach the
      * arch vtable, and optionally block until a client connects. */
-    static gdb_stub_t gdb_stubs[MAX_NODES];
     bool any_gdb = false;
     for (int i = 0; i < node_count; i++) {
         if (gdb_node[i] == 0) continue;
@@ -3902,53 +4142,6 @@ sim_restart:
     if (config_loaded && config.speed > 0)
         ui_speed_ratio = config.speed;
 
-    /* M9.3/9.4: register per-node radio endpoint ops + delivery mode on
-     * the bus, and install the runner's host hooks for the TX path.
-     *
-     * Delivery modes (see sim_radio_bus.h): chips with an rx_incoming
-     * buffer + state guard (CC2420, cc2538_rfcore, nrf54l15) take one
-     * kernel RX_BYTE event per on-air byte; nrf52840's DMA-style RADIO
-     * needs whole frames (per-byte regressed 4-node RPL convergence —
-     * see 9ebe99a investigation), so it stays BATCH; natives are fed
-     * synchronously; JS motes stage like BATCH (frame path delivers). */
-    {
-        static const sim_radio_bus_host_t mixed_bus_host = {
-            .user = NULL,
-            .node_active = bus_host_node_active,
-            .sync_channel = bus_host_sync_channel,
-            .on_tx_byte = bus_host_on_tx_byte,
-            .on_byte_accepted = bus_host_on_byte_accepted,
-            .frame_complete = bus_host_frame_complete,
-        };
-        sim_radio_bus_set_host(&radio_bus, &mixed_bus_host);
-    }
-    for (int i = 0; i < node_count; i++) {
-        switch (nodes[i].type) {
-        case NODE_MSP430:
-            sim_radio_bus_register(&radio_bus, i, &msp_radio_ops, &nodes[i],
-                                   SIM_RADIO_DELIVERY_PER_BYTE);
-            break;
-        case NODE_ARM: {
-            bool nrf54l = arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL;
-            sim_radio_delivery_mode_t mode =
-                (nrf54l || arm_platform_cc2538(&nodes[i].plat.arm) != NULL)
-                ? SIM_RADIO_DELIVERY_PER_BYTE : SIM_RADIO_DELIVERY_BATCH;
-            sim_radio_bus_register(&radio_bus, i,
-                                   nrf54l ? &arm54l_radio_ops : &arm_radio_ops,
-                                   &nodes[i], mode);
-            break;
-        }
-        case NODE_NATIVE:
-            sim_radio_bus_register(&radio_bus, i, &native_radio_ops,
-                                   &nodes[i], SIM_RADIO_DELIVERY_SYNC);
-            break;
-        case NODE_JS:
-            sim_radio_bus_register(&radio_bus, i, &js_radio_ops, &nodes[i],
-                                   SIM_RADIO_DELIVERY_BATCH);
-            break;
-        }
-    }
-
     /* Set up serial socket server for border-router tests */
     if (config_loaded && config.has_serial_socket) {
         /* Find the node index for the bridged node */
@@ -4115,8 +4308,6 @@ sim_restart:
     int64_t end_ns = sim_ns + total_ns;
     int64_t progress_interval = total_ns / 10;
     int64_t next_progress = sim_ns + progress_interval;
-    int64_t spin_trace_time_ns = INT64_MIN;
-    uint64_t spin_trace_count = 0;
     int64_t ui_interval_ns = 100LL * MS_TO_NS;  /* 100ms sim time between UI updates */
     int64_t next_ui_ns = sim_ns + ui_interval_ns;
 
@@ -4367,6 +4558,7 @@ sim_restart:
                             nodes[found].id = act->node;
                             if (init_node(found, fw, act->node) == 0) {
                                 node_count++;
+                                num_nodes = node_count;
                                 radio_medium.node_count = node_count;
                                 if (act->x != 0.0 || act->y != 0.0)
                                     radio_medium_set_position(&radio_medium, found, act->x, act->y);
@@ -4486,224 +4678,16 @@ sim_restart:
 
             t_phase = get_time_ms();
 
-            /* Process events up to sim_ns. Single Cooja-style queue holds
-             * both NODE_WAKEUP and RX_BYTE entries; same-time ordering is
-             * the natural FIFO of (time, seq). */
-            while (1) {
-                int64_t next_ev_time = sim_eq_peek_time(&sim_eq);
-                if (next_ev_time > sim_ns)
-                    break;
-                /* Match Cooja's simulation.getSimulationTime(): callbacks
-                 * fired from the current event observe the exact event time,
-                 * not the coarser outer stepping horizon. */
-                sim_rt.now_ns = next_ev_time;
-                if (trace_event_spin_enabled()) {
-                    if (next_ev_time == spin_trace_time_ns) {
-                        spin_trace_count++;
-                    } else {
-                        spin_trace_time_ns = next_ev_time;
-                        spin_trace_count = 1;
-                    }
-                    if (spin_trace_count == 1000000ULL) {
-                        sim_event_t peek = sim_eq_peek(&sim_eq);
-                        fprintf(stderr,
-                                "  [SPIN] t=%.6f kind=%d node=%d sender=%d seq=%llu\n",
-                                (double)next_ev_time / 1e9,
-                                (int)peek.kind, peek.node_idx, peek.sender_idx,
-                                (unsigned long long)peek.seq);
-                    }
-                }
-                /* Native channels are now sampled inline at every byte/
-                 * frame delivery site (sync_native_node_channel), so the
-                 * old per-event "snapshot all natives" loop is obsolete.
-                 * Inline sync catches TSCH-style mid-tick hops at the
-                 * exact moment the medium consults the channel — no race
-                 * window between sync and filter. */
-                channels_dirty = false;
-
-                sim_event_t ev = sim_eq_pop(&sim_eq);
-
-                /* Milestone 4/5 generation check: drop events whose target
-                 * slot has been removed/rebooted since the event was queued.
-                 * Untracked events (target_generation == 0) are always
-                 * allowed through — see sim_runtime_event_is_current. */
-                if (!sim_runtime_event_is_current(&sim_rt, &ev))
-                    continue;
-
-                /* Timed test-action marker (milestone 8.3b): its sole
-                 * job was to make the time-advance land exactly on a
-                 * GENERATE_MSG instant.  The JS gen-msg check + action
-                 * drain later in this outer iteration runs with
-                 * sim_ns == marker time and injects the scripted
-                 * serial input on the dot. */
-                if (ev.kind == SIM_EV_TEST_ACTION)
-                    continue;
-
-                /* RX byte deliveries: dispatch to receiver chip and continue.
-                 * Cooja-style per-byte delivery — same MspMoteTimeEvent
-                 * pattern for MSP430 and ARM receivers. */
-                if (ev.kind == SIM_EV_RX_BYTE) {
-                    if (ev.node_idx >= 0 && ev.node_idx < node_count &&
-                        nodes[ev.node_idx].type == NODE_ARM)
-                        deliver_arm_rx_byte(&ev);
-                    else
-                        deliver_msp430_rx_byte(&ev);
-                    continue;
-                }
-
-                /* Radio-bus RF timer (M9.5): RX-stall deadline. */
-                if (ev.kind == SIM_EV_RADIO_TIMER) {
-                    deliver_radio_timer(&ev);
-                    continue;
-                }
-
-                /* NODE_WAKEUP: tick one mote. */
-                int i = ev.node_idx;
-                if (i < 0 || i >= node_count || !node_active(i))
-                    continue;
-
-                int64_t ev_time = ev.time_ns;
-
-                /* Snapshot ALL nodes' state to detect frame delivery.
-                 * Must be fresh for each event — ACK chains require
-                 * detecting frames delivered during the current event. */
-                int rx_before[MAX_NODES];
-                int insize_before[MAX_NODES];
-                for (int r = 0; r < node_count; r++) {
-                    if (nodes[r].type == NODE_NATIVE) {
-                        rx_before[r] = nodes[r].plat.native.rx_queue.count;
-                        insize_before[r] = *nodes[r].plat.native.simInSize;
-                    } else {
-                        rx_before[r] = 0;
-                        insize_before[r] = 0;
-                    }
-                }
-
-                bool sender_had_tx = false;
-                if (nodes[i].type == NODE_JS) {
-                    /* Run the JS node up to event time; this fires execute()
-                     * and dispatches any RX frames scheduled at <= ev_time. */
-                    js_node_step_until_ns(&nodes[i].plat.js, ev_time);
-                    int64_t nxt = js_node_next_wakeup_ns(&nodes[i].plat.js);
-                    if (nxt < INT64_MAX)
-                        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, nxt);
-                } else if (nodes[i].type == NODE_NATIVE) {
-                    /* Single tick at event time */
-                    tick_one_native(i, ev_time);
-                    sender_had_tx = native_had_tx[i];
-
-                    /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
-                    schedule_native_wakeup(&sim_rt, i);
-                } else if (nodes[i].type == NODE_MSP430) {
-                    /* MSP430 RF delivery is frame-assembled on the sender
-                     * side and then delivered from the complete-frame path
-                     * below. Consuming rf_pending here can split an in-flight
-                     * frame and corrupt the receiver-side buffer state. */
-                    ticking_node_idx = i;
-                    int64_t returned_us = tick_one_msp430(i, ev_time);
-                    ticking_node_idx = -1;
-                    if (emu_rx_queue[i].count > 0)
-                        emu_rx_queue_drain(i);
-                    /* Match Cooja's MspMote.execute(t, 1): this slice
-                     * schedules the mote's next normal wakeup itself. */
-                    int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
-                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
-                } else {
-                    /* Emulated ARM: use the same Cooja-style tick as MSP430
-                     * so peripheral events are anchored to the scheduler's
-                     * event time and the CPU accumulates cycle time with the
-                     * MSPSim stepMicros accuracy bound. */
-
-                    /* GDB stub: poll for incoming commands; if the CPU is
-                     * halted at a breakpoint, skip the tick and reschedule
-                     * a wakeup so we keep checking the stub at sim_ns time. */
-                    if (gdb_node[i] != 0) {
-                        gdb_stub_poll(&gdb_stubs[i]);
-                        if (gdb_stubs[i].halted) {
-                            nodes[i].plat.arm.cpu.stopping = false;
-                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
-                            /* Continue to RF delivery / next event */
-                            goto arm_tick_done;
-                        }
-                    }
-
-                    ticking_node_idx = i;
-                    int64_t returned_us = tick_one_arm(i, ev_time);
-                    ticking_node_idx = -1;
-
-                    /* GDB stub: a breakpoint may have fired during the tick.
-                     * Clear the cpu->stopping flag set by gdb_stub_check_breakpoint
-                     * so subsequent ticks (after `continue`) can run again. */
-                    if (gdb_node[i] != 0) {
-                        nodes[i].plat.arm.cpu.stopping = false;
-                        if (gdb_stubs[i].halted) {
-                            /* Reschedule sooner so we poll the stub again. */
-                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
-                            goto arm_tick_done;
-                        }
-                    }
-
-                    /* Drain any frames queued for this node (mirrors the
-                     * MSP430 path above).  For nRF52840, the pending_rx
-                     * buffer inside the radio model handles delivery when
-                     * the radio was not in RX state at delivery time; this
-                     * drain covers the emu_rx_queue path which fires when
-                     * direct delivery was deferred to a later tick. */
-                    if (emu_rx_queue[i].count > 0)
-                        emu_rx_queue_drain(i);
-
-                    /* Match MspMote.execute(t, 1): schedule the next normal
-                     * wakeup based on the step_micros lead hint. */
-                    int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
-                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
-                    arm_tick_done: ;
-                }
-
-                /* RF delivery: if this node TX'd, schedule receivers
-                 * and set signal strength on ALL in-range neighbors
-                 * (like COOJA's signalReceptionStart + createConnections).
-                 * This prevents simultaneous TX via CCA. */
-                for (int r = 0; r < node_count; r++) {
-                    if (r == i || !node_active(r)) continue;
-                    if (nodes[r].type == NODE_NATIVE) {
-                        bool got_frame =
-                            nodes[r].plat.native.rx_queue.count > rx_before[r] ||
-                            *nodes[r].plat.native.simInSize > insize_before[r];
-                        if (got_frame) {
-                            *nodes[r].plat.native.simReceiving = 1;
-                            sim_schedule_mote_wakeup_if_earlier(&sim_rt, r, ev_time);
-                        }
-                        /* Set signal strength on in-range neighbors so CCA
-                         * detects the channel as busy. Only for nodes within
-                         * interference range (matching COOJA's signalReceptionStart).
-                         * Setting on ALL nodes causes CCA poisoning where out-of-range
-                         * nodes permanently see channel busy, breaking SMRF/ESMRF. */
-                        if (sender_had_tx && got_frame &&
-                            nodes[r].plat.native.simSignalStrength)
-                            *nodes[r].plat.native.simSignalStrength = -60;
-                    }
-                }
-
-                /* Drain emulated RX queues. After delivery, step receivers
-                 * with enough cycles for the FIFOP ISR + process_run() to
-                 * read the RXFIFO. In Cooja, requestImmediateWakeup() gives
-                 * the receiver a full tick at the current sim time. We give
-                 * 1ms of CPU time (~4000 cycles at 4MHz) which covers ISR +
-                 * one process_run() iteration. */
-                for (int r = 0; r < node_count; r++) {
-                    if (!node_active(r) || nodes[r].type == NODE_NATIVE) continue;
-                    emu_rx_queue_drain(r);
-                }
-
-                /* Deliver pending bytes to native assemblers */
-                for (int r = 0; r < node_count; r++) {
-                    if (!node_active(r) || nodes[r].type != NODE_NATIVE) continue;
-                    mixed_deliver_rf_bytes(r);
-                }
-
-                /* (debug stepping removed — was causing cascade on Node 1
-                 * via unguarded step_node_until on Node 2) */
-            }
+            /* Kernel event pump (milestone 10): pops events with
+             * time <= sim_ns in (time, seq) order, advances now_ns to
+             * each event's exact time (Cooja getSimulationTime()
+             * semantics), drops stale-generation events, and dispatches
+             * through mixed_dispatch_event.  Same-time-spin diagnostics
+             * (CSIM_TRACE_EVENT_SPIN) live in the kernel now. */
+            sim_runtime_run_until(&sim_rt, sim_ns, mixed_dispatch_event,
+                                  NULL);
+            if (sim_runtime_stop_requested(&sim_rt))
+                break;
 
             time_step += get_time_ms() - t_phase;
         }

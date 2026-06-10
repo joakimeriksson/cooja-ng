@@ -174,6 +174,42 @@ void sim_runtime_unsubscribe(sim_runtime_t *sim, int handle);
  * call returns before the event goes out of scope. */
 void sim_runtime_emit(sim_runtime_t *sim, const sim_observer_event_t *ev);
 
+/* ============================================================
+ * Kernel event pump — milestone 10.
+ *
+ * sim_runtime_run_until() is the deterministic core loop (§3.7 of the
+ * refactor plan): it pops events with time_ns <= end_ns in (time, seq)
+ * order, advances now_ns to each event's exact time *before* popping
+ * (callbacks observe the event time, matching Cooja's
+ * getSimulationTime()), drops stale-generation events, and hands each
+ * surviving event to `dispatch`.
+ *
+ * The runner still owns the outer horizon policy (UI pacing, service
+ * polls, timed test actions) and calls the pump once per outer slice.
+ * Event dispatch bodies stay runner-side until the Phase 2 mote vtable
+ * exists; `dispatch` is that seam.
+ *
+ * On return, now_ns is left at the last dispatched event's time (or
+ * unchanged if no event was due) — the caller advances it to its outer
+ * horizon as before.  Honors sim_runtime_request_stop(): the pump
+ * returns early and run_state stays SIM_RUN_STOP_REQUESTED so the
+ * caller can break its outer loop.
+ * ============================================================ */
+
+typedef void (*sim_event_dispatch_fn)(void *user, const sim_event_t *ev);
+
+void sim_runtime_run_until(sim_runtime_t *sim, int64_t end_ns,
+                           sim_event_dispatch_fn dispatch, void *user);
+
+/* Request a graceful stop.  Safe from observer callbacks (the documented
+ * alternative to re-entering kernel dispatch APIs): the pump finishes
+ * the current event and returns. */
+void sim_runtime_request_stop(sim_runtime_t *sim);
+
+static inline bool sim_runtime_stop_requested(const sim_runtime_t *sim) {
+    return sim->run_state == SIM_RUN_STOP_REQUESTED;
+}
+
 #ifdef __cplusplus
 }
 #endif
