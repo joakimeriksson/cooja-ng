@@ -822,13 +822,20 @@ static void sim_test_check_line(int node_id, const char *line, int64_t sim_ns) {
     }
 }
 
-/* Feed a console line to whichever test engine is active */
-static void test_check_line(int node_id, const char *line, int64_t sim_ns) {
+/* Feed a console line to whichever test engine is active.  Subscribed
+ * to the kernel observer stream (milestone 8.3) — both line-assembly
+ * sites emit SIM_OBS_MOTE_LOG_LINE and this adapter fans the line into
+ * the JS engine and the JSON step/validator checker. */
+static void test_engine_observer(void *user, const sim_observer_event_t *ev) {
+    (void)user;
+    if (ev->kind != SIM_OBS_MOTE_LOG_LINE) return;
     if (active_js_engine) {
-        js_test_feed_line(active_js_engine, line, node_id, sim_ns / 1000);
+        js_test_feed_line(active_js_engine, ev->u.log_line.line,
+                          ev->u.log_line.node_id, ev->time_ns / 1000);
     }
     if (active_test) {
-        sim_test_check_line(node_id, line, sim_ns);
+        sim_test_check_line(ev->u.log_line.node_id, ev->u.log_line.line,
+                            ev->time_ns);
     }
 }
 
@@ -2278,7 +2285,7 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
         if (verbose)
             printf("  %7.3f [Node %d/%s] %s\n", (double)ns / 1e9,
                    node->id, node_type_str(nidx), node->line_buf);
-        test_check_line(node->id, node->line_buf, ns);
+        /* test engines receive this line via test_engine_observer */
         if (ui_server)
             ui_add_console_line(nidx, ns, node->line_buf);
         /* Kernel observer stream: assembled console line.  The
@@ -2705,7 +2712,7 @@ static void flush_pending_output(void) {
             if (verbose)
                 printf("  %7.3f [Node %d/%s] %s\n", (double)sim_runtime_now_ns(&sim_rt) / 1e9,
                        nid, node_type_str(nidx), ts->lines[l]);
-            test_check_line(nid, ts->lines[l], sim_runtime_now_ns(&sim_rt));
+            /* test engines receive this line via test_engine_observer */
             if (ui_server)
                 ui_add_console_line(nidx, sim_runtime_now_ns(&sim_rt), ts->lines[l]);
             {
@@ -3758,6 +3765,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * check — zeroed static structs would read as live. */
     sim_serial_bridge_init(&serial_bridge);
     sim_external_command_init(&external_cmd);
+    /* Milestone 8.3: JS/JSON test engines consume console lines off the
+     * observer stream instead of a hardwired call in the UART path. */
+    sim_runtime_subscribe(&sim_rt, test_engine_observer, NULL);
 
     static const char *firmware_paths[MAX_NODES] = { NULL };
     static char firmware_bufs[MAX_NODES][256]; /* storage for config-loaded paths */
