@@ -14,9 +14,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "radio_medium.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+struct sim_runtime;
 
 #define SIM_RADIO_BUS_MAX_NODES 128
 
@@ -105,10 +109,63 @@ typedef struct mote_radio_ops {
     bool (*rx_busy)(void *mote);
 } mote_radio_ops_t;
 
+/* How TX bytes reach a registered receiver (M9.4).  Chosen by the runner
+ * at registration time from platform knowledge:
+ *   SYNC     — native (Cooja-protocol) motes: feed receive_byte
+ *              synchronously from the dispatch loop (frame assembly
+ *              happens mote-side).
+ *   PER_BYTE — chips with an rx_incoming buffer + state guard (CC2420,
+ *              cc2538_rfcore, nrf54l15): one SIM_EV_RX_BYTE kernel event
+ *              per on-air byte at its air time.
+ *   BATCH    — chips that need whole frames (nrf52840's DMA-style RADIO
+ *              writes straight to PACKETPTR; per-byte regressed 4-node
+ *              RPL convergence): stage bytes in rf_pending[], the host's
+ *              frame_complete hook delivers the assembled frame. */
+typedef enum sim_radio_delivery_mode {
+    SIM_RADIO_DELIVERY_NONE = 0,
+    SIM_RADIO_DELIVERY_SYNC,
+    SIM_RADIO_DELIVERY_PER_BYTE,
+    SIM_RADIO_DELIVERY_BATCH,
+} sim_radio_delivery_mode_t;
+
+/* Host (runner) hooks the TX path calls out to (M9.4).  These cover the
+ * pieces that stay runner-side until Phase 2: node lifecycle, native
+ * channel pulls, debug stats, and the frame-complete delivery machinery
+ * (which mini-steps receivers — forbidden inside the bus per §3.9).
+ * Optional hooks may be NULL; node_active and frame_complete are
+ * required for a functional bus. */
+typedef struct sim_radio_bus_host {
+    void *user;
+    /* False while a node hasn't reached its startup-delay time (no RF). */
+    bool (*node_active)(void *user, int idx);
+    /* Pull a native mote's channel into the medium before filtering
+     * (chip motes push synchronously through their FSCTRL callbacks). */
+    void (*sync_channel)(void *user, int idx);
+    /* Optional: one call per TX byte before dispatch.  depth > 0 means
+     * the byte re-entered from a receiver's auto-ACK. */
+    void (*on_tx_byte)(void *user, int sender, uint8_t byte,
+                       int64_t byte_time_ns, int depth);
+    /* Optional: one call per (sender, receiver) byte the medium accepted
+     * for a non-SYNC receiver (debug stats/traces). */
+    void (*on_byte_accepted)(void *user, int sender, int receiver,
+                             uint8_t byte, int depth);
+    /* The sender's frame assembler completed a frame: deliver staged
+     * rf_pending[] frames, run collision/FIFO policy, flush auto-ACKs.
+     * Runs with the bus's tx_depth already raised, so chip TX callbacks
+     * fired from inside (auto-ACKs) re-enter sim_radio_bus_tx_byte as
+     * depth > 0 and are staged, not re-dispatched as frames. */
+    void (*frame_complete)(void *user, int sender, int sender_radio,
+                           int64_t byte_time_ns, int64_t sender_byte_ns);
+} sim_radio_bus_host_t;
+
 /* The bus: all RF routing state, one instance per runtime. */
 typedef struct sim_radio_bus {
     const mote_radio_ops_t *ops[SIM_RADIO_BUS_MAX_NODES];
     void                   *mote[SIM_RADIO_BUS_MAX_NODES];
+    sim_radio_delivery_mode_t delivery[SIM_RADIO_BUS_MAX_NODES];
+    int                node_count;   /* registration high-water mark + 1   */
+    int                tx_depth;     /* >0: inside frame_complete delivery */
+    sim_radio_bus_host_t host;       /* runner hooks (M9.4)                */
     rf_buffer_t        rf_pending[SIM_RADIO_BUS_MAX_NODES];   /* per-receiver byte staging   */
     tx_frame_asm_t     tx_asm[SIM_RADIO_BUS_MAX_NODES];       /* per-sender frame assembler  */
     tx_frame_capture_t tx_cap[SIM_RADIO_BUS_MAX_NODES];       /* sender-side frame capture   */
@@ -116,6 +173,42 @@ typedef struct sim_radio_bus {
     int64_t            emu_rx_end_ns[SIM_RADIO_BUS_MAX_NODES];/* last RX end per receiver    */
     rf_outgoing_t      rf_outgoing[SIM_RADIO_BUS_MAX_NODES];  /* threaded-mode TX staging    */
 } sim_radio_bus_t;
+
+/* Register node idx's radio endpoint + delivery mode.  Call once per
+ * node after platform init, before the main loop. */
+void sim_radio_bus_register(sim_radio_bus_t *bus, int idx,
+                            const mote_radio_ops_t *ops, void *mote,
+                            sim_radio_delivery_mode_t mode);
+
+/* Install the runner's host hooks (copied by value). */
+void sim_radio_bus_set_host(sim_radio_bus_t *bus,
+                            const sim_radio_bus_host_t *host);
+
+/* TX entry point (M9.4, §3.9): chips/native/JS senders emit each on-air
+ * byte here.  The bus arms the sender's byte clock, captures the byte,
+ * dispatches it to every receiver the medium accepts (scheduling
+ * SIM_EV_RX_BYTE / staging in rf_pending / feeding natives per the
+ * receiver's delivery mode), feeds the sender's frame assembler, and
+ * invokes the host's frame_complete hook when a frame ends.  Re-entrant
+ * calls (auto-ACK bytes emitted during frame_complete) are dispatched
+ * to receivers but never fed to the assembler — the outer
+ * frame_complete flushes them. */
+void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
+                           int sender_idx, int sender_radio, uint8_t byte);
+
+/* Per-sender on-air frame assembler.  feed() returns true when `byte`
+ * completes a frame; sticky fields (subghz, expected_len,
+ * subghz_phr_len) stay readable until the next frame's first preamble
+ * byte. */
+bool sim_radio_bus_asm_feed(tx_frame_asm_t *a, uint8_t byte);
+void sim_radio_bus_asm_reset(tx_frame_asm_t *a);
+
+/* Receiver radio slot matching a sender's (node, radio) emission per
+ * the medium's spectrum registration, or -1 to drop (no slot on the
+ * receiver shares the sender's spectrum). */
+int sim_radio_bus_pick_receiver_radio(const radio_medium_t *medium,
+                                      int sender_idx, int sender_radio,
+                                      int receiver_idx);
 
 /* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
  * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. Using the

@@ -83,123 +83,8 @@ typedef struct {
 
 /* rf_buffer_t / tx_frame_asm_t / tx_frame_capture_t live in sim_radio_bus.h (M9.1) */
 
-/* Returns true when a complete frame has been assembled */
-static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
-    switch (a->state) {
-    case TX_ASM_PREAMBLE:
-        /* Look for either preamble pattern. */
-        a->sync_match = (a->sync_match << 8) | byte;
-        if (a->sync_match == RADIO_FRAME_802154G_SYNC_WORD) {
-            /* CC1200 sync word — next 1 or 2 bytes are the PHR (we
-             * disambiguate inside TX_ASM_SUBGHZ_PHR). */
-            a->state = TX_ASM_SUBGHZ_PHR;
-            a->subghz = true;
-            a->subghz_phr_len = 0;
-            a->phr_lo = -1;
-            a->payload_count = 0;
-            return false;
-        }
-        if (byte == 0x00) {
-            a->zero_count++;
-        } else if (a->zero_count >= 4 && byte == 0x7A) {
-            a->state = TX_ASM_LENGTH;
-            a->subghz = false;
-        } else {
-            a->zero_count = 0;
-        }
-        return false;
-
-    case TX_ASM_LENGTH:
-        a->expected_len = byte;
-        if (byte < 3 || byte > 127) {
-            /* Invalid length, reset */
-            a->state = TX_ASM_PREAMBLE;
-            a->zero_count = 0;
-            return false;
-        }
-        a->state = TX_ASM_PAYLOAD;
-        a->payload_count = 0;
-        return false;
-
-    case TX_ASM_SUBGHZ_PHR:
-        /* CC1200 PHR is 1 or 2 bytes depending on the firmware's
-         * configuration of PKT_CFG2 bit 5 (FG_MODE / 802.15.4g). The
-         * test runner doesn't have a back-channel to that register, so
-         * we sniff: if the first PHR byte makes a sensible 1-byte length
-         * (3..200) we lock into 1-byte mode; otherwise we treat it as
-         * the upper 3 bits of a 2-byte 802.15.4g PHR. This works
-         * because the firmwares we ship use either standard mode (PHR=1)
-         * or 802.15.4g mode (PHR=2) — never both — and the 802.15.4g
-         * upper byte's low-3-bits-as-length-high yields values like 0,
-         * 1, or 2 (well under 200), so a phra of e.g. 0x10 (CRC bit + 0)
-         * for a small 802.15.4g frame still parses correctly via the
-         * 1-byte path even though it's 2-byte on the wire. The
-         * follow-up PHR-byte path catches the few high-length cases. */
-        if (a->phr_lo < 0) {
-            /* First PHR byte. */
-            uint8_t len = byte;
-            if (len >= 3 && len <= 200) {
-                a->expected_len = len;
-                a->subghz_phr_len = 1;
-                a->state = TX_ASM_PAYLOAD;
-                a->payload_count = 0;
-                return false;
-            }
-            /* Looks like 802.15.4g: upper byte. */
-            a->phr_lo = byte & 0x07;
-            a->subghz_phr_len = 2;
-        } else {
-            /* PHRB byte: low 8 bits */
-            a->expected_len = (a->phr_lo << 8) | byte;
-            if (a->expected_len < 3 || a->expected_len > 200) {
-                a->state = TX_ASM_PREAMBLE;
-                a->zero_count = 0;
-                a->sync_match = 0;
-                a->subghz = false;
-                return false;
-            }
-            a->state = TX_ASM_PAYLOAD;
-            a->payload_count = 0;
-        }
-        return false;
-
-    case TX_ASM_PAYLOAD:
-        a->payload_count++;
-        /* For 802.15.4 (CC2420 / cc2538_rfcore) the length byte's value
-         * already includes the 2 FCS bytes the chip auto-appends, so
-         * frame-complete fires on byte expected_len. For CC1200 the
-         * length byte counts payload only and the chip appends 2 extra
-         * CRC bytes after the payload — we wait for those too so the
-         * receiver-side dispatch's total_air_bytes count includes them. */
-        int payload_target = a->expected_len + (a->subghz ? 2 : 0);
-        if (a->payload_count >= payload_target) {
-            /* Frame complete — reset only the bytes-on-wire tracking
-             * (state + sliding sync register + zero counter); leave
-             * subghz / subghz_phr_len / expected_len intact so the caller
-             * can read them to compute total_air_bytes. They get cleared
-             * the next time a fresh frame's first preamble byte arrives. */
-            a->state = TX_ASM_PREAMBLE;
-            a->zero_count = 0;
-            a->sync_match = 0;
-            a->phr_lo = -1;
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
-
-static void tx_frame_asm_reset(tx_frame_asm_t *a) {
-    a->state = TX_ASM_PREAMBLE;
-    a->zero_count = 0;
-    a->sync_match = 0;
-    a->expected_len = 0;
-    a->payload_count = 0;
-    a->phr_lo = -1;
-    a->subghz = false;
-    a->subghz_phr_len = 0;
-    a->first_byte_ns = 0;
-}
+/* tx frame assembler (sim_radio_bus_asm_feed/reset) lives in
+ * src/sim/sim_radio_bus.c (M9.4) */
 
 /* emu_rx_frame_t / emu_rx_queue_t live in sim_radio_bus.h (M9.1) */
 
@@ -911,6 +796,33 @@ static const mote_radio_ops_t arm_radio_ops = {
     arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy
 };
 
+/* Native (Cooja-protocol) motes: SYNC delivery — the bus feeds each
+ * accepted on-air byte to the mote's RX frame assembler.  rxfifo 0 / not
+ * busy preserve the pre-M9.4 behaviour of the frame paths, which skip
+ * natives explicitly. */
+static void native_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
+    (void)rssi;
+    mixed_node_t *node = (mixed_node_t *)m;
+    native_rx_assembler_feed(&node->plat.native, byte);
+}
+static int native_radio_rxfifo_available(void *m) { (void)m; return 0; }
+static bool native_radio_rx_busy(void *m) { (void)m; return false; }
+static const mote_radio_ops_t native_radio_ops = {
+    native_radio_receive_byte, native_radio_rxfifo_available,
+    native_radio_rx_busy
+};
+
+/* JS motes: BATCH delivery so the bus stages bytes in rf_pending[] like
+ * before M9.4; receive_byte is a stub because JS motes consume RF at
+ * frame level (mixed_rf_frame_handler), never via byte delivery. */
+static void js_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
+    (void)m; (void)byte; (void)rssi;
+}
+static const mote_radio_ops_t js_radio_ops = {
+    js_radio_receive_byte, native_radio_rxfifo_available,
+    native_radio_rx_busy
+};
+
 static int emulated_rxfifo_available(int idx) {
     if (radio_bus.ops[idx])
         return radio_bus.ops[idx]->rxfifo_available(radio_bus.mote[idx]);
@@ -1387,41 +1299,13 @@ static bool mixed_cc1200_channel_busy(void *user_data) {
  * Re-entrancy guard: auto-ACK bytes from synchronous delivery re-enter
  * this handler. Those bytes are buffered and flushed after the outer
  * delivery completes to prevent byte interleaving.
- */
-static int rf_tx_depth = 0;
-
-/*
- * Pick the receiver radio slot that should match a given sender's
- * (node, radio_idx) emission.  Encodes the radio_pair_match
- * spectrum-gate logic locally so the per-byte / per-frame loop in
- * mixed_rf_tx_handler_radio knows which receiver_radio to dispatch to,
- * keeping the medium API call count at one per receiver (no double-
- * tracking against slots that aren't going to match).
  *
- * Returns the receiver radio_idx, or -1 if no slot matches (drop).
- */
-static inline int pick_receiver_radio(int sender_idx, int sender_radio,
-                                       int receiver_idx) {
-    radio_spectrum_t s_spec =
-        radio_medium.nodes[sender_idx].radios[sender_radio].spectrum;
-    if (s_spec == RADIO_SPECTRUM_NONE) {
-        /* Sender slot unregistered: legacy "unknown sender allows
-         * everything" — target the receiver's slot 0 (the legacy
-         * single-radio slot). */
-        return 0;
-    }
-    /* Sender registered: find the receiver slot with matching spectrum. */
-    for (int r = 0; r < RADIO_MEDIUM_MAX_RADIOS_PER_NODE; r++) {
-        if (radio_medium.nodes[receiver_idx].radios[r].spectrum == s_spec)
-            return r;
-    }
-    /* No matching spectrum on receiver. Slot 0 unregistered keeps the
-     * legacy "receiver-unknown allows everything" behaviour for
-     * platforms that never call register_radio. */
-    if (radio_medium.nodes[receiver_idx].radios[0].spectrum == RADIO_SPECTRUM_NONE)
-        return 0;
-    return -1;
-}
+ * M9.4: the per-byte path (byte clock, capture, frame assembly,
+ * medium-filtered dispatch, re-entrancy depth) lives in
+ * sim_radio_bus_tx_byte(); the runner provides the host hooks below —
+ * node lifecycle, native channel pulls, debug stats, and the
+ * frame-complete delivery machinery (which mini-steps receivers and so
+ * must stay outside the bus per refactor-plan §3.9). */
 
 /* Legacy entry: callers that don't carry a sender_radio (native motes,
  * JS motes, frame-to-byte conversion in mixed_js_rf_handler) treat the
@@ -1434,7 +1318,6 @@ static void mixed_rf_tx_handler(void *user_data, uint8_t byte) {
 
 static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t byte) {
     if (sender_idx < 0 || sender_idx >= num_nodes) return;
-    mixed_node_t *sender = &nodes[sender_idx];
     rf_byte_count++;
     channels_dirty = true;
     if (csim_radio_trace_enabled()) {
@@ -1448,152 +1331,63 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
      * senders push synchronously through their FSCTRL/FREQ callbacks, so
      * this only matters for native (Cooja) motes. */
     sync_native_node_channel(sender_idx);
-    /* Record first byte time for accurate TX start computation and track
-     * subsequent bytes on the sender's on-air byte clock.
-     *
-     * Fires for either preamble flavour: 0x00 (IEEE 802.15.4 2.4 GHz)
-     * or 0x55 (CC1200 802.15.4g sub-GHz). Without arming for 0x55, the
-     * per-byte schedule fell back to first_byte_ns=0 → bytes clamped
-     * to sim_now → whole frame dumped into the receiver in one batch.
-     * That short-circuited the ~16 ms real air time to ~5 ms and
-     * pushed the receiver's ACK ~10 ms ahead of the firmware-tuned
-     * CSMA_ACK_WAIT envelope. The 0x55 arm is paired with the
-     * receive-side MARC_IDLE-tolerance fix in cc1200_receive_byte
-     * (without that, bytes arriving the same sim_ns as the receiver's
-     * CSMA prepare()→SIDLE→SRX transition were silently dropped). */
-    if (tx_asm[sender_idx].state == TX_ASM_PREAMBLE &&
-        tx_asm[sender_idx].zero_count == 0 &&
-        (byte == 0x00 || byte == 0x55)) {
-        /* Match Cooja's radio callbacks: outgoing bytes are observed at the
-         * current scheduler time, not from a mote-local sim_time that may
-         * have advanced within the current execute slice. */
-        tx_asm[sender_idx].first_byte_ns = sim_runtime_now_ns(&sim_rt);
-        tx_cap[sender_idx].len = 0;
-    }
-    /* Per-sender byte period — sub-GHz CC1200 frames take 5x longer per
-     * byte than 2.4 GHz IEEE 802.15.4. Use the sender's frame profile
-     * detected by the assembler (subghz set on sync-word match). */
-    int64_t sender_byte_ns = byte_period_ns(tx_asm[sender_idx].subghz);
-    int64_t byte_time_ns = tx_asm[sender_idx].first_byte_ns +
-                           (int64_t)tx_cap[sender_idx].len * sender_byte_ns;
-    node_last_tx_ns[sender_idx] = byte_time_ns;
-    if (tx_cap[sender_idx].len < (int)sizeof(tx_cap[sender_idx].bytes))
-        tx_cap[sender_idx].bytes[tx_cap[sender_idx].len++] = byte;
+    sim_radio_bus_tx_byte(&radio_bus, &sim_rt, sender_idx, sender_radio, byte);
+}
 
-    if (rf_tx_depth > 0) {
-        /* Re-entrant call (auto-ACK from a receiver). Deliver directly
-         * for MSP430, buffer for others. */
-        if (trace_tsch_ack_enabled() && sender->type == NODE_MSP430) {
-            trace_tsch_ack_log("reentrant tx byte sender=%d state=%s byte=%02x depth=%d",
-                               nodes[sender_idx].id,
-                               cc2420_state_str(sender->plat.msp.cc2420.state),
-                               byte, rf_tx_depth);
-        }
-        for (int i = 0; i < num_nodes; i++) {
-            if (&nodes[i] == sender) continue;
-            if (!node_active(i)) continue;
-            if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
-                continue;
-            /* Native receiver: pull current channel before the medium decides. */
-            sync_native_node_channel(i);
-            int rr = pick_receiver_radio(sender_idx, sender_radio, i);
-            if (rr < 0) continue;
-            if (!radio_medium_filter_byte_radio(&radio_medium, sender_idx,
-                                                 sender_radio, i, rr, byte))
-                continue;
-            if (nodes[i].type == NODE_NATIVE) {
-                native_rx_assembler_feed(&nodes[i].plat.native, byte);
-            } else {
-                int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
-                if (nodes[i].type == NODE_MSP430) {
-                    if (trace_tsch_ack_enabled() &&
-                        sender->type == NODE_MSP430 &&
-                        nodes[sender_idx].id == 1 && nodes[i].id == 2) {
-                        trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
-                                           byte,
-                                           cc2420_state_str(nodes[i].plat.msp.cc2420.state),
-                                           (double)nodes[i].plat.msp.cpu.sim_time_ns / 1e9);
-                    }
-                    stat_msp_byte_push[i]++;
-                    if (sender_idx >= 0 && sender_idx < num_nodes &&
-                        nodes[sender_idx].id == 2 && nodes[i].id == 1)
-                        stat_msp_byte_push_2_to_1++;
-                }
-                /* Per-byte (Cooja Msp802154Radio.receiveCustomData) for
-                 * MSP430/CC2420 and ARM/cc2538_rfcore — both carry an
-                 * rx_incoming buffer + state guard.  nrf54l15 also needs
-                 * per-byte (its 50 µs RX-stall watchdog tripped on the
-                 * old batched gap — see commit 2dc7686).  nrf52840 stays
-                 * batched: its DMA-style RADIO model expects whole-frame
-                 * delivery into PACKETPTR and the per-byte path regressed
-                 * 4-node RPL convergence (no traffic ever reached the
-                 * server) — see investigation in 9ebe99a..HEAD memory. */
-                bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
-                                   (nodes[i].type == NODE_ARM &&
-                                    (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
-                                     arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL));
-                if (per_byte_ok) {
-                    int64_t bt = byte_time_ns;
-                    if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
-                    sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt);
-                } else {
-                    rf_buffer_t *buf = &rf_pending[i];
-                    if (buf->count < RF_BUF_SIZE)
-                        buf->bytes[buf->count++] = byte;
-                }
-            }
-        }
-        return;
-    }
+/* --- Radio-bus host hooks (M9.4) ----------------------------------- */
 
-    /* Outer (non-reentrant) call: deliver bytes to receivers.
-     * Match Cooja's CUSTOM_DATA_TRANSMITTED: each byte is delivered
-     * immediately to the receiver at the sender's current sim time,
-     * preceded by execute(t, 0) to sync the receiver's clock. */
-    for (int i = 0; i < num_nodes; i++) {
-        if (&nodes[i] == sender) continue;
-        if (!node_active(i)) continue;
-        if (sender->type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
-            continue;
-        /* Native receiver: pull current channel before the medium decides. */
-        sync_native_node_channel(i);
-        int rr = pick_receiver_radio(sender_idx, sender_radio, i);
-        if (rr < 0) continue;
-        if (!radio_medium_filter_byte_radio(&radio_medium, sender_idx,
-                                             sender_radio, i, rr, byte))
-            continue;
-        if (nodes[i].type == NODE_NATIVE) {
-            native_rx_assembler_feed(&nodes[i].plat.native, byte);
-        } else {
-            int8_t rssi = radio_medium_get_rssi(&radio_medium, sender_idx, i);
-            if (nodes[i].type == NODE_MSP430) {
-                stat_msp_byte_push[i]++;
-                if (sender_idx >= 0 && sender_idx < num_nodes &&
-                    nodes[sender_idx].id == 2 && nodes[i].id == 1)
-                    stat_msp_byte_push_2_to_1++;
-            }
-            /* Per-byte for chips with rx_incoming buffer; batched for
-             * chips that drop bytes outside RX. nrf52840 stays batched —
-             * see comment on the reentrant branch above (line ~1613). */
-            bool per_byte_ok = (nodes[i].type == NODE_MSP430) ||
-                               (nodes[i].type == NODE_ARM &&
-                                (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
-                                 arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL));
-            if (per_byte_ok) {
-                int64_t bt = byte_time_ns;
-                if (bt < sim_runtime_now_ns(&sim_rt)) bt = sim_runtime_now_ns(&sim_rt);
-                sim_schedule_radio_byte(&sim_rt, i, sender_idx, byte, rssi, bt);
-            } else {
-                rf_buffer_t *buf = &rf_pending[i];
-                if (buf->count < RF_BUF_SIZE)
-                    buf->bytes[buf->count++] = byte;
-            }
-        }
-    }
+static bool bus_host_node_active(void *user, int idx) {
+    (void)user;
+    return node_active(idx) != 0;
+}
 
-    /* Feed the per-sender frame assembler */
-    if (!tx_frame_asm_feed(&tx_asm[sender_idx], byte))
-        return;  /* frame not yet complete */
+static void bus_host_sync_channel(void *user, int idx) {
+    (void)user;
+    sync_native_node_channel(idx);
+}
+
+static void bus_host_on_tx_byte(void *user, int sender, uint8_t byte,
+                                int64_t byte_time_ns, int depth) {
+    (void)user;
+    node_last_tx_ns[sender] = byte_time_ns;
+    if (depth > 0 && trace_tsch_ack_enabled() &&
+        nodes[sender].type == NODE_MSP430) {
+        trace_tsch_ack_log("reentrant tx byte sender=%d state=%s byte=%02x depth=%d",
+                           nodes[sender].id,
+                           cc2420_state_str(nodes[sender].plat.msp.cc2420.state),
+                           byte, depth);
+    }
+}
+
+static void bus_host_on_byte_accepted(void *user, int sender, int receiver,
+                                      uint8_t byte, int depth) {
+    (void)user;
+    if (nodes[receiver].type != NODE_MSP430) return;
+    if (depth > 0 && trace_tsch_ack_enabled() &&
+        nodes[sender].type == NODE_MSP430 &&
+        nodes[sender].id == 1 && nodes[receiver].id == 2) {
+        trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
+                           byte,
+                           cc2420_state_str(nodes[receiver].plat.msp.cc2420.state),
+                           (double)nodes[receiver].plat.msp.cpu.sim_time_ns / 1e9);
+    }
+    stat_msp_byte_push[receiver]++;
+    if (nodes[sender].id == 2 && nodes[receiver].id == 1)
+        stat_msp_byte_push_2_to_1++;
+}
+
+/* Frame-complete hook: the sender's assembler just closed a frame.
+ * Deliver each receiver's staged rf_pending[] frame (collision + FIFO
+ * back-pressure policy), flush auto-ACKs, mark interference.  Runs with
+ * the bus's tx_depth raised, so chip TX callbacks fired from inside
+ * (auto-ACKs) re-enter the bus as depth > 0 and get staged.
+ * byte_time_ns/sender_byte_ns come from the bus's per-sender byte
+ * clock: accurate_tx_end = byte_time_ns + sender_byte_ns. */
+static void bus_host_frame_complete(void *user, int sender_idx,
+                                    int sender_radio, int64_t byte_time_ns,
+                                    int64_t sender_byte_ns) {
+    (void)user;
+    mixed_node_t *sender = &nodes[sender_idx];
 
     if (csim_radio_trace_enabled()) {
         int s_ch = radio_medium.nodes[sender_idx].radios[sender_radio].channel;
@@ -1738,7 +1532,7 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
         }
     }
 
-    rf_tx_depth++;
+    /* (bus tx_depth already raised by sim_radio_bus_tx_byte) */
     suppress_state_callback = 1;  /* explicit timeline events emitted above */
 
     /* The current sender is skipped by the receiver snapshot loop below, but
@@ -1765,7 +1559,9 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
         for (int i = 0; i < num_nodes; i++) {
             if (i == sender_idx || nodes[i].type == NODE_NATIVE || !node_active(i))
                 continue;
-            int rr = pick_receiver_radio(sender_idx, sender_radio, i);
+            int rr = sim_radio_bus_pick_receiver_radio(&radio_medium,
+                                                       sender_idx,
+                                                       sender_radio, i);
             if (rr < 0) continue;
             /* Quick non-probabilistic spectrum/channel check via per-radio
              * frame filter (UDGM dice roll is deterministic at 100% rx
@@ -1990,7 +1786,6 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
         }
     }
 
-    rf_tx_depth--;
     suppress_state_callback = 0;
 
     /* Schedule sender for wakeup so its CC2420 completes the TX->RX
@@ -2450,7 +2245,7 @@ static void distribute_rf_outgoing(void) {
                 }
 
                 /* Check if frame is complete */
-                if (tx_frame_asm_feed(&tx_asm[sender], byte)) {
+                if (sim_radio_bus_asm_feed(&tx_asm[sender], byte)) {
                     stat_rf_frames++;
                     /* Deliver or queue each emulated receiver's buffered frame */
                     for (int i = 0; i < num_nodes; i++) {
@@ -3226,7 +3021,7 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     sim_cancel_mote_events(&sim_rt, idx);
     sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
-    tx_frame_asm_reset(&tx_asm[idx]);
+    sim_radio_bus_asm_reset(&tx_asm[idx]);
 
     const char *type_label = "Native/Cooja";
     if (node->type == NODE_MSP430) {
@@ -3282,7 +3077,7 @@ static int reboot_node(int idx) {
     sim_cancel_mote_events(&sim_rt, idx);
     sim_runtime_bump_mote_generation(&sim_rt, idx);
     emu_rx_end_ns[idx] = 0;
-    tx_frame_asm_reset(&tx_asm[idx]);
+    sim_radio_bus_asm_reset(&tx_asm[idx]);
 
     /* Destroy and reinitialize.  init_node bumps generation again — fine;
      * what matters is that any events queued between this point and the
@@ -4068,16 +3863,49 @@ sim_restart:
     if (config_loaded && config.speed > 0)
         ui_speed_ratio = config.speed;
 
-    /* M9.3: register per-node radio endpoint ops on the bus.  Native/JS
-     * motes keep their bespoke frame paths (no byte-level chip model) —
-     * their slots stay NULL and the bus falls back accordingly. */
+    /* M9.3/9.4: register per-node radio endpoint ops + delivery mode on
+     * the bus, and install the runner's host hooks for the TX path.
+     *
+     * Delivery modes (see sim_radio_bus.h): chips with an rx_incoming
+     * buffer + state guard (CC2420, cc2538_rfcore, nrf54l15) take one
+     * kernel RX_BYTE event per on-air byte; nrf52840's DMA-style RADIO
+     * needs whole frames (per-byte regressed 4-node RPL convergence —
+     * see 9ebe99a investigation), so it stays BATCH; natives are fed
+     * synchronously; JS motes stage like BATCH (frame path delivers). */
+    {
+        static const sim_radio_bus_host_t mixed_bus_host = {
+            .user = NULL,
+            .node_active = bus_host_node_active,
+            .sync_channel = bus_host_sync_channel,
+            .on_tx_byte = bus_host_on_tx_byte,
+            .on_byte_accepted = bus_host_on_byte_accepted,
+            .frame_complete = bus_host_frame_complete,
+        };
+        sim_radio_bus_set_host(&radio_bus, &mixed_bus_host);
+    }
     for (int i = 0; i < node_count; i++) {
-        if (nodes[i].type == NODE_MSP430) {
-            radio_bus.ops[i] = &msp_radio_ops;
-            radio_bus.mote[i] = &nodes[i];
-        } else if (nodes[i].type == NODE_ARM) {
-            radio_bus.ops[i] = &arm_radio_ops;
-            radio_bus.mote[i] = &nodes[i];
+        switch (nodes[i].type) {
+        case NODE_MSP430:
+            sim_radio_bus_register(&radio_bus, i, &msp_radio_ops, &nodes[i],
+                                   SIM_RADIO_DELIVERY_PER_BYTE);
+            break;
+        case NODE_ARM: {
+            sim_radio_delivery_mode_t mode =
+                (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
+                 arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL)
+                ? SIM_RADIO_DELIVERY_PER_BYTE : SIM_RADIO_DELIVERY_BATCH;
+            sim_radio_bus_register(&radio_bus, i, &arm_radio_ops, &nodes[i],
+                                   mode);
+            break;
+        }
+        case NODE_NATIVE:
+            sim_radio_bus_register(&radio_bus, i, &native_radio_ops,
+                                   &nodes[i], SIM_RADIO_DELIVERY_SYNC);
+            break;
+        case NODE_JS:
+            sim_radio_bus_register(&radio_bus, i, &js_radio_ops, &nodes[i],
+                                   SIM_RADIO_DELIVERY_BATCH);
+            break;
         }
     }
 
