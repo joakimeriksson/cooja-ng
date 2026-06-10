@@ -174,6 +174,22 @@ void sim_eq_schedule_rx_byte(sim_event_queue_t *q, int node_idx, int sender_idx,
     sim_eq_schedule_rx_byte_gen(q, node_idx, sender_idx, byte, rssi, time_ns, 0u);
 }
 
+void sim_eq_schedule_test_action(sim_event_queue_t *q, int64_t time_ns) {
+    if (q->count >= SIM_EQ_MAX_EVENTS) {
+        fprintf(stderr, "WARNING: event queue full (%d events), "
+                "dropping test action\n", q->count);
+        return;
+    }
+    int i = q->count++;
+    memset(&q->heap[i], 0, sizeof(q->heap[i]));
+    q->heap[i].kind = SIM_EV_TEST_ACTION;
+    q->heap[i].node_idx = -1;
+    q->heap[i].time_ns = time_ns;
+    q->heap[i].seq = q->next_seq++;
+    /* generation 0 = untracked; not tied to any mote slot */
+    heap_sift_up(q, i);
+}
+
 sim_event_t sim_eq_pop(sim_event_queue_t *q) {
     if (q->count == 0) {
         sim_event_t empty = { .kind = SIM_EV_NODE_WAKEUP, .node_idx = -1,

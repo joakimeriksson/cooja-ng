@@ -28,6 +28,12 @@
 typedef enum {
     SIM_EV_NODE_WAKEUP = 0,
     SIM_EV_RX_BYTE     = 1,
+    /* Timed test-action marker (milestone 8.3b): pins the sequential
+     * loop's time advance to a JS GENERATE_MSG firing time so test
+     * serial input lands at the scripted instant instead of the next
+     * arbitrary iteration boundary.  node_idx = -1; no payload — the
+     * runner's per-iteration drain does the actual injection. */
+    SIM_EV_TEST_ACTION = 2,
 } sim_event_kind_t;
 
 typedef struct {
@@ -74,6 +80,10 @@ void sim_eq_schedule_if_earlier_gen(sim_event_queue_t *q, int node_idx,
 
 /* Schedule an RX byte delivery to (node_idx) at time_ns. Multiple
  * pending entries per node are allowed; never deduped. */
+/* Schedule a timed test-action marker (SIM_EV_TEST_ACTION).  Never
+ * coalesced; node_idx is -1. */
+void sim_eq_schedule_test_action(sim_event_queue_t *q, int64_t time_ns);
+
 void sim_eq_schedule_rx_byte(sim_event_queue_t *q, int node_idx, int sender_idx,
                              uint8_t byte, int8_t rssi, int64_t time_ns);
 void sim_eq_schedule_rx_byte_gen(sim_event_queue_t *q, int node_idx,

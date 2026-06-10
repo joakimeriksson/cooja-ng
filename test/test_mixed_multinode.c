@@ -4074,6 +4074,14 @@ sim_restart:
                 }
                 printf("Test: JavaScript engine (timeout=%lld ms)\n",
                        (long long)(total_ns / MS_TO_NS));
+                /* Milestone 8.3b: pin each GENERATE_MSG firing time on
+                 * the kernel event queue so the sequential loop's time
+                 * advance lands exactly on it — scripted serial input
+                 * is injected at the scripted instant, not the next
+                 * iteration boundary. */
+                for (int g = 0; g < js_engine.gen_msg_count; g++)
+                    sim_eq_schedule_test_action(&sim_eq,
+                        js_engine.gen_msgs[g].at_us * 1000LL);
             } else {
                 fprintf(stderr, "Failed to initialize JS test engine\n");
                 return 1;
@@ -4720,6 +4728,15 @@ sim_restart:
                  * Untracked events (target_generation == 0) are always
                  * allowed through — see sim_runtime_event_is_current. */
                 if (!sim_runtime_event_is_current(&sim_rt, &ev))
+                    continue;
+
+                /* Timed test-action marker (milestone 8.3b): its sole
+                 * job was to make the time-advance land exactly on a
+                 * GENERATE_MSG instant.  The JS gen-msg check + action
+                 * drain later in this outer iteration runs with
+                 * sim_ns == marker time and injects the scripted
+                 * serial input on the dot. */
+                if (ev.kind == SIM_EV_TEST_ACTION)
                     continue;
 
                 /* RX byte deliveries: dispatch to receiver chip and continue.
