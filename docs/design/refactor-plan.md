@@ -775,6 +775,12 @@ Services that need different policies (e.g. JS test engine wanting
 
 ### 3.15 Kernel extraction milestones (canonical Phase 1 task list)
 
+> **Status: all 10 milestones landed (Phase 1 complete).** M9 landed in
+> five slices (struct moves `91db750`, ops vtable `a36aa43`+`363e636`,
+> TX path `c2eca11`, RX-stall sim-time timer `580086d`); M10 is
+> `adbea53` (`sim_runtime_run_until` pump; runner dispatch seam is
+> `mixed_dispatch_event`). Next: Phase 2 (mote vtable).
+
 These 10 milestones are the canonical Phase 1 task list — §9 Phase 1 points
 back here. Land them in order, one PR per milestone where practical:
 
