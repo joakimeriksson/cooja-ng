@@ -749,7 +749,8 @@ static bool msp_radio_rx_busy(void *m) {
     return s == CC2420_RX_FRAME || s == CC2420_RX_OVERFLOW;
 }
 static const mote_radio_ops_t msp_radio_ops = {
-    msp_radio_receive_byte, msp_radio_rxfifo_available, msp_radio_rx_busy
+    msp_radio_receive_byte, msp_radio_rxfifo_available, msp_radio_rx_busy,
+    NULL /* rx_stall */
 };
 
 static int arm_radio_rxfifo_available(void *m) {
@@ -793,7 +794,21 @@ static void arm_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
 }
 static bool arm_radio_rx_busy(void *m) { (void)m; return false; }
 static const mote_radio_ops_t arm_radio_ops = {
-    arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy
+    arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy,
+    NULL /* rx_stall */
+};
+
+/* nrf54l15 variant: same endpoint plus the RX-stall recovery op (M9.5).
+ * The bus only arms its per-receiver stall timer when rx_stall is set,
+ * so other ARM platforms don't pay for timer events they ignore. */
+static void arm54l_radio_rx_stall(void *m) {
+    mixed_node_t *node = (mixed_node_t *)m;
+    nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&node->plat.arm);
+    if (nrfl_soc) nrf54l_radio_rx_stall(nrfl_soc);
+}
+static const mote_radio_ops_t arm54l_radio_ops = {
+    arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy,
+    arm54l_radio_rx_stall
 };
 
 /* Native (Cooja-protocol) motes: SYNC delivery — the bus feeds each
@@ -809,7 +824,7 @@ static int native_radio_rxfifo_available(void *m) { (void)m; return 0; }
 static bool native_radio_rx_busy(void *m) { (void)m; return false; }
 static const mote_radio_ops_t native_radio_ops = {
     native_radio_receive_byte, native_radio_rxfifo_available,
-    native_radio_rx_busy
+    native_radio_rx_busy, NULL /* rx_stall */
 };
 
 /* JS motes: BATCH delivery so the bus stages bytes in rf_pending[] like
@@ -820,7 +835,7 @@ static void js_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
 }
 static const mote_radio_ops_t js_radio_ops = {
     js_radio_receive_byte, native_radio_rxfifo_available,
-    native_radio_rx_busy
+    native_radio_rx_busy, NULL /* rx_stall */
 };
 
 static int emulated_rxfifo_available(int idx) {
@@ -926,6 +941,28 @@ static void deliver_arm_rx_byte(const sim_event_t *ev) {
         sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, next_ns);
         sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, ev->time_ns);
     }
+}
+
+/* Process a SIM_EV_RADIO_TIMER event (M9.5): the radio bus's per-receiver
+ * RX-stall deadline.  The bus decides stale-vs-expired (fresher bytes
+ * extend the deadline and re-arm); on true expiry, sync the mote's CPU
+ * to the deadline time and fire ops->rx_stall so the chip can abandon a
+ * mid-frame parse the way real HW's signal-loss detector would. */
+static void deliver_radio_timer(const sim_event_t *ev) {
+    int idx = ev->node_idx;
+    if (idx < 0 || idx >= num_nodes || !node_active(idx))
+        return;
+    if (!radio_bus.ops[idx] || !radio_bus.ops[idx]->rx_stall)
+        return;
+    if (!sim_radio_bus_rx_stall_expired(&radio_bus, &sim_rt, idx, ev->time_ns))
+        return;  /* deadline extended; bus re-armed */
+    if (nodes[idx].type == NODE_ARM)
+        sync_arm_to_time(idx, ev->time_ns);
+    else if (nodes[idx].type == NODE_MSP430)
+        sync_msp430_to_time(idx, ev->time_ns);
+    radio_bus.ops[idx]->rx_stall(radio_bus.mote[idx]);
+    if (num_threads == 0)
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, ev->time_ns);
 }
 
 /* byte_period_ns lives in sim_radio_bus.h (M9.1) */
@@ -3020,6 +3057,7 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
     sim_cancel_mote_events(&sim_rt, idx);
     sim_runtime_bump_mote_generation(&sim_rt, idx);
+    sim_radio_bus_reset_node(&radio_bus, idx);
     emu_rx_end_ns[idx] = 0;
     sim_radio_bus_asm_reset(&tx_asm[idx]);
 
@@ -3076,6 +3114,7 @@ static int reboot_node(int idx) {
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
     sim_cancel_mote_events(&sim_rt, idx);
     sim_runtime_bump_mote_generation(&sim_rt, idx);
+    sim_radio_bus_reset_node(&radio_bus, idx);
     emu_rx_end_ns[idx] = 0;
     sim_radio_bus_asm_reset(&tx_asm[idx]);
 
@@ -3890,12 +3929,13 @@ sim_restart:
                                    SIM_RADIO_DELIVERY_PER_BYTE);
             break;
         case NODE_ARM: {
+            bool nrf54l = arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL;
             sim_radio_delivery_mode_t mode =
-                (arm_platform_cc2538(&nodes[i].plat.arm) != NULL ||
-                 arm_platform_nrf54l15(&nodes[i].plat.arm) != NULL)
+                (nrf54l || arm_platform_cc2538(&nodes[i].plat.arm) != NULL)
                 ? SIM_RADIO_DELIVERY_PER_BYTE : SIM_RADIO_DELIVERY_BATCH;
-            sim_radio_bus_register(&radio_bus, i, &arm_radio_ops, &nodes[i],
-                                   mode);
+            sim_radio_bus_register(&radio_bus, i,
+                                   nrf54l ? &arm54l_radio_ops : &arm_radio_ops,
+                                   &nodes[i], mode);
             break;
         }
         case NODE_NATIVE:
@@ -4508,6 +4548,12 @@ sim_restart:
                         deliver_arm_rx_byte(&ev);
                     else
                         deliver_msp430_rx_byte(&ev);
+                    continue;
+                }
+
+                /* Radio-bus RF timer (M9.5): RX-stall deadline. */
+                if (ev.kind == SIM_EV_RADIO_TIMER) {
+                    deliver_radio_timer(&ev);
                     continue;
                 }
 

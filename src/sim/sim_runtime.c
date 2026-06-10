@@ -64,6 +64,13 @@ void sim_schedule_radio_byte(sim_runtime_t *sim, int receiver_mote,
                                  byte, rssi, time_ns, gen);
 }
 
+void sim_schedule_radio_timer(sim_runtime_t *sim, int receiver_mote,
+                              int64_t time_ns) {
+    uint32_t gen = sim_runtime_mote_generation(sim, receiver_mote);
+    sim_eq_schedule_radio_timer_gen(&sim->event_queue, receiver_mote,
+                                    time_ns, gen);
+}
+
 void sim_cancel_mote_events(sim_runtime_t *sim, int mote_index) {
     sim_eq_remove_node(&sim->event_queue, mote_index);
 }

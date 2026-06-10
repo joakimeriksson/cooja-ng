@@ -993,10 +993,7 @@ static const uint32_t radio_sub_task_off[NRF54L_RADIO_NUM_SUBSCRIBES] = {
 static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off);
 static void nrf54l_radio_tx_end_cb(void *user, arm_event_t *ev);
 static void nrf54l_radio_rx_disable_timeout_cb(void *user, arm_event_t *ev);
-static void nrf54l_radio_rx_stall_cb(void *user, arm_event_t *ev);
 static void nrf54l_radio_disabled_event_fire_cb(void *user, arm_event_t *ev);
-static void nrf54l_radio_arm_stall_watchdog(nrf54l_radio_state_t *r);
-static void nrf54l_radio_cancel_stall_watchdog(nrf54l_radio_state_t *r);
 static void nrf54l_radio_apply_shorts(nrf54l_radio_state_t *r, uint32_t after_event_bit);
 static void nrf54l_radio_publish_event(nrf54l_radio_state_t *r, int pub_idx);
 static void nrf54l_radio_set_state(nrf54l_radio_state_t *r, uint32_t new_state);
@@ -1313,7 +1310,6 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
                                        fire_cycle);
                 }
             } else {
-                nrf54l_radio_cancel_stall_watchdog(r);
                 nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_DISABLED);
             }
             break;
@@ -1400,12 +1396,13 @@ static void nrf54l_radio_rx_disable_timeout_cb(void *user, arm_event_t *ev) {
     nrf54l_radio_set_state(r, NRF54L_RADIO_STATE_DISABLED);
 }
 
-/* Frame-stall watchdog — see rx_stall_event in the header. Re-armed on
- * every received byte while past WAIT_SFD; fires if the byte stream
- * stops mid-frame (peer aborted). Mimics what real HW's signal-loss
- * detector would do: abandon the frame, fire PHYEND so the
- * PHYEND_DISABLE SHORTS chain runs, and snap state back so a polling
- * driver sees DISABLED on its next read.
+/* Frame-stall recovery — see the header-struct comment. M9.5: the
+ * deadline lives on the kernel's radio bus as a *sim-time* event ("no
+ * RF byte for this mote in SIM_RADIO_RX_STALL_NS"), not on the chip's
+ * cpu-cycle queue.  The previous cpu-cycle watchdog needed a 50 ms
+ * band-aid because the receiver's cycle clock stands still while a
+ * synchronously-emitted frame traverses the parser; global sim time
+ * advances with the bytes' air times, so the bus window can be tight.
  *
  * We do NOT fire CRCERROR — real HW only does that on CRC mismatch of a
  * fully-received frame. Firing it on stall would trick the driver into
@@ -1413,37 +1410,24 @@ static void nrf54l_radio_rx_disable_timeout_cb(void *user, arm_event_t *ev) {
  * us, which would dirty its statistics. PHYEND alone is enough to make
  * the SHORTS chain take the radio back to DISABLED.
  */
-static void nrf54l_radio_arm_stall_watchdog(nrf54l_radio_state_t *r) {
-    arm_cpu_t *cpu = &r->plat->cpu;
-    if (r->rx_stall_scheduled)
-        arm_cancel_event(cpu, &r->rx_stall_event);
-    r->rx_stall_event.callback  = nrf54l_radio_rx_stall_cb;
-    r->rx_stall_event.user_data = r;
-    r->rx_stall_scheduled = 1;
-    /* 50 ms — far above MAX_PSDU * 32 µs + slack. Per-byte rearm.
-     *
-     * Why so much larger than a real "byte period"?  In the multinode
-     * harness the sender emits the entire frame's bytes synchronously
-     * in one chip step (nrf_radio_emit_ieee802154_frame), so the
-     * receiver's cpu->cycles can sit anchored at one value while
-     * 60+ bytes traverse the parser before the sim_eq event loop
-     * accumulates enough wakeup-time to push cpu->cycles forward.
-     * A 50 µs cpu-cycle watchdog tripped mid-frame in that window
-     * and the PHYEND_DISABLE SHORTS dropped the receiver to DISABLED
-     * before payload completion fired the real PHYEND.  5 ms wasn't
-     * enough cushion under all DPPI/SHORTS chain timings — 50 ms
-     * passes the 3-node chain reliably.  Per-byte rearm still detects
-     * a genuine mid-frame stall once the byte stream stops and cpu
-     * cycles advance through other peripheral events. */
-    int64_t fire_cycle = cpu->cycles +
-        cpu_ns_to_cycles(50000000LL, cpu->cpu_freq_hz);
-    arm_schedule_event(cpu, &r->rx_stall_event, fire_cycle);
-}
-
-static void nrf54l_radio_cancel_stall_watchdog(nrf54l_radio_state_t *r) {
-    if (!r->rx_stall_scheduled) return;
-    arm_cancel_event(&r->plat->cpu, &r->rx_stall_event);
-    r->rx_stall_scheduled = 0;
+void nrf54l_radio_rx_stall(nrf54l15_soc_t *soc) {
+    nrf54l_radio_state_t *r = &soc->radio;
+    /* Only fire if we're still mid-frame; the parser may have completed
+     * naturally since the bus saw the last byte. */
+    if (r->state != NRF54L_RADIO_STATE_RX ||
+        r->rx_phase == NRF54L_RX_WAIT_PREAMBLE ||
+        r->rx_phase == NRF54L_RX_WAIT_SFD)
+        return;
+    if (nrf54l_radio_trace_active(r) || getenv("NRF54L_RX_STALL_TRACE"))
+        fprintf(stderr, "[radio cpu=0x%04x cyc=%lld RX_STALL phase=%d remaining=%d]\n",
+                (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
+                (long long)r->plat->cpu.cycles, r->rx_phase, r->rx_remaining);
+    /* Abandon the frame. Fire PHYEND so PHYEND_DISABLE SHORTS chain
+     * disables the radio (matches the real-HW signal-loss path). */
+    r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
+    r->state    = NRF54L_RADIO_STATE_RXIDLE;
+    nrf54l_radio_fire_event(r, &r->evt_phyend, INT_PHYEND, PUB_PHYEND);
+    nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
 }
 
 static void nrf54l_radio_disabled_event_fire_cb(void *user, arm_event_t *ev) {
@@ -1457,28 +1441,10 @@ static void nrf54l_radio_disabled_event_fire_cb(void *user, arm_event_t *ev) {
     nrf54l_radio_fire_event(r, &r->evt_disabled, INT_DISABLED, PUB_DISABLED);
 }
 
-static void nrf54l_radio_rx_stall_cb(void *user, arm_event_t *ev) {
-    (void)ev;
-    nrf54l_radio_state_t *r = (nrf54l_radio_state_t *)user;
-    r->rx_stall_scheduled = 0;
-    /* Only fire if we're still mid-frame; the parser may have completed
-     * naturally between watchdog rearm and this callback. */
-    if (r->state != NRF54L_RADIO_STATE_RX ||
-        r->rx_phase == NRF54L_RX_WAIT_PREAMBLE ||
-        r->rx_phase == NRF54L_RX_WAIT_SFD)
-        return;
-    /* Abandon the frame. Fire PHYEND so PHYEND_DISABLE SHORTS chain
-     * disables the radio (matches the real-HW signal-loss path). */
-    r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
-    r->state    = NRF54L_RADIO_STATE_RXIDLE;
-    nrf54l_radio_fire_event(r, &r->evt_phyend, INT_PHYEND, PUB_PHYEND);
-    nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
-}
-
 /* WFI fast-forward guard. Returns non-zero when the radio holds state
  * that has to advance instruction-by-instruction:
- *   - Mid-frame RX (parser past WAIT_SFD): skipping would let the
- *     stall watchdog fire before the bytes arrive.
+ *   - Mid-frame RX (parser past WAIT_SFD): the frame's remaining
+ *     bytes (or the bus's RX-stall recovery) need normal stepping.
  *   - TX in progress / tx_armed: skipping would let the firmware
  *     observe TX-done before the air time has elapsed, breaking the
  *     channel-busy window in the medium model.
@@ -1497,7 +1463,7 @@ int nrf54l_wfi_skip_guard(void *user) {
     if (r->state == NRF54L_RADIO_STATE_RX &&
         r->rx_phase != NRF54L_RX_WAIT_PREAMBLE)
         return 1;
-    if (r->rx_disable_pending || r->rx_stall_scheduled)
+    if (r->rx_disable_pending)
         return 1;
     return 0;
 }
@@ -1537,7 +1503,6 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
                 r->rx_phase = NRF54L_RX_READ_PHR;
                 nrf54l_radio_fire_event(r, &r->evt_address,    INT_ADDRESS,    PUB_ADDRESS);
                 nrf54l_radio_fire_event(r, &r->evt_framestart, INT_FRAMESTART, PUB_FRAMESTART);
-                nrf54l_radio_arm_stall_watchdog(r);
             } else if (byte != IEEE802154_PREAMBLE_BYTE) {
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
             }
@@ -1545,14 +1510,12 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
         case NRF54L_RX_READ_PHR:
             if (byte < 2 || byte > 127) {
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
-                nrf54l_radio_cancel_stall_watchdog(r);
                 break;
             }
             arm_write8(cpu, r->packetptr, byte);
             r->rx_remaining = byte;
             r->rx_offset    = 1;
             r->rx_phase     = NRF54L_RX_READ_PAYLOAD;
-            nrf54l_radio_arm_stall_watchdog(r);
             /* nrf_802154 typically programs BCC=8 (after FRAMESTART) so it
              * gets a BCMATCH the moment PHR is in the buffer. The check
              * lives both here and in READ_PAYLOAD so the milestone fires
@@ -1570,7 +1533,6 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
             arm_write8(cpu, r->packetptr + (uint32_t)r->rx_offset, byte);
             r->rx_offset++;
             r->rx_remaining--;
-            nrf54l_radio_arm_stall_watchdog(r);
             /* BCMATCH fires when BCC bits have been received.  BCC is in
              * bits and the Nordic 802154 driver programs successive
              * milestones (e.g. PHR + FCF + DST + ...) to inspect headers
@@ -1583,7 +1545,6 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
                 nrf54l_radio_fire_event(r, &r->evt_bcmatch, INT_BCMATCH, PUB_BCMATCH);
             }
             if (r->rx_remaining == 0) {
-                nrf54l_radio_cancel_stall_watchdog(r);
                 nrf54l_radio_fire_event(r, &r->evt_payload,  INT_PAYLOAD,  PUB_PAYLOAD);
                 nrf54l_radio_fire_event(r, &r->evt_end,      INT_END,      PUB_END);
                 nrf54l_radio_fire_event(r, &r->evt_phyend,   INT_PHYEND,   PUB_PHYEND);

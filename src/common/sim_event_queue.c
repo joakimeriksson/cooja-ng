@@ -174,6 +174,36 @@ void sim_eq_schedule_rx_byte(sim_event_queue_t *q, int node_idx, int sender_idx,
     sim_eq_schedule_rx_byte_gen(q, node_idx, sender_idx, byte, rssi, time_ns, 0u);
 }
 
+void sim_eq_schedule_radio_timer_gen(sim_event_queue_t *q, int node_idx,
+                                     int64_t time_ns,
+                                     uint32_t target_generation) {
+    if (node_idx < 0 || node_idx >= SIM_EQ_MAX_NODES) {
+        fprintf(stderr, "WARNING: invalid radio-timer node index %d\n", node_idx);
+        return;
+    }
+    if (q->count >= SIM_EQ_MAX_EVENTS) {
+        fprintf(stderr, "WARNING: event queue full (%d events), "
+                "dropping radio timer for node %d\n", q->count, node_idx);
+        return;
+    }
+    int i = q->count++;
+    memset(&q->heap[i], 0, sizeof(q->heap[i]));
+    q->heap[i].kind = SIM_EV_RADIO_TIMER;
+    q->heap[i].node_idx = node_idx;
+    q->heap[i].time_ns = time_ns;
+    q->heap[i].seq = q->next_seq++;
+    q->heap[i].sender_idx = -1;
+    q->heap[i].target_generation = target_generation;
+    /* Like RX_BYTE, RADIO_TIMER events do not update node_heap_idx[] —
+     * that index tracks only the single pending NODE_WAKEUP per node. */
+    heap_sift_up(q, i);
+}
+
+void sim_eq_schedule_radio_timer(sim_event_queue_t *q, int node_idx,
+                                 int64_t time_ns) {
+    sim_eq_schedule_radio_timer_gen(q, node_idx, time_ns, 0u);
+}
+
 void sim_eq_schedule_test_action(sim_event_queue_t *q, int64_t time_ns) {
     if (q->count >= SIM_EQ_MAX_EVENTS) {
         fprintf(stderr, "WARNING: event queue full (%d events), "

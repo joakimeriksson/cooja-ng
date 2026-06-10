@@ -308,26 +308,26 @@ typedef struct nrf54l_radio_state {
     arm_event_t  rx_disable_timeout_event;
     int          rx_disable_timeout_scheduled;
 
-    /* Frame-stall watchdog. Sibling of rx_disable_timeout but for the
-     * OTHER stuck-parser path: the firmware enters the RADIO peripheral
-     * via TASKS_RXEN/START and sits in RX, waiting for an inbound frame
-     * to complete via PHYEND + the PHYEND_DISABLE SHORTS chain. If the
-     * peer aborts mid-frame the byte parser stalls in READ_PHR /
-     * READ_PAYLOAD, PHYEND never fires, the SHORTS chain never
-     * triggers, and the driver eventually enters
+    /* Frame-stall recovery (M9.5: no chip-local watchdog event anymore).
+     * Sibling of rx_disable_timeout but for the OTHER stuck-parser path:
+     * the firmware enters the RADIO peripheral via TASKS_RXEN/START and
+     * sits in RX, waiting for an inbound frame to complete via PHYEND +
+     * the PHYEND_DISABLE SHORTS chain. If the peer aborts mid-frame the
+     * byte parser stalls in READ_PHR / READ_PAYLOAD, PHYEND never fires,
+     * the SHORTS chain never triggers, and the driver eventually enters
      * wait_until_radio_is_disabled() with state=RX and pending=0 → the
      * same trx.c:360 assert as the deferred-disable path, but unreachable
      * by the rx_disable_pending mechanism because the firmware never
      * issued an explicit TASKS_DISABLE here.
      *
      * Real HW recovers via signal-loss detection / preamble timeout in
-     * the analog front-end. We mirror that with a 50 µs deadline (≈ 1.5
-     * IEEE 802.15.4 byte periods) re-armed on every received byte while
-     * past WAIT_SFD. If the deadline elapses, reset the parser to
-     * WAIT_PREAMBLE and fire PHYEND so the SHORTS chain disables the
-     * radio the way real HW would. */
-    arm_event_t  rx_stall_event;
-    int          rx_stall_scheduled;
+     * the analog front-end. The simulation kernel's radio bus mirrors
+     * that: it fires nrf54l_radio_rx_stall() when no RF byte arrived for
+     * this mote within SIM_RADIO_RX_STALL_NS of *sim time* after the
+     * last delivered byte (see sim_radio_bus.h). The previous
+     * chip-internal cpu-cycle watchdog needed a 50 ms band-aid because
+     * the receiver's cycle clock stands still while a synchronously
+     * emitted frame traverses the parser; sim time does not. */
 
     /* Deferred DISABLED-event fire. Real nRF54L15 takes ~250 ns
      * (~32 cpu cycles) between TASKS_DISABLE triggering and EVENTS_DISABLED
@@ -455,6 +455,14 @@ typedef void (*nrf54l_radio_tx_listener_t)(void *user, uint8_t byte);
 void nrf54l_radio_set_tx_listener(nrf54l15_soc_t *soc,
                                    nrf54l_radio_tx_listener_t cb, void *user);
 void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte);
+
+/* RX-stall recovery entry (M9.5): invoked by the radio bus when no RF
+ * byte arrived for this mote within the stall window of sim time.
+ * No-op unless the parser is mid-frame (past WAIT_SFD); otherwise
+ * abandons the frame and fires PHYEND so the PHYEND_DISABLE SHORTS
+ * chain takes the radio to DISABLED, matching real HW's signal-loss
+ * path. */
+void nrf54l_radio_rx_stall(nrf54l15_soc_t *soc);
 
 
 extern const arm_soc_ops_t nrf54l15_soc_ops;

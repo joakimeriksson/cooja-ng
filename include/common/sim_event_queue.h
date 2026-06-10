@@ -34,6 +34,12 @@ typedef enum {
      * arbitrary iteration boundary.  node_idx = -1; no payload — the
      * runner's per-iteration drain does the actual injection. */
     SIM_EV_TEST_ACTION = 2,
+    /* Radio-bus RF timer (milestone 9.5): sim-time deadline owned by the
+     * radio bus for a receiver mote — today the RX-stall watchdog ("no
+     * RF byte arrived for this receiver in N µs of sim time").  Lazy
+     * re-arm: the bus keeps at most one pending per receiver and decides
+     * at fire time whether the deadline was extended.  No payload. */
+    SIM_EV_RADIO_TIMER = 3,
 } sim_event_kind_t;
 
 typedef struct {
@@ -90,6 +96,15 @@ void sim_eq_schedule_rx_byte_gen(sim_event_queue_t *q, int node_idx,
                                   int sender_idx, uint8_t byte, int8_t rssi,
                                   int64_t time_ns,
                                   uint32_t target_generation);
+
+/* Schedule a radio-bus RF timer (SIM_EV_RADIO_TIMER) for node_idx.
+ * Not coalesced here — the radio bus keeps its own one-pending-per-node
+ * bookkeeping and re-arms lazily at fire time. */
+void sim_eq_schedule_radio_timer(sim_event_queue_t *q, int node_idx,
+                                 int64_t time_ns);
+void sim_eq_schedule_radio_timer_gen(sim_event_queue_t *q, int node_idx,
+                                     int64_t time_ns,
+                                     uint32_t target_generation);
 
 /* Pop the earliest event. Returns event with node_idx=-1 if empty. */
 sim_event_t sim_eq_pop(sim_event_queue_t *q);

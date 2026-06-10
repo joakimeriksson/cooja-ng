@@ -107,6 +107,13 @@ typedef struct mote_radio_ops {
     /* True while a frame is mid-reception (delivery now would corrupt
      * it; the bus queues instead). */
     bool (*rx_busy)(void *mote);
+    /* Optional (M9.5): the bus saw no RF byte for this mote within
+     * SIM_RADIO_RX_STALL_NS of sim time after the last delivered byte.
+     * If the radio is still mid-frame, the stream died (collision /
+     * aborted sender) — abandon the frame the way real HW's signal-loss
+     * detector would.  NULL when the platform has no stalled-parser
+     * hazard; the bus only arms the timer when this op is set. */
+    void (*rx_stall)(void *mote);
 } mote_radio_ops_t;
 
 /* How TX bytes reach a registered receiver (M9.4).  Chosen by the runner
@@ -172,6 +179,10 @@ typedef struct sim_radio_bus {
     emu_rx_queue_t     emu_rx_queue[SIM_RADIO_BUS_MAX_NODES]; /* per-receiver deferred queue */
     int64_t            emu_rx_end_ns[SIM_RADIO_BUS_MAX_NODES];/* last RX end per receiver    */
     rf_outgoing_t      rf_outgoing[SIM_RADIO_BUS_MAX_NODES];  /* threaded-mode TX staging    */
+    /* RX-stall timer bookkeeping (M9.5): one lazy SIM_EV_RADIO_TIMER
+     * pending per receiver, deadline extended per delivered byte. */
+    int64_t            rx_stall_deadline_ns[SIM_RADIO_BUS_MAX_NODES];
+    bool               rx_stall_pending[SIM_RADIO_BUS_MAX_NODES];
 } sim_radio_bus_t;
 
 /* Register node idx's radio endpoint + delivery mode.  Call once per
@@ -210,6 +221,20 @@ int sim_radio_bus_pick_receiver_radio(const radio_medium_t *medium,
                                       int sender_idx, int sender_radio,
                                       int receiver_idx);
 
+/* Called by the runner when a SIM_EV_RADIO_TIMER pops for node_idx.
+ * Returns true when the receiver's RX-stall deadline truly expired —
+ * the caller should sync the mote's CPU to time_ns and invoke
+ * ops->rx_stall.  Returns false when fresher RF bytes extended the
+ * deadline; the bus re-arms the timer and the popped event is stale. */
+bool sim_radio_bus_rx_stall_expired(sim_radio_bus_t *bus,
+                                    struct sim_runtime *sim,
+                                    int node_idx, int64_t time_ns);
+
+/* Clear per-node bus state on mote re-init/reboot (pairs with the
+ * runner's sim_cancel_mote_events purge, which also drops any pending
+ * SIM_EV_RADIO_TIMER for the slot). */
+void sim_radio_bus_reset_node(sim_radio_bus_t *bus, int idx);
+
 /* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
  * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. Using the
  * 2.4 GHz value for CC1200 frames (5× too fast) made hidden-terminal
@@ -217,6 +242,17 @@ int sim_radio_bus_pick_receiver_radio(const radio_medium_t *medium,
  * devices/zoul-firefly/SPEC.md L6. */
 #define IEEE802154_BYTE_NS    32000LL
 #define CC1200_50KBPS_BYTE_NS 160000LL
+
+/* RX-stall window (M9.5): sim-time after a receiver's last delivered RF
+ * byte before ops->rx_stall fires.  Must exceed the inter-byte air gap
+ * (32 µs at 250 kbps) with margin for senders that emit a frame's bytes
+ * incrementally across their own execution slices; 200 µs (~6 byte
+ * periods) is generous on both counts.  This replaces the nrf54l15
+ * chip-internal cpu-cycle watchdog whose 50 ms band-aid existed only
+ * because the receiver's local cycle clock stands still while a
+ * synchronously-emitted frame traverses the parser — global sim time
+ * does not have that problem. */
+#define SIM_RADIO_RX_STALL_NS 200000LL
 
 static inline int64_t byte_period_ns(bool subghz) {
     return subghz ? CC1200_50KBPS_BYTE_NS : IEEE802154_BYTE_NS;

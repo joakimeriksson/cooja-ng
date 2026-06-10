@@ -104,6 +104,12 @@ void sim_schedule_radio_byte(sim_runtime_t *sim, int receiver_mote,
                              int sender_mote, uint8_t byte, int8_t rssi,
                              int64_t time_ns);
 
+/* Radio-bus RF timer for receiver_mote (M9.5).  Not coalesced at the
+ * queue level; the radio bus keeps one-pending-per-node bookkeeping
+ * and re-arms lazily at fire time. */
+void sim_schedule_radio_timer(sim_runtime_t *sim, int receiver_mote,
+                              int64_t time_ns);
+
 /* Drop every pending event targeting `mote_index` (wakeups + RX bytes).
  * Physical purge of the queue, used on mote remove / reboot together with
  * sim_runtime_bump_mote_generation().  Generation-aware dispatch

@@ -230,6 +230,18 @@ static void dispatch_tx_byte(sim_radio_bus_t *bus, sim_runtime_t *sim,
             int64_t now = sim_runtime_now_ns(sim);
             if (bt < now) bt = now;
             sim_schedule_radio_byte(sim, i, sender_idx, byte, rssi, bt);
+            /* RX-stall watchdog (M9.5): extend this receiver's deadline
+             * past the byte's air time; lazily keep one timer pending. */
+            if (bus->ops[i]->rx_stall) {
+                int64_t dl = bt + SIM_RADIO_RX_STALL_NS;
+                if (dl > bus->rx_stall_deadline_ns[i])
+                    bus->rx_stall_deadline_ns[i] = dl;
+                if (!bus->rx_stall_pending[i]) {
+                    bus->rx_stall_pending[i] = true;
+                    sim_schedule_radio_timer(sim, i,
+                                             bus->rx_stall_deadline_ns[i]);
+                }
+            }
         } else {
             /* BATCH: stage for whole-frame delivery at frame-complete. */
             rf_buffer_t *buf = &bus->rf_pending[i];
@@ -237,6 +249,28 @@ static void dispatch_tx_byte(sim_radio_bus_t *bus, sim_runtime_t *sim,
                 buf->bytes[buf->count++] = byte;
         }
     }
+}
+
+bool sim_radio_bus_rx_stall_expired(sim_radio_bus_t *bus,
+                                    struct sim_runtime *sim,
+                                    int node_idx, int64_t time_ns) {
+    if (node_idx < 0 || node_idx >= SIM_RADIO_BUS_MAX_NODES) return false;
+    bus->rx_stall_pending[node_idx] = false;
+    if (time_ns < bus->rx_stall_deadline_ns[node_idx]) {
+        /* Fresher bytes arrived after this timer was armed — re-arm at
+         * the extended deadline; this event is stale. */
+        bus->rx_stall_pending[node_idx] = true;
+        sim_schedule_radio_timer(sim, node_idx,
+                                 bus->rx_stall_deadline_ns[node_idx]);
+        return false;
+    }
+    return true;
+}
+
+void sim_radio_bus_reset_node(sim_radio_bus_t *bus, int idx) {
+    if (idx < 0 || idx >= SIM_RADIO_BUS_MAX_NODES) return;
+    bus->rx_stall_deadline_ns[idx] = 0;
+    bus->rx_stall_pending[idx] = false;
 }
 
 void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
