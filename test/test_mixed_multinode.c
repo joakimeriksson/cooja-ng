@@ -845,8 +845,9 @@ static int64_t sync_arm_to_time(int idx, int64_t sim_ns);
  * still pumps frames in/out correctly. */
 /* --- Mote radio endpoint ops (M9.3) --------------------------------
  * Per-platform implementations registered on the radio bus at node
- * init.  Slice 1: rxfifo_available routed through ops; receive_byte /
- * rx_busy call sites migrate in the next slice. */
+ * init.  All RF byte delivery, FIFO back-pressure, and mid-frame
+ * checks dispatch through these — the bus no longer switches on node
+ * type. */
 
 static int msp_radio_rxfifo_available(void *m) {
     mixed_node_t *node = (mixed_node_t *)m;
@@ -916,6 +917,17 @@ static int emulated_rxfifo_available(int idx) {
     return 0;
 }
 
+/* Deliver one on-air byte to node idx's radio(s) via its registered ops. */
+static inline void radio_receive_byte(int idx, uint8_t byte, int8_t rssi) {
+    if (radio_bus.ops[idx])
+        radio_bus.ops[idx]->receive_byte(radio_bus.mote[idx], byte, rssi);
+}
+
+/* True while node idx's radio is mid-frame (delivery now would corrupt it). */
+static inline bool radio_rx_busy(int idx) {
+    return radio_bus.ops[idx] && radio_bus.ops[idx]->rx_busy(radio_bus.mote[idx]);
+}
+
 /* frame_fifo_bytes lives in sim_radio_bus.c (M9.1) */
 
 /* Push a complete frame into an emulated node's RX queue.
@@ -966,8 +978,7 @@ static void deliver_msp430_rx_byte(const sim_event_t *ev) {
                            ev->byte, (double)ev->time_ns / 1e9,
                            cc2420_state_str(old_state));
     }
-    nodes[ev->node_idx].plat.msp.cc2420.rx_rssi = ev->rssi;
-    cc2420_receive_byte(&nodes[ev->node_idx].plat.msp.cc2420, ev->byte);
+    radio_receive_byte(ev->node_idx, ev->byte, ev->rssi);
     cc2420_radio_state_t new_state = nodes[ev->node_idx].plat.msp.cc2420.state;
     if (trace_tsch_ack_enabled() &&
         nodes[ev->node_idx].id > 0 && nodes[ev->node_idx].id <= 2 &&
@@ -996,22 +1007,7 @@ static void deliver_arm_rx_byte(const sim_event_t *ev) {
         return;
     int64_t returned_us = sync_arm_to_time(ev->node_idx, ev->time_ns);
 
-    const arm_platform_config_t *pcfg = nodes[ev->node_idx].plat.arm.config;
-    bool has_cc1200 = pcfg && pcfg->has_cc1200;
-    cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&nodes[ev->node_idx].plat.arm);
-    nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&nodes[ev->node_idx].plat.arm);
-    nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&nodes[ev->node_idx].plat.arm);
-
-    if (cc_soc) {
-        cc_soc->rfcore.rx_rssi = ev->rssi;
-        cc2538_rfcore_receive_byte(&cc_soc->rfcore, ev->byte);
-        if (has_cc1200) {
-            cc_soc->cc1200.rx_rssi = ev->rssi;
-            cc1200_receive_byte(&cc_soc->cc1200, ev->byte);
-        }
-    }
-    if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, ev->byte);
-    if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, ev->byte);
+    radio_receive_byte(ev->node_idx, ev->byte, ev->rssi);
 
     if (num_threads == 0) {
         int64_t next_ns = ev->time_ns + returned_us * 1000LL;
@@ -1112,11 +1108,10 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         node_states[idx].radio_state = SIM_RADIO_ON;
     }
     if (nodes[idx].type == NODE_MSP430) {
-        /* If CC2420 is mid-frame (RX_FRAME), queue instead of delivering.
+        /* If the radio is mid-frame (RX_FRAME), queue instead of delivering.
          * Delivering now would corrupt the in-progress frame. This happens
          * when two senders' frames are delivered in the same event tick. */
-        cc2420_radio_state_t rx_state = nodes[idx].plat.msp.cc2420.state;
-        if (rx_state == CC2420_RX_FRAME || rx_state == CC2420_RX_OVERFLOW) {
+        if (radio_rx_busy(idx)) {
             emu_rx_queue_push(idx, data, len, rssi, air_time_ns,
                               air_time_ns + (int64_t)len * byte_ns, subghz);
             return;
@@ -1131,7 +1126,6 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
          * skip sync to prevent re-entrant msp430_step_until.  Bytes go into
          * CC2420's rx_incoming buffer and are replayed when the CC2420
          * transitions to RX_SFD_SEARCH naturally. */
-        nodes[idx].plat.msp.cc2420.rx_rssi = rssi;
         int64_t last_byte_ns = air_time_ns;
         if (idx == ticking_node_idx) {
             /* Ticking node: deliver bytes then process CC2420 events.
@@ -1141,7 +1135,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
              * CC2420 to transition to RX_SFD_SEARCH, replay rx_incoming, process
              * the frame, and generate auto-ACK — all within this delivery call. */
             for (int j = 0; j < len; j++)
-                cc2420_receive_byte(&nodes[idx].plat.msp.cc2420, data[j]);
+                radio_receive_byte(idx, data[j], rssi);
             /* Step enough cycles for CC2420 calibration (12 symbols = 192µs ≈ 750 cycles)
              * + frame processing + ACK generation. Use 1ms = ~4000 cycles as safe budget. */
             {
@@ -1156,7 +1150,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
             for (int j = 0; j < len; j++) {
                 int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
                 sync_msp430_to_time(idx, byte_time_ns);
-                cc2420_receive_byte(&nodes[idx].plat.msp.cc2420, data[j]);
+                radio_receive_byte(idx, data[j], rssi);
                 last_byte_ns = byte_time_ns;
             }
         }
@@ -1181,25 +1175,10 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
          * ignores the byte (cc2538_rfcore wants 0x00..0x00 0x7A, cc1200
          * wants 0x55 then sync word 0x6E4E904E). The firmware sees frames
          * arrive on the chip its NETSTACK_RADIO points at. */
-        const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
-        bool has_cc1200 = pcfg && pcfg->has_cc1200;
-        cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&nodes[idx].plat.arm);
-        nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&nodes[idx].plat.arm);
-        nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&nodes[idx].plat.arm);
-        if (cc_soc) {
-            cc_soc->rfcore.rx_rssi = rssi;
-            if (has_cc1200) cc_soc->cc1200.rx_rssi = rssi;
-        }
         int64_t last_byte_ns = air_time_ns;
         if (idx == ticking_node_idx) {
-            for (int j = 0; j < len; j++) {
-                if (cc_soc) {
-                    cc2538_rfcore_receive_byte(&cc_soc->rfcore, data[j]);
-                    if (has_cc1200) cc1200_receive_byte(&cc_soc->cc1200, data[j]);
-                }
-                if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, data[j]);
-                if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, data[j]);
-            }
+            for (int j = 0; j < len; j++)
+                radio_receive_byte(idx, data[j], rssi);
         } else {
             for (int j = 0; j < len; j++) {
                 int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
@@ -1214,12 +1193,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
                 arm_step_micros(cpu, jump_us, 0);
                 cpu->sim_time_ns = byte_time_ns;
                 cpu->last_execute_us = t_us;
-                if (cc_soc) {
-                    cc2538_rfcore_receive_byte(&cc_soc->rfcore, data[j]);
-                    if (has_cc1200) cc1200_receive_byte(&cc_soc->cc1200, data[j]);
-                }
-                if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, data[j]);
-                if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, data[j]);
+                radio_receive_byte(idx, data[j], rssi);
                 last_byte_ns = byte_time_ns;
             }
         }
