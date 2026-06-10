@@ -33,6 +33,8 @@ typedef enum sim_run_state {
     SIM_RUN_STOP_REQUESTED,
 } sim_run_state_t;
 
+struct sim_radio_bus;  /* see sim_radio_bus.h — owned storage lives with the runner until M10 */
+
 typedef struct sim_runtime {
     /* The five Phase 1 milestone 1 fields, in the order the plan lists them. */
     int64_t            now_ns;        /* current simulation time (ns)        */
@@ -40,6 +42,7 @@ typedef struct sim_runtime {
     sim_run_state_t    run_state;     /* lifecycle state, see enum above     */
     sim_event_queue_t  event_queue;   /* unified event queue                 */
     radio_medium_t     radio_medium;  /* per-node radio routing/policy       */
+    struct sim_radio_bus *radio_bus;  /* RF routing state (M9.2)             */
 
     /* Per-mote slot generation counters — milestone 4.  Bumped on mote
      * remove/reboot via sim_runtime_bump_mote_generation().  The sim_schedule_*

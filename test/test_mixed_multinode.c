@@ -37,6 +37,7 @@
 #include "sim_runtime.h"
 #include "sim_serial_bridge.h"
 #include "sim_external_command.h"
+#include "sim_radio_bus.h"
 #include "gdb_stub.h"
 #include "arm_gdb.h"
 #include "pcap_writer.h"
@@ -80,46 +81,7 @@ typedef struct {
     } plat;
 } mixed_node_t;
 
-/* RF byte buffer for deferred delivery */
-#define RF_BUF_SIZE 4096
-typedef struct {
-    uint8_t bytes[RF_BUF_SIZE];
-    int count;
-} rf_buffer_t;
-
-/* TX frame assembler: detects complete frame boundaries in a sender's
- * raw byte stream. Two on-air formats are supported:
- *
- *   - 802.15.4 (CC2420 / cc2538_rfcore): 4×0x00 preamble + 0x7A SFD +
- *     1-byte length (PHY hdr) + payload.
- *   - 802.15.4g (CC1200): 4×0x55 preamble + 32-bit sync word
- *     0x6E4E904E + 2-byte PHR (length = (phra & 0x07)<<8 | phrb) +
- *     payload.
- *
- * The state machine sniffs which one it's looking at on the fly, since
- * the CC2420 callback and the CC1200 callback both feed the same
- * mixed_rf_tx_handler (per the per-node fan-out). */
-#define TX_ASM_PREAMBLE  0
-#define TX_ASM_LENGTH    1
-#define TX_ASM_PAYLOAD   2
-#define TX_ASM_SUBGHZ_PHR 3   /* CC1200: just past sync word, expecting 2-byte PHR */
-
-typedef struct {
-    int state;
-    int zero_count;        /* 0x00 preamble bytes (802.15.4) */
-    uint32_t sync_match;   /* sliding 32-bit register for 802.15.4g sync */
-    int phr_lo;            /* CC1200: top 3 bits of length stashed here */
-    int expected_len;      /* PHY length value (PHR for CC1200) */
-    int payload_count;     /* bytes received after length byte */
-    bool subghz;           /* true once sync word matched (sub-GHz frame) */
-    int subghz_phr_len;    /* CC1200 PHR width: 1 or 2 bytes */
-    int64_t first_byte_ns; /* sim time of first preamble byte */
-} tx_frame_asm_t;
-
-typedef struct {
-    uint8_t bytes[256];
-    int len;
-} tx_frame_capture_t;
+/* rf_buffer_t / tx_frame_asm_t / tx_frame_capture_t live in sim_radio_bus.h (M9.1) */
 
 /* Returns true when a complete frame has been assembled */
 static bool tx_frame_asm_feed(tx_frame_asm_t *a, uint8_t byte) {
@@ -239,32 +201,7 @@ static void tx_frame_asm_reset(tx_frame_asm_t *a) {
     a->first_byte_ns = 0;
 }
 
-/* Per-receiver RX frame queue for emulated nodes.
- *
- * Sized to absorb sub-GHz CC1200 backpressure: at 50 kbps a 100-byte frame
- * occupies the air for ~17 ms.  When CSMA retransmits during a hidden-
- * terminal storm, a burst of 30+ frames can arrive at the receiver before
- * its firmware drains the chip RX FIFO.  16 was too tight for L6 — the
- * queue overflowed by ~900 frames in 60 s.  64 holds ~1 second of full-rate
- * sub-GHz traffic, comfortably more than the firmware's worst-case process
- * latency. */
-#define EMU_RX_QUEUE_SIZE 64
-#define EMU_RX_FRAME_MAX  160  /* preamble(4)+SFD(1)+len(1)+payload(≤127)+CRC(2) */
-
-typedef struct {
-    uint8_t data[EMU_RX_FRAME_MAX];
-    int     len;
-    int8_t  rssi;
-    int64_t arrival_ns;
-    int64_t end_ns;
-    bool    collided;
-    bool    subghz;     /* CC1200 frame — use 160 µs/byte for re-delivery */
-} emu_rx_frame_t;
-
-typedef struct {
-    emu_rx_frame_t frames[EMU_RX_QUEUE_SIZE];
-    int head, count;
-} emu_rx_queue_t;
+/* emu_rx_frame_t / emu_rx_queue_t live in sim_radio_bus.h (M9.1) */
 
 static mixed_node_t nodes[MAX_NODES];
 static int ticking_node_idx = -1;  /* node currently inside tick_one_msp430 (re-entrancy guard) */
@@ -289,11 +226,15 @@ void srh_trace_cb(void *data, uint32_t pc, uint32_t *reg, uint8_t *mem) {
 }
 static int num_nodes = 0;
 static int verbose = 1;
-static rf_buffer_t rf_pending[MAX_NODES];
-static tx_frame_asm_t tx_asm[MAX_NODES];     /* per-sender frame assembler */
-static tx_frame_capture_t tx_cap[MAX_NODES]; /* sender-side full-frame capture */
-static emu_rx_queue_t emu_rx_queue[MAX_NODES]; /* per-receiver frame queue */
-static int64_t emu_rx_end_ns[MAX_NODES];      /* end time of last RX for each emulated receiver */
+/* M9.2: RF routing state lives in the kernel-owned radio bus.  The
+ * aliases keep call sites unchanged until the dispatch functions
+ * migrate into the bus (M9.3/9.4). */
+static sim_radio_bus_t radio_bus;
+#define rf_pending    (radio_bus.rf_pending)
+#define tx_asm        (radio_bus.tx_asm)
+#define tx_cap        (radio_bus.tx_cap)
+#define emu_rx_queue  (radio_bus.emu_rx_queue)
+#define emu_rx_end_ns (radio_bus.emu_rx_end_ns)
 static int rf_byte_count = 0;
 static int uart_byte_count = 0;
 
@@ -442,11 +383,7 @@ static void trace_tsch_ack_log_at(int64_t time_ns, const char *fmt, ...) {
 /* --- Threading support --- */
 static int num_threads = 0;  /* 0 = single-threaded (default) */
 
-/* Per-sender RF outgoing buffer (written only by sender's thread) */
-typedef struct {
-    uint8_t bytes[RF_BUF_SIZE];
-    int count;
-} rf_outgoing_t;
+/* rf_outgoing_t lives in sim_radio_bus.h (M9.1) */
 
 /* Per-sender frame outgoing buffer for native nodes */
 #define MAX_OUTGOING_FRAMES 16
@@ -470,7 +407,7 @@ typedef struct {
     int64_t last_tx_ns;     /* last TX time for UI arrows */
 } node_thread_state_t;
 
-static rf_outgoing_t rf_outgoing[MAX_NODES];
+#define rf_outgoing   (radio_bus.rf_outgoing)
 static frame_outgoing_t frame_outgoing[MAX_NODES];
 static node_thread_state_t thread_state[MAX_NODES];
 
@@ -933,33 +870,7 @@ static int emulated_rxfifo_available(int idx) {
     return 0;
 }
 
-/* Compute how many RX-FIFO bytes a complete air frame will occupy on the
- * receiving chip's FIFO.  This must match what the chip driver actually
- * pushes (PHR + payload + status appendix), and the offset of the payload
- * length byte in the buffered air bytes depends on the on-air format:
- *
- *   - 2.4 GHz IEEE 802.15.4 (CC2420 / cc2538_rfcore):
- *       data layout: 4×0x00 preamble + 0x7A SFD + length + payload (incl. FCS)
- *       length byte at data[5] (the byte right after SFD).
- *       Receiving chip pushes (length + 1) bytes into RX FIFO.
- *
- *   - Sub-GHz IEEE 802.15.4g (CC1200, standard PHR — Contiki default):
- *       data layout: 4×0x55 preamble + 4-byte sync word + 1-byte PHR + payload + 2 CRC
- *       length byte (PHR) at data[8] (the byte right after the sync word).
- *       Receiving chip pushes (PHR + payload + 2 status) = (length + 3) bytes.
- *
- * Returns the number of FIFO bytes the chip needs free to accept the frame.
- * Returns a sentinel > FIFO size if the buffer is too short to extract the
- * length, so the caller queues the frame instead of trying to deliver it. */
-static int frame_fifo_bytes(const uint8_t *data, int len, bool subghz) {
-    if (subghz) {
-        /* Need preamble(4) + sync(4) + PHR(1) at minimum to read length. */
-        if (len < 9) return 9999;
-        return (int)data[8] + 3;
-    }
-    if (len < 6) return 9999;
-    return (int)data[5] + 1;
-}
+/* frame_fifo_bytes lives in sim_radio_bus.c (M9.1) */
 
 /* Push a complete frame into an emulated node's RX queue.
  * Collision detection is NOT done here — it's handled by:
@@ -1063,20 +974,7 @@ static void deliver_arm_rx_byte(const sim_event_t *ev) {
     }
 }
 
-/* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
- * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. The
- * `subghz` flag set by the per-sender frame assembler picks which one
- * to use everywhere a wall-clock byte period is needed (RX byte spacing,
- * frame air time, collision window, ACK timeline). Using the 2.4 GHz
- * value for CC1200 frames (5x too fast) is what made hidden-terminal
- * collisions look like real collisions to the simulator and starved
- * RPL convergence — see devices/zoul-firefly/SPEC.md L6 entry. */
-#define IEEE802154_BYTE_NS 32000LL
-#define CC1200_50KBPS_BYTE_NS 160000LL
-
-static inline int64_t byte_period_ns(bool subghz) {
-    return subghz ? CC1200_50KBPS_BYTE_NS : IEEE802154_BYTE_NS;
-}
+/* byte_period_ns lives in sim_radio_bus.h (M9.1) */
 
 static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
     /* Cap to global sim time — no node should advance past it (Cooja invariant) */
@@ -3765,6 +3663,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * check — zeroed static structs would read as live. */
     sim_serial_bridge_init(&serial_bridge);
     sim_external_command_init(&external_cmd);
+    sim_rt.radio_bus = &radio_bus;
     /* Milestone 8.3: JS/JSON test engines consume console lines off the
      * observer stream instead of a hardwired call in the UART path. */
     sim_runtime_subscribe(&sim_rt, test_engine_observer, NULL);
