@@ -843,30 +843,76 @@ static int64_t sync_arm_to_time(int idx, int64_t sim_ns);
 /* Check available RXFIFO space for an emulated node. Firefly nodes have
  * two radios; we report the more constrained side so back-pressure
  * still pumps frames in/out correctly. */
-static int emulated_rxfifo_available(int idx) {
-    if (nodes[idx].type == NODE_MSP430)
-        return 128 - nodes[idx].plat.msp.cc2420.rx_fifo_len;
-    else if (nodes[idx].type == NODE_ARM) {
-        cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&nodes[idx].plat.arm);
-        nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&nodes[idx].plat.arm);
-        nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&nodes[idx].plat.arm);
-        if (cc_soc) {
-            cc2538_rfcore_t *rf = &cc_soc->rfcore;
-            int avail = RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
-            const arm_platform_config_t *pcfg = nodes[idx].plat.arm.config;
-            if (pcfg && pcfg->has_cc1200) {
-                int cc1200_avail = 128 - cc_soc->cc1200.rx_count;
-                if (cc1200_avail < avail) avail = cc1200_avail;
-            }
-            return avail;
+/* --- Mote radio endpoint ops (M9.3) --------------------------------
+ * Per-platform implementations registered on the radio bus at node
+ * init.  Slice 1: rxfifo_available routed through ops; receive_byte /
+ * rx_busy call sites migrate in the next slice. */
+
+static int msp_radio_rxfifo_available(void *m) {
+    mixed_node_t *node = (mixed_node_t *)m;
+    return 128 - node->plat.msp.cc2420.rx_fifo_len;
+}
+static void msp_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
+    mixed_node_t *node = (mixed_node_t *)m;
+    node->plat.msp.cc2420.rx_rssi = rssi;
+    cc2420_receive_byte(&node->plat.msp.cc2420, byte);
+}
+static bool msp_radio_rx_busy(void *m) {
+    mixed_node_t *node = (mixed_node_t *)m;
+    cc2420_radio_state_t s = node->plat.msp.cc2420.state;
+    return s == CC2420_RX_FRAME || s == CC2420_RX_OVERFLOW;
+}
+static const mote_radio_ops_t msp_radio_ops = {
+    msp_radio_receive_byte, msp_radio_rxfifo_available, msp_radio_rx_busy
+};
+
+static int arm_radio_rxfifo_available(void *m) {
+    mixed_node_t *node = (mixed_node_t *)m;
+    cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&node->plat.arm);
+    nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&node->plat.arm);
+    nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&node->plat.arm);
+    if (cc_soc) {
+        cc2538_rfcore_t *rf = &cc_soc->rfcore;
+        int avail = RF_RXFIFO_SIZE - (rf->rxfifo_len - rf->rxfifo_rd);
+        const arm_platform_config_t *pcfg = node->plat.arm.config;
+        if (pcfg && pcfg->has_cc1200) {
+            int cc1200_avail = 128 - cc_soc->cc1200.rx_count;
+            if (cc1200_avail < avail) avail = cc1200_avail;
         }
-        if (nrf_soc || nrfl_soc) {
-            /* Both nRF chips use EasyDMA — no shared fixed-size FIFO,
-             * just a PACKETPTR-pointed RAM buffer. The receive parser
-             * drops bytes when not in RX state. */
-            return 128;
+        return avail;
+    }
+    if (nrf_soc || nrfl_soc) {
+        /* EasyDMA — no shared fixed-size FIFO; parser drops bytes when
+         * not in RX state. */
+        return 128;
+    }
+    return 0;
+}
+static void arm_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
+    mixed_node_t *node = (mixed_node_t *)m;
+    cc2538_soc_t   *cc_soc   = arm_platform_cc2538(&node->plat.arm);
+    nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(&node->plat.arm);
+    nrf54l15_soc_t *nrfl_soc = arm_platform_nrf54l15(&node->plat.arm);
+    if (cc_soc) {
+        const arm_platform_config_t *pcfg = node->plat.arm.config;
+        cc_soc->rfcore.rx_rssi = rssi;
+        cc2538_rfcore_receive_byte(&cc_soc->rfcore, byte);
+        if (pcfg && pcfg->has_cc1200) {
+            cc_soc->cc1200.rx_rssi = rssi;
+            cc1200_receive_byte(&cc_soc->cc1200, byte);
         }
     }
+    if (nrf_soc)  nrf_radio_receive_byte(nrf_soc, byte);
+    if (nrfl_soc) nrf54l_radio_receive_byte(nrfl_soc, byte);
+}
+static bool arm_radio_rx_busy(void *m) { (void)m; return false; }
+static const mote_radio_ops_t arm_radio_ops = {
+    arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy
+};
+
+static int emulated_rxfifo_available(int idx) {
+    if (radio_bus.ops[idx])
+        return radio_bus.ops[idx]->rxfifo_available(radio_bus.mote[idx]);
     return 0;
 }
 
@@ -4047,6 +4093,19 @@ sim_restart:
     /* Set initial simulation speed from config */
     if (config_loaded && config.speed > 0)
         ui_speed_ratio = config.speed;
+
+    /* M9.3: register per-node radio endpoint ops on the bus.  Native/JS
+     * motes keep their bespoke frame paths (no byte-level chip model) —
+     * their slots stay NULL and the bus falls back accordingly. */
+    for (int i = 0; i < node_count; i++) {
+        if (nodes[i].type == NODE_MSP430) {
+            radio_bus.ops[i] = &msp_radio_ops;
+            radio_bus.mote[i] = &nodes[i];
+        } else if (nodes[i].type == NODE_ARM) {
+            radio_bus.ops[i] = &arm_radio_ops;
+            radio_bus.mote[i] = &nodes[i];
+        }
+    }
 
     /* Set up serial socket server for border-router tests */
     if (config_loaded && config.has_serial_socket) {

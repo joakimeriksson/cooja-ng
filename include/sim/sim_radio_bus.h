@@ -89,8 +89,26 @@ typedef struct {
     int count;
 } rf_outgoing_t;
 
+/* Mote radio endpoint ops (M9.3) — the bus delivers RF bytes through
+ * these instead of switching on node type.  Registered per node by the
+ * runner at init; folds into the full mote vtable in Phase 2. */
+typedef struct mote_radio_ops {
+    /* Deliver one on-air byte to every radio on this mote (multi-radio
+     * motes like Firefly fan out internally; chips whose framer doesn't
+     * recognize the preamble ignore the byte). */
+    void (*receive_byte)(void *mote, uint8_t byte, int8_t rssi);
+    /* Free RXFIFO bytes on the most-constrained radio; the bus queues
+     * frames that don't fit. */
+    int  (*rxfifo_available)(void *mote);
+    /* True while a frame is mid-reception (delivery now would corrupt
+     * it; the bus queues instead). */
+    bool (*rx_busy)(void *mote);
+} mote_radio_ops_t;
+
 /* The bus: all RF routing state, one instance per runtime. */
 typedef struct sim_radio_bus {
+    const mote_radio_ops_t *ops[SIM_RADIO_BUS_MAX_NODES];
+    void                   *mote[SIM_RADIO_BUS_MAX_NODES];
     rf_buffer_t        rf_pending[SIM_RADIO_BUS_MAX_NODES];   /* per-receiver byte staging   */
     tx_frame_asm_t     tx_asm[SIM_RADIO_BUS_MAX_NODES];       /* per-sender frame assembler  */
     tx_frame_capture_t tx_cap[SIM_RADIO_BUS_MAX_NODES];       /* sender-side frame capture   */
