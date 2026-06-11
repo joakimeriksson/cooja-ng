@@ -800,9 +800,21 @@ Only after these are done should plugin loading or config v2 become a priority.
 
 ### 3.16 Mote vtable milestones (canonical Phase 2 task list)
 
-> **Status: in progress.** Numbering continues from Phase 1. Stop condition
-> (from §9 Phase 2): dispatch abstraction only — no platform-init/boot logic
-> moves (that is Phase 4).
+> **Status: PHASE 2 COMPLETE.** M11 `0bf3d12`, M12 `f88b214`,
+> M13 `20a535e`, M14 `718faa6`, M15 `bc23459`, M16 `3444ab4`, M17
+> (slim) in the closing commit.  M17 was descoped after survey: the
+> receive_frame op landed (5 duplicated native/JS frame-RX sites →
+> 1 op), but the deep frame_complete de-typing turned out to be
+> chip-delivery policy entangled with CPU stepping, not vtable work —
+> converting its `type == NODE_NATIVE` tests to mode queries while the
+> bodies still poke plat.native gains nothing structural.  That work
+> moves to the Phase 5 remnants (frame delivery restructuring), along
+> with the threaded-mode `distribute_rf_outgoing` duplication.
+> Remaining type switches in the runner: registration/boot/init
+> (Phase 3/4), frame-delivery policy (Phase 5), end-of-run stats (by
+> design).  Numbering continues from Phase 1. Stop condition
+> (from §9 Phase 2): dispatch abstraction only — no platform-init/boot
+> logic moves (that is Phase 4).
 
 Design decisions locked for this phase:
 

@@ -692,6 +692,10 @@ static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
 static void *msp_mote_get_interface(sim_mote_t *m, int iface);
 static void *arm_mote_get_interface(sim_mote_t *m, int iface);
 static void *null_mote_get_interface(sim_mote_t *m, int iface);
+static void native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
+                                      int len, int64_t now_ns, int sender_idx);
+static void js_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
+                                  int len, int64_t now_ns, int sender_idx);
 
 /* Convenience: the mote's CC2420, or NULL for non-Sky motes (debug
  * traces + per-byte stats branch on this instead of node type). */
@@ -730,6 +734,7 @@ static const sim_mote_ops_t msp_mote_ops = {
     .ui_radio_state  = msp_mote_ui_radio_state,
     .ui_leds         = msp_mote_ui_leds,
     .get_interface   = msp_mote_get_interface,
+    .receive_frame   = NULL, /* per-byte / staged delivery */
 };
 
 /* ARM emulated motes */
@@ -762,6 +767,7 @@ static const sim_mote_ops_t arm_mote_ops = {
     .ui_radio_state  = NULL, /* CC2538 pushes state via async callback */
     .ui_leds         = arm_mote_ui_leds,
     .get_interface   = arm_mote_get_interface,
+    .receive_frame   = NULL, /* per-byte / staged delivery */
 };
 
 /* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
@@ -796,6 +802,7 @@ static const sim_mote_ops_t native_mote_ops = {
     .ui_radio_state  = NULL,
     .ui_leds         = NULL,
     .get_interface   = null_mote_get_interface,
+    .receive_frame   = native_mote_receive_frame,
 };
 
 /* JS app motes (same pseudo-cycle convention as native) */
@@ -822,6 +829,7 @@ static const sim_mote_ops_t js_mote_ops = {
     .ui_radio_state  = NULL,
     .ui_leds         = NULL,
     .get_interface   = null_mote_get_interface,
+    .receive_frame   = js_mote_receive_frame,
 };
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
@@ -2072,12 +2080,12 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                     }
                     stat_rx_frames_queued++;
                 }
-            } else if (nodes[i].type == NODE_JS) {
+            } else if (mote_store[i].ops->receive_frame) {
+                /* JS (or any future frame-consuming mote kind) — M17 op */
                 if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
-                    js_node_deliver_frame(&nodes[i].plat.js, frame, len,
-                                          sim_runtime_now_ns(&sim_rt));
-                    sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_runtime_now_ns(&sim_rt));
-                    stat_rx_frames_queued++;
+                    mote_store[i].ops->receive_frame(
+                        &mote_store[i], frame, len,
+                        sim_runtime_now_ns(&sim_rt), sender_idx);
                 }
             }
             /* Native/JS-to-emulated: handled via rf_tx_callback (byte stream) */
@@ -2115,22 +2123,14 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
             }
         }
     } else {
-        /* NONE: deliver to all other nodes */
+        /* NONE: deliver to all other frame-consuming nodes (M17 op;
+         * NULL = emulated, fed via the byte stream instead) */
         for (int i = 0; i < num_nodes; i++) {
             if (&nodes[i] == sender) continue;
-            if (nodes[i].type == NODE_NATIVE) {
-                native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-                if (q->count >= NATIVE_RX_QUEUE_SIZE)
-                    stat_rx_frames_queue_full++;
-                native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                     sim_runtime_now_ns(&sim_rt), sender_idx);
-                stat_rx_frames_queued++;
-            } else if (nodes[i].type == NODE_JS) {
-                js_node_deliver_frame(&nodes[i].plat.js, frame, len,
-                                      sim_runtime_now_ns(&sim_rt));
-                sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_runtime_now_ns(&sim_rt));
-                stat_rx_frames_queued++;
-            }
+            sim_mote_t *m = &mote_store[i];
+            if (m->ops->receive_frame)
+                m->ops->receive_frame(m, frame, len,
+                                      sim_runtime_now_ns(&sim_rt), sender_idx);
         }
     }
 }
@@ -2604,16 +2604,13 @@ static void distribute_rf_outgoing(void) {
                 neighbor_list_t *nl = &radio_medium.neighbors[sender];
                 for (int n = 0; n < nl->count; n++) {
                     int i = nl->neighbors[n];
-                    if (nodes[i].type == NODE_NATIVE) {
+                    sim_mote_t *m = &mote_store[i];
+                    if (m->ops->receive_frame) {
                         sync_native_node_channel(i);
-                        if (radio_medium_filter_frame(&radio_medium, sender, i)) {
-                            native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-                            if (q->count >= NATIVE_RX_QUEUE_SIZE)
-                                stat_rx_frames_queue_full++;
-                            native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                                 sim_runtime_now_ns(&sim_rt), sender);
-                            stat_rx_frames_queued++;
-                        }
+                        if (radio_medium_filter_frame(&radio_medium, sender, i))
+                            m->ops->receive_frame(m, frame, len,
+                                                  sim_runtime_now_ns(&sim_rt),
+                                                  sender);
                     }
                 }
                 /* Interference collision detection */
@@ -2648,14 +2645,11 @@ static void distribute_rf_outgoing(void) {
                 }
             } else {
                 for (int i = 0; i < num_nodes; i++) {
-                    if (i != sender && nodes[i].type == NODE_NATIVE) {
-                        native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-                        if (q->count >= NATIVE_RX_QUEUE_SIZE)
-                            stat_rx_frames_queue_full++;
-                        native_deliver_frame(&nodes[i].plat.native, frame, len,
-                                             sim_runtime_now_ns(&sim_rt), sender);
-                        stat_rx_frames_queued++;
-                    }
+                    sim_mote_t *m = &mote_store[i];
+                    if (i != sender && m->ops->receive_frame)
+                        m->ops->receive_frame(m, frame, len,
+                                              sim_runtime_now_ns(&sim_rt),
+                                              sender);
                 }
             }
         }
@@ -3410,6 +3404,26 @@ static void *arm_mote_get_interface(sim_mote_t *m, int iface) {
 static void *null_mote_get_interface(sim_mote_t *m, int iface) {
     (void)m; (void)iface;
     return NULL;
+}
+
+/* --- M17 frame-level RX adapters (frame-consuming motes only) --- */
+
+static void native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
+                                      int len, int64_t now_ns,
+                                      int sender_idx) {
+    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
+    if (nat->rx_queue.count >= NATIVE_RX_QUEUE_SIZE)
+        stat_rx_frames_queue_full++;
+    native_deliver_frame(nat, frame, len, now_ns, sender_idx);
+    stat_rx_frames_queued++;
+}
+
+static void js_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
+                                  int len, int64_t now_ns, int sender_idx) {
+    (void)sender_idx;
+    js_node_deliver_frame(&MOTE_IMPL(m)->plat.js, frame, len, now_ns);
+    sim_schedule_mote_wakeup_if_earlier(&sim_rt, MOTE_IDX(m), now_ns);
+    stat_rx_frames_queued++;
 }
 
 static void destroy_node(int idx) {

@@ -146,6 +146,16 @@ typedef struct sim_mote_ops {
      * The escape hatch for genuinely chip-specific code (GDB attach,
      * CC2420 debug traces) so it can stay type-blind at the call site. */
     void *(*get_interface)(sim_mote_t *m, int iface);
+
+    /* ---- M17: frame-level RX --------------------------------------- */
+
+    /* OPTIONAL (frame-consuming motes only — native Cooja + JS; NULL
+     * for emulated motes, which take per-byte / staged delivery):
+     * queue one received frame arriving at now_ns.  sender_idx feeds
+     * the native rx-queue's arrival bookkeeping; JS motes ignore it
+     * and self-schedule an immediate wakeup. */
+    void (*receive_frame)(sim_mote_t *m, const uint8_t *frame, int len,
+                          int64_t now_ns, int sender_idx);
 } sim_mote_ops_t;
 
 struct sim_mote {
