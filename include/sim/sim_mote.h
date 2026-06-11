@@ -95,6 +95,17 @@ typedef struct sim_mote_ops {
      * delivering a chip-level byte or timer at that instant.  Returns
      * the step_micros next-event lead in µs (deviation-corrected). */
     int64_t (*sync_to_time)(sim_mote_t *m, int64_t sim_ns);
+
+    /* ---- M14: serial input ---------------------------------------- */
+
+    /* Inject host-side serial bytes into the mote's console UART.
+     * Returns the number of bytes consumed (0 = mote not ready, caller
+     * retries later — the serial bridge ring keeps unconsumed bytes).
+     * Each adapter implements its platform's delivery contract:
+     * native = Cooja ContikiRS232 append + immediate wakeup, MSP430 =
+     * MSPSim baud-paced injection with CPU mini-steps, ARM = UART RX
+     * register feed, JS = swallowed (no console input). */
+    int (*serial_input)(sim_mote_t *m, const uint8_t *buf, int len);
 } sim_mote_ops_t;
 
 struct sim_mote {

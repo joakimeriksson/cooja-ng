@@ -671,6 +671,7 @@ static double get_time_ms(void) {
 static sim_mote_t mote_store[MAX_NODES];
 
 #define MOTE_IMPL(m) ((mixed_node_t *)(m)->impl)
+#define MOTE_IDX(m)  ((int)(MOTE_IMPL(m) - nodes))
 
 /* M12 execution-op adapters — bodies live next to the tick/step helpers
  * they wrap (after native_has_pending_work); tables below only need the
@@ -691,6 +692,10 @@ static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
 static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
+static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
+static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
+static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
+static int js_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 
 /* MSP430 emulated motes */
 static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
@@ -716,6 +721,7 @@ static const sim_mote_ops_t msp_mote_ops = {
     .advance_to_time = msp_mote_advance_to_time,
     .sched_hint_ns   = msp_mote_sched_hint_ns,
     .sync_to_time    = msp_mote_sync_to_time,
+    .serial_input    = msp_mote_serial_input,
 };
 
 /* ARM emulated motes */
@@ -742,6 +748,7 @@ static const sim_mote_ops_t arm_mote_ops = {
     .advance_to_time = arm_mote_advance_to_time,
     .sched_hint_ns   = arm_mote_sched_hint_ns,
     .sync_to_time    = arm_mote_sync_to_time,
+    .serial_input    = arm_mote_serial_input,
 };
 
 /* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
@@ -770,6 +777,7 @@ static const sim_mote_ops_t native_mote_ops = {
     .advance_to_time = native_mote_advance_to_time,
     .sched_hint_ns   = NULL, /* emulated motes only */
     .sync_to_time    = NULL, /* emulated motes only */
+    .serial_input    = native_mote_serial_input,
 };
 
 /* JS app motes (same pseudo-cycle convention as native) */
@@ -790,6 +798,7 @@ static const sim_mote_ops_t js_mote_ops = {
     .advance_to_time = js_mote_advance_to_time,
     .sched_hint_ns   = NULL, /* emulated motes only */
     .sync_to_time    = NULL, /* emulated motes only */
+    .serial_input    = js_mote_serial_input,
 };
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
@@ -2228,113 +2237,147 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
  * CC2538 UART directly — all of which need node internals until the
  * Phase 2 mote vtable provides a serial-input op. */
 
-/* Inject buf[0..len) into the bridged mote's serial input; returns the
- * number of bytes consumed (0 = mote not ready, bridge retries next poll).
- * For native motes: append into the mote's pending serial buffer (the
- * cooja rs232 backend has a fixed 2048-byte receive buffer).  For
- * emulated motes: inject byte-by-byte via UART RX. */
-static int ss_inject_into_node(void *user, const uint8_t *buf, int len) {
-    (void)user;
-    if (ss_node_idx < 0 || len <= 0) return 0;
+/* ============================================================
+ * M14: serial_input mote-op adapters + the single injection helper.
+ *
+ * One delivery contract per platform (bodies verbatim from the former
+ * ss_inject_into_node type switch, generalized from ss_node_idx to the
+ * mote's own slot).  All five former injection sites — the serial
+ * bridge callback and the four TEST_ACTION_SEND/SEND_ALL blocks —
+ * funnel through inject_serial().
+ * ============================================================ */
 
-    mixed_node_t *node = &nodes[ss_node_idx];
-    if (node->type == NODE_NATIVE) {
-        native_node_t *nat = &node->plat.native;
-        if (!nat->simSerialReceivingData ||
-            !nat->simSerialReceivingLength ||
-            !nat->simSerialReceivingFlag) return 0;
+/* Native motes: append into the mote's pending serial buffer (the
+ * cooja rs232 backend has a fixed 2048-byte receive buffer). */
+static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
+                                    int len) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    int idx = MOTE_IDX(m);
+    native_node_t *nat = &node->plat.native;
+    if (!nat->simSerialReceivingData ||
+        !nat->simSerialReceivingLength ||
+        !nat->simSerialReceivingFlag) return 0;
 
-        /* Match COOJA ContikiRS232: append new bytes into the mote's pending
-         * serial buffer even when simSerialReceivingFlag is already set, then
-         * request an immediate wakeup so the mote drains that buffer. */
-        int old_size = *nat->simSerialReceivingLength;
-        if (old_size < 0) old_size = 0;
-        if (old_size > 2048) old_size = 2048;
-        int space = 2048 - old_size;
-        if (space <= 0) {
-            if (num_threads == 0) {
-                int64_t wake_ns = nat->sim_time_ns;
-                if (node_start_ns[ss_node_idx] > wake_ns)
-                    wake_ns = node_start_ns[ss_node_idx];
-                sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
-            }
-            return 0;
-        }
-
-        int to_send = len;
-        if (to_send > space) to_send = space;
-        memcpy(nat->simSerialReceivingData + old_size, buf, (size_t)to_send);
-        *nat->simSerialReceivingLength = old_size + to_send;
-        *nat->simSerialReceivingFlag = 1;
-        if (nat->simProcessRunValue)
-            *nat->simProcessRunValue = 1;
-        /* Match COOJA's external serial delivery contract: once serial data
-         * is injected, the mote must be re-run at the current simulation
-         * time rather than waiting for a stale timer-based wakeup. This is
-         * the native equivalent of the immediate reschedule used for MSP430
-         * serial injection below. */
+    /* Match COOJA ContikiRS232: append new bytes into the mote's pending
+     * serial buffer even when simSerialReceivingFlag is already set, then
+     * request an immediate wakeup so the mote drains that buffer. */
+    int old_size = *nat->simSerialReceivingLength;
+    if (old_size < 0) old_size = 0;
+    if (old_size > 2048) old_size = 2048;
+    int space = 2048 - old_size;
+    if (space <= 0) {
         if (num_threads == 0) {
             int64_t wake_ns = nat->sim_time_ns;
-            if (node_start_ns[ss_node_idx] > wake_ns)
-                wake_ns = node_start_ns[ss_node_idx];
-            sim_schedule_mote_wakeup_if_earlier(&sim_rt, ss_node_idx, wake_ns);
+            if (node_start_ns[idx] > wake_ns)
+                wake_ns = node_start_ns[idx];
+            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, wake_ns);
         }
-        return to_send;
-    } else if (node->type == NODE_MSP430) {
-        /* Match MSPSim's MspSerial: inject ALL pending bytes at baud-rate
-         * intervals (69µs = 115200 baud), stepping CPU between each byte.
-         * Cooja queues all bytes and delivers them at baud-rate intervals
-         * with requestImmediateWakeup() after each.
-         *
-         * Set ticking_node_idx to prevent re-entrant cascade: if the CPU
-         * TX's during the baud-rate step, the delivery path must not
-         * sync this node back (same guard as tick_one_msp430). */
-        msp430_platform_t *plat = &node->plat.msp;
-        msp430_usart_t *console = (plat->config->console_usart == 0)
-            ? &plat->usart0 : &plat->usart1;
-        bool has_dma = (console->dma_trigger != NULL);
-        if (!has_dma) {
-            if (!console->ie_ptr ||
-                !(*console->ie_ptr & console->ie_rx_mask))
-                return 0;  /* firmware hasn't enabled UART RX yet */
-        }
-        int baud_cycles = (int)((int64_t)node_freq(ss_node_idx) * 69 / 1000000);
-        if (baud_cycles < 200) baud_cycles = 200;
-        int consumed = 0;
-        ticking_node_idx = ss_node_idx;
-        while (consumed < len) {
-            if (!has_dma) {
-                /* Wait for RXIFG clear (firmware consumed previous byte) */
-                if (console->ifg_ptr &&
-                    (*console->ifg_ptr & console->ifg_rx_mask))
-                    break;  /* try again next poll */
-            }
-            msp430_usart_receive_byte(console, buf[consumed]);
-            consumed++;
-            step_node_until(ss_node_idx,
-                node_cycles(ss_node_idx) + baud_cycles);
-        }
-        ticking_node_idx = -1;
-        /* Sync last_execute_us and re-schedule in event queue.
-         * Without this, the node's sim_eq entry is stale and the
-         * trickle timer / other events scheduled during injection
-         * won't fire until the old wakeup time.  Matches Cooja's
-         * requestImmediateWakeup() after serial byte delivery. */
-        if (consumed > 0) {
-            msp430_cpu_t *cpu = &node->plat.msp.cpu;
-            cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
-                cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
-            if (num_threads == 0)
-                schedule_emulated_wakeup(&sim_rt, ss_node_idx);
-        }
-        return consumed;
-    } else if (node->type == NODE_ARM) {
-        cc2538_soc_t *soc = arm_platform_cc2538(&node->plat.arm);
-        for (int i = 0; i < len; i++)
-            cc2538_uart_receive_byte(&soc->uart0, buf[i]);
-        return len;
+        return 0;
     }
-    return len;  /* unknown node type — swallow so the ring drains */
+
+    int to_send = len;
+    if (to_send > space) to_send = space;
+    memcpy(nat->simSerialReceivingData + old_size, buf, (size_t)to_send);
+    *nat->simSerialReceivingLength = old_size + to_send;
+    *nat->simSerialReceivingFlag = 1;
+    if (nat->simProcessRunValue)
+        *nat->simProcessRunValue = 1;
+    /* Match COOJA's external serial delivery contract: once serial data
+     * is injected, the mote must be re-run at the current simulation
+     * time rather than waiting for a stale timer-based wakeup. This is
+     * the native equivalent of the immediate reschedule used for MSP430
+     * serial injection below. */
+    if (num_threads == 0) {
+        int64_t wake_ns = nat->sim_time_ns;
+        if (node_start_ns[idx] > wake_ns)
+            wake_ns = node_start_ns[idx];
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, wake_ns);
+    }
+    return to_send;
+}
+
+/* MSP430: match MSPSim's MspSerial — inject ALL pending bytes at
+ * baud-rate intervals (69µs = 115200 baud), stepping CPU between each
+ * byte.  Cooja queues all bytes and delivers them at baud-rate
+ * intervals with requestImmediateWakeup() after each.
+ *
+ * Set ticking_node_idx to prevent re-entrant cascade: if the CPU TX's
+ * during the baud-rate step, the delivery path must not sync this node
+ * back (same guard as tick_one_msp430). */
+static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
+                                 int len) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    int idx = MOTE_IDX(m);
+    msp430_platform_t *plat = &node->plat.msp;
+    msp430_usart_t *console = (plat->config->console_usart == 0)
+        ? &plat->usart0 : &plat->usart1;
+    bool has_dma = (console->dma_trigger != NULL);
+    if (!has_dma) {
+        if (!console->ie_ptr ||
+            !(*console->ie_ptr & console->ie_rx_mask))
+            return 0;  /* firmware hasn't enabled UART RX yet */
+    }
+    int baud_cycles = (int)((int64_t)node_freq(idx) * 69 / 1000000);
+    if (baud_cycles < 200) baud_cycles = 200;
+    int consumed = 0;
+    ticking_node_idx = idx;
+    while (consumed < len) {
+        if (!has_dma) {
+            /* Wait for RXIFG clear (firmware consumed previous byte) */
+            if (console->ifg_ptr &&
+                (*console->ifg_ptr & console->ifg_rx_mask))
+                break;  /* try again next poll */
+        }
+        msp430_usart_receive_byte(console, buf[consumed]);
+        consumed++;
+        step_node_until(idx, node_cycles(idx) + baud_cycles);
+    }
+    ticking_node_idx = -1;
+    /* Sync last_execute_us and re-schedule in event queue.
+     * Without this, the node's sim_eq entry is stale and the
+     * trickle timer / other events scheduled during injection
+     * won't fire until the old wakeup time.  Matches Cooja's
+     * requestImmediateWakeup() after serial byte delivery. */
+    if (consumed > 0) {
+        msp430_cpu_t *cpu = &node->plat.msp.cpu;
+        cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
+            cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
+        if (num_threads == 0)
+            schedule_emulated_wakeup(&sim_rt, idx);
+    }
+    return consumed;
+}
+
+/* ARM: feed the console UART RX register directly.  (CC2538-family
+ * boards only — the cc2538_soc lookup matches the pre-M14 behavior;
+ * Nordic consoles are output-only today.) */
+static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
+                                 int len) {
+    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
+    for (int i = 0; i < len; i++)
+        cc2538_uart_receive_byte(&soc->uart0, buf[i]);
+    return len;
+}
+
+/* JS motes have no console input — swallow so the bridge ring drains. */
+static int js_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
+                                int len) {
+    (void)m; (void)buf;
+    return len;
+}
+
+/* The single serial-injection entry point: dispatch to the mote's
+ * platform delivery contract.  Returns bytes consumed. */
+static int inject_serial(int idx, const uint8_t *buf, int len) {
+    if (idx < 0 || idx >= num_nodes || len <= 0) return 0;
+    sim_mote_t *m = &mote_store[idx];
+    return m->ops->serial_input(m, buf, len);
+}
+
+/* Serial-bridge callback: inject into the bridged node. */
+static int ss_inject_into_node(void *user, const uint8_t *buf, int len) {
+    (void)user;
+    return inject_serial(ss_node_idx, buf, len);
 }
 
 static void ss_cleanup(void) {
@@ -3581,8 +3624,6 @@ static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
  * slot; they take the mote pointer directly in Phase 4.
  * ============================================================ */
 
-#define MOTE_IDX(m) ((int)(MOTE_IMPL(m) - nodes))
-
 /* --- step_until: mote-unit stepping (cycles emulated, ns native/JS) --- */
 
 static void msp_mote_step_until(sim_mote_t *m, int64_t target) {
@@ -4557,24 +4598,13 @@ sim_restart:
                         }
                     }
                 } else if (act->type == TEST_ACTION_SEND) {
-                    /* Find node index by ID and send data via serial input */
+                    /* Find node index by ID and send data via serial input
+                     * (M14: one platform-dispatched path; natives get the
+                     * Cooja append + immediate-wakeup contract). */
                     for (int i = 0; i < node_count; i++) {
                         if (nodes[i].id == act->node) {
-                            if (nodes[i].type == NODE_ARM) {
-                                for (int b = 0; act->data[b]; b++)
-                                    cc2538_uart_receive_byte(
-                                        &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
-                                        (uint8_t)act->data[b]);
-                            } else if (nodes[i].type == NODE_NATIVE) {
-                                native_node_t *nat = &nodes[i].plat.native;
-                                if (nat->simSerialReceivingData) {
-                                    int len = (int)strlen(act->data);
-                                    memcpy(nat->simSerialReceivingData,
-                                           act->data, (size_t)len);
-                                    *nat->simSerialReceivingLength = len;
-                                    *nat->simSerialReceivingFlag = 1;
-                                }
-                            }
+                            inject_serial(i, (const uint8_t *)act->data,
+                                          (int)strlen(act->data));
                             if (verbose)
                                 printf("  ACTION: send to node %d \"%s\" at %lld ms\n",
                                        act->node, act->data,
@@ -4587,21 +4617,8 @@ sim_restart:
                     for (int i = 0; i < node_count; i++) {
                         if (node_start_ns[i] > sim_ns)
                             continue;  /* not yet started or removed */
-                        if (nodes[i].type == NODE_ARM) {
-                            for (int b = 0; act->data[b]; b++)
-                                cc2538_uart_receive_byte(
-                                    &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
-                                    (uint8_t)act->data[b]);
-                        } else if (nodes[i].type == NODE_NATIVE) {
-                            native_node_t *nat = &nodes[i].plat.native;
-                            if (nat->simSerialReceivingData) {
-                                int len = (int)strlen(act->data);
-                                memcpy(nat->simSerialReceivingData,
-                                       act->data, (size_t)len);
-                                *nat->simSerialReceivingLength = len;
-                                *nat->simSerialReceivingFlag = 1;
-                            }
-                        }
+                        inject_serial(i, (const uint8_t *)act->data,
+                                      (int)strlen(act->data));
                     }
                     if (verbose)
                         printf("  ACTION: send_all \"%s\" at %lld ms\n",
@@ -4655,25 +4672,15 @@ sim_restart:
             for (int ja = 0; ja < js_act_count; ja++) {
                 const sim_test_action_t *act = &js_actions[ja];
                 if (act->type == TEST_ACTION_SEND) {
+                    /* M14: same platform-dispatched injection as the JSON
+                     * action path.  Natives now use the Cooja append +
+                     * immediate-wakeup contract instead of overwrite +
+                     * synchronous step — the wakeup fires in the next pump
+                     * at the mote's own sim time. */
                     for (int i = 0; i < node_count; i++) {
                         if (nodes[i].id == act->node) {
-                            if (nodes[i].type == NODE_ARM) {
-                                for (int b = 0; act->data[b]; b++)
-                                    cc2538_uart_receive_byte(
-                                        &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
-                                        (uint8_t)act->data[b]);
-                            } else if (nodes[i].type == NODE_NATIVE) {
-                                native_node_t *nat = &nodes[i].plat.native;
-                                if (nat->simSerialReceivingData) {
-                                    int len = (int)strlen(act->data);
-                                    memcpy(nat->simSerialReceivingData, act->data, (size_t)len);
-                                    *nat->simSerialReceivingLength = len;
-                                    *nat->simSerialReceivingFlag = 1;
-                                    /* Step the node so it processes the serial input */
-                                    *nat->simProcessRunValue = 1;
-                                    step_node_until(i, sim_ns);
-                                }
-                            }
+                            inject_serial(i, (const uint8_t *)act->data,
+                                          (int)strlen(act->data));
                             if (verbose)
                                 printf("  JS ACTION: send node %d \"%s\"\n",
                                        act->node, act->data);
@@ -4683,22 +4690,8 @@ sim_restart:
                 } else if (act->type == TEST_ACTION_SEND_ALL) {
                     for (int i = 0; i < node_count; i++) {
                         if (node_start_ns[i] > sim_ns) continue;
-                        if (nodes[i].type == NODE_ARM) {
-                            for (int b = 0; act->data[b]; b++)
-                                cc2538_uart_receive_byte(
-                                    &arm_platform_cc2538(&nodes[i].plat.arm)->uart0,
-                                    (uint8_t)act->data[b]);
-                        } else if (nodes[i].type == NODE_NATIVE) {
-                            native_node_t *nat = &nodes[i].plat.native;
-                            if (nat->simSerialReceivingData) {
-                                int len = (int)strlen(act->data);
-                                memcpy(nat->simSerialReceivingData, act->data, (size_t)len);
-                                *nat->simSerialReceivingLength = len;
-                                *nat->simSerialReceivingFlag = 1;
-                                *nat->simProcessRunValue = 1;
-                                step_node_until(i, sim_ns);
-                            }
-                        }
+                        inject_serial(i, (const uint8_t *)act->data,
+                                      (int)strlen(act->data));
                     }
                     if (verbose)
                         printf("  JS ACTION: send_all \"%s\"\n", act->data);
