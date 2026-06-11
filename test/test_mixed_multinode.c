@@ -689,6 +689,8 @@ static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static void js_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
+static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
+static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
 
 /* MSP430 emulated motes */
 static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
@@ -713,6 +715,7 @@ static const sim_mote_ops_t msp_mote_ops = {
     .step_until      = msp_mote_step_until,
     .advance_to_time = msp_mote_advance_to_time,
     .sched_hint_ns   = msp_mote_sched_hint_ns,
+    .sync_to_time    = msp_mote_sync_to_time,
 };
 
 /* ARM emulated motes */
@@ -738,6 +741,7 @@ static const sim_mote_ops_t arm_mote_ops = {
     .step_until      = arm_mote_step_until,
     .advance_to_time = arm_mote_advance_to_time,
     .sched_hint_ns   = arm_mote_sched_hint_ns,
+    .sync_to_time    = arm_mote_sync_to_time,
 };
 
 /* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
@@ -765,6 +769,7 @@ static const sim_mote_ops_t native_mote_ops = {
     .step_until      = native_mote_step_until,
     .advance_to_time = native_mote_advance_to_time,
     .sched_hint_ns   = NULL, /* emulated motes only */
+    .sync_to_time    = NULL, /* emulated motes only */
 };
 
 /* JS app motes (same pseudo-cycle convention as native) */
@@ -784,6 +789,7 @@ static const sim_mote_ops_t js_mote_ops = {
     .step_until      = js_mote_step_until,
     .advance_to_time = js_mote_advance_to_time,
     .sched_hint_ns   = NULL, /* emulated motes only */
+    .sync_to_time    = NULL, /* emulated motes only */
 };
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
@@ -836,8 +842,6 @@ static const char *node_type_str(int idx) {
 static void mixed_deliver_rf_bytes(int idx);
 static void step_node_until(int idx, int64_t target);
 static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx);
-static int64_t sync_msp430_to_time(int idx, int64_t sim_ns);
-static int64_t sync_arm_to_time(int idx, int64_t sim_ns);
 
 /* Check available RXFIFO space for an emulated node. Firefly nodes have
  * two radios; we report the more constrained side so back-pressure
@@ -1034,62 +1038,65 @@ static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
     stat_emu_rx_queued++;
 }
 
-/* Process a SIM_EV_RX_BYTE event for an MSP430 receiver. Mirrors Cooja's
+/* Process a SIM_EV_RX_BYTE event for an emulated receiver (M13: one
+ * type-blind path for MSP430 and ARM).  Mirrors Cooja's
  * MspMoteTimeEvent: execute(t, 0) to advance the receiver's clock, then
  * receivedByte(), then requestImmediateWakeup. */
-static void deliver_msp430_rx_byte(const sim_event_t *ev) {
-    if (ev->node_idx < 0 || ev->node_idx >= num_nodes ||
-        !node_active(ev->node_idx) || nodes[ev->node_idx].type != NODE_MSP430)
+static void deliver_rx_byte(const sim_event_t *ev) {
+    int idx = ev->node_idx;
+    if (idx < 0 || idx >= num_nodes || !node_active(idx))
         return;
-    stat_msp_byte_pop[ev->node_idx]++;
-    if (ev->sender_idx >= 0 && ev->sender_idx < num_nodes &&
-        nodes[ev->sender_idx].id == 2 && nodes[ev->node_idx].id == 1) {
-        stat_msp_byte_pop_2_to_1++;
+    sim_mote_t *m = &mote_store[idx];
+    if (!m->ops->sync_to_time)
+        return;  /* RX_BYTE events only target emulated motes */
+
+    /* MSP430-only byte-flow stats + CC2420 TSCH-ACK trace.  The chip
+     * state peek goes through get_interface in M16; the type test stays
+     * local to this debug block until then. */
+    bool is_msp = (nodes[idx].type == NODE_MSP430);
+    if (is_msp) {
+        stat_msp_byte_pop[idx]++;
+        if (ev->sender_idx >= 0 && ev->sender_idx < num_nodes &&
+            nodes[ev->sender_idx].id == 2 && nodes[idx].id == 1) {
+            stat_msp_byte_pop_2_to_1++;
+        }
     }
-    int64_t returned_us = sync_msp430_to_time(ev->node_idx, ev->time_ns);
-    cc2420_radio_state_t old_state = nodes[ev->node_idx].plat.msp.cc2420.state;
-    if (trace_tsch_ack_enabled() &&
-        nodes[ev->node_idx].id > 0 && nodes[ev->node_idx].id <= 2) {
-        trace_tsch_ack_log("byte event node=%d byte=%02x t=%.6f state_before=%s",
-                           nodes[ev->node_idx].id,
-                           ev->byte, (double)ev->time_ns / 1e9,
-                           cc2420_state_str(old_state));
+
+    int64_t returned_us = m->ops->sync_to_time(m, ev->time_ns);
+
+    cc2420_radio_state_t old_state = CC2420_VREG_OFF;
+    if (is_msp) {
+        old_state = nodes[idx].plat.msp.cc2420.state;
+        if (trace_tsch_ack_enabled() &&
+            nodes[idx].id > 0 && nodes[idx].id <= 2) {
+            trace_tsch_ack_log("byte event node=%d byte=%02x t=%.6f state_before=%s",
+                               nodes[idx].id,
+                               ev->byte, (double)ev->time_ns / 1e9,
+                               cc2420_state_str(old_state));
+        }
     }
-    radio_receive_byte(ev->node_idx, ev->byte, ev->rssi);
-    cc2420_radio_state_t new_state = nodes[ev->node_idx].plat.msp.cc2420.state;
-    if (trace_tsch_ack_enabled() &&
-        nodes[ev->node_idx].id > 0 && nodes[ev->node_idx].id <= 2 &&
-        new_state != old_state) {
-        trace_tsch_ack_log("byte event node=%d state %s -> %s",
-                           nodes[ev->node_idx].id,
-                           cc2420_state_str(old_state),
-                           cc2420_state_str(new_state));
+
+    radio_receive_byte(idx, ev->byte, ev->rssi);
+
+    if (is_msp) {
+        cc2420_radio_state_t new_state = nodes[idx].plat.msp.cc2420.state;
+        if (trace_tsch_ack_enabled() &&
+            nodes[idx].id > 0 && nodes[idx].id <= 2 &&
+            new_state != old_state) {
+            trace_tsch_ack_log("byte event node=%d state %s -> %s",
+                               nodes[idx].id,
+                               cc2420_state_str(old_state),
+                               cc2420_state_str(new_state));
+        }
     }
+
     if (num_threads == 0) {
         /* Match Cooja's MspMoteTimeEvent + requestImmediateWakeup:
          * execute(t, 0) first, then receivedByte(), then a same-time mote
          * wakeup request. Also retain the next wakeup returned by execute. */
         int64_t next_ns = ev->time_ns + returned_us * 1000LL;
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, next_ns);
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, ev->time_ns);
-    }
-}
-
-/* ARM equivalent of deliver_msp430_rx_byte — Cooja MspMoteTimeEvent pattern:
- * advance receiver CPU to byte's air time, feed byte to on-die radio,
- * request immediate wakeup. */
-static void deliver_arm_rx_byte(const sim_event_t *ev) {
-    if (ev->node_idx < 0 || ev->node_idx >= num_nodes ||
-        !node_active(ev->node_idx) || nodes[ev->node_idx].type != NODE_ARM)
-        return;
-    int64_t returned_us = sync_arm_to_time(ev->node_idx, ev->time_ns);
-
-    radio_receive_byte(ev->node_idx, ev->byte, ev->rssi);
-
-    if (num_threads == 0) {
-        int64_t next_ns = ev->time_ns + returned_us * 1000LL;
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, next_ns);
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, ev->node_idx, ev->time_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, next_ns);
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, ev->time_ns);
     }
 }
 
@@ -1106,10 +1113,9 @@ static void deliver_radio_timer(const sim_event_t *ev) {
         return;
     if (!sim_radio_bus_rx_stall_expired(&radio_bus, &sim_rt, idx, ev->time_ns))
         return;  /* deadline extended; bus re-armed */
-    if (nodes[idx].type == NODE_ARM)
-        sync_arm_to_time(idx, ev->time_ns);
-    else if (nodes[idx].type == NODE_MSP430)
-        sync_msp430_to_time(idx, ev->time_ns);
+    sim_mote_t *m = &mote_store[idx];
+    if (m->ops->sync_to_time)
+        m->ops->sync_to_time(m, ev->time_ns);
     radio_bus.ops[idx]->rx_stall(radio_bus.mote[idx]);
     if (num_threads == 0)
         sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, ev->time_ns);
@@ -1117,11 +1123,15 @@ static void deliver_radio_timer(const sim_event_t *ev) {
 
 /* byte_period_ns lives in sim_radio_bus.h (M9.1) */
 
-static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
+/* M13: sync_to_time op adapters (Cooja MspMoteTimeEvent.execute(t, 0)).
+ * Emulated motes only; the RX-byte/radio-timer delivery paths dispatch
+ * through ops->sync_to_time and treat NULL as "not an emulated mote". */
+static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
+    mixed_node_t *node = MOTE_IMPL(m);
     /* Cap to global sim time — no node should advance past it (Cooja invariant) */
     if (sim_ns > sim_runtime_now_ns(&sim_rt))
         sim_ns = sim_runtime_now_ns(&sim_rt);
-    msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
+    msp430_cpu_t *cpu = &node->plat.msp.cpu;
     int64_t t_us = sim_ns / 1000LL;
     int64_t jump_us = 0;
 
@@ -1131,7 +1141,7 @@ static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
     }
 
     /* Apply clock deviation (same as tick_one_msp430) */
-    double deviation = nodes[idx].clock_deviation;
+    double deviation = node->clock_deviation;
     if (deviation != 1.0 && jump_us > 0) {
         double exact = (double)jump_us * deviation;
         jump_us = (int64_t)exact;
@@ -1155,19 +1165,20 @@ static int64_t sync_msp430_to_time(int idx, int64_t sim_ns) {
     return returned_us;
 }
 
-/* ARM equivalent of sync_msp430_to_time — Cooja MspMoteTimeEvent.execute
+/* ARM equivalent of msp_mote_sync_to_time — Cooja MspMoteTimeEvent.execute
  * pattern: advance CPU to event time before feeding chip-level byte. */
-static int64_t sync_arm_to_time(int idx, int64_t sim_ns) {
+static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
+    mixed_node_t *node = MOTE_IMPL(m);
     if (sim_ns > sim_runtime_now_ns(&sim_rt))
         sim_ns = sim_runtime_now_ns(&sim_rt);
-    arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
+    arm_cpu_t *cpu = &node->plat.arm.cpu;
     int64_t t_us = sim_ns / 1000LL;
     int64_t jump_us = 0;
     if (cpu->last_execute_us >= 0) {
         jump_us = t_us - cpu->last_execute_us;
         if (jump_us < 0) jump_us = 0;
     }
-    double deviation = nodes[idx].clock_deviation;
+    double deviation = node->clock_deviation;
     if (deviation != 1.0 && jump_us > 0) {
         double exact = (double)jump_us * deviation;
         jump_us = (int64_t)exact;
@@ -1248,7 +1259,7 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
              * each byte is preceded by execute(t, 0) at the byte's air time. */
             for (int j = 0; j < len; j++) {
                 int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
-                sync_msp430_to_time(idx, byte_time_ns);
+                msp_mote_sync_to_time(&mote_store[idx], byte_time_ns);
                 radio_receive_byte(idx, data[j], rssi);
                 last_byte_ns = byte_time_ns;
             }
@@ -3879,12 +3890,8 @@ static void mixed_dispatch_event(void *user, const sim_event_t *ev) {
         return;
     case SIM_EV_RX_BYTE:
         /* Cooja-style per-byte delivery — same MspMoteTimeEvent pattern
-         * for MSP430 and ARM receivers. */
-        if (ev->node_idx >= 0 && ev->node_idx < num_nodes &&
-            nodes[ev->node_idx].type == NODE_ARM)
-            deliver_arm_rx_byte(ev);
-        else
-            deliver_msp430_rx_byte(ev);
+         * for every emulated receiver (M13: type-blind). */
+        deliver_rx_byte(ev);
         return;
     case SIM_EV_RADIO_TIMER:
         /* Radio-bus RF timer (M9.5): RX-stall deadline. */

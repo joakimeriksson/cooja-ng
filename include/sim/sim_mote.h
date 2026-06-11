@@ -85,6 +85,16 @@ typedef struct sim_mote_ops {
      * unmasked interrupts).  Used after out-of-slice activity (serial
      * injection, queued-frame drain) re-arms the mote's wakeup. */
     int64_t (*sched_hint_ns)(const sim_mote_t *m, int64_t base_ns);
+
+    /* ---- M13: event-time synchronization -------------------------- */
+
+    /* OPTIONAL (emulated motes only, NULL otherwise): Cooja
+     * MspMoteTimeEvent.execute(t) equivalent — advance the CPU to event
+     * time `sim_ns` with a zero-duration execute(t, 0) (clock deviation
+     * applied, sim_time pinned, capped to the kernel's now_ns) before
+     * delivering a chip-level byte or timer at that instant.  Returns
+     * the step_micros next-event lead in µs (deviation-corrected). */
+    int64_t (*sync_to_time)(sim_mote_t *m, int64_t sim_ns);
 } sim_mote_ops_t;
 
 struct sim_mote {
