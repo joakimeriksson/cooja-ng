@@ -29,6 +29,15 @@ extern "C" {
 
 typedef struct sim_mote sim_mote_t;
 
+/* Typed-interface ids for sim_mote_ops_t.get_interface (M16).  An
+ * adapter returns the requested chip/CPU pointer or NULL when the mote
+ * kind doesn't carry that interface — callers branch on NULL instead of
+ * on node type. */
+typedef enum sim_mote_iface {
+    SIM_MOTE_IFACE_ARM_CPU = 1,  /* arm_cpu_t*  — GDB stub attach    */
+    SIM_MOTE_IFACE_CC2420  = 2,  /* cc2420_t*   — CC2420 chip state  */
+} sim_mote_iface_t;
+
 typedef struct sim_mote_ops {
     /* Short human-readable kind tag ("MSP430", "ARM", "NATIVE", "JS").
      * Used for logs/UI only — never compare against it to branch
@@ -119,6 +128,24 @@ typedef struct sim_mote_ops {
      * instead of catching up from t=0.  Emulated motes also re-derive
      * the cycle counter from the new time. */
     void (*reset_time)(sim_mote_t *m, int64_t now_ns);
+
+    /* ---- M16: introspection ---------------------------------------- */
+
+    /* OPTIONAL: UI radio activity poll, returning sim_radio_state_t
+     * values (ui/sim_state.h) as int.  Only motes whose radio state is
+     * sampled by polling implement this (MSP430/CC2420); platforms that
+     * push state through an async callback (CC2538 rfcore) leave it
+     * NULL so the poll never double-reports. */
+    int (*ui_radio_state)(const sim_mote_t *m);
+
+    /* OPTIONAL: current LED levels into leds[0..2] (platform mapping:
+     * Sky P5.4-6, CC2538DK PC0-2).  NULL = mote has no observable LEDs. */
+    void (*ui_leds)(const sim_mote_t *m, uint8_t leds[3]);
+
+    /* Typed interface lookup — returns the requested pointer or NULL.
+     * The escape hatch for genuinely chip-specific code (GDB attach,
+     * CC2420 debug traces) so it can stay type-blind at the call site. */
+    void *(*get_interface)(sim_mote_t *m, int iface);
 } sim_mote_ops_t;
 
 struct sim_mote {

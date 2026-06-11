@@ -89,6 +89,11 @@ typedef struct {
 /* emu_rx_frame_t / emu_rx_queue_t live in sim_radio_bus.h (M9.1) */
 
 static mixed_node_t nodes[MAX_NODES];
+/* Kernel-facing mote objects (Phase 2, M11) — one per slot, bound to
+ * nodes[] by register_node_mote().  Adapter tables live further down. */
+static sim_mote_t mote_store[MAX_NODES];
+#define MOTE_IMPL(m) ((mixed_node_t *)(m)->impl)
+#define MOTE_IDX(m)  ((int)(MOTE_IMPL(m) - nodes))
 static int ticking_node_idx = -1;  /* node currently inside tick_one_msp430 (re-entrancy guard) */
 static int64_t tick_one_msp430(int idx, int64_t sim_ns);  /* forward decl */
 
@@ -441,26 +446,14 @@ static void mixed_rf_state_handler(void *user_data, int old_state, int new_state
 
 /* Track per-node radio state for timeline events */
 static void update_radio_state(int idx) {
-    sim_radio_state_t new_state = SIM_RADIO_OFF;
-    if (nodes[idx].type == NODE_MSP430) {
-        cc2420_radio_state_t rs = nodes[idx].plat.msp.cc2420.state;
-        if (rs >= CC2420_TX_CALIBRATE && rs <= CC2420_TX_UNDERFLOW)
-            new_state = SIM_RADIO_TX;
-        else if (rs == CC2420_RX_FRAME)
-            new_state = SIM_RADIO_RX;       /* actively receiving data (green) */
-        else if (rs == CC2420_RX_CALIBRATE || rs == CC2420_RX_SFD_SEARCH)
-            new_state = SIM_RADIO_ON;       /* on, listening (gray) */
-        /* else: VREG_OFF, POWER_DOWN, IDLE -> OFF (white) */
-    } else if (nodes[idx].type == NODE_ARM) {
-        rf_state_t rs = arm_platform_cc2538(&nodes[idx].plat.arm)->rfcore.state;
-        if (rs >= RF_STATE_TX_CALIBR && rs <= RF_STATE_TX_FINAL)
-            new_state = SIM_RADIO_TX;
-        else if (rs == RF_STATE_RX)
-            new_state = SIM_RADIO_RX;       /* actively receiving data (green) */
-        else if (rs == RF_STATE_RX_CALIBR || rs == RF_STATE_SFD_WAIT)
-            new_state = SIM_RADIO_ON;       /* on, listening (gray) */
-        /* else: IDLE -> OFF (white) */
-    }
+    /* M16: poll the mote's ui_radio_state op.  NULL op = this mote kind
+     * is not state-polled (CC2538 pushes through an async callback;
+     * natives/JS have no chip model to sample). */
+    const sim_mote_t *m = &mote_store[idx];
+    if (!m->ops->ui_radio_state)
+        return;
+    sim_radio_state_t new_state =
+        (sim_radio_state_t)m->ops->ui_radio_state(m);
     if (new_state != node_states[idx].radio_state) {
         node_states[idx].radio_state = new_state;
         if (ui_server) {
@@ -477,21 +470,15 @@ static void update_radio_state(int idx) {
     }
 }
 
-/* Track LED state changes for Tmote Sky (P5.4=green, P5.5=yellow, P5.6=red)
- * and CC2538DK (PC0=red, PC1=yellow, PC2=green) */
+/* Track LED state changes (M16: ui_leds op; platform mapping lives in
+ * the adapters — Tmote Sky P5.4-6, CC2538DK PC0-2).  NULL op = no
+ * observable LEDs for this mote kind. */
 static void update_led_state(int idx) {
+    const sim_mote_t *m = &mote_store[idx];
+    if (!m->ops->ui_leds)
+        return;
     uint8_t leds[SIM_MAX_LEDS] = {0, 0, 0};
-    if (nodes[idx].type == NODE_MSP430) {
-        uint8_t p5out = nodes[idx].plat.msp.gpio.ports[4].out;
-        leds[0] = (p5out >> 4) & 1;  /* green  = P5.4 */
-        leds[1] = (p5out >> 5) & 1;  /* yellow = P5.5 */
-        leds[2] = (p5out >> 6) & 1;  /* red    = P5.6 */
-    } else if (nodes[idx].type == NODE_ARM) {
-        uint32_t pc_data = arm_platform_cc2538(&nodes[idx].plat.arm)->gpio.ports[2].data;
-        leds[0] = (pc_data >> 0) & 1;  /* red */
-        leds[1] = (pc_data >> 1) & 1;  /* yellow */
-        leds[2] = (pc_data >> 2) & 1;  /* green */
-    }
+    m->ops->ui_leds(m, leds);
     for (int l = 0; l < SIM_MAX_LEDS; l++) {
         if (leds[l] != node_states[idx].led[l]) {
             node_states[idx].led[l] = leds[l];
@@ -668,11 +655,6 @@ static double get_time_ms(void) {
  * switch arms; they stay in this file until Phase 4 (boot policy move).
  * ============================================================ */
 
-static sim_mote_t mote_store[MAX_NODES];
-
-#define MOTE_IMPL(m) ((mixed_node_t *)(m)->impl)
-#define MOTE_IDX(m)  ((int)(MOTE_IMPL(m) - nodes))
-
 /* M12 execution-op adapters — bodies live next to the tick/step helpers
  * they wrap (after native_has_pending_work); tables below only need the
  * prototypes. */
@@ -704,6 +686,19 @@ static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static void js_mote_reset_time(sim_mote_t *m, int64_t now_ns);
+static int msp_mote_ui_radio_state(const sim_mote_t *m);
+static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
+static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
+static void *msp_mote_get_interface(sim_mote_t *m, int iface);
+static void *arm_mote_get_interface(sim_mote_t *m, int iface);
+static void *null_mote_get_interface(sim_mote_t *m, int iface);
+
+/* Convenience: the mote's CC2420, or NULL for non-Sky motes (debug
+ * traces + per-byte stats branch on this instead of node type). */
+static inline cc2420_t *mote_cc2420(int idx) {
+    sim_mote_t *m = &mote_store[idx];
+    return (cc2420_t *)m->ops->get_interface(m, SIM_MOTE_IFACE_CC2420);
+}
 
 /* MSP430 emulated motes */
 static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
@@ -732,6 +727,9 @@ static const sim_mote_ops_t msp_mote_ops = {
     .serial_input    = msp_mote_serial_input,
     .destroy         = msp_mote_destroy,
     .reset_time      = msp_mote_reset_time,
+    .ui_radio_state  = msp_mote_ui_radio_state,
+    .ui_leds         = msp_mote_ui_leds,
+    .get_interface   = msp_mote_get_interface,
 };
 
 /* ARM emulated motes */
@@ -761,6 +759,9 @@ static const sim_mote_ops_t arm_mote_ops = {
     .serial_input    = arm_mote_serial_input,
     .destroy         = arm_mote_destroy,
     .reset_time      = arm_mote_reset_time,
+    .ui_radio_state  = NULL, /* CC2538 pushes state via async callback */
+    .ui_leds         = arm_mote_ui_leds,
+    .get_interface   = arm_mote_get_interface,
 };
 
 /* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
@@ -792,6 +793,9 @@ static const sim_mote_ops_t native_mote_ops = {
     .serial_input    = native_mote_serial_input,
     .destroy         = native_mote_destroy,
     .reset_time      = native_mote_reset_time,
+    .ui_radio_state  = NULL,
+    .ui_leds         = NULL,
+    .get_interface   = null_mote_get_interface,
 };
 
 /* JS app motes (same pseudo-cycle convention as native) */
@@ -815,6 +819,9 @@ static const sim_mote_ops_t js_mote_ops = {
     .serial_input    = js_mote_serial_input,
     .destroy         = js_mote_destroy,
     .reset_time      = js_mote_reset_time,
+    .ui_radio_state  = NULL,
+    .ui_leds         = NULL,
+    .get_interface   = null_mote_get_interface,
 };
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
@@ -1075,11 +1082,11 @@ static void deliver_rx_byte(const sim_event_t *ev) {
     if (!m->ops->sync_to_time)
         return;  /* RX_BYTE events only target emulated motes */
 
-    /* MSP430-only byte-flow stats + CC2420 TSCH-ACK trace.  The chip
-     * state peek goes through get_interface in M16; the type test stays
-     * local to this debug block until then. */
-    bool is_msp = (nodes[idx].type == NODE_MSP430);
-    if (is_msp) {
+    /* CC2420-carrying motes only: byte-flow stats + TSCH-ACK trace
+     * (M16: the chip peek goes through get_interface — NULL means this
+     * mote has no CC2420 and the debug block is skipped). */
+    cc2420_t *cc = mote_cc2420(idx);
+    if (cc) {
         stat_msp_byte_pop[idx]++;
         if (ev->sender_idx >= 0 && ev->sender_idx < num_nodes &&
             nodes[ev->sender_idx].id == 2 && nodes[idx].id == 1) {
@@ -1090,8 +1097,8 @@ static void deliver_rx_byte(const sim_event_t *ev) {
     int64_t returned_us = m->ops->sync_to_time(m, ev->time_ns);
 
     cc2420_radio_state_t old_state = CC2420_VREG_OFF;
-    if (is_msp) {
-        old_state = nodes[idx].plat.msp.cc2420.state;
+    if (cc) {
+        old_state = cc->state;
         if (trace_tsch_ack_enabled() &&
             nodes[idx].id > 0 && nodes[idx].id <= 2) {
             trace_tsch_ack_log("byte event node=%d byte=%02x t=%.6f state_before=%s",
@@ -1103,8 +1110,8 @@ static void deliver_rx_byte(const sim_event_t *ev) {
 
     radio_receive_byte(idx, ev->byte, ev->rssi);
 
-    if (is_msp) {
-        cc2420_radio_state_t new_state = nodes[idx].plat.msp.cc2420.state;
+    if (cc) {
+        cc2420_radio_state_t new_state = cc->state;
         if (trace_tsch_ack_enabled() &&
             nodes[idx].id > 0 && nodes[idx].id <= 2 &&
             new_state != old_state) {
@@ -1573,11 +1580,11 @@ static void bus_host_on_tx_byte(void *user, int sender, uint8_t byte,
                                 int64_t byte_time_ns, int depth) {
     (void)user;
     node_last_tx_ns[sender] = byte_time_ns;
-    if (depth > 0 && trace_tsch_ack_enabled() &&
-        nodes[sender].type == NODE_MSP430) {
+    cc2420_t *scc = mote_cc2420(sender);
+    if (depth > 0 && trace_tsch_ack_enabled() && scc) {
         trace_tsch_ack_log("reentrant tx byte sender=%d state=%s byte=%02x depth=%d",
                            nodes[sender].id,
-                           cc2420_state_str(nodes[sender].plat.msp.cc2420.state),
+                           cc2420_state_str(scc->state),
                            byte, depth);
     }
 }
@@ -1585,14 +1592,16 @@ static void bus_host_on_tx_byte(void *user, int sender, uint8_t byte,
 static void bus_host_on_byte_accepted(void *user, int sender, int receiver,
                                       uint8_t byte, int depth) {
     (void)user;
-    if (nodes[receiver].type != NODE_MSP430) return;
+    /* CC2420-carrying receivers only (M16: chip presence, not type). */
+    cc2420_t *rcc = mote_cc2420(receiver);
+    if (!rcc) return;
     if (depth > 0 && trace_tsch_ack_enabled() &&
-        nodes[sender].type == NODE_MSP430 &&
+        mote_cc2420(sender) != NULL &&
         nodes[sender].id == 1 && nodes[receiver].id == 2) {
         trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
                            byte,
-                           cc2420_state_str(nodes[receiver].plat.msp.cc2420.state),
-                           (double)nodes[receiver].plat.msp.cpu.sim_time_ns / 1e9);
+                           cc2420_state_str(rcc->state),
+                           (double)node_sim_time_ns(receiver) / 1e9);
     }
     stat_msp_byte_push[receiver]++;
     if (nodes[sender].id == 2 && nodes[receiver].id == 1)
@@ -1610,7 +1619,6 @@ static void bus_host_frame_complete(void *user, int sender_idx,
                                     int sender_radio, int64_t byte_time_ns,
                                     int64_t sender_byte_ns) {
     (void)user;
-    mixed_node_t *sender = &nodes[sender_idx];
 
     if (csim_radio_trace_enabled()) {
         int s_ch = radio_medium.nodes[sender_idx].radios[sender_radio].channel;
@@ -1678,14 +1686,15 @@ static void bus_host_frame_complete(void *user, int sender_idx,
     if (busy_until > node_tx_busy_until_ns[sender_idx])
         node_tx_busy_until_ns[sender_idx] = busy_until;
 
-    if (trace_tsch_ack_enabled() && sender->type == NODE_MSP430 &&
+    cc2420_t *trace_scc = mote_cc2420(sender_idx);
+    if (trace_tsch_ack_enabled() && trace_scc &&
         (tx_asm[sender_idx].expected_len == 23 || tx_asm[sender_idx].expected_len == 19 ||
          tx_asm[sender_idx].expected_len == 17)) {
         trace_tsch_ack_log("frame-complete sender=%d len=%d start=%.6f end=%.6f state=%s",
                            nodes[sender_idx].id, tx_asm[sender_idx].expected_len,
                            (double)accurate_tx_start / 1e9,
                            (double)accurate_tx_end / 1e9,
-                           cc2420_state_str(sender->plat.msp.cc2420.state));
+                           cc2420_state_str(trace_scc->state));
     }
 
     /* Emit explicit TX timeline event */
@@ -1894,13 +1903,14 @@ static void bus_host_frame_complete(void *user, int sender_idx,
              * so the receiver's wake-up event is always near "now". */
             int64_t delivery_start = tx_asm[sender_idx].subghz
                 ? sim_runtime_now_ns(&sim_rt) : accurate_tx_start;
+            cc2420_t *trace_rcc = mote_cc2420(i);
             if (trace_tsch_ack_enabled() &&
-                sender->type == NODE_MSP430 && nodes[sender_idx].id == 2 &&
-                nodes[i].type == NODE_MSP430 && nodes[i].id == 1 &&
+                mote_cc2420(sender_idx) != NULL && nodes[sender_idx].id == 2 &&
+                trace_rcc != NULL && nodes[i].id == 1 &&
                 tx_asm[sender_idx].expected_len == 23) {
                 trace_tsch_ack_log("deliver data 2->1 start=%.6f node1_state=%s",
                                    (double)delivery_start / 1e9,
-                                   cc2420_state_str(nodes[i].plat.msp.cc2420.state));
+                                   cc2420_state_str(trace_rcc->state));
             }
             if (nodes[i].type == NODE_MSP430 && i != ticking_node_idx) {
                 tick_one_msp430(i, delivery_start);
@@ -3356,6 +3366,52 @@ static void js_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
     MOTE_IMPL(m)->plat.js.sim_time_ns = now_ns;
 }
 
+/* --- M16 introspection adapters --- */
+
+static int msp_mote_ui_radio_state(const sim_mote_t *m) {
+    cc2420_radio_state_t rs = MOTE_IMPL(m)->plat.msp.cc2420.state;
+    if (rs >= CC2420_TX_CALIBRATE && rs <= CC2420_TX_UNDERFLOW)
+        return SIM_RADIO_TX;
+    if (rs == CC2420_RX_FRAME)
+        return SIM_RADIO_RX;        /* actively receiving data (green) */
+    if (rs == CC2420_RX_CALIBRATE || rs == CC2420_RX_SFD_SEARCH)
+        return SIM_RADIO_ON;        /* on, listening (gray) */
+    return SIM_RADIO_OFF;           /* VREG_OFF, POWER_DOWN, IDLE */
+}
+
+static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
+    uint8_t p5out = MOTE_IMPL(m)->plat.msp.gpio.ports[4].out;
+    leds[0] = (p5out >> 4) & 1;  /* green  = P5.4 */
+    leds[1] = (p5out >> 5) & 1;  /* yellow = P5.5 */
+    leds[2] = (p5out >> 6) & 1;  /* red    = P5.6 */
+}
+
+static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
+    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
+    if (!soc)
+        return;  /* Nordic boards: no LED model wired up (the pre-M16
+                  * type-switch would have NULL-dereferenced here) */
+    uint32_t pc_data = soc->gpio.ports[2].data;
+    leds[0] = (pc_data >> 0) & 1;  /* red */
+    leds[1] = (pc_data >> 1) & 1;  /* yellow */
+    leds[2] = (pc_data >> 2) & 1;  /* green */
+}
+
+static void *msp_mote_get_interface(sim_mote_t *m, int iface) {
+    if (iface == SIM_MOTE_IFACE_CC2420)
+        return &MOTE_IMPL(m)->plat.msp.cc2420;
+    return NULL;
+}
+static void *arm_mote_get_interface(sim_mote_t *m, int iface) {
+    if (iface == SIM_MOTE_IFACE_ARM_CPU)
+        return &MOTE_IMPL(m)->plat.arm.cpu;
+    return NULL;
+}
+static void *null_mote_get_interface(sim_mote_t *m, int iface) {
+    (void)m; (void)iface;
+    return NULL;
+}
+
 static void destroy_node(int idx) {
     sim_mote_t *m = &mote_store[idx];
     m->ops->destroy(m);
@@ -4182,7 +4238,10 @@ sim_restart:
     bool any_gdb = false;
     for (int i = 0; i < node_count; i++) {
         if (gdb_node[i] == 0) continue;
-        if (nodes[i].type != NODE_ARM) {
+        /* M16: ask the mote for its ARM CPU instead of testing type. */
+        arm_cpu_t *gdb_cpu = (arm_cpu_t *)mote_store[i].ops->get_interface(
+            &mote_store[i], SIM_MOTE_IFACE_ARM_CPU);
+        if (!gdb_cpu) {
             fprintf(stderr, "  Node %d: --gdb only supports ARM nodes for now (skipped)\n",
                     nodes[i].id);
             gdb_node[i] = 0;
@@ -4194,8 +4253,8 @@ sim_restart:
             gdb_node[i] = 0;
             continue;
         }
-        gdb_stub_attach(&gdb_stubs[i], &nodes[i].plat.arm.cpu, &arm_gdb_ops);
-        nodes[i].plat.arm.cpu.gdb_stub = &gdb_stubs[i];
+        gdb_stub_attach(&gdb_stubs[i], gdb_cpu, &arm_gdb_ops);
+        gdb_cpu->gdb_stub = &gdb_stubs[i];
         any_gdb = true;
         printf("  Node %d: GDB stub on port %d (connect with: target remote :%d)\n",
                nodes[i].id, gdb_node[i], gdb_node[i]);
@@ -4885,12 +4944,13 @@ sim_restart:
             time_step += get_time_ms() - t_phase;
         }
 
-        /* Update per-node radio/LED state for timeline */
+        /* Update per-node radio/LED state for timeline (M16: the ops'
+         * NULL-ness encodes which mote kinds are polled — CC2538 pushes
+         * radio state via async callback, natives/JS have neither). */
         if (ui_server) {
             for (int i = 0; i < node_count; i++) {
-                if (!node_active(i) || nodes[i].type == NODE_NATIVE) continue;
-                if (nodes[i].type == NODE_MSP430)
-                    update_radio_state(i);  /* ARM uses state callback instead */
+                if (!node_active(i)) continue;
+                update_radio_state(i);
                 update_led_state(i);
             }
         }
