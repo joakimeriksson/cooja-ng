@@ -798,6 +798,63 @@ back here. Land them in order, one PR per milestone where practical:
 
 Only after these are done should plugin loading or config v2 become a priority.
 
+### 3.16 Mote vtable milestones (canonical Phase 2 task list)
+
+> **Status: in progress.** Numbering continues from Phase 1. Stop condition
+> (from §9 Phase 2): dispatch abstraction only — no platform-init/boot logic
+> moves (that is Phase 4).
+
+Design decisions locked for this phase:
+
+- `include/sim/sim_mote.h` defines `sim_mote_ops_t` and
+  `sim_mote_t { int id; const sim_mote_ops_t *ops; void *impl; }`.
+- The four adapter implementations (MSP430 / ARM / native / JS) **stay in the
+  runner file** for all of Phase 2 — they reference runner globals
+  (`ticking_node_idx`, `gdb_stubs`, `emu_rx_queue_drain`, `native_had_tx`)
+  by design. They move to `src/motes/` in Phase 4.
+- Motes register into a `sim_runtime_t` slot table
+  (`sim_runtime_register_mote()`), called from `init_node()` next to
+  `register_node_radio_ops()` so reboots and JS-ADD dynamic motes stay
+  covered. The kernel does not *call* mote ops yet — kernel-side
+  `MOTE_EXECUTE` dispatch is a non-goal here (Phase 10).
+- `execute()` contract per §3.6: `int64_t execute(sim_mote_t *m, int64_t
+  now_ns)` returns the next wakeup time (`INT64_MAX` = none); the *caller*
+  does the single `sim_schedule_mote_wakeup_if_earlier()`.
+- Adapter bodies are **character-identical moves** of existing code. No
+  clock-semantics changes — this phase must be byte-for-byte behavior
+  preserving in the Cooja suite.
+
+Milestones (one commit each, full validation gate before each):
+
+11. Scaffold + read-only accessor ops (`kind`, `sim_time_ns`, `cycles`,
+    `freq_hz`, `instructions`); `node_*` accessors become ops dispatches.
+12. Execution ops: `execute`, `step_until`, `next_wakeup_ns`.
+    `dispatch_mote_wakeup` collapses to guards → snapshot → `ops->execute`
+    → schedule returned wakeup → post-tick RF distribution (stays
+    runner-side: cross-node policy). Highest-risk milestone.
+13. Time-sync op `sync_to_time(mote, now_ns)`; `deliver_msp430_rx_byte` +
+    `deliver_arm_rx_byte` merge into one type-blind `deliver_rx_byte`.
+14. Serial-input op `serial_input(mote, buf, len)`; one `inject_serial()`
+    helper replaces the serial-bridge callback and the four duplicated
+    TEST_ACTION_SEND/SEND_ALL blocks. Unify on the append + immediate-wakeup
+    semantics (Cooja-accurate); GENERATE_MSG tests are the detector.
+15. Lifecycle ops: `destroy`, `reset_time` (dedupes the two post-reboot
+    time-reseed blocks).
+16. Introspection: `get_radio_state`, `get_leds` (type-blind
+    `update_radio_state`/`update_led_state`); `get_interface(mote, iface)`
+    for `SIM_IFACE_GDB_ARM` and `SIM_IFACE_CC2420` (trace_tsch_ack goes
+    ops-clean). End-of-run JIT-stats reporting stays type-specific.
+17. (Stretch, deferrable) RF-path de-typing: replace `type == NODE_NATIVE/JS`
+    checks in frame delivery with radio-bus delivery-mode queries (SYNC ⇔
+    native) plus a `radio_receive_frame` op for native + JS.
+
+Validation gate per milestone: `make clean && make`; `correctness` /
+`arm-correctness` / `cc1200-mock-host` / `radio-medium`; sky + firefly
+2-node RPL-UDP 60 s; chain configs (6/7 baseline — firefly-subghz 4-node is
+the pre-existing cc1200 TX-end failure); js-hello + js-rpl-udp; Cooja suite
+81/81 (never rebuild while it runs). M12 additionally: TSCH + clock-drift
+configs. M14 additionally: the GENERATE_MSG-heavy 14-rpl-lite tests.
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.

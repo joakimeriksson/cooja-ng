@@ -19,6 +19,7 @@
 
 #include "radio_medium.h"
 #include "sim_event_queue.h"
+#include "sim_mote.h"
 #include "sim_observer.h"
 
 #ifdef __cplusplus
@@ -52,6 +53,14 @@ typedef struct sim_runtime {
      * the slot and are never dropped by the generation check — they are
      * dispatched as before. */
     uint32_t           mote_generation[SIM_EQ_MAX_NODES];
+
+    /* Mote slot table — Phase 2 milestone 11.  Registered from the
+     * runner's init_node() (covers reboots and dynamically added motes,
+     * same pattern as radio-bus registration).  The kernel does not call
+     * mote ops yet — dispatch stays runner-side until Phase 10; this
+     * table makes motes *visible* to kernel-side code and gives the
+     * runner one canonical handle per slot.  NULL = empty slot. */
+    sim_mote_t        *motes[SIM_EQ_MAX_NODES];
 
     /* Observer subscribers — milestone 6.  Up to SIM_RUNTIME_MAX_OBSERVERS
      * services subscribe via sim_runtime_subscribe().  Fan-out happens in
@@ -145,6 +154,26 @@ void sim_runtime_bump_mote_generation(sim_runtime_t *sim, int mote_index);
  * whose stamped generation still matches the slot. */
 bool sim_runtime_event_is_current(const sim_runtime_t *sim,
                                    const sim_event_t *ev);
+
+/* ============================================================
+ * Mote slot table — Phase 2 milestone 11 (§3.16).
+ *
+ * Register/lookup of the kernel-facing mote object per slot.  Storage
+ * for the sim_mote_t itself is owned by the registrant (the runner);
+ * the runtime only keeps the pointer.  Re-registering a slot (reboot)
+ * just overwrites the pointer.
+ * ============================================================ */
+
+/* Register `mote` at slot `mote_index`.  Pass NULL to clear the slot. */
+void sim_runtime_register_mote(sim_runtime_t *sim, int mote_index,
+                               sim_mote_t *mote);
+
+/* The mote at slot `mote_index`, or NULL if empty/out of range. */
+static inline sim_mote_t *sim_runtime_mote(sim_runtime_t *sim,
+                                           int mote_index) {
+    if (mote_index < 0 || mote_index >= SIM_EQ_MAX_NODES) return (sim_mote_t *)0;
+    return sim->motes[mote_index];
+}
 
 /* ============================================================
  * Observer subscriptions — milestone 6.

@@ -104,6 +104,16 @@ bool sim_runtime_event_is_current(const sim_runtime_t *sim,
 }
 
 /* ============================================================
+ * Mote slot table — Phase 2 milestone 11.
+ * ============================================================ */
+
+void sim_runtime_register_mote(sim_runtime_t *sim, int mote_index,
+                               sim_mote_t *mote) {
+    if (!sim || mote_index < 0 || mote_index >= SIM_EQ_MAX_NODES) return;
+    sim->motes[mote_index] = mote;
+}
+
+/* ============================================================
  * Observer subscriptions — milestone 6.  Fan-out is a simple linear
  * walk; subscriber count is bounded by SIM_RUNTIME_MAX_OBSERVERS.
  *

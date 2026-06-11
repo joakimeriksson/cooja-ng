@@ -658,53 +658,142 @@ static double get_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
-/* --- Type-dispatched accessors --- */
+/* ============================================================
+ * Mote vtable adapters — Phase 2 milestone 11 (§3.16).
+ *
+ * One sim_mote_ops_t per node kind; mote_store[idx] is the kernel-facing
+ * object registered into sim_rt from init_node().  The node_* accessor
+ * functions below dispatch through the table instead of switching on
+ * node_type_t.  Adapter bodies are character-identical moves of the old
+ * switch arms; they stay in this file until Phase 4 (boot policy move).
+ * ============================================================ */
+
+static sim_mote_t mote_store[MAX_NODES];
+
+#define MOTE_IMPL(m) ((mixed_node_t *)(m)->impl)
+
+/* MSP430 emulated motes */
+static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.sim_time_ns;
+}
+static int64_t msp_mote_cycles(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.cycles;
+}
+static uint32_t msp_mote_freq_hz(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.cpu_freq_hz;
+}
+static int64_t msp_mote_instructions(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.instructions;
+}
+static const sim_mote_ops_t msp_mote_ops = {
+    .kind         = "MSP430",
+    .sim_time_ns  = msp_mote_sim_time_ns,
+    .cycles       = msp_mote_cycles,
+    .freq_hz      = msp_mote_freq_hz,
+    .instructions = msp_mote_instructions,
+};
+
+/* ARM emulated motes */
+static int64_t arm_mote_sim_time_ns(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.sim_time_ns;
+}
+static int64_t arm_mote_cycles(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.cycles;
+}
+static uint32_t arm_mote_freq_hz(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.cpu_freq_hz;
+}
+static int64_t arm_mote_instructions(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.instructions;
+}
+static const sim_mote_ops_t arm_mote_ops = {
+    .kind         = "ARM",
+    .sim_time_ns  = arm_mote_sim_time_ns,
+    .cycles       = arm_mote_cycles,
+    .freq_hz      = arm_mote_freq_hz,
+    .instructions = arm_mote_instructions,
+};
+
+/* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
+static int64_t native_mote_sim_time_ns(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.native.sim_time_ns;
+}
+static int64_t native_mote_cycles(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.native.sim_time_ns / 1000LL;
+}
+static uint32_t pseudo_mote_freq_hz(const sim_mote_t *m) {
+    (void)m;
+    return 1000000; /* native/js: 1 MHz pseudo-freq (1 cycle = 1 us) */
+}
+static int64_t zero_mote_instructions(const sim_mote_t *m) {
+    (void)m;
+    return 0; /* native/js: not tracked */
+}
+static const sim_mote_ops_t native_mote_ops = {
+    .kind         = "NATIVE",
+    .sim_time_ns  = native_mote_sim_time_ns,
+    .cycles       = native_mote_cycles,
+    .freq_hz      = pseudo_mote_freq_hz,
+    .instructions = zero_mote_instructions,
+};
+
+/* JS app motes (same pseudo-cycle convention as native) */
+static int64_t js_mote_sim_time_ns(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.js.sim_time_ns;
+}
+static int64_t js_mote_cycles(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.js.sim_time_ns / 1000LL;
+}
+static const sim_mote_ops_t js_mote_ops = {
+    .kind         = "JS",
+    .sim_time_ns  = js_mote_sim_time_ns,
+    .cycles       = js_mote_cycles,
+    .freq_hz      = pseudo_mote_freq_hz,
+    .instructions = zero_mote_instructions,
+};
+
+/* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
+ * Called from init_node() right after the node's type is set, so the
+ * accessors below work during platform init and for rebooted /
+ * dynamically added motes. */
+static void register_node_mote(int idx) {
+    const sim_mote_ops_t *ops;
+    switch (nodes[idx].type) {
+    case NODE_MSP430: ops = &msp_mote_ops;    break;
+    case NODE_ARM:    ops = &arm_mote_ops;    break;
+    case NODE_JS:     ops = &js_mote_ops;     break;
+    default:          ops = &native_mote_ops; break;
+    }
+    mote_store[idx].id = nodes[idx].id;
+    mote_store[idx].ops = ops;
+    mote_store[idx].impl = &nodes[idx];
+    sim_runtime_register_mote(&sim_rt, idx, &mote_store[idx]);
+}
+
+/* --- Type-dispatched accessors (now vtable dispatches) --- */
 
 static int64_t node_sim_time_ns(int idx) {
-    if (nodes[idx].type == NODE_MSP430)
-        return nodes[idx].plat.msp.cpu.sim_time_ns;
-    else if (nodes[idx].type == NODE_ARM)
-        return nodes[idx].plat.arm.cpu.sim_time_ns;
-    else if (nodes[idx].type == NODE_JS)
-        return nodes[idx].plat.js.sim_time_ns;
-    else
-        return nodes[idx].plat.native.sim_time_ns;
+    const sim_mote_t *m = &mote_store[idx];
+    return m->ops->sim_time_ns(m);
 }
 
 static int64_t node_cycles(int idx) {
-    if (nodes[idx].type == NODE_MSP430)
-        return nodes[idx].plat.msp.cpu.cycles;
-    else if (nodes[idx].type == NODE_ARM)
-        return nodes[idx].plat.arm.cpu.cycles;
-    else if (nodes[idx].type == NODE_JS)
-        return nodes[idx].plat.js.sim_time_ns / 1000LL; /* pseudo-cycles: us */
-    else
-        return nodes[idx].plat.native.sim_time_ns / 1000LL; /* pseudo-cycles: us */
+    const sim_mote_t *m = &mote_store[idx];
+    return m->ops->cycles(m);
 }
 
 static uint32_t node_freq(int idx) {
-    if (nodes[idx].type == NODE_MSP430)
-        return nodes[idx].plat.msp.cpu.cpu_freq_hz;
-    else if (nodes[idx].type == NODE_ARM)
-        return nodes[idx].plat.arm.cpu.cpu_freq_hz;
-    else
-        return 1000000; /* native/js: 1 MHz pseudo-freq (1 cycle = 1 us) */
+    const sim_mote_t *m = &mote_store[idx];
+    return m->ops->freq_hz(m);
 }
 
 static int64_t node_instructions(int idx) {
-    if (nodes[idx].type == NODE_MSP430)
-        return nodes[idx].plat.msp.cpu.instructions;
-    else if (nodes[idx].type == NODE_ARM)
-        return nodes[idx].plat.arm.cpu.instructions;
-    else
-        return 0; /* native/js: not tracked */
+    const sim_mote_t *m = &mote_store[idx];
+    return m->ops->instructions(m);
 }
 
 static const char *node_type_str(int idx) {
-    if (nodes[idx].type == NODE_MSP430) return "MSP430";
-    if (nodes[idx].type == NODE_ARM) return "ARM";
-    if (nodes[idx].type == NODE_JS) return "JS";
-    return "NATIVE";
+    return mote_store[idx].ops->kind;
 }
 
 /* --- RF TX/RX bridging --- */
@@ -3079,6 +3168,9 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     node->type = detect_node_type(firmware_path);
     node->id = node_id;
     snprintf(node->firmware_path, sizeof(node->firmware_path), "%s", firmware_path);
+    /* M11: bind + register the kernel-facing mote object early so the
+     * node_* vtable accessors work during platform init below. */
+    register_node_mote(idx);
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
@@ -3744,6 +3836,15 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * radio-medium init still happen at their existing call sites below,
      * just through the runtime fields. */
     sim_runtime_init(&sim_rt);
+    /* M11: pre-bind every mote slot to its node struct with a safe default
+     * ops table so the node_* vtable accessors never see a NULL ops, even
+     * for slots that haven't been through init_node() yet (the old type
+     * switch read zeroed structs in that case). */
+    for (int i = 0; i < MAX_NODES; i++) {
+        mote_store[i].id = 0;
+        mote_store[i].ops = &native_mote_ops;
+        mote_store[i].impl = &nodes[i];
+    }
     /* fd/pid fields must be -1, not 0, before any _active()/_launched()
      * check — zeroed static structs would read as live. */
     sim_serial_bridge_init(&serial_bridge);
