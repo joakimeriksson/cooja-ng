@@ -672,6 +672,24 @@ static sim_mote_t mote_store[MAX_NODES];
 
 #define MOTE_IMPL(m) ((mixed_node_t *)(m)->impl)
 
+/* M12 execution-op adapters — bodies live next to the tick/step helpers
+ * they wrap (after native_has_pending_work); tables below only need the
+ * prototypes. */
+static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns);
+static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns);
+static int64_t native_mote_execute(sim_mote_t *m, int64_t now_ns);
+static int64_t js_mote_execute(sim_mote_t *m, int64_t now_ns);
+static void msp_mote_step_until(sim_mote_t *m, int64_t target);
+static void arm_mote_step_until(sim_mote_t *m, int64_t target);
+static void native_mote_step_until(sim_mote_t *m, int64_t target);
+static void js_mote_step_until(sim_mote_t *m, int64_t target);
+static void msp_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
+static void arm_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
+static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
+static void js_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
+static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
+static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
+
 /* MSP430 emulated motes */
 static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.msp.cpu.sim_time_ns;
@@ -686,11 +704,15 @@ static int64_t msp_mote_instructions(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.msp.cpu.instructions;
 }
 static const sim_mote_ops_t msp_mote_ops = {
-    .kind         = "MSP430",
-    .sim_time_ns  = msp_mote_sim_time_ns,
-    .cycles       = msp_mote_cycles,
-    .freq_hz      = msp_mote_freq_hz,
-    .instructions = msp_mote_instructions,
+    .kind            = "MSP430",
+    .sim_time_ns     = msp_mote_sim_time_ns,
+    .cycles          = msp_mote_cycles,
+    .freq_hz         = msp_mote_freq_hz,
+    .instructions    = msp_mote_instructions,
+    .execute         = msp_mote_execute,
+    .step_until      = msp_mote_step_until,
+    .advance_to_time = msp_mote_advance_to_time,
+    .sched_hint_ns   = msp_mote_sched_hint_ns,
 };
 
 /* ARM emulated motes */
@@ -707,11 +729,15 @@ static int64_t arm_mote_instructions(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.arm.cpu.instructions;
 }
 static const sim_mote_ops_t arm_mote_ops = {
-    .kind         = "ARM",
-    .sim_time_ns  = arm_mote_sim_time_ns,
-    .cycles       = arm_mote_cycles,
-    .freq_hz      = arm_mote_freq_hz,
-    .instructions = arm_mote_instructions,
+    .kind            = "ARM",
+    .sim_time_ns     = arm_mote_sim_time_ns,
+    .cycles          = arm_mote_cycles,
+    .freq_hz         = arm_mote_freq_hz,
+    .instructions    = arm_mote_instructions,
+    .execute         = arm_mote_execute,
+    .step_until      = arm_mote_step_until,
+    .advance_to_time = arm_mote_advance_to_time,
+    .sched_hint_ns   = arm_mote_sched_hint_ns,
 };
 
 /* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
@@ -730,11 +756,15 @@ static int64_t zero_mote_instructions(const sim_mote_t *m) {
     return 0; /* native/js: not tracked */
 }
 static const sim_mote_ops_t native_mote_ops = {
-    .kind         = "NATIVE",
-    .sim_time_ns  = native_mote_sim_time_ns,
-    .cycles       = native_mote_cycles,
-    .freq_hz      = pseudo_mote_freq_hz,
-    .instructions = zero_mote_instructions,
+    .kind            = "NATIVE",
+    .sim_time_ns     = native_mote_sim_time_ns,
+    .cycles          = native_mote_cycles,
+    .freq_hz         = pseudo_mote_freq_hz,
+    .instructions    = zero_mote_instructions,
+    .execute         = native_mote_execute,
+    .step_until      = native_mote_step_until,
+    .advance_to_time = native_mote_advance_to_time,
+    .sched_hint_ns   = NULL, /* emulated motes only */
 };
 
 /* JS app motes (same pseudo-cycle convention as native) */
@@ -745,11 +775,15 @@ static int64_t js_mote_cycles(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.js.sim_time_ns / 1000LL;
 }
 static const sim_mote_ops_t js_mote_ops = {
-    .kind         = "JS",
-    .sim_time_ns  = js_mote_sim_time_ns,
-    .cycles       = js_mote_cycles,
-    .freq_hz      = pseudo_mote_freq_hz,
-    .instructions = zero_mote_instructions,
+    .kind            = "JS",
+    .sim_time_ns     = js_mote_sim_time_ns,
+    .cycles          = js_mote_cycles,
+    .freq_hz         = pseudo_mote_freq_hz,
+    .instructions    = zero_mote_instructions,
+    .execute         = js_mote_execute,
+    .step_until      = js_mote_step_until,
+    .advance_to_time = js_mote_advance_to_time,
+    .sched_hint_ns   = NULL, /* emulated motes only */
 };
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
@@ -3265,14 +3299,8 @@ static int reboot_node(int idx) {
  * chip-driver byte handlers"). */
 
 static void step_node_until(int idx, int64_t target) {
-    if (nodes[idx].type == NODE_MSP430)
-        msp430_step_until(&nodes[idx].plat.msp.cpu, target);
-    else if (nodes[idx].type == NODE_ARM)
-        arm_step_until(&nodes[idx].plat.arm.cpu, target);
-    else if (nodes[idx].type == NODE_JS)
-        js_node_step_until_ns(&nodes[idx].plat.js, target);
-    else
-        native_step_until_ns(&nodes[idx].plat.native, target);
+    sim_mote_t *m = &mote_store[idx];
+    m->ops->step_until(m, target);
 }
 
 static int64_t tick_one_msp430(int idx, int64_t sim_ns) {
@@ -3428,15 +3456,16 @@ static void tick_one_native(int idx, int64_t sim_ns) {
         radio_medium_set_channel(&radio_medium, idx, *nat->simRadioChannel);
 }
 
-/* Schedule a native node's next wakeup in the event queue.
- * Exactly matches COOJA's ContikiClock.doActionsAfterTick(). */
-static void schedule_native_wakeup(sim_runtime_t *sim, int idx) {
+/* Compute a native node's next wakeup time after a tick.
+ * Exactly matches COOJA's ContikiClock.doActionsAfterTick().  The caller
+ * schedules the returned time with sim_schedule_mote_wakeup_if_earlier so
+ * a requestImmediateWakeup already scheduled by RF delivery detection is
+ * never overridden (M12: this is the native execute() op's return value). */
+static int64_t native_next_wakeup_after_tick(int idx) {
     native_node_t *nat = &nodes[idx].plat.native;
     int64_t now = nat->sim_time_ns;
 
-    /* Determine next wakeup time (like ContikiClock.doActionsAfterTick).
-     * Use schedule_if_earlier to avoid overriding a requestImmediateWakeup
-     * that was already scheduled by RF delivery detection. */
+    /* Determine next wakeup time (like ContikiClock.doActionsAfterTick). */
     int64_t next = now + 1000000000LL;  /* 1s max gap */
 
     /* rtimer has priority (exact µs timing) */
@@ -3450,10 +3479,8 @@ static void schedule_native_wakeup(sim_runtime_t *sim, int idx) {
      * scheduled until the exact transmission-end time, and completion
      * requests an immediate same-time wakeup. */
     if (nat->radio_tx_finished) {
-        next = now;
         nat->radio_tx_finished = false;
-        sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
-        return;
+        return now;
     }
     if (nat->radio_is_transmitting) {
         int64_t tx_next = nat->radio_tx_end_ns;
@@ -3484,7 +3511,7 @@ static void schedule_native_wakeup(sim_runtime_t *sim, int idx) {
         if (rx_next < next) next = rx_next;
     }
 
-    sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
+    return next;
 }
 
 /* Schedule an emulated node's next wakeup */
@@ -3507,60 +3534,16 @@ static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx) {
         sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
         return;
     }
-    if (nodes[idx].type == NODE_ARM) {
-        arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
-        if (cpu->next_event_cycle <= cpu->cycles)
-            next = sim_runtime_now_ns(&sim_rt);
-        else
-            next = sim_runtime_now_ns(&sim_rt) + arm_cycles_to_ns(
-                cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
-    } else {
-        msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
-        if ((cpu->interrupts_enabled &&
-             cpu->serviced_interrupt == -1 &&
-             cpu->interrupt_max >= 0) ||
-            cpu->next_event_cycle <= cpu->cycles) {
-            next = sim_runtime_now_ns(&sim_rt);
-        } else {
-            next = sim_runtime_now_ns(&sim_rt) + msp430_cycles_to_ns(
-                cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
-        }
-    }
+    /* M12: the per-architecture next-cpu-event lead computation lives in
+     * the mote's sched_hint_ns op (emulated motes only — this function is
+     * never called for native/JS motes, whose op is NULL). */
+    sim_mote_t *m = &mote_store[idx];
+    next = m->ops->sched_hint_ns(m, sim_runtime_now_ns(&sim_rt));
     sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
 }
 
-/* Check if a native node has pending work at the given sim time */
-/* Compute the next time a node needs to wake up (ns).
- * Used by event-driven stepping to skip idle periods. */
-static int64_t node_next_wakeup_ns(int idx) {
-    if (!node_active(idx)) return INT64_MAX;
-    if (nodes[idx].type == NODE_JS) {
-        return js_node_next_wakeup_ns(&nodes[idx].plat.js);
-    } else if (nodes[idx].type == NODE_NATIVE) {
-        native_node_t *nat = &nodes[idx].plat.native;
-        /* Check immediate work first */
-        if (*nat->simInSize > 0 || nat->rx_queue.count > 0 ||
-            *nat->simProcessRunValue)
-            return nat->sim_time_ns;
-        return native_next_wakeup_ns(nat);
-    } else if (nodes[idx].type == NODE_ARM) {
-        arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
-        if (cpu->next_event_cycle <= cpu->cycles)
-            return cpu->sim_time_ns;
-        int64_t delta = arm_cycles_to_ns(
-            cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
-        return cpu->sim_time_ns + delta;
-    } else {
-        msp430_cpu_t *cpu = &nodes[idx].plat.msp.cpu;
-        if (emu_rx_queue[idx].count > 0)
-            return cpu->sim_time_ns;
-        if ((int64_t)cpu->next_event_cycle <= (int64_t)cpu->cycles)
-            return cpu->sim_time_ns;
-        int64_t delta = msp430_cycles_to_ns(
-            cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
-        return cpu->sim_time_ns + delta;
-    }
-}
+/* (node_next_wakeup_ns removed in M12 — dead since the M10 kernel pump;
+ * the per-arch lead computation lives on in the sched_hint_ns ops.) */
 
 static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
     if (*node->simInSize > 0) return true;  /* frame ready for delivery */
@@ -3577,6 +3560,179 @@ static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
     return false;
 }
 
+/* ============================================================
+ * M12 mote execution-op adapters.
+ *
+ * Bodies are verbatim moves of the former dispatch_mote_wakeup /
+ * threaded_step_node / schedule_emulated_wakeup type-switch arms.
+ * MOTE_IDX recovers the slot index — several wrapped helpers
+ * (tick_one_*, emu_rx_queue_drain, gdb_stubs) are still indexed by
+ * slot; they take the mote pointer directly in Phase 4.
+ * ============================================================ */
+
+#define MOTE_IDX(m) ((int)(MOTE_IMPL(m) - nodes))
+
+/* --- step_until: mote-unit stepping (cycles emulated, ns native/JS) --- */
+
+static void msp_mote_step_until(sim_mote_t *m, int64_t target) {
+    msp430_step_until(&MOTE_IMPL(m)->plat.msp.cpu, target);
+}
+static void arm_mote_step_until(sim_mote_t *m, int64_t target) {
+    arm_step_until(&MOTE_IMPL(m)->plat.arm.cpu, target);
+}
+static void native_mote_step_until(sim_mote_t *m, int64_t target) {
+    native_step_until_ns(&MOTE_IMPL(m)->plat.native, target);
+}
+static void js_mote_step_until(sim_mote_t *m, int64_t target) {
+    js_node_step_until_ns(&MOTE_IMPL(m)->plat.js, target);
+}
+
+/* --- execute: one Cooja-style execute slice at global time now_ns.
+ * Returns the absolute next-wakeup time; the caller schedules it. --- */
+
+static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns) {
+    int idx = MOTE_IDX(m);
+    /* MSP430 RF delivery is frame-assembled on the sender side and then
+     * delivered from the complete-frame path. Consuming rf_pending here
+     * can split an in-flight frame and corrupt the receiver-side buffer
+     * state. */
+    ticking_node_idx = idx;
+    int64_t returned_us = tick_one_msp430(idx, now_ns);
+    ticking_node_idx = -1;
+    if (emu_rx_queue[idx].count > 0)
+        emu_rx_queue_drain(idx);
+    /* Match Cooja's MspMote.execute(t, 1): this slice schedules the
+     * mote's next normal wakeup itself. */
+    return now_ns + (returned_us + 1) * 1000LL;
+}
+
+static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
+    int idx = MOTE_IDX(m);
+    /* Emulated ARM: same Cooja-style tick as MSP430 so peripheral events
+     * are anchored to the scheduler's event time and the CPU accumulates
+     * cycle time with the MSPSim stepMicros accuracy bound. */
+
+    /* GDB stub: poll for incoming commands; if the CPU is halted at a
+     * breakpoint, skip the tick and return a +1µs wakeup so we keep
+     * checking the stub.  (The caller still runs post-tick RF
+     * distribution, matching the old goto arm_tick_done flow.) */
+    if (gdb_node[idx] != 0) {
+        gdb_stub_poll(&gdb_stubs[idx]);
+        if (gdb_stubs[idx].halted) {
+            nodes[idx].plat.arm.cpu.stopping = false;
+            return now_ns + 1000LL;
+        }
+    }
+
+    ticking_node_idx = idx;
+    int64_t returned_us = tick_one_arm(idx, now_ns);
+    ticking_node_idx = -1;
+
+    /* GDB stub: a breakpoint may have fired during the tick.  Clear the
+     * cpu->stopping flag set by gdb_stub_check_breakpoint so subsequent
+     * ticks (after `continue`) can run again. */
+    if (gdb_node[idx] != 0) {
+        nodes[idx].plat.arm.cpu.stopping = false;
+        if (gdb_stubs[idx].halted)
+            return now_ns + 1000LL;  /* poll the stub again soon */
+    }
+
+    /* Drain any frames queued for this node (mirrors the MSP430 path).
+     * For nRF52840, the pending_rx buffer inside the radio model handles
+     * delivery when the radio was not in RX state at delivery time; this
+     * drain covers the emu_rx_queue path which fires when direct
+     * delivery was deferred to a later tick. */
+    if (emu_rx_queue[idx].count > 0)
+        emu_rx_queue_drain(idx);
+
+    /* Match MspMote.execute(t, 1): next normal wakeup from the
+     * step_micros lead hint. */
+    return now_ns + (returned_us + 1) * 1000LL;
+}
+
+/* Handoff from the native execute op to dispatch_mote_wakeup's post-tick
+ * RF distribution: whether this tick transmitted (native_had_tx is
+ * cleared again inside native_next_wakeup_after_tick, so the dispatcher
+ * cannot read it after execute returns). */
+static bool native_exec_had_tx = false;
+
+static int64_t native_mote_execute(sim_mote_t *m, int64_t now_ns) {
+    int idx = MOTE_IDX(m);
+    /* Single tick at event time */
+    tick_one_native(idx, now_ns);
+    native_exec_had_tx = native_had_tx[idx];
+
+    /* Next wakeup (like ContikiClock.doActionsAfterTick) */
+    return native_next_wakeup_after_tick(idx);
+}
+
+static int64_t js_mote_execute(sim_mote_t *m, int64_t now_ns) {
+    js_node_t *jn = &MOTE_IMPL(m)->plat.js;
+    /* Run the JS node up to event time; this fires execute() and
+     * dispatches any RX frames scheduled at <= now_ns. */
+    js_node_step_until_ns(jn, now_ns);
+    return js_node_next_wakeup_ns(jn);  /* INT64_MAX = no known wakeup */
+}
+
+/* --- advance_to_time: out-of-slice catch-up to global sim time
+ * (threaded stepping path) --- */
+
+static void msp_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
+    msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
+    int64_t delta_ns = sim_ns - cpu->sim_time_ns;
+    if (delta_ns > 0)
+        msp430_step_until(cpu, (int64_t)cpu->cycles +
+                          msp430_ns_to_cycles(delta_ns, cpu->cpu_freq_hz));
+}
+static void arm_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
+    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    int64_t delta_ns = sim_ns - cpu->sim_time_ns;
+    if (delta_ns > 0)
+        arm_step_until(cpu, cpu->cycles +
+                       arm_ns_to_cycles(delta_ns, cpu->cpu_freq_hz));
+}
+static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
+    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
+    if (!native_has_pending_work(nat, sim_ns)) {
+        nat->sim_time_ns = sim_ns;
+        return;
+    }
+    native_step_until_ns(nat, sim_ns);
+    /* Process additional queued frames within this time step */
+    while (*nat->simInSize == 0 && nat->rx_queue.count > 0 &&
+           nat->sim_time_ns < sim_ns) {
+        native_dequeue_rx_frame(nat);
+        native_step_until_ns(nat, sim_ns);
+    }
+}
+static void js_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
+    /* Pre-M12 the threaded path mis-stepped JS motes with a cycle-unit
+     * target; JS never ran threaded.  Define the sane ns semantics. */
+    js_node_step_until_ns(&MOTE_IMPL(m)->plat.js, sim_ns);
+}
+
+/* --- sched_hint_ns: next-cpu-event wakeup lead from kernel time base_ns
+ * (emulated motes only; see schedule_emulated_wakeup) --- */
+
+static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
+    const msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
+    if ((cpu->interrupts_enabled &&
+         cpu->serviced_interrupt == -1 &&
+         cpu->interrupt_max >= 0) ||
+        cpu->next_event_cycle <= cpu->cycles) {
+        return base_ns;
+    }
+    return base_ns + msp430_cycles_to_ns(
+        cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+}
+static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
+    const arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    if (cpu->next_event_cycle <= cpu->cycles)
+        return base_ns;
+    return base_ns + arm_cycles_to_ns(
+        cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+}
+
 /*
  * Thread pool step callback: steps a single node to the target sim time.
  * user_data carries the sim_ns cast to void*.
@@ -3588,30 +3744,8 @@ static void threaded_step_node(int idx, void *user_data) {
 
     if (!node_active(idx)) return;
 
-    if (nodes[idx].type == NODE_NATIVE) {
-        if (!native_has_pending_work(&nodes[idx].plat.native, sim_ns)) {
-            nodes[idx].plat.native.sim_time_ns = sim_ns;
-            return;
-        }
-        step_node_until(idx, sim_ns);
-        /* Process additional queued frames within this time step */
-        while (*nodes[idx].plat.native.simInSize == 0 &&
-               nodes[idx].plat.native.rx_queue.count > 0 &&
-               nodes[idx].plat.native.sim_time_ns < sim_ns) {
-            native_dequeue_rx_frame(&nodes[idx].plat.native);
-            step_node_until(idx, sim_ns);
-        }
-    } else {
-        int64_t delta_ns = sim_ns - node_sim_time_ns(idx);
-        if (delta_ns > 0) {
-            int64_t target_cycle;
-            if (nodes[idx].type == NODE_MSP430)
-                target_cycle = node_cycles(idx) + msp430_ns_to_cycles(delta_ns, node_freq(idx));
-            else
-                target_cycle = node_cycles(idx) + arm_ns_to_cycles(delta_ns, node_freq(idx));
-            step_node_until(idx, target_cycle);
-        }
-    }
+    sim_mote_t *m = &mote_store[idx];
+    m->ops->advance_to_time(m, sim_ns);
 }
 
 /* --- Channel synchronization ---
@@ -3675,85 +3809,17 @@ static void dispatch_mote_wakeup(const sim_event_t *ev) {
         }
     }
 
-    bool sender_had_tx = false;
-    if (nodes[i].type == NODE_JS) {
-        /* Run the JS node up to event time; this fires execute()
-         * and dispatches any RX frames scheduled at <= ev_time. */
-        js_node_step_until_ns(&nodes[i].plat.js, ev_time);
-        int64_t nxt = js_node_next_wakeup_ns(&nodes[i].plat.js);
-        if (nxt < INT64_MAX)
-            sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, nxt);
-    } else if (nodes[i].type == NODE_NATIVE) {
-        /* Single tick at event time */
-        tick_one_native(i, ev_time);
-        sender_had_tx = native_had_tx[i];
-
-        /* Schedule next wakeup (like ContikiClock.doActionsAfterTick) */
-        schedule_native_wakeup(&sim_rt, i);
-    } else if (nodes[i].type == NODE_MSP430) {
-        /* MSP430 RF delivery is frame-assembled on the sender
-         * side and then delivered from the complete-frame path
-         * below. Consuming rf_pending here can split an in-flight
-         * frame and corrupt the receiver-side buffer state. */
-        ticking_node_idx = i;
-        int64_t returned_us = tick_one_msp430(i, ev_time);
-        ticking_node_idx = -1;
-        if (emu_rx_queue[i].count > 0)
-            emu_rx_queue_drain(i);
-        /* Match Cooja's MspMote.execute(t, 1): this slice
-         * schedules the mote's next normal wakeup itself. */
-        int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
+    /* M12: the per-type tick bodies live in the mote execute() ops.
+     * Each op runs one Cooja-style execute slice at ev_time and returns
+     * its next-wakeup time; the single schedule_if_earlier below
+     * preserves any requestImmediateWakeup already queued during the
+     * slice (RF delivery detection, drains). */
+    sim_mote_t *m = &mote_store[i];
+    native_exec_had_tx = false;
+    int64_t next_ns = m->ops->execute(m, ev_time);
+    bool sender_had_tx = native_exec_had_tx;
+    if (next_ns < INT64_MAX)
         sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
-    } else {
-        /* Emulated ARM: use the same Cooja-style tick as MSP430
-         * so peripheral events are anchored to the scheduler's
-         * event time and the CPU accumulates cycle time with the
-         * MSPSim stepMicros accuracy bound. */
-
-        /* GDB stub: poll for incoming commands; if the CPU is
-         * halted at a breakpoint, skip the tick and reschedule
-         * a wakeup so we keep checking the stub at sim_ns time. */
-        if (gdb_node[i] != 0) {
-            gdb_stub_poll(&gdb_stubs[i]);
-            if (gdb_stubs[i].halted) {
-                nodes[i].plat.arm.cpu.stopping = false;
-                sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
-                /* Continue to RF delivery / next event */
-                goto arm_tick_done;
-            }
-        }
-
-        ticking_node_idx = i;
-        int64_t returned_us = tick_one_arm(i, ev_time);
-        ticking_node_idx = -1;
-
-        /* GDB stub: a breakpoint may have fired during the tick.
-         * Clear the cpu->stopping flag set by gdb_stub_check_breakpoint
-         * so subsequent ticks (after `continue`) can run again. */
-        if (gdb_node[i] != 0) {
-            nodes[i].plat.arm.cpu.stopping = false;
-            if (gdb_stubs[i].halted) {
-                /* Reschedule sooner so we poll the stub again. */
-                sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, ev_time + 1000LL);
-                goto arm_tick_done;
-            }
-        }
-
-        /* Drain any frames queued for this node (mirrors the
-         * MSP430 path above).  For nRF52840, the pending_rx
-         * buffer inside the radio model handles delivery when
-         * the radio was not in RX state at delivery time; this
-         * drain covers the emu_rx_queue path which fires when
-         * direct delivery was deferred to a later tick. */
-        if (emu_rx_queue[i].count > 0)
-            emu_rx_queue_drain(i);
-
-        /* Match MspMote.execute(t, 1): schedule the next normal
-         * wakeup based on the step_micros lead hint. */
-        int64_t next_ns = ev_time + (returned_us + 1) * 1000LL;
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
-        arm_tick_done: ;
-    }
 
     /* RF delivery: if this node TX'd, schedule receivers
      * and set signal strength on ALL in-range neighbors

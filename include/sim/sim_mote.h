@@ -53,6 +53,38 @@ typedef struct sim_mote_ops {
 
     /* Retired instruction count, 0 if not tracked (native/JS). */
     int64_t (*instructions)(const sim_mote_t *m);
+
+    /* ---- M12: execution ------------------------------------------ */
+
+    /* Run the mote's execute slice at global time `now_ns` (§3.6).
+     * The mote must not advance global time; it returns the absolute
+     * time of its next known wakeup (INT64_MAX = none) and the CALLER
+     * does the single sim_schedule_mote_wakeup_if_earlier().  For
+     * emulated motes this wraps the Cooja MspMote.execute(t, duration)
+     * tick (clock deviation, sim_time pinning, step_micros); for
+     * native motes the ContikiMote.execute() tick + the
+     * doActionsAfterTick wakeup computation; for JS motes the queued
+     * callback dispatch up to now_ns. */
+    int64_t (*execute)(sim_mote_t *m, int64_t now_ns);
+
+    /* Step the mote to `target` in its own execution unit: CPU cycles
+     * for emulated motes, sim-time ns for native/JS motes (the unit
+     * convention predates the vtable; callers already know which they
+     * are driving). */
+    void (*step_until)(sim_mote_t *m, int64_t target);
+
+    /* Advance the mote to global time `sim_ns` from outside an execute
+     * slice (threaded stepping path): convert the mote's lag to its
+     * execution unit and step.  Includes the native pending-work fast
+     * path. */
+    void (*advance_to_time)(sim_mote_t *m, int64_t sim_ns);
+
+    /* OPTIONAL (emulated motes only, NULL otherwise): absolute next
+     * wakeup suggestion measured from kernel time `base_ns`, derived
+     * from the CPU's next pending cpu-event (and, for MSP430, pending
+     * unmasked interrupts).  Used after out-of-slice activity (serial
+     * injection, queued-frame drain) re-arms the mote's wakeup. */
+    int64_t (*sched_hint_ns)(const sim_mote_t *m, int64_t base_ns);
 } sim_mote_ops_t;
 
 struct sim_mote {
