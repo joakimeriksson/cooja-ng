@@ -106,6 +106,19 @@ typedef struct sim_mote_ops {
      * MSPSim baud-paced injection with CPU mini-steps, ARM = UART RX
      * register feed, JS = swallowed (no console input). */
     int (*serial_input)(sim_mote_t *m, const uint8_t *buf, int len);
+
+    /* ---- M15: lifecycle ------------------------------------------- */
+
+    /* Tear down the mote's platform state (emulator, native image, JS
+     * runtime).  The sim_mote_t itself and its slot registration are
+     * owned by the runner. */
+    void (*destroy)(sim_mote_t *m);
+
+    /* Re-seed the mote's local clock to global time `now_ns` after a
+     * reboot/dynamic add, so stepping resumes at the current sim time
+     * instead of catching up from t=0.  Emulated motes also re-derive
+     * the cycle counter from the new time. */
+    void (*reset_time)(sim_mote_t *m, int64_t now_ns);
 } sim_mote_ops_t;
 
 struct sim_mote {

@@ -696,6 +696,14 @@ static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static int js_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
+static void msp_mote_destroy(sim_mote_t *m);
+static void arm_mote_destroy(sim_mote_t *m);
+static void native_mote_destroy(sim_mote_t *m);
+static void js_mote_destroy(sim_mote_t *m);
+static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns);
+static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns);
+static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns);
+static void js_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 
 /* MSP430 emulated motes */
 static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
@@ -722,6 +730,8 @@ static const sim_mote_ops_t msp_mote_ops = {
     .sched_hint_ns   = msp_mote_sched_hint_ns,
     .sync_to_time    = msp_mote_sync_to_time,
     .serial_input    = msp_mote_serial_input,
+    .destroy         = msp_mote_destroy,
+    .reset_time      = msp_mote_reset_time,
 };
 
 /* ARM emulated motes */
@@ -749,6 +759,8 @@ static const sim_mote_ops_t arm_mote_ops = {
     .sched_hint_ns   = arm_mote_sched_hint_ns,
     .sync_to_time    = arm_mote_sync_to_time,
     .serial_input    = arm_mote_serial_input,
+    .destroy         = arm_mote_destroy,
+    .reset_time      = arm_mote_reset_time,
 };
 
 /* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
@@ -778,6 +790,8 @@ static const sim_mote_ops_t native_mote_ops = {
     .sched_hint_ns   = NULL, /* emulated motes only */
     .sync_to_time    = NULL, /* emulated motes only */
     .serial_input    = native_mote_serial_input,
+    .destroy         = native_mote_destroy,
+    .reset_time      = native_mote_reset_time,
 };
 
 /* JS app motes (same pseudo-cycle convention as native) */
@@ -799,6 +813,8 @@ static const sim_mote_ops_t js_mote_ops = {
     .sched_hint_ns   = NULL, /* emulated motes only */
     .sync_to_time    = NULL, /* emulated motes only */
     .serial_input    = js_mote_serial_input,
+    .destroy         = js_mote_destroy,
+    .reset_time      = js_mote_reset_time,
 };
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
@@ -3303,17 +3319,46 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     return 0;
 }
 
-/* --- Destroy node --- */
+/* --- Destroy node (M15: lifecycle ops) --- */
+
+static void msp_mote_destroy(sim_mote_t *m) {
+    msp430_platform_destroy(&MOTE_IMPL(m)->plat.msp);
+}
+static void arm_mote_destroy(sim_mote_t *m) {
+    arm_platform_destroy(&MOTE_IMPL(m)->plat.arm);
+}
+static void native_mote_destroy(sim_mote_t *m) {
+    native_node_destroy(&MOTE_IMPL(m)->plat.native);
+}
+static void js_mote_destroy(sim_mote_t *m) {
+    js_node_destroy(&MOTE_IMPL(m)->plat.js);
+}
+
+/* Re-seed the mote's local clock after reboot/dynamic add so stepping
+ * resumes at the current sim time (don't catch up from t=0).  Bodies
+ * verbatim from the former TEST_ACTION_ADD type switches; the JS body
+ * fixes a latent union aliasing slip — the old else-branch wrote
+ * plat.native.sim_time_ns even for JS motes. */
+static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
+    msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
+    cpu->sim_time_ns = now_ns;
+    cpu->cycles = (uint64_t)now_ns * cpu->cpu_freq_hz / 1000000000ULL;
+}
+static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
+    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    cpu->sim_time_ns = now_ns;
+    cpu->cycles = now_ns * cpu->cpu_freq_hz / 1000000000LL;
+}
+static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
+    MOTE_IMPL(m)->plat.native.sim_time_ns = now_ns;
+}
+static void js_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
+    MOTE_IMPL(m)->plat.js.sim_time_ns = now_ns;
+}
 
 static void destroy_node(int idx) {
-    if (nodes[idx].type == NODE_MSP430)
-        msp430_platform_destroy(&nodes[idx].plat.msp);
-    else if (nodes[idx].type == NODE_ARM)
-        arm_platform_destroy(&nodes[idx].plat.arm);
-    else if (nodes[idx].type == NODE_JS)
-        js_node_destroy(&nodes[idx].plat.js);
-    else
-        native_node_destroy(&nodes[idx].plat.native);
+    sim_mote_t *m = &mote_store[idx];
+    m->ops->destroy(m);
 }
 
 /* --- Reboot node (destroy + reinitialize) --- */
@@ -4642,19 +4687,10 @@ sim_restart:
                                 printf("  ACTION: add (reboot) node %d at %lld ms\n",
                                        act->node, (long long)(sim_ns / MS_TO_NS));
                             reboot_node(i);
-                            /* Set sim_time_ns to current time so stepping
-                             * resumes correctly (don't catch up from t=0) */
-                            if (nodes[i].type == NODE_MSP430) {
-                                msp430_cpu_t *cpu = &nodes[i].plat.msp.cpu;
-                                cpu->sim_time_ns = sim_ns;
-                                cpu->cycles = (uint64_t)sim_ns * cpu->cpu_freq_hz / 1000000000ULL;
-                            } else if (nodes[i].type == NODE_ARM) {
-                                arm_cpu_t *cpu = &nodes[i].plat.arm.cpu;
-                                cpu->sim_time_ns = sim_ns;
-                                cpu->cycles = sim_ns * cpu->cpu_freq_hz / 1000000000LL;
-                            } else {
-                                nodes[i].plat.native.sim_time_ns = sim_ns;
-                            }
+                            /* Re-seed the mote clock to current time so
+                             * stepping resumes correctly (M15 op). */
+                            mote_store[i].ops->reset_time(&mote_store[i],
+                                                          sim_ns);
                             node_start_ns[i] = sim_ns;
                             break;
                         }
@@ -4743,17 +4779,7 @@ sim_restart:
                         if (verbose)
                             printf("  JS ACTION: add (reboot) node %d\n", act->node);
                         reboot_node(i);
-                        if (nodes[i].type == NODE_MSP430) {
-                            msp430_cpu_t *cpu = &nodes[i].plat.msp.cpu;
-                            cpu->sim_time_ns = sim_ns;
-                            cpu->cycles = (uint64_t)sim_ns * cpu->cpu_freq_hz / 1000000000ULL;
-                        } else if (nodes[i].type == NODE_ARM) {
-                            arm_cpu_t *cpu = &nodes[i].plat.arm.cpu;
-                            cpu->sim_time_ns = sim_ns;
-                            cpu->cycles = sim_ns * cpu->cpu_freq_hz / 1000000000LL;
-                        } else {
-                            nodes[i].plat.native.sim_time_ns = sim_ns;
-                        }
+                        mote_store[i].ops->reset_time(&mote_store[i], sim_ns);
                         node_start_ns[i] = sim_ns;
                         /* Schedule the rebooted node in the event queue
                          * so it gets ticked immediately */
