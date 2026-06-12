@@ -165,6 +165,18 @@ int  native_cooja_mote_boot(mixed_node_t *node, int slot,
 void native_cooja_mote_register_radio(mixed_node_t *node, int slot,
                                       sim_radio_bus_t *bus);
 
+/* M21: MSP430 emulated-ELF motes.  Boot + tick + radio ops only — the
+ * msp_mote_ops adapter table stays in the runner until its
+ * dependencies move (frame-delivery drain → Phase 5, ticking guard →
+ * Phase 5; §3.17).  The tick is exported because the runner's
+ * frame-delivery pre-sync path also calls it. */
+int  msp430_elf_mote_boot(mixed_node_t *node, int slot,
+                          const char *firmware_path, int node_id,
+                          const sim_mote_env_t *env);
+void msp430_elf_mote_register_radio(mixed_node_t *node, int slot,
+                                    sim_radio_bus_t *bus);
+int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
+
 #ifdef __cplusplus
 }
 #endif

@@ -77,9 +77,10 @@ SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
               $(SIM_SRC_DIR)/sim_board.c
 
 # Per-kind mote modules (boot policy + adapters) — Phase 4, §3.17.
-# M21–M23 add msp430_elf_mote.c, arm_elf_mote.c, mote_kinds.c.
+# M22–M23 add arm_elf_mote.c, mote_kinds.c.
 MOTES_SOURCES = $(MOTES_SRC_DIR)/js_app_mote.c \
-                $(MOTES_SRC_DIR)/native_cooja_mote.c
+                $(MOTES_SRC_DIR)/native_cooja_mote.c \
+                $(MOTES_SRC_DIR)/msp430_elf_mote.c
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
