@@ -177,6 +177,17 @@ void msp430_elf_mote_register_radio(mixed_node_t *node, int slot,
                                     sim_radio_bus_t *bus);
 int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
 
+/* M22: ARM emulated-ELF motes (CC2538 / firefly / nRF52840 /
+ * nRF54L15).  Same shape and same descope as M21: the arm_mote_ops
+ * adapter table stays in the runner (drain → Phase 5, GDB stubs →
+ * Phase 6). */
+int  arm_elf_mote_boot(mixed_node_t *node, int slot,
+                       const char *firmware_path, int node_id,
+                       const sim_mote_env_t *env);
+void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
+                                 sim_radio_bus_t *bus);
+int64_t arm_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
+
 #ifdef __cplusplus
 }
 #endif
