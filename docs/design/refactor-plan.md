@@ -980,6 +980,155 @@ dynamic-ADD; M20 Cooja suite + GENERATE_MSG-heavy 14-rpl-lite
 dual-radio + nrf52840-dk/nrf54l15 multinode + GDB smoke; M23 reboot +
 JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 
+### 3.18 Radio-bus extraction milestones (canonical Phase 5 task list)
+
+> **Status: planned.** Numbering continues from Phase 4 (M24–M30).
+> Goal (from §9 Phase 5): the remaining RF delivery *policy* moves out
+> of `test/test_mixed_multinode.c` into `src/sim/sim_radio_bus.c`.
+> The M9.4/M9.5 slices already moved the TX byte path (byte clock,
+> frame assembler, capture, medium-filtered dispatch, delivery modes,
+> RX-stall sim-time timer); what remains runner-side is the policy
+> behind the `sim_radio_bus_host_t` hooks — above all the ~413-line
+> `frame_complete` body (air-time windows, snapshots, collision
+> windows, RXFIFO backpressure, MSP430 pre-sync, sync-vs-queue
+> delivery, dual 192 µs auto-ACK windows, interference marking) plus
+> `emu_deliver_bytes`, the emu RX queue, the native/JS frame path,
+> and channel/CCA plumbing.
+> Stop condition (from §9 Phase 5, non-negotiable): never simplify
+> byte timing into frame-only delivery; the dual ACK-window
+> arithmetic — receivers `accurate_tx_end + 192000`, sender
+> `now + 192000`, sender's own ACK always queued, others
+> sync-if-space — is copied digit-for-digit.
+
+Design decisions locked for this phase:
+
+- **`--threads N` is retired in M29** (resolves §3.13's
+  "port or retire by Phase 6": zero usage signals — no config, CI
+  script, tool, or documented workflow exercises it).  A future batch
+  scheduler builds on the bus APIs behind `sim_scheduler_ops_t`.
+  The path stays *working* through M26–M28 (its
+  `distribute_rf_outgoing` calls the new bus APIs) until M29 deletes
+  it.
+- **Ops placement rule**: anything that advances a mote's CPU/local
+  clock is a `sim_mote_ops_t` member; anything that talks to the
+  chip's radio endpoint is a `mote_radio_ops_t` member.  New optional
+  `sim_mote_ops_t` members (M25): `rx_byte_sync(m, byte_time_ns)`
+  (per-byte pre-delivery clock sync; MSP430 = existing sync_to_time
+  path, ARM = the verbatim ex-inline body — unclamped, sim_time
+  pinned before AND after the step; semantics differ, do not unify)
+  and `rx_pre_sync(m, time_ns)` (MSP430-only full execute-slice
+  pre-sync, ex the frame_complete `msp430_elf_mote_tick` call).
+  New optional `mote_radio_ops_t` members (M28):
+  `current_channel(mote)` (native pull-model channel — replaces the
+  `sync_channel` host hook) and `mark_collisions(mote, start, end)`
+  (native rx-queue collision marking; the bus marks its own emu
+  queues directly).
+- **Registration caps**: `sim_radio_bus_register` gains a caps
+  bitmask encoding platform delivery quirks currently expressed as
+  `nodes[].type` checks (e.g. `SIM_RADIO_CAP_WAKE_SENDER_POST_TX`,
+  `SIM_RADIO_CAP_DRAIN_MINI_STEP` — MSP430-only behaviors).  Each
+  src/motes module sets its own caps.
+- **Host hooks v2**: `node_active`, `on_tx_byte`, `on_byte_accepted`
+  stay; `sync_channel` dies in M28; the fat `frame_complete` policy
+  hook is replaced by slim *notification* hooks the runner consumes
+  for observability until Phase 6 turns them into services:
+  `frame_observed(frame_info)` (PCAP / packet analyzer / TX timeline
+  / UI / traces), `on_rx(receiver, outcome, data, len, start, end,
+  subghz)`, `on_ack(acker, start, dur)`.
+- **State ownership after the move**: `node_tx_busy_until_ns` → bus,
+  queried via `sim_radio_bus_channel_busy()` (the CC1200 CCA env
+  callback becomes a delegation); `ticking_node_idx` → bus-owned
+  `executing_node` + setter; counters incremented by moved code →
+  `bus->stats` (end-of-run print reads them);
+  `suppress_state_callback` → `sim_radio_bus_in_delivery()`.
+- **`native_yield_callback` stays runner-side** (cross-node ACK
+  turnaround policy that ticks receiver motes; revisit when the bus
+  can express "tick receiver to generate ACK", likely never — it is
+  ContikiMote semantics, not bus routing).
+- **MSP430/ARM execute/serial adapters move in Phase 6** with the GDB
+  service (re-affirms the §3.17 descope; after Phase 5 their only
+  remaining runner dependency is the GDB stubs).
+- **Fail-fast: cross-build empty-diff.** M25–M27 claim byte-identical
+  behavior; each runs sky 2-node, firefly-subghz 2-node, and cc2538
+  configs on the previous milestone's binary and the new one, and
+  diffs stdout+stderr (minus wall-clock/rate lines).  Non-empty diff
+  = moved-code bug → revert per §11.5.  Phase 4's byte-identical
+  chain history across six commits shows the bar is realistic.
+
+Milestones (one commit each, full validation gate before each):
+
+24. Guardrails (no production-code changes): new `radio-bus` unit
+    suite (`test/test_radio_bus.c`, mock `mote_radio_ops_t` receivers
+    + scripted chip TX byte streams through `sim_radio_bus_tx_byte`,
+    pumped via `sim_runtime_run_until`): 802.15.4 + 802.15.4g frame
+    completion, capture + `first_byte_ns` arming + 32/160 µs byte-
+    clock spacing of PER_BYTE events, delivery-mode routing,
+    re-entrant depth staging, RX-stall arm/extend/stale-rearm/expiry,
+    `pick_receiver_radio`, `frame_fifo_bytes`.  New
+    `tools/check-determinism.sh` (run config twice, diff output)
+    joins the per-milestone gate.  Record the §3.14.1 perf baseline
+    (sky + firefly-subghz-fixed 2-node 60 s).  If a unit test exposes
+    a bug: document, don't fix here.
+25. De-typing prep (runner-side, behavior-preserving): add the
+    `rx_byte_sync`/`rx_pre_sync` ops + registration caps; the RF
+    path's `nodes[].type` checks become mode/caps/ops-presence
+    queries; `emu_deliver_bytes`' ARM branch goes through the op
+    verbatim.  Cross-build diff must be empty.  Detectors: TSCH +
+    clock-drift, firefly-subghz chain, nrf52840-dk (BATCH), nrf54l15
+    (rx_stall).
+26. Emulated RX core into the bus (character-identical):
+    `emu_deliver_bytes` → `sim_radio_bus_deliver_bytes`,
+    `emu_rx_queue_push/drain` → bus APIs, `deliver_rx_byte` →
+    `sim_radio_bus_deliver_rx_byte`, `schedule_emulated_wakeup` →
+    `sim_radio_bus_wake_mote`; `ticking_node_idx` →
+    `bus->executing_node` + `sim_radio_bus_set_executing`; RX
+    timeline/prints via the `on_rx` hook; emu counters →
+    `bus->stats`.  Bus code compiles with no chip/platform headers —
+    a moved line needing `plat.msp/arm` was mis-scoped.  Perf ≤3%
+    cumulative.
+27. Frame-complete policy into the bus — **highest-risk milestone**:
+    air-time math, sub-GHz `first_byte_ns` fixups,
+    `node_tx_busy_until_ns` + `sim_radio_bus_channel_busy`,
+    snapshots, collision windows, RXFIFO backpressure mini-step via
+    ops, `rx_pre_sync`, sync-vs-queue, the dual ACK windows
+    digit-for-digit, interference marking, sender post-TX wake via
+    caps.  Fat hook deleted; runner implements `frame_observed` +
+    `on_ack`.  Unit suite gains collision/backpressure/ACK-window
+    arithmetic tests with a scripted auto-ACK mock.  If any timing
+    constant (192000, 5000 cycles, 1 ms) "needs adjusting" to go
+    green — that is a moved-code bug, STOP.  Perf ≤8% cumulative.
+    Detectors: pcap byte-diff between builds, nrf52840 4-node
+    convergence, firefly-subghz 4-node (stays at the known red, must
+    not worsen), TSCH-ACK traces.
+28. Native/JS frame path + channel consolidation:
+    `mixed_rf_frame_handler`'s delivery loop → `sim_radio_bus_tx_frame`
+    (native direct-`simInDataBuffer` fast path + `simLastPacketTimestamp`
+    becomes part of `native_cooja_mote`'s `receive_frame` op; NONE-medium
+    branch; interference unified via `mark_collisions`);
+    `mixed_node_radio_set_channel` → `sim_radio_bus_push_channel`;
+    `sync_native_node_channel`/`native_channel_sync`/host `sync_channel`
+    collapse onto the `current_channel` op.  If op-ifying the native
+    fast path changes any Cooja result, fall back to a bus-side
+    fast-path op and note it.  Perf ≤10% phase total (channel pull
+    enters the per-byte loop — measure).
+29. Retire `--threads`: delete the threaded callbacks,
+    `distribute_rf_outgoing`, `flush_pending_output`, `thread_state`,
+    `frame_outgoing`, the fixed-1 ms loop arm, `--threads` parsing +
+    `num_threads` guards (mechanical removal only), `rf_outgoing`
+    from `sim_radio_bus_t`, `env->num_threads`, the now-unused
+    `advance_to_time` op + its four impls, and the runner's
+    `sim_thread_pool` usage.
+30. Close-out (docs only): §6.3 RF-timer audit note (cc2538/nrf52840
+    ACK turnarounds verified ns-based; nrf54l15 done in M9.5), §3.18
+    status, §10 determinism wording (stdout diff script; drop the
+    phantom `--timeline-out`), Decisions Log finalized, CLAUDE.md.
+
+Validation gate per milestone: §3.17's gate plus the new `radio-bus`
+suite and the determinism run-twice diff; M25–M27 add the cross-build
+empty-diff.  Perf checkpoints at M24 (baseline), M26 (≤3%), M27
+(≤8%), M28 (≤10% phase total) per §3.14.1; if exceeded, cache ops
+pointers in the delivery loops before merging.
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -1630,6 +1779,11 @@ Stop condition:
 Goal: make RF routing reusable and remove the biggest correctness risk from the
 runner.
 
+The canonical task list is §3.18 above (milestones M24–M30). Land them in
+order, one commit per milestone. The lists below summarize the scope; where
+they disagree with §3.18 (written later, against the post-Phase-4 code),
+§3.18 wins.
+
 Move these concepts into `sim_radio_bus`:
 
 - `rf_listener_ctx_t`
@@ -2003,6 +2157,19 @@ the same patch.
   `src/motes/`; the emulated execute/serial adapters follow their
   dependencies (radio bus Phase 5, GDB service Phase 6) — superseding the
   §3.16 "adapters move in Phase 4" note (M17-descope precedent).
+- **Phase 5 task list is §3.18 (M24–M30).** Frame-delivery policy moves into
+  the bus behind slim notification hooks; the dual 192 µs ACK-window
+  arithmetic is copied digit-for-digit; M25–M27 are gated by a cross-build
+  empty-diff.
+- **`--threads N` is retired in Phase 5 M29** (resolves the §3.13
+  port-or-retire decision: zero usage signals).  A future batch scheduler
+  builds on the bus APIs behind `sim_scheduler_ops_t`.
+- **Ops placement rule (Phase 5)**: CPU/local-clock motion lives on
+  `sim_mote_ops_t`; chip radio-endpoint behavior lives on
+  `mote_radio_ops_t`.  Platform delivery quirks become registration caps,
+  not type checks.
+- **MSP430/ARM execute/serial adapters move in Phase 6** with the GDB
+  service (after Phase 5, GDB is their only runner dependency).
 - **`--threads N` is "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
   (§3.13). Two divergent schedulers persisting indefinitely is not an option.
 - **Performance budget**: ≤5% Phases 1–2, ≤10% Phases 3–5 combined, ≤5% Phases
