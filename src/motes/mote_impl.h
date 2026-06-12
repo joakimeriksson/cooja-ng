@@ -70,7 +70,13 @@ typedef struct mixed_node {
     double ideal_cycles;     /* cumulative ideal cycle target (like MSPSim lastMicrosCycles) */
     rf_listener_ctx_t rf_ctx[2];    /* per-radio TX listener tags (ex
                                      * runner rf_ctx_slot0/1[] arrays) */
-    /* M20 adds: bool native_had_tx, bool exec_had_tx (ex runner globals). */
+    bool native_had_tx;             /* native: last tick had a TX (ex
+                                     * runner native_had_tx[] — TX yield
+                                     * vs TSCH busywait discrimination) */
+    bool exec_had_tx;               /* native: execute→dispatcher handoff
+                                     * for post-tick RF distribution (ex
+                                     * runner native_exec_had_tx global;
+                                     * dispatcher pre-clears + reads it) */
     union {
         msp430_platform_t msp;
         arm_platform_t arm;
@@ -150,6 +156,14 @@ int  js_app_mote_boot(mixed_node_t *node, int slot, const char *script_path,
                       int node_id, const sim_mote_env_t *env);
 void js_app_mote_register_radio(mixed_node_t *node, int slot,
                                 sim_radio_bus_t *bus);
+
+/* M20: native Cooja motes (dlopen'd Contiki shared library). */
+extern const sim_mote_ops_t native_cooja_mote_ops;
+int  native_cooja_mote_boot(mixed_node_t *node, int slot,
+                            const char *firmware_path, int node_id,
+                            const sim_mote_env_t *env);
+void native_cooja_mote_register_radio(mixed_node_t *node, int slot,
+                                      sim_radio_bus_t *bus);
 
 #ifdef __cplusplus
 }

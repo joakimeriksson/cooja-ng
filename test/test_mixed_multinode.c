@@ -648,35 +648,27 @@ static double get_time_ms(void) {
  * prototypes. */
 static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns);
 static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns);
-static int64_t native_mote_execute(sim_mote_t *m, int64_t now_ns);
 static void msp_mote_step_until(sim_mote_t *m, int64_t target);
 static void arm_mote_step_until(sim_mote_t *m, int64_t target);
-static void native_mote_step_until(sim_mote_t *m, int64_t target);
 static void msp_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static void arm_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
-static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
 static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
 static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
-static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static void msp_mote_destroy(sim_mote_t *m);
 static void arm_mote_destroy(sim_mote_t *m);
-static void native_mote_destroy(sim_mote_t *m);
 static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns);
-static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static int msp_mote_ui_radio_state(const sim_mote_t *m);
 static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
 static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
 static void *msp_mote_get_interface(sim_mote_t *m, int iface);
 static void *arm_mote_get_interface(sim_mote_t *m, int iface);
-static void *null_mote_get_interface(sim_mote_t *m, int iface);
-static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
-                                     int len, int64_t now_ns, int sender_idx);
-/* (JS adapters live in src/motes/js_app_mote.c — M19) */
+/* (JS + native adapters live in src/motes/{js_app,native_cooja}_mote.c
+ * — M19/M20) */
 
 /* Convenience: the mote's CC2420, or NULL for non-Sky motes (debug
  * traces + per-byte stats branch on this instead of node type). */
@@ -751,42 +743,8 @@ static const sim_mote_ops_t arm_mote_ops = {
     .receive_frame   = NULL, /* per-byte / staged delivery */
 };
 
-/* Native Cooja motes (pseudo-cycles: 1 cycle = 1 µs, 1 MHz pseudo-freq) */
-static int64_t native_mote_sim_time_ns(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.native.sim_time_ns;
-}
-static int64_t native_mote_cycles(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.native.sim_time_ns / 1000LL;
-}
-static uint32_t pseudo_mote_freq_hz(const sim_mote_t *m) {
-    (void)m;
-    return 1000000; /* native/js: 1 MHz pseudo-freq (1 cycle = 1 us) */
-}
-static int64_t zero_mote_instructions(const sim_mote_t *m) {
-    (void)m;
-    return 0; /* native/js: not tracked */
-}
-static const sim_mote_ops_t native_mote_ops = {
-    .kind            = "NATIVE",
-    .sim_time_ns     = native_mote_sim_time_ns,
-    .cycles          = native_mote_cycles,
-    .freq_hz         = pseudo_mote_freq_hz,
-    .instructions    = zero_mote_instructions,
-    .execute         = native_mote_execute,
-    .step_until      = native_mote_step_until,
-    .advance_to_time = native_mote_advance_to_time,
-    .sched_hint_ns   = NULL, /* emulated motes only */
-    .sync_to_time    = NULL, /* emulated motes only */
-    .serial_input    = native_mote_serial_input,
-    .destroy         = native_mote_destroy,
-    .reset_time      = native_mote_reset_time,
-    .ui_radio_state  = NULL,
-    .ui_leds         = NULL,
-    .get_interface   = null_mote_get_interface,
-    .receive_frame   = native_mote_receive_frame,
-};
-
-/* JS app mote ops live in src/motes/js_app_mote.c (M19). */
+/* Native + JS mote ops live in src/motes/{native_cooja,js_app}_mote.c
+ * (M19/M20). */
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
  * Called from init_node() right after the node's type is set, so the
@@ -795,10 +753,10 @@ static const sim_mote_ops_t native_mote_ops = {
 static void register_node_mote(int idx) {
     const sim_mote_ops_t *ops;
     switch (nodes[idx].type) {
-    case NODE_MSP430: ops = &msp_mote_ops;    break;
-    case NODE_ARM:    ops = &arm_mote_ops;    break;
-    case NODE_JS:     ops = &js_app_mote_ops; break;
-    default:          ops = &native_mote_ops; break;
+    case NODE_MSP430: ops = &msp_mote_ops;        break;
+    case NODE_ARM:    ops = &arm_mote_ops;        break;
+    case NODE_JS:     ops = &js_app_mote_ops;     break;
+    default:          ops = &native_cooja_mote_ops; break;
     }
     mote_store[idx].id = nodes[idx].id;
     mote_store[idx].ops = ops;
@@ -925,23 +883,8 @@ static const mote_radio_ops_t arm54l_radio_ops = {
     arm54l_radio_rx_stall
 };
 
-/* Native (Cooja-protocol) motes: SYNC delivery — the bus feeds each
- * accepted on-air byte to the mote's RX frame assembler.  rxfifo 0 / not
- * busy preserve the pre-M9.4 behaviour of the frame paths, which skip
- * natives explicitly. */
-static void native_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
-    (void)rssi;
-    mixed_node_t *node = (mixed_node_t *)m;
-    native_rx_assembler_feed(&node->plat.native, byte);
-}
-static int native_radio_rxfifo_available(void *m) { (void)m; return 0; }
-static bool native_radio_rx_busy(void *m) { (void)m; return false; }
-static const mote_radio_ops_t native_radio_ops = {
-    native_radio_receive_byte, native_radio_rxfifo_available,
-    native_radio_rx_busy, NULL /* rx_stall */
-};
-
-/* JS radio ops live in src/motes/js_app_mote.c (M19). */
+/* Native + JS radio ops live in src/motes/{native_cooja,js_app}_mote.c
+ * (M19/M20). */
 
 /* Register node idx's radio endpoint + delivery mode on the bus.
  * Called from init_node() after platform init, so dynamically added
@@ -969,8 +912,7 @@ static void register_node_radio_ops(int idx) {
         break;
     }
     case NODE_NATIVE:
-        sim_radio_bus_register(&radio_bus, idx, &native_radio_ops,
-                               &nodes[idx], SIM_RADIO_DELIVERY_SYNC);
+        native_cooja_mote_register_radio(&nodes[idx], idx, &radio_bus);
         break;
     case NODE_JS:
         js_app_mote_register_radio(&nodes[idx], idx, &radio_bus);
@@ -2211,54 +2153,8 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
  * funnel through inject_serial().
  * ============================================================ */
 
-/* Native motes: append into the mote's pending serial buffer (the
- * cooja rs232 backend has a fixed 2048-byte receive buffer). */
-static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
-                                    int len) {
-    mixed_node_t *node = MOTE_IMPL(m);
-    int idx = MOTE_IDX(m);
-    native_node_t *nat = &node->plat.native;
-    if (!nat->simSerialReceivingData ||
-        !nat->simSerialReceivingLength ||
-        !nat->simSerialReceivingFlag) return 0;
-
-    /* Match COOJA ContikiRS232: append new bytes into the mote's pending
-     * serial buffer even when simSerialReceivingFlag is already set, then
-     * request an immediate wakeup so the mote drains that buffer. */
-    int old_size = *nat->simSerialReceivingLength;
-    if (old_size < 0) old_size = 0;
-    if (old_size > 2048) old_size = 2048;
-    int space = 2048 - old_size;
-    if (space <= 0) {
-        if (num_threads == 0) {
-            int64_t wake_ns = nat->sim_time_ns;
-            if (node_start_ns[idx] > wake_ns)
-                wake_ns = node_start_ns[idx];
-            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, wake_ns);
-        }
-        return 0;
-    }
-
-    int to_send = len;
-    if (to_send > space) to_send = space;
-    memcpy(nat->simSerialReceivingData + old_size, buf, (size_t)to_send);
-    *nat->simSerialReceivingLength = old_size + to_send;
-    *nat->simSerialReceivingFlag = 1;
-    if (nat->simProcessRunValue)
-        *nat->simProcessRunValue = 1;
-    /* Match COOJA's external serial delivery contract: once serial data
-     * is injected, the mote must be re-run at the current simulation
-     * time rather than waiting for a stale timer-based wakeup. This is
-     * the native equivalent of the immediate reschedule used for MSP430
-     * serial injection below. */
-    if (num_threads == 0) {
-        int64_t wake_ns = nat->sim_time_ns;
-        if (node_start_ns[idx] > wake_ns)
-            wake_ns = node_start_ns[idx];
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, wake_ns);
-    }
-    return to_send;
-}
+/* (Native serial_input — Cooja rs232 append + immediate wakeup — lives
+ * in native_cooja_mote.c, M20.) */
 
 /* MSP430: match MSPSim's MspSerial — inject ALL pending bytes at
  * baud-rate intervals (69µs = 115200 baud), stepping CPU between each
@@ -3116,31 +3012,9 @@ static void native_yield_callback(void *user_data) {
         native_dequeue_rx_frame(&sender->plat.native);
 }
 
-static int init_native_node(int idx, const char *firmware_path, int node_id) {
-    mixed_node_t *node = &nodes[idx];
-    native_node_t *nat = &node->plat.native;
-
-    if (native_node_init(nat, firmware_path, node_id) != 0)
-        return -1;
-
-    /* Set up UART/log callback */
-    nat->log_callback = mixed_uart_callback;
-    nat->log_callback_data = node;
-
-    /* Set up RF callbacks: byte-stream for emulated, frame for native */
-    nat->rf_tx_callback = mixed_rf_tx_handler;
-    nat->rf_tx_callback_data = node;
-    nat->rf_frame_callback = mixed_rf_frame_handler;
-    nat->rf_frame_callback_data = node;
-    nat->yield_callback = native_yield_callback;
-    nat->yield_callback_data = node;
-
-    /* Reset the RX assembler */
-    native_rx_assembler_reset(&nat->rx_asm);
-
-    printf("  Node %d [NATIVE] initialized\n", node_id);
-    return 0;
-}
+/* (Native boot policy lives in src/motes/native_cooja_mote.c — M20.
+ * native_yield_callback above stays runner-side: it is cross-node
+ * ACK-turnaround policy, injected via env->native_yield.) */
 
 /* JS node TX handler: when mote.send(bytes) fires, bridge the frame to
  * both native receivers (frame-level) and emulated receivers (byte-stream
@@ -3163,11 +3037,18 @@ static void mixed_js_rf_handler(void *user_data, const uint8_t *frame, int len) 
 
 /* --- Top-level node init (dispatches by type) --- */
 
+/* TSCH channel sync for native motes (M20): the module's tick pushes
+ * the mote's current channel into the runner-owned radio medium.
+ * Dissolves into the bus in Phase 5. */
+static void mixed_native_channel_sync(int slot, int channel) {
+    radio_medium_set_channel(&radio_medium, slot, channel);
+}
+
 /* Runner glue bundle for the per-kind mote modules (Phase 4, M18 —
  * see mote_impl.h).  One static instance; init_node() stamps it on
- * every node.  All referenced callbacks are defined above.  The boot
- * bodies still call the callbacks directly until M19–M22 move them
- * into src/motes/; native_channel_sync arrives with M20. */
+ * every node.  All referenced callbacks are defined above.  The
+ * MSP430/ARM boot bodies still call the callbacks directly until
+ * M21/M22 move them into src/motes/. */
 static const sim_mote_env_t mixed_mote_env = {
     .sim                   = &sim_rt,
     .radio_bus             = &radio_bus,
@@ -3184,6 +3065,7 @@ static const sim_mote_env_t mixed_mote_env = {
     .rf_frame              = mixed_rf_frame_handler,
     .native_yield          = native_yield_callback,
     .js_rf_frame           = mixed_js_rf_handler,
+    .native_channel_sync   = mixed_native_channel_sync,
 };
 
 static int init_node(int idx, const char *firmware_path, int node_id) {
@@ -3221,7 +3103,8 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
         rc = js_app_mote_boot(node, idx, firmware_path, node_id,
                               &mixed_mote_env);
     else
-        rc = init_native_node(idx, firmware_path, node_id);
+        rc = native_cooja_mote_boot(node, idx, firmware_path, node_id,
+                                    &mixed_mote_env);
     if (rc != 0)
         return rc;
 
@@ -3240,9 +3123,6 @@ static void msp_mote_destroy(sim_mote_t *m) {
 static void arm_mote_destroy(sim_mote_t *m) {
     arm_platform_destroy(&MOTE_IMPL(m)->plat.arm);
 }
-static void native_mote_destroy(sim_mote_t *m) {
-    native_node_destroy(&MOTE_IMPL(m)->plat.native);
-}
 
 /* Re-seed the mote's local clock after reboot/dynamic add so stepping
  * resumes at the current sim time (don't catch up from t=0).  Bodies
@@ -3258,9 +3138,6 @@ static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
     arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
     cpu->sim_time_ns = now_ns;
     cpu->cycles = now_ns * cpu->cpu_freq_hz / 1000000000LL;
-}
-static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
-    MOTE_IMPL(m)->plat.native.sim_time_ns = now_ns;
 }
 
 /* --- M16 introspection adapters --- */
@@ -3304,21 +3181,8 @@ static void *arm_mote_get_interface(sim_mote_t *m, int iface) {
         return &MOTE_IMPL(m)->plat.arm.cpu;
     return NULL;
 }
-static void *null_mote_get_interface(sim_mote_t *m, int iface) {
-    (void)m; (void)iface;
-    return NULL;
-}
-
-/* --- M17 frame-level RX adapters (frame-consuming motes only) --- */
-
-static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
-                                     int len, int64_t now_ns,
-                                     int sender_idx) {
-    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
-    int rc = (nat->rx_queue.count >= NATIVE_RX_QUEUE_SIZE) ? -1 : 0;
-    native_deliver_frame(nat, frame, len, now_ns, sender_idx);
-    return rc;  /* <0 = queue was full; caller owns the stats (M19) */
-}
+/* (M17 frame-level RX adapters live in the native/JS modules —
+ * M19/M20.) */
 
 static void destroy_node(int idx) {
     sim_mote_t *m = &mote_store[idx];
@@ -3460,122 +3324,15 @@ static int64_t tick_one_arm(int idx, int64_t sim_ns) {
 
 /* --- Event-driven scheduling helpers (COOJA model) --- */
 
-/* Tick a single native node at sim_ns. Single tick, no loop.
- * Matches COOJA's ContikiMote.execute(). */
-/* Track whether the last tick had a TX (for distinguishing TX yield
- * from TSCH busywait in schedule_native_wakeup). */
-static bool native_had_tx[MAX_NODES];
+/* (tick_one_native / native_next_wakeup_after_tick /
+ * native_has_pending_work live in src/motes/native_cooja_mote.c —
+ * M20.  native_had_tx[] became node->native_had_tx.) */
 
 /* GDB stub state (file scope so the kernel-pump event dispatcher can
  * poll stubs from dispatch_mote_wakeup — M10).  gdb_node[i] is the TCP
  * port to bind for node i, or 0 = no stub. */
 static int gdb_node[MAX_NODES];
 static gdb_stub_t gdb_stubs[MAX_NODES];
-
-static void tick_one_native(int idx, int64_t sim_ns) {
-    native_node_t *nat = &nodes[idx].plat.native;
-    nat->sim_time_ns = sim_ns;
-    *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
-    *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
-
-    if (nat->radio_is_transmitting && sim_ns >= nat->radio_tx_end_ns) {
-        nat->radio_is_transmitting = false;
-        nat->radio_tx_finished = true;
-        *nat->simOutSize = 0;
-        if (nat->simProcessRunValue) {
-            *nat->simProcessRunValue = 1;
-        }
-    } else {
-        nat->radio_tx_finished = false;
-    }
-
-    /* Deliver queued RX frame BEFORE tick.
-     * Force simReceiving=0 so pending_packet() returns true.
-     * Only dequeue when the radio is on — TSCH turns radio off between
-     * slots, and doInterfaceActionsBeforeTick drops frames when off.
-     * Keeping the frame in the queue lets it be delivered on a later
-     * tick when the radio is in an active RX slot. */
-    if (*nat->simReceiving)
-        *nat->simReceiving = 0;
-    bool radio_on = !nat->simRadioHWOn || *nat->simRadioHWOn;
-    if (*nat->simInSize == 0 && nat->rx_queue.count > 0 && radio_on)
-        native_dequeue_rx_frame(nat);
-    int pre_insize = *nat->simInSize;
-    nat->cooja_tick();
-    native_had_tx[idx] = (*nat->simOutSize > 0);
-    native_check_radio_tx(nat);
-    native_check_log_output(nat);
-    /* Reset signal strength when frame is consumed (signalReceptionEnd) */
-    if (pre_insize > 0 && *nat->simInSize == 0) {
-        if (nat->simSignalStrength)
-            *nat->simSignalStrength = -100;
-        if (verbose)
-            fprintf(stderr, "  [CONSUMED] node %d consumed %d-byte frame at %lld ms\n",
-                    nodes[idx].id, pre_insize, (long long)(nat->sim_time_ns / 1000000LL));
-    }
-
-    /* Sync this node's channel (for TSCH hopping) */
-    if (nat->simRadioChannel)
-        radio_medium_set_channel(&radio_medium, idx, *nat->simRadioChannel);
-}
-
-/* Compute a native node's next wakeup time after a tick.
- * Exactly matches COOJA's ContikiClock.doActionsAfterTick().  The caller
- * schedules the returned time with sim_schedule_mote_wakeup_if_earlier so
- * a requestImmediateWakeup already scheduled by RF delivery detection is
- * never overridden (M12: this is the native execute() op's return value). */
-static int64_t native_next_wakeup_after_tick(int idx) {
-    native_node_t *nat = &nodes[idx].plat.native;
-    int64_t now = nat->sim_time_ns;
-
-    /* Determine next wakeup time (like ContikiClock.doActionsAfterTick). */
-    int64_t next = now + 1000000000LL;  /* 1s max gap */
-
-    /* rtimer has priority (exact µs timing) */
-    if (*nat->simRtimerPending) {
-        int64_t rt = (int64_t)(*nat->simRtimerNextExpirationTime) * 1000LL;
-        if (rt <= now) rt = now;
-        if (rt < next) next = rt;
-    }
-
-    /* ContikiRadio.doActionsAfterTick(): new transmissions keep the mote
-     * scheduled until the exact transmission-end time, and completion
-     * requests an immediate same-time wakeup. */
-    if (nat->radio_tx_finished) {
-        nat->radio_tx_finished = false;
-        return now;
-    }
-    if (nat->radio_is_transmitting) {
-        int64_t tx_next = nat->radio_tx_end_ns;
-        if (tx_next < next) next = tx_next;
-    } else if (native_had_tx[idx]) {
-        int64_t tx_next = now + 1000000LL;
-        if (tx_next < next) next = tx_next;
-    }
-    native_had_tx[idx] = false;
-
-    /* processRunValue → +1ms (like COOJA's ContikiClock.doActionsAfterTick) */
-    if (*nat->simProcessRunValue) {
-        int64_t prv = now + 1000000LL;
-        if (prv < next) next = prv;
-    }
-
-    /* etimer */
-    if (*nat->simEtimerPending) {
-        int64_t et = (int64_t)(*nat->simEtimerNextExpirationTime) * 1000000LL;
-        if (et <= now) et = now + 1000000LL;  /* stale → +1ms */
-        if (et < next) next = et;
-    }
-
-    /* If rx_queue has frames, schedule +1ms to ensure TSCH slot
-     * operation gets a chance to find the frame via pending_packet(). */
-    if (nat->rx_queue.count > 0 || *nat->simInSize > 0) {
-        int64_t rx_next = now + 1000000LL;
-        if (rx_next < next) next = rx_next;
-    }
-
-    return next;
-}
 
 /* Schedule an emulated node's next wakeup */
 static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx) {
@@ -3608,29 +3365,15 @@ static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx) {
 /* (node_next_wakeup_ns removed in M12 — dead since the M10 kernel pump;
  * the per-arch lead computation lives on in the sched_hint_ns ops.) */
 
-static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
-    if (*node->simInSize > 0) return true;  /* frame ready for delivery */
-    if (node->rx_queue.count > 0) return true;  /* queued frames waiting */
-    if (*node->simProcessRunValue) return true;
-    if (*node->simEtimerPending) {
-        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
-        if (et_ns <= sim_ns) return true;
-    }
-    if (*node->simRtimerPending) {
-        int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
-        if (rt_ns <= sim_ns) return true;
-    }
-    return false;
-}
-
 /* ============================================================
- * M12 mote execution-op adapters.
+ * M12 mote execution-op adapters (MSP430/ARM — native/JS moved to
+ * src/motes/ in M19/M20).
  *
  * Bodies are verbatim moves of the former dispatch_mote_wakeup /
  * threaded_step_node / schedule_emulated_wakeup type-switch arms.
- * MOTE_IDX recovers the slot index — several wrapped helpers
+ * MOTE_IDX recovers the slot index — the wrapped helpers
  * (tick_one_*, emu_rx_queue_drain, gdb_stubs) are still indexed by
- * slot; they take the mote pointer directly in Phase 4.
+ * slot; they follow their dependencies in Phase 5/6 (§3.17).
  * ============================================================ */
 
 /* --- step_until: mote-unit stepping (cycles emulated, ns native/JS) --- */
@@ -3640,9 +3383,6 @@ static void msp_mote_step_until(sim_mote_t *m, int64_t target) {
 }
 static void arm_mote_step_until(sim_mote_t *m, int64_t target) {
     arm_step_until(&MOTE_IMPL(m)->plat.arm.cpu, target);
-}
-static void native_mote_step_until(sim_mote_t *m, int64_t target) {
-    native_step_until_ns(&MOTE_IMPL(m)->plat.native, target);
 }
 
 /* --- execute: one Cooja-style execute slice at global time now_ns.
@@ -3708,21 +3448,9 @@ static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
     return now_ns + (returned_us + 1) * 1000LL;
 }
 
-/* Handoff from the native execute op to dispatch_mote_wakeup's post-tick
- * RF distribution: whether this tick transmitted (native_had_tx is
- * cleared again inside native_next_wakeup_after_tick, so the dispatcher
- * cannot read it after execute returns). */
-static bool native_exec_had_tx = false;
-
-static int64_t native_mote_execute(sim_mote_t *m, int64_t now_ns) {
-    int idx = MOTE_IDX(m);
-    /* Single tick at event time */
-    tick_one_native(idx, now_ns);
-    native_exec_had_tx = native_had_tx[idx];
-
-    /* Next wakeup (like ContikiClock.doActionsAfterTick) */
-    return native_next_wakeup_after_tick(idx);
-}
+/* (Native execute moved to native_cooja_mote.c — M20.  Its handoff to
+ * the dispatcher's post-tick RF distribution is node->exec_had_tx,
+ * ex the native_exec_had_tx global.) */
 
 /* --- advance_to_time: out-of-slice catch-up to global sim time
  * (threaded stepping path) --- */
@@ -3740,20 +3468,6 @@ static void arm_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
     if (delta_ns > 0)
         arm_step_until(cpu, cpu->cycles +
                        arm_ns_to_cycles(delta_ns, cpu->cpu_freq_hz));
-}
-static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
-    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
-    if (!native_has_pending_work(nat, sim_ns)) {
-        nat->sim_time_ns = sim_ns;
-        return;
-    }
-    native_step_until_ns(nat, sim_ns);
-    /* Process additional queued frames within this time step */
-    while (*nat->simInSize == 0 && nat->rx_queue.count > 0 &&
-           nat->sim_time_ns < sim_ns) {
-        native_dequeue_rx_frame(nat);
-        native_step_until_ns(nat, sim_ns);
-    }
 }
 
 /* --- sched_hint_ns: next-cpu-event wakeup lead from kernel time base_ns
@@ -3860,9 +3574,9 @@ static void dispatch_mote_wakeup(const sim_event_t *ev) {
      * preserves any requestImmediateWakeup already queued during the
      * slice (RF delivery detection, drains). */
     sim_mote_t *m = &mote_store[i];
-    native_exec_had_tx = false;
+    nodes[i].exec_had_tx = false;
     int64_t next_ns = m->ops->execute(m, ev_time);
-    bool sender_had_tx = native_exec_had_tx;
+    bool sender_had_tx = nodes[i].exec_had_tx;
     if (next_ns < INT64_MAX)
         sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
 
@@ -3949,7 +3663,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * switch read zeroed structs in that case). */
     for (int i = 0; i < MAX_NODES; i++) {
         mote_store[i].id = 0;
-        mote_store[i].ops = &native_mote_ops;
+        mote_store[i].ops = &native_cooja_mote_ops;
         mote_store[i].impl = &nodes[i];
     }
     /* fd/pid fields must be -1, not 0, before any _active()/_launched()
