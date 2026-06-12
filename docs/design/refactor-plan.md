@@ -1428,6 +1428,15 @@ Stop condition:
 
 ### Phase 3 - Extract platform and board selection
 
+> **Status: COMPLETE.**  `sim_board` registry (include/sim/sim_board.h +
+> src/sim/sim_board.c): one static row per board with extension, arch
+> platform-lookup name, kind, and banner label.  The runner's four
+> extension ladders (detect_node_type, MSP430/ARM platform-name
+> derivations, init banner) read the registry row stashed on the node.
+> `sim_board_find()` (by name) is in place for config/CLI platform
+> overrides.  Kind stays an enum until Phase 4 binds rows to
+> sim_mote_ops_t directly.
+
 Goal: remove filename-extension platform knowledge from the scheduler.
 
 Tasks:

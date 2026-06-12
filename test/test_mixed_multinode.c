@@ -35,6 +35,7 @@
 #include "js_test_engine.h"
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
+#include "sim_board.h"
 #include "sim_serial_bridge.h"
 #include "sim_external_command.h"
 #include "sim_radio_bus.h"
@@ -66,6 +67,8 @@ typedef enum { NODE_MSP430, NODE_ARM, NODE_NATIVE, NODE_JS } node_type_t;
 
 typedef struct {
     node_type_t type;
+    const sim_board_desc_t *board;  /* registry row (Phase 3) — owns
+                                     * platform name + banner label */
     int id;
     char line_buf[256];
     int line_pos;
@@ -2705,29 +2708,21 @@ static void flush_pending_output(void) {
 
 /* --- Detect node type from firmware extension --- */
 
+/* Phase 3: the extension → board mapping lives in the sim_board
+ * registry; this maps the board kind onto the runner's node_type_t
+ * (the enum survives until Phase 4 makes mote types first-class). */
+static node_type_t node_type_for_board(const sim_board_desc_t *board) {
+    switch (board->kind) {
+    case SIM_BOARD_KIND_ARM:    return NODE_ARM;
+    case SIM_BOARD_KIND_NATIVE: return NODE_NATIVE;
+    case SIM_BOARD_KIND_JS:     return NODE_JS;
+    case SIM_BOARD_KIND_MSP430:
+    default:                    return NODE_MSP430;
+    }
+}
+
 static node_type_t detect_node_type(const char *path) {
-    const char *dot = strrchr(path, '.');
-    if (dot && strcmp(dot, ".cc2538dk") == 0)
-        return NODE_ARM;
-    /* Zolertia Firefly: same CC2538 SoC as cc2538dk, different board glue. */
-    if (dot && strcmp(dot, ".zoul-firefly") == 0)
-        return NODE_ARM;
-    /* Nordic nRF52840 (Dongle PCA10059 or Development Kit PCA10056). */
-    if (dot && strcmp(dot, ".nrf52840-dongle") == 0)
-        return NODE_ARM;
-    if (dot && strcmp(dot, ".nrf52840-dk") == 0)
-        return NODE_ARM;
-    /* .nrf52840 without board suffix: built with BOARD=dk (the default board). */
-    if (dot && strcmp(dot, ".nrf52840") == 0)
-        return NODE_ARM;
-    /* Nordic nRF54L15 (Development Kit PCA10156). */
-    if (dot && strcmp(dot, ".nrf54l15-dk") == 0)
-        return NODE_ARM;
-    if (dot && strcmp(dot, ".cooja") == 0)
-        return NODE_NATIVE;
-    if (dot && strcmp(dot, ".js") == 0)
-        return NODE_JS;
-    return NODE_MSP430;  /* default to MSP430 (.sky or other) */
+    return node_type_for_board(sim_board_for_path(path));
 }
 
 /* --- MSP430 node initialization --- */
@@ -2736,16 +2731,8 @@ static int init_msp430_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     msp430_platform_t *plat = &node->plat.msp;
 
-    /* Derive platform from firmware extension: .sky -> sky, .z1 -> z1 */
-    const char *dot = strrchr(firmware_path, '.');
-    const char *plat_name = "sky";
-    if (dot) {
-        if (strcmp(dot, ".z1") == 0) plat_name = "z1";
-        else if (strcmp(dot, ".esb") == 0) plat_name = "esb";
-        else if (strcmp(dot, ".wismote") == 0) plat_name = "wismote";
-        else if (strcmp(dot, ".exp5438") == 0) plat_name = "exp5438";
-        else if (strcmp(dot, ".msp430fr5969") == 0) plat_name = "fr5969";
-    }
+    /* Platform name comes from the board registry row (Phase 3). */
+    const char *plat_name = node->board->name;
     const msp430_platform_config_t *pcfg = msp430_platform_find(plat_name);
     if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }
 
@@ -2937,21 +2924,8 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     arm_platform_t *plat = &node->plat.arm;
 
-    /* Derive ARM platform from firmware extension. */
-    const char *dot = strrchr(firmware_path, '.');
-    const char *plat_name = "cc2538dk";
-    if (dot && strcmp(dot, ".zoul-firefly") == 0)
-        plat_name = "zoul-firefly";
-    else if (dot && strcmp(dot, ".nrf52840-dongle") == 0)
-        plat_name = "nrf52840-dongle";
-    else if (dot && strcmp(dot, ".nrf52840-dk") == 0)
-        plat_name = "nrf52840-dk";
-    /* .nrf52840 without board suffix: built with BOARD=dk (the default). */
-    else if (dot && strcmp(dot, ".nrf52840") == 0)
-        plat_name = "nrf52840-dk";
-    else if (dot && strcmp(dot, ".nrf54l15-dk") == 0)
-        plat_name = "nrf54l15-dk";
-
+    /* Platform name comes from the board registry row (Phase 3). */
+    const char *plat_name = node->board->name;
     const arm_platform_config_t *pcfg = arm_platform_find(plat_name);
     if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }
 
@@ -3273,7 +3247,10 @@ static int init_js_node_wrapper(int idx, const char *script_path, int node_id) {
 static int init_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     memset(node, 0, sizeof(*node));
-    node->type = detect_node_type(firmware_path);
+    /* Phase 3: one registry lookup owns the board decision — node kind,
+     * arch platform name, and banner label all come from the row. */
+    node->board = sim_board_for_path(firmware_path);
+    node->type = node_type_for_board(node->board);
     node->id = node_id;
     snprintf(node->firmware_path, sizeof(node->firmware_path), "%s", firmware_path);
     /* M11: bind + register the kernel-facing mote object early so the
@@ -3288,21 +3265,8 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     emu_rx_end_ns[idx] = 0;
     sim_radio_bus_asm_reset(&tx_asm[idx]);
 
-    const char *type_label = "Native/Cooja";
-    if (node->type == NODE_MSP430) {
-        const char *dot = strrchr(firmware_path, '.');
-        if (dot && strcmp(dot, ".z1") == 0)              type_label = "MSP430/Z1";
-        else if (dot && strcmp(dot, ".esb") == 0)        type_label = "MSP430/ESB";
-        else if (dot && strcmp(dot, ".wismote") == 0)    type_label = "MSP430/WisMote";
-        else if (dot && strcmp(dot, ".exp5438") == 0)    type_label = "MSP430/exp5438";
-        else if (dot && strcmp(dot, ".msp430fr5969") == 0) type_label = "MSP430/FR5969";
-        else                                              type_label = "MSP430/Sky";
-    } else if (node->type == NODE_ARM) {
-        type_label = "ARM/CC2538DK";
-    } else if (node->type == NODE_JS) {
-        type_label = "JS/QuickJS";
-    }
-    printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path, type_label);
+    printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
+           node->board->label);
 
     int rc;
     if (node->type == NODE_MSP430)
