@@ -107,15 +107,29 @@ flowchart TB
 
 ## Reading the diagram
 
-- **Top to bottom = control / data flow.** Browser drives nothing — the simulation tick is owned by the multinode driver, which advances `sim_ns` by 1 ms and calls `*_step_until()` on every node.
-- **Single-threaded, round-robin.** All nodes (MSP430, ARM, native, JS) live in one process; each has its own `sim_event_queue` and per-node cycles.
-- **Radio medium is the only inter-node bus.** `radio_medium.c` does UDGM range checks, frame assembly, and synchronous delivery into `cc2420` / `cc2538_rfcore` — that's why auto-ACK lands in the same CPU step.
-- **Timeline + WebSocket are observation-only.** They sample state; removing them doesn't change simulation outcomes.
+- **Top to bottom = control / data flow.** Browser drives nothing — simulation
+  time is owned by the kernel event pump (`sim_runtime_run_until()` in
+  `src/sim/sim_runtime.c`): events pop in `(time_ns, seq)` order from one
+  unified queue, and each `NODE_WAKEUP` runs one Cooja-style execute slice on
+  its mote via the `sim_mote_ops_t` vtable.  The runner only sets the outer
+  horizon (UI pacing, service polls, timed test actions).
+- **Single-threaded, event-driven.** All nodes (MSP430, ARM, native, JS) live
+  in one process and share the kernel's single `sim_event_queue`; emulated
+  CPUs additionally keep their own per-CPU `cpu_event_t` queues for
+  peripheral timing.
+- **Radio medium is policy, the radio bus is transport.** `radio_medium.c`
+  does UDGM range/channel filtering; `src/sim/sim_radio_bus.c` owns the TX
+  byte clock, frame assembly, and per-receiver delivery modes — SYNC
+  (native), PER_BYTE (CC2420 / cc2538_rfcore / nrf54l15 take one kernel
+  `RX_BYTE` event per on-air byte), BATCH (nrf52840, JS).
+- **Timeline + WebSocket are observation-only.** They subscribe to the kernel
+  observer stream; removing them doesn't change simulation outcomes.
 - **JIT is MSP430-only**, optional, gated on GNU Lightning at build time.
 
 ## File inventory
 
-`src/msp430/` and `src/arm/` are already tabled in `CLAUDE.md`. The rest of the tree:
+`src/msp430/`, `src/arm/`, and `src/sim/` (simulation kernel) are already
+tabled in `CLAUDE.md`. The rest of the tree:
 
 ### `src/common/` — shared infrastructure
 

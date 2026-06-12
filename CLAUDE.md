@@ -22,17 +22,21 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 
 ```sh
 # MSP430 tests
-./build/test_runner correctness -v    # 68 instruction-level tests
+./build/test_runner correctness -v    # 72 instruction-level tests
 ./build/test_runner bench             # 7 micro-benchmarks + 2 firmware benchmarks
 ./build/test_runner firmware          # Firmware integration tests (cputest.sky, timertest.sky)
 ./build/test_runner multinode         # 2-node nullnet-broadcast (default 20s)
 ./build/test_runner multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
 
 # ARM Cortex-M3/M4 tests
-./build/test_runner arm-correctness -v   # 74 instruction-level tests (Thumb-2 + M4 DSP + M4 VFP)
+./build/test_runner arm-correctness -v   # 146 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33)
 ./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
+
+# Chip-driver + radio-medium unit suites
+./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)
+./build/test_runner radio-medium            # 235 radio-medium routing tests
 
 # nRF52840 USB Dongle (PCA10059, Cortex-M4F + on-chip 802.15.4 radio)
 ./build/test_runner nrf52840-dongle-multinode firmware/nrf52840-dongle/udp-server.nrf52840-dongle firmware/nrf52840-dongle/udp-client.nrf52840-dongle -t 60000
@@ -47,15 +51,34 @@ Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet)
 
 ```
 src/
+  sim/                Simulation kernel: runtime, event pump, radio bus, board registry
+  common/             Shared infrastructure: event queue, radio medium, ELF loader, GDB stub
   msp430/             MSP430 emulator source files
-  arm/                ARM Cortex-M3 emulator source files
+  arm/                ARM Cortex-M3/M4/M33 emulator source files
+  native/             Native Cooja motes (dlopen) + JS app motes (QuickJS)
+  ui/                 WebSocket/state bridge (observation only)
 include/
-  msp430/             MSP430 header files
-  arm/                ARM header files
+  sim/                Kernel headers (sim_runtime.h, sim_mote.h, sim_radio_bus.h, sim_board.h)
+  common/, msp430/, arm/, native/, ui/
 test/                 Test runner, correctness, benchmarks, firmware, multinode
 firmware/sky/         Pre-compiled Contiki-NG firmware for Tmote Sky
 firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 ```
+
+### Simulation Kernel (src/sim/)
+
+| File | Purpose |
+|------|---------|
+| `sim_runtime.c` | `sim_runtime_t` container: now_ns, unified event queue, radio medium, mote slots + generations, observer fan-out, `sim_runtime_run_until()` event pump |
+| `sim_radio_bus.c` | RF TX path: per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer |
+| `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
+| `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
+| `sim_external_command.c` | External command service (border-router etc. helper processes) |
+
+The mote vtable (`include/sim/sim_mote.h`, `sim_mote_ops_t`) abstracts the four
+node kinds (MSP430/ARM/native/JS); adapter implementations live in the runner
+until Phase 4 moves them to `src/motes/`. See `docs/design/refactor-plan.md`
+§3.15/§3.16 for the completed Phase 1–3 milestones.
 
 ### MSP430 Source Files (src/msp430/)
 
@@ -233,35 +256,37 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 
 ## Multi-Node Simulation
 
-Single-threaded, round-robin time-stepped execution with ns-based coordination.
+Single-threaded, event-driven kernel (Cooja's scheduling model; Phases 1–3 of
+`docs/design/refactor-plan.md`).  `sim_runtime_t` owns the simulation clock,
+the unified `(time_ns, seq)`-ordered event queue, the radio medium/bus, and
+the per-slot mote objects.
 
 **Architecture:**
-1. Initialize nodes: load ELF, patch ds2411_init -> RET, run crt0 to main
-2. Patch ds2411_id per node (unique MAC addresses)
-3. Main loop: advance sim_ns by 1ms, step each node to corresponding cycle target
-4. RF: TX callback buffers bytes, deliver_rf_bytes() delivers between time steps
+1. Initialize nodes: the board registry (`sim_board.c`) maps the firmware
+   extension to a platform; load ELF, patch ds2411/node-id/linkaddr, run crt0
+   to main, register mote + radio-endpoint ops
+2. Kernel pump: `sim_runtime_run_until(sim, horizon, dispatch)` pops events in
+   `(time, seq)` order, advancing `now_ns` to each event's exact time —
+   `NODE_WAKEUP` (mote execute slice), `RX_BYTE` (per-byte radio delivery),
+   `RADIO_TIMER` (RX-stall watchdog), `TEST_ACTION` (script time pins)
+3. Mote execute: `ops->execute(m, now_ns)` runs one Cooja-style slice
+   (MspMote.execute equivalent: clock-deviation jump, pinned sim_time,
+   step_micros) and returns the mote's next wakeup time
+4. RF TX: chip TX callbacks feed `sim_radio_bus_tx_byte()` (per-sender byte
+   clock + frame assembler + medium filter), which dispatches per receiver
+   delivery mode: SYNC (native), PER_BYTE (CC2420 / cc2538 / nrf54l15 — one
+   kernel RX_BYTE event per on-air byte), BATCH (nrf52840 DMA-style, JS)
 
-**ns-based stepping:**
-```c
-while (sim_ns < end_ns) {
-    sim_ns += 1000000;  // 1ms
-    for (each node) {
-        delta_ns = sim_ns - cpu->sim_time_ns;
-        target_cycle = cpu->cycles + ns_to_cycles(delta_ns, cpu->cpu_freq_hz);
-        msp430_step_until(cpu, target_cycle);
-    }
-}
-```
-
-This correctly handles nodes running at different CPU frequencies after DCO calibration.
+Per-mote cycle accounting inside the execute slices handles nodes running at
+different CPU frequencies after DCO calibration.
 
 ### ARM Multi-Node (CC2538)
 
-Same time-stepped architecture as MSP430, with CC2538 RF Core for 802.15.4 radio:
+Same event-driven kernel as MSP430, with CC2538 RF Core for 802.15.4 radio:
 
 1. Initialize nodes: load ELF, run crt0 to main, patch `linkaddr_node_addr` per node
 2. Each node gets unique IEEE address (00:12:74:node_id:00:00:00:node_id)
-3. RF Core TX callback buffers frames, `arm_deliver_rf_bytes()` delivers between time steps
+3. RF Core TX callback feeds the radio bus; receivers take per-byte kernel events
 4. Auto-ACK at link layer, CSMA retransmissions, 6LoWPAN/RPL networking all functional
 
 **Supported firmware:**
