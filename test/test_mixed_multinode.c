@@ -79,7 +79,8 @@ static mixed_node_t nodes[MAX_NODES];
 /* Kernel-facing mote objects (Phase 2, M11) — one per slot, bound to
  * nodes[] by register_node_mote().  Adapter tables live further down. */
 static sim_mote_t mote_store[MAX_NODES];
-#define MOTE_IMPL(m) ((mixed_node_t *)(m)->impl)
+/* MOTE_IMPL lives in mote_impl.h (M19); MOTE_IDX is runner-only —
+ * module code uses MOTE_IMPL(m)->slot instead. */
 #define MOTE_IDX(m)  ((int)(MOTE_IMPL(m) - nodes))
 static int ticking_node_idx = -1;  /* node currently inside tick_one_msp430 (re-entrancy guard) */
 static int64_t tick_one_msp430(int idx, int64_t sim_ns);  /* forward decl */
@@ -648,15 +649,12 @@ static double get_time_ms(void) {
 static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns);
 static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns);
 static int64_t native_mote_execute(sim_mote_t *m, int64_t now_ns);
-static int64_t js_mote_execute(sim_mote_t *m, int64_t now_ns);
 static void msp_mote_step_until(sim_mote_t *m, int64_t target);
 static void arm_mote_step_until(sim_mote_t *m, int64_t target);
 static void native_mote_step_until(sim_mote_t *m, int64_t target);
-static void js_mote_step_until(sim_mote_t *m, int64_t target);
 static void msp_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static void arm_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
-static void js_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
@@ -664,25 +662,21 @@ static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
 static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
-static int js_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static void msp_mote_destroy(sim_mote_t *m);
 static void arm_mote_destroy(sim_mote_t *m);
 static void native_mote_destroy(sim_mote_t *m);
-static void js_mote_destroy(sim_mote_t *m);
 static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns);
-static void js_mote_reset_time(sim_mote_t *m, int64_t now_ns);
 static int msp_mote_ui_radio_state(const sim_mote_t *m);
 static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
 static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
 static void *msp_mote_get_interface(sim_mote_t *m, int iface);
 static void *arm_mote_get_interface(sim_mote_t *m, int iface);
 static void *null_mote_get_interface(sim_mote_t *m, int iface);
-static void native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
-                                      int len, int64_t now_ns, int sender_idx);
-static void js_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
-                                  int len, int64_t now_ns, int sender_idx);
+static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
+                                     int len, int64_t now_ns, int sender_idx);
+/* (JS adapters live in src/motes/js_app_mote.c — M19) */
 
 /* Convenience: the mote's CC2420, or NULL for non-Sky motes (debug
  * traces + per-byte stats branch on this instead of node type). */
@@ -792,32 +786,7 @@ static const sim_mote_ops_t native_mote_ops = {
     .receive_frame   = native_mote_receive_frame,
 };
 
-/* JS app motes (same pseudo-cycle convention as native) */
-static int64_t js_mote_sim_time_ns(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.js.sim_time_ns;
-}
-static int64_t js_mote_cycles(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.js.sim_time_ns / 1000LL;
-}
-static const sim_mote_ops_t js_mote_ops = {
-    .kind            = "JS",
-    .sim_time_ns     = js_mote_sim_time_ns,
-    .cycles          = js_mote_cycles,
-    .freq_hz         = pseudo_mote_freq_hz,
-    .instructions    = zero_mote_instructions,
-    .execute         = js_mote_execute,
-    .step_until      = js_mote_step_until,
-    .advance_to_time = js_mote_advance_to_time,
-    .sched_hint_ns   = NULL, /* emulated motes only */
-    .sync_to_time    = NULL, /* emulated motes only */
-    .serial_input    = js_mote_serial_input,
-    .destroy         = js_mote_destroy,
-    .reset_time      = js_mote_reset_time,
-    .ui_radio_state  = NULL,
-    .ui_leds         = NULL,
-    .get_interface   = null_mote_get_interface,
-    .receive_frame   = js_mote_receive_frame,
-};
+/* JS app mote ops live in src/motes/js_app_mote.c (M19). */
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
  * Called from init_node() right after the node's type is set, so the
@@ -828,7 +797,7 @@ static void register_node_mote(int idx) {
     switch (nodes[idx].type) {
     case NODE_MSP430: ops = &msp_mote_ops;    break;
     case NODE_ARM:    ops = &arm_mote_ops;    break;
-    case NODE_JS:     ops = &js_mote_ops;     break;
+    case NODE_JS:     ops = &js_app_mote_ops; break;
     default:          ops = &native_mote_ops; break;
     }
     mote_store[idx].id = nodes[idx].id;
@@ -972,16 +941,7 @@ static const mote_radio_ops_t native_radio_ops = {
     native_radio_rx_busy, NULL /* rx_stall */
 };
 
-/* JS motes: BATCH delivery so the bus stages bytes in rf_pending[] like
- * before M9.4; receive_byte is a stub because JS motes consume RF at
- * frame level (mixed_rf_frame_handler), never via byte delivery. */
-static void js_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
-    (void)m; (void)byte; (void)rssi;
-}
-static const mote_radio_ops_t js_radio_ops = {
-    js_radio_receive_byte, native_radio_rxfifo_available,
-    native_radio_rx_busy, NULL /* rx_stall */
-};
+/* JS radio ops live in src/motes/js_app_mote.c (M19). */
 
 /* Register node idx's radio endpoint + delivery mode on the bus.
  * Called from init_node() after platform init, so dynamically added
@@ -1013,8 +973,7 @@ static void register_node_radio_ops(int idx) {
                                &nodes[idx], SIM_RADIO_DELIVERY_SYNC);
         break;
     case NODE_JS:
-        sim_radio_bus_register(&radio_bus, idx, &js_radio_ops, &nodes[idx],
-                               SIM_RADIO_DELIVERY_BATCH);
+        js_app_mote_register_radio(&nodes[idx], idx, &radio_bus);
         break;
     }
 }
@@ -2056,9 +2015,11 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
             } else if (mote_store[i].ops->receive_frame) {
                 /* JS (or any future frame-consuming mote kind) — M17 op */
                 if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
-                    mote_store[i].ops->receive_frame(
-                        &mote_store[i], frame, len,
-                        sim_runtime_now_ns(&sim_rt), sender_idx);
+                    if (mote_store[i].ops->receive_frame(
+                            &mote_store[i], frame, len,
+                            sim_runtime_now_ns(&sim_rt), sender_idx) < 0)
+                        stat_rx_frames_queue_full++;
+                    stat_rx_frames_queued++;
                 }
             }
             /* Native/JS-to-emulated: handled via rf_tx_callback (byte stream) */
@@ -2101,9 +2062,13 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
         for (int i = 0; i < num_nodes; i++) {
             if (&nodes[i] == sender) continue;
             sim_mote_t *m = &mote_store[i];
-            if (m->ops->receive_frame)
-                m->ops->receive_frame(m, frame, len,
-                                      sim_runtime_now_ns(&sim_rt), sender_idx);
+            if (m->ops->receive_frame) {
+                if (m->ops->receive_frame(m, frame, len,
+                                          sim_runtime_now_ns(&sim_rt),
+                                          sender_idx) < 0)
+                    stat_rx_frames_queue_full++;
+                stat_rx_frames_queued++;
+            }
         }
     }
 }
@@ -2358,12 +2323,7 @@ static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
     return len;
 }
 
-/* JS motes have no console input — swallow so the bridge ring drains. */
-static int js_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
-                                int len) {
-    (void)m; (void)buf;
-    return len;
-}
+/* (JS serial_input — no console input — lives in js_app_mote.c, M19.) */
 
 /* The single serial-injection entry point: dispatch to the mote's
  * platform delivery contract.  Returns bytes consumed. */
@@ -2580,10 +2540,13 @@ static void distribute_rf_outgoing(void) {
                     sim_mote_t *m = &mote_store[i];
                     if (m->ops->receive_frame) {
                         sync_native_node_channel(i);
-                        if (radio_medium_filter_frame(&radio_medium, sender, i))
-                            m->ops->receive_frame(m, frame, len,
-                                                  sim_runtime_now_ns(&sim_rt),
-                                                  sender);
+                        if (radio_medium_filter_frame(&radio_medium, sender, i)) {
+                            if (m->ops->receive_frame(m, frame, len,
+                                                      sim_runtime_now_ns(&sim_rt),
+                                                      sender) < 0)
+                                stat_rx_frames_queue_full++;
+                            stat_rx_frames_queued++;
+                        }
                     }
                 }
                 /* Interference collision detection */
@@ -2619,10 +2582,13 @@ static void distribute_rf_outgoing(void) {
             } else {
                 for (int i = 0; i < num_nodes; i++) {
                     sim_mote_t *m = &mote_store[i];
-                    if (i != sender && m->ops->receive_frame)
-                        m->ops->receive_frame(m, frame, len,
-                                              sim_runtime_now_ns(&sim_rt),
-                                              sender);
+                    if (i != sender && m->ops->receive_frame) {
+                        if (m->ops->receive_frame(m, frame, len,
+                                                  sim_runtime_now_ns(&sim_rt),
+                                                  sender) < 0)
+                            stat_rx_frames_queue_full++;
+                        stat_rx_frames_queued++;
+                    }
                 }
             }
         }
@@ -3193,24 +3159,7 @@ static void mixed_js_rf_handler(void *user_data, const uint8_t *frame, int len) 
         mixed_rf_tx_handler(sender, bytes[i]);
 }
 
-static int init_js_node_wrapper(int idx, const char *script_path, int node_id) {
-    mixed_node_t *node = &nodes[idx];
-    js_node_t *jn = &node->plat.js;
-
-    if (js_node_init(jn, script_path, node_id) != 0)
-        return -1;
-
-    jn->log_callback        = mixed_uart_callback;
-    jn->log_callback_data   = node;
-    jn->rf_frame_callback   = mixed_js_rf_handler;
-    jn->rf_frame_callback_data = node;
-
-    /* Now safe to run init() — log/RF callbacks are wired. */
-    js_node_start(jn);
-
-    printf("  Node %d [JS] initialized\n", node_id);
-    return 0;
-}
+/* (JS boot policy lives in src/motes/js_app_mote.c — M19.) */
 
 /* --- Top-level node init (dispatches by type) --- */
 
@@ -3269,7 +3218,8 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     else if (node->type == NODE_ARM)
         rc = init_arm_node(idx, firmware_path, node_id);
     else if (node->type == NODE_JS)
-        rc = init_js_node_wrapper(idx, firmware_path, node_id);
+        rc = js_app_mote_boot(node, idx, firmware_path, node_id,
+                              &mixed_mote_env);
     else
         rc = init_native_node(idx, firmware_path, node_id);
     if (rc != 0)
@@ -3293,15 +3243,12 @@ static void arm_mote_destroy(sim_mote_t *m) {
 static void native_mote_destroy(sim_mote_t *m) {
     native_node_destroy(&MOTE_IMPL(m)->plat.native);
 }
-static void js_mote_destroy(sim_mote_t *m) {
-    js_node_destroy(&MOTE_IMPL(m)->plat.js);
-}
 
 /* Re-seed the mote's local clock after reboot/dynamic add so stepping
  * resumes at the current sim time (don't catch up from t=0).  Bodies
- * verbatim from the former TEST_ACTION_ADD type switches; the JS body
- * fixes a latent union aliasing slip — the old else-branch wrote
- * plat.native.sim_time_ns even for JS motes. */
+ * verbatim from the former TEST_ACTION_ADD type switches (the JS body,
+ * now in js_app_mote.c, fixed a latent union aliasing slip — the old
+ * else-branch wrote plat.native.sim_time_ns even for JS motes). */
 static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
     msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
     cpu->sim_time_ns = now_ns;
@@ -3314,9 +3261,6 @@ static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
 }
 static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
     MOTE_IMPL(m)->plat.native.sim_time_ns = now_ns;
-}
-static void js_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
-    MOTE_IMPL(m)->plat.js.sim_time_ns = now_ns;
 }
 
 /* --- M16 introspection adapters --- */
@@ -3367,22 +3311,13 @@ static void *null_mote_get_interface(sim_mote_t *m, int iface) {
 
 /* --- M17 frame-level RX adapters (frame-consuming motes only) --- */
 
-static void native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
-                                      int len, int64_t now_ns,
-                                      int sender_idx) {
+static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
+                                     int len, int64_t now_ns,
+                                     int sender_idx) {
     native_node_t *nat = &MOTE_IMPL(m)->plat.native;
-    if (nat->rx_queue.count >= NATIVE_RX_QUEUE_SIZE)
-        stat_rx_frames_queue_full++;
+    int rc = (nat->rx_queue.count >= NATIVE_RX_QUEUE_SIZE) ? -1 : 0;
     native_deliver_frame(nat, frame, len, now_ns, sender_idx);
-    stat_rx_frames_queued++;
-}
-
-static void js_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
-                                  int len, int64_t now_ns, int sender_idx) {
-    (void)sender_idx;
-    js_node_deliver_frame(&MOTE_IMPL(m)->plat.js, frame, len, now_ns);
-    sim_schedule_mote_wakeup_if_earlier(&sim_rt, MOTE_IDX(m), now_ns);
-    stat_rx_frames_queued++;
+    return rc;  /* <0 = queue was full; caller owns the stats (M19) */
 }
 
 static void destroy_node(int idx) {
@@ -3709,9 +3644,6 @@ static void arm_mote_step_until(sim_mote_t *m, int64_t target) {
 static void native_mote_step_until(sim_mote_t *m, int64_t target) {
     native_step_until_ns(&MOTE_IMPL(m)->plat.native, target);
 }
-static void js_mote_step_until(sim_mote_t *m, int64_t target) {
-    js_node_step_until_ns(&MOTE_IMPL(m)->plat.js, target);
-}
 
 /* --- execute: one Cooja-style execute slice at global time now_ns.
  * Returns the absolute next-wakeup time; the caller schedules it. --- */
@@ -3792,14 +3724,6 @@ static int64_t native_mote_execute(sim_mote_t *m, int64_t now_ns) {
     return native_next_wakeup_after_tick(idx);
 }
 
-static int64_t js_mote_execute(sim_mote_t *m, int64_t now_ns) {
-    js_node_t *jn = &MOTE_IMPL(m)->plat.js;
-    /* Run the JS node up to event time; this fires execute() and
-     * dispatches any RX frames scheduled at <= now_ns. */
-    js_node_step_until_ns(jn, now_ns);
-    return js_node_next_wakeup_ns(jn);  /* INT64_MAX = no known wakeup */
-}
-
 /* --- advance_to_time: out-of-slice catch-up to global sim time
  * (threaded stepping path) --- */
 
@@ -3830,11 +3754,6 @@ static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
         native_dequeue_rx_frame(nat);
         native_step_until_ns(nat, sim_ns);
     }
-}
-static void js_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
-    /* Pre-M12 the threaded path mis-stepped JS motes with a cycle-unit
-     * target; JS never ran threaded.  Define the sane ns semantics. */
-    js_node_step_until_ns(&MOTE_IMPL(m)->plat.js, sim_ns);
 }
 
 /* --- sched_hint_ns: next-cpu-event wakeup lead from kernel time base_ns

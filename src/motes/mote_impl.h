@@ -22,6 +22,7 @@
 #include "native_node.h"
 #include "js_node.h"
 #include "sim_board.h"
+#include "sim_mote.h"
 #include "sim_runtime.h"
 #include "sim_radio_bus.h"
 
@@ -129,6 +130,26 @@ struct sim_mote_env {
      * into the radio medium for slot `slot`. */
     void (*native_channel_sync)(int slot, int channel);
 };
+
+/* The mote vtable's opaque impl pointer is always a mixed_node_t. */
+#define MOTE_IMPL(m) ((mixed_node_t *)(m)->impl)
+
+/* ============================================================
+ * Per-kind module APIs (one module per mote kind, M19–M22).
+ *
+ * <kind>_mote_boot: platform init + firmware load + boot patching +
+ * chip/console wiring for one node.  <kind>_mote_register_radio:
+ * radio-endpoint ops + delivery mode onto the bus — a SEPARATE
+ * post-boot call because js_node_start() can TX during script init(),
+ * which historically happens before radio registration (§3.17).
+ * ============================================================ */
+
+/* M19: QuickJS application motes. */
+extern const sim_mote_ops_t js_app_mote_ops;
+int  js_app_mote_boot(mixed_node_t *node, int slot, const char *script_path,
+                      int node_id, const sim_mote_env_t *env);
+void js_app_mote_register_radio(mixed_node_t *node, int slot,
+                                sim_radio_bus_t *bus);
 
 #ifdef __cplusplus
 }

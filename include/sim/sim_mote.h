@@ -153,9 +153,13 @@ typedef struct sim_mote_ops {
      * for emulated motes, which take per-byte / staged delivery):
      * queue one received frame arriving at now_ns.  sender_idx feeds
      * the native rx-queue's arrival bookkeeping; JS motes ignore it
-     * and self-schedule an immediate wakeup. */
-    void (*receive_frame)(sim_mote_t *m, const uint8_t *frame, int len,
-                          int64_t now_ns, int sender_idx);
+     * and self-schedule an immediate wakeup.  Returns 0 when queued,
+     * <0 when the mote's RX queue was already full (the frame is
+     * handed to the mote either way — matching the historical native
+     * overwrite semantics); the CALLER owns the queued/queue-full
+     * stats (Phase 4 — adapters must not touch runner stats). */
+    int (*receive_frame)(sim_mote_t *m, const uint8_t *frame, int len,
+                         int64_t now_ns, int sender_idx);
 } sim_mote_ops_t;
 
 struct sim_mote {
