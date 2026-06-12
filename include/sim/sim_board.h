@@ -8,10 +8,12 @@
  * The filename extension stays a compatibility input — config/CLI
  * platform overrides can layer on sim_board_find() later.
  *
- * Phase 3 scope: only the *decision* moves here.  Boot patching and
- * platform init stay in the runner until Phase 4; `kind` is a plain
- * enum until Phase 4 makes mote-type registration first-class (it then
- * becomes a sim_mote_ops_t binding).
+ * Phase 4 (§3.17, M23): `kind` binds to a `sim_mote_kind_t` registry
+ * row in src/motes/mote_kinds.c — boot policy, radio registration,
+ * and (for native/JS) the sim_mote_ops_t table hang off the row.  The
+ * MSP430/ARM ops tables are runner-injected until their execute/serial
+ * adapters follow their dependencies (radio bus Phase 5, GDB service
+ * Phase 6).  Phase 8 folds both registries into sim_registry.
  */
 #ifndef SIM_BOARD_H
 #define SIM_BOARD_H

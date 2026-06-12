@@ -871,9 +871,21 @@ configs. M14 additionally: the GENERATE_MSG-heavy 14-rpl-lite tests.
 
 ### 3.17 Boot-policy extraction milestones (canonical Phase 4 task list)
 
-> **Status: in progress.** M18 `39d6d66` (scaffolding: mote_impl.h +
-> env bundle + rf_ctx fold-in). Next: M19 (js_app_mote.c).
-> Numbering continues from Phase 2 (M18–M23).
+> **Status: PHASE 4 COMPLETE (2026-06-12).** M18 `39d6d66`
+> (scaffolding: mote_impl.h + env bundle + rf_ctx fold-in), M19
+> `ce37365` (js_app_mote: boot + full ops; receive_frame returns
+> queue-full status so call sites own the stats), M20 `84c8a99`
+> (native_cooja_mote: boot + full ops + tick helpers;
+> native_had_tx/exec_had_tx become node fields), M21 `a31b1ba`
+> (msp430_elf_mote: boot + exported tick + radio ops; perf flat),
+> M22 `6966a12` (arm_elf_mote: same shape, all four SoC branches),
+> M23 in the closing commit (sim_mote_kind_t registry; init_node is
+> data-driven; detect_node_type/node_type_for_board ladders gone).
+> Runner shrank ~900 lines net.  Remaining runner-side per the locked
+> descope: MSP430/ARM execute/serial adapter tables (runner-injected
+> via sim_mote_kind_set_ops) — they follow emu_rx_queue_drain +
+> ticking_node_idx to the Phase 5 bus and gdb_stubs to the Phase 6
+> service.  Numbering continues from Phase 2 (M18–M23).
 > Goal (from §9 Phase 4): firmware loading, run-to-main, node-id/
 > linkaddr patching, and board-specific quirks move out of
 > `test/test_mixed_multinode.c` into per-kind modules under

@@ -188,6 +188,32 @@ void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
                                  sim_radio_bus_t *bus);
 int64_t arm_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
 
+/* ============================================================
+ * Mote-kind registry (M23) — one row per mote kind, indexed by the
+ * board registry's sim_board_kind_t.  init_node() becomes data-driven:
+ * kind lookup → boot → register_radio, no per-kind branches.
+ *
+ * `ops` is module-owned for native/JS; for MSP430/ARM the runner
+ * injects its adapter tables via sim_mote_kind_set_ops() at startup
+ * until the emulated execute/serial adapters follow their
+ * dependencies (radio bus → Phase 5, GDB service → Phase 6; §3.17).
+ * ============================================================ */
+
+typedef struct sim_mote_kind {
+    const char *name;            /* "msp430-elf", "arm-elf", ...      */
+    node_type_t node_type;       /* feeds nodes[].type until Phase 5
+                                  * de-types frame-delivery policy    */
+    int  (*boot)(mixed_node_t *node, int slot, const char *path,
+                 int node_id, const sim_mote_env_t *env);
+    void (*register_radio)(mixed_node_t *node, int slot,
+                           sim_radio_bus_t *bus);
+    const sim_mote_ops_t *ops;
+} sim_mote_kind_t;
+
+const sim_mote_kind_t *sim_mote_kind_for(sim_board_kind_t kind);
+void sim_mote_kind_set_ops(sim_board_kind_t kind,
+                           const sim_mote_ops_t *ops);
+
 #ifdef __cplusplus
 }
 #endif

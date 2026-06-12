@@ -7,10 +7,11 @@
  * each provide one `sim_mote_ops_t` table; everything that previously
  * switched on `node_type_t` dispatches through the table instead.
  *
- * Phase 2 scope: the adapter implementations stay in the runner
- * (test/test_mixed_multinode.c) because they reference runner-side
- * policy state (ticking guards, GDB stubs, RX queue drains).  They
- * move to src/motes/ in Phase 4 together with boot policy.
+ * Phase 4 (§3.17): the native/JS adapter tables and all boot policy
+ * live in src/motes/; the MSP430/ARM execute/serial adapters stay in
+ * the runner (test/test_mixed_multinode.c) because they reference
+ * runner-side policy state (ticking guard, GDB stubs, RX queue
+ * drains) — they follow those dependencies in Phase 5/6.
  *
  * Ops are added milestone by milestone (M11..M17); members below are
  * grouped by the milestone that introduced them.  All ops are

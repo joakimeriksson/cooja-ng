@@ -749,15 +749,9 @@ static const sim_mote_ops_t arm_mote_ops = {
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
  * Called from init_node() right after the node's type is set, so the
  * accessors below work during platform init and for rebooted /
- * dynamically added motes. */
-static void register_node_mote(int idx) {
-    const sim_mote_ops_t *ops;
-    switch (nodes[idx].type) {
-    case NODE_MSP430: ops = &msp_mote_ops;        break;
-    case NODE_ARM:    ops = &arm_mote_ops;        break;
-    case NODE_JS:     ops = &js_app_mote_ops;     break;
-    default:          ops = &native_cooja_mote_ops; break;
-    }
+ * dynamically added motes.  Ops come from the kind-registry row
+ * (M23) — the MSP430/ARM tables are injected at startup. */
+static void register_node_mote(int idx, const sim_mote_ops_t *ops) {
     mote_store[idx].id = nodes[idx].id;
     mote_store[idx].ops = ops;
     mote_store[idx].impl = &nodes[idx];
@@ -807,28 +801,8 @@ static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx);
  * type. */
 
 /* All four kinds' radio endpoint ops live in their src/motes modules
- * (M19–M22). */
-
-/* Register node idx's radio endpoint + delivery mode on the bus.
- * Called from init_node() after platform init, so dynamically added
- * motes (JS ADD actions creating new nodes) register too.  Each
- * module owns its delivery-mode decision. */
-static void register_node_radio_ops(int idx) {
-    switch (nodes[idx].type) {
-    case NODE_MSP430:
-        msp430_elf_mote_register_radio(&nodes[idx], idx, &radio_bus);
-        break;
-    case NODE_ARM:
-        arm_elf_mote_register_radio(&nodes[idx], idx, &radio_bus);
-        break;
-    case NODE_NATIVE:
-        native_cooja_mote_register_radio(&nodes[idx], idx, &radio_bus);
-        break;
-    case NODE_JS:
-        js_app_mote_register_radio(&nodes[idx], idx, &radio_bus);
-        break;
-    }
-}
+ * (M19–M22); init_node registers them through the kind-registry row
+ * (M23). */
 
 static int emulated_rxfifo_available(int idx) {
     if (radio_bus.ops[idx])
@@ -2448,24 +2422,9 @@ static void flush_pending_output(void) {
     }
 }
 
-/* --- Detect node type from firmware extension --- */
-
-/* Phase 3: the extension → board mapping lives in the sim_board
- * registry; this maps the board kind onto the runner's node_type_t
- * (the enum survives until Phase 4 makes mote types first-class). */
-static node_type_t node_type_for_board(const sim_board_desc_t *board) {
-    switch (board->kind) {
-    case SIM_BOARD_KIND_ARM:    return NODE_ARM;
-    case SIM_BOARD_KIND_NATIVE: return NODE_NATIVE;
-    case SIM_BOARD_KIND_JS:     return NODE_JS;
-    case SIM_BOARD_KIND_MSP430:
-    default:                    return NODE_MSP430;
-    }
-}
-
-static node_type_t detect_node_type(const char *path) {
-    return node_type_for_board(sim_board_for_path(path));
-}
+/* (Extension → board → mote-kind resolution: sim_board_for_path()
+ * row + sim_mote_kind_for() — the Phase 3 extension ladders and the
+ * Phase 4 node_type_for_board switch are both gone, M23.) */
 
 /* --- MSP430 node initialization --- */
 
@@ -2605,16 +2564,18 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     memset(node, 0, sizeof(*node));
     /* Phase 3: one registry lookup owns the board decision — node kind,
-     * arch platform name, and banner label all come from the row. */
+     * arch platform name, and banner label all come from the row.
+     * M23: the kind row owns boot + radio registration + ops. */
     node->board = sim_board_for_path(firmware_path);
-    node->type = node_type_for_board(node->board);
+    const sim_mote_kind_t *kind = sim_mote_kind_for(node->board->kind);
+    node->type = kind->node_type;
     node->id = node_id;
     node->slot = idx;
     node->env = &mixed_mote_env;
     snprintf(node->firmware_path, sizeof(node->firmware_path), "%s", firmware_path);
     /* M11: bind + register the kernel-facing mote object early so the
      * node_* vtable accessors work during platform init below. */
-    register_node_mote(idx);
+    register_node_mote(idx, kind->ops);
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
     memset(&emu_rx_queue[idx], 0, sizeof(emu_rx_queue[idx]));
     memset(&tx_cap[idx], 0, sizeof(tx_cap[idx]));
@@ -2627,26 +2588,16 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
            node->board->label);
 
-    int rc;
-    if (node->type == NODE_MSP430)
-        rc = msp430_elf_mote_boot(node, idx, firmware_path, node_id,
-                                  &mixed_mote_env);
-    else if (node->type == NODE_ARM)
-        rc = arm_elf_mote_boot(node, idx, firmware_path, node_id,
-                               &mixed_mote_env);
-    else if (node->type == NODE_JS)
-        rc = js_app_mote_boot(node, idx, firmware_path, node_id,
-                              &mixed_mote_env);
-    else
-        rc = native_cooja_mote_boot(node, idx, firmware_path, node_id,
-                                    &mixed_mote_env);
+    int rc = kind->boot(node, idx, firmware_path, node_id, &mixed_mote_env);
     if (rc != 0)
         return rc;
 
     /* M9.3/9.4: radio endpoint ops + delivery mode onto the bus.  Done
      * here (not in a one-shot loop in main) so reboots and dynamically
-     * added motes stay registered. */
-    register_node_radio_ops(idx);
+     * added motes stay registered.  Strictly after boot — js_node_start
+     * can TX during script init(), which historically happens before
+     * radio registration (§3.17). */
+    kind->register_radio(node, idx, &radio_bus);
     return 0;
 }
 
@@ -3106,13 +3057,18 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * radio-medium init still happen at their existing call sites below,
      * just through the runtime fields. */
     sim_runtime_init(&sim_rt);
+    /* M23: inject the runner-side MSP430/ARM adapter tables into the
+     * kind registry (they move to src/motes when their dependencies do
+     * — radio bus Phase 5, GDB service Phase 6). */
+    sim_mote_kind_set_ops(SIM_BOARD_KIND_MSP430, &msp_mote_ops);
+    sim_mote_kind_set_ops(SIM_BOARD_KIND_ARM, &arm_mote_ops);
     /* M11: pre-bind every mote slot to its node struct with a safe default
      * ops table so the node_* vtable accessors never see a NULL ops, even
      * for slots that haven't been through init_node() yet (the old type
      * switch read zeroed structs in that case). */
     for (int i = 0; i < MAX_NODES; i++) {
         mote_store[i].id = 0;
-        mote_store[i].ops = &native_cooja_mote_ops;
+        mote_store[i].ops = sim_mote_kind_for(SIM_BOARD_KIND_NATIVE)->ops;
         mote_store[i].impl = &nodes[i];
     }
     /* fd/pid fields must be -1, not 0, before any _active()/_launched()
@@ -3259,7 +3215,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
     printf("=== Mixed-Platform Multi-Node Test ===\n");
     for (int i = 0; i < firmware_count; i++) {
-        node_type_t t = detect_node_type(firmware_paths[i]);
+        node_type_t t =
+            sim_mote_kind_for(sim_board_for_path(firmware_paths[i])->kind)
+                ->node_type;
         printf("Firmware[%d]: %s (%s)\n", i, firmware_paths[i],
                t == NODE_MSP430 ? "MSP430" : t == NODE_ARM ? "ARM" : "NATIVE");
     }

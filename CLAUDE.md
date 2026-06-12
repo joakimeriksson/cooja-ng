@@ -52,6 +52,7 @@ Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet)
 ```
 src/
   sim/                Simulation kernel: runtime, event pump, radio bus, board registry
+  motes/              Per-kind mote modules: boot policy, adapters, kind registry
   common/             Shared infrastructure: event queue, radio medium, ELF loader, GDB stub
   msp430/             MSP430 emulator source files
   arm/                ARM Cortex-M3/M4/M33 emulator source files
@@ -75,10 +76,23 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
 | `sim_external_command.c` | External command service (border-router etc. helper processes) |
 
+### Mote Modules (src/motes/)
+
+| File | Purpose |
+|------|---------|
+| `mote_impl.h` | Private shared header: `mixed_node_t`, `sim_mote_env_t` (runner glue bundle), per-kind module APIs |
+| `mote_kinds.c` | Mote-kind registry: board kind → {boot, register_radio, ops} row |
+| `msp430_elf_mote.c` | MSP430 boot policy (ELF load, ds2411/infomem/node-id patches, run-to-main), execute tick, CC2420 radio ops |
+| `arm_elf_mote.c` | ARM boot policy (cc2538/firefly/nrf52840/nrf54l15 wiring, FICR seeding, linkaddr patches), execute tick, radio ops |
+| `native_cooja_mote.c` | Native Cooja mote: boot, full adapter table, tick helpers, SYNC radio ops |
+| `js_app_mote.c` | JS app mote: boot, full adapter table, BATCH radio ops |
+
 The mote vtable (`include/sim/sim_mote.h`, `sim_mote_ops_t`) abstracts the four
-node kinds (MSP430/ARM/native/JS); adapter implementations live in the runner
-until Phase 4 moves them to `src/motes/`. See `docs/design/refactor-plan.md`
-§3.15/§3.16 for the completed Phase 1–3 milestones.
+node kinds (MSP430/ARM/native/JS). Native/JS adapter tables live in their
+modules; the MSP430/ARM execute/serial adapters stay in the runner until their
+dependencies move (radio bus → Phase 5, GDB service → Phase 6). See
+`docs/design/refactor-plan.md` §3.15–§3.17 for the completed Phase 1–4
+milestones.
 
 ### MSP430 Source Files (src/msp430/)
 
