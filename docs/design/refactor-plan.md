@@ -823,7 +823,9 @@ Design decisions locked for this phase:
 - The four adapter implementations (MSP430 / ARM / native / JS) **stay in the
   runner file** for all of Phase 2 — they reference runner globals
   (`ticking_node_idx`, `gdb_stubs`, `emu_rx_queue_drain`, `native_had_tx`)
-  by design. They move to `src/motes/` in Phase 4.
+  by design. *(Amended by §3.17: Phase 4 moves the JS and native adapter
+  sets plus all boot policy; the MSP430/ARM execute/serial adapters follow
+  their dependencies — radio bus in Phase 5, GDB service in Phase 6.)*
 - Motes register into a `sim_runtime_t` slot table
   (`sim_runtime_register_mote()`), called from `init_node()` next to
   `register_node_radio_ops()` so reboots and JS-ADD dynamic motes stay
@@ -866,6 +868,103 @@ Validation gate per milestone: `make clean && make`; `correctness` /
 the pre-existing cc1200 TX-end failure); js-hello + js-rpl-udp; Cooja suite
 81/81 (never rebuild while it runs). M12 additionally: TSCH + clock-drift
 configs. M14 additionally: the GENERATE_MSG-heavy 14-rpl-lite tests.
+
+### 3.17 Boot-policy extraction milestones (canonical Phase 4 task list)
+
+> **Status: planned.** Numbering continues from Phase 2 (M18–M23).
+> Goal (from §9 Phase 4): firmware loading, run-to-main, node-id/
+> linkaddr patching, and board-specific quirks move out of
+> `test/test_mixed_multinode.c` into per-kind modules under
+> `src/motes/`, so adding a board stops requiring runner edits.
+> Stop condition: firmware-specific patches stay local to the board
+> boot policy with a comment naming the firmware symbol they depend on.
+
+Design decisions locked for this phase:
+
+- **Scope: boot policy, radio-endpoint ops, pure tick helpers, and the
+  full JS + native adapter sets.** The emulated (MSP430/ARM)
+  execute/serial adapters stay in the runner and follow their
+  dependencies — `emu_rx_queue_drain` (frame-delivery policy, Phase 5),
+  `ticking_node_idx` (shared with runner RF handlers, Phase 5),
+  `gdb_stubs` (GDB service, Phase 6). Moving them now would add ~4 env
+  seams that Phases 5/6 delete again. This supersedes the §3.16 note
+  that all adapters move in Phase 4 (same precedent as the M17 descope).
+- **Shared private header `src/motes/mote_impl.h`** — *not*
+  `include/sim/` — holds `node_type_t`, `rf_listener_ctx_t`,
+  `mixed_node_t` (verbatim move plus new fields: `slot`, `env`,
+  `rf_ctx[2]`; M20 adds `native_had_tx`, `exec_had_tx`), and
+  `sim_mote_env_t`. It embeds all four platform structs, so it stays
+  private to `src/motes/*` and the runner frontend. Names stay
+  `mixed_node_t`/`node_type_t` (character-identical-move discipline;
+  renames are Phase 10 cosmetics).
+- **`sim_mote_env_t` is the runner-owned glue bundle injected into
+  boot** — `src/motes` never links against runner symbols. Members:
+  `sim_runtime_t *sim`, `sim_radio_bus_t *radio_bus`, `const int
+  *verbose`, `const int *num_threads`, `const int64_t *node_start_ns`,
+  plus fn ptrs `uart_byte`, `chip_tx_byte`, `radio_set_channel`,
+  `rfcore_state_change`, `rfcore_channel_change`, `cc1200_channel_busy`,
+  `rf_tx_byte`, `rf_frame`, `native_yield`, `js_rf_frame`,
+  `native_channel_sync`. Everything in the env is documented Phase 5/6
+  debt; members retire as those phases land.
+- **Per-kind module API**: `int <kind>_mote_boot(mixed_node_t *n, int
+  slot, const char *path, int node_id, const sim_mote_env_t *env)` plus
+  a *separate* `void <kind>_mote_register_radio(mixed_node_t *n, int
+  slot, sim_radio_bus_t *bus)`. Radio registration stays a separate
+  post-boot call: `js_node_start()` can TX during script `init()`,
+  which today happens *before* radio-ops registration — merging the two
+  would change behavior.
+- `tick_one_msp430` exports as `msp430_elf_mote_tick()` — it has a
+  second runner caller (the frame-delivery pre-sync), which keeps
+  calling the exported symbol until Phase 5 moves that path into the
+  bus. `tick_one_arm` exports likewise as `arm_elf_mote_tick()`.
+- `native_yield_callback` **stays in the runner** (cross-node RF
+  policy: walks `nodes[]`, calls the deliver path) and is injected via
+  the env. Most tempting wrong move in this phase.
+- `nodes[].type` survives Phase 4 — frame-delivery policy (Phase 5) and
+  end-of-run stats still key on it by design.
+
+Milestones (one commit each, full validation gate before each):
+
+18. Scaffolding: `src/motes/` Makefile rules + `-Isrc/motes`;
+    `mote_impl.h` with `mixed_node_t` + `sim_mote_env_t`; runner
+    `mixed_mote_env` instance; the `rf_ctx_slot0/1[]` listener-context
+    arrays fold into `node->rf_ctx[2]`.
+19. `js_app_mote.c`: boot + full ops table + BATCH radio registration
+    (smallest kind — proves the env pattern). Prep in the same commit:
+    `stat_rx_frames_queued`/`queue_full` hoist from the JS/native
+    `receive_frame` adapters to their call sites (behavior-identical).
+20. `native_cooja_mote.c`: boot + full ops + `tick_one_native` /
+    `native_next_wakeup_after_tick` / `native_has_pending_work`.
+    `native_had_tx[]`/`native_exec_had_tx` become node fields; the
+    TSCH channel push goes through `env->native_channel_sync`.
+21. `msp430_elf_mote.c`: boot policy verbatim (ds2411_init/xmem RET
+    patches, ds2411_id/infomem-0x1980/node_id/Z1-linkaddr patches,
+    run-to-main, run-to-ready), exported tick, `msp_radio_ops` +
+    PER_BYTE registration. Ops table + execute/serial adapters stay
+    runner-side. Record the §3.14.1 perf baseline here (the tick is
+    the hottest moved function).
+22. `arm_elf_mote.c`: boot policy verbatim (cc2538/firefly/nrf52840/
+    nrf54l15 wiring branches, FICR/RFRND seeding, run-to-main,
+    step-past-first-event), exported tick, `arm_radio_ops` /
+    `arm54l_radio_ops` + the PER_BYTE-vs-BATCH delivery decision.
+    Ops table stays runner-side.
+23. Kind registry `mote_kinds.c`: `sim_mote_kind_t { name, node_type,
+    boot, register_radio, ops }`, `sim_mote_kind_for(board_kind)`,
+    `sim_mote_kind_set_ops()` (runner injects the MSP430/ARM ops
+    tables at startup until Phase 5/6 moves them). `init_node`
+    dispatch becomes data-driven (kind lookup → boot → register_radio,
+    ordering preserved); `detect_node_type`/`node_type_for_board`
+    ladders deleted; `sim_board.h`/`sim_mote.h` header notes updated.
+
+Validation gate per milestone: same as §3.16 (make clean && make;
+`correctness` / `arm-correctness` / `cc1200-mock-host` /
+`radio-medium`; sky + firefly 2-node RPL-UDP 60 s; chain configs (6/7
+baseline); js-hello + js-rpl-udp; Cooja suite 81/81 — never rebuild
+while it runs). Per-milestone fail-fast detectors: M19 JS tests +
+dynamic-ADD; M20 Cooja suite + GENERATE_MSG-heavy 14-rpl-lite
+(serial-input moved); M21 TSCH + clock-drift configs; M22 firefly
+dual-radio + nrf52840-dk/nrf54l15 multinode + GDB smoke; M23 reboot +
+JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 
 ## 4. Core API Sketches
 
@@ -1474,6 +1573,9 @@ Stop condition:
 Goal: move firmware loading, run-to-main, node id/linkaddr patching, and
 board-specific quirks out of `test/test_mixed_multinode.c`.
 
+The canonical task list is §3.17 above (milestones M18–M23). Land them in
+order, one commit per milestone. The lists below summarize the scope.
+
 Create boot policy modules:
 
 - `src/motes/msp430_elf_mote.c`
@@ -1882,6 +1984,11 @@ the same patch.
 
 - **Phase 1 task list is §3.15 (10 numbered milestones).** §9 Phase 1 points at
   it; do not re-invent a parallel list.
+- **Phase 4 task list is §3.17 (M18–M23).** It moves boot policy,
+  radio-endpoint ops, tick helpers, and the full JS/native adapter sets to
+  `src/motes/`; the emulated execute/serial adapters follow their
+  dependencies (radio bus Phase 5, GDB service Phase 6) — superseding the
+  §3.16 "adapters move in Phase 4" note (M17-descope precedent).
 - **`--threads N` is "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
   (§3.13). Two divergent schedulers persisting indefinitely is not an option.
 - **Performance budget**: ≤5% Phases 1–2, ≤10% Phases 3–5 combined, ≤5% Phases
