@@ -63,26 +63,10 @@
 #define DEFAULT_SIM_MS    20000      /* 20 seconds of simulated time */
 #define MS_TO_NS          1000000LL
 
-typedef enum { NODE_MSP430, NODE_ARM, NODE_NATIVE, NODE_JS } node_type_t;
-
-typedef struct {
-    node_type_t type;
-    const sim_board_desc_t *board;  /* registry row (Phase 3) — owns
-                                     * platform name + banner label */
-    int id;
-    char line_buf[256];
-    int line_pos;
-    char firmware_path[256];
-    double clock_deviation; /* 1.0 = normal, <1.0 = slower (Cooja MspClock) */
-    int64_t last_execute_ns; /* last tick sim_ns (for ns-precision stepping) */
-    double ideal_cycles;     /* cumulative ideal cycle target (like MSPSim lastMicrosCycles) */
-    union {
-        msp430_platform_t msp;
-        arm_platform_t arm;
-        native_node_t native;
-        js_node_t js;
-    } plat;
-} mixed_node_t;
+/* node_type_t / mixed_node_t / rf_listener_ctx_t / sim_mote_env_t live
+ * in src/motes/mote_impl.h (Phase 4, M18) — shared with the per-kind
+ * mote modules. */
+#include "mote_impl.h"
 
 /* rf_buffer_t / tx_frame_asm_t / tx_frame_capture_t live in sim_radio_bus.h (M9.1) */
 
@@ -1357,25 +1341,11 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
     }
 }
 
-/*
- * Per-chip TX listener context.
- *
- * Each chip's RF TX callback fires with a (node_idx, radio_idx) tag so
- * the harness can dispatch into the medium's per-radio filter API
- * without sniffing the byte stream.  Static storage keeps the address
- * stable across the chip's lifetime, since the TX listener captures it
- * by pointer.  Slot 0 is the on-board 2.4 GHz radio (CC2420 on MSP430,
- * cc2538_rfcore on ARM); slot 1 is the off-SoC sub-GHz radio (CC1200
- * on Firefly).  Native motes don't go through this path — they use
- * the legacy mixed_rf_tx_handler entry which assumes slot 0.
- */
-typedef struct {
-    int node_idx;
-    int radio_idx;
-} rf_listener_ctx_t;
-
-static rf_listener_ctx_t rf_ctx_slot0[MAX_NODES];
-static rf_listener_ctx_t rf_ctx_slot1[MAX_NODES];
+/* Per-chip TX listener contexts live in node->rf_ctx[2] (M18 — the
+ * rf_listener_ctx_t definition and rationale are in mote_impl.h).
+ * nodes[] is static storage, so the captured addresses stay stable
+ * across the chip's lifetime exactly as the old rf_ctx_slot0/1[]
+ * arrays did. */
 
 /* Forward decl — full body lives below. */
 static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t byte);
@@ -2783,9 +2753,9 @@ static int init_msp430_node(int idx, const char *firmware_path, int node_id) {
     /* Per-radio TX listener: CC2420 lives in slot 0. The chip stays
      * unaware of which slot it occupies; the harness encodes that in
      * the rf_listener_ctx_t it captures on the chip's side. */
-    rf_ctx_slot0[idx].node_idx  = idx;
-    rf_ctx_slot0[idx].radio_idx = 0;
-    cc2420_set_rf_listener(&plat->cc2420, mixed_rf_tx_chip_cb, &rf_ctx_slot0[idx]);
+    node->rf_ctx[0].node_idx  = idx;
+    node->rf_ctx[0].radio_idx = 0;
+    cc2420_set_rf_listener(&plat->cc2420, mixed_rf_tx_chip_cb, &node->rf_ctx[0]);
     plat->cc2420.node_id = node_id;
     /* CC2420's FSCTRL writes push channel via the sim_host_t vtable
      * onto radio slot 0 for this node. Same adapter as the ARM path. */
@@ -2946,10 +2916,10 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
 
     if (cc_soc) {
         /* CC2538-class platform (cc2538dk / openmote / zoul-firefly). */
-        rf_ctx_slot0[idx].node_idx  = idx;
-        rf_ctx_slot0[idx].radio_idx = 0;
+        node->rf_ctx[0].node_idx  = idx;
+        node->rf_ctx[0].radio_idx = 0;
         cc2538_rfcore_set_tx_callback(&cc_soc->rfcore, mixed_rf_tx_chip_cb,
-                                       &rf_ctx_slot0[idx]);
+                                       &node->rf_ctx[0]);
         cc_soc->rfcore.node_id = node_id;
         cc_soc->rfcore.state_callback = mixed_rf_state_handler;
         cc_soc->rfcore.state_user_data = node;
@@ -2957,10 +2927,10 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
                                             mixed_rfcore_channel_callback, node);
 
         if (pcfg->has_cc1200) {
-            rf_ctx_slot1[idx].node_idx  = idx;
-            rf_ctx_slot1[idx].radio_idx = 1;
+            node->rf_ctx[1].node_idx  = idx;
+            node->rf_ctx[1].radio_idx = 1;
             cc1200_set_rf_listener(&cc_soc->cc1200, mixed_rf_tx_chip_cb,
-                                    &rf_ctx_slot1[idx]);
+                                    &node->rf_ctx[1]);
             cc1200_set_channel_busy_query(&cc_soc->cc1200,
                                            mixed_cc1200_channel_busy, node);
         }
@@ -2987,10 +2957,10 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
          * only slot 0 is in play. TX bytes flow out through the radio
          * listener; RX bytes flow in via nrf_radio_receive_byte (see
          * mixed_deliver_rf_bytes branch). */
-        rf_ctx_slot0[idx].node_idx  = idx;
-        rf_ctx_slot0[idx].radio_idx = 0;
+        node->rf_ctx[0].node_idx  = idx;
+        node->rf_ctx[0].radio_idx = 0;
         nrf_radio_set_tx_listener(nrf_soc, mixed_rf_tx_chip_cb,
-                                   &rf_ctx_slot0[idx]);
+                                   &node->rf_ctx[0]);
 
         /* FICR.DEVICEADDR per-node — Contiki uses these to derive the
          * IEEE EUI-64 (Nordic OUI f4:ce:36 prepended in platform.c).
@@ -3016,10 +2986,10 @@ static int init_arm_node(int idx, const char *firmware_path, int node_id) {
         /* nRF54L15 (DK).  Single on-die 2.4 GHz radio, slot 0.  TX
          * bytes flow out through the radio listener; RX bytes flow in
          * via nrf54l_radio_receive_byte (see mixed_deliver_rf_bytes). */
-        rf_ctx_slot0[idx].node_idx  = idx;
-        rf_ctx_slot0[idx].radio_idx = 0;
+        node->rf_ctx[0].node_idx  = idx;
+        node->rf_ctx[0].radio_idx = 0;
         nrf54l_radio_set_tx_listener(nrfl_soc, mixed_rf_tx_chip_cb,
-                                      &rf_ctx_slot0[idx]);
+                                      &node->rf_ctx[0]);
 
         /* FICR.INFO.DEVICEID per-node — Contiki's linkaddr-arch.c
          * combines these two 32-bit words with the Nordic OUI
@@ -3244,6 +3214,29 @@ static int init_js_node_wrapper(int idx, const char *script_path, int node_id) {
 
 /* --- Top-level node init (dispatches by type) --- */
 
+/* Runner glue bundle for the per-kind mote modules (Phase 4, M18 —
+ * see mote_impl.h).  One static instance; init_node() stamps it on
+ * every node.  All referenced callbacks are defined above.  The boot
+ * bodies still call the callbacks directly until M19–M22 move them
+ * into src/motes/; native_channel_sync arrives with M20. */
+static const sim_mote_env_t mixed_mote_env = {
+    .sim                   = &sim_rt,
+    .radio_bus             = &radio_bus,
+    .verbose               = &verbose,
+    .num_threads           = &num_threads,
+    .node_start_ns         = node_start_ns,
+    .uart_byte             = mixed_uart_callback,
+    .chip_tx_byte          = mixed_rf_tx_chip_cb,
+    .radio_set_channel     = mixed_host_radio_set_channel,
+    .rfcore_state_change   = mixed_rf_state_handler,
+    .rfcore_channel_change = mixed_rfcore_channel_callback,
+    .cc1200_channel_busy   = mixed_cc1200_channel_busy,
+    .rf_tx_byte            = mixed_rf_tx_handler,
+    .rf_frame              = mixed_rf_frame_handler,
+    .native_yield          = native_yield_callback,
+    .js_rf_frame           = mixed_js_rf_handler,
+};
+
 static int init_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     memset(node, 0, sizeof(*node));
@@ -3252,6 +3245,8 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     node->board = sim_board_for_path(firmware_path);
     node->type = node_type_for_board(node->board);
     node->id = node_id;
+    node->slot = idx;
+    node->env = &mixed_mote_env;
     snprintf(node->firmware_path, sizeof(node->firmware_path), "%s", firmware_path);
     /* M11: bind + register the kernel-facing mote object early so the
      * node_* vtable accessors work during platform init below. */

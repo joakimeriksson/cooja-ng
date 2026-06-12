@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native -flto -MMD -MP
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -march=native -flto -MMD -MP
 LDFLAGS = -lm -lpthread -flto
 
 # Auto-detect GNU Lightning
@@ -8,6 +8,7 @@ LIGHTNING_LIBS := $(shell pkg-config --libs lightning 2>/dev/null)
 
 COMMON_SRC_DIR = src/common
 SIM_SRC_DIR = src/sim
+MOTES_SRC_DIR = src/motes
 MSP430_SRC_DIR = src/msp430
 ARM_SRC_DIR = src/arm
 NATIVE_SRC_DIR = src/native
@@ -17,6 +18,7 @@ TEST_DIR = test
 BUILD_DIR = build
 COMMON_BUILD_DIR = build/common
 SIM_BUILD_DIR = build/sim
+MOTES_BUILD_DIR = build/motes
 MSP430_BUILD_DIR = build/msp430
 ARM_BUILD_DIR = build/arm
 NATIVE_BUILD_DIR = build/native
@@ -74,6 +76,11 @@ SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
               $(SIM_SRC_DIR)/sim_radio_bus.c \
               $(SIM_SRC_DIR)/sim_board.c
 
+# Per-kind mote modules (boot policy + adapters) — Phase 4, §3.17.
+# M19–M23 add js_app_mote.c, native_cooja_mote.c, msp430_elf_mote.c,
+# arm_elf_mote.c, mote_kinds.c.
+MOTES_SOURCES =
+
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
                  $(NATIVE_SRC_DIR)/sim_config.c \
@@ -104,6 +111,7 @@ endif
 
 COMMON_OBJECTS = $(patsubst $(COMMON_SRC_DIR)/%.c, $(COMMON_BUILD_DIR)/%.o, $(COMMON_SOURCES))
 SIM_OBJECTS = $(patsubst $(SIM_SRC_DIR)/%.c, $(SIM_BUILD_DIR)/%.o, $(SIM_SOURCES))
+MOTES_OBJECTS = $(patsubst $(MOTES_SRC_DIR)/%.c, $(MOTES_BUILD_DIR)/%.o, $(MOTES_SOURCES))
 OBJECTS = $(patsubst $(MSP430_SRC_DIR)/%.c, $(MSP430_BUILD_DIR)/%.o, $(SOURCES))
 ARM_OBJECTS = $(patsubst $(ARM_SRC_DIR)/%.c, $(ARM_BUILD_DIR)/%.o, $(ARM_SOURCES))
 NATIVE_OBJECTS = $(patsubst $(NATIVE_SRC_DIR)/%.c, $(NATIVE_BUILD_DIR)/%.o, $(NATIVE_SOURCES))
@@ -155,6 +163,9 @@ $(COMMON_BUILD_DIR):
 $(SIM_BUILD_DIR):
 	mkdir -p $(SIM_BUILD_DIR)
 
+$(MOTES_BUILD_DIR):
+	mkdir -p $(MOTES_BUILD_DIR)
+
 $(LIB_BUILD_DIR):
 	mkdir -p $(LIB_BUILD_DIR)
 
@@ -165,6 +176,9 @@ $(COMMON_BUILD_DIR)/%.o: $(COMMON_SRC_DIR)/%.c | $(COMMON_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(SIM_BUILD_DIR)/%.o: $(SIM_SRC_DIR)/%.c | $(SIM_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(MOTES_BUILD_DIR)/%.o: $(MOTES_SRC_DIR)/%.c | $(MOTES_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(MSP430_BUILD_DIR)/%.o: $(MSP430_SRC_DIR)/%.c | $(MSP430_BUILD_DIR)
@@ -189,7 +203,7 @@ $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Auto-generated header dependencies (from -MMD). Catches the case where
