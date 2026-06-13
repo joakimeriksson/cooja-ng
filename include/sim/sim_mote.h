@@ -161,6 +161,28 @@ typedef struct sim_mote_ops {
      * stats (Phase 4 — adapters must not touch runner stats). */
     int (*receive_frame)(sim_mote_t *m, const uint8_t *frame, int len,
                          int64_t now_ns, int sender_idx);
+
+    /* ---- M25 (Phase 5 de-typing prep): RF-delivery clock motion ----
+     *
+     * These let the radio bus drive an emulated receiver's local clock
+     * during synchronous frame delivery without knowing the node type
+     * (the byte-delivery loop becomes type-blind ahead of moving into
+     * the bus in M26/M27).  Both are OPTIONAL and present ONLY on the
+     * emulated kinds — native/JS leave them NULL, which is exactly the
+     * "is this an emulated receiver?" test the old nodes[].type checks
+     * performed. */
+
+    /* Sync the mote's CPU to one incoming byte's air time, just before
+     * the byte is handed to the chip (Cooja's execute(t, 0) per byte).
+     * MSP430 delegates to its clamped, deviation-aware sync_to_time;
+     * ARM uses the unclamped pin-step-pin body — the two differ on
+     * purpose, do not unify. */
+    void (*rx_byte_sync)(sim_mote_t *m, int64_t byte_time_ns);
+
+    /* MSP430 only: a full execute-slice pre-sync run before a
+     * synchronous frame delivery (ex the frame_complete pre-sync tick).
+     * NULL elsewhere. */
+    void (*rx_pre_sync)(sim_mote_t *m, int64_t time_ns);
 } sim_mote_ops_t;
 
 struct sim_mote {

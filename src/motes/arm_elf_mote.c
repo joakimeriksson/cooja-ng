@@ -301,7 +301,7 @@ void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
         ? SIM_RADIO_DELIVERY_PER_BYTE : SIM_RADIO_DELIVERY_BATCH;
     sim_radio_bus_register(bus, slot,
                            nrf54l ? &arm54l_radio_ops : &arm_radio_ops,
-                           node, mode);
+                           node, mode, /*caps=*/0);
 }
 
 /* ============================================================

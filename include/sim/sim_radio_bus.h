@@ -135,6 +135,23 @@ typedef enum sim_radio_delivery_mode {
     SIM_RADIO_DELIVERY_BATCH,
 } sim_radio_delivery_mode_t;
 
+/* Per-receiver/per-sender delivery capability flags (M25).  These
+ * encode platform RF-delivery quirks the runner previously expressed
+ * as `nodes[].type == NODE_MSP430` checks, so the delivery code can be
+ * type-blind ahead of moving into the bus.  Each src/motes module sets
+ * its own caps at registration; today only the MSP430 module sets any.
+ *
+ *   RX_TICKING_STEP   — in the synchronous RX path, when the receiver
+ *                       is the currently-executing node, step it ~1 ms
+ *                       so the chip's symbol/ACK work runs in-line.
+ *   DRAIN_MINI_STEP   — in the RX-queue drain, when the RXFIFO is full,
+ *                       mini-step the receiver (up to 4×) to drain it.
+ *   WAKE_SENDER_POST_TX — after a frame completes, schedule the sender's
+ *                       own wakeup so its radio finishes the TX→RX turn. */
+#define SIM_RADIO_CAP_RX_TICKING_STEP    (1u << 0)
+#define SIM_RADIO_CAP_DRAIN_MINI_STEP    (1u << 1)
+#define SIM_RADIO_CAP_WAKE_SENDER_POST_TX (1u << 2)
+
 /* Host (runner) hooks the TX path calls out to (M9.4).  These cover the
  * pieces that stay runner-side until Phase 2: node lifecycle, native
  * channel pulls, debug stats, and the frame-complete delivery machinery
@@ -170,6 +187,7 @@ typedef struct sim_radio_bus {
     const mote_radio_ops_t *ops[SIM_RADIO_BUS_MAX_NODES];
     void                   *mote[SIM_RADIO_BUS_MAX_NODES];
     sim_radio_delivery_mode_t delivery[SIM_RADIO_BUS_MAX_NODES];
+    uint32_t                caps[SIM_RADIO_BUS_MAX_NODES];   /* SIM_RADIO_CAP_* */
     int                node_count;   /* registration high-water mark + 1   */
     int                tx_depth;     /* >0: inside frame_complete delivery */
     sim_radio_bus_host_t host;       /* runner hooks (M9.4)                */
@@ -185,11 +203,12 @@ typedef struct sim_radio_bus {
     bool               rx_stall_pending[SIM_RADIO_BUS_MAX_NODES];
 } sim_radio_bus_t;
 
-/* Register node idx's radio endpoint + delivery mode.  Call once per
- * node after platform init, before the main loop. */
+/* Register node idx's radio endpoint + delivery mode + capability
+ * flags (SIM_RADIO_CAP_*).  Call once per node after platform init,
+ * before the main loop (re-called on reboot, so caps re-apply). */
 void sim_radio_bus_register(sim_radio_bus_t *bus, int idx,
                             const mote_radio_ops_t *ops, void *mote,
-                            sim_radio_delivery_mode_t mode);
+                            sim_radio_delivery_mode_t mode, uint32_t caps);
 
 /* Install the runner's host hooks (copied by value). */
 void sim_radio_bus_set_host(sim_radio_bus_t *bus,

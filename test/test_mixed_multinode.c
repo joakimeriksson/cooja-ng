@@ -656,6 +656,9 @@ static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
 static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
+static void msp_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns);
+static void arm_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns);
+static void msp_mote_rx_pre_sync(sim_mote_t *m, int64_t time_ns);
 static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
 static void msp_mote_destroy(sim_mote_t *m);
@@ -708,6 +711,8 @@ static const sim_mote_ops_t msp_mote_ops = {
     .ui_leds         = msp_mote_ui_leds,
     .get_interface   = msp_mote_get_interface,
     .receive_frame   = NULL, /* per-byte / staged delivery */
+    .rx_byte_sync    = msp_mote_rx_byte_sync,
+    .rx_pre_sync     = msp_mote_rx_pre_sync,
 };
 
 /* ARM emulated motes */
@@ -741,6 +746,8 @@ static const sim_mote_ops_t arm_mote_ops = {
     .ui_leds         = arm_mote_ui_leds,
     .get_interface   = arm_mote_get_interface,
     .receive_frame   = NULL, /* per-byte / staged delivery */
+    .rx_byte_sync    = arm_mote_rx_byte_sync,
+    .rx_pre_sync     = NULL, /* MSP430-only pre-sync tick */
 };
 
 /* Native + JS mote ops live in src/motes/{native_cooja,js_app}_mote.c
@@ -1008,6 +1015,35 @@ static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
     return returned_us;
 }
 
+/* M25 (Phase 5 de-typing): per-byte RX clock sync used by the
+ * synchronous frame-delivery path (emu_deliver_bytes).  Bodies are the
+ * verbatim ex-inline per-byte sync from the old nodes[].type branches:
+ * MSP430 reuses its clamped, deviation-aware sync_to_time; ARM keeps
+ * its distinct unclamped pin-step-pin body (the two differ on
+ * purpose — do not unify). */
+static void msp_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
+    msp_mote_sync_to_time(m, byte_time_ns);
+}
+static void arm_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
+    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    int64_t t_us = byte_time_ns / 1000LL;
+    int64_t jump_us = 0;
+    if (cpu->last_execute_us >= 0) {
+        jump_us = t_us - cpu->last_execute_us;
+        if (jump_us < 0) jump_us = 0;
+    }
+    cpu->sim_time_ns = byte_time_ns;
+    arm_step_micros(cpu, jump_us, 0);
+    cpu->sim_time_ns = byte_time_ns;
+    cpu->last_execute_us = t_us;
+}
+
+/* M25: full execute-slice pre-sync before a synchronous frame delivery
+ * (ex the frame_complete pre-sync tick; MSP430 only). */
+static void msp_mote_rx_pre_sync(sim_mote_t *m, int64_t time_ns) {
+    msp430_elf_mote_tick(MOTE_IMPL(m), time_ns);
+}
+
 /* Deliver buffered bytes directly to an emulated node's radio.
  * Emits explicit RX timeline events with computed frame air time.
  * For MSP430, advance the receiver's internal clock before each byte to
@@ -1029,100 +1065,62 @@ static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
         emit_radio_obs(idx, air_time_ns + rx_dur, SIM_OBS_RADIO_RX_END);
         node_states[idx].radio_state = SIM_RADIO_ON;
     }
-    if (nodes[idx].type == NODE_MSP430) {
-        /* If the radio is mid-frame (RX_FRAME), queue instead of delivering.
-         * Delivering now would corrupt the in-progress frame. This happens
-         * when two senders' frames are delivered in the same event tick. */
-        if (radio_rx_busy(idx)) {
-            emu_rx_queue_push(idx, data, len, rssi, air_time_ns,
-                              air_time_ns + (int64_t)len * byte_ns, subghz);
-            return;
-        }
-        /* Match Cooja's Msp802154Radio.receiveCustomData(): incoming bytes
-         * for MSP radios are delivered at the same simulation time, each
-         * preceded by execute(t, 0). Keep ACK frames atomic for now, but
-         * still synchronize the receiver to the ACK arrival time once so
-         * the sender observes the turnaround at the correct simulated time.
-         *
-         * GUARD: If this node is currently being ticked (ticking_node_idx),
-         * skip sync to prevent re-entrant msp430_step_until.  Bytes go into
-         * CC2420's rx_incoming buffer and are replayed when the CC2420
-         * transitions to RX_SFD_SEARCH naturally. */
-        int64_t last_byte_ns = air_time_ns;
-        if (idx == ticking_node_idx) {
-            /* Ticking node: deliver bytes then process CC2420 events.
-             * Match Cooja's pattern: execute(t, 0) + receivedByte + requestImmediateWakeup.
-             * We can't do full sync (cascade risk), but we CAN process pending
-             * CC2420 symbol events by stepping a tiny amount. This allows the
-             * CC2420 to transition to RX_SFD_SEARCH, replay rx_incoming, process
-             * the frame, and generate auto-ACK — all within this delivery call. */
-            for (int j = 0; j < len; j++)
-                radio_receive_byte(idx, data[j], rssi);
-            /* Step enough cycles for CC2420 calibration (12 symbols = 192µs ≈ 750 cycles)
-             * + frame processing + ACK generation. Use 1ms = ~4000 cycles as safe budget. */
-            {
-                int64_t budget = (int64_t)node_freq(idx) / 1000; /* 1ms */
-                if (budget < 1000) budget = 1000;
-                step_node_until(idx, node_cycles(idx) + budget);
-            }
-        } else {
-            /* Normal receiver: sync clock then deliver bytes.
-             * Match Cooja's Msp802154Radio.receiveCustomData():
-             * each byte is preceded by execute(t, 0) at the byte's air time. */
-            for (int j = 0; j < len; j++) {
-                int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
-                msp_mote_sync_to_time(&mote_store[idx], byte_time_ns);
-                radio_receive_byte(idx, data[j], rssi);
-                last_byte_ns = byte_time_ns;
-            }
-        }
+    /* Emulated receivers only (MSP430/ARM).  Native/JS leave the
+     * rx_byte_sync op NULL — for them the byte path past the timeline
+     * emit is a no-op, exactly as the old `type == NODE_MSP430 /
+     * NODE_ARM` branches were (M25 de-typing: see emu_deliver_bytes'
+     * old type switch). */
+    sim_mote_t *m = &mote_store[idx];
+    if (!m->ops->rx_byte_sync)
+        return;
 
-        /* Request immediate wakeup after the delivered byte burst so the
-         * receiver gets CPU time to process FIFOP/ISR work. */
-        if (num_threads == 0) {
-            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
-        }
-    } else if (nodes[idx].type == NODE_ARM) {
-        /* Mirror the MSP430 RX path: pre-sync the receiver to the byte's
-         * air time for each byte, deliver the byte, then request an
-         * immediate wakeup so the RF Core ISR runs before the next slice.
-         * Guarded against re-entry for the currently-ticking node.
-         *
-         * Per-node radio fan-out (Firefly): each Firefly node owns two
-         * receive endpoints — cc2538_rfcore (2.4 GHz) and cc1200 (sub-GHz).
-         * The cross-band channel filter in radio_medium has already
-         * dropped bytes that crossed bands, so it's safe to feed every
-         * delivered byte to BOTH chips on this node. The chip whose
-         * air-side decoder doesn't recognise the preamble/sync simply
-         * ignores the byte (cc2538_rfcore wants 0x00..0x00 0x7A, cc1200
-         * wants 0x55 then sync word 0x6E4E904E). The firmware sees frames
-         * arrive on the chip its NETSTACK_RADIO points at. */
-        int64_t last_byte_ns = air_time_ns;
-        if (idx == ticking_node_idx) {
-            for (int j = 0; j < len; j++)
-                radio_receive_byte(idx, data[j], rssi);
-        } else {
-            for (int j = 0; j < len; j++) {
-                int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
-                int64_t t_us = byte_time_ns / 1000LL;
-                arm_cpu_t *cpu = &nodes[idx].plat.arm.cpu;
-                int64_t jump_us = 0;
-                if (cpu->last_execute_us >= 0) {
-                    jump_us = t_us - cpu->last_execute_us;
-                    if (jump_us < 0) jump_us = 0;
-                }
-                cpu->sim_time_ns = byte_time_ns;
-                arm_step_micros(cpu, jump_us, 0);
-                cpu->sim_time_ns = byte_time_ns;
-                cpu->last_execute_us = t_us;
-                radio_receive_byte(idx, data[j], rssi);
-                last_byte_ns = byte_time_ns;
-            }
-        }
+    /* If the radio is mid-frame (RX_FRAME), queue instead of delivering;
+     * delivering now would corrupt the in-progress frame.  This happens
+     * when two senders' frames are delivered in the same event tick.
+     * (Only CC2420 reports busy — cc2538/nrf rx_busy is always false, so
+     * this guard is a no-op for ARM, matching the old MSP430-only check.) */
+    if (radio_rx_busy(idx)) {
+        emu_rx_queue_push(idx, data, len, rssi, air_time_ns,
+                          air_time_ns + (int64_t)len * byte_ns, subghz);
+        return;
+    }
 
-        if (num_threads == 0) {
-            sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
+    /* Match Cooja's Msp802154Radio.receiveCustomData(): each incoming
+     * byte is preceded by execute(t, 0) at its air time, then delivered;
+     * after the burst the receiver gets an immediate wakeup so its ISR
+     * work runs before the next slice.
+     *
+     * GUARD: if this node is currently being ticked (ticking_node_idx),
+     * skip the per-byte sync to prevent a re-entrant step.  Bytes go
+     * into the chip's rx_incoming buffer and are replayed when it
+     * transitions to RX naturally.  MSP430 additionally steps ~1 ms in
+     * that case (CAP_RX_TICKING_STEP) so the CC2420 processes symbol
+     * events + auto-ACK in-line.
+     *
+     * Per-node radio fan-out (Firefly): each delivered byte is fed to
+     * both on-board chips; the cross-band medium filter already dropped
+     * out-of-band bytes, and the chip whose decoder doesn't recognise
+     * the preamble/sync ignores it. */
+    int64_t last_byte_ns = air_time_ns;
+    if (idx == ticking_node_idx) {
+        for (int j = 0; j < len; j++)
+            radio_receive_byte(idx, data[j], rssi);
+        if (radio_bus.caps[idx] & SIM_RADIO_CAP_RX_TICKING_STEP) {
+            int64_t budget = (int64_t)node_freq(idx) / 1000; /* 1ms */
+            if (budget < 1000) budget = 1000;
+            step_node_until(idx, node_cycles(idx) + budget);
         }
+    } else {
+        for (int j = 0; j < len; j++) {
+            int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
+            m->ops->rx_byte_sync(m, byte_time_ns);
+            radio_receive_byte(idx, data[j], rssi);
+            last_byte_ns = byte_time_ns;
+        }
+    }
+
+    if (num_threads == 0) {
+        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
     }
 }
 
@@ -1555,7 +1553,11 @@ static void bus_host_frame_complete(void *user, int sender_idx,
                 nodes[sender_idx].id, tx_asm[sender_idx].expected_len,
                 (double)sim_runtime_now_ns(&sim_rt) / 1e9);
         for (int i = 0; i < num_nodes; i++) {
-            if (i == sender_idx || nodes[i].type == NODE_NATIVE || !node_active(i))
+            /* SYNC ⇔ native: natives take the frame-level path, not the
+             * byte snapshot (M25 de-typing). */
+            if (i == sender_idx ||
+                radio_bus.delivery[i] == SIM_RADIO_DELIVERY_SYNC ||
+                !node_active(i))
                 continue;
             int rr = sim_radio_bus_pick_receiver_radio(&radio_medium,
                                                        sender_idx,
@@ -1573,7 +1575,14 @@ static void bus_host_frame_complete(void *user, int sender_idx,
 
     for (int i = 0; i < num_nodes; i++) {
         rf_buffer_t *buf = &rf_pending[i];
-        if (i == sender_idx || nodes[i].type == NODE_NATIVE || nodes[i].type == NODE_MSP430 || buf->count == 0)
+        /* Only BATCH receivers stage on-air bytes in rf_pending; SYNC
+         * (native) feed synchronously and PER_BYTE (MSP430/cc2538/
+         * nrf54l15) take kernel RX_BYTE events — both leave count==0
+         * here, so `!= BATCH` is exactly the old NATIVE||MSP430 skip
+         * (M25 de-typing). */
+        if (i == sender_idx ||
+            radio_bus.delivery[i] != SIM_RADIO_DELIVERY_BATCH ||
+            buf->count == 0)
             continue;
         if (buf->count != total_air_bytes) {
             if (verbose) {
@@ -1678,8 +1687,10 @@ static void bus_host_frame_complete(void *user, int sender_idx,
                                    (double)delivery_start / 1e9,
                                    cc2420_state_str(trace_rcc->state));
             }
-            if (nodes[i].type == NODE_MSP430 && i != ticking_node_idx) {
-                msp430_elf_mote_tick(&nodes[i], delivery_start);
+            /* MSP430-only full-slice pre-sync before delivery; only the
+             * MSP430 ops table sets rx_pre_sync (M25 de-typing). */
+            if (mote_store[i].ops->rx_pre_sync && i != ticking_node_idx) {
+                mote_store[i].ops->rx_pre_sync(&mote_store[i], delivery_start);
             }
             emu_deliver_bytes(i, frame_snap[i], frame_snap_len[i],
                               frame_snap_rssi[i], delivery_start,
@@ -1729,7 +1740,10 @@ static void bus_host_frame_complete(void *user, int sender_idx,
         int64_t sender_ack_start = sim_runtime_now_ns(&sim_rt) + 192000LL;
         int ack_tx_emitted = 0;
         for (int j = 0; j < num_nodes; j++) {
-            if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
+            /* SYNC ⇔ native: natives never stage ACK bytes in rf_pending
+             * (M25 de-typing). */
+            if (rf_pending[j].count > 0 &&
+                radio_bus.delivery[j] != SIM_RADIO_DELIVERY_SYNC) {
                 if (ui_server && !ack_tx_emitted) {
                     /* ACKs follow the same PHY as the data frame they
                      * acknowledge — CC1200 ACK = sub-GHz timing too. */
@@ -1772,7 +1786,8 @@ static void bus_host_frame_complete(void *user, int sender_idx,
         int64_t int_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
-            if (nodes[i].type == NODE_NATIVE) continue;  /* native handled elsewhere */
+            /* SYNC ⇔ native: native interference handled elsewhere (M25). */
+            if (radio_bus.delivery[i] == SIM_RADIO_DELIVERY_SYNC) continue;
             emu_rx_queue_t *q = &emu_rx_queue[i];
             for (int f = 0; f < q->count; f++) {
                 int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
@@ -1791,7 +1806,8 @@ static void bus_host_frame_complete(void *user, int sender_idx,
      * transition. Use the node's actual next internal event timing
      * rather than a coarse fixed delay; enhanced ACK reception depends
      * on the sender re-entering RX on the normal CC2420 turnaround path. */
-    if (nodes[sender_idx].type == NODE_MSP430 && num_threads == 0) {
+    if ((radio_bus.caps[sender_idx] & SIM_RADIO_CAP_WAKE_SENDER_POST_TX) &&
+        num_threads == 0) {
         schedule_emulated_wakeup(&sim_rt, sender_idx);
     }
 }
@@ -1931,7 +1947,9 @@ static void emu_rx_queue_drain(int idx) {
         /* Required FIFO space depends on on-air format (see frame_fifo_bytes). */
         int fifo_needed = frame_fifo_bytes(f->data, f->len, f->subghz);
         if (emulated_rxfifo_available(idx) < fifo_needed) {
-            if (nodes[idx].type == NODE_MSP430 && blocked_attempts < 4) {
+            /* MSP430-only mini-step retry (CAP_DRAIN_MINI_STEP) (M25). */
+            if ((radio_bus.caps[idx] & SIM_RADIO_CAP_DRAIN_MINI_STEP) &&
+                blocked_attempts < 4) {
                 int64_t freq = node_freq(idx);
                 int64_t spare_cycles = freq / 1000;
                 if (spare_cycles <= 0) spare_cycles = 1;

@@ -57,7 +57,7 @@ static const mote_radio_ops_t js_radio_ops = {
 void js_app_mote_register_radio(mixed_node_t *node, int slot,
                                 sim_radio_bus_t *bus) {
     sim_radio_bus_register(bus, slot, &js_radio_ops, node,
-                           SIM_RADIO_DELIVERY_BATCH);
+                           SIM_RADIO_DELIVERY_BATCH, /*caps=*/0);
 }
 
 /* ============================================================

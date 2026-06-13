@@ -289,8 +289,8 @@ static void test_delivery_sync(void) {
     /* SYNC receiver gets bytes synchronously, during tx_byte. */
     fixture_t f;
     fx_init(&f, 2);
-    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
-    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_SYNC);
+    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_SYNC, 0);
 
     uint8_t frame[64];
     int n = build_802154(frame, 6);
@@ -306,8 +306,8 @@ static void test_delivery_per_byte(void) {
      * land at 32µs byte-clock spacing from first_byte_ns. */
     fixture_t f;
     fx_init(&f, 2);
-    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
-    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE);
+    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE, 0);
 
     f.sim.now_ns = 0;
     uint8_t frame[64];
@@ -335,8 +335,8 @@ static void test_delivery_batch(void) {
      * here there is none, so we just verify staging). */
     fixture_t f;
     fx_init(&f, 2);
-    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
-    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_BATCH);
+    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_BATCH, 0);
 
     uint8_t frame[64];
     int n = build_802154(frame, 6);
@@ -351,8 +351,8 @@ static void test_delivery_batch(void) {
 static void test_capture_and_first_byte(void) {
     fixture_t f;
     fx_init(&f, 2);
-    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
-    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE);
+    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE, 0);
 
     f.sim.now_ns = 5000;  /* first preamble byte arms first_byte_ns = now */
     uint8_t frame[64];
@@ -394,9 +394,9 @@ static void test_reentrant_depth(void) {
     /* node 0 = the emulated sender (PER_BYTE), node 1 = SYNC receiver
      * that ACKs, node 2 = a BATCH bystander that should also see the ACK
      * byte staged. */
-    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
-    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_SYNC);
-    sim_radio_bus_register(&f.bus, 2, &mock_ops, &f.rx[2], SIM_RADIO_DELIVERY_BATCH);
+    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_SYNC, 0);
+    sim_radio_bus_register(&f.bus, 2, &mock_ops, &f.rx[2], SIM_RADIO_DELIVERY_BATCH, 0);
     /* When rx[1] is fed the SFD (0x7A), it re-enters as sender 1. */
     f.rx[1].reenter_on = 0x7A;
     f.rx[1].reenter_sender = 1;
@@ -423,9 +423,9 @@ static void test_reentrant_depth(void) {
 static void test_rx_stall(void) {
     fixture_t f;
     fx_init(&f, 2);
-    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
+    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
     /* Receiver with an rx_stall op → the bus arms the watchdog. */
-    sim_radio_bus_register(&f.bus, 1, &mock_ops_stall, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops_stall, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE, 0);
 
     f.sim.now_ns = 0;
     /* Deliver three bytes; last air time = 2 * 32µs = 64000. */
@@ -452,8 +452,8 @@ static void test_rx_stall(void) {
     /* A receiver WITHOUT an rx_stall op never arms the watchdog. */
     fixture_t g;
     fx_init(&g, 2);
-    sim_radio_bus_register(&g.bus, 0, &mock_ops, &g.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
-    sim_radio_bus_register(&g.bus, 1, &mock_ops, &g.rx[1], SIM_RADIO_DELIVERY_PER_BYTE);
+    sim_radio_bus_register(&g.bus, 0, &mock_ops, &g.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    sim_radio_bus_register(&g.bus, 1, &mock_ops, &g.rx[1], SIM_RADIO_DELIVERY_PER_BYTE, 0);
     sim_radio_bus_tx_byte(&g.bus, &g.sim, 0, 0, 0x11);
     ASSERT(!g.bus.rx_stall_pending[1], "no rx_stall op → watchdog never armed");
 }
@@ -465,8 +465,8 @@ static void test_rx_stall(void) {
 static void test_reset_node(void) {
     fixture_t f;
     fx_init(&f, 2);
-    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE);
-    sim_radio_bus_register(&f.bus, 1, &mock_ops_stall, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE);
+    sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops_stall, &f.rx[1], SIM_RADIO_DELIVERY_PER_BYTE, 0);
     sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, 0x55);
     ASSERT(f.bus.rx_stall_pending[1], "armed before reset");
     sim_radio_bus_reset_node(&f.bus, 1);

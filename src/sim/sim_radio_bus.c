@@ -147,11 +147,12 @@ void sim_radio_bus_asm_reset(tx_frame_asm_t *a) {
 
 void sim_radio_bus_register(sim_radio_bus_t *bus, int idx,
                             const mote_radio_ops_t *ops, void *mote,
-                            sim_radio_delivery_mode_t mode) {
+                            sim_radio_delivery_mode_t mode, uint32_t caps) {
     if (idx < 0 || idx >= SIM_RADIO_BUS_MAX_NODES) return;
     bus->ops[idx] = ops;
     bus->mote[idx] = mote;
     bus->delivery[idx] = mode;
+    bus->caps[idx] = caps;
     if (idx >= bus->node_count) bus->node_count = idx + 1;
 }
 

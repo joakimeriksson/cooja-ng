@@ -72,7 +72,7 @@ static const mote_radio_ops_t native_radio_ops = {
 void native_cooja_mote_register_radio(mixed_node_t *node, int slot,
                                       sim_radio_bus_t *bus) {
     sim_radio_bus_register(bus, slot, &native_radio_ops, node,
-                           SIM_RADIO_DELIVERY_SYNC);
+                           SIM_RADIO_DELIVERY_SYNC, /*caps=*/0);
 }
 
 /* ============================================================

@@ -247,9 +247,15 @@ static const mote_radio_ops_t msp_radio_ops = {
 void msp430_elf_mote_register_radio(mixed_node_t *node, int slot,
                                     sim_radio_bus_t *bus) {
     /* CC2420 has an rx_incoming buffer + state guard: one kernel
-     * RX_BYTE event per on-air byte. */
+     * RX_BYTE event per on-air byte.  The three MSP430-only RF-delivery
+     * quirks (in-line ticking step on synchronous RX, mini-step drain
+     * when the RXFIFO is full, sender self-wake after a frame) are
+     * declared as caps so the delivery code stays type-blind (M25). */
     sim_radio_bus_register(bus, slot, &msp_radio_ops, node,
-                           SIM_RADIO_DELIVERY_PER_BYTE);
+                           SIM_RADIO_DELIVERY_PER_BYTE,
+                           SIM_RADIO_CAP_RX_TICKING_STEP |
+                           SIM_RADIO_CAP_DRAIN_MINI_STEP |
+                           SIM_RADIO_CAP_WAKE_SENDER_POST_TX);
 }
 
 /* ============================================================
