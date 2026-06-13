@@ -984,8 +984,12 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 
 > **Status: in progress.** M24 `355e95e` (guardrails: radio-bus unit
 > suite, 83 assertions + tools/check-determinism.sh + perf baseline —
-> sky 2-node 60 s ≈ 134 ms, firefly-subghz-fixed ≈ 8.4 s).  Next: M25
-> (de-typing prep).  Numbering continues from Phase 4 (M24–M30).
+> sky 2-node 60 s ≈ 134 ms, firefly-subghz-fixed ≈ 8.4 s); M25
+> `074430e` (de-typing: rx_byte_sync/rx_pre_sync ops + SIM_RADIO_CAP_*
+> register caps; emu_deliver_bytes/frame_complete/drain type checks →
+> mode/caps/ops-presence queries; cross-build diff vs M24 IDENTICAL on
+> sky/firefly/cc2538).  Next: M26 (emu RX core into the bus).
+> Numbering continues from Phase 4 (M24–M30).
 > Goal (from §9 Phase 5): the remaining RF delivery *policy* moves out
 > of `test/test_mixed_multinode.c` into `src/sim/sim_radio_bus.c`.
 > The M9.4/M9.5 slices already moved the TX byte path (byte clock,
