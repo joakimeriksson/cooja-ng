@@ -48,6 +48,9 @@ extern int run_cc1200_tests(int verbose);
 /* radio_medium_t unit tests (pure C, no CPU) */
 extern int run_radio_medium_tests(int verbose);
 
+/* sim_radio_bus unit tests (Phase 5 guardrail, no CPU) */
+extern int run_radio_bus_tests(int verbose);
+
 int main(int argc, char **argv) {
     int verbose = 0;
 
@@ -68,6 +71,7 @@ int main(int argc, char **argv) {
         printf("Mixed:        mixed-multinode\n");
         printf("Chip drivers: cc1200-mock-host\n");
         printf("Radio medium: radio-medium\n");
+        printf("Radio bus:    radio-bus\n");
         printf("Test:         test <config.json> [-v] [-t ms]\n");
         printf("Combined:     all\n");
         return 1;
@@ -291,6 +295,11 @@ int main(int argc, char **argv) {
     /* radio_medium_t unit tests */
     if (strcmp(mode, "radio-medium") == 0 || strcmp(mode, "all") == 0) {
         failures += run_radio_medium_tests(verbose);
+    }
+
+    /* sim_radio_bus unit tests (Phase 5 guardrail) */
+    if (strcmp(mode, "radio-bus") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_radio_bus_tests(verbose);
     }
 
     if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {
