@@ -982,7 +982,10 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 
 ### 3.18 Radio-bus extraction milestones (canonical Phase 5 task list)
 
-> **Status: planned.** Numbering continues from Phase 4 (M24–M30).
+> **Status: in progress.** M24 `355e95e` (guardrails: radio-bus unit
+> suite, 83 assertions + tools/check-determinism.sh + perf baseline —
+> sky 2-node 60 s ≈ 134 ms, firefly-subghz-fixed ≈ 8.4 s).  Next: M25
+> (de-typing prep).  Numbering continues from Phase 4 (M24–M30).
 > Goal (from §9 Phase 5): the remaining RF delivery *policy* moves out
 > of `test/test_mixed_multinode.c` into `src/sim/sim_radio_bus.c`.
 > The M9.4/M9.5 slices already moved the TX byte path (byte clock,
