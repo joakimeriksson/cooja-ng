@@ -86,13 +86,6 @@ typedef struct {
     int head, count;
 } emu_rx_queue_t;
 
-/* Per-sender RF outgoing buffer (threaded mode: written only by the
- * sender's thread) */
-typedef struct {
-    uint8_t bytes[RF_BUF_SIZE];
-    int count;
-} rf_outgoing_t;
-
 /* Mote radio endpoint ops (M9.3) — the bus delivers RF bytes through
  * these instead of switching on node type.  Registered per node by the
  * runner at init; folds into the full mote vtable in Phase 2. */
@@ -257,7 +250,6 @@ typedef struct sim_radio_bus {
     tx_frame_capture_t tx_cap[SIM_RADIO_BUS_MAX_NODES];       /* sender-side frame capture   */
     emu_rx_queue_t     emu_rx_queue[SIM_RADIO_BUS_MAX_NODES]; /* per-receiver deferred queue */
     int64_t            emu_rx_end_ns[SIM_RADIO_BUS_MAX_NODES];/* last RX end per receiver    */
-    rf_outgoing_t      rf_outgoing[SIM_RADIO_BUS_MAX_NODES];  /* threaded-mode TX staging    */
     /* RX-stall timer bookkeeping (M9.5): one lazy SIM_EV_RADIO_TIMER
      * pending per receiver, deadline extended per delivered byte. */
     int64_t            rx_stall_deadline_ns[SIM_RADIO_BUS_MAX_NODES];
@@ -266,9 +258,6 @@ typedef struct sim_radio_bus {
      * ticking_node_idx).  The synchronous RX path skips per-byte clock
      * sync for this node to avoid a re-entrant step.  -1 = none. */
     int                executing_node;
-    /* M26: threaded mode — the threaded driver advances motes itself, so
-     * the delivery path must not schedule mote wakeups. */
-    bool               defer_wakeups;
     sim_radio_bus_stats_t stats;
     /* M27: per-sender medium-busy deadline (ex node_tx_busy_until_ns) —
      * a frame occupies the sender's channel until this sim time; CCA

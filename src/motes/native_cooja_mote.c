@@ -215,21 +215,6 @@ static int64_t native_next_wakeup_after_tick(mixed_node_t *mnode) {
     return next;
 }
 
-static bool native_has_pending_work(native_node_t *node, int64_t sim_ns) {
-    if (*node->simInSize > 0) return true;  /* frame ready for delivery */
-    if (node->rx_queue.count > 0) return true;  /* queued frames waiting */
-    if (*node->simProcessRunValue) return true;
-    if (*node->simEtimerPending) {
-        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
-        if (et_ns <= sim_ns) return true;
-    }
-    if (*node->simRtimerPending) {
-        int64_t rt_ns = (int64_t)(*node->simRtimerNextExpirationTime) * 1000LL;
-        if (rt_ns <= sim_ns) return true;
-    }
-    return false;
-}
-
 /* ============================================================
  * Mote ops (full table — natives have no emulated-CPU entanglements;
  * the post-execute RF distribution stays in the runner's dispatcher,
@@ -270,21 +255,6 @@ static void native_mote_step_until(sim_mote_t *m, int64_t target) {
     native_step_until_ns(&MOTE_IMPL(m)->plat.native, target);
 }
 
-static void native_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
-    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
-    if (!native_has_pending_work(nat, sim_ns)) {
-        nat->sim_time_ns = sim_ns;
-        return;
-    }
-    native_step_until_ns(nat, sim_ns);
-    /* Process additional queued frames within this time step */
-    while (*nat->simInSize == 0 && nat->rx_queue.count > 0 &&
-           nat->sim_time_ns < sim_ns) {
-        native_dequeue_rx_frame(nat);
-        native_step_until_ns(nat, sim_ns);
-    }
-}
-
 /* Native motes: append into the mote's pending serial buffer (the
  * cooja rs232 backend has a fixed 2048-byte receive buffer). */
 static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
@@ -305,12 +275,10 @@ static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
     if (old_size > 2048) old_size = 2048;
     int space = 2048 - old_size;
     if (space <= 0) {
-        if (*env->num_threads == 0) {
-            int64_t wake_ns = nat->sim_time_ns;
-            if (env->node_start_ns[idx] > wake_ns)
-                wake_ns = env->node_start_ns[idx];
-            sim_schedule_mote_wakeup_if_earlier(env->sim, idx, wake_ns);
-        }
+        int64_t wake_ns = nat->sim_time_ns;
+        if (env->node_start_ns[idx] > wake_ns)
+            wake_ns = env->node_start_ns[idx];
+        sim_schedule_mote_wakeup_if_earlier(env->sim, idx, wake_ns);
         return 0;
     }
 
@@ -326,7 +294,7 @@ static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
      * time rather than waiting for a stale timer-based wakeup. This is
      * the native equivalent of the immediate reschedule used for MSP430
      * serial injection. */
-    if (*env->num_threads == 0) {
+    {
         int64_t wake_ns = nat->sim_time_ns;
         if (env->node_start_ns[idx] > wake_ns)
             wake_ns = env->node_start_ns[idx];
@@ -376,7 +344,6 @@ const sim_mote_ops_t native_cooja_mote_ops = {
     .instructions    = native_mote_instructions,
     .execute         = native_mote_execute,
     .step_until      = native_mote_step_until,
-    .advance_to_time = native_mote_advance_to_time,
     .sched_hint_ns   = NULL, /* emulated motes only */
     .sync_to_time    = NULL, /* emulated motes only */
     .serial_input    = native_mote_serial_input,

@@ -83,12 +83,6 @@ typedef struct sim_mote_ops {
      * are driving). */
     void (*step_until)(sim_mote_t *m, int64_t target);
 
-    /* Advance the mote to global time `sim_ns` from outside an execute
-     * slice (threaded stepping path): convert the mote's lag to its
-     * execution unit and step.  Includes the native pending-work fast
-     * path. */
-    void (*advance_to_time)(sim_mote_t *m, int64_t sim_ns);
-
     /* OPTIONAL (emulated motes only, NULL otherwise): absolute next
      * wakeup suggestion measured from kernel time `base_ns`, derived
      * from the CPU's next pending cpu-event (and, for MSP430, pending

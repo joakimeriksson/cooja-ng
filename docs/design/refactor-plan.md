@@ -698,17 +698,26 @@ Rules:
 
 The event-driven single-threaded kernel is the reference semantics.
 
-The current optional `--threads N` path is a batch stepping optimization and
-does not have the same clean event semantics. Decision (committed):
+The optional `--threads N` batch stepping path **was retired in Phase 5 M29**
+(commit follows §3.18). It never had the kernel's clean event semantics, and
+keeping two divergent schedulers alive through the radio-bus extraction would
+have doubled the surface every milestone had to keep byte-identical. The
+original decision was "port to a `sim_scheduler_ops::batch` entry or retire by
+Phase 6"; with zero usage signals (no config, CI, tool, or doc referenced it)
+the resolution was **retire**. A future batch scheduler, if wanted, is now
+greenfield work on the post-Phase-5 bus APIs (`sim_radio_bus_*`,
+`sim_mote_ops_t`, `sim_runtime_run_until`) rather than a port of the deleted
+type-switched path. The original staged plan is preserved below for context.
 
-- Through Phase 5 (radio bus extraction): keep `--threads N` working as a
-  separate code path; do not let it define the core API.
-- After Phase 5: re-implement `--threads N` behind a second
-  `sim_scheduler_ops_t` entry (`batch`) sitting on top of the new
-  mote/radio/service APIs. If that proves more invasive than expected, retire
-  the threaded path instead of letting two divergent schedulers persist.
-
-The choice is "port or retire by Phase 6" — not "keep both forever."
+> _Historical (superseded by M29):_
+> - Through Phase 5 (radio bus extraction): keep `--threads N` working as a
+>   separate code path; do not let it define the core API.
+> - After Phase 5: re-implement `--threads N` behind a second
+>   `sim_scheduler_ops_t` entry (`batch`) sitting on top of the new
+>   mote/radio/service APIs. If that proves more invasive than expected, retire
+>   the threaded path instead of letting two divergent schedulers persist.
+>
+> The choice was "port or retire by Phase 6" — not "keep both forever."
 
 ```c
 typedef struct sim_scheduler_ops {
@@ -1007,7 +1016,16 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 > Cooja 81/81 is the native gate).  Two documented unified-path
 > changes: NONE-medium native delivery now uses the direct-if-empty
 > fast path; full-queue native frame_queue_full now counted on UDGM
-> too (stat-only).  **Next: M29 (retire --threads)**, then M30 (docs).
+> too (stat-only).  M29 `<pending>` (retire `--threads`: deleted the
+> threaded callbacks/distribute/flush path, the fixed-1 ms loop arm,
+> `--threads` parsing + all `num_threads` guards, the `advance_to_time`
+> op + its 4 impls, `rf_outgoing`/`defer_wakeups` from the bus,
+> `env->num_threads`, and the orphaned `sim_threads.{c,h}` thread pool;
+> the kernel's sequential event pump is now the only scheduler — the
+> guard collapse is behavior-preserving since `num_threads == 0` was the
+> default path, proven by IDENTICAL cross-build diffs on
+> sky/cc2538/firefly-subghz 2-node + 5 chain configs + JS broadcast,
+> Cooja 81/81).  **Next: M30 (docs close-out).**
 > Numbering continues from Phase 4 (M24–M30).
 > Goal (from §9 Phase 5): the remaining RF delivery *policy* moves out
 > of `test/test_mixed_multinode.c` into `src/sim/sim_radio_bus.c`.
@@ -1028,13 +1046,14 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 
 Design decisions locked for this phase:
 
-- **`--threads N` is retired in M29** (resolves §3.13's
+- **`--threads N` is retired (done, M29)** (resolves §3.13's
   "port or retire by Phase 6": zero usage signals — no config, CI
-  script, tool, or documented workflow exercises it).  A future batch
+  script, tool, or documented workflow exercised it).  A future batch
   scheduler builds on the bus APIs behind `sim_scheduler_ops_t`.
-  The path stays *working* through M26–M28 (its
-  `distribute_rf_outgoing` calls the new bus APIs) until M29 deletes
-  it.
+  The path stayed *working* through M26–M28 (its
+  `distribute_rf_outgoing` called the new bus APIs); M29 then deleted
+  it, the orphaned `sim_threads.{c,h}` pool, and the `advance_to_time`
+  op it was the last caller of.
 - **Ops placement rule**: anything that advances a mote's CPU/local
   clock is a `sim_mote_ops_t` member; anything that talks to the
   chip's radio endpoint is a `mote_radio_ops_t` member.  New optional
@@ -2187,17 +2206,23 @@ the same patch.
   the bus behind slim notification hooks; the dual 192 µs ACK-window
   arithmetic is copied digit-for-digit; M25–M27 are gated by a cross-build
   empty-diff.
-- **`--threads N` is retired in Phase 5 M29** (resolves the §3.13
-  port-or-retire decision: zero usage signals).  A future batch scheduler
-  builds on the bus APIs behind `sim_scheduler_ops_t`.
+- **`--threads N` is retired (done, Phase 5 M29)** — resolved the §3.13
+  port-or-retire decision toward *retire* (zero usage signals).  The threaded
+  callbacks, `distribute_rf_outgoing`/`flush_pending_output`, the fixed-1 ms
+  loop arm, `num_threads` + its guards, `rf_outgoing`/`defer_wakeups`, the
+  `advance_to_time` op + 4 impls, and the `sim_threads.{c,h}` pool are deleted;
+  the sequential kernel pump is the sole scheduler.  A future batch scheduler,
+  if wanted, is greenfield work on the bus APIs behind `sim_scheduler_ops_t`,
+  not a port of the deleted path.
 - **Ops placement rule (Phase 5)**: CPU/local-clock motion lives on
   `sim_mote_ops_t`; chip radio-endpoint behavior lives on
   `mote_radio_ops_t`.  Platform delivery quirks become registration caps,
   not type checks.
 - **MSP430/ARM execute/serial adapters move in Phase 6** with the GDB
   service (after Phase 5, GDB is their only runner dependency).
-- **`--threads N` is "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
-  (§3.13). Two divergent schedulers persisting indefinitely is not an option.
+- **`--threads N` was "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
+  (§3.13) — resolved to *retire* in M29 (see entry above). Two divergent
+  schedulers persisting indefinitely was not an option.
 - **Performance budget**: ≤5% Phases 1–2, ≤10% Phases 3–5 combined, ≤5% Phases
   6–10, ≤20% cumulative on the 2-node Sky baseline (§3.14.1).
 - **Error policy**: mote execute failure → drop wakeup, continue. Service init

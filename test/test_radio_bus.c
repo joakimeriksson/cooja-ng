@@ -584,19 +584,6 @@ static void test_deliver_executing_node(void) {
     ASSERT_EQ(mm.cyc, 1000, "executing: stepped ~1 ms (1000 cycles @ 1 MHz)");
 }
 
-static void test_deliver_defer_wakeups(void) {
-    /* Threaded mode: no wakeup scheduled. */
-    fixture_t f; fx_init(&f, 2);
-    mock_mote_t mm;
-    register_emulated(&f, &mm, 1, 0);
-    f.bus.executing_node = -1;
-    f.bus.defer_wakeups = true;
-
-    uint8_t frame[64]; int n = short_frame(frame, 3);
-    sim_radio_bus_deliver_bytes(&f.bus, &f.sim, 1, frame, n, -40, 0, false);
-    ASSERT(sim_eq_empty(&f.sim.event_queue), "defer_wakeups: no wakeup scheduled");
-}
-
 static void test_queue_and_drain(void) {
     /* queue_frame stages frames FIFO; drain delivers one per call. */
     fixture_t f; fx_init(&f, 2);
@@ -845,7 +832,6 @@ int run_radio_bus_tests(int verbose) {
     test_reset_node();
     test_deliver_direct();
     test_deliver_executing_node();
-    test_deliver_defer_wakeups();
     test_queue_and_drain();
     test_drain_collided_skip();
     test_drain_max_arrival();

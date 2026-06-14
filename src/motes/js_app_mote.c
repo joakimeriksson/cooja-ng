@@ -93,12 +93,6 @@ static void js_mote_step_until(sim_mote_t *m, int64_t target) {
     js_node_step_until_ns(&MOTE_IMPL(m)->plat.js, target);
 }
 
-static void js_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
-    /* Pre-M12 the threaded path mis-stepped JS motes with a cycle-unit
-     * target; JS never ran threaded.  Define the sane ns semantics. */
-    js_node_step_until_ns(&MOTE_IMPL(m)->plat.js, sim_ns);
-}
-
 /* JS motes have no console input — swallow so the bridge ring drains. */
 static int js_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
                                 int len) {
@@ -136,7 +130,6 @@ const sim_mote_ops_t js_app_mote_ops = {
     .instructions    = js_mote_instructions,
     .execute         = js_mote_execute,
     .step_until      = js_mote_step_until,
-    .advance_to_time = js_mote_advance_to_time,
     .sched_hint_ns   = NULL, /* emulated motes only */
     .sync_to_time    = NULL, /* emulated motes only */
     .serial_input    = js_mote_serial_input,

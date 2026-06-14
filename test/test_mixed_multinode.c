@@ -28,7 +28,6 @@
 #include "radio_medium.h"
 #include "ws_server.h"
 #include "sim_state.h"
-#include "sim_threads.h"
 #include "timeline.h"
 #include "packet_analyzer.h"
 #include "cJSON.h"
@@ -244,37 +243,6 @@ static void trace_tsch_ack_log_at(int64_t time_ns, const char *fmt, ...) {
     va_end(ap);
     trace_tsch_ack_lines++;
 }
-
-/* --- Threading support --- */
-static int num_threads = 0;  /* 0 = single-threaded (default) */
-
-/* rf_outgoing_t lives in sim_radio_bus.h (M9.1) */
-
-/* Per-sender frame outgoing buffer for native nodes */
-#define MAX_OUTGOING_FRAMES 16
-typedef struct {
-    uint8_t data[MAX_OUTGOING_FRAMES][128];
-    int lengths[MAX_OUTGOING_FRAMES];
-    int count;
-} frame_outgoing_t;
-
-/* Per-node deferred UART line buffer */
-#define MAX_PENDING_LINES 32
-typedef struct {
-    char lines[MAX_PENDING_LINES][256];
-    int node_idx[MAX_PENDING_LINES];
-    int node_id[MAX_PENDING_LINES];
-    int count;
-    int rf_byte_count;      /* local accumulator */
-    int uart_byte_count;    /* local accumulator */
-    int rf_frame_count;     /* local accumulator */
-    bool channels_dirty;    /* local flag */
-    int64_t last_tx_ns;     /* last TX time for UI arrows */
-} node_thread_state_t;
-
-#define rf_outgoing   (radio_bus.rf_outgoing)
-static frame_outgoing_t frame_outgoing[MAX_NODES];
-static node_thread_state_t thread_state[MAX_NODES];
 
 /* Per-node last TX timestamp for UI communication arrows */
 static int64_t node_last_tx_ns[MAX_NODES];
@@ -645,8 +613,6 @@ static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns);
 static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns);
 static void msp_mote_step_until(sim_mote_t *m, int64_t target);
 static void arm_mote_step_until(sim_mote_t *m, int64_t target);
-static void msp_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
-static void arm_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns);
 static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
 static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
@@ -696,7 +662,6 @@ static const sim_mote_ops_t msp_mote_ops = {
     .instructions    = msp_mote_instructions,
     .execute         = msp_mote_execute,
     .step_until      = msp_mote_step_until,
-    .advance_to_time = msp_mote_advance_to_time,
     .sched_hint_ns   = msp_mote_sched_hint_ns,
     .sync_to_time    = msp_mote_sync_to_time,
     .serial_input    = msp_mote_serial_input,
@@ -731,7 +696,6 @@ static const sim_mote_ops_t arm_mote_ops = {
     .instructions    = arm_mote_instructions,
     .execute         = arm_mote_execute,
     .step_until      = arm_mote_step_until,
-    .advance_to_time = arm_mote_advance_to_time,
     .sched_hint_ns   = arm_mote_sched_hint_ns,
     .sync_to_time    = arm_mote_sync_to_time,
     .serial_input    = arm_mote_serial_input,
@@ -806,12 +770,6 @@ static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx);
  * (M19–M22); init_node registers them through the kind-registry row
  * (M23). */
 
-static int emulated_rxfifo_available(int idx) {
-    if (radio_bus.ops[idx])
-        return radio_bus.ops[idx]->rxfifo_available(radio_bus.mote[idx]);
-    return 0;
-}
-
 /* Deliver one on-air byte to node idx's radio(s) via its registered ops. */
 static inline void radio_receive_byte(int idx, uint8_t byte, int8_t rssi) {
     if (radio_bus.ops[idx])
@@ -826,15 +784,8 @@ static inline bool radio_rx_busy(int idx) {
 /* frame_fifo_bytes lives in sim_radio_bus.c (M9.1) */
 
 /* Emulated RX queue push/deliver/drain bodies moved to
- * src/sim/sim_radio_bus.c (M26); these stay as thin forwarders so the
- * call sites are unchanged.  emu_rx_queue[] / emu_rx_end_ns[] / the
+ * src/sim/sim_radio_bus.c (M26).  emu_rx_queue[] / emu_rx_end_ns[] / the
  * RX stat counters now live on the bus. */
-static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
-                               int8_t rssi, int64_t arrival_ns, int64_t end_ns,
-                               bool subghz) {
-    sim_radio_bus_queue_frame(&radio_bus, idx, data, len, rssi,
-                              arrival_ns, end_ns, subghz);
-}
 
 /* Process a SIM_EV_RX_BYTE event for an emulated receiver (M13: one
  * type-blind path for MSP430 and ARM).  Mirrors Cooja's
@@ -888,14 +839,12 @@ static void deliver_rx_byte(const sim_event_t *ev) {
         }
     }
 
-    if (num_threads == 0) {
-        /* Match Cooja's MspMoteTimeEvent + requestImmediateWakeup:
-         * execute(t, 0) first, then receivedByte(), then a same-time mote
-         * wakeup request. Also retain the next wakeup returned by execute. */
-        int64_t next_ns = ev->time_ns + returned_us * 1000LL;
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, next_ns);
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, ev->time_ns);
-    }
+    /* Match Cooja's MspMoteTimeEvent + requestImmediateWakeup:
+     * execute(t, 0) first, then receivedByte(), then a same-time mote
+     * wakeup request. Also retain the next wakeup returned by execute. */
+    int64_t next_ns = ev->time_ns + returned_us * 1000LL;
+    sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, next_ns);
+    sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, ev->time_ns);
 }
 
 /* Process a SIM_EV_RADIO_TIMER event (M9.5): the radio bus's per-receiver
@@ -915,8 +864,7 @@ static void deliver_radio_timer(const sim_event_t *ev) {
     if (m->ops->sync_to_time)
         m->ops->sync_to_time(m, ev->time_ns);
     radio_bus.ops[idx]->rx_stall(radio_bus.mote[idx]);
-    if (num_threads == 0)
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, ev->time_ns);
+    sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, ev->time_ns);
 }
 
 /* byte_period_ns lives in sim_radio_bus.h (M9.1) */
@@ -1587,8 +1535,7 @@ static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
         msp430_cpu_t *cpu = &node->plat.msp.cpu;
         cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
             cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
-        if (num_threads == 0)
-            schedule_emulated_wakeup(&sim_rt, idx);
+        schedule_emulated_wakeup(&sim_rt, idx);
     }
     return consumed;
 }
@@ -1623,304 +1570,6 @@ static int ss_inject_into_node(void *user, const uint8_t *buf, int len) {
 static void ss_cleanup(void) {
     sim_serial_bridge_stop(&serial_bridge);
     sim_external_command_stop(&external_cmd);
-}
-
-/* --- Threaded callbacks (write only to sender's own buffers) --- */
-
-/*
- * Threaded RF TX handler: buffers bytes in rf_outgoing[sender] instead of
- * delivering directly. No cross-node writes, no radio_medium access.
- */
-static void threaded_rf_tx_handler(void *user_data, uint8_t byte) {
-    mixed_node_t *sender = (mixed_node_t *)user_data;
-    int sender_idx = (int)(sender - nodes);
-    node_thread_state_t *ts = &thread_state[sender_idx];
-    ts->rf_byte_count++;
-    ts->channels_dirty = true;
-    ts->last_tx_ns = sim_runtime_now_ns(&sim_rt);
-
-    rf_outgoing_t *out = &rf_outgoing[sender_idx];
-    if (out->count < RF_BUF_SIZE)
-        out->bytes[out->count++] = byte;
-}
-
-/*
- * Threaded frame handler: buffers frames in frame_outgoing[sender].
- * No cross-node writes.
- */
-static void threaded_rf_frame_handler(void *user_data, const uint8_t *frame, int len) {
-    mixed_node_t *sender = (mixed_node_t *)user_data;
-    int sender_idx = (int)(sender - nodes);
-    node_thread_state_t *ts = &thread_state[sender_idx];
-    ts->rf_frame_count++;
-    ts->channels_dirty = true;
-    ts->last_tx_ns = sim_runtime_now_ns(&sim_rt);
-
-    frame_outgoing_t *out = &frame_outgoing[sender_idx];
-    if (out->count < MAX_OUTGOING_FRAMES && len <= 128) {
-        memcpy(out->data[out->count], frame, (size_t)len);
-        out->lengths[out->count] = len;
-        out->count++;
-    }
-}
-
-/*
- * Threaded UART callback: buffers completed lines for deferred processing.
- * Still accumulates bytes in node->line_buf (per-node, no contention).
- */
-static void threaded_uart_callback(void *user_data, uint8_t byte) {
-    mixed_node_t *node = (mixed_node_t *)user_data;
-    int idx = (int)(node - nodes);
-    node_thread_state_t *ts = &thread_state[idx];
-    ts->uart_byte_count++;
-
-    if (byte == '\n') {
-        node->line_buf[node->line_pos] = '\0';
-        if (ts->count < MAX_PENDING_LINES) {
-            strncpy(ts->lines[ts->count], node->line_buf, 255);
-            ts->lines[ts->count][255] = '\0';
-            ts->node_idx[ts->count] = idx;
-            ts->node_id[ts->count] = node->id;
-            ts->count++;
-        }
-        node->line_pos = 0;
-    } else if (byte == '\r') {
-        /* ignore */
-    } else if (node->line_pos < (int)sizeof(node->line_buf) - 1) {
-        node->line_buf[node->line_pos++] = (char)byte;
-    }
-}
-
-/*
- * Sequential phase: distribute rf_outgoing[sender] to receivers via
- * radio_medium filtering, then deliver to rf_pending[] / native assemblers.
- */
-static void distribute_rf_outgoing(void) {
-    for (int sender = 0; sender < num_nodes; sender++) {
-        /* Distribute byte-stream RF with frame assembly */
-        rf_outgoing_t *out = &rf_outgoing[sender];
-        if (out->count > 0) {
-            /* Native sender: pull channel once per sender before this batch. */
-            sync_native_node_channel(sender);
-            /* NOTE: do NOT reset tx_asm[sender] here — frame assembly state
-             * must persist across time steps since frames may span multiple
-             * steps (at 250kbps, a 100-byte frame takes ~3.2ms > 1ms step). */
-            for (int b = 0; b < out->count; b++) {
-                uint8_t byte = out->bytes[b];
-                for (int i = 0; i < num_nodes; i++) {
-                    if (i == sender) continue;
-                    if (!node_active(i)) continue;
-                    if (nodes[sender].type == NODE_NATIVE && nodes[i].type == NODE_NATIVE)
-                        continue;
-                    /* Native receiver: pull current channel inline. */
-                    sync_native_node_channel(i);
-                    if (!radio_medium_filter_byte(&radio_medium, sender, i, byte))
-                        continue;
-                    if (nodes[i].type == NODE_NATIVE) {
-                        native_rx_assembler_feed(&nodes[i].plat.native, byte);
-                    } else {
-                        rf_buffer_t *buf = &rf_pending[i];
-                        if (buf->count < RF_BUF_SIZE)
-                            buf->bytes[buf->count++] = byte;
-                    }
-                }
-
-                /* Check if frame is complete */
-                if (sim_radio_bus_asm_feed(&tx_asm[sender], byte)) {
-                    stat_rf_frames++;
-                    /* Deliver or queue each emulated receiver's buffered frame */
-                    for (int i = 0; i < num_nodes; i++) {
-                        rf_buffer_t *buf = &rf_pending[i];
-                        if (buf->count == 0 || nodes[i].type == NODE_NATIVE)
-                            continue;
-                        int64_t tx_start = sim_runtime_now_ns(&sim_rt);
-                        int64_t tx_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
-
-                        /* Collision check against previously delivered frame */
-                        if (tx_start < emu_rx_end_ns[i]) {
-                            radio_bus.stats.rx_collided++;
-                            buf->count = 0;
-                            continue;
-                        }
-
-                        int8_t rssi = radio_medium_get_rssi(&radio_medium, sender, i);
-                        int frame_payload = (buf->count > 5) ? buf->bytes[5] : 0;
-                        if (emulated_rxfifo_available(i) < frame_payload + 1)
-                            step_node_until(i, node_cycles(i) + 5000);
-                        /* Native senders only emit 2.4 GHz frames in this
-                         * runner — pass subghz=false. */
-                        if (emulated_rxfifo_available(i) >= frame_payload + 1) {
-                            emu_deliver_bytes(i, buf->bytes, buf->count, rssi, tx_start,
-                                              /*subghz=*/false);
-                            radio_bus.stats.rx_direct++;
-                            emu_rx_end_ns[i] = tx_end;
-                        } else {
-                            emu_rx_queue_push(i, buf->bytes, buf->count, rssi,
-                                              tx_start, tx_end, /*subghz=*/false);
-                            emu_rx_end_ns[i] = tx_end;
-                        }
-                        buf->count = 0;
-                    }
-
-                    /* Flush auto-ACK bytes generated by this delivery */
-                    {
-                        int64_t native_ack_start = sim_runtime_now_ns(&sim_rt) + 192000LL;
-                        for (int j = 0; j < num_nodes; j++) {
-                            if (rf_pending[j].count > 0 && nodes[j].type != NODE_NATIVE) {
-                                int ack_payload = (rf_pending[j].count > 5) ? rf_pending[j].bytes[5] : 0;
-                                if (emulated_rxfifo_available(j) >= ack_payload + 1)
-                                    emu_deliver_bytes(j, rf_pending[j].bytes, rf_pending[j].count,
-                                                      -50, native_ack_start, /*subghz=*/false);
-                                else
-                                    emu_rx_queue_push(j, rf_pending[j].bytes, rf_pending[j].count,
-                                                      -50, sim_runtime_now_ns(&sim_rt),
-                                                      sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS,
-                                                      /*subghz=*/false);
-                                rf_pending[j].count = 0;
-                            }
-                        }
-                    }
-
-                    /* Interference check for emulated nodes */
-                    if (radio_medium.type != RADIO_MEDIUM_NONE) {
-                        neighbor_list_t *inl = &radio_medium.interference_neighbors[sender];
-                        int64_t int_start = sim_runtime_now_ns(&sim_rt);
-                        int64_t int_end = sim_runtime_now_ns(&sim_rt) + TIME_STEP_NS;
-                        for (int n = 0; n < inl->count; n++) {
-                            int i = inl->neighbors[n];
-                            if (nodes[i].type == NODE_NATIVE) continue;
-                            emu_rx_queue_t *q = &emu_rx_queue[i];
-                            for (int f = 0; f < q->count; f++) {
-                                int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
-                                emu_rx_frame_t *existing = &q->frames[fi];
-                                if (int_start < existing->end_ns &&
-                                    existing->arrival_ns < int_end) {
-                                    if (!existing->collided) radio_bus.stats.rx_collided++;
-                                    existing->collided = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            out->count = 0;
-        }
-
-        /* Distribute complete frames (native TX) */
-        frame_outgoing_t *fout = &frame_outgoing[sender];
-        if (fout->count > 0)
-            sync_native_node_channel(sender);
-        for (int f = 0; f < fout->count; f++) {
-            uint8_t *frame = fout->data[f];
-            int len = fout->lengths[f];
-
-            if (radio_medium.type != RADIO_MEDIUM_NONE) {
-                neighbor_list_t *nl = &radio_medium.neighbors[sender];
-                for (int n = 0; n < nl->count; n++) {
-                    int i = nl->neighbors[n];
-                    sim_mote_t *m = &mote_store[i];
-                    if (m->ops->receive_frame) {
-                        sync_native_node_channel(i);
-                        if (radio_medium_filter_frame(&radio_medium, sender, i)) {
-                            if (m->ops->receive_frame(m, frame, len,
-                                                      sim_runtime_now_ns(&sim_rt),
-                                                      sender) < 0)
-                                radio_bus.stats.frame_queue_full++;
-                            radio_bus.stats.frame_queued++;
-                        }
-                    }
-                }
-                /* Interference collision detection */
-                neighbor_list_t *inl = &radio_medium.interference_neighbors[sender];
-                int64_t tx_start = sim_runtime_now_ns(&sim_rt);
-                int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
-                for (int n = 0; n < inl->count; n++) {
-                    int i = inl->neighbors[n];
-                    if (nodes[i].type == NODE_NATIVE) {
-                        native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-                        for (int ff = 0; ff < q->count; ff++) {
-                            int idx = (q->head + ff) % NATIVE_RX_QUEUE_SIZE;
-                            native_pending_frame_t *existing = &q->frames[idx];
-                            if (tx_start < existing->end_ns &&
-                                existing->arrival_ns < tx_end) {
-                                if (!existing->collided) radio_bus.stats.frame_collided++;
-                                existing->collided = true;
-                            }
-                        }
-                    } else {
-                        emu_rx_queue_t *q = &emu_rx_queue[i];
-                        for (int ff = 0; ff < q->count; ff++) {
-                            int fi = (q->head + ff) % EMU_RX_QUEUE_SIZE;
-                            emu_rx_frame_t *existing = &q->frames[fi];
-                            if (tx_start < existing->end_ns &&
-                                existing->arrival_ns < tx_end) {
-                                if (!existing->collided) radio_bus.stats.rx_collided++;
-                                existing->collided = true;
-                            }
-                        }
-                    }
-                }
-            } else {
-                for (int i = 0; i < num_nodes; i++) {
-                    sim_mote_t *m = &mote_store[i];
-                    if (i != sender && m->ops->receive_frame) {
-                        if (m->ops->receive_frame(m, frame, len,
-                                                  sim_runtime_now_ns(&sim_rt),
-                                                  sender) < 0)
-                            radio_bus.stats.frame_queue_full++;
-                        radio_bus.stats.frame_queued++;
-                    }
-                }
-            }
-        }
-        fout->count = 0;
-    }
-}
-
-/*
- * Sequential phase: flush deferred UART lines — printf, test check, UI console.
- * Also merge per-node counters into globals.
- */
-static void flush_pending_output(void) {
-    for (int i = 0; i < num_nodes; i++) {
-        node_thread_state_t *ts = &thread_state[i];
-
-        /* Merge counters */
-        rf_byte_count += ts->rf_byte_count;
-        uart_byte_count += ts->uart_byte_count;
-        stat_rf_frames += ts->rf_frame_count;
-        if (ts->channels_dirty) channels_dirty = true;
-
-        if (ts->last_tx_ns > node_last_tx_ns[i])
-            node_last_tx_ns[i] = ts->last_tx_ns;
-        ts->rf_byte_count = 0;
-        ts->uart_byte_count = 0;
-        ts->rf_frame_count = 0;
-        ts->channels_dirty = false;
-        ts->last_tx_ns = 0;
-
-        /* Flush buffered UART lines */
-        for (int l = 0; l < ts->count; l++) {
-            int nidx = ts->node_idx[l];
-            int nid = ts->node_id[l];
-            if (verbose)
-                printf("  %7.3f [Node %d/%s] %s\n", (double)sim_runtime_now_ns(&sim_rt) / 1e9,
-                       nid, node_type_str(nidx), ts->lines[l]);
-            /* test engines receive this line via test_engine_observer */
-            if (ui_server)
-                ui_add_console_line(nidx, sim_runtime_now_ns(&sim_rt), ts->lines[l]);
-            {
-                sim_observer_event_t lev = { .kind = SIM_OBS_MOTE_LOG_LINE,
-                                             .time_ns = sim_runtime_now_ns(&sim_rt),
-                                             .mote_index = nidx, .radio_idx = -1 };
-                lev.u.log_line.line = ts->lines[l];
-                lev.u.log_line.len = (int)strlen(ts->lines[l]);
-                lev.u.log_line.node_id = nid;
-                sim_runtime_emit(&sim_rt, &lev);
-            }
-        }
-        ts->count = 0;
-    }
 }
 
 /* (Extension → board → mote-kind resolution: sim_board_for_path()
@@ -2046,7 +1695,6 @@ static const sim_mote_env_t mixed_mote_env = {
     .sim                   = &sim_rt,
     .radio_bus             = &radio_bus,
     .verbose               = &verbose,
-    .num_threads           = &num_threads,
     .node_start_ns         = node_start_ns,
     .uart_byte             = mixed_uart_callback,
     .chip_tx_byte          = mixed_rf_tx_chip_cb,
@@ -2203,8 +1851,8 @@ static int reboot_node(int idx) {
 
 /* --- Simulation step for one node ---
  *
- * Used by the main time-stepping loop and threaded-mode driver to
- * advance a node's CPU. Do NOT call this from chip-driver code or the
+ * Used by the main time-stepping loop to advance a node's CPU. Do NOT
+ * call this from chip-driver code or the
  * per-byte RX delivery path — that's a code smell indicating the chip
  * driver is missing a host->schedule_ns() call. The simulator is
  * event-driven: chip drivers must put state-change side effects on
@@ -2250,7 +1898,7 @@ static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx) {
  * src/motes/ in M19/M20).
  *
  * Bodies are verbatim moves of the former dispatch_mote_wakeup /
- * threaded_step_node / schedule_emulated_wakeup type-switch arms.
+ * schedule_emulated_wakeup type-switch arms.
  * MOTE_IDX recovers the slot index — the wrapped helpers
  * (tick_one_*, emu_rx_queue_drain, gdb_stubs) are still indexed by
  * slot; they follow their dependencies in Phase 5/6 (§3.17).
@@ -2332,23 +1980,8 @@ static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
  * the dispatcher's post-tick RF distribution is node->exec_had_tx,
  * ex the native_exec_had_tx global.) */
 
-/* --- advance_to_time: out-of-slice catch-up to global sim time
- * (threaded stepping path) --- */
-
-static void msp_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
-    msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
-    int64_t delta_ns = sim_ns - cpu->sim_time_ns;
-    if (delta_ns > 0)
-        msp430_step_until(cpu, (int64_t)cpu->cycles +
-                          msp430_ns_to_cycles(delta_ns, cpu->cpu_freq_hz));
-}
-static void arm_mote_advance_to_time(sim_mote_t *m, int64_t sim_ns) {
-    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
-    int64_t delta_ns = sim_ns - cpu->sim_time_ns;
-    if (delta_ns > 0)
-        arm_step_until(cpu, cpu->cycles +
-                       arm_ns_to_cycles(delta_ns, cpu->cpu_freq_hz));
-}
+/* (advance_to_time + threaded_step_node removed with the --threads
+ * path, M29.) */
 
 /* --- sched_hint_ns: next-cpu-event wakeup lead from kernel time base_ns
  * (emulated motes only; see schedule_emulated_wakeup) --- */
@@ -2370,21 +2003,6 @@ static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
         return base_ns;
     return base_ns + arm_cycles_to_ns(
         cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
-}
-
-/*
- * Thread pool step callback: steps a single node to the target sim time.
- * user_data carries the sim_ns cast to void*.
- * RF delivery and native frame dequeue happen in the sequential phase,
- * so this only does the CPU stepping.
- */
-static void threaded_step_node(int idx, void *user_data) {
-    int64_t sim_ns = (int64_t)(intptr_t)user_data;
-
-    if (!node_active(idx)) return;
-
-    sim_mote_t *m = &mote_store[idx];
-    m->ops->advance_to_time(m, sim_ns);
 }
 
 /* --- Channel synchronization ---
@@ -2635,9 +2253,6 @@ int run_mixed_multinode_test(int argc, char **argv) {
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             sim_ms = atoi(argv[++i]);
             sim_ms_set = 1;
-        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-            num_threads = atoi(argv[++i]);
-            if (num_threads < 0) num_threads = 0;
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             /* Per-node startup delay spread (ms). Each node gets a
              * pseudo-random offset in [0, N) ms. Without this, all
@@ -2704,16 +2319,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         printf("Firmware[%d]: %s (%s)\n", i, firmware_paths[i],
                t == NODE_MSP430 ? "MSP430" : t == NODE_ARM ? "ARM" : "NATIVE");
     }
-    printf("Nodes: %d, Simulated time: %d ms (%lld ns), Threads: %d%s\n",
-           node_count, sim_ms, (long long)total_ns,
-           num_threads > 0 ? num_threads : 1,
-           num_threads > 0 ? "" : " (sequential)");
+    printf("Nodes: %d, Simulated time: %d ms (%lld ns), Threads: 1 (sequential)\n",
+           node_count, sim_ms, (long long)total_ns);
     printf("Time step: %lld ns\n\n", (long long)TIME_STEP_NS);
 
     num_nodes = node_count;
-    /* Threaded mode advances motes itself, so the bus's RX delivery
-     * must not also schedule wakeups (M26). */
-    radio_bus.defer_wakeups = (num_threads != 0);
 sim_restart:
     for (int i = 0; i < node_count; i++) {
         const char *fw = firmware_paths[i < firmware_count ? i : firmware_count - 1];
@@ -3042,45 +2652,6 @@ sim_restart:
         }
     }
 
-    /* Initialize thread pool and swap to threaded callbacks */
-    sim_thread_pool_t thread_pool;
-    memset(&thread_pool, 0, sizeof(thread_pool));
-    if (num_threads > 0) {
-        /* Clear thread state buffers */
-        memset(rf_outgoing, 0, sizeof(rf_outgoing));
-        memset(frame_outgoing, 0, sizeof(frame_outgoing));
-        memset(thread_state, 0, sizeof(thread_state));
-
-        if (sim_thread_pool_init(&thread_pool, num_threads, node_count) != 0) {
-            fprintf(stderr, "Failed to initialize thread pool\n");
-            return 1;
-        }
-
-        /* Swap callbacks to threaded versions */
-        for (int i = 0; i < node_count; i++) {
-            if (nodes[i].type == NODE_MSP430) {
-                msp430_platform_set_console(&nodes[i].plat.msp,
-                    threaded_uart_callback, &nodes[i]);
-                cc2420_set_rf_listener(&nodes[i].plat.msp.cc2420,
-                    threaded_rf_tx_handler, &nodes[i]);
-            } else if (nodes[i].type == NODE_ARM) {
-                arm_platform_set_console(&nodes[i].plat.arm,
-                    threaded_uart_callback, &nodes[i]);
-                cc2538_rfcore_set_tx_callback(
-                    &arm_platform_cc2538(&nodes[i].plat.arm)->rfcore,
-                    threaded_rf_tx_handler, &nodes[i]);
-            } else {
-                nodes[i].plat.native.log_callback = threaded_uart_callback;
-                nodes[i].plat.native.log_callback_data = &nodes[i];
-                nodes[i].plat.native.rf_tx_callback = threaded_rf_tx_handler;
-                nodes[i].plat.native.rf_tx_callback_data = &nodes[i];
-                nodes[i].plat.native.rf_frame_callback = threaded_rf_frame_handler;
-                nodes[i].plat.native.rf_frame_callback_data = &nodes[i];
-            }
-        }
-        printf("Thread pool: %d threads\n", num_threads);
-    }
-
     /* Track action execution index */
     int action_idx = 0;
 
@@ -3132,11 +2703,9 @@ sim_restart:
     /* Initialize event queue for Cooja-model sequential stepping.
      * File-scope so emu_deliver_bytes() can schedule receivers. */
     sim_eq_init(&sim_eq);
-    if (num_threads == 0) {
-        for (int i = 0; i < node_count; i++) {
-            if (node_start_ns[i] >= INT64_MAX) continue;  /* removed node */
-            sim_schedule_mote_wakeup(&sim_rt, i, node_start_ns[i]);
-        }
+    for (int i = 0; i < node_count; i++) {
+        if (node_start_ns[i] >= INT64_MAX) continue;  /* removed node */
+        sim_schedule_mote_wakeup(&sim_rt, i, node_start_ns[i]);
     }
 
 
@@ -3162,12 +2731,8 @@ sim_restart:
             goto ui_broadcast;
         }
 
-        /* Advance simulation time.
-         * For threaded mode: fixed 1ms steps.
-         * For sequential mode: jump to next event in queue, capped for UI. */
-        if (num_threads > 0) {
-            sim_ns += TIME_STEP_NS;
-        } else {
+        /* Advance simulation time: jump to next event in queue, capped for UI. */
+        {
             int64_t next_event = sim_eq_peek_time(&sim_eq);
             int64_t max_ns = ui_server ? sim_ns + 100LL * MS_TO_NS
                 : sim_serial_bridge_active(&serial_bridge) ? sim_ns + TIME_STEP_NS
@@ -3382,45 +2947,7 @@ sim_restart:
         if (channels_dirty)
             channels_dirty = false;
 
-        if (num_threads > 0) {
-            /* === PARALLEL PATH === */
-
-            /* Sequential: distribute RF from previous step */
-            t_phase = get_time_ms();
-            distribute_rf_outgoing();
-            time_distribute += get_time_ms() - t_phase;
-
-            /* Sequential: deliver to radios (native nodes only).
-             * Emulated nodes' bytes stay in rf_pending until the per-sender
-             * frame assembler detects a complete frame — delivering partial
-             * frames would leave the radio mid-RX and corrupt the queue. */
-            t_phase = get_time_ms();
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i)) continue;
-                if (nodes[i].type == NODE_NATIVE) {
-                    mixed_deliver_rf_bytes(i);
-                    native_dequeue_rx_frame(&nodes[i].plat.native);
-                }
-            }
-            time_deliver += get_time_ms() - t_phase;
-
-            /* Parallel: step all nodes */
-            t_phase = get_time_ms();
-            sim_thread_pool_run(&thread_pool, threaded_step_node, (void *)(intptr_t)sim_ns);
-            time_step += get_time_ms() - t_phase;
-
-            /* Sequential: drain queued RX frames for emulated nodes */
-            for (int i = 0; i < node_count; i++) {
-                if (!node_active(i)) continue;
-                if (nodes[i].type != NODE_NATIVE)
-                    emu_rx_queue_drain(i);
-            }
-
-            /* Sequential: flush deferred output, merge counters */
-            t_phase = get_time_ms();
-            flush_pending_output();
-            time_flush += get_time_ms() - t_phase;
-        } else {
+        {
             /* === SEQUENTIAL EVENT-DRIVEN PATH (COOJA model) ===
              * Pop events from the event queue, tick one node per event.
              * After each tick, check for TX and schedule receivers at
@@ -3652,10 +3179,6 @@ sim_restart:
         for (int i = 0; i < node_count; i++)
             destroy_node(i);
 
-        /* Cleanup thread pool */
-        if (num_threads > 0)
-            sim_thread_pool_destroy(&thread_pool);
-
         /* Reset all global state */
         rf_byte_count = 0;
         uart_byte_count = 0;
@@ -3675,9 +3198,6 @@ sim_restart:
         memset(emu_rx_queue, 0, sizeof(emu_rx_queue));
         memset(emu_rx_end_ns, 0, sizeof(emu_rx_end_ns));
         memset(tx_asm, 0, sizeof(tx_asm));
-        memset(rf_outgoing, 0, sizeof(rf_outgoing));
-        memset(frame_outgoing, 0, sizeof(frame_outgoing));
-        memset(thread_state, 0, sizeof(thread_state));
         memset(node_last_tx_ns, 0, sizeof(node_last_tx_ns));
         memset(radio_bus.tx_busy_until_ns, 0, sizeof(radio_bus.tx_busy_until_ns));
         memset(node_start_ns, 0, sizeof(node_start_ns));
@@ -3956,10 +3476,6 @@ sim_restart:
         destroy_node(i);
     }
 
-    /* Cleanup thread pool */
-    if (num_threads > 0)
-        sim_thread_pool_destroy(&thread_pool);
-
     /* Serial socket: use child exit status as test result */
     if (sim_external_command_exited(&external_cmd)) {
         int st = sim_external_command_status(&external_cmd);
@@ -3993,10 +3509,8 @@ sim_restart:
     printf("  Wall-clock time:  %.1f ms (%.2f s)\n", elapsed_ms, elapsed_ms / 1000.0);
     printf("  Simulated time:   %d ms (%.1f s)\n", sim_ms, sim_ms / 1000.0);
     double speedup = sim_ms / elapsed_ms;
-    printf("  Speed ratio:      %.1fx real-time (%d nodes, %d thread%s)\n",
-           speedup, node_count,
-           num_threads > 0 ? num_threads : 1,
-           (num_threads > 0 ? num_threads : 1) == 1 ? "" : "s");
+    printf("  Speed ratio:      %.1fx real-time (%d nodes, 1 thread)\n",
+           speedup, node_count);
     printf("  Total cycles:     %lld across %d nodes\n",
            (long long)total_node_cycles, node_count);
     printf("  Total instrs:     %lld across %d nodes\n",

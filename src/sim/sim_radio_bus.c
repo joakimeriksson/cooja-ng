@@ -479,9 +479,8 @@ void sim_radio_bus_deliver_bytes(sim_radio_bus_t *bus, sim_runtime_t *sim,
     }
 
     /* Request immediate wakeup so the receiver gets CPU time for its
-     * FIFOP/ISR work (skipped in threaded mode — the driver steps it). */
-    if (!bus->defer_wakeups)
-        sim_schedule_mote_wakeup_if_earlier(sim, idx, last_byte_ns);
+     * FIFOP/ISR work. */
+    sim_schedule_mote_wakeup_if_earlier(sim, idx, last_byte_ns);
 }
 
 /* Drain queued RX frames for an emulated node: at most one frame per
@@ -774,8 +773,7 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
 
     /* Schedule the sender's wakeup so its radio completes the TX→RX
      * turnaround (enhanced-ACK reception depends on it). */
-    if ((bus->caps[sender_idx] & SIM_RADIO_CAP_WAKE_SENDER_POST_TX) &&
-        !bus->defer_wakeups)
+    if (bus->caps[sender_idx] & SIM_RADIO_CAP_WAKE_SENDER_POST_TX)
         sim_radio_bus_wake_mote(bus, sim, sender_idx);
 }
 

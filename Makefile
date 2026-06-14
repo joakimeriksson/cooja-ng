@@ -60,7 +60,6 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
 
 COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/radio_medium.c \
-                 $(COMMON_SRC_DIR)/sim_threads.c \
                  $(COMMON_SRC_DIR)/packet_analyzer.c \
                  $(COMMON_SRC_DIR)/timeline.c \
                  $(COMMON_SRC_DIR)/js_test_engine.c \

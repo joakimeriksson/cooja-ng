@@ -95,15 +95,13 @@ typedef struct mixed_node {
  * node's lifetime.
  *
  * Every member is documented Phase 5/6 debt: the RF glue dissolves
- * into the radio bus (Phase 5), num_threads/node_start_ns retire with
- * the threaded path (§3.13), and the console/observer callbacks become
+ * into the radio bus (Phase 5), and the console/observer callbacks become
  * observer events (Phase 6).
  */
 struct sim_mote_env {
     sim_runtime_t   *sim;        /* kernel instance (public API) */
     sim_radio_bus_t *radio_bus;
     const int       *verbose;
-    const int       *num_threads;     /* threaded-mode flag */
     const int64_t   *node_start_ns;   /* per-slot start gates */
 
     /* Console: every UART byte off the node (user_data = node). */
