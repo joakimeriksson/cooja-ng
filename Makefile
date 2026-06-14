@@ -8,6 +8,7 @@ LIGHTNING_LIBS := $(shell pkg-config --libs lightning 2>/dev/null)
 
 COMMON_SRC_DIR = src/common
 SIM_SRC_DIR = src/sim
+SERVICES_SRC_DIR = src/services
 MOTES_SRC_DIR = src/motes
 MSP430_SRC_DIR = src/msp430
 ARM_SRC_DIR = src/arm
@@ -18,6 +19,7 @@ TEST_DIR = test
 BUILD_DIR = build
 COMMON_BUILD_DIR = build/common
 SIM_BUILD_DIR = build/sim
+SERVICES_BUILD_DIR = build/services
 MOTES_BUILD_DIR = build/motes
 MSP430_BUILD_DIR = build/msp430
 ARM_BUILD_DIR = build/arm
@@ -76,6 +78,8 @@ SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
               $(SIM_SRC_DIR)/sim_radio_bus.c \
               $(SIM_SRC_DIR)/sim_board.c
 
+SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c
+
 # Per-kind mote modules (boot policy + adapters) + the mote-kind
 # registry — Phase 4, §3.17.
 MOTES_SOURCES = $(MOTES_SRC_DIR)/js_app_mote.c \
@@ -114,6 +118,7 @@ endif
 
 COMMON_OBJECTS = $(patsubst $(COMMON_SRC_DIR)/%.c, $(COMMON_BUILD_DIR)/%.o, $(COMMON_SOURCES))
 SIM_OBJECTS = $(patsubst $(SIM_SRC_DIR)/%.c, $(SIM_BUILD_DIR)/%.o, $(SIM_SOURCES))
+SERVICES_OBJECTS = $(patsubst $(SERVICES_SRC_DIR)/%.c, $(SERVICES_BUILD_DIR)/%.o, $(SERVICES_SOURCES))
 MOTES_OBJECTS = $(patsubst $(MOTES_SRC_DIR)/%.c, $(MOTES_BUILD_DIR)/%.o, $(MOTES_SOURCES))
 OBJECTS = $(patsubst $(MSP430_SRC_DIR)/%.c, $(MSP430_BUILD_DIR)/%.o, $(SOURCES))
 ARM_OBJECTS = $(patsubst $(ARM_SRC_DIR)/%.c, $(ARM_BUILD_DIR)/%.o, $(ARM_SOURCES))
@@ -167,6 +172,9 @@ $(COMMON_BUILD_DIR):
 $(SIM_BUILD_DIR):
 	mkdir -p $(SIM_BUILD_DIR)
 
+$(SERVICES_BUILD_DIR):
+	mkdir -p $(SERVICES_BUILD_DIR)
+
 $(MOTES_BUILD_DIR):
 	mkdir -p $(MOTES_BUILD_DIR)
 
@@ -180,6 +188,9 @@ $(COMMON_BUILD_DIR)/%.o: $(COMMON_SRC_DIR)/%.c | $(COMMON_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(SIM_BUILD_DIR)/%.o: $(SIM_SRC_DIR)/%.c | $(SIM_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(SERVICES_BUILD_DIR)/%.o: $(SERVICES_SRC_DIR)/%.c | $(SERVICES_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(MOTES_BUILD_DIR)/%.o: $(MOTES_SRC_DIR)/%.c | $(MOTES_BUILD_DIR)
@@ -207,7 +218,7 @@ $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Auto-generated header dependencies (from -MMD). Catches the case where

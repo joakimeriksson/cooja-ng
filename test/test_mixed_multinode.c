@@ -29,6 +29,7 @@
 #include "ws_server.h"
 #include "sim_state.h"
 #include "timeline.h"
+#include "timeline_service.h"
 #include "packet_analyzer.h"
 #include "cJSON.h"
 #include "js_test_engine.h"
@@ -289,48 +290,25 @@ static int ss_node_idx = -1;     /* index of the bridged node */
 static sim_external_command_t external_cmd;
 
 /* --- Timeline and packet analyzer state --- */
-static timeline_t timeline;
+/* M32: the timeline data + its observer consumer live in the timeline
+ * service (src/services/timeline_service.c).  The runner still writes a
+ * few chip/UI-state-poll events into timeline_svc.tl directly
+ * (mixed_rf_state_handler, update_radio_state) and the UI broadcast reads
+ * it for CBOR deltas — those move to the UI service in M39. */
+static timeline_service_t timeline_svc;
+static int timeline_node_id(int mote_index) {
+    if (mote_index < 0 || mote_index >= MAX_NODES) return -1;
+    return nodes[mote_index].id;
+}
 static sim_node_state_t node_states[MAX_NODES];
 static sim_node_state_t prev_node_states[MAX_NODES]; /* previous delta state for change detection */
 static int64_t prev_last_tx_ns[MAX_NODES];           /* previous TX timestamps for change detection */
 /* "suppress chip state callbacks during synchronous delivery" moved to
  * radio_bus.in_delivery (M27). */
 
-/* Timeline observer — Phase 1 milestone 7.  Subscribed to the runtime via
- * sim_runtime_subscribe() at startup; translates each kernel-emitted
- * sim_observer_event_t into the equivalent tl_*_event() call.
- *
- * This commit migrates the frame-level events (TX/RX start/end,
- * interference, packet frame, LED change).  The two radio-state-tracking
- * call sites in update_radio_state() still call tl_radio_event() directly
- * because they emit chip-state transitions (ON/OFF/INTF/TX/RX) that
- * don't have a clean 1:1 mapping to the plan's START/END observer kinds. */
-static void timeline_observer_cb(void *user, const sim_observer_event_t *ev) {
-    timeline_t *tl = (timeline_t *)user;
-    if (!tl || ev->mote_index < 0 || ev->mote_index >= MAX_NODES) return;
-    int node_id = nodes[ev->mote_index].id;
-    switch (ev->kind) {
-    case SIM_OBS_RADIO_TX_START:
-        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_TX);   break;
-    case SIM_OBS_RADIO_TX_END:
-        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_ON);   break;
-    case SIM_OBS_RADIO_RX_START:
-        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_RX);   break;
-    case SIM_OBS_RADIO_RX_END:
-        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_ON);   break;
-    case SIM_OBS_RADIO_INTERFERENCE:
-        tl_radio_event(tl, node_id, ev->time_ns, TL_RADIO_INTF); break;
-    case SIM_OBS_LED_CHANGED:
-        tl_led_event(tl, node_id, ev->time_ns,
-                     ev->u.led.led_index, ev->u.led.on ? 1 : 0);  break;
-    case SIM_OBS_PACKET_FRAME:
-        tl_frame_event(tl, node_id, ev->time_ns,
-                       ev->u.frame.is_tx ? 1 : 0,
-                       ev->u.frame.summary);                       break;
-    default:
-        break;
-    }
-}
+/* (timeline_observer_cb moved to src/services/timeline_service.c — M32.
+ * The runner still emits the observer events through the emit_*_obs
+ * helpers below; the host fan-out delivers them to the service.) */
 
 /* Helpers to keep the call-site changes one-liners and visually close to the
  * legacy tl_*_event() forms they replace. */
@@ -391,7 +369,7 @@ static void mixed_rf_state_handler(void *user_data, int old_state, int new_state
         /* Use CPU cycles for accurate intra-step timing */
         int64_t ts = arm_cycles_to_ns(node->plat.arm.cpu.cycles,
                                        node->plat.arm.cpu.cpu_freq_hz);
-        tl_radio_event(&timeline, node->id, ts, etype);
+        tl_radio_event(&timeline_svc.tl, node->id, ts, etype);
     }
 }
 
@@ -416,7 +394,7 @@ static void update_radio_state(int idx) {
             case SIM_RADIO_INTF: etype = TL_RADIO_INTF; break;
             default:             etype = TL_RADIO_OFF;   break;
             }
-            tl_radio_event(&timeline, nodes[idx].id, sim_runtime_now_ns(&sim_rt), etype);
+            tl_radio_event(&timeline_svc.tl, nodes[idx].id, sim_runtime_now_ns(&sim_rt), etype);
         }
     }
 }
@@ -2566,12 +2544,14 @@ sim_restart:
         active_test = NULL;
     }
 
-    /* Initialize timeline and node state tracking */
-    tl_init(&timeline);
-    /* Milestone 7: timeline becomes the first observer subscriber.  All
-     * frame-level / LED / interference events now flow through
-     * sim_runtime_emit() instead of direct tl_*_event() calls. */
-    sim_runtime_subscribe(&sim_rt, timeline_observer_cb, &timeline);
+    /* Initialize timeline and node state tracking.
+     * M32: the timeline is a service now — attach runs tl_init() and the
+     * host's fan-out observer delivers the frame/LED/interference events to
+     * it.  Attaching here (right after the test-engine observer, before the
+     * serial services) keeps the fan-out order identical to the old direct
+     * timeline subscription. */
+    timeline_svc.node_id = timeline_node_id;
+    sim_service_attach(&sim_rt, &timeline_service_ops, &timeline_svc);
     memset(node_states, 0, sizeof(node_states));
     memset(prev_node_states, 0, sizeof(prev_node_states));
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
@@ -3119,7 +3099,7 @@ sim_restart:
                     /* Flush old timeline events so the first delta only
                      * contains events from NOW, not stale history that
                      * would be off-screen in the viewer. */
-                    tl_flush_new(&timeline);
+                    tl_flush_new(&timeline_svc.tl);
                     /* Clear new console counts */
                     for (int i = 0; i < node_count; i++)
                         ui_console_new_count[i] = 0;
@@ -3146,9 +3126,9 @@ sim_restart:
                      * permanently losing all future events. */
                     static uint8_t tl_cbor_buf[262144];
                     int tl_cbor_len = tl_events_to_cbor(
-                        (struct timeline_s *)&timeline,
+                        (struct timeline_s *)&timeline_svc.tl,
                         tl_cbor_buf, (int)sizeof(tl_cbor_buf));
-                    tl_flush_new(&timeline);
+                    tl_flush_new(&timeline_svc.tl);
 
                     /* Encode full delta to CBOR — must be large enough
                      * for timeline data + stats + console + radio changes */
@@ -3255,7 +3235,7 @@ sim_restart:
         memset(ui_console_new, 0, sizeof(ui_console_new));
         memset(ui_console_new_count, 0, sizeof(ui_console_new_count));
         memset(node_states, 0, sizeof(node_states));
-        tl_init(&timeline);
+        tl_init(&timeline_svc.tl);
         extern void cc2538_rfcore_reset_rxfifo_overflows(void);
         cc2538_rfcore_reset_rxfifo_overflows();
 
