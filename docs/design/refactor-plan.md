@@ -1181,7 +1181,7 @@ pointers in the delivery loops before merging.
 
 ### 3.19 Service-extraction milestones (canonical Phase 6 task list)
 
-> **Status: in progress (M31–M35 landed).** Phase 6 (§9) extracts the
+> **Status: in progress (M31–M36 landed).** Phase 6 (§9) extracts the
 > runner's embedded optional/observation features into
 > `src/services/*_service.c` behind a `sim_service_ops_t` vtable host, then
 > — once the GDB stub is a service — finally moves the MSP430/ARM
@@ -1202,10 +1202,13 @@ pointers in the delivery loops before merging.
 > position-pinned tick); M35 `3f448a2` (JSON-test service — step/validator/
 > fail_on checker on_event + per-step timeout + "--- Test Results ---"
 > report; the timed-action executor stays runner-side as shared node
-> scripting).  All byte-identical (cross-build empty-diff on
+> scripting); M36 `f756397` (JS-test service — the JS line feed onto the
+> fan-out as on_event, deleting the runner's test_engine_observer; engine
+> lifecycle/drain/results stay runner-side; re-entrancy depth assert added
+> to the fan-out).  All byte-identical (cross-build empty-diff on
 > sky/cc2538/firefly-subghz 2-node + 5 chains + JS broadcast + step-based
-> configs; M33 adds a pcap byte-diff).  **Next: M36 (JS-test service,
-> re-entrancy).**
+> configs + test-js-hello/test-js-rpl-udp; M33 adds a pcap byte-diff).
+> **Next: M37 (GDB service), then M38 (the MSP430/ARM adapter move).**
 
 Design decisions locked for this phase:
 
