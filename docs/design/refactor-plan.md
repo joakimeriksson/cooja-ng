@@ -987,9 +987,12 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 > sky 2-node 60 s ≈ 134 ms, firefly-subghz-fixed ≈ 8.4 s); M25
 > `074430e` (de-typing: rx_byte_sync/rx_pre_sync ops + SIM_RADIO_CAP_*
 > register caps; emu_deliver_bytes/frame_complete/drain type checks →
-> mode/caps/ops-presence queries; cross-build diff vs M24 IDENTICAL on
-> sky/firefly/cc2538).  Next: M26 (emu RX core into the bus).
-> Numbering continues from Phase 4 (M24–M30).
+> mode/caps/ops-presence queries); M26 `9cfd8f4` (emu RX core into the
+> bus: deliver_bytes/queue_frame/drain_rx + executing_node + on_rx hook
+> + bus->stats; deliver_rx_byte + schedule_emulated_wakeup stay runner-
+> side, not M27 prerequisites; cross-build diff IDENTICAL; radio-bus
+> suite → 104).  Next: M27 (frame_complete policy into the bus —
+> highest risk).  Numbering continues from Phase 4 (M24–M30).
 > Goal (from §9 Phase 5): the remaining RF delivery *policy* moves out
 > of `test/test_mixed_multinode.c` into `src/sim/sim_radio_bus.c`.
 > The M9.4/M9.5 slices already moved the TX byte path (byte clock,
