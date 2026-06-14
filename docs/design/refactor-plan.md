@@ -1181,7 +1181,7 @@ pointers in the delivery loops before merging.
 
 ### 3.19 Service-extraction milestones (canonical Phase 6 task list)
 
-> **Status: in progress (M31–M36 landed).** Phase 6 (§9) extracts the
+> **Status: in progress (M31–M37 landed).** Phase 6 (§9) extracts the
 > runner's embedded optional/observation features into
 > `src/services/*_service.c` behind a `sim_service_ops_t` vtable host, then
 > — once the GDB stub is a service — finally moves the MSP430/ARM
@@ -1205,10 +1205,14 @@ pointers in the delivery loops before merging.
 > scripting); M36 `f756397` (JS-test service — the JS line feed onto the
 > fan-out as on_event, deleting the runner's test_engine_observer; engine
 > lifecycle/drain/results stay runner-side; re-entrancy depth assert added
-> to the fan-out).  All byte-identical (cross-build empty-diff on
+> to the fan-out); M37 `a5e31c8` (GDB service — gdb_stub storage + --gdb CLI
+> + bind/attach into the service; arm_mote_execute polls cpu->gdb_stub, not
+> the runner globals, which unblocks M38; full RSP session validated
+> end-to-end).  All byte-identical (cross-build empty-diff on
 > sky/cc2538/firefly-subghz 2-node + 5 chains + JS broadcast + step-based
-> configs + test-js-hello/test-js-rpl-udp; M33 adds a pcap byte-diff).
-> **Next: M37 (GDB service), then M38 (the MSP430/ARM adapter move).**
+> configs + test-js-hello/test-js-rpl-udp + a --gdb bind smoke; M33 adds a
+> pcap byte-diff).  **Next: M38 — finally move the MSP430/ARM execute/serial
+> adapters out of the runner (the §3.17/§3.18 deferred debt).**
 
 Design decisions locked for this phase:
 
