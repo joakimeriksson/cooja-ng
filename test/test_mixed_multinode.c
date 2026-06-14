@@ -1567,9 +1567,46 @@ static int ss_inject_into_node(void *user, const uint8_t *buf, int len) {
     return inject_serial(ss_node_idx, buf, len);
 }
 
+/* M31: adopt the serial-bridge and external-command services onto the
+ * sim_service host.  init adopts the already-started struct (the runner
+ * still constructs them at their config-gated call sites, preserving the
+ * existing warn-and-continue error handling); the host owns the poll
+ * cadence (sim_service_poll_all) and reverse-order teardown
+ * (sim_service_destroy_all). */
+static int ss_bridge_svc_init(sim_runtime_t *sim, const void *cfg, void **state) {
+    (void)sim; *state = (void *)cfg; return 0;
+}
+static void ss_bridge_svc_poll(sim_runtime_t *sim, void *state) {
+    (void)sim; sim_serial_bridge_poll((sim_serial_bridge_t *)state);
+}
+static void ss_bridge_svc_destroy(sim_runtime_t *sim, void *state) {
+    (void)sim; sim_serial_bridge_stop((sim_serial_bridge_t *)state);
+}
+static const sim_service_ops_t ss_bridge_service_ops = {
+    .name    = "serial-bridge",
+    .init    = ss_bridge_svc_init,
+    .destroy = ss_bridge_svc_destroy,
+    .poll    = ss_bridge_svc_poll,
+};
+
+static int ss_extcmd_svc_init(sim_runtime_t *sim, const void *cfg, void **state) {
+    (void)sim; *state = (void *)cfg; return 0;
+}
+static void ss_extcmd_svc_poll(sim_runtime_t *sim, void *state) {
+    (void)sim; sim_external_command_poll((sim_external_command_t *)state);
+}
+static void ss_extcmd_svc_destroy(sim_runtime_t *sim, void *state) {
+    (void)sim; sim_external_command_stop((sim_external_command_t *)state);
+}
+static const sim_service_ops_t ss_extcmd_service_ops = {
+    .name    = "external-command",
+    .init    = ss_extcmd_svc_init,
+    .destroy = ss_extcmd_svc_destroy,
+    .poll    = ss_extcmd_svc_poll,
+};
+
 static void ss_cleanup(void) {
-    sim_serial_bridge_stop(&serial_bridge);
-    sim_external_command_stop(&external_cmd);
+    sim_service_destroy_all(&sim_rt);
 }
 
 /* (Extension → board → mote-kind resolution: sim_board_for_path()
@@ -2591,11 +2628,21 @@ sim_restart:
                                         config.serial_socket_port,
                                         ss_inject_into_node, NULL) < 0) {
                 fprintf(stderr, "serial_socket: failed to create listener\n");
-            } else if (config.serial_socket_command[0]) {
-                /* COOJA.testlog tee + child launch live in the
-                 * external-command service (milestone 8.2). */
-                sim_external_command_start(&external_cmd, &sim_rt,
-                                           config.serial_socket_command);
+            } else {
+                /* M31: register the bridge (and, if configured, the
+                 * external-command child) with the service host so the
+                 * loop polls them via sim_service_poll_all and tears them
+                 * down in reverse at ss_cleanup. */
+                sim_service_attach(&sim_rt, &ss_bridge_service_ops,
+                                   &serial_bridge);
+                if (config.serial_socket_command[0]) {
+                    /* COOJA.testlog tee + child launch live in the
+                     * external-command service (milestone 8.2). */
+                    sim_external_command_start(&external_cmd, &sim_rt,
+                                               config.serial_socket_command);
+                    sim_service_attach(&sim_rt, &ss_extcmd_service_ops,
+                                       &external_cmd);
+                }
             }
         }
     }
@@ -2929,11 +2976,12 @@ sim_restart:
                 break;
         }
 
-        /* Serial bridge service tick + external-command child check */
+        /* Service host tick (M31: serial bridge + external-command child).
+         * poll_all walks attached services in order; the polls are
+         * self-guarding no-ops when inactive. */
         if (sim_serial_bridge_active(&serial_bridge) ||
             sim_external_command_running(&external_cmd)) {
-            sim_serial_bridge_poll(&serial_bridge);
-            sim_external_command_poll(&external_cmd);
+            sim_service_poll_all(&sim_rt);
             if (sim_external_command_exited(&external_cmd))
                 break;
         }

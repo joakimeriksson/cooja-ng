@@ -21,6 +21,7 @@
 #include "sim_event_queue.h"
 #include "sim_mote.h"
 #include "sim_observer.h"
+#include "sim_service.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,6 +73,17 @@ typedef struct sim_runtime {
         void                   *user;
     }                  observers[SIM_RUNTIME_MAX_OBSERVERS];
     int                observer_count;
+
+    /* Service host — Phase 6 milestone 31 (§3.19).  An ordered table of
+     * extracted services (timeline, PCAP, progress, …).  The host
+     * subscribes ONE fan-out observer (sim_service_dispatch_event) that
+     * walks these services' on_event, so a service does not consume an
+     * observer slot of its own.  service_observer_handle is the slot of
+     * that fan-out observer, or -1 when not yet subscribed.  See
+     * sim_service.h / sim_service.c. */
+    sim_service_slot_t services[SIM_RUNTIME_MAX_SERVICES];
+    int                service_count;
+    int                service_observer_handle;
 } sim_runtime_t;
 
 /* Zero-initialize the runtime; does NOT init the event queue or radio medium

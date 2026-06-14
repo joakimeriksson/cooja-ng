@@ -70,6 +70,7 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
 
 # Simulation kernel — see docs/design/refactor-plan.md.
 SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
+              $(SIM_SRC_DIR)/sim_service.c \
               $(SIM_SRC_DIR)/sim_serial_bridge.c \
               $(SIM_SRC_DIR)/sim_external_command.c \
               $(SIM_SRC_DIR)/sim_radio_bus.c \

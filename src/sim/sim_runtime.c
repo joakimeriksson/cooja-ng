@@ -18,6 +18,9 @@ void sim_runtime_init(sim_runtime_t *sim) {
     if (!sim) return;
     memset(sim, 0, sizeof(*sim));
     sim->run_state = SIM_RUN_STOPPED;
+    /* Milestone 31: -1 = the service host's fan-out observer is not yet
+     * subscribed (0 is a valid observer slot, so memset-0 won't do). */
+    sim->service_observer_handle = -1;
     /* sim->event_queue and sim->radio_medium left zeroed; the runner
      * still calls sim_eq_init() and radio_medium_init() on them via the
      * aliases declared in test/test_mixed_multinode.c. */
