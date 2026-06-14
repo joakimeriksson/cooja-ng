@@ -34,6 +34,7 @@
 #include "cJSON.h"
 #include "js_test_engine.h"
 #include "json_test_service.h"
+#include "js_test_service.h"
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
 #include "sim_board.h"
@@ -492,20 +493,11 @@ static void ui_add_console_line(int node_idx, int64_t sim_ns, const char *line) 
  * json_test service (src/services/json_test_service.c).  The JS engine
  * pointer stays here until M36. */
 static json_test_service_t json_test_svc;
-static js_test_engine_t *active_js_engine = NULL;
-
-/* Feed a console line to the JS test engine (M36 will move this onto the
- * host fan-out too).  The JSON step/validator checker is now the json_test
- * service's on_event (M35).  Subscribed to the kernel observer stream
- * (milestone 8.3) — both line-assembly sites emit SIM_OBS_MOTE_LOG_LINE. */
-static void test_engine_observer(void *user, const sim_observer_event_t *ev) {
-    (void)user;
-    if (ev->kind != SIM_OBS_MOTE_LOG_LINE) return;
-    if (active_js_engine) {
-        js_test_feed_line(active_js_engine, ev->u.log_line.line,
-                          ev->u.log_line.node_id, ev->time_ns / 1000);
-    }
-}
+/* M36: both test engines consume console lines through the host fan-out
+ * now — json_test (M35) and js_test (this milestone) each as a service
+ * on_event.  The runner's dedicated test_engine_observer is gone; the JS
+ * engine's lifecycle/drain/results stay runner-side around js_test_svc. */
+static js_test_service_t js_test_svc;
 
 static double get_time_ms(void) {
     struct timespec ts;
@@ -2153,9 +2145,10 @@ int run_mixed_multinode_test(int argc, char **argv) {
         sim_radio_bus_set_host(&radio_bus, &mixed_bus_host);
         radio_bus.executing_node = -1;
     }
-    /* Milestone 8.3: JS/JSON test engines consume console lines off the
-     * observer stream instead of a hardwired call in the UART path. */
-    sim_runtime_subscribe(&sim_rt, test_engine_observer, NULL);
+    /* Milestone 8.3 / M35–M36: the JS and JSON test engines consume console
+     * lines off the observer stream — now each as a service on_event via the
+     * host fan-out (json_test_svc, js_test_svc), so no dedicated observer
+     * subscription here. */
 
     static const char *firmware_paths[MAX_NODES] = { NULL };
     static char firmware_bufs[MAX_NODES][256]; /* storage for config-loaded paths */
@@ -2434,7 +2427,9 @@ sim_restart:
 
             if (js_test_init(&js_engine, js_script, js_node_ids, node_count) == 0) {
                 use_js_engine = true;
-                active_js_engine = &js_engine;
+                /* M36: the JS line feed is a service on_event now. */
+                js_test_service_start(&js_test_svc, &js_engine);
+                sim_service_attach(&sim_rt, &js_test_service_ops, &js_test_svc);
                 /* Use timeout from JS TIMEOUT() call if set, else from config.
                  * Add margin so the sim loop runs past the timeout point,
                  * allowing js_test_check_timeout to fire the callback.
@@ -3185,7 +3180,7 @@ sim_restart:
             test_exit_code = 1;
         }
         js_test_destroy(&js_engine);
-        active_js_engine = NULL;
+        js_test_svc.active = false;  /* engine destroyed — stop feeding */
     }
 
     printf("\n--- Simulation complete ---\n");

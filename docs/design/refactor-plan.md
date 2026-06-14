@@ -1271,9 +1271,17 @@ Milestones (one commit each, full validation gate before each):
     MOVE/SEND/SEND_ALL/REMOVE/ADD) **stays runner-side**: it is config-driven
     node scripting (mutates nodes[]/radio_medium, dynamic add), structurally
     shared with the JS engine's action path (M36) and not test-engine state.
-36. JS-test engine service (re-entrancy): `on_event` only enqueues into a
-    deferred-resume queue + may `sim_runtime_request_stop()`, never
-    re-enters dispatch; `poll()` drains/executes the actions.
+36. JS-test engine service: move the JS console-line feed onto the host
+    fan-out as `on_event` and delete the runner's dedicated
+    test_engine_observer (both engines consume lines as services now).  The
+    re-entrancy contract was already satisfied by construction —
+    js_test_feed_line only matches/queues, the action drain+execute runs in
+    the loop (the deferred-resume point), not the callback — so the engine
+    lifecycle/drain/results stay runner-side (shared node scripting +
+    config-coupled setup), like M35's timed-action split.  A re-entrancy
+    depth assert was added to `sim_service_dispatch_event`.  Came out
+    byte-identical (cross-build empty-diff incl. test-js-hello /
+    test-js-rpl-udp).
 37. GDB service: stub storage + `--gdb` CLI + attach into the service
     (sets `cpu->gdb_stub`); ARM module polls `cpu->gdb_stub`; service
     `poll()` keepalive while any stub is attached.

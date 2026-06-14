@@ -10,6 +10,7 @@
 #include "sim_service.h"
 #include "sim_runtime.h"
 
+#include <assert.h>
 #include <stddef.h>
 
 int sim_service_attach(sim_runtime_t *sim, const sim_service_ops_t *ops,
@@ -64,6 +65,14 @@ void sim_service_disable(sim_runtime_t *sim, void *state) {
 void sim_service_dispatch_event(void *user, const sim_observer_event_t *ev) {
     sim_runtime_t *sim = (sim_runtime_t *)user;
     if (!sim || !ev) return;
+    /* Re-entrancy guard (M36): a service on_event must not emit an observer
+     * event (which would re-enter this fan-out) or otherwise re-enter
+     * dispatch — it observes only, deferring sim-mutating work to its
+     * poll() or the runner loop.  A non-zero depth here means some service
+     * violated that contract. */
+    static int dispatch_depth = 0;
+    assert(dispatch_depth == 0 && "service on_event re-entered dispatch");
+    dispatch_depth++;
     /* Snapshot the count so a service attached mid-dispatch isn't called
      * for the event that triggered it (mirrors sim_runtime_emit). */
     int count = sim->service_count;
@@ -72,6 +81,7 @@ void sim_service_dispatch_event(void *user, const sim_observer_event_t *ev) {
         if (s->enabled && s->ops->on_event)
             s->ops->on_event(sim, s->state, ev);
     }
+    dispatch_depth--;
 }
 
 void sim_service_destroy_all(sim_runtime_t *sim) {
