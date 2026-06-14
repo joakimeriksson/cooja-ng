@@ -1181,7 +1181,7 @@ pointers in the delivery loops before merging.
 
 ### 3.19 Service-extraction milestones (canonical Phase 6 task list)
 
-> **Status: in progress (M31–M37 landed).** Phase 6 (§9) extracts the
+> **Status: in progress (M31–M38 landed).** Phase 6 (§9) extracts the
 > runner's embedded optional/observation features into
 > `src/services/*_service.c` behind a `sim_service_ops_t` vtable host, then
 > — once the GDB stub is a service — finally moves the MSP430/ARM
@@ -1208,11 +1208,15 @@ pointers in the delivery loops before merging.
 > to the fan-out); M37 `a5e31c8` (GDB service — gdb_stub storage + --gdb CLI
 > + bind/attach into the service; arm_mote_execute polls cpu->gdb_stub, not
 > the runner globals, which unblocks M38; full RSP session validated
-> end-to-end).  All byte-identical (cross-build empty-diff on
-> sky/cc2538/firefly-subghz 2-node + 5 chains + JS broadcast + step-based
-> configs + test-js-hello/test-js-rpl-udp + a --gdb bind smoke; M33 adds a
-> pcap byte-diff).  **Next: M38 — finally move the MSP430/ARM execute/serial
-> adapters out of the runner (the §3.17/§3.18 deferred debt).**
+> end-to-end); M38 `d3b94af` (the §3.17/§3.18 debt paid — the MSP430/ARM
+> execute/serial adapter tables + 30 functions move into
+> src/motes/{msp430,arm}_elf_mote.c as msp430_elf_mote_ops/arm_elf_mote_ops,
+> runner-globals rewired through node->env, sim_mote_kind_set_ops deleted;
+> runner −493 lines).  All byte-identical (cross-build empty-diff on
+> sky/cc2538/firefly-subghz 2-node + 6 chains incl. z1 MSP430X + JS
+> broadcast + step-based configs + test-js-hello/test-js-rpl-udp + a --gdb
+> bind smoke; M33 adds a pcap byte-diff; M38 re-verifies the full GDB RSP
+> session).  **Next: M39 (WebSocket-UI service), M40 (stats, optional).**
 
 Design decisions locked for this phase:
 
