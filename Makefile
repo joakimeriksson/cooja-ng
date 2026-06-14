@@ -80,7 +80,8 @@ SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
 
 SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
                    $(SERVICES_SRC_DIR)/pcap_service.c \
-                   $(SERVICES_SRC_DIR)/progress_service.c
+                   $(SERVICES_SRC_DIR)/progress_service.c \
+                   $(SERVICES_SRC_DIR)/json_test_service.c
 
 # Per-kind mote modules (boot policy + adapters) + the mote-kind
 # registry — Phase 4, §3.17.

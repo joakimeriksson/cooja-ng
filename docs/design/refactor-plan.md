@@ -1260,8 +1260,13 @@ Milestones (one commit each, full validation gate before each):
     (`[UIP]`) — no clean service home — so it moves with the UI
     frame-summary path in M39.
 34. Progress-printing service: per-tick progress block into a `poll()`.
-35. JSON-test service (actions + validators): observer half → `on_event`,
-    timed actions drain in `poll()`, loop reads `finished` via a query.
+35. JSON-test service: the step/validator/fail_on checker (`on_event` on
+    SIM_OBS_MOTE_LOG_LINE) + per-run state + per-step timeout + the
+    end-of-run "--- Test Results ---" report; the loop reads `finished`
+    via a query.  The timed-action executor (`config.test.actions[]` →
+    MOVE/SEND/SEND_ALL/REMOVE/ADD) **stays runner-side**: it is config-driven
+    node scripting (mutates nodes[]/radio_medium, dynamic add), structurally
+    shared with the JS engine's action path (M36) and not test-engine state.
 36. JS-test engine service (re-entrancy): `on_event` only enqueues into a
     deferred-resume queue + may `sim_runtime_request_stop()`, never
     re-enters dispatch; `poll()` drains/executes the actions.

@@ -33,6 +33,7 @@
 #include "packet_analyzer.h"
 #include "cJSON.h"
 #include "js_test_engine.h"
+#include "json_test_service.h"
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
 #include "sim_board.h"
@@ -487,88 +488,22 @@ static void ui_add_console_line(int node_idx, int64_t sim_ns, const char *line) 
 
 /* --- Test scripting state --- */
 
-typedef struct {
-    const sim_test_config_t *config;
-    int  current_step;
-    int  match_count;
-    int64_t step_start_ns;
-    int  finished;          /* 0=running, 1=pass, -1=fail */
-    char fail_reason[512];
-    int  validator_counts[MAX_TEST_VALIDATORS];
-} sim_test_state_t;
-
-static sim_test_state_t *active_test = NULL;
+/* M35: the JSON step/validator/fail_on checker + per-run state live in the
+ * json_test service (src/services/json_test_service.c).  The JS engine
+ * pointer stays here until M36. */
+static json_test_service_t json_test_svc;
 static js_test_engine_t *active_js_engine = NULL;
 
-static void sim_test_check_line(int node_id, const char *line, int64_t sim_ns) {
-    if (!active_test || active_test->finished)
-        return;
-
-    /* Check fail_on patterns first */
-    for (int i = 0; i < active_test->config->fail_on_count; i++) {
-        if (strstr(line, active_test->config->fail_on[i])) {
-            active_test->finished = -1;
-            snprintf(active_test->fail_reason, sizeof(active_test->fail_reason),
-                     "fail_on pattern \"%s\" matched at node %d, %lld ms: %s",
-                     active_test->config->fail_on[i], node_id,
-                     (long long)(sim_ns / MS_TO_NS), line);
-            return;
-        }
-    }
-
-    /* Update validator counters (always, regardless of steps) */
-    for (int i = 0; i < active_test->config->validator_count; i++) {
-        const sim_test_validator_t *v = &active_test->config->validators[i];
-        if (v->node >= 0 && v->node != node_id)
-            continue;
-        if (strstr(line, v->pattern))
-            active_test->validator_counts[i]++;
-    }
-
-    /* If no steps, nothing more to check (fail_on-only or timeout_is_success test) */
-    if (active_test->config->step_count == 0)
-        return;
-
-    const sim_test_step_t *step =
-        &active_test->config->steps[active_test->current_step];
-
-    /* Node filter: -1 = any */
-    if (step->node >= 0 && step->node != node_id)
-        return;
-
-    /* Substring match */
-    if (!strstr(line, step->pattern))
-        return;
-
-    active_test->match_count++;
-    if (active_test->match_count >= step->count) {
-        printf("  TEST step %d PASS: \"%s\" matched %d/%d (node %d, %lld ms)\n",
-               active_test->current_step, step->pattern,
-               active_test->match_count, step->count, node_id,
-               (long long)(sim_ns / MS_TO_NS));
-        active_test->current_step++;
-        active_test->match_count = 0;
-        active_test->step_start_ns = sim_ns;
-
-        if (active_test->current_step >= active_test->config->step_count)
-            active_test->finished = 1;  /* all steps passed */
-    }
-}
-
-/* Feed a console line to whichever test engine is active.  Subscribed
- * to the kernel observer stream (milestone 8.3) — both line-assembly
- * sites emit SIM_OBS_MOTE_LOG_LINE and this adapter fans the line into
- * the JS engine and the JSON step/validator checker. */
+/* Feed a console line to the JS test engine (M36 will move this onto the
+ * host fan-out too).  The JSON step/validator checker is now the json_test
+ * service's on_event (M35).  Subscribed to the kernel observer stream
+ * (milestone 8.3) — both line-assembly sites emit SIM_OBS_MOTE_LOG_LINE. */
 static void test_engine_observer(void *user, const sim_observer_event_t *ev) {
     (void)user;
     if (ev->kind != SIM_OBS_MOTE_LOG_LINE) return;
     if (active_js_engine) {
         js_test_feed_line(active_js_engine, ev->u.log_line.line,
                           ev->u.log_line.node_id, ev->time_ns / 1000);
-    }
-    if (active_test) {
-        sim_test_check_line(ev->u.log_line.node_id, ev->u.log_line.line,
-                            ev->time_ns);
     }
 }
 
@@ -2468,7 +2403,6 @@ sim_restart:
     sync_node_channels();
 
     /* Initialize test engine if config has test section */
-    sim_test_state_t test_state;
     js_test_engine_t js_engine;
     bool use_js_engine = false;
 
@@ -2533,11 +2467,9 @@ sim_restart:
             if (js_script != config.js_script_inline)
                 free(js_script);
         }
-        active_test = NULL;
+        json_test_service_start(&json_test_svc, NULL);
     } else if (config_loaded && config.has_test) {
-        memset(&test_state, 0, sizeof(test_state));
-        test_state.config = &config.test;
-        active_test = &test_state;
+        json_test_service_start(&json_test_svc, &config.test);
         printf("Test: %d steps", config.test.step_count);
         if (config.test.fail_on_count > 0)
             printf(", %d fail_on patterns", config.test.fail_on_count);
@@ -2549,8 +2481,11 @@ sim_restart:
             printf(", %d actions", config.test.action_count);
         printf("\n");
     } else {
-        active_test = NULL;
+        json_test_service_start(&json_test_svc, NULL);
     }
+    /* M35: register the JSON test runner once; its on_event consumes
+     * SIM_OBS_MOTE_LOG_LINE via the host fan-out (a no-op when inactive). */
+    sim_service_attach(&sim_rt, &json_test_service_ops, &json_test_svc);
 
     /* Initialize timeline and node state tracking.
      * M32: the timeline is a service now — attach runs tl_init() and the
@@ -3022,25 +2957,9 @@ sim_restart:
             }
         }
 
-        /* Test engine: check per-step timeout */
-        if (active_test && !active_test->finished &&
-            active_test->config->step_count > 0) {
-            const sim_test_step_t *step =
-                &active_test->config->steps[active_test->current_step];
-            int step_timeout = step->timeout_ms > 0
-                ? step->timeout_ms : sim_ms;
-            int64_t elapsed_step_ns = sim_ns - active_test->step_start_ns;
-            if (elapsed_step_ns >= (int64_t)step_timeout * MS_TO_NS) {
-                active_test->finished = -1;
-                snprintf(active_test->fail_reason,
-                         sizeof(active_test->fail_reason),
-                         "step %d timed out after %d ms waiting for \"%s\" "
-                         "(matched %d/%d)",
-                         active_test->current_step, step_timeout,
-                         step->pattern, active_test->match_count, step->count);
-            }
-        }
-        if (active_test && active_test->finished)
+        /* Test engine: check per-step timeout (M35: json_test service) */
+        json_test_check_step_timeout(&json_test_svc, sim_ns, sim_ms);
+        if (json_test_finished(&json_test_svc))
             break;
 
         /* WebSocket UI: poll and broadcast state */
@@ -3251,80 +3170,9 @@ sim_restart:
     double t_end = get_time_ms();
     double elapsed_ms = t_end - t_start;
 
-    /* If test is still running when simulation ends */
-    int test_exit_code = 0;
-    if (active_test && !active_test->finished) {
-        if (active_test->config->timeout_is_success) {
-            /* timeout_is_success: reaching timeout without failure = PASS */
-            active_test->finished = 1;
-        } else if (active_test->config->step_count == 0) {
-            /* No steps and no failure hit — pass (fail_on-only test) */
-            active_test->finished = 1;
-        } else {
-            active_test->finished = -1;
-            const sim_test_step_t *step =
-                &active_test->config->steps[active_test->current_step];
-            snprintf(active_test->fail_reason, sizeof(active_test->fail_reason),
-                     "simulation ended at %lld ms, step %d waiting for \"%s\" "
-                     "(matched %d/%d)",
-                     (long long)(sim_ns / MS_TO_NS), active_test->current_step,
-                     step->pattern, active_test->match_count, step->count);
-        }
-    }
-    /* Check validators at end of test (when test would otherwise pass) */
-    if (active_test && active_test->finished == 1 &&
-        active_test->config->validator_count > 0) {
-        for (int i = 0; i < active_test->config->validator_count; i++) {
-            if (active_test->validator_counts[i] <
-                active_test->config->validators[i].min_count) {
-                active_test->finished = -1;
-                snprintf(active_test->fail_reason, sizeof(active_test->fail_reason),
-                         "validator \"%s\" matched %d/%d times",
-                         active_test->config->validators[i].pattern,
-                         active_test->validator_counts[i],
-                         active_test->config->validators[i].min_count);
-                break;
-            }
-        }
-    }
-    if (active_test) {
-        printf("\n--- Test Results ---\n");
-        for (int i = 0; i < active_test->config->step_count; i++) {
-            const sim_test_step_t *s = &active_test->config->steps[i];
-            const char *status;
-            if (i < active_test->current_step)
-                status = "PASS";
-            else if (i == active_test->current_step && active_test->finished == -1)
-                status = "FAIL";
-            else
-                status = "SKIP";
-            printf("  Step %d [%s]: wait \"%s\"", i, status, s->pattern);
-            if (s->node >= 0)
-                printf(" node=%d", s->node);
-            if (s->count > 1)
-                printf(" count=%d", s->count);
-            printf("\n");
-        }
-        /* Print validator results */
-        for (int i = 0; i < active_test->config->validator_count; i++) {
-            const sim_test_validator_t *v = &active_test->config->validators[i];
-            int count = active_test->validator_counts[i];
-            const char *vstat = (count >= v->min_count) ? "PASS" : "FAIL";
-            printf("  Validator [%s]: \"%s\" matched %d/%d",
-                   vstat, v->pattern, count, v->min_count);
-            if (v->node >= 0)
-                printf(" node=%d", v->node);
-            printf("\n");
-        }
-        if (active_test->finished == 1) {
-            printf("\n  TEST PASSED (%lld ms simulated)\n",
-                   (long long)(sim_ns / MS_TO_NS));
-        } else {
-            printf("\n  TEST FAILED: %s\n", active_test->fail_reason);
-            test_exit_code = 1;
-        }
-        active_test = NULL;
-    }
+    /* End-of-run JSON test resolution + "--- Test Results ---" report
+     * (M35: json_test service).  Returns the process exit code. */
+    int test_exit_code = json_test_report(&json_test_svc, sim_ns);
 
     /* JS test engine results */
     if (use_js_engine) {
