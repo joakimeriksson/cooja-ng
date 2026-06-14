@@ -6,6 +6,11 @@
 
 #include <string.h>
 
+static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
+                                         sim_runtime_t *sim, int sender_idx,
+                                         int sender_radio, int64_t byte_time_ns,
+                                         int64_t sender_byte_ns);
+
 /* On-air formats:
  *   2.4 GHz: preamble(4) 0x00 + SFD 0x7A + length at data[5]; receiving
  *     chip pushes (length + 1) bytes into its RXFIFO.
@@ -331,13 +336,13 @@ void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
     if (!sim_radio_bus_asm_feed(a, byte))
         return;  /* frame not yet complete */
 
-    /* Frame complete — the host delivers staged frames, runs
-     * collision/FIFO policy, and flushes auto-ACKs.  tx_depth marks the
+    /* Frame complete — the bus delivers staged frames, runs collision/
+     * FIFO policy, and flushes auto-ACKs (M27).  tx_depth marks the
      * scope so nested chip TX callbacks take the re-entrant path. */
+    (void)h;
     bus->tx_depth++;
-    if (h->frame_complete)
-        h->frame_complete(h->user, sender_idx, sender_radio,
-                          byte_time_ns, sender_byte_ns);
+    sim_radio_bus_frame_complete(bus, sim, sender_idx, sender_radio,
+                                 byte_time_ns, sender_byte_ns);
     bus->tx_depth--;
 }
 
@@ -486,4 +491,244 @@ void sim_radio_bus_drain_rx(sim_radio_bus_t *bus, sim_runtime_t *sim,
         q->count--;
         break;
     }
+}
+
+void sim_radio_bus_wake_mote(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                             int idx) {
+    /* sim_runtime_now_ns is the authoritative cross-node "now"; a queued
+     * RX frame means re-run at the current sim time (Cooja's
+     * requestImmediateWakeup), otherwise use the mote's next-CPU-event
+     * lead from sched_hint_ns (emulated motes only — this is never
+     * called for native/JS). */
+    int64_t now = sim_runtime_now_ns(sim);
+    if (bus->emu_rx_queue[idx].count > 0) {
+        sim_schedule_mote_wakeup_if_earlier(sim, idx, now);
+        return;
+    }
+    sim_mote_t *m = sim_runtime_mote(sim, idx);
+    int64_t next = m->ops->sched_hint_ns(m, now);
+    sim_schedule_mote_wakeup_if_earlier(sim, idx, next);
+}
+
+/* ============================================================
+ * Frame-complete delivery policy (M27 — moved from the runner's
+ * bus_host_frame_complete).  Owns: air-time math, CCA busy-until,
+ * the per-receiver snapshot, collision windows, RXFIFO backpressure,
+ * sync-vs-queue delivery, the dual 192 µs auto-ACK windows, and
+ * interference marking.  All observability (timeline, PCAP, packet
+ * analyzer, verbose prints, traces) is delegated to the host's
+ * frame_observed / on_rx_frame / on_ack hooks so the bus stays free of
+ * chip and presentation concerns.
+ * ============================================================ */
+static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
+                                         sim_runtime_t *sim, int sender_idx,
+                                         int sender_radio, int64_t byte_time_ns,
+                                         int64_t sender_byte_ns) {
+    const sim_radio_bus_host_t *h = &bus->host;
+    tx_frame_asm_t *a = &bus->tx_asm[sender_idx];
+    int64_t now = sim_runtime_now_ns(sim);
+
+    /* Air-byte budget for the dispatch loop must match what the chip
+     * driver emitted: 802.15.4 = 4 preamble + SFD + length byte +
+     * payload (length includes the 2 FCS); 802.15.4g = 4 preamble +
+     * 4 sync + PHR(1/2) + payload + 2 auto-CRC. */
+    int total_air_bytes = a->subghz
+        ? (4 + 4 + a->subghz_phr_len + a->expected_len + 2)
+        : (4 + 1 + 1 + a->expected_len);
+    int64_t frame_air_dur = (int64_t)total_air_bytes * sender_byte_ns;
+    int64_t accurate_tx_end = byte_time_ns + sender_byte_ns;
+    int64_t accurate_tx_start = accurate_tx_end - frame_air_dur;
+    if (accurate_tx_start < 0) accurate_tx_start = 0;
+
+    /* Mark the medium TX-busy on the sender's channel until the frame
+     * leaves the air (CCA reads this).  Sub-GHz first_byte_ns isn't
+     * armed, so anchor busy-until to now + air-time for CC1200. */
+    int64_t busy_until = accurate_tx_end;
+    if (a->subghz)
+        busy_until = now + frame_air_dur;
+    if (busy_until > bus->tx_busy_until_ns[sender_idx])
+        bus->tx_busy_until_ns[sender_idx] = busy_until;
+
+    sim_radio_frame_info_t fi = {
+        .sender_idx      = sender_idx,
+        .sender_radio    = sender_radio,
+        .expected_len    = a->expected_len,
+        .total_air_bytes = total_air_bytes,
+        .subghz          = a->subghz,
+        .tx_start_ns     = accurate_tx_start,
+        .tx_end_ns       = accurate_tx_end,
+        .air_dur_ns      = frame_air_dur,
+        .sender_byte_ns  = sender_byte_ns,
+        .capture         = bus->tx_cap[sender_idx].bytes,
+        .capture_len     = bus->tx_cap[sender_idx].len,
+    };
+    /* Entry observability (RTRACE, TX timeline, PCAP, analyzer prints,
+     * the [RF] receiver-list trace, stat_rf_frames). */
+    if (h->frame_observed)
+        h->frame_observed(h->user, &fi);
+
+    bus->in_delivery = true;  /* explicit timeline events emitted above */
+
+    /* The sender is skipped by the snapshot loop, but nested auto-ACK
+     * delivery buffers into rf_pending[sender]; clear it so ACK bytes
+     * can't append onto stale contents. */
+    bus->rf_pending[sender_idx].count = 0;
+
+    /* Snapshot each BATCH receiver's staged frame before delivery, so
+     * re-entrant auto-ACK bytes (written to other receivers' rf_pending
+     * during synchronous delivery) can't corrupt later receivers. */
+    static uint8_t frame_snap[SIM_RADIO_BUS_MAX_NODES][EMU_RX_FRAME_MAX];
+    static int     frame_snap_len[SIM_RADIO_BUS_MAX_NODES];
+    static int8_t  frame_snap_rssi[SIM_RADIO_BUS_MAX_NODES];
+    static int     snap_indices[SIM_RADIO_BUS_MAX_NODES];
+    int snap_count = 0;
+
+    for (int i = 0; i < bus->node_count; i++) {
+        rf_buffer_t *buf = &bus->rf_pending[i];
+        /* Only BATCH receivers stage bytes in rf_pending; SYNC/PER_BYTE
+         * leave count==0 (M25 de-typing). */
+        if (i == sender_idx ||
+            bus->delivery[i] != SIM_RADIO_DELIVERY_BATCH ||
+            buf->count == 0)
+            continue;
+        if (buf->count != total_air_bytes) {
+            if (h->on_rx_frame)
+                h->on_rx_frame(h->user, &fi, i, SIM_RADIO_RX_STALE_BUFFER,
+                               NULL, buf->count, 0, 0);
+            buf->count = 0;
+            continue;
+        }
+        int copy_len = buf->count < EMU_RX_FRAME_MAX ? buf->count : EMU_RX_FRAME_MAX;
+        memcpy(frame_snap[i], buf->bytes, (size_t)copy_len);
+        frame_snap_len[i] = copy_len;
+        frame_snap_rssi[i] = radio_medium_get_rssi(&sim->radio_medium,
+                                                    sender_idx, i);
+        snap_indices[snap_count++] = i;
+        buf->count = 0;  /* clear before delivery to isolate re-entrancy */
+    }
+
+    for (int s = 0; s < snap_count; s++) {
+        int i = snap_indices[s];
+        /* Collision window: the frame occupies the channel [coll_start,
+         * coll_end).  Sub-GHz anchors to now (first_byte_ns unarmed). */
+        int64_t coll_start = accurate_tx_start;
+        int64_t coll_end = accurate_tx_end;
+        if (a->subghz) {
+            coll_start = now;
+            coll_end = now + frame_air_dur;
+        }
+
+        if (coll_start < bus->emu_rx_end_ns[i]) {
+            bus->stats.rx_collided++;
+            if (h->on_rx_frame)
+                h->on_rx_frame(h->user, &fi, i, SIM_RADIO_RX_COLLIDED,
+                               frame_snap[i], frame_snap_len[i],
+                               coll_start, bus->emu_rx_end_ns[i]);
+            continue;
+        }
+
+        int fifo_needed = frame_fifo_bytes(frame_snap[i], frame_snap_len[i],
+                                           a->subghz);
+        sim_mote_t *mi = sim_runtime_mote(sim, i);
+        if (bus->ops[i]->rxfifo_available(bus->mote[i]) < fifo_needed) {
+            /* RXFIFO full — mini-step the receiver to read the previous
+             * frame; keep it short to avoid cascade TX. */
+            mi->ops->step_until(mi, mi->ops->cycles(mi) + 5000);
+        }
+        if (bus->ops[i]->rxfifo_available(bus->mote[i]) >= fifo_needed) {
+            /* Sub-GHz delivery anchors to now (first_byte_ns unarmed). */
+            int64_t delivery_start = a->subghz ? now : accurate_tx_start;
+            /* MSP430-only full-slice pre-sync before delivery. */
+            if (mi->ops->rx_pre_sync && i != bus->executing_node)
+                mi->ops->rx_pre_sync(mi, delivery_start);
+            sim_radio_bus_deliver_bytes(bus, sim, i, frame_snap[i],
+                                        frame_snap_len[i], frame_snap_rssi[i],
+                                        delivery_start, a->subghz);
+            bus->stats.rx_direct++;
+            bus->emu_rx_end_ns[i] = coll_end;
+            if (h->on_rx_frame)
+                h->on_rx_frame(h->user, &fi, i, SIM_RADIO_RX_DIRECT,
+                               frame_snap[i], frame_snap_len[i], 0, 0);
+        } else {
+            sim_radio_bus_queue_frame(bus, i, frame_snap[i], frame_snap_len[i],
+                                      frame_snap_rssi[i], accurate_tx_start,
+                                      coll_end, a->subghz);
+            bus->emu_rx_end_ns[i] = coll_end;
+            if (h->on_rx_frame)
+                h->on_rx_frame(h->user, &fi, i, SIM_RADIO_RX_QUEUED,
+                               frame_snap[i], frame_snap_len[i], 0, 0);
+        }
+
+        /* Flush auto-ACK bytes generated by this delivery.  ACK starts
+         * after the data frame ends + 192 µs turnaround (12 symbols).
+         * The data sender's own ACK uses now + 192 µs instead: TX is
+         * instantaneous here, so its firmware ACK-wait timer starts at
+         * now, and accurate_tx_end + 192 µs would land past the
+         * RTIMER_BUSYWAIT_UNTIL timeout → perpetual CSMA retransmits. */
+        int64_t ack_start = accurate_tx_end + 192000LL;
+        int64_t sender_ack_start = now + 192000LL;
+        int ack_tx_emitted = 0;
+        for (int j = 0; j < bus->node_count; j++) {
+            /* SYNC ⇔ native: natives never stage ACK bytes (M25). */
+            if (bus->rf_pending[j].count > 0 &&
+                bus->delivery[j] != SIM_RADIO_DELIVERY_SYNC) {
+                if (!ack_tx_emitted) {
+                    if (h->on_ack)
+                        h->on_ack(h->user, &fi, i, ack_start,
+                                  bus->rf_pending[j].count);
+                    ack_tx_emitted = 1;
+                }
+                int ack_payload = (bus->rf_pending[j].count > 5)
+                                      ? bus->rf_pending[j].bytes[5] : 0;
+                /* The data sender's ACK goes via the rx_queue (its radio
+                 * is still TX/DISABLED at synchronous delivery time; the
+                 * end-of-tick drain delivers it after the driver flips
+                 * back to RX) at sender_ack_start. */
+                if (j == sender_idx)
+                    sim_radio_bus_queue_frame(bus, j, bus->rf_pending[j].bytes,
+                                              bus->rf_pending[j].count, -50,
+                                              sender_ack_start, coll_end,
+                                              a->subghz);
+                else if (bus->ops[j]->rxfifo_available(bus->mote[j]) >= ack_payload + 1)
+                    sim_radio_bus_deliver_bytes(bus, sim, j,
+                                                bus->rf_pending[j].bytes,
+                                                bus->rf_pending[j].count, -50,
+                                                ack_start, a->subghz);
+                else
+                    sim_radio_bus_queue_frame(bus, j, bus->rf_pending[j].bytes,
+                                              bus->rf_pending[j].count, -50,
+                                              ack_start, coll_end, a->subghz);
+                bus->rf_pending[j].count = 0;
+            }
+        }
+    }
+
+    /* Interference: mark queued frames on the sender's interference-range
+     * neighbours as collided if they overlap this transmission. */
+    if (sim->radio_medium.type != RADIO_MEDIUM_NONE) {
+        neighbor_list_t *inl = &sim->radio_medium.interference_neighbors[sender_idx];
+        int64_t int_start = now;
+        int64_t int_end = now + SIM_RADIO_INTERFERENCE_WINDOW_NS;
+        for (int n = 0; n < inl->count; n++) {
+            int i = inl->neighbors[n];
+            if (bus->delivery[i] == SIM_RADIO_DELIVERY_SYNC) continue;
+            emu_rx_queue_t *q = &bus->emu_rx_queue[i];
+            for (int f = 0; f < q->count; f++) {
+                int fi2 = (q->head + f) % EMU_RX_QUEUE_SIZE;
+                emu_rx_frame_t *existing = &q->frames[fi2];
+                if (int_start < existing->end_ns && existing->arrival_ns < int_end) {
+                    if (!existing->collided) bus->stats.rx_collided++;
+                    existing->collided = true;
+                }
+            }
+        }
+    }
+
+    bus->in_delivery = false;
+
+    /* Schedule the sender's wakeup so its radio completes the TX→RX
+     * turnaround (enhanced-ACK reception depends on it). */
+    if ((bus->caps[sender_idx] & SIM_RADIO_CAP_WAKE_SENDER_POST_TX) &&
+        !bus->defer_wakeups)
+        sim_radio_bus_wake_mote(bus, sim, sender_idx);
 }

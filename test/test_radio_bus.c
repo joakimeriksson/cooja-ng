@@ -149,6 +149,60 @@ static int feed_seq(tx_frame_asm_t *a, const uint8_t *seq, int n) {
     return completes;
 }
 
+/* Mock emulated mote: provides the sim_mote_ops the bus's delivery path
+ * drives (rx_byte_sync / step_until / cycles / freq_hz). */
+typedef struct {
+    sim_mote_t mote;
+    int      sync_count;
+    int64_t  sync_times[256];
+    int      step_count;
+    int64_t  cyc;
+    uint32_t freq;
+} mock_mote_t;
+
+static void mm_rx_byte_sync(sim_mote_t *m, int64_t t) {
+    mock_mote_t *mm = (mock_mote_t *)m->impl;
+    if (mm->sync_count < 256) mm->sync_times[mm->sync_count] = t;
+    mm->sync_count++;
+}
+static void mm_step_until(sim_mote_t *m, int64_t target) {
+    mock_mote_t *mm = (mock_mote_t *)m->impl;
+    mm->step_count++;
+    mm->cyc = target;
+}
+static int64_t  mm_cycles(const sim_mote_t *m) { return ((mock_mote_t *)m->impl)->cyc; }
+static uint32_t mm_freq(const sim_mote_t *m)   { return ((mock_mote_t *)m->impl)->freq; }
+
+static const sim_mote_ops_t mm_ops = {
+    .rx_byte_sync = mm_rx_byte_sync,
+    .step_until   = mm_step_until,
+    .cycles       = mm_cycles,
+    .freq_hz      = mm_freq,
+};
+
+/* Register node idx as an emulated receiver: a mock_rx for the radio
+ * endpoint + a mock_mote for the sim_mote ops, with the given caps. */
+static void register_emulated(fixture_t *f, mock_mote_t *mm, int idx,
+                              uint32_t caps) {
+    memset(mm, 0, sizeof(*mm));
+    mm->freq = 1000000;          /* 1 MHz → 1 ms = 1000 cycles */
+    mm->mote.impl = mm;
+    mm->mote.ops = &mm_ops;
+    sim_runtime_register_mote(&f->sim, idx, &mm->mote);
+    sim_radio_bus_register(&f->bus, idx, &mock_ops, &f->rx[idx],
+                           SIM_RADIO_DELIVERY_PER_BYTE, caps);
+}
+
+/* A short 802.15.4 frame body (preamble..payload). */
+static int short_frame(uint8_t *buf, int payload) {
+    int n = 0;
+    buf[n++] = 0; buf[n++] = 0; buf[n++] = 0; buf[n++] = 0;
+    buf[n++] = 0x7A; buf[n++] = (uint8_t)payload;
+    for (int i = 0; i < payload; i++) buf[n++] = (uint8_t)(0x40 + i);
+    return n;
+}
+
+
 /* ============================================================
  * Frame assembler.
  * ============================================================ */
@@ -330,22 +384,30 @@ static void test_delivery_per_byte(void) {
 }
 
 static void test_delivery_batch(void) {
-    /* BATCH receiver: bytes accumulate in rf_pending, receive_byte never
-     * fires (the bus's frame_complete host hook delivers in production;
-     * here there is none, so we just verify staging). */
+    /* BATCH receiver: bytes accumulate in rf_pending during dispatch,
+     * then frame_complete (M27) snapshots and delivers the whole frame
+     * to the chip — rf_pending ends empty. */
     fixture_t f;
     fx_init(&f, 2);
+    mock_mote_t mm;
     sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    /* node 1 = BATCH receiver with a registered sim_mote (the snapshot
+     * delivery drives its rx_byte_sync/step ops). */
+    memset(&mm, 0, sizeof(mm));
+    mm.freq = 1000000; mm.mote.impl = &mm; mm.mote.ops = &mm_ops;
+    sim_runtime_register_mote(&f.sim, 1, &mm.mote);
     sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_BATCH, 0);
+    f.bus.executing_node = -1;
 
     uint8_t frame[64];
-    int n = build_802154(frame, 6);
+    int n = build_802154(frame, 6);   /* expected_len 6 → total_air_bytes == n */
     for (int i = 0; i < n; i++)
         sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[i]);
 
-    ASSERT_EQ(f.rx[1].recv_count, 0, "BATCH: receive_byte not called");
-    ASSERT_EQ(f.bus.rf_pending[1].count, n, "BATCH: bytes staged in rf_pending");
-    ASSERT(sim_eq_empty(&f.sim.event_queue), "BATCH schedules no RX_BYTE events");
+    ASSERT_EQ(f.bus.rf_pending[1].count, 0,
+              "BATCH: staged frame consumed at frame-complete");
+    ASSERT_EQ(f.rx[1].recv_count, n, "BATCH: whole frame delivered to the chip");
+    ASSERT_EQ(f.bus.stats.rx_direct, 1, "BATCH: counted as a direct delivery");
 }
 
 static void test_capture_and_first_byte(void) {
@@ -371,10 +433,11 @@ static void test_capture_and_first_byte(void) {
  * ============================================================ */
 
 static int reentry_frames_completed;
-static void reentry_frame_complete(void *user, int sender, int sender_radio,
-                                   int64_t byte_time_ns, int64_t sender_byte_ns) {
-    (void)user; (void)sender; (void)sender_radio;
-    (void)byte_time_ns; (void)sender_byte_ns;
+/* M27: the frame_complete host hook became the bus-internal
+ * sim_radio_bus_frame_complete; the re-entrancy test now counts frames
+ * via the frame_observed notification (fired once per completed frame). */
+static void reentry_frame_observed(void *user, const sim_radio_frame_info_t *fi) {
+    (void)user; (void)fi;
     reentry_frames_completed++;
 }
 
@@ -388,16 +451,16 @@ static void test_reentrant_depth(void) {
     fx_init(&f, 3);
     reentry_frames_completed = 0;
     sim_radio_bus_host_t host = { 0 };
-    host.frame_complete = reentry_frame_complete;
+    host.frame_observed = reentry_frame_observed;
     sim_radio_bus_set_host(&f.bus, &host);
 
-    /* node 0 = the emulated sender (PER_BYTE), node 1 = SYNC receiver
-     * that ACKs, node 2 = a BATCH bystander that should also see the ACK
-     * byte staged. */
+    /* node 0 = the sender (PER_BYTE), node 1 = a SYNC receiver that emits
+     * an ACK byte the moment it is fed the SFD, node 2 = a PER_BYTE
+     * bystander that should also receive the re-entrant ACK byte. */
     sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
     sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1], SIM_RADIO_DELIVERY_SYNC, 0);
-    sim_radio_bus_register(&f.bus, 2, &mock_ops, &f.rx[2], SIM_RADIO_DELIVERY_BATCH, 0);
-    /* When rx[1] is fed the SFD (0x7A), it re-enters as sender 1. */
+    sim_radio_bus_register(&f.bus, 2, &mock_ops, &f.rx[2], SIM_RADIO_DELIVERY_PER_BYTE, 0);
+    f.bus.executing_node = -1;
     f.rx[1].reenter_on = 0x7A;
     f.rx[1].reenter_sender = 1;
 
@@ -406,13 +469,18 @@ static void test_reentrant_depth(void) {
     for (int i = 0; i < n; i++)
         sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[i]);
 
+    /* The outer frame completes exactly once: the re-entrant ACK byte
+     * (0xAC) is dispatched to receivers but never fed to a sender's
+     * assembler in a way that closes a second frame. */
     ASSERT_EQ(reentry_frames_completed, 1,
               "outer frame completes exactly once despite re-entrant ACK byte");
-    /* The 0xAC ACK byte re-entered as sender 1 and was staged for the
-     * BATCH bystander (node 2) — proves re-entrant bytes still dispatch. */
+
+    /* The re-entrant 0xAC was dispatched as sender 1 → scheduled to the
+     * PER_BYTE bystander; pump and confirm it arrived. */
+    fx_pump(&f, 100 * 1000000LL);
     bool saw_ack = false;
-    for (int i = 0; i < f.bus.rf_pending[2].count; i++)
-        if (f.bus.rf_pending[2].bytes[i] == 0xAC) saw_ack = true;
+    for (int i = 0; i < f.rx[2].recv_count; i++)
+        if (f.rx[2].recv_byte[i] == 0xAC) saw_ack = true;
     ASSERT(saw_ack, "re-entrant ACK byte dispatched to other receivers");
 }
 
@@ -477,59 +545,6 @@ static void test_reset_node(void) {
 /* ============================================================
  * Emulated-RX delivery / queue / drain (M26).
  * ============================================================ */
-
-/* Mock emulated mote: provides the sim_mote_ops the bus's delivery path
- * drives (rx_byte_sync / step_until / cycles / freq_hz). */
-typedef struct {
-    sim_mote_t mote;
-    int      sync_count;
-    int64_t  sync_times[256];
-    int      step_count;
-    int64_t  cyc;
-    uint32_t freq;
-} mock_mote_t;
-
-static void mm_rx_byte_sync(sim_mote_t *m, int64_t t) {
-    mock_mote_t *mm = (mock_mote_t *)m->impl;
-    if (mm->sync_count < 256) mm->sync_times[mm->sync_count] = t;
-    mm->sync_count++;
-}
-static void mm_step_until(sim_mote_t *m, int64_t target) {
-    mock_mote_t *mm = (mock_mote_t *)m->impl;
-    mm->step_count++;
-    mm->cyc = target;
-}
-static int64_t  mm_cycles(const sim_mote_t *m) { return ((mock_mote_t *)m->impl)->cyc; }
-static uint32_t mm_freq(const sim_mote_t *m)   { return ((mock_mote_t *)m->impl)->freq; }
-
-static const sim_mote_ops_t mm_ops = {
-    .rx_byte_sync = mm_rx_byte_sync,
-    .step_until   = mm_step_until,
-    .cycles       = mm_cycles,
-    .freq_hz      = mm_freq,
-};
-
-/* Register node idx as an emulated receiver: a mock_rx for the radio
- * endpoint + a mock_mote for the sim_mote ops, with the given caps. */
-static void register_emulated(fixture_t *f, mock_mote_t *mm, int idx,
-                              uint32_t caps) {
-    memset(mm, 0, sizeof(*mm));
-    mm->freq = 1000000;          /* 1 MHz → 1 ms = 1000 cycles */
-    mm->mote.impl = mm;
-    mm->mote.ops = &mm_ops;
-    sim_runtime_register_mote(&f->sim, idx, &mm->mote);
-    sim_radio_bus_register(&f->bus, idx, &mock_ops, &f->rx[idx],
-                           SIM_RADIO_DELIVERY_PER_BYTE, caps);
-}
-
-/* A short 802.15.4 frame body (preamble..payload). */
-static int short_frame(uint8_t *buf, int payload) {
-    int n = 0;
-    buf[n++] = 0; buf[n++] = 0; buf[n++] = 0; buf[n++] = 0;
-    buf[n++] = 0x7A; buf[n++] = (uint8_t)payload;
-    for (int i = 0; i < payload; i++) buf[n++] = (uint8_t)(0x40 + i);
-    return n;
-}
 
 static void test_deliver_direct(void) {
     /* Synchronous delivery: each byte is pre-synced to its air time and

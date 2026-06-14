@@ -158,6 +158,29 @@ typedef enum sim_radio_delivery_mode {
  * (which mini-steps receivers — forbidden inside the bus per §3.9).
  * Optional hooks may be NULL; node_active and frame_complete are
  * required for a functional bus. */
+/* Per-frame context shared by the M27 observability hooks. */
+typedef struct sim_radio_frame_info {
+    int      sender_idx;
+    int      sender_radio;
+    int      expected_len;     /* tx_asm.expected_len (PHY length value)  */
+    int      total_air_bytes;  /* preamble..payload(+CRC) byte budget     */
+    bool     subghz;
+    int64_t  tx_start_ns;      /* accurate frame air-time start           */
+    int64_t  tx_end_ns;        /* accurate frame air-time end             */
+    int64_t  air_dur_ns;       /* tx_end - tx_start                       */
+    int64_t  sender_byte_ns;   /* per-byte air period for this frame      */
+    const uint8_t *capture;    /* sender-side captured on-air bytes       */
+    int      capture_len;
+} sim_radio_frame_info_t;
+
+/* on_rx_frame outcome codes (the bus's per-receiver delivery decision). */
+typedef enum sim_radio_rx_outcome {
+    SIM_RADIO_RX_STALE_BUFFER = 0, /* staged byte count != frame size; dropped */
+    SIM_RADIO_RX_COLLIDED,         /* overlapped a prior frame; dropped        */
+    SIM_RADIO_RX_DIRECT,           /* delivered synchronously                  */
+    SIM_RADIO_RX_QUEUED,           /* deferred to the emu RX queue             */
+} sim_radio_rx_outcome_t;
+
 typedef struct sim_radio_bus_host {
     void *user;
     /* False while a node hasn't reached its startup-delay time (no RF). */
@@ -173,13 +196,20 @@ typedef struct sim_radio_bus_host {
      * for a non-SYNC receiver (debug stats/traces). */
     void (*on_byte_accepted)(void *user, int sender, int receiver,
                              uint8_t byte, int depth);
-    /* The sender's frame assembler completed a frame: deliver staged
-     * rf_pending[] frames, run collision/FIFO policy, flush auto-ACKs.
-     * Runs with the bus's tx_depth already raised, so chip TX callbacks
-     * fired from inside (auto-ACKs) re-enter sim_radio_bus_tx_byte as
-     * depth > 0 and are staged, not re-dispatched as frames. */
-    void (*frame_complete)(void *user, int sender, int sender_radio,
-                           int64_t byte_time_ns, int64_t sender_byte_ns);
+    /* M27 frame-completion observability (the delivery policy moved into
+     * sim_radio_bus_frame_complete; these notify the runner so the
+     * TX/RX timeline, PCAP, packet-analyzer prints, and traces stay
+     * runner-side until Phase 6).  Defined below the host struct.
+     * frame_observed: once per completed frame, before delivery.
+     * on_rx_frame:    once per emulated receiver, with the bus's outcome.
+     * on_ack:         the data delivery to a receiver triggered an ACK. */
+    void (*frame_observed)(void *user, const struct sim_radio_frame_info *fi);
+    void (*on_rx_frame)(void *user, const struct sim_radio_frame_info *fi,
+                        int receiver, int outcome,
+                        const uint8_t *data, int len,
+                        int64_t coll_start_ns, int64_t prev_rx_end_ns);
+    void (*on_ack)(void *user, const struct sim_radio_frame_info *fi,
+                   int data_receiver, int64_t ack_start_ns, int ack_byte_count);
     /* M26: the bus delivered/queued a frame's worth of on-air bytes to
      * emulated receiver `idx` occupying the air window [start_ns,
      * end_ns].  The runner emits the RX timeline + radio state from
@@ -225,6 +255,14 @@ typedef struct sim_radio_bus {
      * the delivery path must not schedule mote wakeups. */
     bool               defer_wakeups;
     sim_radio_bus_stats_t stats;
+    /* M27: per-sender medium-busy deadline (ex node_tx_busy_until_ns) —
+     * a frame occupies the sender's channel until this sim time; CCA
+     * queries (cc1200) read it. */
+    int64_t            tx_busy_until_ns[SIM_RADIO_BUS_MAX_NODES];
+    /* M27: true while frame_complete is delivering synchronously, so the
+     * runner suppresses async chip state callbacks (ex
+     * suppress_state_callback). */
+    bool               in_delivery;
 } sim_radio_bus_t;
 
 /* Register node idx's radio endpoint + delivery mode + capability
@@ -317,6 +355,13 @@ void sim_radio_bus_deliver_bytes(sim_radio_bus_t *bus, struct sim_runtime *sim,
 void sim_radio_bus_drain_rx(sim_radio_bus_t *bus, struct sim_runtime *sim,
                             int idx);
 
+/* M27: schedule node idx's next wakeup after RF activity — re-run at the
+ * current sim time if it has queued RX frames, else at its next CPU
+ * event (mote sched_hint_ns op).  Ex the runner's schedule_emulated_wakeup;
+ * emulated motes only. */
+void sim_radio_bus_wake_mote(sim_radio_bus_t *bus, struct sim_runtime *sim,
+                             int idx);
+
 /* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
  * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. Using the
  * 2.4 GHz value for CC1200 frames (5× too fast) made hidden-terminal
@@ -339,6 +384,11 @@ void sim_radio_bus_drain_rx(sim_radio_bus_t *bus, struct sim_runtime *sim,
 static inline int64_t byte_period_ns(bool subghz) {
     return subghz ? CC1200_50KBPS_BYTE_NS : IEEE802154_BYTE_NS;
 }
+
+/* Window (sim ns) over which a completing frame can collide with queued
+ * frames on interference-range neighbours (M27 — the runner's 1 ms
+ * TIME_STEP_NS, kept as the interference overlap span). */
+#define SIM_RADIO_INTERFERENCE_WINDOW_NS 1000000LL
 
 /* FIFO bytes a receiving chip needs free to accept a buffered on-air
  * frame; sentinel > any FIFO size when the buffer is too short to read
