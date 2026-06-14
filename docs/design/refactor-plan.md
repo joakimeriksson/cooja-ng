@@ -1181,7 +1181,7 @@ pointers in the delivery loops before merging.
 
 ### 3.19 Service-extraction milestones (canonical Phase 6 task list)
 
-> **Status: in progress (M31–M34 landed).** Phase 6 (§9) extracts the
+> **Status: in progress (M31–M35 landed).** Phase 6 (§9) extracts the
 > runner's embedded optional/observation features into
 > `src/services/*_service.c` behind a `sim_service_ops_t` vtable host, then
 > — once the GDB stub is a service — finally moves the MSP430/ARM
@@ -1199,9 +1199,13 @@ pointers in the delivery loops before merging.
 > the analyzer is NOT a service — stateless decoder, chip-coupled verbose,
 > moves with the UI emit at M39); M34 `7fb1c04` (progress-report service —
 > cadence + per-node summary via a describe callback, explicit
-> position-pinned tick).  All four are byte-identical (cross-build empty-diff
-> on sky/cc2538/firefly-subghz 2-node + 5 chains + JS broadcast; M33 adds a
-> pcap byte-diff).  **Next: M35 (JSON-test service).**
+> position-pinned tick); M35 `3f448a2` (JSON-test service — step/validator/
+> fail_on checker on_event + per-step timeout + "--- Test Results ---"
+> report; the timed-action executor stays runner-side as shared node
+> scripting).  All byte-identical (cross-build empty-diff on
+> sky/cc2538/firefly-subghz 2-node + 5 chains + JS broadcast + step-based
+> configs; M33 adds a pcap byte-diff).  **Next: M36 (JS-test service,
+> re-entrancy).**
 
 Design decisions locked for this phase:
 
