@@ -1000,13 +1000,15 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 > policy unit tests — collision/backpressure/ACK-window with a scripted
 > auto-ACK mock; radio-bus suite → 121).  M28 split in two: part 1
 > `b74f0e8` (channel consolidation — sim_radio_bus_push_channel +
-> current_channel pull op; sync_channel host hook deleted; cross-build
-> IDENTICAL incl. firefly dual-radio + native).  **Remaining: M28
-> part 2** (native/JS frame path — mixed_rf_frame_handler →
+> current_channel pull op; sync_channel host hook deleted) + part 2
+> `b0d168f` (native/JS frame path — mixed_rf_frame_handler →
 > sim_radio_bus_tx_frame; native direct-buffer fast path into the
 > receive_frame op; mark_collisions op; native stats → bus->stats;
-> note the NONE-medium native behaviour trap), then M29 (retire
-> --threads), M30 (docs).  Numbering continues from Phase 4 (M24–M30).
+> Cooja 81/81 is the native gate).  Two documented unified-path
+> changes: NONE-medium native delivery now uses the direct-if-empty
+> fast path; full-queue native frame_queue_full now counted on UDGM
+> too (stat-only).  **Next: M29 (retire --threads)**, then M30 (docs).
+> Numbering continues from Phase 4 (M24–M30).
 > Goal (from §9 Phase 5): the remaining RF delivery *policy* moves out
 > of `test/test_mixed_multinode.c` into `src/sim/sim_radio_bus.c`.
 > The M9.4/M9.5 slices already moved the TX byte path (byte clock,
