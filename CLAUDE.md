@@ -71,7 +71,7 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | File | Purpose |
 |------|---------|
 | `sim_runtime.c` | `sim_runtime_t` container: now_ns, unified event queue, radio medium, mote slots + generations, observer fan-out, `sim_runtime_run_until()` event pump |
-| `sim_radio_bus.c` | RF TX path: per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer |
+| `sim_radio_bus.c` | Full RF delivery path (Phase 5): per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer, emulated RX core (deliver/queue/drain), frame-complete policy (air-time + collision windows, RXFIFO backpressure, dual 192 µs auto-ACK windows), native/JS frame path, channel push/pull, channel-busy query, bus-owned RX/frame stats |
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
 | `sim_external_command.c` | External command service (border-router etc. helper processes) |
@@ -89,10 +89,12 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 
 The mote vtable (`include/sim/sim_mote.h`, `sim_mote_ops_t`) abstracts the four
 node kinds (MSP430/ARM/native/JS). Native/JS adapter tables live in their
-modules; the MSP430/ARM execute/serial adapters stay in the runner until their
-dependencies move (radio bus → Phase 5, GDB service → Phase 6). See
-`docs/design/refactor-plan.md` §3.15–§3.17 for the completed Phase 1–4
-milestones.
+modules; the MSP430/ARM execute/serial adapters stay in the runner until the
+GDB service moves in Phase 6 (the radio-bus dependency cleared in Phase 5). See
+`docs/design/refactor-plan.md` §3.15–§3.18 for the completed Phase 1–5
+milestones (Phase 5 extracted the RF-delivery policy into `sim_radio_bus.c`
+and retired the `--threads` batch scheduler — the sequential event pump is now
+the sole scheduler).
 
 ### MSP430 Source Files (src/msp430/)
 

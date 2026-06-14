@@ -991,7 +991,7 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 
 ### 3.18 Radio-bus extraction milestones (canonical Phase 5 task list)
 
-> **Status: in progress.** M24 `355e95e` (guardrails: radio-bus unit
+> **Status: complete (M24–M30).** M24 `355e95e` (guardrails: radio-bus unit
 > suite, 83 assertions + tools/check-determinism.sh + perf baseline —
 > sky 2-node 60 s ≈ 134 ms, firefly-subghz-fixed ≈ 8.4 s); M25
 > `074430e` (de-typing: rx_byte_sync/rx_pre_sync ops + SIM_RADIO_CAP_*
@@ -1016,7 +1016,7 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 > Cooja 81/81 is the native gate).  Two documented unified-path
 > changes: NONE-medium native delivery now uses the direct-if-empty
 > fast path; full-queue native frame_queue_full now counted on UDGM
-> too (stat-only).  M29 `<pending>` (retire `--threads`: deleted the
+> too (stat-only).  M29 `c7cbbfa` (retire `--threads`: deleted the
 > threaded callbacks/distribute/flush path, the fixed-1 ms loop arm,
 > `--threads` parsing + all `num_threads` guards, the `advance_to_time`
 > op + its 4 impls, `rf_outgoing`/`defer_wakeups` from the bus,
@@ -1025,7 +1025,12 @@ JS-ADD paths + a mixed-platform config (all four kinds in one sim).
 > guard collapse is behavior-preserving since `num_threads == 0` was the
 > default path, proven by IDENTICAL cross-build diffs on
 > sky/cc2538/firefly-subghz 2-node + 5 chain configs + JS broadcast,
-> Cooja 81/81).  **Next: M30 (docs close-out).**
+> Cooja 81/81).  M30 (this commit — docs close-out: §6.3 RF-timer audit
+> note, §10 determinism wording switched to the stdout-diff script with
+> the phantom `--timeline-out` dropped, Decisions Log finalized,
+> CLAUDE.md).  **Phase 5 complete; the RF-delivery policy now lives in
+> `src/sim/sim_radio_bus.c`.  The MSP430/ARM execute/serial adapters
+> stay runner-side until Phase 6 (GDB service).**
 > Numbering continues from Phase 4 (M24–M30).
 > Goal (from §9 Phase 5): the remaining RF delivery *policy* moves out
 > of `test/test_mixed_multinode.c` into `src/sim/sim_radio_bus.c`.
@@ -1461,6 +1466,15 @@ Preserve these during every extraction:
   §3.6: many byte events fire at the same `cpu->cycles`, the watchdog's
   fire_cycle never moves with the byte stream, and it trips mid-frame.
   The radio bus owns RF-derived scheduling for exactly this reason.
+
+> **Phase 5 RF-timer audit (M30).** With the frame-delivery policy now in
+> `sim_radio_bus.c`, the RF-derived timers were re-audited against the
+> invariant above and are all sim-time anchored: the bus's RX-stall
+> watchdog and the dual 192 µs auto-ACK windows schedule on `now_ns`
+> (`accurate_tx_end + 192000` receivers, `now + 192000` sender); the
+> cc2538 and nrf52840 RX→TX ACK turnarounds were confirmed ns-based; the
+> nrf54l15 GRTC RX-stall fix landed in M9.5. No RF timer remains on a
+> chip cpu-event queue.
 
 ## 7. Service & Plugin Model
 
@@ -2077,18 +2091,18 @@ make
 # radio-bus extraction) must call that out explicitly in the PR description.
 make cooja-tests
 
-# Determinism reproducibility — run the same config twice with the same seed,
-# compare timelines.  Any per-phase divergence is a bug, not a "minor refactor
-# side effect".
-./build/test_runner mixed-multinode configs/test-4node-chain.json -t 10000 -q \
-    --timeline-out /tmp/run-a.json
-./build/test_runner mixed-multinode configs/test-4node-chain.json -t 10000 -q \
-    --timeline-out /tmp/run-b.json
-diff /tmp/run-a.json /tmp/run-b.json     # must be empty
+# Determinism reproducibility — run the same config twice with the same seed
+# and diff stdout+stderr (minus host-timing noise lines).  Any per-phase
+# divergence is a bug, not a "minor refactor side effect".
+tools/check-determinism.sh mixed-multinode configs/test-4node-chain.json -t 10000 -q
 ```
 
-(If `--timeline-out` doesn't exist yet, Phase 0 adds it. Determinism check is
-worthless without it.)
+(`tools/check-determinism.sh` (added in M24) runs the given config twice and
+diffs the captured output with wall-clock/throughput lines filtered out.
+Stdout is strictly richer than the once-planned `--timeline-out` JSON — every
+delivered byte, RX outcome, and ACK is printed — so that flag was never built;
+the script supersedes it.  The same stdout-diff harness, run across two
+*builds* instead of two runs, is the M25–M28 cross-build empty-diff gate.)
 
 ### Performance regression check
 
