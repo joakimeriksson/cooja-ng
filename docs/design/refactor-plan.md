@@ -1179,6 +1179,95 @@ empty-diff.  Perf checkpoints at M24 (baseline), M26 (≤3%), M27
 (≤8%), M28 (≤10% phase total) per §3.14.1; if exceeded, cache ops
 pointers in the delivery loops before merging.
 
+### 3.19 Service-extraction milestones (canonical Phase 6 task list)
+
+> **Status: in progress.** Phase 6 (§9) extracts the runner's embedded
+> optional/observation features into `src/services/*_service.c` behind a
+> `sim_service_ops_t` vtable host, then — once the GDB stub is a service —
+> finally moves the MSP430/ARM execute/serial adapter tables out of the
+> runner (the §3.17/§3.18 deferred debt).  Numbering continues from
+> Phase 5 (M31–M40).  Two services are already extracted as the template
+> (`sim_serial_bridge.c`, `sim_external_command.c`); the observer stream
+> (`sim_observer.h`) and the bus host hooks (`sim_radio_bus_host_t`)
+> already exist.
+
+Design decisions locked for this phase:
+
+- **The service host is a thin `sim_service_ops_t` vtable host built now**
+  (M31), not the ad-hoc per-service pattern and not the full Phase-8
+  registry.  `sim_service_ops_t {name, init, destroy, on_event, poll}`; a
+  `{ops,state,enabled}` array lives in `sim_runtime_t` next to
+  `observers[]`; the host subscribes **one** fan-out observer that walks
+  enabled services → `on_event` (services don't each consume an observer
+  slot) and a `sim_service_poll_all()` that walks them → `poll`.
+  Attach order = fan-out order (cheap/pure-observer first, control-coupled
+  last); **teardown is strict reverse**.  Error policy (per §Decisions
+  Log) enforced in the host: `init` non-zero → runner refuses to start; a
+  service reporting a runtime failure is marked `enabled=false` and
+  skipped (run continues); `destroy` runs for all attached services.
+  Phase 8 adds register-by-name (`"builtin:pcap"`) on top.
+- **PCAP and the packet analyzer stay on the bus host hooks**
+  (`frame_observed`/`on_rx_frame`), not the observer stream:
+  `sim_radio_frame_info_t` already carries `capture`/`capture_len` (raw
+  on-air bytes) + `tx_start_ns`, whereas `SIM_OBS_PACKET_FRAME` carries
+  only `is_tx` + `summary`.  Enriching the observer payload with raw
+  bytes is Phase 8+ debt; in Phase 6 these services register a
+  `sim_radio_bus_host_t` and still *emit* `SIM_OBS_PACKET_FRAME` for the
+  timeline to consume the summary.
+- **The GDB stub decouples via `cpu->gdb_stub`.**  The ARM cpu already
+  holds the back pointer; the inline poll in `arm_mote_execute` becomes a
+  `cpu->gdb_stub` check inside the ARM module, erasing the runner globals
+  `gdb_node[]`/`gdb_stubs[]` and unblocking the adapter move.  The GDB
+  service (M37) lands **before** the adapter move (M38).
+- **The MSP430/ARM execute/serial adapters move in M38** (re-affirms the
+  §3.17/§3.18 deferral — after the GDB service their only runner
+  dependency is gone); `sim_mote_kind_set_ops` injection is deleted,
+  finishing the M23 TODO.
+- **End-of-run stats (M40) may stay type-specific** (reads chip internals
+  + firmware symbols); per the M16/M23 precedent it can keep a
+  runner-provided accessor or defer to Phase 10 rather than go
+  observer-clean.  If un-clean, Phase 6 closes at M39.
+
+Milestones (one commit each, full validation gate before each):
+
+31. Service host scaffolding: `sim_service.{h,c}` (the vtable + host),
+    service array + `sim_service_attach/poll_all/dispatch_event/keepalive`
+    in `sim_runtime`; wrap `serial_bridge` + `external_command` as the
+    first two host clients (validates the host against working code).
+32. Timeline service (`src/services/timeline_service.c`): move
+    `timeline_observer_cb` + `emit_*_obs` helpers + `tl_flush`/CBOR;
+    the timeline owns `node_states[]`, the UI reads via an accessor.
+33. Packet-analyzer + PCAP services: split `bus_host_frame_observed`/
+    `bus_host_on_rx_frame` onto two `sim_radio_bus_host_t` clients; the
+    `--pcap` CLI + open/close become the pcap service.
+34. Progress-printing service: per-tick progress block into a `poll()`.
+35. JSON-test service (actions + validators): observer half → `on_event`,
+    timed actions drain in `poll()`, loop reads `finished` via a query.
+36. JS-test engine service (re-entrancy): `on_event` only enqueues into a
+    deferred-resume queue + may `sim_runtime_request_stop()`, never
+    re-enters dispatch; `poll()` drains/executes the actions.
+37. GDB service: stub storage + `--gdb` CLI + attach into the service
+    (sets `cpu->gdb_stub`); ARM module polls `cpu->gdb_stub`; service
+    `poll()` keepalive while any stub is attached.
+38. Move the MSP430/ARM execute/serial adapter tables into
+    `src/motes/{msp430,arm}_elf_mote.c`; delete `sim_mote_kind_set_ops`.
+39. WebSocket-UI service: sockets/serialization/console/pacing/message
+    handling into the service; the loop keeps 4 query funcs
+    (`paused`/`restart_requested`/`ui_cap_ns`/`pace`).
+40. End-of-run stats service (optional/last) or defer to Phase 10.
+
+Validation gate per milestone: §3.18's gate (make clean && make;
+correctness / arm-correctness / cc1200-mock-host / radio-medium /
+radio-bus; sky + firefly-subghz-fixed 2-node RPL-UDP 60 s; chains 6/7;
+js-hello + js-rpl-udp; Cooja 81/81; determinism run-twice) plus the
+Phase-6 additions where relevant (`timeline`, `test
+configs/test-js-hello.json`, `mixed-multinode configs/ui-demo-cc2538dk.json
+-t 5000`, a `--gdb` smoke).  M31–M35/M38/M40 are byte-identical →
+cross-build empty-diff (M33 adds a pcap byte-diff); M36 (deferred resume)
+gates on js output equality + determinism; M39 (wall-clock pacing) gates
+on the ui-demo smoke, not a diff.  Perf ≤5% additional wall for Phases
+6–10 combined (§3.14.1).
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -1892,6 +1981,11 @@ Stop condition:
 
 Goal: move optional features out of the scheduler.
 
+The canonical task list is **§3.19 above (milestones M31–M40)**; land them
+in order, one commit per milestone.  The notes below summarize the scope;
+where they disagree with §3.19 (written later, against the post-Phase-5
+code), §3.19 wins.
+
 Services to extract:
 
 - timeline
@@ -2232,8 +2326,18 @@ the same patch.
   `sim_mote_ops_t`; chip radio-endpoint behavior lives on
   `mote_radio_ops_t`.  Platform delivery quirks become registration caps,
   not type checks.
-- **MSP430/ARM execute/serial adapters move in Phase 6** with the GDB
-  service (after Phase 5, GDB is their only runner dependency).
+- **MSP430/ARM execute/serial adapters move in Phase 6 M38** with the GDB
+  service (after Phase 5, GDB is their only runner dependency; the GDB
+  service M37 clears it via `cpu->gdb_stub`).
+- **Phase 6 task list is §3.19 (M31–M40).**  Optional/observation features
+  extract into `src/services/*_service.c` behind a `sim_service_ops_t`
+  vtable host built in M31 (one fan-out observer + ordered poll + the
+  §Error-policy enforcement; the full register-by-name registry is
+  Phase 8).  PCAP/analyzer stay on the bus host hooks (raw bytes +
+  `tx_start_ns` live there, not on `SIM_OBS_PACKET_FRAME`); observer-payload
+  enrichment is Phase 8+ debt.  The JS-test service routes stop through
+  `sim_runtime_request_stop()` + a deferred-resume queue, never re-entering
+  dispatch.  End-of-run stats (M40) may stay type-specific.
 - **`--threads N` was "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
   (§3.13) — resolved to *retire* in M29 (see entry above). Two divergent
   schedulers persisting indefinitely was not an option.
