@@ -43,6 +43,7 @@
 #include "arm_gdb.h"
 #include "pcap_writer.h"
 #include "pcap_service.h"
+#include "progress_service.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -729,6 +730,17 @@ static int64_t node_instructions(int idx) {
 
 static const char *node_type_str(int idx) {
     return mote_store[idx].ops->kind;
+}
+
+/* M34: per-tick progress report is a service; this resolver hands it each
+ * node's display fields so it needs no access to nodes[] / mote ops. */
+static progress_service_t progress_svc;
+static void progress_describe_node(int i, int *node_id, const char **type,
+                                   int64_t *cycles, uint32_t *freq_hz) {
+    *node_id = nodes[i].id;
+    *type    = node_type_str(i);
+    *cycles  = node_cycles(i);
+    *freq_hz = node_freq(i);
 }
 
 /* --- RF TX/RX bridging --- */
@@ -2718,8 +2730,13 @@ sim_restart:
            (long long)sim_ns, (long long)(sim_ns / MS_TO_NS));
 
     int64_t end_ns = sim_ns + total_ns;
-    int64_t progress_interval = total_ns / 10;
-    int64_t next_progress = sim_ns + progress_interval;
+    /* M34: the per-tick progress report is a service now.  Cadence state +
+     * the print move into progress_service; the explicit tick stays at the
+     * original loop position so the line interleaves with mote UART output
+     * byte-for-byte as before. */
+    progress_service_start(&progress_svc, sim_ns, total_ns, end_ns,
+                           &node_count, progress_describe_node);
+    sim_service_attach(&sim_rt, &progress_service_ops, &progress_svc);
     int64_t ui_interval_ns = 100LL * MS_TO_NS;  /* 100ms sim time between UI updates */
     int64_t next_ui_ns = sim_ns + ui_interval_ns;
 
@@ -3180,18 +3197,8 @@ sim_restart:
             }
         }
 
-        if (sim_ns >= next_progress) {
-            int pct = (int)((sim_ns - (end_ns - total_ns)) * 100 / total_ns);
-            printf("  --- Progress: %d%% (%lld ms) rf_bytes=%d uart_bytes=%d ---\n",
-                   pct, (long long)(sim_ns / MS_TO_NS),
-                   rf_byte_count, uart_byte_count);
-            for (int i = 0; i < node_count; i++) {
-                printf("    Node %d [%s]: %lld cycles, freq=%u Hz\n",
-                       nodes[i].id, node_type_str(i),
-                       (long long)node_cycles(i), node_freq(i));
-            }
-            next_progress += progress_interval;
-        }
+        progress_service_tick(&progress_svc, sim_ns,
+                              rf_byte_count, uart_byte_count);
     }
 
     /* Handle restart request from UI */
