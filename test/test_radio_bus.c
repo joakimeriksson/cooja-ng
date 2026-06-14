@@ -475,6 +475,193 @@ static void test_reset_node(void) {
 }
 
 /* ============================================================
+ * Emulated-RX delivery / queue / drain (M26).
+ * ============================================================ */
+
+/* Mock emulated mote: provides the sim_mote_ops the bus's delivery path
+ * drives (rx_byte_sync / step_until / cycles / freq_hz). */
+typedef struct {
+    sim_mote_t mote;
+    int      sync_count;
+    int64_t  sync_times[256];
+    int      step_count;
+    int64_t  cyc;
+    uint32_t freq;
+} mock_mote_t;
+
+static void mm_rx_byte_sync(sim_mote_t *m, int64_t t) {
+    mock_mote_t *mm = (mock_mote_t *)m->impl;
+    if (mm->sync_count < 256) mm->sync_times[mm->sync_count] = t;
+    mm->sync_count++;
+}
+static void mm_step_until(sim_mote_t *m, int64_t target) {
+    mock_mote_t *mm = (mock_mote_t *)m->impl;
+    mm->step_count++;
+    mm->cyc = target;
+}
+static int64_t  mm_cycles(const sim_mote_t *m) { return ((mock_mote_t *)m->impl)->cyc; }
+static uint32_t mm_freq(const sim_mote_t *m)   { return ((mock_mote_t *)m->impl)->freq; }
+
+static const sim_mote_ops_t mm_ops = {
+    .rx_byte_sync = mm_rx_byte_sync,
+    .step_until   = mm_step_until,
+    .cycles       = mm_cycles,
+    .freq_hz      = mm_freq,
+};
+
+/* Register node idx as an emulated receiver: a mock_rx for the radio
+ * endpoint + a mock_mote for the sim_mote ops, with the given caps. */
+static void register_emulated(fixture_t *f, mock_mote_t *mm, int idx,
+                              uint32_t caps) {
+    memset(mm, 0, sizeof(*mm));
+    mm->freq = 1000000;          /* 1 MHz → 1 ms = 1000 cycles */
+    mm->mote.impl = mm;
+    mm->mote.ops = &mm_ops;
+    sim_runtime_register_mote(&f->sim, idx, &mm->mote);
+    sim_radio_bus_register(&f->bus, idx, &mock_ops, &f->rx[idx],
+                           SIM_RADIO_DELIVERY_PER_BYTE, caps);
+}
+
+/* A short 802.15.4 frame body (preamble..payload). */
+static int short_frame(uint8_t *buf, int payload) {
+    int n = 0;
+    buf[n++] = 0; buf[n++] = 0; buf[n++] = 0; buf[n++] = 0;
+    buf[n++] = 0x7A; buf[n++] = (uint8_t)payload;
+    for (int i = 0; i < payload; i++) buf[n++] = (uint8_t)(0x40 + i);
+    return n;
+}
+
+static void test_deliver_direct(void) {
+    /* Synchronous delivery: each byte is pre-synced to its air time and
+     * handed to the chip; a wakeup is scheduled after the burst. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm;
+    register_emulated(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+    f.sim.now_ns = 0;
+
+    uint8_t frame[64]; int n = short_frame(frame, 5);
+    sim_radio_bus_deliver_bytes(&f.bus, &f.sim, 1, frame, n, -40, 0, false);
+
+    ASSERT_EQ(f.rx[1].recv_count, n, "direct: all bytes reached the chip");
+    ASSERT_EQ(mm.sync_count, n, "direct: one clock-sync per byte");
+    bool spaced = true;
+    for (int i = 1; i < mm.sync_count; i++)
+        if (mm.sync_times[i] - mm.sync_times[i-1] != IEEE802154_BYTE_NS) spaced = false;
+    ASSERT(spaced, "direct: per-byte sync on the 32µs air clock");
+    ASSERT(!sim_eq_empty(&f.sim.event_queue), "direct: wakeup scheduled");
+}
+
+static void test_deliver_executing_node(void) {
+    /* When the receiver is the executing node, skip per-byte sync; with
+     * CAP_RX_TICKING_STEP the bus steps the CPU ~1 ms instead. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm;
+    register_emulated(&f, &mm, 1, SIM_RADIO_CAP_RX_TICKING_STEP);
+    f.bus.executing_node = 1;
+
+    uint8_t frame[64]; int n = short_frame(frame, 4);
+    sim_radio_bus_deliver_bytes(&f.bus, &f.sim, 1, frame, n, -40, 0, false);
+
+    ASSERT_EQ(f.rx[1].recv_count, n, "executing: bytes still delivered");
+    ASSERT_EQ(mm.sync_count, 0, "executing: no per-byte clock sync");
+    ASSERT_EQ(mm.step_count, 1, "executing: CAP_RX_TICKING_STEP stepped once");
+    ASSERT_EQ(mm.cyc, 1000, "executing: stepped ~1 ms (1000 cycles @ 1 MHz)");
+}
+
+static void test_deliver_defer_wakeups(void) {
+    /* Threaded mode: no wakeup scheduled. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm;
+    register_emulated(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+    f.bus.defer_wakeups = true;
+
+    uint8_t frame[64]; int n = short_frame(frame, 3);
+    sim_radio_bus_deliver_bytes(&f.bus, &f.sim, 1, frame, n, -40, 0, false);
+    ASSERT(sim_eq_empty(&f.sim.event_queue), "defer_wakeups: no wakeup scheduled");
+}
+
+static void test_queue_and_drain(void) {
+    /* queue_frame stages frames FIFO; drain delivers one per call. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm;
+    register_emulated(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+
+    uint8_t a[64], b[64];
+    int na = short_frame(a, 3), nb = short_frame(b, 4);
+    a[6] = 0xA1; b[6] = 0xB1;   /* distinguishable first payload byte */
+    sim_radio_bus_queue_frame(&f.bus, 1, a, na, -40, 0, 1000, false);
+    sim_radio_bus_queue_frame(&f.bus, 1, b, nb, -40, 0, 1000, false);
+    ASSERT_EQ(f.bus.emu_rx_queue[1].count, 2, "queue: two frames staged");
+    ASSERT_EQ(f.bus.stats.rx_queued, 2, "queue: rx_queued counted");
+
+    sim_radio_bus_drain_rx(&f.bus, &f.sim, 1);
+    ASSERT_EQ(f.bus.emu_rx_queue[1].count, 1, "drain: one frame consumed");
+    ASSERT_EQ(f.bus.stats.rx_drained, 1, "drain: rx_drained counted");
+    ASSERT_EQ(f.rx[1].recv_byte[6], 0xA1, "drain: FIFO order (frame A first)");
+
+    sim_radio_bus_drain_rx(&f.bus, &f.sim, 1);
+    ASSERT_EQ(f.bus.emu_rx_queue[1].count, 0, "drain: queue empty");
+    ASSERT_EQ(f.rx[1].recv_byte[na + 6], 0xB1, "drain: frame B second");
+}
+
+static void test_drain_collided_skip(void) {
+    /* A collided frame is dropped without delivery; the next good frame
+     * is delivered. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm;
+    register_emulated(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+
+    uint8_t a[64], b[64];
+    int na = short_frame(a, 3), nb = short_frame(b, 3);
+    b[6] = 0xB2;
+    sim_radio_bus_queue_frame(&f.bus, 1, a, na, -40, 0, 1000, false);
+    sim_radio_bus_queue_frame(&f.bus, 1, b, nb, -40, 0, 1000, false);
+    /* Mark the head (frame A) collided. */
+    f.bus.emu_rx_queue[1].frames[f.bus.emu_rx_queue[1].head].collided = true;
+
+    sim_radio_bus_drain_rx(&f.bus, &f.sim, 1);
+    ASSERT_EQ(f.bus.emu_rx_queue[1].count, 0, "drain: collided skipped + good drained");
+    ASSERT_EQ(f.rx[1].recv_count, nb, "drain: only the good frame's bytes");
+    ASSERT_EQ(f.rx[1].recv_byte[6], 0xB2, "drain: delivered frame B, not collided A");
+}
+
+static void test_drain_max_arrival(void) {
+    /* A frame queued with a future arrival_ns is delivered at that time
+     * (max(arrival, now)) so the ACK turnaround is preserved. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm;
+    register_emulated(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+    f.sim.now_ns = 1000;
+
+    uint8_t a[64]; int na = short_frame(a, 2);
+    int64_t future = 500000;   /* well past now */
+    sim_radio_bus_queue_frame(&f.bus, 1, a, na, -40, future, 1000, false);
+    sim_radio_bus_drain_rx(&f.bus, &f.sim, 1);
+    ASSERT_EQ(mm.sync_times[0], future, "drain: delivered at max(arrival, now)");
+}
+
+static void test_deliver_native_noop(void) {
+    /* A receiver whose sim_mote has no rx_byte_sync (native/JS) gets no
+     * byte delivery — only the on_rx timeline notification. */
+    fixture_t f; fx_init(&f, 2);
+    sim_mote_t bare = {0};
+    static const sim_mote_ops_t bare_ops = { .kind = "X" };  /* rx_byte_sync NULL */
+    bare.ops = &bare_ops;
+    sim_runtime_register_mote(&f.sim, 1, &bare);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops, &f.rx[1],
+                           SIM_RADIO_DELIVERY_SYNC, 0);
+
+    uint8_t frame[64]; int n = short_frame(frame, 4);
+    sim_radio_bus_deliver_bytes(&f.bus, &f.sim, 1, frame, n, -40, 0, false);
+    ASSERT_EQ(f.rx[1].recv_count, 0, "native: no byte delivery (rx_byte_sync NULL)");
+}
+
+/* ============================================================
  * Entry point.
  * ============================================================ */
 
@@ -498,6 +685,13 @@ int run_radio_bus_tests(int verbose) {
     test_reentrant_depth();
     test_rx_stall();
     test_reset_node();
+    test_deliver_direct();
+    test_deliver_executing_node();
+    test_deliver_defer_wakeups();
+    test_queue_and_drain();
+    test_drain_collided_skip();
+    test_drain_max_arrival();
+    test_deliver_native_noop();
 
     printf("--- Results: %d passed, %d failed ---\n", passed, failed);
     return failed;

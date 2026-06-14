@@ -180,7 +180,23 @@ typedef struct sim_radio_bus_host {
      * depth > 0 and are staged, not re-dispatched as frames. */
     void (*frame_complete)(void *user, int sender, int sender_radio,
                            int64_t byte_time_ns, int64_t sender_byte_ns);
+    /* M26: the bus delivered/queued a frame's worth of on-air bytes to
+     * emulated receiver `idx` occupying the air window [start_ns,
+     * end_ns].  The runner emits the RX timeline + radio state from
+     * this (observability stays runner-side until Phase 6). */
+    void (*on_rx)(void *user, int idx, int64_t start_ns, int64_t end_ns);
 } sim_radio_bus_host_t;
+
+/* Bus-owned RF delivery counters (M26): incremented by the emulated-RX
+ * delivery/queue paths the bus now owns; the runner reads them at end of
+ * run and zeroes them per sim restart. */
+typedef struct sim_radio_bus_stats {
+    int rx_direct;    /* frames delivered synchronously               */
+    int rx_queued;    /* frames pushed to an emu RX queue (RXFIFO busy)*/
+    int rx_drained;   /* frames delivered out of an emu RX queue       */
+    int rx_dropped;   /* frames dropped because the queue was full     */
+    int rx_collided;  /* frames dropped due to an RF collision         */
+} sim_radio_bus_stats_t;
 
 /* The bus: all RF routing state, one instance per runtime. */
 typedef struct sim_radio_bus {
@@ -201,6 +217,14 @@ typedef struct sim_radio_bus {
      * pending per receiver, deadline extended per delivered byte. */
     int64_t            rx_stall_deadline_ns[SIM_RADIO_BUS_MAX_NODES];
     bool               rx_stall_pending[SIM_RADIO_BUS_MAX_NODES];
+    /* M26: the node whose CPU is currently executing (was the runner's
+     * ticking_node_idx).  The synchronous RX path skips per-byte clock
+     * sync for this node to avoid a re-entrant step.  -1 = none. */
+    int                executing_node;
+    /* M26: threaded mode — the threaded driver advances motes itself, so
+     * the delivery path must not schedule mote wakeups. */
+    bool               defer_wakeups;
+    sim_radio_bus_stats_t stats;
 } sim_radio_bus_t;
 
 /* Register node idx's radio endpoint + delivery mode + capability
@@ -253,6 +277,45 @@ bool sim_radio_bus_rx_stall_expired(sim_radio_bus_t *bus,
  * runner's sim_cancel_mote_events purge, which also drops any pending
  * SIM_EV_RADIO_TIMER for the slot). */
 void sim_radio_bus_reset_node(sim_radio_bus_t *bus, int idx);
+
+/* M26: mark the node whose CPU is currently executing (-1 = none).
+ * The runner's execute adapters + serial-injection path set this around
+ * any CPU step so the synchronous RX delivery path can avoid a
+ * re-entrant step for that node. */
+void sim_radio_bus_set_executing(sim_radio_bus_t *bus, int idx);
+
+/* ============================================================
+ * Emulated-receiver RX delivery (M26 — moved from the runner).
+ *
+ * These own the byte-burst delivery to an emulated mote's radio, the
+ * deferred-RX queue, and the queue drain.  CPU motion goes through the
+ * mote's sim_mote_ops_t (rx_byte_sync / step_until / cycles / freq_hz)
+ * via sim_runtime_mote(); the runner stays responsible only for the
+ * RX timeline/state (the on_rx host hook) and the SIM_EV_RX_BYTE event
+ * dispatch (deliver_rx_byte) whose CC2420 trace needs chip headers.
+ * ============================================================ */
+
+/* Push a complete frame into emulated node idx's deferred RX queue
+ * (no collision detection here — the caller owns that). */
+void sim_radio_bus_queue_frame(sim_radio_bus_t *bus, int idx,
+                               const uint8_t *data, int len, int8_t rssi,
+                               int64_t arrival_ns, int64_t end_ns,
+                               bool subghz);
+
+/* Deliver a frame's on-air bytes to emulated node idx's radio, spaced
+ * on the air-time byte clock, pre-syncing the receiver's CPU per byte;
+ * queues instead if the radio is mid-frame.  No-op for non-emulated
+ * receivers (rx_byte_sync == NULL). */
+void sim_radio_bus_deliver_bytes(sim_radio_bus_t *bus, struct sim_runtime *sim,
+                                 int idx, const uint8_t *data, int len,
+                                 int8_t rssi, int64_t air_time_ns,
+                                 bool subghz);
+
+/* Deliver at most one queued frame to emulated node idx (skips collided
+ * frames; mini-steps the receiver to free RXFIFO when CAP_DRAIN_MINI_STEP
+ * is set). */
+void sim_radio_bus_drain_rx(sim_radio_bus_t *bus, struct sim_runtime *sim,
+                            int idx);
 
 /* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
  * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. Using the

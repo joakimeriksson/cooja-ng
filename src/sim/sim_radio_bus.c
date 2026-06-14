@@ -4,6 +4,8 @@
 #include "sim_radio_bus.h"
 #include "sim_runtime.h"
 
+#include <string.h>
+
 /* On-air formats:
  *   2.4 GHz: preamble(4) 0x00 + SFD 0x7A + length at data[5]; receiving
  *     chip pushes (length + 1) bytes into its RXFIFO.
@@ -337,4 +339,151 @@ void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
         h->frame_complete(h->user, sender_idx, sender_radio,
                           byte_time_ns, sender_byte_ns);
     bus->tx_depth--;
+}
+
+/* ============================================================
+ * Emulated-receiver RX delivery (M26 — moved from the runner).
+ * CPU motion goes through the mote's sim_mote_ops_t; no chip headers.
+ * ============================================================ */
+
+void sim_radio_bus_set_executing(sim_radio_bus_t *bus, int idx) {
+    bus->executing_node = idx;
+}
+
+/* Push a complete frame into an emulated node's RX queue.  Collision
+ * detection is NOT done here — the caller owns it (emu_rx_end_ns check +
+ * interference loops), since a data frame and its own auto-ACK queued to
+ * the same receiver would otherwise look like a self-collision. */
+void sim_radio_bus_queue_frame(sim_radio_bus_t *bus, int idx,
+                               const uint8_t *data, int len, int8_t rssi,
+                               int64_t arrival_ns, int64_t end_ns,
+                               bool subghz) {
+    emu_rx_queue_t *q = &bus->emu_rx_queue[idx];
+    if (q->count >= EMU_RX_QUEUE_SIZE) {
+        bus->stats.rx_dropped++;
+        return;
+    }
+    int slot = (q->head + q->count) % EMU_RX_QUEUE_SIZE;
+    int copy_len = len < EMU_RX_FRAME_MAX ? len : EMU_RX_FRAME_MAX;
+    memcpy(q->frames[slot].data, data, (size_t)copy_len);
+    q->frames[slot].len = copy_len;
+    q->frames[slot].rssi = rssi;
+    q->frames[slot].arrival_ns = arrival_ns;
+    q->frames[slot].end_ns = end_ns;
+    q->frames[slot].collided = false;
+    q->frames[slot].subghz = subghz;
+    q->count++;
+    bus->stats.rx_queued++;
+}
+
+/* Deliver buffered bytes directly to an emulated node's radio.  The RX
+ * timeline + radio state stay runner-side via the on_rx hook.  For
+ * MSP430 each byte is preceded by execute(t, 0) at its air time (Cooja's
+ * Msp802154Radio.receiveCustomData()); ARM mirrors it with its own
+ * per-byte sync.  Both go through the mote's rx_byte_sync op — native/JS
+ * leave it NULL, for which this is a no-op past the timeline emit. */
+void sim_radio_bus_deliver_bytes(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                                 int idx, const uint8_t *data, int len,
+                                 int8_t rssi, int64_t air_time_ns,
+                                 bool subghz) {
+    int64_t byte_ns = byte_period_ns(subghz);
+    if (len > 0 && bus->host.on_rx)
+        bus->host.on_rx(bus->host.user, idx, air_time_ns,
+                        air_time_ns + (int64_t)len * byte_ns);
+
+    sim_mote_t *m = sim_runtime_mote(sim, idx);
+    if (!m || !m->ops->rx_byte_sync)
+        return;  /* native/JS: timeline only, no byte delivery */
+
+    /* If the radio is mid-frame (RX_FRAME), queue instead of delivering;
+     * delivering now would corrupt the in-progress frame.  Only CC2420
+     * reports busy — cc2538/nrf rx_busy is always false. */
+    if (bus->ops[idx]->rx_busy(bus->mote[idx])) {
+        sim_radio_bus_queue_frame(bus, idx, data, len, rssi, air_time_ns,
+                                  air_time_ns + (int64_t)len * byte_ns, subghz);
+        return;
+    }
+
+    /* GUARD: if this node is currently executing (executing_node), skip
+     * the per-byte sync to avoid a re-entrant step; bytes go into the
+     * chip's rx_incoming buffer and replay when it re-enters RX.  MSP430
+     * additionally steps ~1 ms (CAP_RX_TICKING_STEP) so the CC2420
+     * processes symbol events + auto-ACK in-line. */
+    int64_t last_byte_ns = air_time_ns;
+    if (idx == bus->executing_node) {
+        for (int j = 0; j < len; j++)
+            bus->ops[idx]->receive_byte(bus->mote[idx], data[j], rssi);
+        if (bus->caps[idx] & SIM_RADIO_CAP_RX_TICKING_STEP) {
+            int64_t budget = (int64_t)m->ops->freq_hz(m) / 1000; /* 1ms */
+            if (budget < 1000) budget = 1000;
+            m->ops->step_until(m, m->ops->cycles(m) + budget);
+        }
+    } else {
+        for (int j = 0; j < len; j++) {
+            int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
+            m->ops->rx_byte_sync(m, byte_time_ns);
+            bus->ops[idx]->receive_byte(bus->mote[idx], data[j], rssi);
+            last_byte_ns = byte_time_ns;
+        }
+    }
+
+    /* Request immediate wakeup so the receiver gets CPU time for its
+     * FIFOP/ISR work (skipped in threaded mode — the driver steps it). */
+    if (!bus->defer_wakeups)
+        sim_schedule_mote_wakeup_if_earlier(sim, idx, last_byte_ns);
+}
+
+/* Drain queued RX frames for an emulated node: at most one frame per
+ * call, skipping collided frames, mini-stepping to free the RXFIFO when
+ * the platform allows it (CAP_DRAIN_MINI_STEP). */
+void sim_radio_bus_drain_rx(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                            int idx) {
+    emu_rx_queue_t *q = &bus->emu_rx_queue[idx];
+    int blocked_attempts = 0;
+    while (q->count > 0) {
+        emu_rx_frame_t *f = &q->frames[q->head];
+
+        /* Skip collided frames (like native_dequeue_rx_frame does). */
+        if (f->collided) {
+            q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
+            q->count--;
+            continue;
+        }
+
+        int fifo_needed = frame_fifo_bytes(f->data, f->len, f->subghz);
+        if (bus->ops[idx]->rxfifo_available(bus->mote[idx]) < fifo_needed) {
+            if ((bus->caps[idx] & SIM_RADIO_CAP_DRAIN_MINI_STEP) &&
+                blocked_attempts < 4) {
+                sim_mote_t *m = sim_runtime_mote(sim, idx);
+                int64_t freq = m->ops->freq_hz(m);
+                int64_t spare_cycles = freq / 1000;
+                if (spare_cycles <= 0) spare_cycles = 1;
+                m->ops->step_until(m, m->ops->cycles(m) + spare_cycles);
+                blocked_attempts++;
+                continue;
+            }
+            break;  /* RXFIFO still busy, try next time step */
+        }
+        blocked_attempts = 0;
+
+        /* Reset collision tracking before each drain delivery: a queued
+         * frame's delivery may trigger an auto-ACK whose frame assembler
+         * sets emu_rx_end_ns on the ACK receiver; without this reset,
+         * sequential drains would falsely collide. */
+        memset(bus->emu_rx_end_ns, 0, sizeof(bus->emu_rx_end_ns));
+
+        /* max(arrival, now): deferred ACKs queued with a future arrival
+         * (192 µs turnaround past the data frame's TX-end) still advance
+         * the receiver's CPU by the turnaround before bytes hit the
+         * radio. */
+        int64_t now = sim_runtime_now_ns(sim);
+        int64_t deliver_ns = f->arrival_ns > now ? f->arrival_ns : now;
+        sim_radio_bus_deliver_bytes(bus, sim, idx, f->data, f->len, f->rssi,
+                                    deliver_ns, f->subghz);
+        bus->stats.rx_drained++;
+
+        q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
+        q->count--;
+        break;
+    }
 }

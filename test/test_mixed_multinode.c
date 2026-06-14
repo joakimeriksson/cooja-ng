@@ -82,8 +82,9 @@ static sim_mote_t mote_store[MAX_NODES];
 /* MOTE_IMPL lives in mote_impl.h (M19); MOTE_IDX is runner-only —
  * module code uses MOTE_IMPL(m)->slot instead. */
 #define MOTE_IDX(m)  ((int)(MOTE_IMPL(m) - nodes))
-static int ticking_node_idx = -1;  /* node currently inside an MSP430/ARM
-                                    * execute tick (re-entrancy guard) */
+/* The "currently-executing node" guard moved onto the bus
+ * (radio_bus.executing_node, M26); set via sim_radio_bus_set_executing
+ * around CPU steps, read by the bus's synchronous RX delivery. */
 
 /* PC trace callback for debugging */
 static uint32_t srh_trace_fn_addr;
@@ -174,11 +175,8 @@ static pcap_writer_t pcap_writer = { 0 };
 
 /* Statistics counters */
 static int stat_rf_frames = 0;       /* total TX frames (all node types) */
-static int stat_emu_rx_direct = 0;   /* frames delivered synchronously (auto-ACK works) */
-static int stat_emu_rx_queued = 0;   /* frames queued (RXFIFO busy) */
-static int stat_emu_rx_drained = 0;  /* frames delivered from queue via mini-step */
-static int stat_emu_rx_dropped = 0;  /* frames dropped (queue full) */
-static int stat_emu_rx_collided = 0; /* frames dropped due to RF collision */
+/* The five emu-RX delivery counters moved to radio_bus.stats (M26):
+ * rx_direct / rx_queued / rx_drained / rx_dropped / rx_collided. */
 static int stat_rx_frames_queued = 0;
 static int stat_rx_frames_collided = 0;
 static int stat_rx_frames_queue_full = 0;
@@ -830,31 +828,15 @@ static inline bool radio_rx_busy(int idx) {
 
 /* frame_fifo_bytes lives in sim_radio_bus.c (M9.1) */
 
-/* Push a complete frame into an emulated node's RX queue.
- * Collision detection is NOT done here — it's handled by:
- *   1. emu_rx_end_ns[] check before delivery (multi-sender same-step collision)
- *   2. Interference-range loops marking queued frames as collided
- * Doing overlap checks here would cause false positives (e.g., a data frame
- * and its auto-ACK from the same sender queued to the same receiver). */
+/* Emulated RX queue push/deliver/drain bodies moved to
+ * src/sim/sim_radio_bus.c (M26); these stay as thin forwarders so the
+ * call sites are unchanged.  emu_rx_queue[] / emu_rx_end_ns[] / the
+ * RX stat counters now live on the bus. */
 static void emu_rx_queue_push(int idx, const uint8_t *data, int len,
                                int8_t rssi, int64_t arrival_ns, int64_t end_ns,
                                bool subghz) {
-    emu_rx_queue_t *q = &emu_rx_queue[idx];
-    if (q->count >= EMU_RX_QUEUE_SIZE) {
-        stat_emu_rx_dropped++;
-        return;
-    }
-    int slot = (q->head + q->count) % EMU_RX_QUEUE_SIZE;
-    int copy_len = len < EMU_RX_FRAME_MAX ? len : EMU_RX_FRAME_MAX;
-    memcpy(q->frames[slot].data, data, (size_t)copy_len);
-    q->frames[slot].len = copy_len;
-    q->frames[slot].rssi = rssi;
-    q->frames[slot].arrival_ns = arrival_ns;
-    q->frames[slot].end_ns = end_ns;
-    q->frames[slot].collided = false;
-    q->frames[slot].subghz = subghz;
-    q->count++;
-    stat_emu_rx_queued++;
+    sim_radio_bus_queue_frame(&radio_bus, idx, data, len, rssi,
+                              arrival_ns, end_ns, subghz);
 }
 
 /* Process a SIM_EV_RX_BYTE event for an emulated receiver (M13: one
@@ -1044,84 +1026,14 @@ static void msp_mote_rx_pre_sync(sim_mote_t *m, int64_t time_ns) {
     msp430_elf_mote_tick(MOTE_IMPL(m), time_ns);
 }
 
-/* Deliver buffered bytes directly to an emulated node's radio.
- * Emits explicit RX timeline events with computed frame air time.
- * For MSP430, advance the receiver's internal clock before each byte to
- * better approximate Cooja's byte-delivery events: execute(t, 0) +
- * receivedByte(byte) + requestImmediateWakeup().
- *
- * `subghz` selects the wall-clock byte period: 32 µs for 802.15.4
- * (CC2420 / cc2538_rfcore), 160 µs for 802.15.4g (CC1200 50 kbps).
- * Using the wrong value compresses RX on the receiver and breaks
- * collision modelling — see byte_period_ns(). */
+/* Deliver buffered bytes to an emulated node's radio — body moved to
+ * sim_radio_bus_deliver_bytes (M26); thin forwarder keeps call sites
+ * unchanged.  The RX timeline emit moved to the bus's on_rx hook
+ * (bus_host_on_rx). */
 static void emu_deliver_bytes(int idx, const uint8_t *data, int len,
                                int8_t rssi, int64_t air_time_ns, bool subghz) {
-    int64_t byte_ns = byte_period_ns(subghz);
-    /* Emit RX timeline event using the provided air-time timestamp
-     * (derived from the sender's TX timing) for consistency. */
-    if (ui_server && len > 0) {
-        int64_t rx_dur = (int64_t)len * byte_ns;
-        emit_radio_obs(idx, air_time_ns, SIM_OBS_RADIO_RX_START);
-        emit_radio_obs(idx, air_time_ns + rx_dur, SIM_OBS_RADIO_RX_END);
-        node_states[idx].radio_state = SIM_RADIO_ON;
-    }
-    /* Emulated receivers only (MSP430/ARM).  Native/JS leave the
-     * rx_byte_sync op NULL — for them the byte path past the timeline
-     * emit is a no-op, exactly as the old `type == NODE_MSP430 /
-     * NODE_ARM` branches were (M25 de-typing: see emu_deliver_bytes'
-     * old type switch). */
-    sim_mote_t *m = &mote_store[idx];
-    if (!m->ops->rx_byte_sync)
-        return;
-
-    /* If the radio is mid-frame (RX_FRAME), queue instead of delivering;
-     * delivering now would corrupt the in-progress frame.  This happens
-     * when two senders' frames are delivered in the same event tick.
-     * (Only CC2420 reports busy — cc2538/nrf rx_busy is always false, so
-     * this guard is a no-op for ARM, matching the old MSP430-only check.) */
-    if (radio_rx_busy(idx)) {
-        emu_rx_queue_push(idx, data, len, rssi, air_time_ns,
-                          air_time_ns + (int64_t)len * byte_ns, subghz);
-        return;
-    }
-
-    /* Match Cooja's Msp802154Radio.receiveCustomData(): each incoming
-     * byte is preceded by execute(t, 0) at its air time, then delivered;
-     * after the burst the receiver gets an immediate wakeup so its ISR
-     * work runs before the next slice.
-     *
-     * GUARD: if this node is currently being ticked (ticking_node_idx),
-     * skip the per-byte sync to prevent a re-entrant step.  Bytes go
-     * into the chip's rx_incoming buffer and are replayed when it
-     * transitions to RX naturally.  MSP430 additionally steps ~1 ms in
-     * that case (CAP_RX_TICKING_STEP) so the CC2420 processes symbol
-     * events + auto-ACK in-line.
-     *
-     * Per-node radio fan-out (Firefly): each delivered byte is fed to
-     * both on-board chips; the cross-band medium filter already dropped
-     * out-of-band bytes, and the chip whose decoder doesn't recognise
-     * the preamble/sync ignores it. */
-    int64_t last_byte_ns = air_time_ns;
-    if (idx == ticking_node_idx) {
-        for (int j = 0; j < len; j++)
-            radio_receive_byte(idx, data[j], rssi);
-        if (radio_bus.caps[idx] & SIM_RADIO_CAP_RX_TICKING_STEP) {
-            int64_t budget = (int64_t)node_freq(idx) / 1000; /* 1ms */
-            if (budget < 1000) budget = 1000;
-            step_node_until(idx, node_cycles(idx) + budget);
-        }
-    } else {
-        for (int j = 0; j < len; j++) {
-            int64_t byte_time_ns = air_time_ns + (int64_t)j * byte_ns;
-            m->ops->rx_byte_sync(m, byte_time_ns);
-            radio_receive_byte(idx, data[j], rssi);
-            last_byte_ns = byte_time_ns;
-        }
-    }
-
-    if (num_threads == 0) {
-        sim_schedule_mote_wakeup_if_earlier(&sim_rt, idx, last_byte_ns);
-    }
+    sim_radio_bus_deliver_bytes(&radio_bus, &sim_rt, idx, data, len, rssi,
+                                air_time_ns, subghz);
 }
 
 /* Per-chip TX listener contexts live in node->rf_ctx[2] (M18 — the
@@ -1338,6 +1250,18 @@ static bool bus_host_node_active(void *user, int idx) {
 static void bus_host_sync_channel(void *user, int idx) {
     (void)user;
     sync_native_node_channel(idx);
+}
+
+/* M26: the bus delivered a frame's on-air bytes to emulated receiver
+ * idx over [start_ns, end_ns]; emit the RX timeline + radio state (the
+ * observability that used to live inline in emu_deliver_bytes). */
+static void bus_host_on_rx(void *user, int idx, int64_t start_ns,
+                           int64_t end_ns) {
+    (void)user;
+    if (!ui_server) return;
+    emit_radio_obs(idx, start_ns, SIM_OBS_RADIO_RX_START);
+    emit_radio_obs(idx, end_ns, SIM_OBS_RADIO_RX_END);
+    node_states[idx].radio_state = SIM_RADIO_ON;
 }
 
 static void bus_host_on_tx_byte(void *user, int sender, uint8_t byte,
@@ -1633,7 +1557,7 @@ static void bus_host_frame_complete(void *user, int sender_idx,
          * delivered frame on this receiver? */
         if (coll_start < emu_rx_end_ns[i]) {
             /* Collision with previously delivered frame — drop this one */
-            stat_emu_rx_collided++;
+            radio_bus.stats.rx_collided++;
             if (verbose)
                 fprintf(stderr, "  [COLLISION] Node %d->%d frame dropped @ %.3f s "
                         "(channel busy until %.3f s)\n",
@@ -1689,13 +1613,14 @@ static void bus_host_frame_complete(void *user, int sender_idx,
             }
             /* MSP430-only full-slice pre-sync before delivery; only the
              * MSP430 ops table sets rx_pre_sync (M25 de-typing). */
-            if (mote_store[i].ops->rx_pre_sync && i != ticking_node_idx) {
+            if (mote_store[i].ops->rx_pre_sync &&
+                i != radio_bus.executing_node) {
                 mote_store[i].ops->rx_pre_sync(&mote_store[i], delivery_start);
             }
             emu_deliver_bytes(i, frame_snap[i], frame_snap_len[i],
                               frame_snap_rssi[i], delivery_start,
                               tx_asm[sender_idx].subghz);
-            stat_emu_rx_direct++;
+            radio_bus.stats.rx_direct++;
             emu_rx_end_ns[i] = coll_end;
 
             /* Generate RX frame event for packet log.
@@ -1793,7 +1718,7 @@ static void bus_host_frame_complete(void *user, int sender_idx,
                 int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
                 emu_rx_frame_t *existing = &q->frames[fi];
                 if (int_start < existing->end_ns && existing->arrival_ns < int_end) {
-                    if (!existing->collided) stat_emu_rx_collided++;
+                    if (!existing->collided) radio_bus.stats.rx_collided++;
                     existing->collided = true;
                 }
             }
@@ -1892,7 +1817,7 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
                     emu_rx_frame_t *existing = &q->frames[fi];
                     if (tx_start < existing->end_ns &&
                         existing->arrival_ns < tx_end) {
-                        if (!existing->collided) stat_emu_rx_collided++;
+                        if (!existing->collided) radio_bus.stats.rx_collided++;
                         existing->collided = true;
                     }
                 }
@@ -1927,64 +1852,11 @@ static void mixed_deliver_rf_bytes(int idx) {
     buf->count = 0;
 }
 
-/*
- * Drain queued RX frames for an emulated node. Deliver at most one frame per
- * call and let the normal event queue provide the immediate wakeup.
- */
+/* Drain queued RX frames for an emulated node — body moved to
+ * sim_radio_bus_drain_rx (M26); thin forwarder keeps call sites
+ * unchanged. */
 static void emu_rx_queue_drain(int idx) {
-    emu_rx_queue_t *q = &emu_rx_queue[idx];
-    int blocked_attempts = 0;
-    while (q->count > 0) {
-        emu_rx_frame_t *f = &q->frames[q->head];
-
-        /* Skip collided frames (like native_dequeue_rx_frame does) */
-        if (f->collided) {
-            q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
-            q->count--;
-            continue;
-        }
-
-        /* Required FIFO space depends on on-air format (see frame_fifo_bytes). */
-        int fifo_needed = frame_fifo_bytes(f->data, f->len, f->subghz);
-        if (emulated_rxfifo_available(idx) < fifo_needed) {
-            /* MSP430-only mini-step retry (CAP_DRAIN_MINI_STEP) (M25). */
-            if ((radio_bus.caps[idx] & SIM_RADIO_CAP_DRAIN_MINI_STEP) &&
-                blocked_attempts < 4) {
-                int64_t freq = node_freq(idx);
-                int64_t spare_cycles = freq / 1000;
-                if (spare_cycles <= 0) spare_cycles = 1;
-                step_node_until(idx, node_cycles(idx) + spare_cycles);
-                blocked_attempts++;
-                continue;
-            }
-            break;  /* RXFIFO still busy, try next time step */
-        }
-        blocked_attempts = 0;
-
-        /* Reset collision tracking before each drain delivery.
-         * Delivering a queued frame may trigger auto-ACK, which goes through
-         * the frame assembler and sets emu_rx_end_ns on the ACK receiver.
-         * Without reset, sequential drain deliveries would falsely collide
-         * (each auto-ACK would see emu_rx_end_ns set by the previous one). */
-        memset(emu_rx_end_ns, 0, sizeof(emu_rx_end_ns));
-
-        /* Deliver frame bytes to radio — preserve the original frame's
-         * sub-GHz flag so re-delivery uses the correct byte timing.
-         * Use max(arrival_ns, current_sim_ns) so deferred ACKs queued
-         * with a future arrival_ns (192µs turnaround past the data
-         * frame's tx-end) still advance the receiver's CPU forward
-         * by the turnaround before bytes hit the radio. */
-        int64_t deliver_ns = f->arrival_ns > sim_runtime_now_ns(&sim_rt)
-                                ? f->arrival_ns : sim_runtime_now_ns(&sim_rt);
-        emu_deliver_bytes(idx, f->data, f->len, f->rssi, deliver_ns,
-                          f->subghz);
-        stat_emu_rx_drained++;
-
-        q->head = (q->head + 1) % EMU_RX_QUEUE_SIZE;
-        q->count--;
-
-        break;
-    }
+    sim_radio_bus_drain_rx(&radio_bus, &sim_rt, idx);
 }
 
 /* --- UART callback --- */
@@ -2063,9 +1935,9 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
  * byte.  Cooja queues all bytes and delivers them at baud-rate
  * intervals with requestImmediateWakeup() after each.
  *
- * Set ticking_node_idx to prevent re-entrant cascade: if the CPU TX's
- * during the baud-rate step, the delivery path must not sync this node
- * back (same guard as tick_one_msp430). */
+ * Mark this node executing (radio_bus.executing_node) to prevent a
+ * re-entrant cascade: if the CPU TX's during the baud-rate step, the
+ * delivery path must not sync this node back. */
 static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
                                  int len) {
     mixed_node_t *node = MOTE_IMPL(m);
@@ -2082,7 +1954,7 @@ static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
     int baud_cycles = (int)((int64_t)node_freq(idx) * 69 / 1000000);
     if (baud_cycles < 200) baud_cycles = 200;
     int consumed = 0;
-    ticking_node_idx = idx;
+    sim_radio_bus_set_executing(&radio_bus, idx);
     while (consumed < len) {
         if (!has_dma) {
             /* Wait for RXIFG clear (firmware consumed previous byte) */
@@ -2094,7 +1966,7 @@ static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
         consumed++;
         step_node_until(idx, node_cycles(idx) + baud_cycles);
     }
-    ticking_node_idx = -1;
+    sim_radio_bus_set_executing(&radio_bus, -1);
     /* Sync last_execute_us and re-schedule in event queue.
      * Without this, the node's sim_eq entry is stale and the
      * trickle timer / other events scheduled during injection
@@ -2255,7 +2127,7 @@ static void distribute_rf_outgoing(void) {
 
                         /* Collision check against previously delivered frame */
                         if (tx_start < emu_rx_end_ns[i]) {
-                            stat_emu_rx_collided++;
+                            radio_bus.stats.rx_collided++;
                             buf->count = 0;
                             continue;
                         }
@@ -2269,7 +2141,7 @@ static void distribute_rf_outgoing(void) {
                         if (emulated_rxfifo_available(i) >= frame_payload + 1) {
                             emu_deliver_bytes(i, buf->bytes, buf->count, rssi, tx_start,
                                               /*subghz=*/false);
-                            stat_emu_rx_direct++;
+                            radio_bus.stats.rx_direct++;
                             emu_rx_end_ns[i] = tx_end;
                         } else {
                             emu_rx_queue_push(i, buf->bytes, buf->count, rssi,
@@ -2312,7 +2184,7 @@ static void distribute_rf_outgoing(void) {
                                 emu_rx_frame_t *existing = &q->frames[fi];
                                 if (int_start < existing->end_ns &&
                                     existing->arrival_ns < int_end) {
-                                    if (!existing->collided) stat_emu_rx_collided++;
+                                    if (!existing->collided) radio_bus.stats.rx_collided++;
                                     existing->collided = true;
                                 }
                             }
@@ -2371,7 +2243,7 @@ static void distribute_rf_outgoing(void) {
                             emu_rx_frame_t *existing = &q->frames[fi];
                             if (tx_start < existing->end_ns &&
                                 existing->arrival_ns < tx_end) {
-                                if (!existing->collided) stat_emu_rx_collided++;
+                                if (!existing->collided) radio_bus.stats.rx_collided++;
                                 existing->collided = true;
                             }
                         }
@@ -2812,9 +2684,9 @@ static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns) {
      * delivered from the complete-frame path. Consuming rf_pending here
      * can split an in-flight frame and corrupt the receiver-side buffer
      * state. */
-    ticking_node_idx = idx;
+    sim_radio_bus_set_executing(&radio_bus, idx);
     int64_t returned_us = msp430_elf_mote_tick(&nodes[idx], now_ns);
-    ticking_node_idx = -1;
+    sim_radio_bus_set_executing(&radio_bus, -1);
     if (emu_rx_queue[idx].count > 0)
         emu_rx_queue_drain(idx);
     /* Match Cooja's MspMote.execute(t, 1): this slice schedules the
@@ -2840,9 +2712,9 @@ static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
         }
     }
 
-    ticking_node_idx = idx;
+    sim_radio_bus_set_executing(&radio_bus, idx);
     int64_t returned_us = arm_elf_mote_tick(&nodes[idx], now_ns);
-    ticking_node_idx = -1;
+    sim_radio_bus_set_executing(&radio_bus, -1);
 
     /* GDB stub: a breakpoint may have fired during the tick.  Clear the
      * cpu->stopping flag set by gdb_stub_check_breakpoint so subsequent
@@ -3104,8 +2976,10 @@ int run_mixed_multinode_test(int argc, char **argv) {
             .on_tx_byte = bus_host_on_tx_byte,
             .on_byte_accepted = bus_host_on_byte_accepted,
             .frame_complete = bus_host_frame_complete,
+            .on_rx = bus_host_on_rx,
         };
         sim_radio_bus_set_host(&radio_bus, &mixed_bus_host);
+        radio_bus.executing_node = -1;
     }
     /* Milestone 8.3: JS/JSON test engines consume console lines off the
      * observer stream instead of a hardwired call in the UART path. */
@@ -3246,6 +3120,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("Time step: %lld ns\n\n", (long long)TIME_STEP_NS);
 
     num_nodes = node_count;
+    /* Threaded mode advances motes itself, so the bus's RX delivery
+     * must not also schedule wakeups (M26). */
+    radio_bus.defer_wakeups = (num_threads != 0);
 sim_restart:
     for (int i = 0; i < node_count; i++) {
         const char *fw = firmware_paths[i < firmware_count ? i : firmware_count - 1];
@@ -4194,11 +4071,11 @@ sim_restart:
         sim_rt.now_ns = 0;
         sim_eq_init(&sim_eq);
         stat_rf_frames = 0;
-        stat_emu_rx_direct = 0;
-        stat_emu_rx_queued = 0;
-        stat_emu_rx_drained = 0;
-        stat_emu_rx_dropped = 0;
-        stat_emu_rx_collided = 0;
+        radio_bus.stats.rx_direct = 0;
+        radio_bus.stats.rx_queued = 0;
+        radio_bus.stats.rx_drained = 0;
+        radio_bus.stats.rx_dropped = 0;
+        radio_bus.stats.rx_collided = 0;
         stat_rx_frames_queued = 0;
         stat_rx_frames_collided = 0;
         stat_rx_frames_queue_full = 0;
@@ -4385,8 +4262,8 @@ sim_restart:
     printf("  Total RF bytes: %d\n", rf_byte_count);
     printf("  Total UART bytes: %d\n", uart_byte_count);
     printf("  Emu RX frames: %d direct, %d queued, %d drained, %d dropped, %d collided\n",
-           stat_emu_rx_direct, stat_emu_rx_queued, stat_emu_rx_drained,
-           stat_emu_rx_dropped, stat_emu_rx_collided);
+           radio_bus.stats.rx_direct, radio_bus.stats.rx_queued, radio_bus.stats.rx_drained,
+           radio_bus.stats.rx_dropped, radio_bus.stats.rx_collided);
     for (int i = 0; i < node_count; i++) {
         if (nodes[i].type != NODE_MSP430) continue;
         printf("  Node %d MSP byte queue: pushed=%llu popped=%llu\n",
