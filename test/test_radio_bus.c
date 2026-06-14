@@ -677,6 +677,149 @@ static void test_deliver_native_noop(void) {
 }
 
 /* ============================================================
+ * Frame-complete delivery policy (M27): collision windows, the dual
+ * 192 µs auto-ACK windows, and RXFIFO backpressure — driven end to end
+ * through sim_radio_bus_tx_byte (which invokes the bus-internal
+ * sim_radio_bus_frame_complete) and observed via the frame_observed /
+ * on_rx_frame / on_ack hooks.
+ * ============================================================ */
+
+static struct {
+    int     frame_observed;
+    int     outcome[8];       /* last on_rx_frame outcome per receiver */
+    int     ack_count;
+    int     ack_receiver;
+    int64_t ack_start;
+} frec;
+
+static void frec_observed(void *u, const sim_radio_frame_info_t *fi) {
+    (void)u; (void)fi; frec.frame_observed++;
+}
+static void frec_rx(void *u, const sim_radio_frame_info_t *fi, int receiver,
+                    int outcome, const uint8_t *data, int len,
+                    int64_t coll_start, int64_t prev_end) {
+    (void)u; (void)fi; (void)data; (void)len; (void)coll_start; (void)prev_end;
+    if (receiver >= 0 && receiver < 8) frec.outcome[receiver] = outcome;
+}
+static void frec_ack(void *u, const sim_radio_frame_info_t *fi, int data_recv,
+                     int64_t ack_start, int ack_bytes) {
+    (void)u; (void)fi; (void)ack_bytes;
+    frec.ack_count++;
+    frec.ack_receiver = data_recv;
+    frec.ack_start = ack_start;
+}
+static void frec_set_host(fixture_t *f) {
+    memset(&frec, 0, sizeof(frec));
+    for (int i = 0; i < 8; i++) frec.outcome[i] = -1;
+    static sim_radio_bus_host_t host;
+    memset(&host, 0, sizeof(host));
+    host.frame_observed = frec_observed;
+    host.on_rx_frame = frec_rx;
+    host.on_ack = frec_ack;
+    sim_radio_bus_set_host(&f->bus, &host);
+}
+
+/* Register node idx as a BATCH emulated receiver (snapshot-delivered by
+ * frame_complete) with a sim_mote backing the CPU ops. */
+static void reg_batch(fixture_t *f, mock_mote_t *mm, int idx, uint32_t caps) {
+    memset(mm, 0, sizeof(*mm));
+    mm->freq = 1000000;
+    mm->mote.impl = mm;
+    mm->mote.ops = &mm_ops;
+    sim_runtime_register_mote(&f->sim, idx, &mm->mote);
+    sim_radio_bus_register(&f->bus, idx, &mock_ops, &f->rx[idx],
+                           SIM_RADIO_DELIVERY_BATCH, caps);
+}
+
+static void tx_frame(fixture_t *f, int sender, const uint8_t *frame, int n) {
+    for (int i = 0; i < n; i++)
+        sim_radio_bus_tx_byte(&f->bus, &f->sim, sender, 0, frame[i]);
+}
+
+static void test_frame_collision_window(void) {
+    /* A frame whose air window opens before the receiver's previous RX
+     * ended (emu_rx_end_ns) is dropped as a collision — no delivery. */
+    fixture_t f; fx_init(&f, 2);
+    frec_set_host(&f);
+    mock_mote_t mm; reg_batch(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+    f.sim.now_ns = 1000;                  /* frame air-start == now (M27) */
+    f.bus.emu_rx_end_ns[1] = 5000;        /* receiver busy until 5 µs     */
+
+    uint8_t frame[64]; int n = build_802154(frame, 5);
+    tx_frame(&f, 0, frame, n);
+
+    ASSERT_EQ(frec.frame_observed, 1, "collision: frame observed once");
+    ASSERT_EQ(frec.outcome[1], SIM_RADIO_RX_COLLIDED, "collision: receiver outcome COLLIDED");
+    ASSERT_EQ(f.bus.stats.rx_collided, 1, "collision: rx_collided counted");
+    ASSERT_EQ(f.rx[1].recv_count, 0, "collision: no bytes delivered");
+    ASSERT_EQ(f.bus.stats.rx_direct, 0, "collision: not delivered directly");
+}
+
+static void test_frame_no_collision_when_clear(void) {
+    /* Same frame with a clear channel delivers directly. */
+    fixture_t f; fx_init(&f, 2);
+    frec_set_host(&f);
+    mock_mote_t mm; reg_batch(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+    f.sim.now_ns = 1000;
+    f.bus.emu_rx_end_ns[1] = 0;           /* channel clear */
+
+    uint8_t frame[64]; int n = build_802154(frame, 5);
+    tx_frame(&f, 0, frame, n);
+
+    ASSERT_EQ(frec.outcome[1], SIM_RADIO_RX_DIRECT, "clear: outcome DIRECT");
+    ASSERT_EQ(f.bus.stats.rx_direct, 1, "clear: delivered directly");
+    ASSERT_EQ(f.rx[1].recv_count, n, "clear: all bytes delivered");
+}
+
+static void test_frame_backpressure_queue(void) {
+    /* RXFIFO too small: frame_complete mini-steps the receiver once, and
+     * (still full) queues the frame instead of delivering. */
+    fixture_t f; fx_init(&f, 2);
+    frec_set_host(&f);
+    mock_mote_t mm; reg_batch(&f, &mm, 1, 0);
+    f.bus.executing_node = -1;
+    f.rx[1].rxfifo = 2;                   /* < frame_fifo_bytes (len+1) */
+
+    uint8_t frame[64]; int n = build_802154(frame, 5);
+    tx_frame(&f, 0, frame, n);
+
+    ASSERT_EQ(mm.step_count, 1, "backpressure: mini-stepped once to drain RXFIFO");
+    ASSERT_EQ(frec.outcome[1], SIM_RADIO_RX_QUEUED, "backpressure: outcome QUEUED");
+    ASSERT_EQ(f.bus.stats.rx_queued, 1, "backpressure: rx_queued counted");
+    ASSERT_EQ(f.bus.stats.rx_direct, 0, "backpressure: not delivered directly");
+    ASSERT_EQ(f.bus.emu_rx_queue[1].count, 1, "backpressure: frame deferred to RX queue");
+}
+
+static void test_frame_ack_window_sender(void) {
+    /* Scripted auto-ACK: the receiver emits an ACK byte (re-entering the
+     * bus as its own sender) the moment it is fed the SFD during
+     * synchronous delivery.  The ACK is staged in the data sender's
+     * rf_pending and, at the ACK flush, queued for the sender at
+     * now + 192 µs (the sender turnaround window — not tx_end + 192 µs). */
+    fixture_t f; fx_init(&f, 2);
+    frec_set_host(&f);
+    mock_mote_t mm0, mm1;
+    reg_batch(&f, &mm0, 0, 0);   /* data sender — also receives the ACK */
+    reg_batch(&f, &mm1, 1, 0);   /* data receiver — auto-ACKs           */
+    f.bus.executing_node = -1;
+    f.sim.now_ns = 0;
+    f.rx[1].reenter_on = 0x7A;   /* on the SFD, emit one ACK byte... */
+    f.rx[1].reenter_sender = 1;  /* ...as a transmission from node 1 */
+
+    uint8_t frame[64]; int n = build_802154(frame, 5);
+    tx_frame(&f, 0, frame, n);
+
+    ASSERT_EQ(frec.ack_count, 1, "ack: one ACK flush notification");
+    ASSERT_EQ(frec.ack_receiver, 1, "ack: keyed on the data receiver");
+    /* Sender's ACK is queued (not delivered) for the sender turnaround. */
+    ASSERT_EQ(f.bus.emu_rx_queue[0].count, 1, "ack: sender ACK deferred to its RX queue");
+    ASSERT_EQ(f.bus.emu_rx_queue[0].frames[f.bus.emu_rx_queue[0].head].arrival_ns,
+              192000, "ack: sender ACK at now + 192 µs turnaround");
+}
+
+/* ============================================================
  * Entry point.
  * ============================================================ */
 
@@ -707,6 +850,10 @@ int run_radio_bus_tests(int verbose) {
     test_drain_collided_skip();
     test_drain_max_arrival();
     test_deliver_native_noop();
+    test_frame_collision_window();
+    test_frame_no_collision_when_clear();
+    test_frame_backpressure_queue();
+    test_frame_ack_window_sender();
 
     printf("--- Results: %d passed, %d failed ---\n", passed, failed);
     return failed;
