@@ -1181,15 +1181,27 @@ pointers in the delivery loops before merging.
 
 ### 3.19 Service-extraction milestones (canonical Phase 6 task list)
 
-> **Status: in progress.** Phase 6 (§9) extracts the runner's embedded
-> optional/observation features into `src/services/*_service.c` behind a
-> `sim_service_ops_t` vtable host, then — once the GDB stub is a service —
-> finally moves the MSP430/ARM execute/serial adapter tables out of the
-> runner (the §3.17/§3.18 deferred debt).  Numbering continues from
-> Phase 5 (M31–M40).  Two services are already extracted as the template
-> (`sim_serial_bridge.c`, `sim_external_command.c`); the observer stream
-> (`sim_observer.h`) and the bus host hooks (`sim_radio_bus_host_t`)
-> already exist.
+> **Status: in progress (M31–M34 landed).** Phase 6 (§9) extracts the
+> runner's embedded optional/observation features into
+> `src/services/*_service.c` behind a `sim_service_ops_t` vtable host, then
+> — once the GDB stub is a service — finally moves the MSP430/ARM
+> execute/serial adapter tables out of the runner (the §3.17/§3.18 deferred
+> debt).  Numbering continues from Phase 5 (M31–M40).  Two services were
+> already extracted as the template (`sim_serial_bridge.c`,
+> `sim_external_command.c`); the observer stream (`sim_observer.h`) and the
+> bus host hooks (`sim_radio_bus_host_t`) already exist.
+> Landed: M31 `101cb9d` (service host scaffolding — sim_service.{h,c} vtable
+> + fan-out observer + ordered poll/teardown + error policy; serial bridge
+> and external command adopted as the first clients); M32 `783bf85`
+> (timeline service — the on_event consumer + owned timeline_t, node-id via
+> a runner resolver; node_states[] stays runner-side for the UI/M39); M33
+> `688f5fb` (PCAP service — pcap_writer_t + --pcap CLI + open/write/close;
+> the analyzer is NOT a service — stateless decoder, chip-coupled verbose,
+> moves with the UI emit at M39); M34 `7fb1c04` (progress-report service —
+> cadence + per-node summary via a describe callback, explicit
+> position-pinned tick).  All four are byte-identical (cross-build empty-diff
+> on sky/cc2538/firefly-subghz 2-node + 5 chains + JS broadcast; M33 adds a
+> pcap byte-diff).  **Next: M35 (JSON-test service).**
 
 Design decisions locked for this phase:
 
