@@ -42,6 +42,7 @@
 #include "gdb_stub.h"
 #include "arm_gdb.h"
 #include "pcap_writer.h"
+#include "pcap_service.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -169,9 +170,11 @@ void csim_radio_trace_filter(int s, int sr, int rcv, int rr,
                "(channel_mismatch)", s, sr, rcv, rr, s_ch, r_ch);
 }
 
-/* Optional pcap writer — opened by --pcap PATH, captures every TX frame
- * once at the on-air timestamp. */
-static pcap_writer_t pcap_writer = { 0 };
+/* Optional pcap capture — opened by --pcap PATH, captures every TX frame
+ * once at the on-air timestamp.  M33: state + lifecycle live in the pcap
+ * service (src/services/pcap_service.c); the runner feeds it the MAC bytes
+ * from the radio-bus frame_observed hook. */
+static pcap_service_t pcap_svc = { 0 };
 
 /* Statistics counters */
 static int stat_rf_frames = 0;       /* total TX frames (all node types) */
@@ -1213,7 +1216,7 @@ static void bus_host_frame_observed(void *user,
         node_states[sender_idx].radio_state = SIM_RADIO_ON;
     }
 
-    if (ui_server || verbose || pcap_writer_is_open(&pcap_writer)) {
+    if (ui_server || verbose || pcap_service_is_open(&pcap_svc)) {
         const uint8_t *buf = fi->capture;
         int buf_len = fi->capture_len;
         int fstart = -1;
@@ -1226,10 +1229,8 @@ static void bus_host_frame_observed(void *user,
         if (fstart >= 0 && fstart < buf_len) {
             int mac_off = fstart + 1;
             int mac_len = buf_len - mac_off;
-            if (pcap_writer_is_open(&pcap_writer) && mac_len > 0) {
-                pcap_writer_packet(&pcap_writer, accurate_tx_start,
-                                   buf + mac_off, mac_len);
-            }
+            pcap_service_write(&pcap_svc, accurate_tx_start,
+                               buf + mac_off, mac_len);
             pkt_info_t pinfo;
             int frame_len = buf_len - fstart;
             pkt_analyze(buf + fstart, frame_len, &pinfo);
@@ -2396,15 +2397,10 @@ sim_restart:
     /* PCAP capture: open the file and arm the TX hook in the frame
      * delivery path.  All frame transmissions will be captured at the
      * sender's on-air timestamp until the writer is closed at end. */
-    if (pcap_path) {
-        if (pcap_writer_open(&pcap_writer, pcap_path,
-                             PCAP_LINKTYPE_IEEE802_15_4_WITHFCS) == 0) {
-            printf("  PCAP: writing 802.15.4 capture to %s\n", pcap_path);
-        } else {
-            fprintf(stderr, "  PCAP: failed to open %s for writing\n", pcap_path);
-            pcap_path = NULL;
-        }
-    }
+    /* M33: open the capture (prints the status line here, preserving its
+     * position) and register the service for teardown safety. */
+    pcap_service_open(&pcap_svc, pcap_path);
+    sim_service_attach(&sim_rt, &pcap_service_ops, &pcap_svc);
 
     /* Initialize radio medium */
     radio_medium_init(&radio_medium, node_count);
@@ -3338,11 +3334,7 @@ sim_restart:
     }
 
     printf("\n--- Simulation complete ---\n");
-    if (pcap_writer_is_open(&pcap_writer)) {
-        printf("  PCAP: wrote %lld frames to %s\n",
-               (long long)pcap_writer.packet_count, pcap_path);
-        pcap_writer_close(&pcap_writer);
-    }
+    pcap_service_close(&pcap_svc);
     extern void msp430_timer_dump_ccr_counts(void);
     msp430_timer_dump_ccr_counts();
     extern int msp430_gpio_get_isr_count(void);

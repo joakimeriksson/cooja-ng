@@ -1237,9 +1237,16 @@ Milestones (one commit each, full validation gate before each):
 32. Timeline service (`src/services/timeline_service.c`): move
     `timeline_observer_cb` + `emit_*_obs` helpers + `tl_flush`/CBOR;
     the timeline owns `node_states[]`, the UI reads via an accessor.
-33. Packet-analyzer + PCAP services: split `bus_host_frame_observed`/
-    `bus_host_on_rx_frame` onto two `sim_radio_bus_host_t` clients; the
-    `--pcap` CLI + open/close become the pcap service.
+33. PCAP service: move `pcap_writer_t` + the `--pcap` CLI + open/write/
+    close lifecycle into `src/services/pcap_service.c`; the runner's single
+    radio-bus `frame_observed` hook feeds it the MAC bytes via
+    `pcap_service_write()` (the bus has one host, not per-service hosts).
+    The open/close prints stay at their original call sites for
+    byte-identity.  **The packet analyzer is NOT extracted here**: it is a
+    stateless decoder (`pkt_analyze`) whose verbose output is interleaved
+    with the UI frame-summary emit and reaches MSP430 firmware symbols
+    (`[UIP]`) — no clean service home — so it moves with the UI
+    frame-summary path in M39.
 34. Progress-printing service: per-tick progress block into a `poll()`.
 35. JSON-test service (actions + validators): observer half → `on_event`,
     timed actions drain in `poll()`, loop reads `finished` via a query.
@@ -2333,9 +2340,11 @@ the same patch.
   extract into `src/services/*_service.c` behind a `sim_service_ops_t`
   vtable host built in M31 (one fan-out observer + ordered poll + the
   §Error-policy enforcement; the full register-by-name registry is
-  Phase 8).  PCAP/analyzer stay on the bus host hooks (raw bytes +
+  Phase 8).  PCAP rides the bus host hook (raw bytes +
   `tx_start_ns` live there, not on `SIM_OBS_PACKET_FRAME`); observer-payload
-  enrichment is Phase 8+ debt.  The JS-test service routes stop through
+  enrichment is Phase 8+ debt.  The packet analyzer is a stateless decoder
+  with no service home (its verbose path reaches chip internals), so it is
+  not extracted as a service — it moves with the UI frame-summary emit (M39).  The JS-test service routes stop through
   `sim_runtime_request_stop()` + a deferred-resume queue, never re-entering
   dispatch.  End-of-run stats (M40) may stay type-specific.
 - **`--threads N` was "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
