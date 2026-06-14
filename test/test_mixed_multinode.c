@@ -175,11 +175,9 @@ static pcap_writer_t pcap_writer = { 0 };
 
 /* Statistics counters */
 static int stat_rf_frames = 0;       /* total TX frames (all node types) */
-/* The five emu-RX delivery counters moved to radio_bus.stats (M26):
- * rx_direct / rx_queued / rx_drained / rx_dropped / rx_collided. */
-static int stat_rx_frames_queued = 0;
-static int stat_rx_frames_collided = 0;
-static int stat_rx_frames_queue_full = 0;
+/* The five emu-RX delivery counters moved to radio_bus.stats (M26);
+ * the three native/JS frame counters (frame_queued / frame_queue_full /
+ * frame_collided) moved there too (M28). */
 static bool channels_dirty = false;
 static uint64_t stat_msp_byte_push[MAX_NODES];
 static uint64_t stat_msp_byte_pop[MAX_NODES];
@@ -1445,98 +1443,12 @@ static void mixed_rf_frame_handler(void *user_data, const uint8_t *frame, int le
     mixed_node_t *sender = (mixed_node_t *)user_data;
     int sender_idx = (int)(sender - nodes);
 
+    /* TX-side bookkeeping stays runner-side; the delivery loop +
+     * interference marking moved to sim_radio_bus_tx_frame (M28). */
     stat_rf_frames++;
     channels_dirty = true;  /* TX happened, channels may have changed */
     node_last_tx_ns[sender_idx] = sim_runtime_now_ns(&sim_rt);
-    /* Native sender: snap current channel into the medium before the
-     * neighbour-loop filter calls. */
-    sync_native_node_channel(sender_idx);
-
-    if (radio_medium.type != RADIO_MEDIUM_NONE) {
-        /* UDGM: iterate precomputed TX-range neighbors */
-        neighbor_list_t *nl = &radio_medium.neighbors[sender_idx];
-        for (int n = 0; n < nl->count; n++) {
-            int i = nl->neighbors[n];
-            if (nodes[i].type == NODE_NATIVE) {
-                /* Native receiver: snap channel before filter consults it. */
-                sync_native_node_channel(i);
-                /* Direct delivery to simInDataBuffer if possible.
-                 * Force simRadioHWOn=1 to prevent firmware from dropping.
-                 * Queue to rx_queue as fallback if simInSize > 0. */
-                if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
-                    native_node_t *rcv = &nodes[i].plat.native;
-                    if (*rcv->simInSize == 0) {
-                        memcpy(rcv->simInDataBuffer, frame, (size_t)len);
-                        *rcv->simInSize = len;
-                        /* Set packet timestamp (TSCH uses this for sync) */
-                        if (rcv->simLastPacketTimestamp)
-                            *rcv->simLastPacketTimestamp =
-                                (uint64_t)(sim_runtime_now_ns(&sim_rt) / 1000LL);
-                    } else {
-                        native_deliver_frame(rcv, frame, len,
-                                             sim_runtime_now_ns(&sim_rt), sender_idx);
-                    }
-                    stat_rx_frames_queued++;
-                }
-            } else if (mote_store[i].ops->receive_frame) {
-                /* JS (or any future frame-consuming mote kind) — M17 op */
-                if (radio_medium_filter_frame(&radio_medium, sender_idx, i)) {
-                    if (mote_store[i].ops->receive_frame(
-                            &mote_store[i], frame, len,
-                            sim_runtime_now_ns(&sim_rt), sender_idx) < 0)
-                        stat_rx_frames_queue_full++;
-                    stat_rx_frames_queued++;
-                }
-            }
-            /* Native/JS-to-emulated: handled via rf_tx_callback (byte stream) */
-        }
-
-        /* Interference-range neighbors: mark overlapping frames as collided */
-        neighbor_list_t *inl = &radio_medium.interference_neighbors[sender_idx];
-        int64_t tx_start = sim_runtime_now_ns(&sim_rt);
-        int64_t tx_end = tx_start + (int64_t)(len + 6) * 32000LL;
-        for (int n = 0; n < inl->count; n++) {
-            int i = inl->neighbors[n];
-            if (nodes[i].type == NODE_NATIVE) {
-                native_rx_queue_t *q = &nodes[i].plat.native.rx_queue;
-                for (int f = 0; f < q->count; f++) {
-                    int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
-                    native_pending_frame_t *existing = &q->frames[idx];
-                    if (tx_start < existing->end_ns &&
-                        existing->arrival_ns < tx_end) {
-                        if (!existing->collided) stat_rx_frames_collided++;
-                        existing->collided = true;
-                    }
-                }
-            } else {
-                /* Emulated receiver: mark queued frames as collided */
-                emu_rx_queue_t *q = &emu_rx_queue[i];
-                for (int f = 0; f < q->count; f++) {
-                    int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
-                    emu_rx_frame_t *existing = &q->frames[fi];
-                    if (tx_start < existing->end_ns &&
-                        existing->arrival_ns < tx_end) {
-                        if (!existing->collided) radio_bus.stats.rx_collided++;
-                        existing->collided = true;
-                    }
-                }
-            }
-        }
-    } else {
-        /* NONE: deliver to all other frame-consuming nodes (M17 op;
-         * NULL = emulated, fed via the byte stream instead) */
-        for (int i = 0; i < num_nodes; i++) {
-            if (&nodes[i] == sender) continue;
-            sim_mote_t *m = &mote_store[i];
-            if (m->ops->receive_frame) {
-                if (m->ops->receive_frame(m, frame, len,
-                                          sim_runtime_now_ns(&sim_rt),
-                                          sender_idx) < 0)
-                    stat_rx_frames_queue_full++;
-                stat_rx_frames_queued++;
-            }
-        }
-    }
+    sim_radio_bus_tx_frame(&radio_bus, &sim_rt, sender_idx, frame, len);
 }
 
 /* Deliver buffered RF bytes to a native node's assembler.
@@ -1913,8 +1825,8 @@ static void distribute_rf_outgoing(void) {
                             if (m->ops->receive_frame(m, frame, len,
                                                       sim_runtime_now_ns(&sim_rt),
                                                       sender) < 0)
-                                stat_rx_frames_queue_full++;
-                            stat_rx_frames_queued++;
+                                radio_bus.stats.frame_queue_full++;
+                            radio_bus.stats.frame_queued++;
                         }
                     }
                 }
@@ -1931,7 +1843,7 @@ static void distribute_rf_outgoing(void) {
                             native_pending_frame_t *existing = &q->frames[idx];
                             if (tx_start < existing->end_ns &&
                                 existing->arrival_ns < tx_end) {
-                                if (!existing->collided) stat_rx_frames_collided++;
+                                if (!existing->collided) radio_bus.stats.frame_collided++;
                                 existing->collided = true;
                             }
                         }
@@ -1955,8 +1867,8 @@ static void distribute_rf_outgoing(void) {
                         if (m->ops->receive_frame(m, frame, len,
                                                   sim_runtime_now_ns(&sim_rt),
                                                   sender) < 0)
-                            stat_rx_frames_queue_full++;
-                        stat_rx_frames_queued++;
+                            radio_bus.stats.frame_queue_full++;
+                        radio_bus.stats.frame_queued++;
                     }
                 }
             }
@@ -3575,7 +3487,7 @@ sim_restart:
                     .rf_bytes = rf_byte_count,
                     .uart_bytes = uart_byte_count,
                     .rx_frames_queued = (int)radio_medium.next_frame_id + stat_rf_frames,
-                    .rx_frames_collided = stat_rx_frames_collided,
+                    .rx_frames_collided = radio_bus.stats.frame_collided,
                     .speed_ratio = ui_speed_ratio,
                     .paused = ui_paused,
                 };
@@ -3755,9 +3667,9 @@ sim_restart:
         radio_bus.stats.rx_drained = 0;
         radio_bus.stats.rx_dropped = 0;
         radio_bus.stats.rx_collided = 0;
-        stat_rx_frames_queued = 0;
-        stat_rx_frames_collided = 0;
-        stat_rx_frames_queue_full = 0;
+        radio_bus.stats.frame_queued = 0;
+        radio_bus.stats.frame_collided = 0;
+        radio_bus.stats.frame_queue_full = 0;
         channels_dirty = false;
         memset(rf_pending, 0, sizeof(rf_pending));
         memset(emu_rx_queue, 0, sizeof(emu_rx_queue));
@@ -3953,9 +3865,9 @@ sim_restart:
     printf("  MSP byte queue 2->1: pushed=%llu popped=%llu\n",
            (unsigned long long)stat_msp_byte_push_2_to_1,
            (unsigned long long)stat_msp_byte_pop_2_to_1);
-    printf("  Native RX frames queued: %d\n", stat_rx_frames_queued);
-    printf("  Native RX frames collided: %d\n", stat_rx_frames_collided);
-    printf("  Native RX frames queue full: %d\n", stat_rx_frames_queue_full);
+    printf("  Native RX frames queued: %d\n", radio_bus.stats.frame_queued);
+    printf("  Native RX frames collided: %d\n", radio_bus.stats.frame_collided);
+    printf("  Native RX frames queue full: %d\n", radio_bus.stats.frame_queue_full);
     extern int cc2538_rfcore_get_rxfifo_overflows(void);
     printf("  CC2538 RXFIFO overflows: %d\n", cc2538_rfcore_get_rxfifo_overflows());
     { int s,c,rej,ov,cg,cb,dr;

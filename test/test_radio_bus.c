@@ -81,10 +81,10 @@ static bool mock_rx_busy(void *m) { return ((mock_rx_t *)m)->busy; }
 static void mock_rx_stall(void *m) { ((mock_rx_t *)m)->stall_count++; }
 
 static const mote_radio_ops_t mock_ops = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL,
 };
 static const mote_radio_ops_t mock_ops_stall = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL,
 };
 
 /* ============================================================

@@ -272,7 +272,7 @@ static void arm_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
 static bool arm_radio_rx_busy(void *m) { (void)m; return false; }
 static const mote_radio_ops_t arm_radio_ops = {
     arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy,
-    NULL /* rx_stall */, NULL /* current_channel */
+    NULL /* rx_stall */, NULL /* current_channel */, NULL /* mark_collisions */
 };
 
 /* nrf54l15 variant: same endpoint plus the RX-stall recovery op (M9.5).
@@ -285,7 +285,7 @@ static void arm54l_radio_rx_stall(void *m) {
 }
 static const mote_radio_ops_t arm54l_radio_ops = {
     arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy,
-    arm54l_radio_rx_stall, NULL /* current_channel */
+    arm54l_radio_rx_stall, NULL /* current_channel */, NULL /* mark_collisions */
 };
 
 void arm_elf_mote_register_radio(mixed_node_t *node, int slot,

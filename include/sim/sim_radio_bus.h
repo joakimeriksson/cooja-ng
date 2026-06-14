@@ -120,6 +120,11 @@ typedef struct mote_radio_ops {
      * bus syncs it into the medium before filtering.  NULL for motes that
      * push their channel synchronously through a chip callback. */
     int (*current_channel)(void *mote);
+    /* Optional (M28): mark this mote's own queued RX frames that overlap
+     * [start_ns, end_ns) as collided; returns the number newly marked.
+     * Only motes that keep their RX queue mote-side (native Cooja) set
+     * this; the bus marks its own emu_rx_queue directly for others. */
+    int (*mark_collisions)(void *mote, int64_t start_ns, int64_t end_ns);
 } mote_radio_ops_t;
 
 /* How TX bytes reach a registered receiver (M9.4).  Chosen by the runner
@@ -231,6 +236,11 @@ typedef struct sim_radio_bus_stats {
     int rx_drained;   /* frames delivered out of an emu RX queue       */
     int rx_dropped;   /* frames dropped because the queue was full     */
     int rx_collided;  /* frames dropped due to an RF collision         */
+    /* M28: frame-level (native/JS) RX path counters (ex the runner's
+     * stat_rx_frames_*). */
+    int frame_queued;     /* frames delivered/queued to a native/JS mote */
+    int frame_queue_full; /* of those, the mote's RX queue was full      */
+    int frame_collided;   /* native queued frames marked collided        */
 } sim_radio_bus_stats_t;
 
 /* The bus: all RF routing state, one instance per runtime. */
@@ -366,6 +376,14 @@ void sim_radio_bus_drain_rx(sim_radio_bus_t *bus, struct sim_runtime *sim,
  * emulated motes only. */
 void sim_radio_bus_wake_mote(sim_radio_bus_t *bus, struct sim_runtime *sim,
                              int idx);
+
+/* M28: deliver a complete frame from a native/JS sender to its
+ * frame-consuming neighbours (the ones with a receive_frame mote op) and
+ * mark interference-range collisions.  Ex the runner's
+ * mixed_rf_frame_handler delivery loop; the runner wrapper keeps the
+ * TX-side bookkeeping (stat_rf_frames, channels_dirty, last_tx_ns). */
+void sim_radio_bus_tx_frame(sim_radio_bus_t *bus, struct sim_runtime *sim,
+                            int sender_idx, const uint8_t *frame, int len);
 
 /* M28: push a (radio_idx, channel) change for node idx into the medium —
  * auto-registers the slot's spectrum on first push (slot 0 = 2.4 GHz,

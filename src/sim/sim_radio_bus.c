@@ -778,3 +778,75 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
         !bus->defer_wakeups)
         sim_radio_bus_wake_mote(bus, sim, sender_idx);
 }
+
+/* ============================================================
+ * Frame-level TX path for native/JS senders (M28 — moved from the
+ * runner's mixed_rf_frame_handler delivery loop).  Delivers a complete
+ * frame to every frame-consuming neighbour through its receive_frame
+ * mote op (native's op now does the direct-buffer-or-queue fast path),
+ * and marks interference-range collisions (native via its
+ * mark_collisions op, emulated queues bus-side).
+ * ============================================================ */
+void sim_radio_bus_tx_frame(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                            int sender_idx, const uint8_t *frame, int len) {
+    radio_medium_t *medium = &sim->radio_medium;
+    int64_t now = sim_runtime_now_ns(sim);
+
+    /* Native sender: pull its channel into the medium before filtering. */
+    bus_sync_channel(bus, sim, sender_idx);
+
+    if (medium->type != RADIO_MEDIUM_NONE) {
+        neighbor_list_t *nl = &medium->neighbors[sender_idx];
+        for (int n = 0; n < nl->count; n++) {
+            int i = nl->neighbors[n];
+            /* Native receiver: snap channel before the filter consults
+             * it (no-op for chip motes, which push their channel). */
+            bus_sync_channel(bus, sim, i);
+            sim_mote_t *m = sim_runtime_mote(sim, i);
+            if (m && m->ops->receive_frame) {
+                if (radio_medium_filter_frame(medium, sender_idx, i)) {
+                    if (m->ops->receive_frame(m, frame, len, now, sender_idx) < 0)
+                        bus->stats.frame_queue_full++;
+                    bus->stats.frame_queued++;
+                }
+            }
+            /* Native/JS-to-emulated is handled via the byte-stream TX
+             * callback, not this frame path. */
+        }
+
+        /* Interference-range neighbours: mark overlapping queued frames
+         * as collided. */
+        neighbor_list_t *inl = &medium->interference_neighbors[sender_idx];
+        int64_t tx_start = now;
+        int64_t tx_end = tx_start + (int64_t)(len + 6) * IEEE802154_BYTE_NS;
+        for (int n = 0; n < inl->count; n++) {
+            int i = inl->neighbors[n];
+            if (bus->ops[i] && bus->ops[i]->mark_collisions) {
+                bus->stats.frame_collided +=
+                    bus->ops[i]->mark_collisions(bus->mote[i], tx_start, tx_end);
+            } else {
+                emu_rx_queue_t *q = &bus->emu_rx_queue[i];
+                for (int f = 0; f < q->count; f++) {
+                    int fi = (q->head + f) % EMU_RX_QUEUE_SIZE;
+                    emu_rx_frame_t *existing = &q->frames[fi];
+                    if (tx_start < existing->end_ns &&
+                        existing->arrival_ns < tx_end) {
+                        if (!existing->collided) bus->stats.rx_collided++;
+                        existing->collided = true;
+                    }
+                }
+            }
+        }
+    } else {
+        /* NONE: deliver to every other frame-consuming node. */
+        for (int i = 0; i < bus->node_count; i++) {
+            if (i == sender_idx) continue;
+            sim_mote_t *m = sim_runtime_mote(sim, i);
+            if (m && m->ops->receive_frame) {
+                if (m->ops->receive_frame(m, frame, len, now, sender_idx) < 0)
+                    bus->stats.frame_queue_full++;
+                bus->stats.frame_queued++;
+            }
+        }
+    }
+}

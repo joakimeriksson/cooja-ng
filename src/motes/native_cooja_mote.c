@@ -72,12 +72,28 @@ static int native_radio_current_channel(void *m) {
     if (!nat->simRadioChannel) return -2;
     return *nat->simRadioChannel;
 }
+/* M28: mark this native mote's queued RX frames overlapping [start, end)
+ * as collided; returns the count newly marked. */
+static int native_radio_mark_collisions(void *m, int64_t start, int64_t end) {
+    native_rx_queue_t *q = &((mixed_node_t *)m)->plat.native.rx_queue;
+    int marked = 0;
+    for (int f = 0; f < q->count; f++) {
+        int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
+        native_pending_frame_t *existing = &q->frames[idx];
+        if (start < existing->end_ns && existing->arrival_ns < end) {
+            if (!existing->collided) marked++;
+            existing->collided = true;
+        }
+    }
+    return marked;
+}
 static const mote_radio_ops_t native_radio_ops = {
     .receive_byte     = native_radio_receive_byte,
     .rxfifo_available = native_radio_rxfifo_available,
     .rx_busy          = native_radio_rx_busy,
     .rx_stall         = NULL,
     .current_channel  = native_radio_current_channel,
+    .mark_collisions  = native_radio_mark_collisions,
 };
 
 void native_cooja_mote_register_radio(mixed_node_t *node, int slot,
@@ -336,9 +352,20 @@ static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
                                      int len, int64_t now_ns,
                                      int sender_idx) {
     native_node_t *nat = &MOTE_IMPL(m)->plat.native;
+    /* M28: the direct-to-simInDataBuffer fast path (ex the runner's
+     * mixed_rf_frame_handler inline native branch) — deliver immediately
+     * when the RX buffer is free, force-setting the packet timestamp TSCH
+     * keys on; otherwise fall back to the deferred RX queue. */
+    if (*nat->simInSize == 0) {
+        memcpy(nat->simInDataBuffer, frame, (size_t)len);
+        *nat->simInSize = len;
+        if (nat->simLastPacketTimestamp)
+            *nat->simLastPacketTimestamp = (uint64_t)(now_ns / 1000LL);
+        return 0;
+    }
     int rc = (nat->rx_queue.count >= NATIVE_RX_QUEUE_SIZE) ? -1 : 0;
     native_deliver_frame(nat, frame, len, now_ns, sender_idx);
-    return rc;  /* <0 = queue was full; caller owns the stats (M19) */
+    return rc;  /* <0 = queue was full; caller owns the stats */
 }
 
 const sim_mote_ops_t native_cooja_mote_ops = {
