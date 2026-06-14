@@ -35,6 +35,7 @@
 #include "js_test_engine.h"
 #include "json_test_service.h"
 #include "js_test_service.h"
+#include "gdb_service.h"
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
 #include "sim_board.h"
@@ -302,10 +303,6 @@ static sim_external_command_t external_cmd;
  * (mixed_rf_state_handler, update_radio_state) and the UI broadcast reads
  * it for CBOR deltas — those move to the UI service in M39. */
 static timeline_service_t timeline_svc;
-static int timeline_node_id(int mote_index) {
-    if (mote_index < 0 || mote_index >= MAX_NODES) return -1;
-    return nodes[mote_index].id;
-}
 static sim_node_state_t node_states[MAX_NODES];
 static sim_node_state_t prev_node_states[MAX_NODES]; /* previous delta state for change detection */
 static int64_t prev_last_tx_ns[MAX_NODES];           /* previous TX timestamps for change detection */
@@ -657,6 +654,14 @@ static int64_t node_instructions(int idx) {
 
 static const char *node_type_str(int idx) {
     return mote_store[idx].ops->kind;
+}
+
+/* Shared mote-index → Cooja node-id resolver, handed to the services that
+ * need it (timeline M32, progress M34, gdb M37) so they don't touch
+ * nodes[]. */
+static int mote_node_id(int mote_index) {
+    if (mote_index < 0 || mote_index >= MAX_NODES) return -1;
+    return nodes[mote_index].id;
 }
 
 /* M34: per-tick progress report is a service; this resolver hands it each
@@ -1832,11 +1837,10 @@ static void step_node_until(int idx, int64_t target) {
  * native_has_pending_work live in src/motes/native_cooja_mote.c —
  * M20.  native_had_tx[] became node->native_had_tx.) */
 
-/* GDB stub state (file scope so the kernel-pump event dispatcher can
- * poll stubs from dispatch_mote_wakeup — M10).  gdb_node[i] is the TCP
- * port to bind for node i, or 0 = no stub. */
-static int gdb_node[MAX_NODES];
-static gdb_stub_t gdb_stubs[MAX_NODES];
+/* GDB stub state (M37: owned by the gdb service).  The ARM execute slice
+ * polls each CPU's own cpu->gdb_stub back-pointer (set by the service at
+ * attach), so the runner no longer indexes stub storage by slot. */
+static gdb_service_t gdb_svc;
 
 /* Schedule an emulated node's next wakeup */
 /* Body moved to sim_radio_bus_wake_mote (M27); thin forwarder keeps the
@@ -1893,14 +1897,16 @@ static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
      * are anchored to the scheduler's event time and the CPU accumulates
      * cycle time with the MSPSim stepMicros accuracy bound. */
 
-    /* GDB stub: poll for incoming commands; if the CPU is halted at a
-     * breakpoint, skip the tick and return a +1µs wakeup so we keep
-     * checking the stub.  (The caller still runs post-tick RF
-     * distribution, matching the old goto arm_tick_done flow.) */
-    if (gdb_node[idx] != 0) {
-        gdb_stub_poll(&gdb_stubs[idx]);
-        if (gdb_stubs[idx].halted) {
-            nodes[idx].plat.arm.cpu.stopping = false;
+    /* GDB stub (M37: consulted via the CPU's own back-pointer, set by the
+     * gdb service at attach — no runner-side stub table).  Poll for
+     * incoming commands; if the CPU is halted at a breakpoint, skip the
+     * tick and return a +1µs wakeup so we keep checking the stub. */
+    arm_cpu_t *gdb_cpu = &nodes[idx].plat.arm.cpu;
+    gdb_stub_t *gdb = (gdb_stub_t *)gdb_cpu->gdb_stub;
+    if (gdb) {
+        gdb_stub_poll(gdb);
+        if (gdb->halted) {
+            gdb_cpu->stopping = false;
             return now_ns + 1000LL;
         }
     }
@@ -1912,9 +1918,9 @@ static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
     /* GDB stub: a breakpoint may have fired during the tick.  Clear the
      * cpu->stopping flag set by gdb_stub_check_breakpoint so subsequent
      * ticks (after `continue`) can run again. */
-    if (gdb_node[idx] != 0) {
-        nodes[idx].plat.arm.cpu.stopping = false;
-        if (gdb_stubs[idx].halted)
+    if (gdb) {
+        gdb_cpu->stopping = false;
+        if (gdb->halted)
             return now_ns + 1000LL;  /* poll the stub again soon */
     }
 
@@ -2158,7 +2164,6 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int sim_ms_set = 0;  /* track if -t was given (overrides config) */
     int ui_enabled = 0;
     int ui_port = 8080;
-    int gdb_wait = 0;  /* if true, block on first connect before starting sim */
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
     sim_config_t config;
@@ -2188,12 +2193,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 port = atoi(spec);
             }
             if (node >= 1 && node <= MAX_NODES && port > 0)
-                gdb_node[node - 1] = port;
+                gdb_svc.port[node - 1] = port;
             else
                 fprintf(stderr, "--gdb: bad spec '%s' (use [node:]port)\n", spec);
         }
         else if (strcmp(argv[i], "--gdb-wait") == 0) {
-            gdb_wait = 1;
+            gdb_svc.wait = true;
         }
         else if (strcmp(argv[i], "--pcap") == 0 && i + 1 < argc) {
             pcap_path = argv[++i];
@@ -2298,40 +2303,13 @@ sim_restart:
             printf("  Node %d: clock deviation=%.10f\n", nodes[i].id, nodes[i].clock_deviation);
     }
 
-    /* GDB stubs: bind one TCP listener per --gdb-tagged node, attach the
-     * arch vtable, and optionally block until a client connects. */
-    bool any_gdb = false;
-    for (int i = 0; i < node_count; i++) {
-        if (gdb_node[i] == 0) continue;
-        /* M16: ask the mote for its ARM CPU instead of testing type. */
-        arm_cpu_t *gdb_cpu = (arm_cpu_t *)mote_store[i].ops->get_interface(
-            &mote_store[i], SIM_MOTE_IFACE_ARM_CPU);
-        if (!gdb_cpu) {
-            fprintf(stderr, "  Node %d: --gdb only supports ARM nodes for now (skipped)\n",
-                    nodes[i].id);
-            gdb_node[i] = 0;
-            continue;
-        }
-        if (gdb_stub_init(&gdb_stubs[i], gdb_node[i]) != 0) {
-            fprintf(stderr, "  Node %d: failed to bind GDB stub on port %d\n",
-                    nodes[i].id, gdb_node[i]);
-            gdb_node[i] = 0;
-            continue;
-        }
-        gdb_stub_attach(&gdb_stubs[i], gdb_cpu, &arm_gdb_ops);
-        gdb_cpu->gdb_stub = &gdb_stubs[i];
-        any_gdb = true;
-        printf("  Node %d: GDB stub on port %d (connect with: target remote :%d)\n",
-               nodes[i].id, gdb_node[i], gdb_node[i]);
-    }
-    if (any_gdb && gdb_wait) {
-        for (int i = 0; i < node_count; i++) {
-            if (gdb_node[i] == 0) continue;
-            printf("  Node %d: waiting for GDB on port %d ...\n",
-                   nodes[i].id, gdb_node[i]);
-            if (gdb_stub_wait_for_client(&gdb_stubs[i]) != 0)
-                fprintf(stderr, "  Node %d: GDB wait failed\n", nodes[i].id);
-        }
+    /* GDB stubs (M37: the gdb service binds one TCP listener per
+     * --gdb-tagged node, attaches the arch vtable, sets each cpu->gdb_stub,
+     * and optionally blocks until a client connects).  Register it for
+     * teardown only when configured. */
+    if (gdb_service_configured(&gdb_svc)) {
+        gdb_service_attach_all(&gdb_svc, &sim_rt, node_count, mote_node_id);
+        sim_service_attach(&sim_rt, &gdb_service_ops, &gdb_svc);
     }
 
     /* PCAP capture: open the file and arm the TX hook in the frame
@@ -2488,7 +2466,7 @@ sim_restart:
      * it.  Attaching here (right after the test-engine observer, before the
      * serial services) keeps the fan-out order identical to the old direct
      * timeline subscription. */
-    timeline_svc.node_id = timeline_node_id;
+    timeline_svc.node_id = mote_node_id;
     sim_service_attach(&sim_rt, &timeline_service_ops, &timeline_svc);
     memset(node_states, 0, sizeof(node_states));
     memset(prev_node_states, 0, sizeof(prev_node_states));
