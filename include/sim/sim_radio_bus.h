@@ -114,6 +114,12 @@ typedef struct mote_radio_ops {
      * detector would.  NULL when the platform has no stalled-parser
      * hazard; the bus only arms the timer when this op is set. */
     void (*rx_stall)(void *mote);
+    /* Optional (M28): pull-model channel for motes with no push callback
+     * (native Cooja reads simRadioChannel).  Returns the current channel,
+     * or a value < -1 ("no channel reported") that the bus ignores.  The
+     * bus syncs it into the medium before filtering.  NULL for motes that
+     * push their channel synchronously through a chip callback. */
+    int (*current_channel)(void *mote);
 } mote_radio_ops_t;
 
 /* How TX bytes reach a registered receiver (M9.4).  Chosen by the runner
@@ -185,9 +191,8 @@ typedef struct sim_radio_bus_host {
     void *user;
     /* False while a node hasn't reached its startup-delay time (no RF). */
     bool (*node_active)(void *user, int idx);
-    /* Pull a native mote's channel into the medium before filtering
-     * (chip motes push synchronously through their FSCTRL callbacks). */
-    void (*sync_channel)(void *user, int idx);
+    /* (M28: the native channel pull moved to the current_channel mote
+     * op + the bus's bus_sync_channel; the sync_channel hook is gone.) */
     /* Optional: one call per TX byte before dispatch.  depth > 0 means
      * the byte re-entered from a receiver's auto-ACK. */
     void (*on_tx_byte)(void *user, int sender, uint8_t byte,
@@ -361,6 +366,14 @@ void sim_radio_bus_drain_rx(sim_radio_bus_t *bus, struct sim_runtime *sim,
  * emulated motes only. */
 void sim_radio_bus_wake_mote(sim_radio_bus_t *bus, struct sim_runtime *sim,
                              int idx);
+
+/* M28: push a (radio_idx, channel) change for node idx into the medium —
+ * auto-registers the slot's spectrum on first push (slot 0 = 2.4 GHz,
+ * slot 1 = sub-GHz) and mirrors the legacy single-channel alias the CCA
+ * query still reads.  Ex the runner's mixed_node_radio_set_channel body.
+ * The runner wrapper keeps the idx bound + the trace. */
+void sim_radio_bus_push_channel(sim_radio_bus_t *bus, struct sim_runtime *sim,
+                                int idx, int radio_idx, int channel);
 
 /* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
  * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. Using the

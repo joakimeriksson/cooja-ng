@@ -64,9 +64,20 @@ static void native_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
 }
 static int native_radio_rxfifo_available(void *m) { (void)m; return 0; }
 static bool native_radio_rx_busy(void *m) { (void)m; return false; }
+/* M28: native motes report their channel by pull (they have no chip
+ * FSCTRL callback) — the bus syncs it into the medium before filtering.
+ * -2 = "no channel reported" (simRadioChannel pointer unset). */
+static int native_radio_current_channel(void *m) {
+    native_node_t *nat = &((mixed_node_t *)m)->plat.native;
+    if (!nat->simRadioChannel) return -2;
+    return *nat->simRadioChannel;
+}
 static const mote_radio_ops_t native_radio_ops = {
-    native_radio_receive_byte, native_radio_rxfifo_available,
-    native_radio_rx_busy, NULL /* rx_stall */
+    .receive_byte     = native_radio_receive_byte,
+    .rxfifo_available = native_radio_rxfifo_available,
+    .rx_busy          = native_radio_rx_busy,
+    .rx_stall         = NULL,
+    .current_channel  = native_radio_current_channel,
 };
 
 void native_cooja_mote_register_radio(mixed_node_t *node, int slot,

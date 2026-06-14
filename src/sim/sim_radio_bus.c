@@ -196,6 +196,52 @@ int sim_radio_bus_pick_receiver_radio(const radio_medium_t *medium,
     return -1;
 }
 
+void sim_radio_bus_push_channel(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                                int idx, int radio_idx, int channel) {
+    (void)bus;
+    radio_medium_t *rm = &sim->radio_medium;
+    /* Slot 0 = 2.4 GHz primary; slot 1 = sub-GHz (CC1200) by convention. */
+    if (radio_idx < 0 || radio_idx >= RADIO_MEDIUM_MAX_RADIOS_PER_NODE) return;
+    /* Auto-register the radio's spectrum on first channel push so
+     * pick_receiver_radio routes per-band instead of falling back to
+     * slot 0 (which would send CC1200 bytes to a parked cc2538_rfcore). */
+    if (channel >= 0 &&
+        rm->nodes[idx].radios[radio_idx].spectrum == RADIO_SPECTRUM_NONE) {
+        radio_spectrum_t want = (radio_idx == 0)
+            ? RADIO_SPECTRUM_2_4GHZ_15_4
+            : RADIO_SPECTRUM_868MHZ_15_4G;
+        radio_medium_register_radio(rm, idx, radio_idx, want);
+    }
+    radio_medium_set_radio_channel(rm, idx, radio_idx, channel);
+    /* Legacy single-channel alias mirror (the CCA channel-busy query and
+     * a few older readers still key on nodes[i].channel): sub-GHz radios
+     * appear at SUBGHZ_CHANNEL_BASE + channel; a 2.4 GHz radio writes the
+     * raw channel only if slot 1 is unregistered (on dual-radio Firefly
+     * the cc1200 is the active radio, so cc2538_rfcore must not stomp the
+     * alias and flip the band gate). */
+    if (radio_idx == 1 && channel >= 0) {
+        rm->nodes[idx].channel = RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE + channel;
+    } else if (radio_idx == 0) {
+        bool slot1_registered =
+            rm->nodes[idx].radios[1].spectrum != RADIO_SPECTRUM_NONE;
+        if (!slot1_registered)
+            rm->nodes[idx].channel = channel;
+    }
+}
+
+/* M28: pull a native mote's channel into the medium before filtering
+ * (chip motes push synchronously through their channel callbacks, so
+ * they leave current_channel NULL and this is a no-op for them).
+ * Mirrors the runner's old sync_native_node_channel. */
+static void bus_sync_channel(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                             int idx) {
+    if (!bus->ops[idx] || !bus->ops[idx]->current_channel) return;
+    int ch = bus->ops[idx]->current_channel(bus->mote[idx]);
+    if (ch < -1) return;  /* no channel reported */
+    if (sim->radio_medium.nodes[idx].radios[0].channel == ch) return;
+    radio_medium_set_channel(&sim->radio_medium, idx, ch);
+}
+
 /* Dispatch one on-air byte to every receiver the medium accepts.
  * Identical policy for outer and re-entrant (auto-ACK) bytes; `depth`
  * only flows into the host's debug hooks. */
@@ -215,7 +261,7 @@ static void dispatch_tx_byte(sim_radio_bus_t *bus, sim_runtime_t *sim,
         if (sender_sync && bus->delivery[i] == SIM_RADIO_DELIVERY_SYNC)
             continue;
         /* Native receiver: pull current channel before the medium decides. */
-        if (h->sync_channel) h->sync_channel(h->user, i);
+        bus_sync_channel(bus, sim, i);
         int rr = sim_radio_bus_pick_receiver_radio(medium, sender_idx,
                                                    sender_radio, i);
         if (rr < 0) continue;

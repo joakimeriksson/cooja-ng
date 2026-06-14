@@ -1089,53 +1089,13 @@ static void mixed_node_radio_set_channel(mixed_node_t *node, int radio_idx,
                                           int channel) {
     int idx = (int)(node - nodes);
     if (idx < 0 || idx >= num_nodes) return;
-    /* Keep slot 0 reserved for the 2.4 GHz primary radio; CC1200 lives
-     * on slot 1 by convention. The chip drivers already call us with
-     * the correct slot, so this is just a defensive sanity guard. */
-    if (radio_idx < 0 || radio_idx >= RADIO_MEDIUM_MAX_RADIOS_PER_NODE) return;
+    /* Trace stays runner-side (the spectrum-register + alias-mirror body
+     * moved to sim_radio_bus_push_channel, M28). */
     int prev = radio_medium.nodes[idx].radios[radio_idx].channel;
     if (prev != channel)
         RTRACE("ch_set node=%d radio=%d ch=%d (was %d)",
                idx, radio_idx, channel, prev);
-    /* Auto-register the radio's spectrum on first channel push if not
-     * already registered. Without this, pick_receiver_radio sees
-     * SPECTRUM_NONE and falls back to "target slot 0" — which routes
-     * CC1200 (slot 1) bytes to the receiver's parked cc2538_rfcore
-     * (slot 0) instead of to its CC1200. Convention:
-     *   slot 0 → 2.4 GHz IEEE 802.15.4 (CC2420 / cc2538_rfcore)
-     *   slot 1 → sub-GHz 802.15.4g (CC1200 EU 868 MHz default)
-     * This is harness-side metadata; chip drivers stay portable
-     * (they just push a (radio_idx, channel) pair). */
-    if (channel >= 0 &&
-        radio_medium.nodes[idx].radios[radio_idx].spectrum
-            == RADIO_SPECTRUM_NONE) {
-        radio_spectrum_t want = (radio_idx == 0)
-            ? RADIO_SPECTRUM_2_4GHZ_15_4
-            : RADIO_SPECTRUM_868MHZ_15_4G;
-        radio_medium_register_radio(&radio_medium, idx, radio_idx, want);
-    }
-    radio_medium_set_radio_channel(&radio_medium, idx, radio_idx, channel);
-    /* Legacy alias — the CCA channel-busy query and a couple of older
-     * call sites still read radio_medium.nodes[i].channel directly.
-     * Mirror writes onto the legacy alias so those readers keep
-     * returning the same answer they did before the per-radio refactor:
-     *   - sub-GHz radios (slot 1) appear as RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE
-     *     + their channel (legacy "channel >= base means sub-GHz")
-     *   - 2.4 GHz radios (slot 0) write the raw channel ONLY if slot 1
-     *     is not registered. On dual-radio Firefly nodes the cc1200 is
-     *     the active radio (NETSTACK_RADIO=cc1200_driver), so the
-     *     CCA-busy query keys on its channel. Letting cc2538_rfcore
-     *     (parked) stomp the alias would flip the band gate and kill
-     *     all sub-GHz CCA. */
-    if (radio_idx == 1 && channel >= 0) {
-        radio_medium.nodes[idx].channel =
-            RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE + channel;
-    } else if (radio_idx == 0) {
-        bool slot1_registered =
-            radio_medium.nodes[idx].radios[1].spectrum != RADIO_SPECTRUM_NONE;
-        if (!slot1_registered)
-            radio_medium.nodes[idx].channel = channel;
-    }
+    sim_radio_bus_push_channel(&radio_bus, &sim_rt, idx, radio_idx, channel);
 }
 
 /* sim_host_t adapter (off-SoC chip drivers). */
@@ -1244,11 +1204,6 @@ static void mixed_rf_tx_handler_radio(int sender_idx, int sender_radio, uint8_t 
 static bool bus_host_node_active(void *user, int idx) {
     (void)user;
     return node_active(idx) != 0;
-}
-
-static void bus_host_sync_channel(void *user, int idx) {
-    (void)user;
-    sync_native_node_channel(idx);
 }
 
 /* M26: the bus delivered a frame's on-air bytes to emulated receiver
@@ -2695,7 +2650,6 @@ int run_mixed_multinode_test(int argc, char **argv) {
         static const sim_radio_bus_host_t mixed_bus_host = {
             .user = NULL,
             .node_active = bus_host_node_active,
-            .sync_channel = bus_host_sync_channel,
             .on_tx_byte = bus_host_on_tx_byte,
             .on_byte_accepted = bus_host_on_byte_accepted,
             .frame_observed = bus_host_frame_observed,

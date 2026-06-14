@@ -241,7 +241,7 @@ static bool msp_radio_rx_busy(void *m) {
 }
 static const mote_radio_ops_t msp_radio_ops = {
     msp_radio_receive_byte, msp_radio_rxfifo_available, msp_radio_rx_busy,
-    NULL /* rx_stall */
+    NULL /* rx_stall */, NULL /* current_channel */
 };
 
 void msp430_elf_mote_register_radio(mixed_node_t *node, int slot,
