@@ -7,10 +7,9 @@
  * instead of switching on node_type_t.  Rows are data: adding a mote
  * kind means adding a module and a row, not editing the runner.
  *
- * The MSP430/ARM `ops` slots start NULL and are injected by the
- * runner (sim_mote_kind_set_ops) because those adapter tables still
- * live runner-side — they follow their dependencies in Phase 5/6.
- * Phase 8 folds this table into the full sim_registry.
+ * Every kind's `ops` is module-owned (M38 moved the MSP430/ARM adapter
+ * tables into their modules, retiring the runner injection).  Phase 8
+ * folds this table into the full sim_registry.
  */
 #include "mote_impl.h"
 
@@ -20,14 +19,14 @@ static sim_mote_kind_t kinds[] = {
         .node_type      = NODE_MSP430,
         .boot           = msp430_elf_mote_boot,
         .register_radio = msp430_elf_mote_register_radio,
-        .ops            = NULL,   /* runner-injected until Phase 5/6 */
+        .ops            = &msp430_elf_mote_ops,
     },
     [SIM_BOARD_KIND_ARM] = {
         .name           = "arm-elf",
         .node_type      = NODE_ARM,
         .boot           = arm_elf_mote_boot,
         .register_radio = arm_elf_mote_register_radio,
-        .ops            = NULL,   /* runner-injected until Phase 5/6 */
+        .ops            = &arm_elf_mote_ops,
     },
     [SIM_BOARD_KIND_NATIVE] = {
         .name           = "native-cooja",
@@ -47,9 +46,4 @@ static sim_mote_kind_t kinds[] = {
 
 const sim_mote_kind_t *sim_mote_kind_for(sim_board_kind_t kind) {
     return &kinds[kind];
-}
-
-void sim_mote_kind_set_ops(sim_board_kind_t kind,
-                           const sim_mote_ops_t *ops) {
-    kinds[kind].ops = ops;
 }

@@ -17,6 +17,8 @@
 #include "mote_impl.h"
 
 #include "msp430_elf.h"
+#include "msp430_usart.h"   /* msp_mote_serial_input (M38) */
+#include "sim_state.h"      /* SIM_RADIO_* for msp_mote_ui_radio_state (M38) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -311,3 +313,198 @@ int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns) {
     cpu->last_execute_us = t_us;
     return returned_us;
 }
+
+/* ============================================================
+ * Mote vtable adapters (M38 — moved from the runner; §3.19).
+ *
+ * Character-identical to the runner's msp_mote_* functions, with the
+ * runner-global seams rewired through the mote: nodes[idx] → MOTE_IMPL(m),
+ * &radio_bus → node->env->radio_bus, &sim_rt → node->env->sim,
+ * emu_rx_queue_drain(idx) → sim_radio_bus_drain_rx(),
+ * schedule_emulated_wakeup() → sim_radio_bus_wake_mote(),
+ * step_node_until() → m->ops->step_until(), node_freq/cycles → cpu fields.
+ * ============================================================ */
+
+static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.sim_time_ns;
+}
+static int64_t msp_mote_cycles(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.cycles;
+}
+static uint32_t msp_mote_freq_hz(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.cpu_freq_hz;
+}
+static int64_t msp_mote_instructions(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.instructions;
+}
+
+static void msp_mote_step_until(sim_mote_t *m, int64_t target) {
+    msp430_step_until(&MOTE_IMPL(m)->plat.msp.cpu, target);
+}
+
+static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    /* Cap to global sim time — no node should advance past it (Cooja invariant) */
+    if (sim_ns > sim_runtime_now_ns(node->env->sim))
+        sim_ns = sim_runtime_now_ns(node->env->sim);
+    msp430_cpu_t *cpu = &node->plat.msp.cpu;
+    int64_t t_us = sim_ns / 1000LL;
+    int64_t jump_us = 0;
+
+    if (cpu->last_execute_us >= 0) {
+        jump_us = t_us - cpu->last_execute_us;
+        if (jump_us < 0) jump_us = 0;
+    }
+
+    /* Apply clock deviation (same as the execute tick) */
+    double deviation = node->clock_deviation;
+    if (deviation != 1.0 && jump_us > 0) {
+        double exact = (double)jump_us * deviation;
+        jump_us = (int64_t)exact;
+        cpu->step_cycle_remainder += exact - (double)jump_us;
+        if (cpu->step_cycle_remainder > 1.0) {
+            jump_us++;
+            cpu->step_cycle_remainder -= 1.0;
+        }
+    }
+
+    int64_t returned_us = msp430_step_micros(cpu, jump_us, 0);
+    /* Cooja's MspMoteTimeEvent.execute(t) performs execute(t, 0): pin the
+     * CPU's event-time view to the byte-delivery timestamp after a
+     * zero-duration sync. */
+    cpu->sim_time_ns = sim_ns;
+    cpu->last_execute_us = t_us;
+    if (deviation != 1.0 && returned_us > 0)
+        returned_us = (int64_t)((double)returned_us / deviation);
+    return returned_us;
+}
+
+static void msp_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
+    msp_mote_sync_to_time(m, byte_time_ns);
+}
+
+static void msp_mote_rx_pre_sync(sim_mote_t *m, int64_t time_ns) {
+    msp430_elf_mote_tick(MOTE_IMPL(m), time_ns);
+}
+
+static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    sim_radio_bus_t *bus = node->env->radio_bus;
+    int idx = node->slot;
+    /* MSP430 RF delivery is frame-assembled on the sender side and then
+     * delivered from the complete-frame path. */
+    sim_radio_bus_set_executing(bus, idx);
+    int64_t returned_us = msp430_elf_mote_tick(node, now_ns);
+    sim_radio_bus_set_executing(bus, -1);
+    if (bus->emu_rx_queue[idx].count > 0)
+        sim_radio_bus_drain_rx(bus, node->env->sim, idx);
+    /* Match Cooja's MspMote.execute(t, 1): this slice schedules the
+     * mote's next normal wakeup itself. */
+    return now_ns + (returned_us + 1) * 1000LL;
+}
+
+static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
+    const msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
+    if ((cpu->interrupts_enabled &&
+         cpu->serviced_interrupt == -1 &&
+         cpu->interrupt_max >= 0) ||
+        cpu->next_event_cycle <= cpu->cycles) {
+        return base_ns;
+    }
+    return base_ns + msp430_cycles_to_ns(
+        cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+}
+
+static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    int idx = node->slot;
+    sim_radio_bus_t *bus = node->env->radio_bus;
+    msp430_platform_t *plat = &node->plat.msp;
+    msp430_usart_t *console = (plat->config->console_usart == 0)
+        ? &plat->usart0 : &plat->usart1;
+    bool has_dma = (console->dma_trigger != NULL);
+    if (!has_dma) {
+        if (!console->ie_ptr ||
+            !(*console->ie_ptr & console->ie_rx_mask))
+            return 0;  /* firmware hasn't enabled UART RX yet */
+    }
+    int baud_cycles = (int)((int64_t)plat->cpu.cpu_freq_hz * 69 / 1000000);
+    if (baud_cycles < 200) baud_cycles = 200;
+    int consumed = 0;
+    sim_radio_bus_set_executing(bus, idx);
+    while (consumed < len) {
+        if (!has_dma) {
+            /* Wait for RXIFG clear (firmware consumed previous byte) */
+            if (console->ifg_ptr &&
+                (*console->ifg_ptr & console->ifg_rx_mask))
+                break;  /* try again next poll */
+        }
+        msp430_usart_receive_byte(console, buf[consumed]);
+        consumed++;
+        m->ops->step_until(m, plat->cpu.cycles + baud_cycles);
+    }
+    sim_radio_bus_set_executing(bus, -1);
+    /* Sync last_execute_us and re-schedule in the event queue (Cooja's
+     * requestImmediateWakeup() after serial byte delivery). */
+    if (consumed > 0) {
+        msp430_cpu_t *cpu = &node->plat.msp.cpu;
+        cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
+            cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
+        sim_radio_bus_wake_mote(bus, node->env->sim, idx);
+    }
+    return consumed;
+}
+
+static void msp_mote_destroy(sim_mote_t *m) {
+    msp430_platform_destroy(&MOTE_IMPL(m)->plat.msp);
+}
+static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
+    msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
+    cpu->sim_time_ns = now_ns;
+    cpu->cycles = (uint64_t)now_ns * cpu->cpu_freq_hz / 1000000000ULL;
+}
+
+static int msp_mote_ui_radio_state(const sim_mote_t *m) {
+    cc2420_radio_state_t rs = MOTE_IMPL(m)->plat.msp.cc2420.state;
+    if (rs >= CC2420_TX_CALIBRATE && rs <= CC2420_TX_UNDERFLOW)
+        return SIM_RADIO_TX;
+    if (rs == CC2420_RX_FRAME)
+        return SIM_RADIO_RX;        /* actively receiving data (green) */
+    if (rs == CC2420_RX_CALIBRATE || rs == CC2420_RX_SFD_SEARCH)
+        return SIM_RADIO_ON;        /* on, listening (gray) */
+    return SIM_RADIO_OFF;           /* VREG_OFF, POWER_DOWN, IDLE */
+}
+
+static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
+    uint8_t p5out = MOTE_IMPL(m)->plat.msp.gpio.ports[4].out;
+    leds[0] = (p5out >> 4) & 1;  /* green  = P5.4 */
+    leds[1] = (p5out >> 5) & 1;  /* yellow = P5.5 */
+    leds[2] = (p5out >> 6) & 1;  /* red    = P5.6 */
+}
+
+static void *msp_mote_get_interface(sim_mote_t *m, int iface) {
+    if (iface == SIM_MOTE_IFACE_CC2420)
+        return &MOTE_IMPL(m)->plat.msp.cc2420;
+    return NULL;
+}
+
+const sim_mote_ops_t msp430_elf_mote_ops = {
+    .kind            = "MSP430",
+    .sim_time_ns     = msp_mote_sim_time_ns,
+    .cycles          = msp_mote_cycles,
+    .freq_hz         = msp_mote_freq_hz,
+    .instructions    = msp_mote_instructions,
+    .execute         = msp_mote_execute,
+    .step_until      = msp_mote_step_until,
+    .sched_hint_ns   = msp_mote_sched_hint_ns,
+    .sync_to_time    = msp_mote_sync_to_time,
+    .serial_input    = msp_mote_serial_input,
+    .destroy         = msp_mote_destroy,
+    .reset_time      = msp_mote_reset_time,
+    .ui_radio_state  = msp_mote_ui_radio_state,
+    .ui_leds         = msp_mote_ui_leds,
+    .get_interface   = msp_mote_get_interface,
+    .receive_frame   = NULL, /* per-byte / staged delivery */
+    .rx_byte_sync    = msp_mote_rx_byte_sync,
+    .rx_pre_sync     = msp_mote_rx_pre_sync,
+};

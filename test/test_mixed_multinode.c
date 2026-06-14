@@ -505,40 +505,12 @@ static double get_time_ms(void) {
 /* ============================================================
  * Mote vtable adapters — Phase 2 milestone 11 (§3.16).
  *
- * One sim_mote_ops_t per node kind; mote_store[idx] is the kernel-facing
- * object registered into sim_rt from init_node().  The node_* accessor
- * functions below dispatch through the table instead of switching on
- * node_type_t.  Adapter bodies are character-identical moves of the old
- * switch arms; they stay in this file until Phase 4 (boot policy move).
+ * The MSP430/ARM adapter tables (msp430_elf_mote_ops / arm_elf_mote_ops)
+ * and their bodies moved to src/motes/{msp430,arm}_elf_mote.c in M38, once
+ * their radio-bus and GDB dependencies cleared (Phase 5 / M37).  The
+ * mote-kind registry wires every kind's ops directly now; the runner only
+ * keeps a few mote_store[] convenience peeks.
  * ============================================================ */
-
-/* M12 execution-op adapters — bodies live next to the tick/step helpers
- * they wrap (after native_has_pending_work); tables below only need the
- * prototypes. */
-static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns);
-static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns);
-static void msp_mote_step_until(sim_mote_t *m, int64_t target);
-static void arm_mote_step_until(sim_mote_t *m, int64_t target);
-static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
-static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns);
-static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
-static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns);
-static void msp_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns);
-static void arm_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns);
-static void msp_mote_rx_pre_sync(sim_mote_t *m, int64_t time_ns);
-static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
-static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len);
-static void msp_mote_destroy(sim_mote_t *m);
-static void arm_mote_destroy(sim_mote_t *m);
-static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns);
-static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns);
-static int msp_mote_ui_radio_state(const sim_mote_t *m);
-static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
-static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]);
-static void *msp_mote_get_interface(sim_mote_t *m, int iface);
-static void *arm_mote_get_interface(sim_mote_t *m, int iface);
-/* (JS + native adapters live in src/motes/{js_app,native_cooja}_mote.c
- * — M19/M20) */
 
 /* Convenience: the mote's CC2420, or NULL for non-Sky motes (debug
  * traces + per-byte stats branch on this instead of node type). */
@@ -547,76 +519,8 @@ static inline cc2420_t *mote_cc2420(int idx) {
     return (cc2420_t *)m->ops->get_interface(m, SIM_MOTE_IFACE_CC2420);
 }
 
-/* MSP430 emulated motes */
-static int64_t msp_mote_sim_time_ns(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.msp.cpu.sim_time_ns;
-}
-static int64_t msp_mote_cycles(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.msp.cpu.cycles;
-}
-static uint32_t msp_mote_freq_hz(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.msp.cpu.cpu_freq_hz;
-}
-static int64_t msp_mote_instructions(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.msp.cpu.instructions;
-}
-static const sim_mote_ops_t msp_mote_ops = {
-    .kind            = "MSP430",
-    .sim_time_ns     = msp_mote_sim_time_ns,
-    .cycles          = msp_mote_cycles,
-    .freq_hz         = msp_mote_freq_hz,
-    .instructions    = msp_mote_instructions,
-    .execute         = msp_mote_execute,
-    .step_until      = msp_mote_step_until,
-    .sched_hint_ns   = msp_mote_sched_hint_ns,
-    .sync_to_time    = msp_mote_sync_to_time,
-    .serial_input    = msp_mote_serial_input,
-    .destroy         = msp_mote_destroy,
-    .reset_time      = msp_mote_reset_time,
-    .ui_radio_state  = msp_mote_ui_radio_state,
-    .ui_leds         = msp_mote_ui_leds,
-    .get_interface   = msp_mote_get_interface,
-    .receive_frame   = NULL, /* per-byte / staged delivery */
-    .rx_byte_sync    = msp_mote_rx_byte_sync,
-    .rx_pre_sync     = msp_mote_rx_pre_sync,
-};
-
-/* ARM emulated motes */
-static int64_t arm_mote_sim_time_ns(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.arm.cpu.sim_time_ns;
-}
-static int64_t arm_mote_cycles(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.arm.cpu.cycles;
-}
-static uint32_t arm_mote_freq_hz(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.arm.cpu.cpu_freq_hz;
-}
-static int64_t arm_mote_instructions(const sim_mote_t *m) {
-    return MOTE_IMPL(m)->plat.arm.cpu.instructions;
-}
-static const sim_mote_ops_t arm_mote_ops = {
-    .kind            = "ARM",
-    .sim_time_ns     = arm_mote_sim_time_ns,
-    .cycles          = arm_mote_cycles,
-    .freq_hz         = arm_mote_freq_hz,
-    .instructions    = arm_mote_instructions,
-    .execute         = arm_mote_execute,
-    .step_until      = arm_mote_step_until,
-    .sched_hint_ns   = arm_mote_sched_hint_ns,
-    .sync_to_time    = arm_mote_sync_to_time,
-    .serial_input    = arm_mote_serial_input,
-    .destroy         = arm_mote_destroy,
-    .reset_time      = arm_mote_reset_time,
-    .ui_radio_state  = NULL, /* CC2538 pushes state via async callback */
-    .ui_leds         = arm_mote_ui_leds,
-    .get_interface   = arm_mote_get_interface,
-    .receive_frame   = NULL, /* per-byte / staged delivery */
-    .rx_byte_sync    = arm_mote_rx_byte_sync,
-    .rx_pre_sync     = NULL, /* MSP430-only pre-sync tick */
-};
-
-/* Native + JS mote ops live in src/motes/{native_cooja,js_app}_mote.c
- * (M19/M20). */
+/* All four kinds' mote ops live in their src/motes modules
+ * (MSP430/ARM moved in M38); init_node wires them via the kind registry. */
 
 /* Bind mote_store[idx] to nodes[idx] and register it with the kernel.
  * Called from init_node() right after the node's type is set, so the
@@ -679,8 +583,6 @@ static void progress_describe_node(int i, int *node_id, const char **type,
 
 /* Forward declarations */
 static void mixed_deliver_rf_bytes(int idx);
-static void step_node_until(int idx, int64_t target);
-static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx);
 
 /* Check available RXFIFO space for an emulated node. Firefly nodes have
  * two radios; we report the more constrained side so back-pressure
@@ -794,107 +696,8 @@ static void deliver_radio_timer(const sim_event_t *ev) {
 
 /* byte_period_ns lives in sim_radio_bus.h (M9.1) */
 
-/* M13: sync_to_time op adapters (Cooja MspMoteTimeEvent.execute(t, 0)).
- * Emulated motes only; the RX-byte/radio-timer delivery paths dispatch
- * through ops->sync_to_time and treat NULL as "not an emulated mote". */
-static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
-    mixed_node_t *node = MOTE_IMPL(m);
-    /* Cap to global sim time — no node should advance past it (Cooja invariant) */
-    if (sim_ns > sim_runtime_now_ns(&sim_rt))
-        sim_ns = sim_runtime_now_ns(&sim_rt);
-    msp430_cpu_t *cpu = &node->plat.msp.cpu;
-    int64_t t_us = sim_ns / 1000LL;
-    int64_t jump_us = 0;
-
-    if (cpu->last_execute_us >= 0) {
-        jump_us = t_us - cpu->last_execute_us;
-        if (jump_us < 0) jump_us = 0;
-    }
-
-    /* Apply clock deviation (same as tick_one_msp430) */
-    double deviation = node->clock_deviation;
-    if (deviation != 1.0 && jump_us > 0) {
-        double exact = (double)jump_us * deviation;
-        jump_us = (int64_t)exact;
-        cpu->step_cycle_remainder += exact - (double)jump_us;
-        if (cpu->step_cycle_remainder > 1.0) {
-            jump_us++;
-            cpu->step_cycle_remainder -= 1.0;
-        }
-    }
-
-    int64_t returned_us = msp430_step_micros(cpu, jump_us, 0);
-    /* Cooja's MspMoteTimeEvent.execute(t) performs execute(t, 0): the mote is
-     * synchronized to the scheduler's event time t for this delivery, rather
-     * than leaving peripheral event scheduling anchored to a cycle-derived
-     * local time that may have drifted ahead. Keep the CPU's event-time view
-     * pinned to the byte-delivery timestamp after a zero-duration sync. */
-    cpu->sim_time_ns = sim_ns;
-    cpu->last_execute_us = t_us;
-    if (deviation != 1.0 && returned_us > 0)
-        returned_us = (int64_t)((double)returned_us / deviation);
-    return returned_us;
-}
-
-/* ARM equivalent of msp_mote_sync_to_time — Cooja MspMoteTimeEvent.execute
- * pattern: advance CPU to event time before feeding chip-level byte. */
-static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
-    mixed_node_t *node = MOTE_IMPL(m);
-    if (sim_ns > sim_runtime_now_ns(&sim_rt))
-        sim_ns = sim_runtime_now_ns(&sim_rt);
-    arm_cpu_t *cpu = &node->plat.arm.cpu;
-    int64_t t_us = sim_ns / 1000LL;
-    int64_t jump_us = 0;
-    if (cpu->last_execute_us >= 0) {
-        jump_us = t_us - cpu->last_execute_us;
-        if (jump_us < 0) jump_us = 0;
-    }
-    double deviation = node->clock_deviation;
-    if (deviation != 1.0 && jump_us > 0) {
-        double exact = (double)jump_us * deviation;
-        jump_us = (int64_t)exact;
-        cpu->step_cycle_remainder += exact - (double)jump_us;
-        if (cpu->step_cycle_remainder > 1.0) {
-            jump_us++;
-            cpu->step_cycle_remainder -= 1.0;
-        }
-    }
-    int64_t returned_us = arm_step_micros(cpu, jump_us, 0);
-    cpu->sim_time_ns = sim_ns;
-    cpu->last_execute_us = t_us;
-    if (deviation != 1.0 && returned_us > 0)
-        returned_us = (int64_t)((double)returned_us / deviation);
-    return returned_us;
-}
-
-/* M25 (Phase 5 de-typing): per-byte RX clock sync used by the
- * synchronous frame-delivery path (emu_deliver_bytes).  Bodies are the
- * verbatim ex-inline per-byte sync from the old nodes[].type branches:
- * MSP430 reuses its clamped, deviation-aware sync_to_time; ARM keeps
- * its distinct unclamped pin-step-pin body (the two differ on
- * purpose — do not unify). */
-static void msp_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
-    msp_mote_sync_to_time(m, byte_time_ns);
-}
-static void arm_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
-    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
-    int64_t t_us = byte_time_ns / 1000LL;
-    int64_t jump_us = 0;
-    if (cpu->last_execute_us >= 0) {
-        jump_us = t_us - cpu->last_execute_us;
-        if (jump_us < 0) jump_us = 0;
-    }
-    cpu->sim_time_ns = byte_time_ns;
-    arm_step_micros(cpu, jump_us, 0);
-    cpu->sim_time_ns = byte_time_ns;
-    cpu->last_execute_us = t_us;
-}
-
-/* M25: full execute-slice pre-sync before a synchronous frame delivery
- * (ex the frame_complete pre-sync tick; MSP430 only). */
-static void msp_mote_rx_pre_sync(sim_mote_t *m, int64_t time_ns) {
-    msp430_elf_mote_tick(MOTE_IMPL(m), time_ns);
-}
+/* (M13 sync_to_time + M25 rx_byte_sync/rx_pre_sync adapters moved to
+ * src/motes/{msp430,arm}_elf_mote.c — M38.) */
 
 /* Deliver buffered bytes to an emulated node's radio — body moved to
  * sim_radio_bus_deliver_bytes (M26); thin forwarder keeps call sites
@@ -1412,69 +1215,9 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
 /* (Native serial_input — Cooja rs232 append + immediate wakeup — lives
  * in native_cooja_mote.c, M20.) */
 
-/* MSP430: match MSPSim's MspSerial — inject ALL pending bytes at
- * baud-rate intervals (69µs = 115200 baud), stepping CPU between each
- * byte.  Cooja queues all bytes and delivers them at baud-rate
- * intervals with requestImmediateWakeup() after each.
- *
- * Mark this node executing (radio_bus.executing_node) to prevent a
- * re-entrant cascade: if the CPU TX's during the baud-rate step, the
- * delivery path must not sync this node back. */
-static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
-                                 int len) {
-    mixed_node_t *node = MOTE_IMPL(m);
-    int idx = MOTE_IDX(m);
-    msp430_platform_t *plat = &node->plat.msp;
-    msp430_usart_t *console = (plat->config->console_usart == 0)
-        ? &plat->usart0 : &plat->usart1;
-    bool has_dma = (console->dma_trigger != NULL);
-    if (!has_dma) {
-        if (!console->ie_ptr ||
-            !(*console->ie_ptr & console->ie_rx_mask))
-            return 0;  /* firmware hasn't enabled UART RX yet */
-    }
-    int baud_cycles = (int)((int64_t)node_freq(idx) * 69 / 1000000);
-    if (baud_cycles < 200) baud_cycles = 200;
-    int consumed = 0;
-    sim_radio_bus_set_executing(&radio_bus, idx);
-    while (consumed < len) {
-        if (!has_dma) {
-            /* Wait for RXIFG clear (firmware consumed previous byte) */
-            if (console->ifg_ptr &&
-                (*console->ifg_ptr & console->ifg_rx_mask))
-                break;  /* try again next poll */
-        }
-        msp430_usart_receive_byte(console, buf[consumed]);
-        consumed++;
-        step_node_until(idx, node_cycles(idx) + baud_cycles);
-    }
-    sim_radio_bus_set_executing(&radio_bus, -1);
-    /* Sync last_execute_us and re-schedule in event queue.
-     * Without this, the node's sim_eq entry is stale and the
-     * trickle timer / other events scheduled during injection
-     * won't fire until the old wakeup time.  Matches Cooja's
-     * requestImmediateWakeup() after serial byte delivery. */
-    if (consumed > 0) {
-        msp430_cpu_t *cpu = &node->plat.msp.cpu;
-        cpu->last_execute_us = (int64_t)msp430_cycles_to_ns(
-            cpu->cycles, cpu->cpu_freq_hz) / 1000LL;
-        schedule_emulated_wakeup(&sim_rt, idx);
-    }
-    return consumed;
-}
-
-/* ARM: feed the console UART RX register directly.  (CC2538-family
- * boards only — the cc2538_soc lookup matches the pre-M14 behavior;
- * Nordic consoles are output-only today.) */
-static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
-                                 int len) {
-    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
-    for (int i = 0; i < len; i++)
-        cc2538_uart_receive_byte(&soc->uart0, buf[i]);
-    return len;
-}
-
-/* (JS serial_input — no console input — lives in js_app_mote.c, M19.) */
+/* (MSP430 baud-paced serial_input + ARM cc2538 serial_input moved to
+ * src/motes/{msp430,arm}_elf_mote.c — M38.  JS has no console input
+ * (js_app_mote.c, M19); native append lives in native_cooja_mote.c.) */
 
 /* The single serial-injection entry point: dispatch to the mote's
  * platform delivery contract.  Returns bytes consumed. */
@@ -1710,74 +1453,9 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     return 0;
 }
 
-/* --- Destroy node (M15: lifecycle ops) --- */
-
-static void msp_mote_destroy(sim_mote_t *m) {
-    msp430_platform_destroy(&MOTE_IMPL(m)->plat.msp);
-}
-static void arm_mote_destroy(sim_mote_t *m) {
-    arm_platform_destroy(&MOTE_IMPL(m)->plat.arm);
-}
-
-/* Re-seed the mote's local clock after reboot/dynamic add so stepping
- * resumes at the current sim time (don't catch up from t=0).  Bodies
- * verbatim from the former TEST_ACTION_ADD type switches (the JS body,
- * now in js_app_mote.c, fixed a latent union aliasing slip — the old
- * else-branch wrote plat.native.sim_time_ns even for JS motes). */
-static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
-    msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
-    cpu->sim_time_ns = now_ns;
-    cpu->cycles = (uint64_t)now_ns * cpu->cpu_freq_hz / 1000000000ULL;
-}
-static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
-    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
-    cpu->sim_time_ns = now_ns;
-    cpu->cycles = now_ns * cpu->cpu_freq_hz / 1000000000LL;
-}
-
-/* --- M16 introspection adapters --- */
-
-static int msp_mote_ui_radio_state(const sim_mote_t *m) {
-    cc2420_radio_state_t rs = MOTE_IMPL(m)->plat.msp.cc2420.state;
-    if (rs >= CC2420_TX_CALIBRATE && rs <= CC2420_TX_UNDERFLOW)
-        return SIM_RADIO_TX;
-    if (rs == CC2420_RX_FRAME)
-        return SIM_RADIO_RX;        /* actively receiving data (green) */
-    if (rs == CC2420_RX_CALIBRATE || rs == CC2420_RX_SFD_SEARCH)
-        return SIM_RADIO_ON;        /* on, listening (gray) */
-    return SIM_RADIO_OFF;           /* VREG_OFF, POWER_DOWN, IDLE */
-}
-
-static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
-    uint8_t p5out = MOTE_IMPL(m)->plat.msp.gpio.ports[4].out;
-    leds[0] = (p5out >> 4) & 1;  /* green  = P5.4 */
-    leds[1] = (p5out >> 5) & 1;  /* yellow = P5.5 */
-    leds[2] = (p5out >> 6) & 1;  /* red    = P5.6 */
-}
-
-static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
-    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
-    if (!soc)
-        return;  /* Nordic boards: no LED model wired up (the pre-M16
-                  * type-switch would have NULL-dereferenced here) */
-    uint32_t pc_data = soc->gpio.ports[2].data;
-    leds[0] = (pc_data >> 0) & 1;  /* red */
-    leds[1] = (pc_data >> 1) & 1;  /* yellow */
-    leds[2] = (pc_data >> 2) & 1;  /* green */
-}
-
-static void *msp_mote_get_interface(sim_mote_t *m, int iface) {
-    if (iface == SIM_MOTE_IFACE_CC2420)
-        return &MOTE_IMPL(m)->plat.msp.cc2420;
-    return NULL;
-}
-static void *arm_mote_get_interface(sim_mote_t *m, int iface) {
-    if (iface == SIM_MOTE_IFACE_ARM_CPU)
-        return &MOTE_IMPL(m)->plat.arm.cpu;
-    return NULL;
-}
-/* (M17 frame-level RX adapters live in the native/JS modules —
- * M19/M20.) */
+/* (M15 destroy/reset_time + M16 ui_radio_state/ui_leds/get_interface
+ * adapters for MSP430/ARM moved to src/motes/{msp430,arm}_elf_mote.c —
+ * M38.  The native/JS equivalents live in their modules — M19/M20.) */
 
 static void destroy_node(int idx) {
     sim_mote_t *m = &mote_store[idx];
@@ -1820,10 +1498,9 @@ static int reboot_node(int idx) {
  * See docs/porting-a-device.md §8 ("Synchronous side effects in
  * chip-driver byte handlers"). */
 
-static void step_node_until(int idx, int64_t target) {
-    sim_mote_t *m = &mote_store[idx];
-    m->ops->step_until(m, target);
-}
+/* (step_node_until removed — its only caller, the MSP430 baud-paced
+ * serial injection, moved to msp430_elf_mote.c and calls
+ * m->ops->step_until directly — M38.) */
 
 /* (MSP430 execute tick lives in src/motes/msp430_elf_mote.c — M21,
  * exported as msp430_elf_mote_tick.) */
@@ -1842,129 +1519,17 @@ static void step_node_until(int idx, int64_t target) {
  * attach), so the runner no longer indexes stub storage by slot. */
 static gdb_service_t gdb_svc;
 
-/* Schedule an emulated node's next wakeup */
-/* Body moved to sim_radio_bus_wake_mote (M27); thin forwarder keeps the
- * msp serial-injection caller unchanged. */
-static void schedule_emulated_wakeup(sim_runtime_t *sim, int idx) {
-    sim_radio_bus_wake_mote(&radio_bus, sim, idx);
-}
+/* (schedule_emulated_wakeup removed — its only caller, the MSP430 serial
+ * injection, moved to msp430_elf_mote.c and calls sim_radio_bus_wake_mote
+ * directly — M38.) */
 
 /* (node_next_wakeup_ns removed in M12 — dead since the M10 kernel pump;
  * the per-arch lead computation lives on in the sched_hint_ns ops.) */
 
-/* ============================================================
- * M12 mote execution-op adapters (MSP430/ARM — native/JS moved to
- * src/motes/ in M19/M20).
- *
- * Bodies are verbatim moves of the former dispatch_mote_wakeup /
- * schedule_emulated_wakeup type-switch arms.
- * MOTE_IDX recovers the slot index — the wrapped helpers
- * (tick_one_*, emu_rx_queue_drain, gdb_stubs) are still indexed by
- * slot; they follow their dependencies in Phase 5/6 (§3.17).
- * ============================================================ */
-
-/* --- step_until: mote-unit stepping (cycles emulated, ns native/JS) --- */
-
-static void msp_mote_step_until(sim_mote_t *m, int64_t target) {
-    msp430_step_until(&MOTE_IMPL(m)->plat.msp.cpu, target);
-}
-static void arm_mote_step_until(sim_mote_t *m, int64_t target) {
-    arm_step_until(&MOTE_IMPL(m)->plat.arm.cpu, target);
-}
-
-/* --- execute: one Cooja-style execute slice at global time now_ns.
- * Returns the absolute next-wakeup time; the caller schedules it. --- */
-
-static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns) {
-    int idx = MOTE_IDX(m);
-    /* MSP430 RF delivery is frame-assembled on the sender side and then
-     * delivered from the complete-frame path. Consuming rf_pending here
-     * can split an in-flight frame and corrupt the receiver-side buffer
-     * state. */
-    sim_radio_bus_set_executing(&radio_bus, idx);
-    int64_t returned_us = msp430_elf_mote_tick(&nodes[idx], now_ns);
-    sim_radio_bus_set_executing(&radio_bus, -1);
-    if (emu_rx_queue[idx].count > 0)
-        emu_rx_queue_drain(idx);
-    /* Match Cooja's MspMote.execute(t, 1): this slice schedules the
-     * mote's next normal wakeup itself. */
-    return now_ns + (returned_us + 1) * 1000LL;
-}
-
-static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
-    int idx = MOTE_IDX(m);
-    /* Emulated ARM: same Cooja-style tick as MSP430 so peripheral events
-     * are anchored to the scheduler's event time and the CPU accumulates
-     * cycle time with the MSPSim stepMicros accuracy bound. */
-
-    /* GDB stub (M37: consulted via the CPU's own back-pointer, set by the
-     * gdb service at attach — no runner-side stub table).  Poll for
-     * incoming commands; if the CPU is halted at a breakpoint, skip the
-     * tick and return a +1µs wakeup so we keep checking the stub. */
-    arm_cpu_t *gdb_cpu = &nodes[idx].plat.arm.cpu;
-    gdb_stub_t *gdb = (gdb_stub_t *)gdb_cpu->gdb_stub;
-    if (gdb) {
-        gdb_stub_poll(gdb);
-        if (gdb->halted) {
-            gdb_cpu->stopping = false;
-            return now_ns + 1000LL;
-        }
-    }
-
-    sim_radio_bus_set_executing(&radio_bus, idx);
-    int64_t returned_us = arm_elf_mote_tick(&nodes[idx], now_ns);
-    sim_radio_bus_set_executing(&radio_bus, -1);
-
-    /* GDB stub: a breakpoint may have fired during the tick.  Clear the
-     * cpu->stopping flag set by gdb_stub_check_breakpoint so subsequent
-     * ticks (after `continue`) can run again. */
-    if (gdb) {
-        gdb_cpu->stopping = false;
-        if (gdb->halted)
-            return now_ns + 1000LL;  /* poll the stub again soon */
-    }
-
-    /* Drain any frames queued for this node (mirrors the MSP430 path).
-     * For nRF52840, the pending_rx buffer inside the radio model handles
-     * delivery when the radio was not in RX state at delivery time; this
-     * drain covers the emu_rx_queue path which fires when direct
-     * delivery was deferred to a later tick. */
-    if (emu_rx_queue[idx].count > 0)
-        emu_rx_queue_drain(idx);
-
-    /* Match MspMote.execute(t, 1): next normal wakeup from the
-     * step_micros lead hint. */
-    return now_ns + (returned_us + 1) * 1000LL;
-}
-
-/* (Native execute moved to native_cooja_mote.c — M20.  Its handoff to
- * the dispatcher's post-tick RF distribution is node->exec_had_tx,
- * ex the native_exec_had_tx global.) */
-
-/* (advance_to_time + threaded_step_node removed with the --threads
- * path, M29.) */
-
-/* --- sched_hint_ns: next-cpu-event wakeup lead from kernel time base_ns
- * (emulated motes only; see schedule_emulated_wakeup) --- */
-
-static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
-    const msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
-    if ((cpu->interrupts_enabled &&
-         cpu->serviced_interrupt == -1 &&
-         cpu->interrupt_max >= 0) ||
-        cpu->next_event_cycle <= cpu->cycles) {
-        return base_ns;
-    }
-    return base_ns + msp430_cycles_to_ns(
-        cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
-}
-static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
-    const arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
-    if (cpu->next_event_cycle <= cpu->cycles)
-        return base_ns;
-    return base_ns + arm_cycles_to_ns(
-        cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
-}
+/* (M12 step_until / execute / sched_hint_ns adapters for MSP430/ARM moved
+ * to src/motes/{msp430,arm}_elf_mote.c — M38; the ARM execute carries the
+ * cpu->gdb_stub poll, M37.  Native/JS equivalents are in their modules,
+ * M19/M20.) */
 
 /* --- Channel synchronization ---
  *
@@ -2116,11 +1681,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * radio-medium init still happen at their existing call sites below,
      * just through the runtime fields. */
     sim_runtime_init(&sim_rt);
-    /* M23: inject the runner-side MSP430/ARM adapter tables into the
-     * kind registry (they move to src/motes when their dependencies do
-     * — radio bus Phase 5, GDB service Phase 6). */
-    sim_mote_kind_set_ops(SIM_BOARD_KIND_MSP430, &msp_mote_ops);
-    sim_mote_kind_set_ops(SIM_BOARD_KIND_ARM, &arm_mote_ops);
+    /* M38: every mote kind's ops are module-owned now (the MSP430/ARM
+     * adapter tables moved to src/motes/{msp430,arm}_elf_mote.c), so the
+     * kind registry needs no runtime injection. */
     /* M11: pre-bind every mote slot to its node struct with a safe default
      * ops table so the node_* vtable accessors never see a NULL ops, even
      * for slots that haven't been through init_node() yet (the old type

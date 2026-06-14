@@ -19,8 +19,10 @@
 
 #include "arm_elf.h"
 #include "cc2538_soc.h"
+#include "cc2538_uart.h"    /* arm_mote_serial_input (M38) */
 #include "nrf52840_soc.h"
 #include "nrf54l15_soc.h"
+#include "gdb_stub.h"       /* arm_mote_execute cpu->gdb_stub poll (M38) */
 
 #include <stdio.h>
 #include <string.h>
@@ -353,3 +355,179 @@ int64_t arm_elf_mote_tick(mixed_node_t *node, int64_t sim_ns) {
     cpu->last_execute_us = t_us;
     return returned_us;
 }
+
+/* ============================================================
+ * Mote vtable adapters (M38 — moved from the runner; §3.19).
+ *
+ * Character-identical to the runner's arm_mote_* functions, with the
+ * runner-global seams rewired through the mote (nodes[idx] → MOTE_IMPL(m),
+ * &radio_bus → node->env->radio_bus, &sim_rt → node->env->sim,
+ * emu_rx_queue_drain → sim_radio_bus_drain_rx).  The GDB poll consults the
+ * CPU's own cpu->gdb_stub back-pointer (set by the gdb service, M37).
+ * ============================================================ */
+
+static int64_t arm_mote_sim_time_ns(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.sim_time_ns;
+}
+static int64_t arm_mote_cycles(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.cycles;
+}
+static uint32_t arm_mote_freq_hz(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.cpu_freq_hz;
+}
+static int64_t arm_mote_instructions(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.instructions;
+}
+
+static void arm_mote_step_until(sim_mote_t *m, int64_t target) {
+    arm_step_until(&MOTE_IMPL(m)->plat.arm.cpu, target);
+}
+
+static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    if (sim_ns > sim_runtime_now_ns(node->env->sim))
+        sim_ns = sim_runtime_now_ns(node->env->sim);
+    arm_cpu_t *cpu = &node->plat.arm.cpu;
+    int64_t t_us = sim_ns / 1000LL;
+    int64_t jump_us = 0;
+    if (cpu->last_execute_us >= 0) {
+        jump_us = t_us - cpu->last_execute_us;
+        if (jump_us < 0) jump_us = 0;
+    }
+    double deviation = node->clock_deviation;
+    if (deviation != 1.0 && jump_us > 0) {
+        double exact = (double)jump_us * deviation;
+        jump_us = (int64_t)exact;
+        cpu->step_cycle_remainder += exact - (double)jump_us;
+        if (cpu->step_cycle_remainder > 1.0) {
+            jump_us++;
+            cpu->step_cycle_remainder -= 1.0;
+        }
+    }
+    int64_t returned_us = arm_step_micros(cpu, jump_us, 0);
+    cpu->sim_time_ns = sim_ns;
+    cpu->last_execute_us = t_us;
+    if (deviation != 1.0 && returned_us > 0)
+        returned_us = (int64_t)((double)returned_us / deviation);
+    return returned_us;
+}
+
+/* ARM per-byte RX clock sync: distinct unclamped pin-step-pin body (it
+ * differs from the MSP430 clamped sync on purpose — do not unify). */
+static void arm_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
+    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    int64_t t_us = byte_time_ns / 1000LL;
+    int64_t jump_us = 0;
+    if (cpu->last_execute_us >= 0) {
+        jump_us = t_us - cpu->last_execute_us;
+        if (jump_us < 0) jump_us = 0;
+    }
+    cpu->sim_time_ns = byte_time_ns;
+    arm_step_micros(cpu, jump_us, 0);
+    cpu->sim_time_ns = byte_time_ns;
+    cpu->last_execute_us = t_us;
+}
+
+static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    sim_radio_bus_t *bus = node->env->radio_bus;
+    int idx = node->slot;
+    /* Emulated ARM: same Cooja-style tick as MSP430 so peripheral events
+     * are anchored to the scheduler's event time. */
+
+    /* GDB stub (M37): consulted via the CPU's own back-pointer, set by the
+     * gdb service at attach.  If the CPU is halted at a breakpoint, skip
+     * the tick and return a +1µs wakeup so we keep checking the stub. */
+    arm_cpu_t *cpu = &node->plat.arm.cpu;
+    gdb_stub_t *gdb = (gdb_stub_t *)cpu->gdb_stub;
+    if (gdb) {
+        gdb_stub_poll(gdb);
+        if (gdb->halted) {
+            cpu->stopping = false;
+            return now_ns + 1000LL;
+        }
+    }
+
+    sim_radio_bus_set_executing(bus, idx);
+    int64_t returned_us = arm_elf_mote_tick(node, now_ns);
+    sim_radio_bus_set_executing(bus, -1);
+
+    /* GDB stub: a breakpoint may have fired during the tick.  Clear the
+     * cpu->stopping flag so subsequent ticks (after `continue`) can run. */
+    if (gdb) {
+        cpu->stopping = false;
+        if (gdb->halted)
+            return now_ns + 1000LL;  /* poll the stub again soon */
+    }
+
+    /* Drain any frames queued for this node (mirrors the MSP430 path). */
+    if (bus->emu_rx_queue[idx].count > 0)
+        sim_radio_bus_drain_rx(bus, node->env->sim, idx);
+
+    /* Match MspMote.execute(t, 1): next normal wakeup from the
+     * step_micros lead hint. */
+    return now_ns + (returned_us + 1) * 1000LL;
+}
+
+static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
+    const arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    if (cpu->next_event_cycle <= cpu->cycles)
+        return base_ns;
+    return base_ns + arm_cycles_to_ns(
+        cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
+}
+
+/* ARM: feed the console UART RX register directly (CC2538-family boards
+ * only; Nordic consoles are output-only today). */
+static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len) {
+    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
+    for (int i = 0; i < len; i++)
+        cc2538_uart_receive_byte(&soc->uart0, buf[i]);
+    return len;
+}
+
+static void arm_mote_destroy(sim_mote_t *m) {
+    arm_platform_destroy(&MOTE_IMPL(m)->plat.arm);
+}
+static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
+    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    cpu->sim_time_ns = now_ns;
+    cpu->cycles = now_ns * cpu->cpu_freq_hz / 1000000000LL;
+}
+
+static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
+    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
+    if (!soc)
+        return;  /* Nordic boards: no LED model wired up */
+    uint32_t pc_data = soc->gpio.ports[2].data;
+    leds[0] = (pc_data >> 0) & 1;  /* red */
+    leds[1] = (pc_data >> 1) & 1;  /* yellow */
+    leds[2] = (pc_data >> 2) & 1;  /* green */
+}
+
+static void *arm_mote_get_interface(sim_mote_t *m, int iface) {
+    if (iface == SIM_MOTE_IFACE_ARM_CPU)
+        return &MOTE_IMPL(m)->plat.arm.cpu;
+    return NULL;
+}
+
+const sim_mote_ops_t arm_elf_mote_ops = {
+    .kind            = "ARM",
+    .sim_time_ns     = arm_mote_sim_time_ns,
+    .cycles          = arm_mote_cycles,
+    .freq_hz         = arm_mote_freq_hz,
+    .instructions    = arm_mote_instructions,
+    .execute         = arm_mote_execute,
+    .step_until      = arm_mote_step_until,
+    .sched_hint_ns   = arm_mote_sched_hint_ns,
+    .sync_to_time    = arm_mote_sync_to_time,
+    .serial_input    = arm_mote_serial_input,
+    .destroy         = arm_mote_destroy,
+    .reset_time      = arm_mote_reset_time,
+    .ui_radio_state  = NULL, /* CC2538 pushes state via async callback */
+    .ui_leds         = arm_mote_ui_leds,
+    .get_interface   = arm_mote_get_interface,
+    .receive_frame   = NULL, /* per-byte / staged delivery */
+    .rx_byte_sync    = arm_mote_rx_byte_sync,
+    .rx_pre_sync     = NULL, /* MSP430-only pre-sync tick */
+};

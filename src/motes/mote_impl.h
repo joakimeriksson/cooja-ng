@@ -163,11 +163,11 @@ int  native_cooja_mote_boot(mixed_node_t *node, int slot,
 void native_cooja_mote_register_radio(mixed_node_t *node, int slot,
                                       sim_radio_bus_t *bus);
 
-/* M21: MSP430 emulated-ELF motes.  Boot + tick + radio ops only — the
- * msp_mote_ops adapter table stays in the runner until its
- * dependencies move (frame-delivery drain → Phase 5, ticking guard →
- * Phase 5; §3.17).  The tick is exported because the runner's
- * frame-delivery pre-sync path also calls it. */
+/* M21/M38: MSP430 emulated-ELF motes.  Boot + tick + radio ops + the full
+ * mote vtable (msp430_elf_mote_ops; the execute/serial/sync adapters moved
+ * here in M38 once their radio-bus + GDB deps cleared).  The tick is
+ * exported because the frame-delivery pre-sync path also calls it. */
+extern const sim_mote_ops_t msp430_elf_mote_ops;
 int  msp430_elf_mote_boot(mixed_node_t *node, int slot,
                           const char *firmware_path, int node_id,
                           const sim_mote_env_t *env);
@@ -175,10 +175,10 @@ void msp430_elf_mote_register_radio(mixed_node_t *node, int slot,
                                     sim_radio_bus_t *bus);
 int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
 
-/* M22: ARM emulated-ELF motes (CC2538 / firefly / nRF52840 /
- * nRF54L15).  Same shape and same descope as M21: the arm_mote_ops
- * adapter table stays in the runner (drain → Phase 5, GDB stubs →
- * Phase 6). */
+/* M22/M38: ARM emulated-ELF motes (CC2538 / firefly / nRF52840 /
+ * nRF54L15).  Same shape as M21: boot + tick + radio ops + the full mote
+ * vtable (arm_elf_mote_ops). */
+extern const sim_mote_ops_t arm_elf_mote_ops;
 int  arm_elf_mote_boot(mixed_node_t *node, int slot,
                        const char *firmware_path, int node_id,
                        const sim_mote_env_t *env);
@@ -191,10 +191,8 @@ int64_t arm_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
  * board registry's sim_board_kind_t.  init_node() becomes data-driven:
  * kind lookup → boot → register_radio, no per-kind branches.
  *
- * `ops` is module-owned for native/JS; for MSP430/ARM the runner
- * injects its adapter tables via sim_mote_kind_set_ops() at startup
- * until the emulated execute/serial adapters follow their
- * dependencies (radio bus → Phase 5, GDB service → Phase 6; §3.17).
+ * `ops` is module-owned for every kind (M38 moved the MSP430/ARM
+ * adapter tables into their modules, retiring the runner injection).
  * ============================================================ */
 
 typedef struct sim_mote_kind {
@@ -209,8 +207,6 @@ typedef struct sim_mote_kind {
 } sim_mote_kind_t;
 
 const sim_mote_kind_t *sim_mote_kind_for(sim_board_kind_t kind);
-void sim_mote_kind_set_ops(sim_board_kind_t kind,
-                           const sim_mote_ops_t *ops);
 
 #ifdef __cplusplus
 }
