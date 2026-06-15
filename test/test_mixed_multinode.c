@@ -1858,7 +1858,8 @@ sim_restart:
     /* M33: open the capture (prints the status line here, preserving its
      * position) and register the service for teardown safety. */
     pcap_service_open(&pcap_svc, pcap_path);
-    sim_service_attach(&sim_rt, &pcap_service_ops, &pcap_svc);
+    sim_service_attach(&sim_rt, sim_registry_find_service(&g_registry, "pcap"),
+                       &pcap_svc);
 
     /* Initialize radio medium */
     radio_medium_init(&radio_medium, node_count);
@@ -1998,7 +1999,9 @@ sim_restart:
     }
     /* M35: register the JSON test runner once; its on_event consumes
      * SIM_OBS_MOTE_LOG_LINE via the host fan-out (a no-op when inactive). */
-    sim_service_attach(&sim_rt, &json_test_service_ops, &json_test_svc);
+    sim_service_attach(&sim_rt,
+                       sim_registry_find_service(&g_registry, "json-test"),
+                       &json_test_svc);
 
     /* Initialize timeline and node state tracking.
      * M32: the timeline is a service now — attach runs tl_init() and the
@@ -2007,7 +2010,9 @@ sim_restart:
      * serial services) keeps the fan-out order identical to the old direct
      * timeline subscription. */
     timeline_svc.node_id = mote_node_id;
-    sim_service_attach(&sim_rt, &timeline_service_ops, &timeline_svc);
+    sim_service_attach(&sim_rt,
+                       sim_registry_find_service(&g_registry, "timeline"),
+                       &timeline_svc);
     memset(node_states, 0, sizeof(node_states));
     memset(prev_node_states, 0, sizeof(prev_node_states));
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
@@ -2173,7 +2178,9 @@ sim_restart:
      * byte-for-byte as before. */
     progress_service_start(&progress_svc, sim_ns, total_ns, end_ns,
                            &node_count, progress_describe_node);
-    sim_service_attach(&sim_rt, &progress_service_ops, &progress_svc);
+    sim_service_attach(&sim_rt,
+                       sim_registry_find_service(&g_registry, "progress"),
+                       &progress_svc);
     int64_t ui_interval_ns = 100LL * MS_TO_NS;  /* 100ms sim time between UI updates */
     int64_t next_ui_ns = sim_ns + ui_interval_ns;
 
