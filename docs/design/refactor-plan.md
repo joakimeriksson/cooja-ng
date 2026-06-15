@@ -1411,13 +1411,13 @@ plus a v1-only cross-build empty-diff.
 
 ### 3.21 Static-registry milestones (canonical Phase 8 task list)
 
-> **Status: in progress (M44–M51).** Phase 8 (§9 / §7.1) introduces one
+> **Status: complete (M44–M51).** Phase 8 (§9 / §7.1) introduces one
 > static registry (`sim_registry_t`) as the single lookup surface for the
 > simulator's built-ins, delivering the fold the `sim_board.h` /
-> `mote_kinds.c` headers already promise.  Today the runner reaches into
-> three separate lookup mechanisms — `sim_board_for_path`/`sim_board_find`
+> `mote_kinds.c` headers already promise.  Before Phase 8 the runner reached
+> into three separate lookup mechanisms — `sim_board_for_path`/`sim_board_find`
 > (the `boards[]` table in `src/sim/sim_board.c`), `sim_mote_kind_for` (the
-> enum-indexed `kinds[]` in `src/motes/mote_kinds.c`), and nine hard-coded
+> enum-indexed `kinds[]` in `src/motes/mote_kinds.c`), and eight hard-coded
 > `&xxx_service_ops` at the `sim_service_attach` call sites.  Phase 8 routes
 > all three through one registry populated at startup, **without moving any
 > data literal** — the registry *references* the existing tables and its
@@ -1426,6 +1426,25 @@ plus a v1-only cross-build empty-diff.
 > register into the same registry) and Phase 10 (the runner shrinks to:
 > parse → load → register built-ins → attach services → run).  Numbering
 > continues from Phase 7 (M44–M51).
+> Landed: M44 `caa836b` (this §3.21 doc); M45 `d981c0d` (`sim_registry.{h,c}`
+> skeleton + `csim_register_builtin_{platforms,mote_types}` storing the
+> referenced board/kind tables + the service catalog infrastructure +
+> board/kind accessors that forward to the existing bodies; file-scope
+> `g_registry` singleton built after `sim_runtime_init`; nothing rerouted);
+> M46 `d426870` (board lookup routes through the registry); M47 `f420faa`
+> (mote-kind lookup routes through the registry, across all four kinds);
+> M48 `a67299b` (`csim_register_builtin_services` registers the six exported
+> library services; the runner registers its two file-local serial-socket
+> services on top — eight host services; websocket-UI excluded, not a host
+> service); M49 `c325907` (the four unconditional attach sites resolve ops
+> by name — pcap byte-diff added to the gate); M50 `26c8e8e` (the four
+> conditional attach sites resolve ops by name, guards untouched;
+> `ui_service_start` left alone); M51 (this commit — close-out).  **All
+> eight milestones byte-identical** (cross-build empty-diff on
+> sky/cc2538/firefly/z1/js + the Sky-default fallback + the fan-out-sensitive
+> ui-demo + the `--gdb` conditional path + the pcap file bytes), and the
+> v2↔v1 equivalence diff stayed green throughout (no v2-metadata creep).
+> **Phase 8 COMPLETE.**
 > Stop condition (§9 Phase 8, non-negotiable): do **not** implement `dlopen`
 > plugins — "plugin" stays reserved for Phase 9; keep the low-level
 > `msp430_platform_find` / `arm_platform_find` (called from boot in
@@ -1460,7 +1479,9 @@ Design decisions locked for this phase:
   the three populate functions that have backing data:
   `csim_register_builtin_mote_types` (← `kinds[]`),
   `csim_register_builtin_platforms` (← `boards[]`),
-  `csim_register_builtin_services` (← the nine service-ops structs).
+  `csim_register_builtin_services` (← the eight host service-ops structs —
+  six exported library services + the runner's two file-local serial-socket
+  services; the websocket UI is not a host service and is excluded).
 - **The inert v2 `board`/`cpu`/`soc` metadata is NOT consumed.** Node→board
   resolution stays via the firmware extension (`sim_board_for_path`), exactly
   as §3.20 locked.  Switching to `sim_board_find(mote_type.board)` is a
@@ -1489,8 +1510,9 @@ Milestones (one commit each, full validation gate before each):
     accessor.  Byte-identical (same enum-indexed access).  Kept separate from
     M46 so a diff failure bisects to one table.
 48. Add the service-type catalog registration (`csim_register_builtin_
-    services` registers the nine built-in service-ops by name); no attach
-    site rerouted yet.  Byte-identical (pure addition).
+    services` registers the six exported library service-ops by name + the
+    runner registers its two file-local serial-socket services — eight host
+    services); no attach site rerouted yet.  Byte-identical (pure addition).
 49. Reroute the *unconditional* service-attach sites (pcap, json-test,
     timeline, progress) through the catalog by name; state pointers + attach
     order (= fan-out order) unchanged.  Byte-identical.
@@ -2636,11 +2658,11 @@ the same patch.
   `mote_types[]` table.  v2's `cpu`/`soc`/`board`/`plugins` metadata is
   captured but inert in Phase 7 — node→board resolution still goes through
   the firmware extension; the registry-by-name lookup is Phase 8.
-- **Phase 8 task list is §3.21 (M44–M51).** One static registry
-  (`sim_registry_t`) becomes the single lookup surface for built-ins; the
-  runner's three lookup mechanisms (`sim_board_for_path`/`sim_board_find`,
-  `sim_mote_kind_for`, the hard-coded `&xxx_service_ops` attach sites) route
-  through it.  **The registry references the existing `boards[]`/`kinds[]`
+- **Phase 8 is complete (§3.21, M44–M51).** One static registry
+  (`sim_registry_t`) is the single lookup surface for built-ins; the runner's
+  three lookup mechanisms (`sim_board_for_path`/`sim_board_find`,
+  `sim_mote_kind_for`, the eight hard-coded `&xxx_service_ops` attach sites)
+  route through it.  **The registry references the existing `boards[]`/`kinds[]`
   tables — it does not own them** (accessors forward to the existing function
   bodies; no data literal relocates, preserving the Sky-default fallback and
   the enum-indexed kind access verbatim).  It is a **file-scope singleton in

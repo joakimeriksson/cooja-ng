@@ -60,7 +60,7 @@ src/
   native/             Native Cooja motes (dlopen) + JS app motes (QuickJS)
   ui/                 WebSocket/state bridge (observation only)
 include/
-  sim/                Kernel headers (sim_runtime.h, sim_mote.h, sim_radio_bus.h, sim_board.h)
+  sim/                Kernel headers (sim_runtime.h, sim_mote.h, sim_radio_bus.h, sim_board.h, sim_registry.h)
   common/, msp430/, arm/, native/, ui/
 test/                 Test runner, correctness, benchmarks, firmware, multinode
 firmware/sky/         Pre-compiled Contiki-NG firmware for Tmote Sky
@@ -74,6 +74,7 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_runtime.c` | `sim_runtime_t` container: now_ns, unified event queue, radio medium, mote slots + generations, observer fan-out, `sim_runtime_run_until()` event pump |
 | `sim_radio_bus.c` | Full RF delivery path (Phase 5): per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer, emulated RX core (deliver/queue/drain), frame-complete policy (air-time + collision windows, RXFIFO backpressure, dual 192 µs auto-ACK windows), native/JS frame path, channel push/pull, channel-busy query, bus-owned RX/frame stats |
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
+| `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, and services; `csim_register_builtin_{platforms,mote_types,services}` populate it by *reference* to the existing tables; board/kind accessors forward to the existing bodies, services resolve by name via the owned name→ops catalog. No dlopen (Phase 9) |
 | `sim_config.c` | JSON config loader (Phase 7): `sim_config_load` dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
 | `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
@@ -107,11 +108,14 @@ node kinds (MSP430/ARM/native/JS). All four kinds' ops tables are module-owned
 now — Phase 6 M38 moved the MSP430/ARM execute/serial adapters into their
 modules (the radio-bus dependency cleared in Phase 5, the GDB-stub dependency
 in Phase 6 M37), retiring the runner-side injection. See
-`docs/design/refactor-plan.md` §3.15–§3.19 for the completed Phase 1–6
+`docs/design/refactor-plan.md` §3.15–§3.21 for the completed Phase 1–8
 milestones (Phase 5 extracted the RF-delivery policy into `sim_radio_bus.c`
 and retired `--threads`; Phase 6 extracted the observation/optional features
 into `src/services/` behind a `sim_service_ops_t` host and moved the emulated
-adapters out — the runner is now a frontend over the kernel + services).
+adapters out; Phase 7 added config v2 over one `sim_normalized_config_t`;
+Phase 8 routed the runner's board/mote-kind/service lookups through one
+static `sim_registry_t` — the runner is now a frontend over the kernel +
+services + registry).
 
 ### MSP430 Source Files (src/msp430/)
 
