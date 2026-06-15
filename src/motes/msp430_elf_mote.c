@@ -80,6 +80,31 @@ void msp430_elf_mote_pc_trace_counts(int *cc2420_tx, int *eb_process,
     if (queue_add)  *queue_add  = tsch_queue_add_count;
 }
 
+/* Verbose [UIP] dump (Phase 10 M57): inspect a sending MSP430 node's
+ * uip_aligned_buf (IPv6 header + SRH) from chip memory.  Type-blind entry —
+ * no-op unless this is MSP430 node 1 (the historical debug filter).  Moved
+ * out of the runner's frame-observed hook so the runner needs no MSP430 chip
+ * access. */
+void msp430_elf_mote_dump_uip(const mixed_node_t *node) {
+    if (node->type != NODE_MSP430 || node->id != 1)
+        return;
+    uint32_t uip_buf_sym =
+        msp430_elf_find_symbol(node->firmware_path, "uip_aligned_buf");
+    if (uip_buf_sym && uip_buf_sym + 40 < node->plat.msp.cpu.max_mem) {
+        const uint8_t *ip6 = node->plat.msp.cpu.memory + uip_buf_sym;
+        uint16_t ulen = (ip6[4] << 8) | ip6[5];
+        const uint8_t *cpumem = node->plat.msp.cpu.memory;
+        uint8_t pfx_len = cpumem[0x2964];
+        uint8_t inst_used = cpumem[0x2930];
+        fprintf(stderr, "  [UIP] dest=%02x%02x:...:%02x%02x nh=%d plen=%d pfxlen=%d inst=%d SRH@40=",
+            ip6[24],ip6[25],ip6[38],ip6[39], ip6[6], ulen,
+            pfx_len, inst_used);
+        for (int h = 40; h < 64; h++)
+            fprintf(stderr, "%02x", ip6[h]);
+        fprintf(stderr, "\n");
+    }
+}
+
 /* ============================================================
  * Boot policy
  *

@@ -919,23 +919,11 @@ static void bus_host_frame_observed(void *user,
                     fprintf(stderr, "%02x", buf[fstart + h]);
                 fprintf(stderr, "\n");
             }
-            if (verbose && nodes[sender_idx].type == NODE_MSP430 && nodes[sender_idx].id == 1) {
-                uint32_t uip_buf_sym = msp430_elf_find_symbol(
-                    nodes[sender_idx].firmware_path, "uip_aligned_buf");
-                if (uip_buf_sym && uip_buf_sym + 40 < nodes[sender_idx].plat.msp.cpu.max_mem) {
-                    uint8_t *ip6 = nodes[sender_idx].plat.msp.cpu.memory + uip_buf_sym;
-                    uint16_t ulen = (ip6[4] << 8) | ip6[5];
-                    uint8_t *cpumem = nodes[sender_idx].plat.msp.cpu.memory;
-                    uint8_t pfx_len = cpumem[0x2964];
-                    uint8_t inst_used = cpumem[0x2930];
-                    fprintf(stderr, "  [UIP] dest=%02x%02x:...:%02x%02x nh=%d plen=%d pfxlen=%d inst=%d SRH@40=",
-                        ip6[24],ip6[25],ip6[38],ip6[39], ip6[6], ulen,
-                        pfx_len, inst_used);
-                    for (int h = 40; h < 64; h++)
-                        fprintf(stderr, "%02x", ip6[h]);
-                    fprintf(stderr, "\n");
-                }
-            }
+            /* M57: the verbose [UIP] dump (sender MSP430 chip-memory read)
+             * moved into the MSP430 module; the call is type-blind (no-op
+             * unless MSP430 node 1). */
+            if (verbose)
+                msp430_elf_mote_dump_uip(&nodes[sender_idx]);
             if (ui_service_active(&ui_svc))
                 emit_frame_obs(sender_idx, accurate_tx_start, true,
                                pinfo.summary);
