@@ -311,6 +311,25 @@ static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
     MOTE_IMPL(m)->plat.native.sim_time_ns = now_ns;
 }
 
+/* M54: native/cooja motes init at t=0 before the randomized startup spread.
+ * Shift any absolute pending timer deadlines by the same delay so the first
+ * wakeup is anchored to the delayed start, not the boot-time zero.  Returns
+ * false — sim_time itself is NOT advanced, so the runner adds delay_ns to
+ * node_start_ns. */
+static bool native_mote_apply_startup_delay(sim_mote_t *m, int64_t delay_ns) {
+    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
+    int64_t delay_ms = delay_ns / 1000000LL;
+    if (nat->simEtimerPending && *nat->simEtimerPending &&
+        nat->simEtimerNextExpirationTime) {
+        *nat->simEtimerNextExpirationTime += (uint64_t)delay_ms;
+    }
+    if (nat->simRtimerPending && *nat->simRtimerPending &&
+        nat->simRtimerNextExpirationTime) {
+        *nat->simRtimerNextExpirationTime += (uint64_t)(delay_ns / 1000LL);
+    }
+    return false;
+}
+
 static void *native_mote_get_interface(sim_mote_t *m, int iface) {
     (void)m; (void)iface;
     return NULL;
@@ -353,4 +372,5 @@ const sim_mote_ops_t native_cooja_mote_ops = {
     .ui_leds         = NULL,
     .get_interface   = native_mote_get_interface,
     .receive_frame   = native_mote_receive_frame,
+    .apply_startup_delay = native_mote_apply_startup_delay,
 };

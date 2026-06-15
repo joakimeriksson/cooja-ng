@@ -437,6 +437,16 @@ static void arm_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
     cpu->last_execute_us = t_us;
 }
 
+/* M54: shift sim_time_ns + cycles forward by the startup delay so the sleep
+ * timer shows different elapsed times per node.  Returns true — the runner's
+ * node_start_ns then uses the post-shift sim_time directly (no double-add). */
+static bool arm_mote_apply_startup_delay(sim_mote_t *m, int64_t delay_ns) {
+    arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    cpu->sim_time_ns += delay_ns;
+    cpu->cycles += delay_ns * cpu->cpu_freq_hz / 1000000000LL;
+    return true;
+}
+
 static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
     mixed_node_t *node = MOTE_IMPL(m);
     sim_radio_bus_t *bus = node->env->radio_bus;
@@ -539,4 +549,5 @@ const sim_mote_ops_t arm_elf_mote_ops = {
     .receive_frame   = NULL, /* per-byte / staged delivery */
     .rx_byte_sync    = arm_mote_rx_byte_sync,
     .rx_pre_sync     = NULL, /* MSP430-only pre-sync tick */
+    .apply_startup_delay = arm_mote_apply_startup_delay,
 };

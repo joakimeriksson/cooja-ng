@@ -177,6 +177,18 @@ typedef struct sim_mote_ops {
      * synchronous frame delivery (ex the frame_complete pre-sync tick).
      * NULL elsewhere. */
     void (*rx_pre_sync)(sim_mote_t *m, int64_t time_ns);
+
+    /* ---- M54 (Phase 10): per-kind startup-delay shift ---------------
+     *
+     * OPTIONAL: apply the randomized startup-delay spread to the mote's
+     * platform state and report whether the mote's LOCAL sim-time was
+     * advanced by `delay_ns`.  ARM shifts cpu->sim_time_ns + cycles and
+     * returns true (so the runner's node_start_ns uses the post-shift
+     * sim_time directly); native shifts its pending etimer/rtimer
+     * expirations and returns false (sim_time unchanged → runner adds
+     * delay_ns).  MSP430/JS leave this NULL (no internal shift; runner
+     * treats NULL as "not advanced" and adds delay_ns). */
+    bool (*apply_startup_delay)(sim_mote_t *m, int64_t delay_ns);
 } sim_mote_ops_t;
 
 struct sim_mote {

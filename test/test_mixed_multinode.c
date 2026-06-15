@@ -2094,41 +2094,22 @@ sim_restart:
             int delay_ms = (int)(delay_seed % (unsigned int)config.startup_delay_ms);
             int64_t delay_ns = (int64_t)delay_ms * MS_TO_NS;
 
-            /* For ARM nodes: shift sim_time_ns and cycles forward so
-             * the sleep timer shows different elapsed times per node. */
-            if (nodes[i].type == NODE_ARM) {
-                arm_cpu_t *cpu = &nodes[i].plat.arm.cpu;
-                cpu->sim_time_ns += delay_ns;
-                cpu->cycles += delay_ns * cpu->cpu_freq_hz / 1000000000LL;
-            } else if (nodes[i].type == NODE_NATIVE) {
-                native_node_t *nat = &nodes[i].plat.native;
-                /* Native/cooja motes are initialized at t=0 before the
-                 * randomized startup spread is applied. Shift any absolute
-                 * pending timer deadlines by the same startup delay so their
-                 * first wakeup is anchored to the delayed start time, not the
-                 * boot-time zero point. */
-                if (nat->simEtimerPending && *nat->simEtimerPending &&
-                    nat->simEtimerNextExpirationTime) {
-                    *nat->simEtimerNextExpirationTime += (uint64_t)delay_ms;
-                }
-                if (nat->simRtimerPending && *nat->simRtimerPending &&
-                    nat->simRtimerNextExpirationTime) {
-                    *nat->simRtimerNextExpirationTime += (uint64_t)(delay_ns / 1000LL);
-                }
-            }
+            /* M54: each kind applies its own startup-delay shift via the
+             * vtable op (ARM shifts cpu sim_time+cycles; native shifts its
+             * pending etimer/rtimer deadlines; MSP430/JS have no op).  The
+             * op reports whether it advanced the mote's local sim-time. */
+            sim_mote_t *m = &mote_store[i];
+            bool advanced = m->ops->apply_startup_delay
+                            ? m->ops->apply_startup_delay(m, delay_ns)
+                            : false;
             /* For all node types: set start_ns so the node isn't stepped
-             * until its delay has elapsed.  Don't shift MSP430 internals
-             * — just start it later.
-             *
-             * For ARM nodes the shift above already moved sim_time_ns
-             * forward by delay_ns, so node_sim_time_ns(i) already reflects
-             * the post-delay timestamp; adding delay_ns again would
-             * double-count it (Node 1 reported "start at 109 ms" for a
-             * 54 ms delay because of this). */
+             * until its delay has elapsed.  When the op already advanced
+             * sim_time (ARM), node_sim_time_ns(i) already reflects the
+             * post-delay timestamp, so use it directly; adding delay_ns
+             * again would double-count it (Node 1 reported "start at 109 ms"
+             * for a 54 ms delay because of this). */
             int64_t base_ns = node_sim_time_ns(i);
-            node_start_ns[i] = (nodes[i].type == NODE_ARM)
-                ? base_ns
-                : base_ns + delay_ns;
+            node_start_ns[i] = advanced ? base_ns : base_ns + delay_ns;
             printf("  Node %d: start at %lld ms (delay %d ms)\n",
                    nodes[i].id,
                    (long long)(node_start_ns[i] / MS_TO_NS), delay_ms);
