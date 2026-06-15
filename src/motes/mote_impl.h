@@ -200,6 +200,9 @@ int64_t arm_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
 /* Cycle-derived "now" in ns (raw intra-step value) for the UI/timeline
  * rf-state event — keeps arm_systick.h out of the runner (Phase 10 M53). */
 int64_t arm_elf_mote_now_ns(const sim_mote_t *m);
+/* Classify a cc2538 RF-core state into a sim_radio_state_t (Phase 10 M61);
+ * keeps the RF_STATE_* chip enum out of the runner's rf-state handler. */
+int arm_elf_mote_rf_sim_state(int rf_state);
 
 /* ============================================================
  * Mote-kind registry (M23) — one row per mote kind, indexed by the

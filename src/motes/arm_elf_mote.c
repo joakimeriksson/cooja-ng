@@ -23,6 +23,7 @@
 #include "nrf52840_soc.h"
 #include "nrf54l15_soc.h"
 #include "gdb_stub.h"       /* arm_mote_execute cpu->gdb_stub poll (M38) */
+#include "sim_state.h"      /* SIM_RADIO_* for arm_elf_mote_rf_sim_state (M61) */
 
 #include <stdio.h>
 #include <string.h>
@@ -383,6 +384,19 @@ static uint32_t arm_mote_freq_hz(const sim_mote_t *m) {
 int64_t arm_elf_mote_now_ns(const sim_mote_t *m) {
     const arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
     return arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+}
+
+/* Classify a cc2538 RF-core state (RF_STATE_*) into a sim_radio_state_t value
+ * for the UI/timeline rf-state handler (Phase 10 M61) — keeps the chip enum
+ * out of the runner.  Returns the sim_radio_state_t as int. */
+int arm_elf_mote_rf_sim_state(int rf_state) {
+    if (rf_state >= RF_STATE_TX_CALIBR && rf_state <= RF_STATE_TX_FINAL)
+        return SIM_RADIO_TX;
+    if (rf_state == RF_STATE_RX)
+        return SIM_RADIO_RX;
+    if (rf_state == RF_STATE_RX_CALIBR || rf_state == RF_STATE_SFD_WAIT)
+        return SIM_RADIO_ON;
+    return SIM_RADIO_OFF;
 }
 static int64_t arm_mote_instructions(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.arm.cpu.instructions;

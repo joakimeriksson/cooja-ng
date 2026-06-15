@@ -13,14 +13,12 @@
  *   .cooja    -> Native (Cooja mote via dlopen)
  *   .js       -> JavaScript application mote (QuickJS)
  */
-#include "msp430_platform.h"
-#include "msp430_elf.h"
-#include "cc2420.h"
-#include "arm_platform.h"
-#include "cc2538_soc.h"
-#include "nrf52840_soc.h"
-#include "nrf54l15_soc.h"
-#include "arm_elf.h"
+/* Phase 10 M61: the runner is a frontend — it includes NO chip headers.
+ * The emulated CPU/chip types and ops live behind the mote vtable
+ * (src/motes/) and the per-kind modules.  native_node.h / js_node.h stay:
+ * the host-process (native Cooja / JS) scheduling policy is runner-side
+ * (the §3.22 bucket-C deferral) and they are node-impl headers, not chip
+ * headers. */
 #include "native_node.h"
 #include "js_node.h"
 #include "sim_config.h"
@@ -44,7 +42,6 @@
 #include "sim_external_command.h"
 #include "sim_radio_bus.h"
 #include "gdb_stub.h"
-#include "arm_gdb.h"
 #include "pcap_writer.h"
 #include "pcap_service.h"
 #include "progress_service.h"
@@ -73,6 +70,12 @@
  * in src/motes/mote_impl.h (Phase 4, M18) — shared with the per-kind
  * mote modules. */
 #include "mote_impl.h"
+
+/* M61: the TSCH-ACK trace fetches a node's CC2420 via get_interface and passes
+ * the handle to the chip's state-name accessor — it never dereferences it, so
+ * an opaque forward declaration keeps cc2420.h out of the runner. */
+typedef struct cc2420 cc2420_t;
+extern const char *cc2420_state_name(const cc2420_t *r);
 
 /* rf_buffer_t / tx_frame_asm_t / tx_frame_capture_t live in sim_radio_bus.h (M9.1) */
 
@@ -313,13 +316,10 @@ static void mixed_rf_state_handler(void *user_data, int old_state, int new_state
     mixed_node_t *node = (mixed_node_t *)user_data;
     int idx = (int)(node - nodes);
 
-    sim_radio_state_t sim_state = SIM_RADIO_OFF;
-    if (new_state >= RF_STATE_TX_CALIBR && new_state <= RF_STATE_TX_FINAL)
-        sim_state = SIM_RADIO_TX;
-    else if (new_state == RF_STATE_RX)
-        sim_state = SIM_RADIO_RX;
-    else if (new_state == RF_STATE_RX_CALIBR || new_state == RF_STATE_SFD_WAIT)
-        sim_state = SIM_RADIO_ON;
+    /* M61: the cc2538 RF_STATE_* classification lives in the ARM module so the
+     * runner needs no chip header for it. */
+    sim_radio_state_t sim_state =
+        (sim_radio_state_t)arm_elf_mote_rf_sim_state(new_state);
 
     /* Skip TX/RX events — explicit timeline events handle those with
      * proper frame duration.  Only emit ON/OFF transitions here. */
