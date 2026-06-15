@@ -1538,22 +1538,35 @@ cross-build empty-diff.
 
 ### 3.22 Runner-shrink milestones (canonical Phase 10 task list)
 
-> **Status: in progress (M52–M62).** Phase 10 (§9) finishes the
-> runner-extraction arc: `test/test_mixed_multinode.c` becomes a pure
+> **Status: complete (M52–M62).** Phase 10 (§9) finished the
+> runner-extraction arc: `test/test_mixed_multinode.c` is now a pure
 > frontend (parse CLI, load config, instantiate runtime, register built-ins,
-> attach services, run, report exit code).  The runner is already a frontend
-> over the kernel + service host + registry, but it still reaches directly
-> into emulated-CPU chip internals in a handful of places.  Phase 10
-> decouples the **emulated MSP430/ARM** chip layer: it adds two mote-vtable
-> ops (`dump_diagnostics`, `apply_startup_delay`) and moves the chip-coupled
-> code into `src/motes/{msp430,arm}_elf_mote.c`, where the chip types already
-> arrive via `mote_impl.h`.  Numbering continues from Phase 8 (M52–M62;
-> Phase 9 — the dlopen ABI — is intentionally deferred and done after the
-> shrink, since a cleaner runtime surface de-risks the plugin ABI).
-> Success metric (§9): the runner no longer `#include`s chip headers
-> directly; it no longer switches on `NODE_MSP430`/`NODE_ARM` for normal
-> simulation; new platforms register descriptors/adapters instead of editing
-> the runner.  All milestones byte-identical (cross-build empty-diff).
+> attach services, run, report exit code).  Phase 10 decoupled the
+> **emulated MSP430/ARM** chip layer by adding four mote-vtable ops
+> (`dump_diagnostics`, `apply_startup_delay`, `program_counter`, plus the
+> banner-label data on the kind row) and moving the chip-coupled code into
+> `src/motes/{msp430,arm}_elf_mote.c`, where the chip types arrive via
+> `mote_impl.h`.  Numbering continued from Phase 8 (M52–M62; Phase 9 — the
+> dlopen ABI — is intentionally done after the shrink, since a cleaner
+> runtime surface de-risks the plugin ABI).
+> **Success metric MET:** the runner `#include`s no chip headers; it has no
+> `plat.msp`/`plat.arm` access and no `NODE_MSP430`/`NODE_ARM` switch (grep
+> clean, comments aside); new platforms register a kind row + descriptors,
+> no runner edit.  Runner −146 lines (2794 → 2648).
+> Landed: M52 `ae92fc1` (this §3.22 doc); M53 `c046116` (ARM rf-state
+> timestamp via cycles/freq ops → drop arm_systick.h); M54 `dc886ec`
+> (`apply_startup_delay` op); M55 `3891ef9` (srh_trace + PC-trace install →
+> MSP430 module); M56 `2573d24` (`cc2420_state_name` accessor, enum out of
+> the runner); M57 `ad53a95` (verbose `[UIP]` dump → MSP430 module); M58
+> `8a9cdde` (MSP430 `dump_diagnostics` — the per-node stats block); M59
+> `660b47f` (global RF stat getters via neutral extern); M60 `22cbce3`
+> (split destroy/PC fusion via a `program_counter` op + de-type the firmware
+> banner via a kind `banner_label`); M61 `1d9b2cb` (delete all nine chip
+> includes — cc2420 via an opaque forward-decl, cc2538 RF_STATE_* classifier
+> → ARM module); M62 (this commit — close-out).  **All ten code milestones
+> byte-identical** (cross-build empty-diff incl. the always-printed
+> diagnostics + the TSCH-ACK trace + the ui-demo rf-state path).
+> **Phase 10 COMPLETE.**
 
 Scope decision locked for this phase — **defer the native host-process
 scheduling policy**:
@@ -2793,6 +2806,22 @@ the same patch.
   precedent).  Global RF stat getters (`cc2420_get_rx_stats` etc.) stay single
   runner calls via neutral `extern` (they are process-global, not per-node).
   Phase 9 (dlopen) follows.
+- **Phase 10 is complete (§3.22, M52–M62), done before Phase 9.** The runner
+  is now a pure frontend: it includes no chip headers and has no
+  `plat.msp`/`plat.arm` access or `NODE_MSP430`/`NODE_ARM` switch.  The
+  emulated MSP430/ARM chip coupling moved behind four mote ops
+  (`dump_diagnostics`, `apply_startup_delay`, `program_counter`) + a kind-row
+  `banner_label`, with the per-node stats / traces / startup-delay /
+  rf-state-classification living in `src/motes/{msp430,arm}_elf_mote.c`.
+  **The native host-process scheduling policy is deferred** (the
+  `NODE_NATIVE` switches + `plat.native` — `native_yield_callback`, the
+  `dispatch_mote_wakeup` native paths, `sync_native_node_channel`): the
+  success metric names only MSP430/ARM + chip headers, the code flags it as
+  "the most tempting wrong move (§3.17)", and it is a high-risk cross-node
+  state machine for zero metric gain (M40 precedent).  `native_node.h` /
+  `js_node.h` stay (node-impl, not chip headers).  Global RF stat getters
+  (`cc2420_get_rx_stats` etc.) stay single runner calls via neutral `extern`
+  (process-global, not per-node).  Phase 9 (dlopen) follows.
 - **Terminology**: "service" for built-in components via `sim_service_ops_t`,
   "plugin" for dynamic-loaded services only (§2.1).
 - **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.

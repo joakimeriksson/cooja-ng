@@ -108,14 +108,18 @@ node kinds (MSP430/ARM/native/JS). All four kinds' ops tables are module-owned
 now — Phase 6 M38 moved the MSP430/ARM execute/serial adapters into their
 modules (the radio-bus dependency cleared in Phase 5, the GDB-stub dependency
 in Phase 6 M37), retiring the runner-side injection. See
-`docs/design/refactor-plan.md` §3.15–§3.21 for the completed Phase 1–8
+`docs/design/refactor-plan.md` §3.15–§3.22 for the completed Phase 1–8 + 10
 milestones (Phase 5 extracted the RF-delivery policy into `sim_radio_bus.c`
 and retired `--threads`; Phase 6 extracted the observation/optional features
 into `src/services/` behind a `sim_service_ops_t` host and moved the emulated
 adapters out; Phase 7 added config v2 over one `sim_normalized_config_t`;
 Phase 8 routed the runner's board/mote-kind/service lookups through one
-static `sim_registry_t` — the runner is now a frontend over the kernel +
-services + registry).
+static `sim_registry_t`; Phase 10 shrank the runner to a pure frontend —
+the emulated MSP430/ARM chip coupling moved behind mote ops
+(`dump_diagnostics`/`apply_startup_delay`/`program_counter`) so the runner
+includes no chip headers and never switches on `NODE_MSP430`/`NODE_ARM`; the
+native host-process scheduling policy is the documented deferral). Phase 9
+(dlopen plugin ABI) is the remaining phase.
 
 ### MSP430 Source Files (src/msp430/)
 
