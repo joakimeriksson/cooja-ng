@@ -212,6 +212,14 @@ typedef struct sim_mote_ops {
      * delay_ns).  MSP430/JS leave this NULL (no internal shift; runner
      * treats NULL as "not advanced" and adds delay_ns). */
     bool (*apply_startup_delay)(sim_mote_t *m, int64_t delay_ns);
+
+    /* ---- M60 (Phase 10): program counter -----------------------------
+     *
+     * OPTIONAL: current program counter, for the end-of-run per-node summary
+     * line.  MSP430 returns reg[MSP430_PC]; NULL elsewhere (the summary shows
+     * PC=0x0000 for non-MSP430 kinds, matching the prior behavior where only
+     * MSP430 read a PC). */
+    uint32_t (*program_counter)(const sim_mote_t *m);
 } sim_mote_ops_t;
 
 struct sim_mote {

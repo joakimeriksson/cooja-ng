@@ -1768,12 +1768,13 @@ int run_mixed_multinode_test(int argc, char **argv) {
 
     printf("=== Mixed-Platform Multi-Node Test ===\n");
     for (int i = 0; i < firmware_count; i++) {
-        node_type_t t =
+        /* M60: the banner label is data on the mote-kind row, not a type
+         * switch — adding a platform needs no runner edit. */
+        const sim_mote_kind_t *kind =
             sim_registry_mote_kind_for(&g_registry,
-                sim_registry_board_for_path(&g_registry, firmware_paths[i])->kind)
-                ->node_type;
+                sim_registry_board_for_path(&g_registry, firmware_paths[i])->kind);
         printf("Firmware[%d]: %s (%s)\n", i, firmware_paths[i],
-               t == NODE_MSP430 ? "MSP430" : t == NODE_ARM ? "ARM" : "NATIVE");
+               kind->banner_label);
     }
     printf("Nodes: %d, Simulated time: %d ms (%lld ns), Threads: 1 (sequential)\n",
            node_count, sim_ms, (long long)total_ns);
@@ -2587,18 +2588,21 @@ sim_restart:
 
     int64_t total_node_cycles = 0;
     int64_t total_node_instructions = 0;
+    /* M60: pass 1 reads per-node stats (PC via the op, NULL ⇒ 0 for
+     * non-MSP430) + accumulates totals.  Destroy is split into pass 2 so the
+     * runner reads no chip state mid-teardown and needs no plat.msp access. */
     for (int i = 0; i < node_count; i++) {
-        uint32_t cur_pc = 0;
-        if (nodes[i].type == NODE_MSP430)
-            cur_pc = nodes[i].plat.msp.cpu.reg[MSP430_PC];
+        const sim_mote_t *m = &mote_store[i];
+        uint32_t cur_pc = m->ops->program_counter ? m->ops->program_counter(m) : 0;
         printf("  Node %d [%s]: %lld cycles, %lld instructions, PC=0x%04x\n",
                nodes[i].id, node_type_str(i),
                (long long)node_cycles(i), (long long)node_instructions(i),
                cur_pc);
         total_node_cycles += node_cycles(i);
         total_node_instructions += node_instructions(i);
-        destroy_node(i);
     }
+    for (int i = 0; i < node_count; i++)
+        destroy_node(i);
 
     /* Serial socket: use child exit status as test result */
     if (sim_external_command_exited(&external_cmd)) {

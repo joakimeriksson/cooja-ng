@@ -544,6 +544,10 @@ static uint32_t msp_mote_freq_hz(const sim_mote_t *m) {
 static int64_t msp_mote_instructions(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.msp.cpu.instructions;
 }
+/* M60: current PC for the end-of-run per-node summary line. */
+static uint32_t msp_mote_program_counter(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.msp.cpu.reg[MSP430_PC];
+}
 
 static void msp_mote_step_until(sim_mote_t *m, int64_t target) {
     msp430_step_until(&MOTE_IMPL(m)->plat.msp.cpu, target);
@@ -715,4 +719,5 @@ const sim_mote_ops_t msp430_elf_mote_ops = {
     .rx_byte_sync    = msp_mote_rx_byte_sync,
     .rx_pre_sync     = msp_mote_rx_pre_sync,
     .dump_diagnostics = msp430_elf_mote_dump_diagnostics,
+    .program_counter = msp_mote_program_counter,
 };

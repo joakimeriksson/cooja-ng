@@ -212,6 +212,9 @@ int64_t arm_elf_mote_now_ns(const sim_mote_t *m);
 
 typedef struct sim_mote_kind {
     const char *name;            /* "msp430-elf", "arm-elf", ...      */
+    const char *banner_label;    /* "MSP430"/"ARM"/"NATIVE" — the
+                                  * pre-init firmware-banner label
+                                  * (M60; JS shares "NATIVE")          */
     node_type_t node_type;       /* feeds nodes[].type until Phase 5
                                   * de-types frame-delivery policy    */
     int  (*boot)(mixed_node_t *node, int slot, const char *path,

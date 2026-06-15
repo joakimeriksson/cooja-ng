@@ -17,6 +17,7 @@
 static sim_mote_kind_t kinds[] = {
     [SIM_BOARD_KIND_MSP430] = {
         .name           = "msp430-elf",
+        .banner_label   = "MSP430",
         .node_type      = NODE_MSP430,
         .boot           = msp430_elf_mote_boot,
         .register_radio = msp430_elf_mote_register_radio,
@@ -24,6 +25,7 @@ static sim_mote_kind_t kinds[] = {
     },
     [SIM_BOARD_KIND_ARM] = {
         .name           = "arm-elf",
+        .banner_label   = "ARM",
         .node_type      = NODE_ARM,
         .boot           = arm_elf_mote_boot,
         .register_radio = arm_elf_mote_register_radio,
@@ -31,6 +33,7 @@ static sim_mote_kind_t kinds[] = {
     },
     [SIM_BOARD_KIND_NATIVE] = {
         .name           = "native-cooja",
+        .banner_label   = "NATIVE",
         .node_type      = NODE_NATIVE,
         .boot           = native_cooja_mote_boot,
         .register_radio = native_cooja_mote_register_radio,
@@ -38,6 +41,7 @@ static sim_mote_kind_t kinds[] = {
     },
     [SIM_BOARD_KIND_JS] = {
         .name           = "js-app",
+        .banner_label   = "NATIVE",  /* banner lumps JS with native (historical) */
         .node_type      = NODE_JS,
         .boot           = js_app_mote_boot,
         .register_radio = js_app_mote_register_radio,
