@@ -1379,7 +1379,7 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     /* Phase 3: one registry lookup owns the board decision — node kind,
      * arch platform name, and banner label all come from the row.
      * M23: the kind row owns boot + radio registration + ops. */
-    node->board = sim_board_for_path(firmware_path);
+    node->board = sim_registry_board_for_path(&g_registry, firmware_path);
     const sim_mote_kind_t *kind = sim_mote_kind_for(node->board->kind);
     node->type = kind->node_type;
     node->id = node_id;
@@ -1804,7 +1804,8 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("=== Mixed-Platform Multi-Node Test ===\n");
     for (int i = 0; i < firmware_count; i++) {
         node_type_t t =
-            sim_mote_kind_for(sim_board_for_path(firmware_paths[i])->kind)
+            sim_mote_kind_for(
+                sim_registry_board_for_path(&g_registry, firmware_paths[i])->kind)
                 ->node_type;
         printf("Firmware[%d]: %s (%s)\n", i, firmware_paths[i],
                t == NODE_MSP430 ? "MSP430" : t == NODE_ARM ? "ARM" : "NATIVE");
