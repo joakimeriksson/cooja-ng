@@ -74,6 +74,7 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_runtime.c` | `sim_runtime_t` container: now_ns, unified event queue, radio medium, mote slots + generations, observer fan-out, `sim_runtime_run_until()` event pump |
 | `sim_radio_bus.c` | Full RF delivery path (Phase 5): per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer, emulated RX core (deliver/queue/drain), frame-complete policy (air-time + collision windows, RXFIFO backpressure, dual 192 µs auto-ACK windows), native/JS frame path, channel push/pull, channel-busy query, bus-owned RX/frame stats |
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
+| `sim_config.c` | JSON config loader (Phase 7): `sim_config_load` dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
 | `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
 | `sim_external_command.c` | External command service (border-router etc. helper processes) |

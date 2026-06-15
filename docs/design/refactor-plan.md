@@ -1339,10 +1339,17 @@ on the ui-demo smoke, not a diff.  Perf ≤5% additional wall for Phases
 
 ### 3.20 Config-v2 milestones (canonical Phase 7 task list)
 
-> **Status: in progress.** Phase 7 (§9 / §8.3) adds a **config v2** format
-> alongside the legacy v1 JSON so configs can name mote types / platforms /
-> plugins (which Phase 8's static registry resolves by name).  Numbering
-> continues from Phase 6 (M41–M43).
+> **Status: complete (M41–M43).** Phase 7 (§9 / §8.3) added a **config v2**
+> format alongside the legacy v1 JSON so configs can name mote types /
+> platforms / plugins (which Phase 8's static registry resolves by name).
+> Numbering continues from Phase 6 (M41–M43).  Landed: M41 `6d9b8a3`
+> (versioned-dispatch refactor + relocate config to the sim namespace +
+> rename `sim_config_t`→`sim_normalized_config_t`, byte-identical); M42
+> `4a9cf31` (v2 parser — shared `parse_medium_object`/`parse_test` helpers +
+> named `mote_types`/`plugins` + `type`-name node resolution; v2 twins +
+> `tools/check-config-equivalence.sh`; v2↔v1 output byte-identical; also
+> fixed a latent double-free from the M41 move); M43 (this commit — docs
+> close-out).
 > Key finding: `sim_config_t` is **already** the normalized config struct
 > §8.3 calls for — the runner consumes the parsed struct (40 field reads),
 > not the JSON (the cJSON tree is freed in `sim_config_load` before it
@@ -1847,6 +1854,21 @@ Steps:
 4. Add a v2 parser path producing the same `sim_normalized_config_t`.
 5. Update `sim_runtime_init` to consume normalized config.
 6. Keep `tools/csc2json.py` emitting v1 until v2 is stable.
+
+**Outcome (Phase 7, M41–M43).** The existing `sim_config_t` *was already*
+the normalized struct — the runner consumes the parsed struct (not the JSON;
+`sim_config_load` frees the cJSON tree before returning), so step 5 was
+already satisfied and **Phase 7 left the runtime untouched**.  Steps as
+landed: `sim_config_t` was renamed `sim_normalized_config_t` and relocated to
+the `sim` namespace (M41); `sim_config_load` became a `version`-dispatcher
+over `parse_v1`/`parse_v2` sharing `parse_medium_object`/`parse_test`
+helpers (M41/M42); v2 named `mote_types`/`plugins` + `type`-name node
+resolution were added (M42).  Two carry-overs to Phase 8: the legacy
+index-keyed `mote_type_firmware[8][256]` table is retained (read by index in
+`TEST_ACTION_ADD`) — the v2 parser writes it alongside the richer
+`mote_types[]`; and v2's `cpu`/`soc`/`board`/`plugins` metadata is captured
+but inert (node→board resolution still uses the firmware extension; the
+register-by-name lookup is Phase 8).  `csc2json.py` still emits v1.
 
 ## 9. Refactor Phases
 
