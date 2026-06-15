@@ -1536,6 +1536,106 @@ v2-metadata creep); the `--ui` smoke on the service-reroute milestones
 (fan-out order is byte-sensitive).  All milestones are byte-identical →
 cross-build empty-diff.
 
+### 3.22 Runner-shrink milestones (canonical Phase 10 task list)
+
+> **Status: in progress (M52–M62).** Phase 10 (§9) finishes the
+> runner-extraction arc: `test/test_mixed_multinode.c` becomes a pure
+> frontend (parse CLI, load config, instantiate runtime, register built-ins,
+> attach services, run, report exit code).  The runner is already a frontend
+> over the kernel + service host + registry, but it still reaches directly
+> into emulated-CPU chip internals in a handful of places.  Phase 10
+> decouples the **emulated MSP430/ARM** chip layer: it adds two mote-vtable
+> ops (`dump_diagnostics`, `apply_startup_delay`) and moves the chip-coupled
+> code into `src/motes/{msp430,arm}_elf_mote.c`, where the chip types already
+> arrive via `mote_impl.h`.  Numbering continues from Phase 8 (M52–M62;
+> Phase 9 — the dlopen ABI — is intentionally deferred and done after the
+> shrink, since a cleaner runtime surface de-risks the plugin ABI).
+> Success metric (§9): the runner no longer `#include`s chip headers
+> directly; it no longer switches on `NODE_MSP430`/`NODE_ARM` for normal
+> simulation; new platforms register descriptors/adapters instead of editing
+> the runner.  All milestones byte-identical (cross-build empty-diff).
+
+Scope decision locked for this phase — **defer the native host-process
+scheduling policy**:
+
+- The runner's remaining `NODE_NATIVE` switches + `node->plat.native.*`
+  accesses (`native_yield_callback` ACK-turnaround, the
+  `dispatch_mote_wakeup` native RX snapshot/dispatch, `sync_native_node_channel`)
+  stay runner-side, **out of Phase-10 scope**.  Rationale: the success metric
+  names only `NODE_MSP430`/`NODE_ARM` and *chip* headers
+  (`native_node.h`/`js_node.h` are host-process node headers, not chip
+  headers); `mote_impl.h` + the runner both flag this native policy in-code as
+  "the most tempting wrong move (§3.17)"; it is a tightly-ordered cross-node
+  state machine (pre-execute snapshots, up-to-5 soft-ACK ticks, CCA
+  `simSignalStrength` poisoning) — high byte-identity risk for zero gain
+  against the metric; and M40 set the precedent (documented type-specific
+  host-side policy, revisit later).
+
+Design decisions locked for this phase:
+
+- **End-of-run statistics → a per-kind optional `dump_diagnostics(const
+  sim_mote_t *m)` op.**  Each module reads its own chip internals + firmware
+  symbols and prints its own block (MSP430: SFD/Timer-B/TSCH-state/
+  neighbor+SR tables/per-node CC2420 stats/`msp430_timer_dump_ccr_counts`/
+  `msp430_gpio_get_isr_count`/PC; ARM: its bits; native/JS NULL).  The runner
+  loops the op, one call per original print site, with the module emitting
+  **character-identical** format strings.  Not a service (M40 adjudicated:
+  re-exposes chip internals for no gain); not `get_interface` (that hands the
+  chip pointer back to the runner, keeping the include).  The cross-cutting
+  aggregates (`radio_bus.stats`, total RF/UART bytes, phase timing,
+  performance summary, cycle/instruction totals via the existing
+  `cycles`/`instructions` ops) stay runner-side — no chip coupling.
+- **Global stat getters stay single runner calls.**  `cc2420_get_rx_stats` /
+  `cc2420_get_auto_ack_count` / `cc2538_rfcore_get_rxfifo_overflows` read
+  process-global counters, **not** per-node — they must NOT enter the
+  per-mote op (that multiplies by node count).  They remain single type-blind
+  runner calls reached via a neutral `extern` prototype (no chip header
+  pinned).
+- **The destroy/PC fusion splits into two passes in one loop's order** — pass
+  1 prints the per-node line (PC via the diagnostics op) + accumulates
+  totals; pass 2 destroys.  Same iteration order; destroy strictly last.
+- **Startup-delay → an optional `apply_startup_delay(m, delay_ns)` op** that
+  returns whether it already advanced sim-time, so the runner picks `base_ns`
+  vs `base_ns+delay_ns` from the flag instead of a `type==NODE_ARM` test
+  (MSP430 no-op; ARM shifts `cpu.sim_time_ns`/`cycles`; native shifts the
+  etimer/rtimer expirations).  Not folded into `reset_time` (different
+  semantics).
+- **ARM rf-state timestamp from vtable ops** — `mixed_rf_state_handler`
+  computes `arm_cycles_to_ns(cycles(m), freq_hz(m))` in the ARM module,
+  dropping the runner's sole `arm_systick.h` use.
+- **Chip-header includes come off LAST (M61), batched** — a mechanically
+  empty-diff pure-deletion commit once every symbol user has moved (four are
+  already unused; the rest lose their last user across M53–M60).
+
+Milestones (one commit each, full validation gate before each):
+
+52. Docs: this §3.22 (mirrors §3.18–§3.21); §9 Phase 10 points here.
+53. ARM rf-state timestamp via `cycles`/`freq_hz` ops; drop `arm_systick.h`.
+54. `apply_startup_delay` op (ARM/native shifts into modules; runner keeps the
+    seed/print/`node_start_ns`, choosing the base from the returned flag).
+55. Move `srh_trace_cb` + the PC-trace install block + the three counters into
+    the MSP430 module behind a hook.
+56. Relocate `cc2420_state_str`/`cc2420_radio_state_t` out of the runner (the
+    `trace_tsch_ack` lines stay — they use `get_interface`); clears the
+    runner's `cc2420.h` enum use.
+57. Move the verbose `[UIP]` dump into the MSP430 module behind a type-blind
+    hook (NULL ⇒ skip).
+58. MSP430 `dump_diagnostics` (the per-node MSP430 stats block).
+59. ARM `dump_diagnostics`; native/JS no-ops; the global RF stat getters stay
+    single runner calls behind neutral `extern` protos.
+60. Split the destroy/PC fusion into two passes.
+61. Delete the chip-header includes (lines 16–24, 48) — pure deletion after
+    grep confirms zero symbol use.
+62. Close-out (docs only): §3.22 status, §9 Phase 10 done, bucket-C deferral,
+    Decisions Log, CLAUDE.md.
+
+Validation gate per milestone: §3.21's gate plus the **cross-build empty-diff
+including the always-printed diagnostics lines** (only host-timing noise is
+stripped).  M58–M60 (stats) are highest-risk — diff a TSCH-heavy MSP430 run +
+a 4-node chain to exercise every diagnostic print site; confirm the global
+RF-stat line prints exactly once.  Closing check: `grep` for chip includes +
+`plat.(msp|arm)` + `NODE_(MSP430|ARM)` in the runner returns nothing.
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -2425,6 +2525,12 @@ Stop condition:
 
 ### Phase 10 - Shrink the runner
 
+The canonical task list is **§3.22 above (milestones M52–M62)**; land them in
+order, one commit per milestone.  The notes below summarize the scope; where
+they disagree with §3.22 (written later, against the post-Phase-8 code),
+§3.22 wins.  Phase 9 (dlopen ABI) is done after this phase — a cleaner runtime
+surface de-risks the plugin ABI.
+
 Goal: `test/test_mixed_multinode.c` becomes a frontend.
 
 Target responsibilities:
@@ -2673,6 +2779,20 @@ the same patch.
   stays on the firmware extension (§3.20 lock); consuming it is Phase 10.
   `dlopen` stays out (Phase 9); `msp430_platform_find`/`arm_platform_find`
   stay as low-level impl details.
+- **Phase 10 task list is §3.22 (M52–M62), done before Phase 9.** The runner
+  becomes a pure frontend by decoupling the emulated MSP430/ARM chip layer:
+  two new mote ops (`dump_diagnostics`, `apply_startup_delay`) + moving the
+  end-of-run stats, the MSP430 debug/trace hooks, the startup-delay shifts,
+  and the ARM rf-state timestamp into `src/motes/{msp430,arm}_elf_mote.c`;
+  the chip-header includes come off last (M61).  **The native host-process
+  scheduling policy is deferred** (NODE_NATIVE switches + `plat.native` —
+  `native_yield_callback`, the `dispatch_mote_wakeup` native paths,
+  `sync_native_node_channel`): the success metric names only MSP430/ARM +
+  chip headers, the code flags it as "the most tempting wrong move (§3.17)",
+  and it is a high-risk cross-node state machine for zero metric gain (M40
+  precedent).  Global RF stat getters (`cc2420_get_rx_stats` etc.) stay single
+  runner calls via neutral `extern` (they are process-global, not per-node).
+  Phase 9 (dlopen) follows.
 - **Terminology**: "service" for built-in components via `sim_service_ops_t`,
   "plugin" for dynamic-loaded services only (§2.1).
 - **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.
