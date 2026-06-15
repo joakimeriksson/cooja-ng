@@ -9,6 +9,7 @@
  * for unknown extensions.
  */
 #include "sim_board.h"
+#include "sim_registry.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -58,4 +59,26 @@ const sim_board_desc_t *sim_board_find(const char *name) {
             return &boards[i];
     }
     return NULL;
+}
+
+/* --- Registry glue (Phase 8 M45).  The registry references this table; the
+ * accessors forward to the bodies above so the Sky-default fallback stays
+ * verbatim. --- */
+
+void csim_register_builtin_platforms(sim_registry_t *r) {
+    if (!r) return;
+    r->boards = boards;
+    r->board_count = BOARD_COUNT;
+}
+
+const sim_board_desc_t *sim_registry_board_for_path(const sim_registry_t *r,
+                                                    const char *path) {
+    (void)r;
+    return sim_board_for_path(path);
+}
+
+const sim_board_desc_t *sim_registry_board_find(const sim_registry_t *r,
+                                                const char *name) {
+    (void)r;
+    return sim_board_find(name);
 }

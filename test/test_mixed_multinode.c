@@ -40,6 +40,7 @@
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
 #include "sim_board.h"
+#include "sim_registry.h"
 #include "sim_serial_bridge.h"
 #include "sim_external_command.h"
 #include "sim_radio_bus.h"
@@ -115,6 +116,12 @@ static int verbose = 1;
  * aliases keep call sites unchanged until the dispatch functions
  * migrate into the bus (M9.3/9.4). */
 static sim_radio_bus_t radio_bus;
+
+/* Phase 8 (§3.21): the static built-in registry — the single lookup surface
+ * for boards, mote kinds, and services.  Populated once in
+ * run_mixed_multinode_test after sim_runtime_init; the runner's board/kind/
+ * service lookups route through it (M46–M50). */
+static sim_registry_t g_registry;
 #define rf_pending    (radio_bus.rf_pending)
 #define tx_asm        (radio_bus.tx_asm)
 #define tx_cap        (radio_bus.tx_cap)
@@ -1651,6 +1658,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * check — zeroed static structs would read as live. */
     sim_serial_bridge_init(&serial_bridge);
     sim_external_command_init(&external_cmd);
+    /* Phase 8 M45: build the static built-in registry from the existing
+     * tables.  References boards[]/kinds[] (no data moved); the runner's
+     * lookups route through it starting M46.  Services register at M48. */
+    csim_register_builtin_platforms(&g_registry);
+    csim_register_builtin_mote_types(&g_registry);
     sim_rt.radio_bus = &radio_bus;
     /* M9.4: runner host hooks for the bus TX path (per-node ops register
      * in init_node via register_node_radio_ops). */

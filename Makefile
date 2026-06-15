@@ -77,6 +77,7 @@ SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
               $(SIM_SRC_DIR)/sim_external_command.c \
               $(SIM_SRC_DIR)/sim_radio_bus.c \
               $(SIM_SRC_DIR)/sim_board.c \
+              $(SIM_SRC_DIR)/sim_registry.c \
               $(SIM_SRC_DIR)/sim_config.c
 
 SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
