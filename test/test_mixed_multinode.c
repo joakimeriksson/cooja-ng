@@ -1380,7 +1380,8 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
      * arch platform name, and banner label all come from the row.
      * M23: the kind row owns boot + radio registration + ops. */
     node->board = sim_registry_board_for_path(&g_registry, firmware_path);
-    const sim_mote_kind_t *kind = sim_mote_kind_for(node->board->kind);
+    const sim_mote_kind_t *kind =
+        sim_registry_mote_kind_for(&g_registry, node->board->kind);
     node->type = kind->node_type;
     node->id = node_id;
     node->slot = idx;
@@ -1642,6 +1643,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * radio-medium init still happen at their existing call sites below,
      * just through the runtime fields. */
     sim_runtime_init(&sim_rt);
+    /* Phase 8 M45: build the static built-in registry from the existing
+     * tables.  References boards[]/kinds[] (no data moved); the runner's
+     * board/kind/service lookups route through it (M46–M50).  Populated here,
+     * before the first registry lookup in the mote-store pre-bind loop. */
+    csim_register_builtin_platforms(&g_registry);
+    csim_register_builtin_mote_types(&g_registry);
     /* M38: every mote kind's ops are module-owned now (the MSP430/ARM
      * adapter tables moved to src/motes/{msp430,arm}_elf_mote.c), so the
      * kind registry needs no runtime injection. */
@@ -1651,18 +1658,14 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * switch read zeroed structs in that case). */
     for (int i = 0; i < MAX_NODES; i++) {
         mote_store[i].id = 0;
-        mote_store[i].ops = sim_mote_kind_for(SIM_BOARD_KIND_NATIVE)->ops;
+        mote_store[i].ops =
+            sim_registry_mote_kind_for(&g_registry, SIM_BOARD_KIND_NATIVE)->ops;
         mote_store[i].impl = &nodes[i];
     }
     /* fd/pid fields must be -1, not 0, before any _active()/_launched()
      * check — zeroed static structs would read as live. */
     sim_serial_bridge_init(&serial_bridge);
     sim_external_command_init(&external_cmd);
-    /* Phase 8 M45: build the static built-in registry from the existing
-     * tables.  References boards[]/kinds[] (no data moved); the runner's
-     * lookups route through it starting M46.  Services register at M48. */
-    csim_register_builtin_platforms(&g_registry);
-    csim_register_builtin_mote_types(&g_registry);
     sim_rt.radio_bus = &radio_bus;
     /* M9.4: runner host hooks for the bus TX path (per-node ops register
      * in init_node via register_node_radio_ops). */
@@ -1804,7 +1807,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("=== Mixed-Platform Multi-Node Test ===\n");
     for (int i = 0; i < firmware_count; i++) {
         node_type_t t =
-            sim_mote_kind_for(
+            sim_registry_mote_kind_for(&g_registry,
                 sim_registry_board_for_path(&g_registry, firmware_paths[i])->kind)
                 ->node_type;
         printf("Firmware[%d]: %s (%s)\n", i, firmware_paths[i],
