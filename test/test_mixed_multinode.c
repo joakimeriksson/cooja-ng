@@ -1649,6 +1649,13 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * before the first registry lookup in the mote-store pre-bind loop. */
     csim_register_builtin_platforms(&g_registry);
     csim_register_builtin_mote_types(&g_registry);
+    /* M48: the service catalog (name -> ops).  The built-in library services
+     * ship as exported ops; the two serial-socket services are file-local to
+     * the runner, so register them on top.  Populated here but unread until
+     * the attach sites resolve by name (M49–M50). */
+    csim_register_builtin_services(&g_registry);
+    sim_registry_register_service(&g_registry, &ss_bridge_service_ops);
+    sim_registry_register_service(&g_registry, &ss_extcmd_service_ops);
     /* M38: every mote kind's ops are module-owned now (the MSP430/ARM
      * adapter tables moved to src/motes/{msp430,arm}_elf_mote.c), so the
      * kind registry needs no runtime injection. */

@@ -8,7 +8,29 @@
  */
 #include "sim_registry.h"
 
+#include "timeline_service.h"     /* timeline_service_ops   */
+#include "pcap_service.h"         /* pcap_service_ops       */
+#include "progress_service.h"     /* progress_service_ops   */
+#include "json_test_service.h"    /* json_test_service_ops  */
+#include "js_test_service.h"      /* js_test_service_ops    */
+#include "gdb_service.h"          /* gdb_service_ops        */
+
 #include <string.h>
+
+/* Register the built-in library services that ship as exported ops structs.
+ * The runner registers its two file-local serial-socket services
+ * (serial-bridge, external-command) on top of these.  Registration order is
+ * not significant — the catalog is keyed by name, and attach order (= the
+ * service host's fan-out order) is decided at the attach sites, not here. */
+void csim_register_builtin_services(sim_registry_t *r) {
+    if (!r) return;
+    sim_registry_register_service(r, &timeline_service_ops);
+    sim_registry_register_service(r, &pcap_service_ops);
+    sim_registry_register_service(r, &progress_service_ops);
+    sim_registry_register_service(r, &json_test_service_ops);
+    sim_registry_register_service(r, &js_test_service_ops);
+    sim_registry_register_service(r, &gdb_service_ops);
+}
 
 int sim_registry_register_service(sim_registry_t *r,
                                   const sim_service_ops_t *ops) {
