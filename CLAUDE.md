@@ -51,8 +51,9 @@ Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet)
 
 ```
 src/
-  sim/                Simulation kernel: runtime, event pump, radio bus, board registry
-  motes/              Per-kind mote modules: boot policy, adapters, kind registry
+  sim/                Simulation kernel: runtime, event pump, radio bus, board registry, service host
+  services/           Extracted services (Phase 6): timeline, pcap, progress, json-test, js-test, gdb, websocket-ui
+  motes/              Per-kind mote modules: boot policy, full mote vtable, kind registry
   common/             Shared infrastructure: event queue, radio medium, ELF loader, GDB stub
   msp430/             MSP430 emulator source files
   arm/                ARM Cortex-M3/M4/M33 emulator source files
@@ -73,8 +74,21 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_runtime.c` | `sim_runtime_t` container: now_ns, unified event queue, radio medium, mote slots + generations, observer fan-out, `sim_runtime_run_until()` event pump |
 | `sim_radio_bus.c` | Full RF delivery path (Phase 5): per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer, emulated RX core (deliver/queue/drain), frame-complete policy (air-time + collision windows, RXFIFO backpressure, dual 192 µs auto-ACK windows), native/JS frame path, channel push/pull, channel-busy query, bus-owned RX/frame stats |
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
+| `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
 | `sim_external_command.c` | External command service (border-router etc. helper processes) |
+
+### Services (src/services/)
+
+Phase 6 extracted the runner's optional/observation features into services
+behind the `sim_service_ops_t` host: `timeline_service.c` (activity
+timeline), `pcap_service.c` (802.15.4 capture), `progress_service.c`
+(per-tick progress report), `json_test_service.c` (JSON step/validator
+runner), `js_test_service.c` (JS test-engine line feed), `gdb_service.c`
+(per-mote GDB stub; sets `cpu->gdb_stub`), `websocket_ui_service.c` (live
+UI: ws_server + console + serialization). The end-of-run statistics stay
+runner-side (type-specific diagnostics that read chip memory + firmware
+symbols).
 
 ### Mote Modules (src/motes/)
 
@@ -82,19 +96,21 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 |------|---------|
 | `mote_impl.h` | Private shared header: `mixed_node_t`, `sim_mote_env_t` (runner glue bundle), per-kind module APIs |
 | `mote_kinds.c` | Mote-kind registry: board kind → {boot, register_radio, ops} row |
-| `msp430_elf_mote.c` | MSP430 boot policy (ELF load, ds2411/infomem/node-id patches, run-to-main), execute tick, CC2420 radio ops |
-| `arm_elf_mote.c` | ARM boot policy (cc2538/firefly/nrf52840/nrf54l15 wiring, FICR seeding, linkaddr patches), execute tick, radio ops |
+| `msp430_elf_mote.c` | MSP430 boot policy (ELF load, ds2411/infomem/node-id patches, run-to-main), execute tick, CC2420 radio ops, full mote vtable (`msp430_elf_mote_ops`) |
+| `arm_elf_mote.c` | ARM boot policy (cc2538/firefly/nrf52840/nrf54l15 wiring, FICR seeding, linkaddr patches), execute tick, radio ops, full mote vtable (`arm_elf_mote_ops`) |
 | `native_cooja_mote.c` | Native Cooja mote: boot, full adapter table, tick helpers, SYNC radio ops |
 | `js_app_mote.c` | JS app mote: boot, full adapter table, BATCH radio ops |
 
 The mote vtable (`include/sim/sim_mote.h`, `sim_mote_ops_t`) abstracts the four
-node kinds (MSP430/ARM/native/JS). Native/JS adapter tables live in their
-modules; the MSP430/ARM execute/serial adapters stay in the runner until the
-GDB service moves in Phase 6 (the radio-bus dependency cleared in Phase 5). See
-`docs/design/refactor-plan.md` §3.15–§3.18 for the completed Phase 1–5
+node kinds (MSP430/ARM/native/JS). All four kinds' ops tables are module-owned
+now — Phase 6 M38 moved the MSP430/ARM execute/serial adapters into their
+modules (the radio-bus dependency cleared in Phase 5, the GDB-stub dependency
+in Phase 6 M37), retiring the runner-side injection. See
+`docs/design/refactor-plan.md` §3.15–§3.19 for the completed Phase 1–6
 milestones (Phase 5 extracted the RF-delivery policy into `sim_radio_bus.c`
-and retired the `--threads` batch scheduler — the sequential event pump is now
-the sole scheduler).
+and retired `--threads`; Phase 6 extracted the observation/optional features
+into `src/services/` behind a `sim_service_ops_t` host and moved the emulated
+adapters out — the runner is now a frontend over the kernel + services).
 
 ### MSP430 Source Files (src/msp430/)
 

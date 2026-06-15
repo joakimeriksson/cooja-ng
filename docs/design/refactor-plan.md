@@ -1181,7 +1181,7 @@ pointers in the delivery loops before merging.
 
 ### 3.19 Service-extraction milestones (canonical Phase 6 task list)
 
-> **Status: in progress (M31–M39 landed).** Phase 6 (§9) extracts the
+> **Status: complete (M31–M40).** Phase 6 (§9) extracts the
 > runner's embedded optional/observation features into
 > `src/services/*_service.c` behind a `sim_service_ops_t` vtable host, then
 > — once the GDB stub is a service — finally moves the MSP430/ARM
@@ -1221,8 +1221,16 @@ pointers in the delivery loops before merging.
 > keeps loop control + pacing + node_states; NOT byte-identical on the UI
 > path (wall-clock pacing), but the headless path stays IDENTICAL and the UI
 > path is validated by a WS client receiving the full-state JSON + a CBOR
-> delta + handling a speed command).  **Next: M40 (end-of-run stats,
-> optional — may stay type-specific / defer to Phase 10).**
+> delta + handling a speed command); M40 (close-out — the end-of-run stats
+> stay runner-side as documented type-specific diagnostics; they read chip
+> memory + firmware symbols and the cycle-totals loop is fused with
+> destroy_node, so service-ifying them would violate the no-chip-internals
+> rule for no gain).  **Phase 6 COMPLETE.**  The runner is now a frontend
+> over the kernel + the service host: CLI/config parsing, node lifecycle,
+> the loop control, the node-scripting timed actions, and the type-specific
+> terminal diagnostics.  The remaining MSP430/ARM execute/serial adapters
+> moved out in M38; the only emulated-CPU code left in the runner is the
+> firmware-symbol stats dump.
 
 Design decisions locked for this phase:
 
@@ -1307,7 +1315,15 @@ Milestones (one commit each, full validation gate before each):
 39. WebSocket-UI service: sockets/serialization/console/pacing/message
     handling into the service; the loop keeps 4 query funcs
     (`paused`/`restart_requested`/`ui_cap_ns`/`pace`).
-40. End-of-run stats service (optional/last) or defer to Phase 10.
+40. End-of-run stats: **resolved to stay runner-side** (the sanctioned
+    fallback).  The Performance / Phase-Timing / detailed-stats block reads
+    `plat.msp.cpu.memory` + firmware symbols (TSCH state, neighbor/SR
+    tables, CC2420 stats) directly, and its cycle/instruction totals loop is
+    fused with `destroy_node()` — service-ifying it would violate the
+    no-chip-internals rule for no real gain.  Per the M16/M23 precedent it is
+    documented type-specific terminal diagnostics; revisit in Phase 10 if the
+    runner is reduced to a pure frontend.  **Phase 6 closes at M39 + this
+    note.**
 
 Validation gate per milestone: §3.18's gate (make clean && make;
 correctness / arm-correctness / cc1200-mock-host / radio-medium /
@@ -2382,17 +2398,23 @@ the same patch.
 - **MSP430/ARM execute/serial adapters move in Phase 6 M38** with the GDB
   service (after Phase 5, GDB is their only runner dependency; the GDB
   service M37 clears it via `cpu->gdb_stub`).
-- **Phase 6 task list is §3.19 (M31–M40).**  Optional/observation features
-  extract into `src/services/*_service.c` behind a `sim_service_ops_t`
+- **Phase 6 is complete (§3.19, M31–M40).**  Optional/observation features
+  extracted into `src/services/*_service.c` behind a `sim_service_ops_t`
   vtable host built in M31 (one fan-out observer + ordered poll + the
   §Error-policy enforcement; the full register-by-name registry is
-  Phase 8).  PCAP rides the bus host hook (raw bytes +
+  Phase 8).  Seven services landed: timeline, pcap, progress, json-test,
+  js-test, gdb, websocket-ui.  PCAP rides the bus host hook (raw bytes +
   `tx_start_ns` live there, not on `SIM_OBS_PACKET_FRAME`); observer-payload
   enrichment is Phase 8+ debt.  The packet analyzer is a stateless decoder
-  with no service home (its verbose path reaches chip internals), so it is
-  not extracted as a service — it moves with the UI frame-summary emit (M39).  The JS-test service routes stop through
+  with no service home (its verbose path reaches chip internals), so it
+  stays runner-side.  The JS-test service routes stop through
   `sim_runtime_request_stop()` + a deferred-resume queue, never re-entering
-  dispatch.  End-of-run stats (M40) may stay type-specific.
+  dispatch.  The MSP430/ARM execute/serial adapters moved to `src/motes/`
+  (M38, the §3.17/§3.18 debt).  **End-of-run stats stay runner-side (M40)**:
+  they read chip memory + firmware symbols and the cycle-totals loop is
+  fused with `destroy_node`, so service-ifying them would violate the
+  no-chip-internals rule for no gain — documented type-specific terminal
+  diagnostics, revisit in Phase 10.
 - **`--threads N` was "port to `sim_scheduler_ops::batch` or retire by Phase 6"**
   (§3.13) — resolved to *retire* in M29 (see entry above). Two divergent
   schedulers persisting indefinitely was not an option.
