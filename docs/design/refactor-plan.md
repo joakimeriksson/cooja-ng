@@ -1181,7 +1181,7 @@ pointers in the delivery loops before merging.
 
 ### 3.19 Service-extraction milestones (canonical Phase 6 task list)
 
-> **Status: in progress (M31–M38 landed).** Phase 6 (§9) extracts the
+> **Status: in progress (M31–M39 landed).** Phase 6 (§9) extracts the
 > runner's embedded optional/observation features into
 > `src/services/*_service.c` behind a `sim_service_ops_t` vtable host, then
 > — once the GDB stub is a service — finally moves the MSP430/ARM
@@ -1216,7 +1216,13 @@ pointers in the delivery loops before merging.
 > sky/cc2538/firefly-subghz 2-node + 6 chains incl. z1 MSP430X + JS
 > broadcast + step-based configs + test-js-hello/test-js-rpl-udp + a --gdb
 > bind smoke; M33 adds a pcap byte-diff; M38 re-verifies the full GDB RSP
-> session).  **Next: M39 (WebSocket-UI service), M40 (stats, optional).**
+> session); M39 `3be54dd` (WebSocket-UI service — ws_server + console +
+> flags + message handler + serialization into the service; the runner
+> keeps loop control + pacing + node_states; NOT byte-identical on the UI
+> path (wall-clock pacing), but the headless path stays IDENTICAL and the UI
+> path is validated by a WS client receiving the full-state JSON + a CBOR
+> delta + handling a speed command).  **Next: M40 (end-of-run stats,
+> optional — may stay type-specific / defer to Phase 10).**
 
 Design decisions locked for this phase:
 
