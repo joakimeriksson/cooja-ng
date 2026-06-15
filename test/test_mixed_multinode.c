@@ -28,6 +28,7 @@
 #include "radio_medium.h"
 #include "ws_server.h"
 #include "sim_state.h"
+#include "websocket_ui_service.h"
 #include "timeline.h"
 #include "timeline_service.h"
 #include "packet_analyzer.h"
@@ -266,20 +267,11 @@ static inline int node_active(int idx) {
     return sim_runtime_now_ns(&sim_rt) >= node_start_ns[idx];
 }
 
-/* --- WebSocket UI state --- */
-static ws_server_t *ui_server = NULL;
-#define UI_CONSOLE_LINES 20
-#define UI_CONSOLE_LINELEN 256
-static char ui_console[MAX_NODES][UI_CONSOLE_LINES][UI_CONSOLE_LINELEN];
-static int ui_console_head[MAX_NODES];
-static int ui_console_count[MAX_NODES];
-/* New lines since last broadcast */
-static char ui_console_new[MAX_NODES][UI_CONSOLE_LINES][UI_CONSOLE_LINELEN];
-static int ui_console_new_count[MAX_NODES];
-static double ui_speed_ratio = 10.0;  /* adjustable from UI, default 10x */
-static int ui_paused = 0;             /* play/pause state */
-static int ui_full_state_requested = 1; /* send full state on first broadcast */
-static int ui_restart_requested = 0;   /* restart simulation from UI */
+/* --- WebSocket UI (M39: ws_server + console + flags + serialization live
+ * in the websocket_ui service; the runner keeps the loop control + pacing
+ * + node_states[] the RF path also writes, feeding the service through
+ * stored pointers). --- */
+static websocket_ui_service_t ui_svc;
 
 /* --- Serial socket (TCP bridge for border-router tests) ---
  *
@@ -343,7 +335,7 @@ static inline void emit_led_obs(int mote_index, int64_t time_ns,
  * handlers (with proper frame duration). This callback handles radio ON/OFF
  * transitions (ISRXON, ISRFOFF, tx_done return-to-RX). */
 static void mixed_rf_state_handler(void *user_data, int old_state, int new_state) {
-    if (!ui_server || radio_bus.in_delivery) return;
+    if (!ui_service_active(&ui_svc) || radio_bus.in_delivery) return;
     mixed_node_t *node = (mixed_node_t *)user_data;
     int idx = (int)(node - nodes);
 
@@ -388,7 +380,7 @@ static void update_radio_state(int idx) {
         (sim_radio_state_t)m->ops->ui_radio_state(m);
     if (new_state != node_states[idx].radio_state) {
         node_states[idx].radio_state = new_state;
-        if (ui_server) {
+        if (ui_service_active(&ui_svc)) {
             tl_event_type_t etype;
             switch (new_state) {
             case SIM_RADIO_TX:   etype = TL_RADIO_TX;   break;
@@ -414,73 +406,23 @@ static void update_led_state(int idx) {
     for (int l = 0; l < SIM_MAX_LEDS; l++) {
         if (leds[l] != node_states[idx].led[l]) {
             node_states[idx].led[l] = leds[l];
-            if (ui_server)
+            if (ui_service_active(&ui_svc))
                 emit_led_obs(idx, sim_runtime_now_ns(&sim_rt), l, leds[l] ? true : false);
         }
     }
 }
 
-static void ui_message_handler(const char *data, int len, void *userdata) {
-    (void)userdata;
-    cJSON *root = cJSON_ParseWithLength(data, len);
-    if (!root) return;
-    cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
-    if (cmd && cJSON_IsString(cmd)) {
-        if (strcmp(cmd->valuestring, "speed") == 0) {
-            cJSON *val = cJSON_GetObjectItem(root, "value");
-            if (val && cJSON_IsNumber(val)) {
-                double v = val->valuedouble;
-                if (v >= 0.1 && v <= 1000.0)
-                    ui_speed_ratio = v;
-            }
-        } else if (strcmp(cmd->valuestring, "pause") == 0) {
-            ui_paused = 1;
-        } else if (strcmp(cmd->valuestring, "play") == 0) {
-            ui_paused = 0;
-        } else if (strcmp(cmd->valuestring, "full") == 0) {
-            ui_full_state_requested = 1;
-        } else if (strcmp(cmd->valuestring, "restart") == 0) {
-            ui_restart_requested = 1;
-            ui_paused = 0;
-        } else if (strcmp(cmd->valuestring, "move") == 0) {
-            cJSON *jnode = cJSON_GetObjectItem(root, "node");
-            cJSON *jx = cJSON_GetObjectItem(root, "x");
-            cJSON *jy = cJSON_GetObjectItem(root, "y");
-            if (jnode && cJSON_IsNumber(jnode) && jx && cJSON_IsNumber(jx) && jy && cJSON_IsNumber(jy)) {
-                int nid = jnode->valueint;
-                for (int i = 0; i < num_nodes; i++) {
-                    if (nodes[i].id == nid) {
-                        radio_medium_set_position(&radio_medium, i, jx->valuedouble, jy->valuedouble);
-                        radio_medium_compute_neighbors(&radio_medium);
-                        break;
-                    }
-                }
-            }
+/* M39: ui_message_handler + ui_add_console_line moved to the websocket_ui
+ * service.  The "move" command calls back into the runner through
+ * ui_move_node (it needs nodes[]/radio_medium); the service supplies the
+ * other per-node scalars via ui_describe_node. */
+static void ui_move_node(int node_id, double x, double y) {
+    for (int i = 0; i < num_nodes; i++) {
+        if (nodes[i].id == node_id) {
+            radio_medium_set_position(&radio_medium, i, x, y);
+            radio_medium_compute_neighbors(&radio_medium);
+            break;
         }
-    }
-    cJSON_Delete(root);
-}
-
-static void ui_add_console_line(int node_idx, int64_t sim_ns, const char *line) {
-    /* Prepend simulation timestamp */
-    char stamped[UI_CONSOLE_LINELEN];
-    double sim_s = (double)sim_ns / 1e9;
-    snprintf(stamped, sizeof(stamped), "[%7.3f] %s", sim_s, line);
-
-    /* Add to ring buffer */
-    int slot = (ui_console_head[node_idx] + ui_console_count[node_idx]) % UI_CONSOLE_LINES;
-    if (ui_console_count[node_idx] < UI_CONSOLE_LINES)
-        ui_console_count[node_idx]++;
-    else
-        ui_console_head[node_idx] = (ui_console_head[node_idx] + 1) % UI_CONSOLE_LINES;
-    strncpy(ui_console[node_idx][slot], stamped, UI_CONSOLE_LINELEN - 1);
-    ui_console[node_idx][slot][UI_CONSOLE_LINELEN - 1] = '\0';
-
-    /* Add to new-lines buffer for next broadcast */
-    if (ui_console_new_count[node_idx] < UI_CONSOLE_LINES) {
-        int ni = ui_console_new_count[node_idx]++;
-        strncpy(ui_console_new[node_idx][ni], stamped, UI_CONSOLE_LINELEN - 1);
-        ui_console_new[node_idx][ni][UI_CONSOLE_LINELEN - 1] = '\0';
     }
 }
 
@@ -577,6 +519,18 @@ static void progress_describe_node(int i, int *node_id, const char **type,
     *type    = node_type_str(i);
     *cycles  = node_cycles(i);
     *freq_hz = node_freq(i);
+}
+
+/* M39: per-node scalars for the UI broadcast (the service supplies x/y/
+ * last_tx/console itself from its stored pointers). */
+static void ui_describe_node(int i, int *node_id, const char **type,
+                             int64_t *cycles, uint32_t *freq_hz,
+                             int64_t *sim_time) {
+    *node_id  = nodes[i].id;
+    *type     = node_type_str(i);
+    *cycles   = node_cycles(i);
+    *freq_hz  = node_freq(i);
+    *sim_time = node_sim_time_ns(i);
 }
 
 /* --- RF TX/RX bridging --- */
@@ -886,7 +840,7 @@ static bool bus_host_node_active(void *user, int idx) {
 static void bus_host_on_rx(void *user, int idx, int64_t start_ns,
                            int64_t end_ns) {
     (void)user;
-    if (!ui_server) return;
+    if (!ui_service_active(&ui_svc)) return;
     emit_radio_obs(idx, start_ns, SIM_OBS_RADIO_RX_START);
     emit_radio_obs(idx, end_ns, SIM_OBS_RADIO_RX_END);
     node_states[idx].radio_state = SIM_RADIO_ON;
@@ -957,13 +911,13 @@ static void bus_host_frame_observed(void *user,
                            cc2420_state_str(trace_scc->state));
     }
 
-    if (ui_server) {
+    if (ui_service_active(&ui_svc)) {
         emit_radio_obs(sender_idx, accurate_tx_start, SIM_OBS_RADIO_TX_START);
         emit_radio_obs(sender_idx, accurate_tx_end,   SIM_OBS_RADIO_TX_END);
         node_states[sender_idx].radio_state = SIM_RADIO_ON;
     }
 
-    if (ui_server || verbose || pcap_service_is_open(&pcap_svc)) {
+    if (ui_service_active(&ui_svc) || verbose || pcap_service_is_open(&pcap_svc)) {
         const uint8_t *buf = fi->capture;
         int buf_len = fi->capture_len;
         int fstart = -1;
@@ -1008,7 +962,7 @@ static void bus_host_frame_observed(void *user,
                     fprintf(stderr, "\n");
                 }
             }
-            if (ui_server)
+            if (ui_service_active(&ui_svc))
                 emit_frame_obs(sender_idx, accurate_tx_start, true,
                                pinfo.summary);
         }
@@ -1061,7 +1015,7 @@ static void bus_host_on_rx_frame(void *user, const sim_radio_frame_info_t *fi,
                     nodes[sender_idx].id, nodes[i].id,
                     (double)coll_start_ns / 1e9,
                     (double)prev_rx_end_ns / 1e9);
-        if (ui_server) {
+        if (ui_service_active(&ui_svc)) {
             int64_t intf_dur = (int64_t)len * fi->sender_byte_ns;
             emit_radio_obs(i, fi->tx_start_ns, SIM_OBS_RADIO_INTERFERENCE);
             emit_radio_obs(i, fi->tx_start_ns + intf_dur, SIM_OBS_RADIO_RX_END);
@@ -1078,7 +1032,7 @@ static void bus_host_on_rx_frame(void *user, const sim_radio_frame_info_t *fi,
                                (double)delivery_start / 1e9,
                                cc2420_state_str(trace_rcc->state));
         }
-        if (ui_server && len > 5) {
+        if (ui_service_active(&ui_svc) && len > 5) {
             int fstart = -1;
             for (int b = 0; b + 5 < len; b++) {
                 if (data[b] == 0x7A && b >= 4) { fstart = b + 1; break; }
@@ -1102,7 +1056,7 @@ static void bus_host_on_ack(void *user, const sim_radio_frame_info_t *fi,
                             int data_receiver, int64_t ack_start_ns,
                             int ack_byte_count) {
     (void)user;
-    if (!ui_server) return;
+    if (!ui_service_active(&ui_svc)) return;
     int64_t ack_dur = (int64_t)ack_byte_count * fi->sender_byte_ns;
     emit_radio_obs(data_receiver, ack_start_ns, SIM_OBS_RADIO_TX_START);
     emit_radio_obs(data_receiver, ack_start_ns + ack_dur, SIM_OBS_RADIO_TX_END);
@@ -1171,8 +1125,8 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
             printf("  %7.3f [Node %d/%s] %s\n", (double)ns / 1e9,
                    node->id, node_type_str(nidx), node->line_buf);
         /* test engines receive this line via test_engine_observer */
-        if (ui_server)
-            ui_add_console_line(nidx, ns, node->line_buf);
+        if (ui_service_active(&ui_svc))
+            ui_service_add_console_line(&ui_svc, nidx, ns, node->line_buf);
         /* Kernel observer stream: assembled console line.  The
          * external-command service tees this into COOJA.testlog. */
         {
@@ -2035,36 +1989,25 @@ sim_restart:
     memset(prev_node_states, 0, sizeof(prev_node_states));
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
 
-    /* Initialize WebSocket UI server (only on first run, not restart) */
-    if (ui_enabled && !ui_server) {
-        ui_server = ws_server_init(ui_port);
-        if (ui_server) {
-            ws_server_set_message_callback(ui_server, ui_message_handler, NULL);
-            /* Load HTML from ui/index.html */
-            FILE *hf = fopen("ui/index.html", "r");
-            if (hf) {
-                fseek(hf, 0, SEEK_END);
-                long hlen = ftell(hf);
-                fseek(hf, 0, SEEK_SET);
-                char *html = malloc((size_t)hlen + 1);
-                if (html) {
-                    fread(html, 1, (size_t)hlen, hf);
-                    html[hlen] = '\0';
-                    ws_server_set_html(ui_server, html, (int)hlen);
-                    free(html);
-                }
-                fclose(hf);
-            } else {
-                fprintf(stderr, "Warning: ui/index.html not found, serving default page\n");
-            }
-        } else {
-            fprintf(stderr, "Warning: failed to start UI server on port %d\n", ui_port);
-        }
+    /* Initialize WebSocket UI service (only on first run, not restart).
+     * M39: speed_ratio defaults to 10x and is shared with serial-socket
+     * pacing, so set it before the service even starts (it owns the value
+     * but serial mode reads it via ui_service_speed_ratio when the UI is
+     * off). */
+    ui_svc.speed_ratio = 10.0;
+    if (ui_enabled && !ui_service_active(&ui_svc)) {
+        if (!ui_service_start(&ui_svc, ui_port,
+                              node_states, prev_node_states,
+                              node_last_tx_ns, prev_last_tx_ns,
+                              &radio_medium, &timeline_svc.tl,
+                              &node_count, ui_describe_node, ui_move_node))
+            fprintf(stderr, "Warning: failed to start UI server on port %d\n",
+                    ui_port);
     }
 
     /* Set initial simulation speed from config */
     if (config_loaded && config.speed > 0)
-        ui_speed_ratio = config.speed;
+        ui_svc.speed_ratio = config.speed;
 
     /* Set up serial socket server for border-router tests */
     if (config_loaded && config.has_serial_socket) {
@@ -2228,24 +2171,24 @@ sim_restart:
     double t_start = get_time_ms();
 
     int ss_has_command = sim_external_command_launched(&external_cmd);
-    while (sim_ns < end_ns || ui_server ||
+    while (sim_ns < end_ns || ui_service_active(&ui_svc) ||
            (sim_serial_bridge_active(&serial_bridge) && ss_has_command)) {
         /* Check for restart request from UI */
-        if (ui_restart_requested) break;
+        if (ui_service_restart_requested(&ui_svc)) break;
 
         /* When paused, poll WebSocket and sleep but skip to UI broadcast */
-        if (ui_paused && ui_server) {
-            ws_server_poll(ui_server);
+        if (ui_service_paused(&ui_svc) && ui_service_active(&ui_svc)) {
+            ui_service_poll(&ui_svc);
             usleep(50000); /* 50ms */
             /* Reset pacing baseline so resuming doesn't cause a burst */
-            t_start = get_time_ms() - (double)(sim_ns - (end_ns - total_ns)) / 1e6 / ui_speed_ratio;
+            t_start = get_time_ms() - (double)(sim_ns - (end_ns - total_ns)) / 1e6 / ui_service_speed_ratio(&ui_svc);
             goto ui_broadcast;
         }
 
         /* Advance simulation time: jump to next event in queue, capped for UI. */
         {
             int64_t next_event = sim_eq_peek_time(&sim_eq);
-            int64_t max_ns = ui_server ? sim_ns + 100LL * MS_TO_NS
+            int64_t max_ns = ui_service_active(&ui_svc) ? sim_ns + 100LL * MS_TO_NS
                 : sim_serial_bridge_active(&serial_bridge) ? sim_ns + TIME_STEP_NS
                 : end_ns;
             if (next_event < max_ns) max_ns = next_event;
@@ -2485,7 +2428,7 @@ sim_restart:
         /* Update per-node radio/LED state for timeline (M16: the ops'
          * NULL-ness encodes which mote kinds are polled — CC2538 pushes
          * radio state via async callback, natives/JS have neither). */
-        if (ui_server) {
+        if (ui_service_active(&ui_svc)) {
             for (int i = 0; i < node_count; i++) {
                 if (!node_active(i)) continue;
                 update_radio_state(i);
@@ -2498,153 +2441,43 @@ sim_restart:
         if (json_test_finished(&json_test_svc))
             break;
 
-        /* WebSocket UI: poll and broadcast state */
+        /* WebSocket UI: poll and broadcast state (M39: serialization in the
+         * websocket_ui service; the runner keeps the broadcast cadence +
+         * wall-clock pacing because t_start is shared with serial mode and
+         * the end-of-run perf print). */
         ui_broadcast:
-        if (ui_server) {
-            if (!ui_paused) ws_server_poll(ui_server);
-            if (sim_ns >= next_ui_ns || ui_paused) {
-                if (!ui_paused) next_ui_ns = sim_ns + ui_interval_ns;
+        if (ui_service_active(&ui_svc)) {
+            if (!ui_service_paused(&ui_svc)) ui_service_poll(&ui_svc);
+            if (sim_ns >= next_ui_ns || ui_service_paused(&ui_svc)) {
+                if (!ui_service_paused(&ui_svc)) next_ui_ns = sim_ns + ui_interval_ns;
 
-                sim_stats_t st = {
-                    .sim_time_ns = sim_ns,
-                    .rf_bytes = rf_byte_count,
-                    .uart_bytes = uart_byte_count,
-                    .rx_frames_queued = (int)radio_medium.next_frame_id + stat_rf_frames,
-                    .rx_frames_collided = radio_bus.stats.frame_collided,
-                    .speed_ratio = ui_speed_ratio,
-                    .paused = ui_paused,
-                };
-
-                int has_clients = ws_server_client_count(ui_server) > 0;
-                char *json = NULL;
-
-                if (ui_full_state_requested && has_clients) {
-                    /* === Full state: on connect/reload === */
-                    ui_full_state_requested = 0;
-
-                    /* Build full node info with ALL console history */
-                    sim_node_info_t ni[MAX_NODES];
-                    const char *con_ptrs[MAX_NODES][UI_CONSOLE_LINES];
-                    for (int i = 0; i < node_count; i++) {
-                        ni[i].id = nodes[i].id;
-                        ni[i].type = node_type_str(i);
-                        ni[i].x = radio_medium.nodes[i].x;
-                        ni[i].y = radio_medium.nodes[i].y;
-                        ni[i].cycles = node_cycles(i);
-                        ni[i].freq_hz = node_freq(i);
-                        ni[i].sim_time_ns = node_sim_time_ns(i);
-                        ni[i].last_tx_ns = node_last_tx_ns[i];
-                        /* Send ALL console history for full state */
-                        ni[i].console_count = ui_console_count[i];
-                        int base = (ui_console_head[i] - ui_console_count[i]
-                                    + UI_CONSOLE_LINES) % UI_CONSOLE_LINES;
-                        for (int c = 0; c < ui_console_count[i]; c++)
-                            con_ptrs[i][c] = ui_console[i][(base + c) % UI_CONSOLE_LINES];
-                        ni[i].console = con_ptrs[i];
-                        /* Don't reset new counts — delta still needs them */
-                    }
-
-                    /* Build radio info */
-                    int neighbor_counts[MAX_NODES];
-                    const int *neighbor_ptrs[MAX_NODES];
-                    for (int i = 0; i < node_count; i++) {
-                        neighbor_ptrs[i] = radio_medium.neighbors[i].neighbors;
-                        neighbor_counts[i] = radio_medium.neighbors[i].count;
-                    }
-                    sim_radio_info_t ri = {
-                        .type = radio_medium.type == RADIO_MEDIUM_UDGM ? "UDGM" : "NONE",
-                        .tx_range = radio_medium.udgm.tx_range,
-                        .node_count = node_count,
-                        .neighbors = neighbor_ptrs,
-                        .neighbor_counts = neighbor_counts,
-                    };
-
-                    /* Skip timeline in full state — viewer accumulates
-                     * events from CBOR deltas after connect.  This keeps the
-                     * full state JSON small (~10 KB vs multi-MB). */
-                    json = sim_state_to_json(ni, node_count, &ri, &st,
-                                             node_states, NULL);
-                    /* Flush old timeline events so the first delta only
-                     * contains events from NOW, not stale history that
-                     * would be off-screen in the viewer. */
-                    tl_flush_new(&timeline_svc.tl);
-                    /* Clear new console counts */
-                    for (int i = 0; i < node_count; i++)
-                        ui_console_new_count[i] = 0;
-
-                } else if (has_clients) {
-                    /* === Delta: CBOR binary, change-only === */
-                    int ids[MAX_NODES];
-                    const char *con_new_ptrs[MAX_NODES][UI_CONSOLE_LINES];
-                    const char **con_ptr_arr[MAX_NODES];
-                    int con_counts[MAX_NODES];
-
-                    for (int i = 0; i < node_count; i++) {
-                        ids[i] = nodes[i].id;
-                        con_counts[i] = ui_console_new_count[i];
-                        for (int c = 0; c < ui_console_new_count[i]; c++)
-                            con_new_ptrs[i][c] = ui_console_new[i][c];
-                        con_ptr_arr[i] = con_new_ptrs[i];
-                        ui_console_new_count[i] = 0;
-                    }
-
-                    /* Encode timeline events to CBOR.
-                     * Always flush new_count to prevent accumulation if
-                     * buffer overflows — losing a batch is better than
-                     * permanently losing all future events. */
-                    static uint8_t tl_cbor_buf[262144];
-                    int tl_cbor_len = tl_events_to_cbor(
-                        (struct timeline_s *)&timeline_svc.tl,
-                        tl_cbor_buf, (int)sizeof(tl_cbor_buf));
-                    tl_flush_new(&timeline_svc.tl);
-
-                    /* Encode full delta to CBOR — must be large enough
-                     * for timeline data + stats + console + radio changes */
-                    static uint8_t cbor_buf[524288];
-                    int cbor_len = sim_state_delta_cbor(
-                        cbor_buf, (int)sizeof(cbor_buf),
-                        &st, node_states, prev_node_states,
-                        node_count, ids,
-                        node_last_tx_ns, prev_last_tx_ns,
-                        (const char ***)con_ptr_arr, con_counts,
-                        tl_cbor_buf, tl_cbor_len);
-
-                    if (cbor_len > 0)
-                        ws_server_broadcast_binary(ui_server, cbor_buf, cbor_len);
-
-                    /* Save current state as previous for next delta */
-                    memcpy(prev_node_states, node_states, sizeof(node_states));
-                    memcpy(prev_last_tx_ns, node_last_tx_ns, sizeof(prev_last_tx_ns));
-                }
-
-                /* Broadcast the JSON (full state only) */
-                if (json) {
-                    ws_server_broadcast(ui_server, json, (int)strlen(json));
-                    free(json);
-                }
+                ui_service_set_stats(&ui_svc, rf_byte_count, uart_byte_count,
+                                     (int)radio_medium.next_frame_id + stat_rf_frames,
+                                     radio_bus.stats.frame_collided);
+                ui_service_broadcast(&ui_svc, sim_ns);
 
                 /* Real-time pacing: throttle to target speed for UI.
-                 * Sleep in small increments (50ms max) so ws_server_poll
+                 * Sleep in small increments (50ms max) so the socket poll
                  * can process incoming speed changes promptly. */
                 double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
                 for (;;) {
                     double wall_elapsed = get_time_ms() - t_start;
-                    double target_wall = sim_elapsed_ms / ui_speed_ratio;
+                    double target_wall = sim_elapsed_ms / ui_service_speed_ratio(&ui_svc);
                     double wait_ms = target_wall - wall_elapsed;
                     if (wait_ms <= 0) break;
                     if (wait_ms > 50.0) wait_ms = 50.0;
                     usleep((useconds_t)(wait_ms * 1000.0));
-                    ws_server_poll(ui_server);
+                    ui_service_poll(&ui_svc);
                 }
             }
         }
 
         /* Real-time pacing for serial socket mode (no UI server needed).
          * Throttle simulation to match wall-clock time at ui_speed_ratio. */
-        if (sim_serial_bridge_active(&serial_bridge) && !ui_server) {
+        if (sim_serial_bridge_active(&serial_bridge) && !ui_service_active(&ui_svc)) {
             double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
             double wall_elapsed = get_time_ms() - t_start;
-            double target_wall = sim_elapsed_ms / ui_speed_ratio;
+            double target_wall = sim_elapsed_ms / ui_service_speed_ratio(&ui_svc);
             double wait_ms = target_wall - wall_elapsed;
             if (wait_ms > 0) {
                 if (wait_ms > 10.0) wait_ms = 10.0;
@@ -2657,9 +2490,9 @@ sim_restart:
     }
 
     /* Handle restart request from UI */
-    if (ui_restart_requested && ui_server) {
+    if (ui_service_restart_requested(&ui_svc) && ui_service_active(&ui_svc)) {
         printf("\n--- Restarting simulation (requested from UI) ---\n\n");
-        ui_restart_requested = 0;
+        ui_service_clear_restart(&ui_svc);
 
         /* Destroy all nodes */
         for (int i = 0; i < node_count; i++)
@@ -2687,18 +2520,11 @@ sim_restart:
         memset(node_last_tx_ns, 0, sizeof(node_last_tx_ns));
         memset(radio_bus.tx_busy_until_ns, 0, sizeof(radio_bus.tx_busy_until_ns));
         memset(node_start_ns, 0, sizeof(node_start_ns));
-        memset(ui_console, 0, sizeof(ui_console));
-        memset(ui_console_head, 0, sizeof(ui_console_head));
-        memset(ui_console_count, 0, sizeof(ui_console_count));
-        memset(ui_console_new, 0, sizeof(ui_console_new));
-        memset(ui_console_new_count, 0, sizeof(ui_console_new_count));
+        ui_service_reset(&ui_svc);  /* clear console rings + arm full-state */
         memset(node_states, 0, sizeof(node_states));
         tl_init(&timeline_svc.tl);
         extern void cc2538_rfcore_reset_rxfifo_overflows(void);
         cc2538_rfcore_reset_rxfifo_overflows();
-
-        /* Request full state send on first UI broadcast */
-        ui_full_state_requested = 1;
 
         goto sim_restart;
     }
@@ -2901,10 +2727,7 @@ sim_restart:
     ss_cleanup();
 
     /* Cleanup UI server */
-    if (ui_server) {
-        ws_server_destroy(ui_server);
-        ui_server = NULL;
-    }
+    ui_service_destroy(&ui_svc);
 
     printf("\n--- Phase Timing ---\n");
     double time_accounted = time_distribute + time_deliver + time_step + time_flush + time_channel_sync;

@@ -83,7 +83,8 @@ SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
                    $(SERVICES_SRC_DIR)/progress_service.c \
                    $(SERVICES_SRC_DIR)/json_test_service.c \
                    $(SERVICES_SRC_DIR)/js_test_service.c \
-                   $(SERVICES_SRC_DIR)/gdb_service.c
+                   $(SERVICES_SRC_DIR)/gdb_service.c \
+                   $(SERVICES_SRC_DIR)/websocket_ui_service.c
 
 # Per-kind mote modules (boot policy + adapters) + the mote-kind
 # registry — Phase 4, §3.17.
