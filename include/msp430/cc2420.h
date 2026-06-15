@@ -292,6 +292,9 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data);
 /* Register RF TX listener (called for each byte transmitted over the air) */
 void cc2420_set_rf_listener(cc2420_t *radio, cc2420_rf_callback_fn cb, void *data);
 
+/* State-name accessor for type-blind trace callers (Phase 10 M56). */
+const char *cc2420_state_name(const cc2420_t *r);
+
 /* Get global RX statistics (for debugging) */
 void cc2420_get_rx_stats(int *started, int *completed, int *rejected,
                           int *overflowed, int *crc_good, int *crc_bad,

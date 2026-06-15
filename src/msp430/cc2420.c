@@ -52,6 +52,14 @@ static const char *cc2420_state_str(cc2420_radio_state_t s) {
     }
 }
 
+/* Public state-name accessor (Phase 10 M56) — lets type-blind callers (the
+ * runner's TSCH-ACK trace) stringify a chip's radio state without naming the
+ * cc2420_radio_state_t enum.  NULL → "VREG_OFF" (never reached: callers guard
+ * chip presence). */
+const char *cc2420_state_name(const cc2420_t *r) {
+    return r ? cc2420_state_str(r->state) : "VREG_OFF";
+}
+
 /* SHR (Synchronization Header): 4 preamble bytes + SFD.
  * Layout matches every IEEE 802.15.4 2.4 GHz radio in this tree
  * (cc2538_rfcore, nrf52840, nrf54l15 all emit the same SHR). */

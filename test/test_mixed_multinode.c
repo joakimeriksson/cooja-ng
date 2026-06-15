@@ -197,26 +197,8 @@ static bool trace_tsch_ack_enabled(void) {
     return trace_tsch_ack != 0;
 }
 
-static const char *cc2420_state_str(cc2420_radio_state_t s) {
-    switch (s) {
-    case CC2420_VREG_OFF: return "VREG_OFF";
-    case CC2420_POWER_DOWN: return "POWER_DOWN";
-    case CC2420_IDLE: return "IDLE";
-    case CC2420_RX_CALIBRATE: return "RX_CAL";
-    case CC2420_RX_SFD_SEARCH: return "RX_SFD";
-    case CC2420_RX_WAIT: return "RX_WAIT";
-    case CC2420_RX_FRAME: return "RX_FRAME";
-    case CC2420_RX_OVERFLOW: return "RX_OVERFLOW";
-    case CC2420_TX_CALIBRATE: return "TX_CAL";
-    case CC2420_TX_PREAMBLE: return "TX_PREAMBLE";
-    case CC2420_TX_FRAME: return "TX_FRAME";
-    case CC2420_TX_ACK_CALIBRATE: return "TX_ACK_CAL";
-    case CC2420_TX_ACK_PREAMBLE: return "TX_ACK_PREAMBLE";
-    case CC2420_TX_ACK: return "TX_ACK";
-    case CC2420_TX_UNDERFLOW: return "TX_UNDERFLOW";
-    default: return "UNKNOWN";
-    }
-}
+/* M56: cc2420_state_str moved behind the chip as cc2420_state_name(cc) so the
+ * trace below stays type-blind without naming the cc2420_radio_state_t enum. */
 
 static void trace_tsch_ack_log(const char *fmt, ...) {
     if (!trace_tsch_ack_enabled() || trace_tsch_ack_lines >= TRACE_TSCH_ACK_MAX_LINES ||
@@ -586,29 +568,29 @@ static void deliver_rx_byte(const sim_event_t *ev) {
 
     int64_t returned_us = m->ops->sync_to_time(m, ev->time_ns);
 
-    cc2420_radio_state_t old_state = CC2420_VREG_OFF;
+    const char *old_state_name = NULL;
     if (cc) {
-        old_state = cc->state;
+        old_state_name = cc2420_state_name(cc);
         if (trace_tsch_ack_enabled() &&
             nodes[idx].id > 0 && nodes[idx].id <= 2) {
             trace_tsch_ack_log("byte event node=%d byte=%02x t=%.6f state_before=%s",
                                nodes[idx].id,
                                ev->byte, (double)ev->time_ns / 1e9,
-                               cc2420_state_str(old_state));
+                               old_state_name);
         }
     }
 
     radio_receive_byte(idx, ev->byte, ev->rssi);
 
     if (cc) {
-        cc2420_radio_state_t new_state = cc->state;
+        const char *new_state_name = cc2420_state_name(cc);
         if (trace_tsch_ack_enabled() &&
             nodes[idx].id > 0 && nodes[idx].id <= 2 &&
-            new_state != old_state) {
+            strcmp(new_state_name, old_state_name) != 0) {
             trace_tsch_ack_log("byte event node=%d state %s -> %s",
                                nodes[idx].id,
-                               cc2420_state_str(old_state),
-                               cc2420_state_str(new_state));
+                               old_state_name,
+                               new_state_name);
         }
     }
 
@@ -846,7 +828,7 @@ static void bus_host_on_tx_byte(void *user, int sender, uint8_t byte,
     if (depth > 0 && trace_tsch_ack_enabled() && scc) {
         trace_tsch_ack_log("reentrant tx byte sender=%d state=%s byte=%02x depth=%d",
                            nodes[sender].id,
-                           cc2420_state_str(scc->state),
+                           cc2420_state_name(scc),
                            byte, depth);
     }
 }
@@ -862,7 +844,7 @@ static void bus_host_on_byte_accepted(void *user, int sender, int receiver,
         nodes[sender].id == 1 && nodes[receiver].id == 2) {
         trace_tsch_ack_log("ack-byte queued 1->2 byte=%02x rx_state=%s node2_sim=%.6f",
                            byte,
-                           cc2420_state_str(rcc->state),
+                           cc2420_state_name(rcc),
                            (double)node_sim_time_ns(receiver) / 1e9);
     }
     stat_msp_byte_push[receiver]++;
@@ -900,7 +882,7 @@ static void bus_host_frame_observed(void *user,
                            nodes[sender_idx].id, fi->expected_len,
                            (double)accurate_tx_start / 1e9,
                            (double)accurate_tx_end / 1e9,
-                           cc2420_state_str(trace_scc->state));
+                           cc2420_state_name(trace_scc));
     }
 
     if (ui_service_active(&ui_svc)) {
@@ -1022,7 +1004,7 @@ static void bus_host_on_rx_frame(void *user, const sim_radio_frame_info_t *fi,
                                                 : fi->tx_start_ns;
             trace_tsch_ack_log("deliver data 2->1 start=%.6f node1_state=%s",
                                (double)delivery_start / 1e9,
-                               cc2420_state_str(trace_rcc->state));
+                               cc2420_state_name(trace_rcc));
         }
         if (ui_service_active(&ui_svc) && len > 5) {
             int fstart = -1;
