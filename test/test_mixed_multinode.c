@@ -2551,11 +2551,15 @@ sim_restart:
     printf("  Native RX frames queued: %d\n", radio_bus.stats.frame_queued);
     printf("  Native RX frames collided: %d\n", radio_bus.stats.frame_collided);
     printf("  Native RX frames queue full: %d\n", radio_bus.stats.frame_queue_full);
+    /* M59: the global (process-wide, not per-node) RF stat getters stay as
+     * single runner calls, reached via neutral extern declarations so no chip
+     * header is pinned for them. */
     extern int cc2538_rfcore_get_rxfifo_overflows(void);
     printf("  CC2538 RXFIFO overflows: %d\n", cc2538_rfcore_get_rxfifo_overflows());
     { int s,c,rej,ov,cg,cb,dr;
-      cc2420_get_rx_stats(&s,&c,&rej,&ov,&cg,&cb,&dr);
+      extern void cc2420_get_rx_stats(int *, int *, int *, int *, int *, int *, int *);
       extern int cc2420_get_auto_ack_count(void);
+      cc2420_get_rx_stats(&s,&c,&rej,&ov,&cg,&cb,&dr);
       printf("  CC2420 RX: started=%d completed=%d rejected=%d overflow=%d crc_ok=%d crc_fail=%d dropped=%d auto_ack=%d\n",
              s,c,rej,ov,cg,cb,dr, cc2420_get_auto_ack_count());
     }
