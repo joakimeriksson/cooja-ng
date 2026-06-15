@@ -375,6 +375,15 @@ static int64_t arm_mote_cycles(const sim_mote_t *m) {
 static uint32_t arm_mote_freq_hz(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.arm.cpu.cpu_freq_hz;
 }
+
+/* Cycle-derived "now" in ns for the UI/timeline rf-state event (Phase 10
+ * M53).  Deliberately the raw intra-step value — arm_cycles_to_ns(cycles,
+ * freq), NOT the pinned sim_time_ns — matching the runner's historical
+ * computation so the timeline timestamps are byte-identical. */
+int64_t arm_elf_mote_now_ns(const sim_mote_t *m) {
+    const arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    return arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+}
 static int64_t arm_mote_instructions(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.arm.cpu.instructions;
 }

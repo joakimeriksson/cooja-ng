@@ -20,7 +20,6 @@
 #include "cc2538_soc.h"
 #include "nrf52840_soc.h"
 #include "nrf54l15_soc.h"
-#include "arm_systick.h"
 #include "arm_elf.h"
 #include "native_node.h"
 #include "js_node.h"
@@ -368,9 +367,9 @@ static void mixed_rf_state_handler(void *user_data, int old_state, int new_state
         case SIM_RADIO_ON:   etype = TL_RADIO_ON;   break;
         default:             etype = TL_RADIO_OFF;   break;
         }
-        /* Use CPU cycles for accurate intra-step timing */
-        int64_t ts = arm_cycles_to_ns(node->plat.arm.cpu.cycles,
-                                       node->plat.arm.cpu.cpu_freq_hz);
+        /* Use CPU cycles for accurate intra-step timing (M53: computed in
+         * the ARM module so the runner needs no chip header). */
+        int64_t ts = arm_elf_mote_now_ns(&mote_store[idx]);
         tl_radio_event(&timeline_svc.tl, node->id, ts, etype);
     }
 }

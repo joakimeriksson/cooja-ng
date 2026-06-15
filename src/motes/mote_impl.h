@@ -185,6 +185,9 @@ int  arm_elf_mote_boot(mixed_node_t *node, int slot,
 void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
                                  sim_radio_bus_t *bus);
 int64_t arm_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
+/* Cycle-derived "now" in ns (raw intra-step value) for the UI/timeline
+ * rf-state event — keeps arm_systick.h out of the runner (Phase 10 M53). */
+int64_t arm_elf_mote_now_ns(const sim_mote_t *m);
 
 /* ============================================================
  * Mote-kind registry (M23) — one row per mote kind, indexed by the
