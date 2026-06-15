@@ -1337,6 +1337,71 @@ gates on js output equality + determinism; M39 (wall-clock pacing) gates
 on the ui-demo smoke, not a diff.  Perf ≤5% additional wall for Phases
 6–10 combined (§3.14.1).
 
+### 3.20 Config-v2 milestones (canonical Phase 7 task list)
+
+> **Status: in progress.** Phase 7 (§9 / §8.3) adds a **config v2** format
+> alongside the legacy v1 JSON so configs can name mote types / platforms /
+> plugins (which Phase 8's static registry resolves by name).  Numbering
+> continues from Phase 6 (M41–M43).
+> Key finding: `sim_config_t` is **already** the normalized config struct
+> §8.3 calls for — the runner consumes the parsed struct (40 field reads),
+> not the JSON (the cJSON tree is freed in `sim_config_load` before it
+> returns).  So §8.3 step 5 ("runtime consumes normalized config") is
+> already satisfied; **Phase 7 does not touch the runtime**.  The work is a
+> versioned parser dispatch + a v2 parser that populates the *same* struct
+> + struct extensions that *capture* v2 metadata (named mote-types,
+> plugins) for Phase 8 to consume.
+> Stop condition (§9 Phase 7, non-negotiable): do not break existing
+> configs — all v1 JSON configs + the CLI multinode mode (firmware args +
+> `-n N`, extension→board resolution) keep working byte-identically;
+> `tools/csc2json.py` keeps emitting v1 (§8.3 step 6).
+
+Design decisions locked for this phase:
+
+- **`sim_config_t` is renamed `sim_normalized_config_t`** (fidelity to the
+  §8.3 commitment) — cheap because the literal type name appears in only 3
+  files (header typedef + 2 signatures, the parser, one runner line); the
+  40 `config.X` reads are member accesses, unaffected.  Sub-structs keep
+  their names (`sim_test_config_t`, `sim_node_config_t`, … — renaming them
+  would touch json_test_service / js_test_engine for nothing).
+- **The config module relocates** `include/native/`+`src/native/` →
+  `include/sim/`+`src/sim/` (config is general, not native-mote-specific);
+  a zero-risk `git mv` + Makefile move (both `-I` paths already in CFLAGS).
+- **The legacy `mote_type_firmware[8][256]` index table is retained** — it
+  is read by integer index at runtime (`TEST_ACTION_ADD`); the v2 parser
+  writes both the rich `mote_types[]` table and the legacy index array, so
+  the runtime is unchanged.  Migrating the runtime to the rich table is
+  Phase 8 debt.
+- **v2 resolves through the firmware extension, as today** — v2's
+  `mote_type.firmware` carries the `.sky`/`.cc2538dk` extension, so the v2
+  node parser writes the resolved firmware into `nodes[i].firmware` and the
+  existing `sim_board_for_path` resolution is unchanged.  The captured
+  `cpu`/`soc`/`board`/`plugins` are inert in Phase 7 (Phase 8 consumes them).
+
+Milestones (one commit each, full validation gate before each):
+
+41. Versioned-dispatch refactor + relocate + rename (byte-identical): split
+    `sim_config_load` into file-read + top-level `version` detection →
+    `parse_v1` (verbatim move of the current body) + shared `parse_test` /
+    `parse_medium_object` leaf helpers; `git mv` the config module to the
+    sim namespace; rename the struct; add a `version` field (=1, unused).
+42. Config v2: add `sim_mote_type_t` (name/kind/cpu/soc/board/firmware) +
+    `mote_types[]` alongside the retained index table + `plugins[]` +
+    node `type_name`; `parse_v2` (reuses the shared helpers; resolves
+    `node.type` → named mote-type → firmware, writing the legacy index too);
+    version-guarded print; v2 example configs (twins of existing v1) + a
+    v1↔v2 equivalence diff (byte-identical output).
+43. Close-out (docs only): §3.20 status, §8.3 amendment (normalized struct =
+    `sim_normalized_config_t`, step 5 already satisfied), legacy index table
+    noted as Phase-8 debt, `csc2json.py` stays v1, Decisions Log, CLAUDE.md.
+
+Validation gate per milestone: §3.19's gate plus the two Phase-7 config
+gates (`test configs/test-rpl-udp-sky.json`, `test
+configs/rpl-udp-cc2538dk.json`).  M41 is byte-identical → cross-build
+empty-diff (the v1-extraction backstop); M42 adds the v2↔v1 equivalence
+diff (each v2 twin produces byte-identical sim output to its v1 original)
+plus a v1-only cross-build empty-diff.
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -2124,6 +2189,11 @@ Stop condition:
 
 Goal: create a clean config-to-runtime path.
 
+The canonical task list is **§3.20 above (milestones M41–M43)**; land them in
+order, one commit per milestone.  The notes below summarize the scope; where
+they disagree with §3.20 (written later, against the post-Phase-6 code),
+§3.20 wins.
+
 Tasks:
 
 - Add normalized config structs independent of legacy JSON layout.
@@ -2425,6 +2495,15 @@ the same patch.
   OOM in kernel → `abort()` (§3.14.2).
 - **Config v2 migration uses a single normalized internal struct that both v1
   and v2 parsers populate** (§8.3). Not "v2 parser OR extend v1 parser."
+  Phase 7 task list is **§3.20 (M41–M43)**.  That normalized struct is the
+  existing `sim_config_t`, **renamed `sim_normalized_config_t`** (the runner
+  already consumes the parsed struct, not the JSON — §8.3 step 5 was already
+  satisfied, so Phase 7 leaves the runtime untouched).  The legacy
+  index-keyed `mote_type_firmware[8][256]` table is retained (read by index
+  in `TEST_ACTION_ADD`); the v2 parser writes it alongside the richer
+  `mote_types[]` table.  v2's `cpu`/`soc`/`board`/`plugins` metadata is
+  captured but inert in Phase 7 — node→board resolution still goes through
+  the firmware extension; the registry-by-name lookup is Phase 8.
 - **Terminology**: "service" for built-in components via `sim_service_ops_t`,
   "plugin" for dynamic-loaded services only (§2.1).
 - **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.
