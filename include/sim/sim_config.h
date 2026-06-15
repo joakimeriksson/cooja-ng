@@ -84,6 +84,7 @@ typedef struct {
 } sim_node_config_t;
 
 typedef struct {
+    int  version;      /* config schema version: 1 (legacy) or 2 (M41+) */
     char title[128];
     int  timeout_ms;   /* default 20000 */
     int  seed;         /* 0 = not set */
@@ -121,12 +122,17 @@ typedef struct {
     int  serial_socket_port;        /* TCP port (default 60001) */
     int  serial_socket_node;        /* node ID to bridge serial to */
     char serial_socket_command[1024]; /* external command to run after socket ready */
-} sim_config_t;
+} sim_normalized_config_t;
 
-/* Load a JSON config file. Returns 0 on success, -1 on error. */
-int  sim_config_load(sim_config_t *cfg, const char *json_path);
+/* The single normalized config struct both the v1 and v2 JSON parsers
+ * populate; the runtime consumes only this, never the raw JSON layout
+ * (§8.3).  Phase 7 renamed it from sim_config_t. */
+
+/* Load a JSON config file (v1 or v2, dispatched on the top-level "version"
+ * key).  Returns 0 on success, -1 on error. */
+int  sim_config_load(sim_normalized_config_t *cfg, const char *json_path);
 
 /* Print config summary to stdout. */
-void sim_config_print(const sim_config_t *cfg);
+void sim_config_print(const sim_normalized_config_t *cfg);
 
 #endif /* SIM_CONFIG_H */

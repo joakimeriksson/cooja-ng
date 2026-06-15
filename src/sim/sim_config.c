@@ -1,5 +1,10 @@
 /*
- * JSON simulation configuration loader
+ * JSON simulation configuration loader.
+ *
+ * sim_config_load reads the file, parses JSON, and dispatches on the
+ * top-level "version" key to a per-version parser (parse_v1 / parse_v2 —
+ * §8.3).  Each parser populates the same normalized struct
+ * (sim_normalized_config_t); the runtime consumes only that struct.
  */
 #include "sim_config.h"
 #include "cJSON.h"
@@ -7,8 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-int sim_config_load(sim_config_t *cfg, const char *json_path) {
+static int parse_v1(cJSON *root, sim_normalized_config_t *cfg);
+
+int sim_config_load(sim_normalized_config_t *cfg, const char *json_path) {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->version = 1;         /* default; overridden by the "version" key */
     cfg->timeout_ms = 20000;  /* default */
     cfg->tx_range = 50.0;
     cfg->interference_range = 100.0;
@@ -50,6 +58,34 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
         return -1;
     }
 
+    /* Dispatch on the schema version (absent/1 = legacy v1). */
+    cJSON *ver = cJSON_GetObjectItem(root, "version");
+    if (cJSON_IsNumber(ver))
+        cfg->version = ver->valueint;
+
+    int rc;
+    if (cfg->version >= 2) {
+        fprintf(stderr, "sim_config: config v2 not supported yet (added in M42)\n");
+        rc = -1;
+    } else {
+        rc = parse_v1(root, cfg);
+    }
+    cJSON_Delete(root);
+    if (rc != 0)
+        return rc;
+
+    /* Auto-assign IDs for nodes without explicit id */
+    for (int i = 0; i < cfg->node_count; i++) {
+        if (cfg->nodes[i].id == 0)
+            cfg->nodes[i].id = i + 1;
+    }
+    return 0;
+}
+
+/* v1 (legacy) JSON → normalized config.  Verbatim move of the original
+ * parse body; populates cfg from `root` and leaves cJSON_Delete + node-ID
+ * auto-assignment to the caller. */
+static int parse_v1(cJSON *root, sim_normalized_config_t *cfg) {
     /* Extract top-level fields */
     cJSON *title = cJSON_GetObjectItemCaseSensitive(root, "title");
     if (cJSON_IsString(title) && title->valuestring) {
@@ -356,19 +392,10 @@ int sim_config_load(sim_config_t *cfg, const char *json_path) {
                      "%s", ss_cmd->valuestring);
     }
 
-    cJSON_Delete(root);
-
-    /* Auto-assign IDs for nodes without explicit id */
-    for (int i = 0; i < cfg->node_count; i++) {
-        if (cfg->nodes[i].id == 0) {
-            cfg->nodes[i].id = i + 1;
-        }
-    }
-
     return 0;
 }
 
-void sim_config_print(const sim_config_t *cfg) {
+void sim_config_print(const sim_normalized_config_t *cfg) {
     if (cfg->title[0])
         printf("Config: %s\n", cfg->title);
     printf("  timeout_ms: %d\n", cfg->timeout_ms);

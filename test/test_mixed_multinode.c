@@ -1683,7 +1683,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int ui_port = 8080;
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
-    sim_config_t config;
+    sim_normalized_config_t config;
     int config_loaded = 0;
 
     for (int i = 0; i < argc; i++) {

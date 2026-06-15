@@ -76,7 +76,8 @@ SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
               $(SIM_SRC_DIR)/sim_serial_bridge.c \
               $(SIM_SRC_DIR)/sim_external_command.c \
               $(SIM_SRC_DIR)/sim_radio_bus.c \
-              $(SIM_SRC_DIR)/sim_board.c
+              $(SIM_SRC_DIR)/sim_board.c \
+              $(SIM_SRC_DIR)/sim_config.c
 
 SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
                    $(SERVICES_SRC_DIR)/pcap_service.c \
@@ -96,7 +97,6 @@ MOTES_SOURCES = $(MOTES_SRC_DIR)/js_app_mote.c \
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
-                 $(NATIVE_SRC_DIR)/sim_config.c \
                  $(NATIVE_SRC_DIR)/js_node.c
 
 UI_SOURCES = $(UI_SRC_DIR)/ws_server.c \
