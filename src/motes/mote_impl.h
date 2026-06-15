@@ -174,6 +174,12 @@ int  msp430_elf_mote_boot(mixed_node_t *node, int slot,
 void msp430_elf_mote_register_radio(mixed_node_t *node, int slot,
                                     sim_radio_bus_t *bus);
 int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
+/* PC-trace debug instrumentation (Phase 10 M55).  install returns the
+ * resolved cc2420_transmit address (0 = non-MSP430 or unresolved); the
+ * counts getter feeds the end-of-run stats. */
+uint32_t msp430_elf_mote_install_pc_trace(mixed_node_t *node);
+void msp430_elf_mote_pc_trace_counts(int *cc2420_tx, int *eb_process,
+                                     int *queue_add);
 
 /* M22/M38: ARM emulated-ELF motes (CC2538 / firefly / nRF52840 /
  * nRF54L15).  Same shape as M21: boot + tick + radio ops + the full mote

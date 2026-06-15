@@ -92,23 +92,9 @@ static sim_mote_t mote_store[MAX_NODES];
  * (radio_bus.executing_node, M26); set via sim_radio_bus_set_executing
  * around CPU steps, read by the bus's synchronous RX delivery. */
 
-/* PC trace callback for debugging */
-static uint32_t srh_trace_fn_addr;
-static int cc2420_transmit_count;
-static int tsch_eb_process_count;
-static int tsch_queue_add_count;
-void srh_trace_cb(void *data, uint32_t pc, uint32_t *reg, uint8_t *mem) {
-    (void)data; (void)reg; (void)mem;
-    /* Track firmware-level cc2420_transmit calls */
-    if (srh_trace_fn_addr && pc == srh_trace_fn_addr)
-        cc2420_transmit_count++;
-    /* Track EB process calls */
-    if (pc == 0xcb32)
-        tsch_eb_process_count++;
-    /* Track queue add */
-    if (pc == 0xb138)
-        tsch_queue_add_count++;
-}
+/* M55: the MSP430 PC-trace debug instrumentation (cc2420_transmit / TSCH
+ * EB-process / queue-add counters) moved into src/motes/msp430_elf_mote.c —
+ * the runner installs it type-blind and reads the counts via getters. */
 static int num_nodes = 0;
 static int verbose = 1;
 /* M9.2: RF routing state lives in the kernel-owned radio bus.  The
@@ -2120,33 +2106,15 @@ sim_restart:
     int action_idx = 0;
 
     printf("\n--- Simulation running ---\n\n");
-    /* Verify trace is set */
-    for (int i = 0; i < node_count; i++) {
-        if (nodes[i].type == NODE_MSP430 && nodes[i].plat.msp.cpu.pc_trace_fn)
-            fprintf(stderr, "  [DBG] Node %d pc_trace_fn=%p lo=0x%x hi=0x%x\n",
-                nodes[i].id, (void*)nodes[i].plat.msp.cpu.pc_trace_fn,
-                nodes[i].plat.msp.cpu.pc_trace_lo, nodes[i].plat.msp.cpu.pc_trace_hi);
-    }
 
-    /* Debug: PC trace for cc2420_transmit + TSCH EB on all MSP430 nodes */
+    /* Debug: PC trace for cc2420_transmit + TSCH EB on all MSP430 nodes (M55:
+     * the install + counters live in the MSP430 module; the call is type-blind
+     * — non-MSP430 nodes return 0). */
     for (int i = 0; i < node_count; i++) {
-        if (nodes[i].type == NODE_MSP430) {
-            uint32_t tx_addr = msp430_elf_find_symbol(
-                nodes[i].firmware_path, "cc2420_transmit");
-            if (tx_addr) {
-                srh_trace_fn_addr = tx_addr;
-                cc2420_transmit_count = 0;
-                tsch_eb_process_count = 0;
-                tsch_queue_add_count = 0;
-                /* Set range to cover all code including memcpy in .rodata area */
-                nodes[i].plat.msp.cpu.pc_trace_lo = 0x3d00;
-                nodes[i].plat.msp.cpu.pc_trace_hi = 0x10000;
-                nodes[i].plat.msp.cpu.pc_trace_fn = srh_trace_cb;
-                nodes[i].plat.msp.cpu.pc_trace_data = &nodes[i];
-                printf("  PC trace: cc2420_transmit=0x%04x eb_process=0xcb32 queue_add=0xb138 (Node %d)\n",
-                       tx_addr, nodes[i].id);
-            }
-        }
+        uint32_t tx_addr = msp430_elf_mote_install_pc_trace(&nodes[i]);
+        if (tx_addr)
+            printf("  PC trace: cc2420_transmit=0x%04x eb_process=0xcb32 queue_add=0xb138 (Node %d)\n",
+                   tx_addr, nodes[i].id);
     }
 
     /* Start sim_time_ns at max of all nodes' current sim_time_ns */
@@ -2573,8 +2541,10 @@ sim_restart:
     msp430_timer_dump_ccr_counts();
     extern int msp430_gpio_get_isr_count(void);
     printf("  GPIO ISR count: %d\n", msp430_gpio_get_isr_count());
+    int fw_cc2420_tx = 0, fw_eb_process = 0, fw_queue_add = 0;
+    msp430_elf_mote_pc_trace_counts(&fw_cc2420_tx, &fw_eb_process, &fw_queue_add);
     printf("  FW cc2420_transmit=%d eb_process=%d queue_add=%d\n",
-           cc2420_transmit_count, tsch_eb_process_count, tsch_queue_add_count);
+           fw_cc2420_tx, fw_eb_process, fw_queue_add);
     /* Dump SFD timestamp and Timer B state for TSCH debugging */
     for (int i = 0; i < node_count; i++) {
         if (nodes[i].type != NODE_MSP430) continue;

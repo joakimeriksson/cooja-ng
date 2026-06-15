@@ -24,6 +24,63 @@
 #include <stdlib.h>
 
 /* ============================================================
+ * MSP430 PC-trace debug instrumentation (Phase 10 M55)
+ *
+ * Firmware-level cc2420_transmit / TSCH EB-process / queue-add counters,
+ * driven by the CPU's pc_trace hook.  Lives in the MSP430 module (not the
+ * runner) so the runner needs no MSP430 chip access for it.
+ * ============================================================ */
+
+static uint32_t srh_trace_fn_addr;
+static int cc2420_transmit_count;
+static int tsch_eb_process_count;
+static int tsch_queue_add_count;
+
+static void srh_trace_cb(void *data, uint32_t pc, uint32_t *reg, uint8_t *mem) {
+    (void)data; (void)reg; (void)mem;
+    /* Track firmware-level cc2420_transmit calls */
+    if (srh_trace_fn_addr && pc == srh_trace_fn_addr)
+        cc2420_transmit_count++;
+    /* Track EB process calls */
+    if (pc == 0xcb32)
+        tsch_eb_process_count++;
+    /* Track queue add */
+    if (pc == 0xb138)
+        tsch_queue_add_count++;
+}
+
+/* Install the PC-trace instrumentation on an MSP430 node.  No-op + returns 0
+ * for non-MSP430 nodes or when cc2420_transmit can't be resolved; otherwise
+ * returns the resolved cc2420_transmit address so the caller can emit its
+ * historical "PC trace: ..." line. */
+uint32_t msp430_elf_mote_install_pc_trace(mixed_node_t *node) {
+    if (node->type != NODE_MSP430)
+        return 0;
+    uint32_t tx_addr =
+        msp430_elf_find_symbol(node->firmware_path, "cc2420_transmit");
+    if (!tx_addr)
+        return 0;
+    srh_trace_fn_addr = tx_addr;
+    cc2420_transmit_count = 0;
+    tsch_eb_process_count = 0;
+    tsch_queue_add_count = 0;
+    /* Set range to cover all code including memcpy in .rodata area */
+    node->plat.msp.cpu.pc_trace_lo = 0x3d00;
+    node->plat.msp.cpu.pc_trace_hi = 0x10000;
+    node->plat.msp.cpu.pc_trace_fn = srh_trace_cb;
+    node->plat.msp.cpu.pc_trace_data = node;
+    return tx_addr;
+}
+
+/* Report the PC-trace counters (read by the end-of-run stats, M58). */
+void msp430_elf_mote_pc_trace_counts(int *cc2420_tx, int *eb_process,
+                                     int *queue_add) {
+    if (cc2420_tx)  *cc2420_tx  = cc2420_transmit_count;
+    if (eb_process) *eb_process = tsch_eb_process_count;
+    if (queue_add)  *queue_add  = tsch_queue_add_count;
+}
+
+/* ============================================================
  * Boot policy
  *
  * Every firmware patch below names the firmware symbol it depends on
