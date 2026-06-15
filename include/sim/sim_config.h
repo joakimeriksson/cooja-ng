@@ -81,7 +81,20 @@ typedef struct {
     double x, y;     /* position in meters */
     int  has_position; /* true if x,y specified in JSON */
     double clock_deviation; /* 1.0 = normal, <1.0 = slower (Cooja MspClock deviation) */
+    char type_name[64]; /* v2: the named mote-type this node uses ("" for v1) */
 } sim_node_config_t;
+
+/* v2 named mote type (config v2 §8.2).  In Phase 7 only `firmware` drives
+ * the runtime (board resolved from its extension as in v1); name/kind/cpu/
+ * soc/board are captured for the Phase 8 static registry. */
+typedef struct {
+    char name[64];
+    char kind[32];      /* "emulated-elf" | "native-cooja" | "js-app" */
+    char cpu[32];       /* "msp430" | "armv7m" | ...                  */
+    char soc[32];       /* "msp430f1611" | "cc2538" | ...             */
+    char board[32];     /* "sky" | "zoul-firefly" | "cc2538dk" | ...  */
+    char firmware[256];
+} sim_mote_type_t;
 
 typedef struct {
     int  version;      /* config schema version: 1 (legacy) or 2 (M41+) */
@@ -113,9 +126,17 @@ typedef struct {
     char js_script_path[512];       /* path to .js file */
     char *js_script_inline;         /* inline script (malloc'd, or NULL) */
 
-    /* Mote types (for getMoteTypes()[index] mapping) */
+    /* Mote types (for getMoteTypes()[index] mapping).  The legacy
+     * index-keyed firmware table is read by TEST_ACTION_ADD at runtime; the
+     * v2 parser writes both it and the richer mote_types[] table below. */
     int mote_type_count;
     char mote_type_firmware[8][256]; /* firmware path per type index */
+    sim_mote_type_t mote_types[8];   /* v2 named mote types (M42)       */
+
+    /* v2 plugin/service names (captured for Phase 8 register-by-name;
+     * inert in Phase 7).  e.g. "builtin:timeline", "builtin:pcap". */
+    int  plugin_count;
+    char plugins[16][48];
 
     /* Serial socket server (for border-router tests) */
     int  has_serial_socket;

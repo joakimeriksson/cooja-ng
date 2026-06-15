@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "title": "RPL-UDP CC2538DK test",
+  "timeout_ms": 60000,
+  "mote_types": [
+    { "name": "cc2538-server", "kind": "emulated-elf", "cpu": "armv7m", "soc": "cc2538", "board": "cc2538dk", "firmware": "firmware/cc2538dk/udp-server.cc2538dk" },
+    { "name": "cc2538-client", "kind": "emulated-elf", "cpu": "armv7m", "soc": "cc2538", "board": "cc2538dk", "firmware": "firmware/cc2538dk/udp-client.cc2538dk" }
+  ],
+  "nodes": [
+    { "type": "cc2538-server", "id": 1 },
+    { "type": "cc2538-client", "id": 2 }
+  ]
+}
