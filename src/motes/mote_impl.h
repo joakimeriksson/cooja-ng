@@ -183,6 +183,9 @@ void msp430_elf_mote_pc_trace_counts(int *cc2420_tx, int *eb_process,
 /* Verbose [UIP] dump of a sending MSP430 node (Phase 10 M57); no-op unless
  * MSP430 node 1 — keeps the chip-memory read out of the runner. */
 void msp430_elf_mote_dump_uip(const mixed_node_t *node);
+/* End-of-run per-node diagnostics (Phase 10 M58); the dump_diagnostics op for
+ * MSP430 — one section (sim_mote_diag_t) per call. */
+void msp430_elf_mote_dump_diagnostics(const sim_mote_t *m, int section);
 
 /* M22/M38: ARM emulated-ELF motes (CC2538 / firefly / nRF52840 /
  * nRF54L15).  Same shape as M21: boot + tick + radio ops + the full mote

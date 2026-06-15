@@ -106,6 +106,131 @@ void msp430_elf_mote_dump_uip(const mixed_node_t *node) {
 }
 
 /* ============================================================
+ * End-of-run diagnostics (Phase 10 M58)
+ *
+ * The per-node MSP430 terminal-report blocks (SFD/Timer-B, TSCH state,
+ * CC2420 stats, neighbor + SR tables) — chip-memory + firmware-symbol reads
+ * — moved out of the runner behind the dump_diagnostics op.  The runner
+ * drives the section order; cross-cutting aggregates stay runner-side.
+ * ============================================================ */
+
+void msp430_elf_mote_dump_diagnostics(const sim_mote_t *m, int section) {
+    mixed_node_t *node = MOTE_IMPL(m);
+    const char *firmware_path = node->firmware_path;
+    switch (section) {
+    case SIM_MOTE_DIAG_SFD_TIMERB: {
+        uint8_t *mem = node->plat.msp.cpu.memory;
+        uint16_t sfd_time = mem[0x24f8] | (mem[0x24f9] << 8);
+        msp430_timer_t *tb = &node->plat.msp.timer_b;
+        printf("  Node %d: sfd_start_time=%u TB_mode=%d TB_CCR1=%u TB_CCTL1=0x%04x\n",
+               node->id, sfd_time, tb->mode, tb->ccr[1], tb->cctl[1]);
+        break;
+    }
+    case SIM_MOTE_DIAG_TSCH_STATE: {
+        uint32_t tsch_coord = msp430_elf_find_symbol(firmware_path, "tsch_is_coordinator");
+        uint32_t tsch_init = msp430_elf_find_symbol(firmware_path, "tsch_is_initialized");
+        uint32_t tsch_start = msp430_elf_find_symbol(firmware_path, "tsch_is_started");
+        if (tsch_coord && tsch_init && tsch_start) {
+            uint8_t *mem = node->plat.msp.cpu.memory;
+            uint32_t asn_addr = msp430_elf_find_symbol(firmware_path, "tsch_current_asn");
+            uint32_t in_slot = msp430_elf_find_symbol(firmware_path, "tsch_in_slot_operation");
+            uint32_t asn_lo = asn_addr ? (mem[asn_addr] | (mem[asn_addr+1]<<8) | (mem[asn_addr+2]<<16) | (mem[asn_addr+3]<<24)) : 0;
+            uint32_t tsch_assoc = msp430_elf_find_symbol(firmware_path, "tsch_is_associated");
+            uint32_t tsch_secured = msp430_elf_find_symbol(firmware_path, "tsch_is_pan_secured");
+            uint32_t eb_period_addr = msp430_elf_find_symbol(firmware_path, "tsch_current_eb_period");
+            uint32_t eb_period = eb_period_addr ? (mem[eb_period_addr] | (mem[eb_period_addr+1]<<8) |
+                (mem[eb_period_addr+2]<<16) | (mem[eb_period_addr+3]<<24)) : 0;
+            uint32_t leaf_only_addr = msp430_elf_find_symbol(firmware_path, "rpl_leaf_only");
+            uint32_t used_addr = 0x2568;  /* curr_instance.used */
+            uint32_t rank1 = 0x2572, rank2 = 0x25a6;
+            uint32_t clock_count_addr = msp430_elf_find_symbol(firmware_path, "count");
+            uint32_t clock_seconds_addr = msp430_elf_find_symbol(firmware_path, "seconds");
+            uint32_t clock_count_val = clock_count_addr ?
+                (mem[clock_count_addr] | (mem[clock_count_addr+1]<<8) |
+                 (mem[clock_count_addr+2]<<16) | (mem[clock_count_addr+3]<<24)) : 0;
+            uint32_t clock_seconds_val = clock_seconds_addr ?
+                (mem[clock_seconds_addr] | (mem[clock_seconds_addr+1]<<8) |
+                 (mem[clock_seconds_addr+2]<<16) | (mem[clock_seconds_addr+3]<<24)) : 0;
+            printf("  Node %d TSCH: coord=%d init=%d started=%d assoc=%d secured=%d in_slot=%d asn=%u eb_period=%u "
+                   "leaf_only=%d rpl_used=%d rank=%d/%d clock=%u/%us\n",
+                node->id, mem[tsch_coord], mem[tsch_init], mem[tsch_start],
+                tsch_assoc ? mem[tsch_assoc] : -1,
+                tsch_secured ? mem[tsch_secured] : -1,
+                in_slot ? mem[in_slot] : -1, asn_lo, eb_period,
+                leaf_only_addr ? mem[leaf_only_addr] : -1,
+                mem[used_addr],
+                mem[rank1] | (mem[rank1+1]<<8),
+                mem[rank2] | (mem[rank2+1]<<8),
+                clock_count_val, clock_seconds_val);
+        }
+        break;
+    }
+    case SIM_MOTE_DIAG_CC2420_STATS: {
+        cc2420_t *r = &node->plat.msp.cc2420;
+        printf("  Node %d CC2420: state=%d on=%d spi=%d rx=%d/%d ack_rx=%d rej=%d ov=%d crc=%d/%d ack=%d "
+               "incoming=%d replayed=%d dropped=%d "
+               "strobes: rxon=%d txon=%d txoncca=%d rfoff=%d tx_cal=%d\n",
+               node->id, r->state, r->on, r->stat_spi_count,
+               r->stat_rx_started, r->stat_rx_completed, r->stat_rx_ack_completed,
+               r->stat_rx_rejected, r->stat_rx_overflow,
+               r->stat_crc_ok, r->stat_crc_fail, r->stat_auto_ack,
+               r->stat_rx_buffered, r->stat_rx_replayed, r->stat_rx_dropped,
+               r->stat_strobe_srxon, r->stat_strobe_stxon,
+               r->stat_strobe_stxoncca, r->stat_strobe_srfoff,
+               r->stat_tx_calibrate);
+        break;
+    }
+    case SIM_MOTE_DIAG_NEIGHBOR_TABLE: {
+        msp430_cpu_t *cpu = &node->plat.msp.cpu;
+        /* Find _ds6_neighbors_mem and neighbor_addr_mem_memb_mem */
+        uint32_t nbr_addr = msp430_elf_find_symbol(firmware_path,
+            "neighbor_addr_mem_memb_mem");
+        uint32_t nbr_used = msp430_elf_find_symbol(firmware_path,
+            "neighbor_addr_mem_memb_used");
+        if (nbr_addr && nbr_used && nbr_addr < cpu->max_mem) {
+            /* neighbor_addr_mem_memb: 16 entries × 10 bytes (2-byte list ptr + 8-byte lladdr) */
+            int num_entries = 16;
+            int entry_size = 10;
+            printf("  Node %d neighbor table (addr_mem at 0x%04x):\n", node->id, nbr_addr);
+            for (int n = 0; n < num_entries; n++) {
+                if (nbr_used + n < cpu->max_mem && cpu->memory[nbr_used + n]) {
+                    uint8_t *ll = cpu->memory + nbr_addr + n * entry_size + 2;
+                    printf("    [%d] lladdr=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
+                           n, ll[0],ll[1],ll[2],ll[3],ll[4],ll[5],ll[6],ll[7]);
+                }
+            }
+        }
+        break;
+    }
+    case SIM_MOTE_DIAG_SR_TABLE: {
+        if (node->id != 1) break;
+        msp430_cpu_t *cpu = &node->plat.msp.cpu;
+        uint32_t sr_mem = msp430_elf_find_symbol(firmware_path,
+            "nodememb_memb_mem");
+        uint32_t sr_used = msp430_elf_find_symbol(firmware_path,
+            "nodememb_memb_used");
+        if (sr_mem && sr_used && sr_mem < cpu->max_mem) {
+            printf("  Node 1 SR table (nodememb at 0x%04x):\n", sr_mem);
+            /* uip_sr_node_t: list ptr(2) + ipaddr suffix(2) + parent ptr(2) + ... = 18 bytes */
+            for (int n = 0; n < 16; n++) {
+                if (sr_used < cpu->max_mem && cpu->memory[sr_used + n]) {
+                    uint8_t *entry = cpu->memory + sr_mem + n * 18;
+                    /* Dump raw bytes to understand layout */
+                    printf("    [%d] raw:", n);
+                    for (int b = 0; b < 18; b++)
+                        printf(" %02x", entry[b]);
+                    printf("\n");
+                }
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* ============================================================
  * Boot policy
  *
  * Every firmware patch below names the firmware symbol it depends on
@@ -589,4 +714,5 @@ const sim_mote_ops_t msp430_elf_mote_ops = {
     .receive_frame   = NULL, /* per-byte / staged delivery */
     .rx_byte_sync    = msp_mote_rx_byte_sync,
     .rx_pre_sync     = msp_mote_rx_pre_sync,
+    .dump_diagnostics = msp430_elf_mote_dump_diagnostics,
 };

@@ -30,6 +30,17 @@ extern "C" {
 
 typedef struct sim_mote sim_mote_t;
 
+/* End-of-run diagnostic sections for sim_mote_ops_t.dump_diagnostics
+ * (Phase 10 M58).  Each names one per-node terminal-report block; the order
+ * the runner emits them in (interleaved with aggregates) is preserved. */
+typedef enum sim_mote_diag {
+    SIM_MOTE_DIAG_SFD_TIMERB = 1,
+    SIM_MOTE_DIAG_TSCH_STATE,
+    SIM_MOTE_DIAG_CC2420_STATS,
+    SIM_MOTE_DIAG_NEIGHBOR_TABLE,
+    SIM_MOTE_DIAG_SR_TABLE,
+} sim_mote_diag_t;
+
 /* Typed-interface ids for sim_mote_ops_t.get_interface (M16).  An
  * adapter returns the requested chip/CPU pointer or NULL when the mote
  * kind doesn't carry that interface — callers branch on NULL instead of
@@ -177,6 +188,18 @@ typedef struct sim_mote_ops {
      * synchronous frame delivery (ex the frame_complete pre-sync tick).
      * NULL elsewhere. */
     void (*rx_pre_sync)(sim_mote_t *m, int64_t time_ns);
+
+    /* ---- M58 (Phase 10): end-of-run per-node diagnostics ------------ */
+
+    /* OPTIONAL: emit one end-of-run diagnostic section for this mote.  Only
+     * the MSP430 kind implements it (the per-node SFD/Timer-B/TSCH-state/
+     * neighbor+SR-table/CC2420-stats chip-memory + firmware-symbol dumps);
+     * NULL elsewhere.  The runner drives the section order (interleaved with
+     * cross-cutting aggregates that carry no chip coupling) and treats a NULL
+     * op as "this kind has no per-node diagnostics" — which doubles as the
+     * type-blind "is this an MSP430 mote?" test the old NODE_MSP430 stat
+     * loops performed.  `section` is a sim_mote_diag_t. */
+    void (*dump_diagnostics)(const sim_mote_t *m, int section);
 
     /* ---- M54 (Phase 10): per-kind startup-delay shift ---------------
      *
