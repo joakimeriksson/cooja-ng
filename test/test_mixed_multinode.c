@@ -1849,7 +1849,8 @@ sim_restart:
      * teardown only when configured. */
     if (gdb_service_configured(&gdb_svc)) {
         gdb_service_attach_all(&gdb_svc, &sim_rt, node_count, mote_node_id);
-        sim_service_attach(&sim_rt, &gdb_service_ops, &gdb_svc);
+        sim_service_attach(&sim_rt, sim_registry_find_service(&g_registry, "gdb"),
+                           &gdb_svc);
     }
 
     /* PCAP capture: open the file and arm the TX hook in the frame
@@ -1948,7 +1949,9 @@ sim_restart:
                 use_js_engine = true;
                 /* M36: the JS line feed is a service on_event now. */
                 js_test_service_start(&js_test_svc, &js_engine);
-                sim_service_attach(&sim_rt, &js_test_service_ops, &js_test_svc);
+                sim_service_attach(&sim_rt,
+                                   sim_registry_find_service(&g_registry, "js-test"),
+                                   &js_test_svc);
                 /* Use timeout from JS TIMEOUT() call if set, else from config.
                  * Add margin so the sim loop runs past the timeout point,
                  * allowing js_test_check_timeout to fire the callback.
@@ -2063,14 +2066,18 @@ sim_restart:
                  * external-command child) with the service host so the
                  * loop polls them via sim_service_poll_all and tears them
                  * down in reverse at ss_cleanup. */
-                sim_service_attach(&sim_rt, &ss_bridge_service_ops,
+                sim_service_attach(&sim_rt,
+                                   sim_registry_find_service(&g_registry,
+                                                             "serial-bridge"),
                                    &serial_bridge);
                 if (config.serial_socket_command[0]) {
                     /* COOJA.testlog tee + child launch live in the
                      * external-command service (milestone 8.2). */
                     sim_external_command_start(&external_cmd, &sim_rt,
                                                config.serial_socket_command);
-                    sim_service_attach(&sim_rt, &ss_extcmd_service_ops,
+                    sim_service_attach(&sim_rt,
+                                       sim_registry_find_service(&g_registry,
+                                                                 "external-command"),
                                        &external_cmd);
                 }
             }
