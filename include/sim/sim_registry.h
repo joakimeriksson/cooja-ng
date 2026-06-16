@@ -33,6 +33,7 @@
 
 #include "sim_board.h"     /* sim_board_desc_t, sim_board_kind_t */
 #include "sim_service.h"   /* sim_service_ops_t                  */
+#include "radio_medium.h"  /* radio_medium_type_t, sim_medium_ops_t (Phase 11) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +45,17 @@ extern "C" {
 typedef struct sim_mote_kind sim_mote_kind_t;
 
 #define SIM_REGISTRY_MAX_SERVICES 16
+#define SIM_REGISTRY_MAX_MEDIA     8
+
+/* A registered radio medium (Phase 11): a name → policy ops, plus which
+ * generic pipeline it runs (UDGM = the full filter machinery with custom
+ * policy; NONE = the all-to-all bypass).  Built-ins "udgm"/"none"; a plugin
+ * registers a custom medium that runs the UDGM pipeline with its own ops. */
+typedef struct sim_medium_type {
+    const char             *name;
+    radio_medium_type_t     pipeline;
+    const sim_medium_ops_t *ops;
+} sim_medium_type_t;
 
 typedef struct sim_registry {
     /* Referenced built-in tables (owned by sim_board.c / mote_kinds.c). */
@@ -54,6 +66,9 @@ typedef struct sim_registry {
     /* The service catalog the registry owns (name → ops). */
     const sim_service_ops_t *services[SIM_REGISTRY_MAX_SERVICES];
     int                      service_count;
+    /* The radio-medium catalog (name → policy). */
+    const sim_medium_type_t *media[SIM_REGISTRY_MAX_MEDIA];
+    int                      media_count;
 } sim_registry_t;
 
 /* Built-in registration (call once at startup, after zero-init).  Each stores
@@ -61,6 +76,7 @@ typedef struct sim_registry {
 void csim_register_builtin_platforms(sim_registry_t *r);
 void csim_register_builtin_mote_types(sim_registry_t *r);
 void csim_register_builtin_services(sim_registry_t *r);
+void csim_register_builtin_media(sim_registry_t *r);   /* "udgm", "none" */
 
 /* Service catalog: append an ops by name; reject duplicates by name and a full
  * table.  Returns the slot index ≥ 0, or < 0 on failure.  find returns the
@@ -69,6 +85,14 @@ int  sim_registry_register_service(sim_registry_t *r,
                                    const sim_service_ops_t *ops);
 const sim_service_ops_t *sim_registry_find_service(const sim_registry_t *r,
                                                    const char *name);
+
+/* Radio-medium catalog: append a medium by name (rejects duplicate name + a
+ * full table); find returns the registered medium whose ->name matches, or
+ * NULL.  Mirrors the service catalog. */
+int  sim_registry_register_radio_medium(sim_registry_t *r,
+                                        const sim_medium_type_t *m);
+const sim_medium_type_t *sim_registry_find_radio_medium(const sim_registry_t *r,
+                                                        const char *name);
 
 /* Board lookup — forwards to the existing sim_board.c bodies (identical Sky
  * default fallback for unknown/missing extensions). */

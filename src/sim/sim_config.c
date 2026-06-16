@@ -209,9 +209,11 @@ static int parse_v1(cJSON *root, sim_normalized_config_t *cfg) {
 static void parse_medium_object(cJSON *medium, sim_normalized_config_t *cfg) {
     if (!cJSON_IsObject(medium)) return;
     cJSON *mtype = cJSON_GetObjectItemCaseSensitive(medium, "type");
-    if (cJSON_IsString(mtype) && mtype->valuestring &&
-        strcmp(mtype->valuestring, "udgm") == 0) {
-        cfg->medium_type = 1;  /* RADIO_MEDIUM_UDGM */
+    if (cJSON_IsString(mtype) && mtype->valuestring) {
+        snprintf(cfg->medium_name, sizeof(cfg->medium_name), "%s",
+                 mtype->valuestring);
+        if (strcmp(mtype->valuestring, "udgm") == 0)
+            cfg->medium_type = 1;  /* RADIO_MEDIUM_UDGM */
     }
 
     cJSON *val;

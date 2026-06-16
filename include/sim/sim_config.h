@@ -104,8 +104,11 @@ typedef struct {
     int  node_count;
     sim_node_config_t nodes[MAX_SIM_NODES];
 
-    /* Radio medium (0=NONE, 1=UDGM) */
+    /* Radio medium (0=NONE, 1=UDGM).  medium_name is the config "type" string
+     * verbatim (Phase 11) — built-ins resolve via medium_type, a custom name
+     * (a registered/plugin medium) resolves through the registry post-load. */
     int    medium_type;
+    char   medium_name[32];
     double tx_range;             /* default 50.0 */
     double interference_range;   /* default 100.0 */
     double success_ratio_tx;     /* default 1.0 */

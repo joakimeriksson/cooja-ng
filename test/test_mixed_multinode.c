@@ -1605,6 +1605,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * before the first registry lookup in the mote-store pre-bind loop. */
     csim_register_builtin_platforms(&g_registry);
     csim_register_builtin_mote_types(&g_registry);
+    csim_register_builtin_media(&g_registry);   /* "udgm", "none" (Phase 11) */
     /* M48: the service catalog (name -> ops).  The built-in library services
      * ship as exported ops; the two serial-socket services are file-local to
      * the runner, so register them on top.  Populated here but unread until

@@ -58,3 +58,42 @@ const sim_service_ops_t *sim_registry_find_service(const sim_registry_t *r,
     }
     return NULL;
 }
+
+/* --- Radio-medium catalog (Phase 11), mirroring the service catalog. --- */
+
+int sim_registry_register_radio_medium(sim_registry_t *r,
+                                       const sim_medium_type_t *m) {
+    if (!r || !m || !m->name)
+        return -1;
+    if (sim_registry_find_radio_medium(r, m->name))
+        return -1;
+    if (r->media_count >= SIM_REGISTRY_MAX_MEDIA)
+        return -1;
+    int idx = r->media_count++;
+    r->media[idx] = m;
+    return idx;
+}
+
+const sim_medium_type_t *sim_registry_find_radio_medium(const sim_registry_t *r,
+                                                        const char *name) {
+    if (!r || !name)
+        return NULL;
+    for (int i = 0; i < r->media_count; i++) {
+        const sim_medium_type_t *m = r->media[i];
+        if (m && m->name && strcmp(m->name, name) == 0)
+            return m;
+    }
+    return NULL;
+}
+
+/* The built-in media: UDGM (the full filter pipeline) + NONE (the all-to-all
+ * bypass).  Their ops are radio_medium.c's csim_udgm_ops / csim_none_ops. */
+void csim_register_builtin_media(sim_registry_t *r) {
+    if (!r) return;
+    static const sim_medium_type_t udgm = {
+        .name = "udgm", .pipeline = RADIO_MEDIUM_UDGM, .ops = &csim_udgm_ops };
+    static const sim_medium_type_t none = {
+        .name = "none", .pipeline = RADIO_MEDIUM_NONE, .ops = &csim_none_ops };
+    sim_registry_register_radio_medium(r, &udgm);
+    sim_registry_register_radio_medium(r, &none);
+}
