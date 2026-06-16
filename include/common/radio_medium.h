@@ -195,6 +195,16 @@ struct sim_medium_ops {
 extern const sim_medium_ops_t csim_udgm_ops;
 extern const sim_medium_ops_t csim_none_ops;
 
+/* A named, registrable radio medium (Phase 11): a name → policy ops, plus
+ * which generic pipeline it runs (UDGM = the full filter machinery with custom
+ * policy; NONE = the all-to-all bypass).  Lives here (not the host registry
+ * header) so a plugin can construct one.  The registry stores these by name. */
+typedef struct sim_medium_type {
+    const char             *name;
+    radio_medium_type_t     pipeline;
+    const sim_medium_ops_t *ops;
+} sim_medium_type_t;
+
 /* --- Initialization --- */
 
 /* Initialize radio medium (defaults to NONE type) */
@@ -286,5 +296,22 @@ void radio_medium_compute_neighbors(radio_medium_t *rm);
  * Returns -50 dBm when radio medium is NONE (backward compatible).
  */
 int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver);
+
+/* --- Accessors for a plugin medium policy (Phase 11) ---
+ *
+ * A medium `ops` implementation (especially in a .so plugin) reads node state
+ * and fills the neighbor lists through these, so it never names radio_medium_t
+ * internals (the plugin stop condition). */
+
+int  radio_medium_node_count(const radio_medium_t *rm);
+void radio_medium_node_pos(const radio_medium_t *rm, int node,
+                           double *x, double *y);
+void radio_medium_udgm_params(const radio_medium_t *rm, udgm_config_t *out);
+
+/* compute_neighbors helpers: clear a node's lists, then append TX-range
+ * neighbors / interference-range neighbors.  Bounds-checked host-side. */
+void radio_medium_clear_neighbors(radio_medium_t *rm, int node);
+void radio_medium_add_neighbor(radio_medium_t *rm, int node, int neighbor);
+void radio_medium_add_interferer(radio_medium_t *rm, int node, int neighbor);
 
 #endif /* RADIO_MEDIUM_H */

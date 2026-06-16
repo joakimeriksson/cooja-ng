@@ -35,20 +35,33 @@
 extern "C" {
 #endif
 
-#define CSIM_PLUGIN_API_VERSION 1u
+/* ABI version.  GROWS additively: new fields are APPENDED to the end of the
+ * vtable structs and the version is bumped.  A plugin checks
+ * `api->version >= <the version it needs>` (NOT exact equality), so a newer
+ * host always satisfies an older plugin; a v1 plugin keeps working on a v2
+ * host because it never reads past the field it knows.
+ *   v1: register_service.
+ *   v2: + register_radio_medium (Phase 11). */
+#define CSIM_PLUGIN_API_VERSION 2u
 
 /* Opaque to the plugin — it only passes the pointer back into the registry
  * vtable, never dereferences it. */
 typedef struct sim_registry sim_registry_t;
+/* A registrable radio medium — defined in radio_medium.h (a plugin medium
+ * includes it).  Opaque here (only used as a pointer in the vtable). */
+typedef struct sim_medium_type sim_medium_type_t;
 
-/* Registry capability handed to the plugin.  v1 = service registration only.
- * register_radio_medium / register_platform / register_mote_type are
- * deliberately absent in v1 (see the file header). */
+/* Registry capability handed to the plugin.  Fields are append-only (see the
+ * version contract above).  register_platform / register_mote_type remain
+ * absent (their descriptor catalogs don't exist yet — §5/§6). */
 typedef struct csim_registry_ops {
     /* Register a service into the host registry's catalog.  Returns the slot
      * index >= 0, or < 0 on a duplicate name or a full table.  The host
      * attaches newly-registered services after the plugin-load loop. */
     int (*register_service)(sim_registry_t *reg, const sim_service_ops_t *ops);
+    /* v2 (gate on api->version >= 2): register a radio-medium policy, selectable
+     * by config medium.type = its name.  Returns the slot index >= 0, or < 0. */
+    int (*register_radio_medium)(sim_registry_t *reg, const sim_medium_type_t *m);
 } csim_registry_ops_t;
 
 /* Optional host-routed logging — one printf-like function.  Keeps plugin

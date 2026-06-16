@@ -87,7 +87,9 @@ static const sim_service_ops_t sink_ops = {
 };
 
 int csim_plugin_init(const csim_api_t *api) {
-    if (!api || api->version != CSIM_PLUGIN_API_VERSION)
+    /* Additive-ABI contract: accept any host at or above the version this
+     * plugin needs (v1 — it only uses register_service). */
+    if (!api || api->version < 1u)
         return -1;
     if (!api->registry || !api->registry->register_service)
         return -1;

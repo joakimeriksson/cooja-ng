@@ -561,3 +561,44 @@ bool radio_medium_filter_byte_radio(radio_medium_t *rm,
 bool radio_medium_filter_byte(radio_medium_t *rm, int sender, int receiver, uint8_t byte) {
     return radio_medium_filter_byte_radio(rm, sender, 0, receiver, 0, byte);
 }
+
+/* --- Accessors for a plugin medium policy (Phase 11) --- */
+
+int radio_medium_node_count(const radio_medium_t *rm) {
+    return rm ? rm->node_count : 0;
+}
+
+void radio_medium_node_pos(const radio_medium_t *rm, int node,
+                           double *x, double *y) {
+    if (!rm || node < 0 || node >= RADIO_MEDIUM_MAX_NODES) {
+        if (x) *x = 0.0;
+        if (y) *y = 0.0;
+        return;
+    }
+    if (x) *x = rm->nodes[node].x;
+    if (y) *y = rm->nodes[node].y;
+}
+
+void radio_medium_udgm_params(const radio_medium_t *rm, udgm_config_t *out) {
+    if (out && rm) *out = rm->udgm;
+}
+
+void radio_medium_clear_neighbors(radio_medium_t *rm, int node) {
+    if (!rm || node < 0 || node >= RADIO_MEDIUM_MAX_NODES) return;
+    rm->neighbors[node].count = 0;
+    rm->interference_neighbors[node].count = 0;
+}
+
+void radio_medium_add_neighbor(radio_medium_t *rm, int node, int neighbor) {
+    if (!rm || node < 0 || node >= RADIO_MEDIUM_MAX_NODES) return;
+    neighbor_list_t *nl = &rm->neighbors[node];
+    if (nl->count < RADIO_MEDIUM_MAX_NODES)
+        nl->neighbors[nl->count++] = neighbor;
+}
+
+void radio_medium_add_interferer(radio_medium_t *rm, int node, int neighbor) {
+    if (!rm || node < 0 || node >= RADIO_MEDIUM_MAX_NODES) return;
+    neighbor_list_t *nl = &rm->interference_neighbors[node];
+    if (nl->count < RADIO_MEDIUM_MAX_NODES)
+        nl->neighbors[nl->count++] = neighbor;
+}

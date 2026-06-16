@@ -30,7 +30,8 @@ static const csim_log_ops_t g_log_ops = {
 /* The registry capability is the real catalog-append, called with the
  * registry the host hands the plugin via api->reg. */
 static const csim_registry_ops_t g_registry_ops = {
-    .register_service = sim_registry_register_service,
+    .register_service      = sim_registry_register_service,
+    .register_radio_medium = sim_registry_register_radio_medium,
 };
 
 int sim_plugin_load(const char *path, sim_registry_t *reg,
