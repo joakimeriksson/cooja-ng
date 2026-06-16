@@ -48,11 +48,13 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
 
 ```sh
-# Dynamic plugins (Phase 9) — dlopen a .so that registers a service
-make plugins                                    # builds build/plugins/packet_sink.so
+# Dynamic plugins (Phase 9) — dlopen a .so that registers a service or medium
+make plugins                                    # builds packet_sink.so + lossy_medium.so
 ./build/test_runner test configs/test-rpl-udp-sky.json --plugin build/plugins/packet_sink.so
 ./build/test_runner test configs/plugin-demo-sky-v2.json   # config v2 "plugins": [...]
-tools/check-plugin.sh                           # plugin smoke check (tally + missing-.so)
+# Pluggable radio medium (Phase 11) — config medium.type names a plugin medium
+./build/test_runner test configs/medium-plugin-sky-v2.json # "medium": {"type": "lossy"}
+tools/check-plugin.sh                           # plugin smoke check (service + medium)
 ```
 
 ## Project Structure
@@ -82,7 +84,7 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_runtime.c` | `sim_runtime_t` container: now_ns, unified event queue, radio medium, mote slots + generations, observer fan-out, `sim_runtime_run_until()` event pump |
 | `sim_radio_bus.c` | Full RF delivery path (Phase 5): per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer, emulated RX core (deliver/queue/drain), frame-complete policy (air-time + collision windows, RXFIFO backpressure, dual 192 µs auto-ACK windows), native/JS frame path, channel push/pull, channel-busy query, bus-owned RX/frame stats |
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
-| `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, and services; `csim_register_builtin_{platforms,mote_types,services}` populate it by *reference* to the existing tables; board/kind accessors forward to the existing bodies, services resolve by name via the owned name→ops catalog |
+| `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, services, and radio media; `csim_register_builtin_{platforms,mote_types,services,media}` populate it; services + media (Phase 11: "udgm"/"none" + plugins) resolve by name via owned name→ops catalogs |
 | `sim_plugin.c` | Dynamic plugin loader (Phase 9): `sim_plugin_load` dlopens a `.so` (RTLD_NOW\|RTLD_LOCAL), resolves `csim_plugin_init`, and hands it a `csim_api_t` (the v1 ABI = `register_service` only) so external plugins register a service. The example is `plugins/packet_sink.c`. ABI in `include/sim/csim_plugin.h` |
 | `sim_config.c` | JSON config loader (Phase 7): `sim_config_load` dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
 | `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |

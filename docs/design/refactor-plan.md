@@ -1749,16 +1749,29 @@ tests), not by diff.
 
 ### 3.24 Pluggable-radio-medium milestones (canonical Phase 11 task list)
 
-> **Status: in progress (M68–M72).** Phase 11 makes the radio medium's
-> **policy** pluggable (Cooja-style swappable `RadioMedium`).  Today the medium
-> is a concrete `radio_medium_t` selected by a 2-value enum
-> (`RADIO_MEDIUM_NONE`/`UDGM`); this phase turns the built-ins into registered
-> implementations and lets an external `.so` register a custom medium selected
-> by config `medium.type: "<name>"`, reusing the Phase-8 registry + the Phase-9
-> plugin loader.  Numbering continues from Phase 9 (M68–M72).  Perf is a
-> non-issue: the medium is ~0% of runtime per the Phase-Timing breakdown, and
-> the indirect call lands on the already-rare per-frame decision, not the
-> per-byte hot path.
+> **Status: complete (M68–M73).** Phase 11 made the radio medium's **policy**
+> pluggable (Cooja-style swappable `RadioMedium`): the built-in UDGM/NONE are
+> registered implementations of a 3-function vtable, and an external `.so` can
+> register a custom medium selected by config `medium.type: "<name>"`, reusing
+> the Phase-8 registry + the Phase-9 plugin loader.  Numbering continued from
+> Phase 9 (M68–M73; M71 split into M71 ABI/accessors + M72 example/binding).
+> Landed: M68 `736fc84` (this §3.24 doc); M69 `95598ff` (the policy vtable over
+> UDGM/NONE, `common/` only, byte-identical — the 235 radio-medium + 120
+> radio-bus suites the detector); M70 `956f337` (registry
+> `register_radio_medium` + `csim_register_builtin_media` + config name
+> capture); M71 `b401e42` (plugin ABI v2 — `register_radio_medium` appended,
+> macro→2u, additive contract, packet_sink `<1u` fix; the medium accessors);
+> M72 `24be458` (the example `plugins/lossy_medium.c` + the deferred
+> post-plugin medium binding + `-rdynamic`/`__attribute__((used))` so a plugin
+> resolves the host accessors); M73 (this commit — close-out).  The built-in
+> path stayed byte-identical throughout; the lossy medium is demonstrably
+> different (2763 vs UDGM's 1413 RF bytes in the same 2-node setup) and
+> deterministic.  **Phase 11 COMPLETE.**  Perf was a non-issue (the medium is
+> ~0% of runtime; the indirect call lands on the rare per-frame decision).
+> The one realized limitation: a plugin medium's *reach* is still capped by
+> `tx_range` (the preamble distance gate in `filter_byte_radio` is not
+> pluggable) — it can change in-range loss/RSSI/topology but not extend range;
+> a fully-pluggable reach (or additive-SINR) is a future phase.
 
 The architectural finding the phase rests on — the medium splits into
 **generic bookkeeping (stays)** vs **pluggable policy (3 seams)**:
@@ -3067,12 +3080,16 @@ the same patch.
   uses `RTLD_NOW|RTLD_LOCAL`, no `-rdynamic`/`-ldl` (the plugin reaches the
   host only through the passed vtable).  The example is a packet-sink service
   (prints a frame tally once at SIM_STOP).  This is the final phase.
-- **Phase 11 task list is §3.24 (M68–M72).** Make the radio medium's *policy*
+- **Phase 11 is complete (§3.24, M68–M73).** The radio medium's *policy* is
   pluggable: a 3-function `sim_medium_ops_t` (reception_prob / get_rssi /
-  compute_neighbors) over the generic medium bookkeeping; UDGM/NONE become
-  registered implementations; `register_radio_medium` (deferred at Phase 9)
-  lands in the registry + the plugin ABI v2 (additive — append the field, bump
-  the macro, plugin checks `version >= MIN`).  **`reception_prob` returns a
+  compute_neighbors) over the generic medium bookkeeping; UDGM/NONE are
+  registered implementations; `register_radio_medium` (deferred at Phase 9) is
+  in the registry + the plugin ABI v2 (additive — appended field, macro→2u,
+  plugin checks `version >= MIN`).  Example: `plugins/lossy_medium.c`.  A
+  plugin medium that uses host accessors needs `-rdynamic` +
+  `__attribute__((used))` (the accessors have no host caller, so LTO would
+  strip them).  A plugin medium's reach stays capped by `tx_range` (the
+  preamble gate isn't pluggable) — a future-phase item.  **`reception_prob` returns a
   probability, not a bool** — the generic code keeps the dice roll so the RNG
   sequence stays byte-identical; **NONE keeps its bypass** (never routed through
   ops).  No interference/SINR op (a medium shapes interference via its neighbor
