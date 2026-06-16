@@ -464,7 +464,8 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
         cfg->mote_type_count = ti;
     }
 
-    /* Plugins list (captured; inert in Phase 7, consumed by Phase 8) */
+    /* Plugins list (captured in Phase 7; consumed by Phase 9 — .so paths are
+     * dlopen'd, "builtin:NAME" entries name a built-in service). */
     cJSON *plugins = cJSON_GetObjectItemCaseSensitive(root, "plugins");
     if (cJSON_IsArray(plugins)) {
         int pi = 0;
@@ -472,8 +473,16 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
         cJSON_ArrayForEach(p, plugins) {
             if (pi >= 16) break;
             if (cJSON_IsString(p) && p->valuestring) {
-                snprintf(cfg->plugins[pi], sizeof(cfg->plugins[pi]), "%s",
-                         p->valuestring);
+                int n = snprintf(cfg->plugins[pi], sizeof(cfg->plugins[pi]),
+                                 "%s", p->valuestring);
+                if (n < 0 || n >= (int)sizeof(cfg->plugins[pi])) {
+                    /* Refuse a truncated path rather than dlopen the wrong
+                     * file — blank the entry so the consumer skips it. */
+                    fprintf(stderr, "config: plugin entry too long (>%d), "
+                            "ignored: %s\n",
+                            (int)sizeof(cfg->plugins[pi]) - 1, p->valuestring);
+                    cfg->plugins[pi][0] = '\0';
+                }
                 pi++;
             }
         }

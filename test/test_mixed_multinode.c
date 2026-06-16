@@ -2117,17 +2117,40 @@ sim_restart:
                        sim_registry_find_service(&g_registry, "progress"),
                        &progress_svc);
 
-    /* M65: load any --plugin .so's (after the built-in services, so plugins
-     * observe last).  Register-then-attach: record the catalog size, load each
-     * plugin (which registers its services), then attach the newly-registered
-     * services.  When no plugin is given this whole block is a no-op, so the
-     * default path stays byte-identical. */
-    if (plugin_path_count > 0) {
+    /* M65/M66: load plugins from --plugin (CLI) and config v2 plugins[] (after
+     * the built-in services, so plugins observe last).  Register-then-attach:
+     * record the catalog size, load each plugin (which registers its services),
+     * then attach the newly-registered services.  When no plugin is given this
+     * whole block is a no-op, so the default path stays byte-identical. */
+    {
         int svc_before = g_registry.service_count;
+        /* CLI --plugin paths (always .so paths). */
         for (int p = 0; p < plugin_path_count; p++) {
             char err[256] = {0};
             if (sim_plugin_load(plugin_paths[p], &g_registry, err, sizeof(err)) < 0)
                 fprintf(stderr, "plugin: %s: %s\n", plugin_paths[p], err);
+        }
+        /* Config v2 plugins[]: a "/"-bearing or ".so"-suffixed entry is a path
+         * to dlopen; otherwise it names a built-in service ("builtin:NAME" or
+         * "NAME") — validate it exists (attaching built-ins by name is the
+         * runner's existing flag-driven job, not the plugin path). */
+        for (int p = 0; config_loaded && p < config.plugin_count; p++) {
+            const char *entry = config.plugins[p];
+            if (!entry[0]) continue;  /* truncated entry (parser blanked it) */
+            size_t len = strlen(entry);
+            int is_path = strchr(entry, '/') != NULL ||
+                          (len > 3 && strcmp(entry + len - 3, ".so") == 0);
+            if (is_path) {
+                char err[256] = {0};
+                if (sim_plugin_load(entry, &g_registry, err, sizeof(err)) < 0)
+                    fprintf(stderr, "plugin: %s: %s\n", entry, err);
+            } else {
+                const char *name = strncmp(entry, "builtin:", 8) == 0
+                                       ? entry + 8 : entry;
+                if (!sim_registry_find_service(&g_registry, name))
+                    fprintf(stderr, "plugin: unknown builtin service '%s'\n",
+                            name);
+            }
         }
         for (int s = svc_before; s < g_registry.service_count; s++) {
             const sim_service_ops_t *ops = g_registry.services[s];
