@@ -198,9 +198,31 @@ static void track_byte(radio_medium_t *rm, int sender, int sender_radio, uint8_t
 
 /* --- Public API: init / configure --- */
 
+/* Built-in media (Phase 11).  The udgm ops point at the existing function
+ * bodies → byte-identical.  csim_none_ops shares the UDGM neighbor body (for
+ * NONE it runs with zero udgm params and leaves the lists empty, as before);
+ * its reception_prob/get_rssi are never dispatched (the NONE early-returns
+ * handle them). */
+static int8_t udgm_get_rssi(const radio_medium_t *rm, int sender, int receiver);
+static void   udgm_compute_neighbors(radio_medium_t *rm);
+
+const sim_medium_ops_t csim_udgm_ops = {
+    .name              = "udgm",
+    .reception_prob    = udgm_reception_prob,
+    .get_rssi          = udgm_get_rssi,
+    .compute_neighbors = udgm_compute_neighbors,
+};
+const sim_medium_ops_t csim_none_ops = {
+    .name              = "none",
+    .reception_prob    = NULL,   /* NONE bypass: never dispatched */
+    .get_rssi          = NULL,   /* NONE bypass: never dispatched */
+    .compute_neighbors = udgm_compute_neighbors,
+};
+
 void radio_medium_init(radio_medium_t *rm, int node_count) {
     memset(rm, 0, sizeof(*rm));
     rm->type = RADIO_MEDIUM_NONE;
+    rm->ops = &csim_none_ops;
     rm->node_count = node_count;
     rm->rng_state = 0x12345678;  /* default seed */
     rm->next_frame_id = 0;
@@ -221,6 +243,7 @@ void radio_medium_configure_udgm(radio_medium_t *rm, double tx_range,
     double interference_range, double success_ratio_tx, double success_ratio_rx)
 {
     rm->type = RADIO_MEDIUM_UDGM;
+    rm->ops = &csim_udgm_ops;
     rm->udgm.tx_range = tx_range;
     rm->udgm.interference_range = interference_range;
     rm->udgm.success_ratio_tx = success_ratio_tx;
@@ -297,7 +320,10 @@ void radio_medium_set_channel(radio_medium_t *rm, int node, int channel) {
 
 /* --- Compute neighbors --- */
 
-void radio_medium_compute_neighbors(radio_medium_t *rm) {
+/* The UDGM neighbor policy (Phase 11: the csim_udgm_ops.compute_neighbors
+ * target; also csim_none_ops's — for NONE this runs with zero udgm params and
+ * leaves all lists empty, exactly the prior behavior). */
+static void udgm_compute_neighbors(radio_medium_t *rm) {
     double tx_range_sq = rm->udgm.tx_range * rm->udgm.tx_range;
     double int_range_sq = rm->udgm.interference_range * rm->udgm.interference_range;
     for (int i = 0; i < rm->node_count; i++) {
@@ -317,6 +343,11 @@ void radio_medium_compute_neighbors(radio_medium_t *rm) {
             }
         }
     }
+}
+
+void radio_medium_compute_neighbors(radio_medium_t *rm) {
+    if (rm->ops && rm->ops->compute_neighbors)
+        rm->ops->compute_neighbors(rm);
 }
 
 /* --- Per-radio match: spectrum + channel + rx_enabled --- */
@@ -438,8 +469,10 @@ bool radio_medium_filter_frame_radio(radio_medium_t *rm,
     if (!radio_pair_match(rm, sender, sender_radio, receiver, receiver_radio))
         return false;
 
-    /* Distance-based probabilistic check */
-    double prob = udgm_reception_prob(rm, sender, receiver);
+    /* Per-frame reception-probability policy (Phase 11: via the medium ops;
+     * the dice roll + the no-draw short-circuits stay here so the RNG sequence
+     * is identical across media). */
+    double prob = rm->ops->reception_prob(rm, sender, receiver);
     if (prob <= 0.0)
         return false;
     if (prob >= 1.0)
@@ -453,10 +486,10 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
 
 /* --- RSSI --- */
 
-int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver) {
-    if (rm->type == RADIO_MEDIUM_NONE)
-        return -50;
-
+/* The UDGM RSSI policy (Phase 11: the csim_udgm_ops.get_rssi target).  The
+ * NONE -50 case is handled by radio_medium_get_rssi's early-return, so this is
+ * never called for NONE. */
+static int8_t udgm_get_rssi(const radio_medium_t *rm, int sender, int receiver) {
     double dx = rm->nodes[sender].x - rm->nodes[receiver].x;
     double dy = rm->nodes[sender].y - rm->nodes[receiver].y;
     double dist = sqrt(dx * dx + dy * dy);
@@ -473,6 +506,12 @@ int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver)
     if (rssi < -128.0) rssi = -128.0;
     if (rssi > 0.0) rssi = 0.0;
     return (int8_t)rssi;
+}
+
+int8_t radio_medium_get_rssi(const radio_medium_t *rm, int sender, int receiver) {
+    if (rm->type == RADIO_MEDIUM_NONE)
+        return -50;
+    return rm->ops->get_rssi(rm, sender, receiver);
 }
 
 /* --- Byte-level filter --- */
@@ -500,8 +539,9 @@ bool radio_medium_filter_byte_radio(radio_medium_t *rm,
     /* If we're inside a tracked frame, use cached per-frame decision */
     if (ft->frame_id > 0 && dec->frame_id == ft->frame_id) {
         if (!dec->decided) {
-            /* First byte of this frame for this receiver — roll the dice */
-            double prob = udgm_reception_prob(rm, sender, receiver);
+            /* First byte of this frame for this receiver — roll the dice
+             * (the prob comes from the medium policy; the roll stays here). */
+            double prob = rm->ops->reception_prob(rm, sender, receiver);
             double roll = rng_next(rm);
             dec->drop = (roll >= prob);
             dec->decided = true;

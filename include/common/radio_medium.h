@@ -153,6 +153,10 @@ typedef struct {
     int count;
 } neighbor_list_t;
 
+/* The pluggable medium policy vtable (Phase 11 §3.24) — forward-declared here
+ * so radio_medium_t can hold a pointer; fully defined after the struct. */
+typedef struct sim_medium_ops sim_medium_ops_t;
+
 typedef struct {
     radio_medium_type_t type;
     udgm_config_t       udgm;
@@ -166,7 +170,30 @@ typedef struct {
     neighbor_list_t     interference_neighbors[RADIO_MEDIUM_MAX_NODES];
     uint32_t            next_frame_id;
     uint32_t            rng_state;
+    /* Policy vtable (Phase 11).  Set by radio_medium_init (= &csim_none_ops)
+     * and radio_medium_configure_udgm (= &csim_udgm_ops); a plugin medium
+     * installs its own.  Appended at the end so existing field offsets and
+     * the memset-zero init are unchanged. */
+    const sim_medium_ops_t *ops;
 } radio_medium_t;
+
+/* Pluggable medium policy (Phase 11 §3.24).  A medium overrides only the
+ * policy — the generic frame tracking / spectrum+channel matching / RNG dice
+ * roll / neighbor-list bookkeeping stay in radio_medium.c.  `reception_prob`
+ * returns a clamped [0,1] and MUST NOT call the RNG (the generic code owns the
+ * roll, so the draw sequence stays identical across media). */
+struct sim_medium_ops {
+    const char *name;
+    double (*reception_prob)(const radio_medium_t *rm, int sender, int receiver);
+    int8_t (*get_rssi)(const radio_medium_t *rm, int sender, int receiver);
+    void   (*compute_neighbors)(radio_medium_t *rm);
+};
+
+/* Built-in media (radio_medium.c).  csim_udgm_ops points at the existing UDGM
+ * function bodies; csim_none_ops is the all-to-all bypass (reception_prob /
+ * get_rssi are never dispatched — the NONE early-returns handle them). */
+extern const sim_medium_ops_t csim_udgm_ops;
+extern const sim_medium_ops_t csim_none_ops;
 
 /* --- Initialization --- */
 
