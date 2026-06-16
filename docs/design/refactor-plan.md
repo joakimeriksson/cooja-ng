@@ -1649,6 +1649,89 @@ a 4-node chain to exercise every diagnostic print site; confirm the global
 RF-stat line prints exactly once.  Closing check: `grep` for chip includes +
 `plat.(msp|arm)` + `NODE_(MSP430|ARM)` in the runner returns nothing.
 
+### 3.23 Dynamic-plugin-ABI milestones (canonical Phase 9 task list)
+
+> **Status: in progress (M63–M67).** Phase 9 (§9 / §7.2) is the last phase:
+> it adds **optional external plugin loading** via `dlopen`, the payoff of the
+> static registry.  A plugin is a `.so` exporting one symbol,
+> `csim_plugin_init(const csim_api_t *)`; the host loads it, hands it a
+> `csim_api_t` (a bundle of host capabilities), and the plugin registers a
+> service through it.  The example is a **packet sink** — an observer service
+> that tallies frames and prints once at sim-stop.  Numbering continues from
+> Phase 10 (M63–M67; Phase 9 is done *after* the Phase-10 shrink, since a
+> cleaner runtime surface de-risked the ABI).  Prereqs (all met): the static
+> registry is stable (Phase 8); config v2 already parses a `plugins[]` array
+> (inert since Phase 7); the runtime exposes no internal structs as required
+> plugin API.
+> Stop condition (§9 Phase 9): if the plugin API needs many internal fields,
+> stop and add explicit runtime functions instead of exporting structs.
+
+Scope decision locked — **v1 ABI is services-only**:
+
+- The §4.4 sketch's four-function `sim_registry_ops_t` (register_mote_type /
+  register_platform / register_radio_medium / register_service) references
+  descriptor types that **do not exist in the tree** (no medium-ops or
+  platform-ops vtable — `radio_medium_t` is one concrete struct chosen by a
+  2-value enum; §5/§6 work).  Implementing the other three registrations would
+  force exporting internal structs — a direct stop-condition violation.  **v1
+  ships `register_service` only**; the other three are documented deferrals
+  (version-gated future additions once §5 lands real descriptor catalogs).
+  This also fixes the example on a **packet-sink service** (reuses the Phase-6
+  host + the Phase-8 `register_service`), not a radio medium.
+
+Design decisions locked for this phase:
+
+- **The ABI (`include/sim/csim_plugin.h`)**: `CSIM_PLUGIN_API_VERSION 1u`;
+  `csim_api_t { uint32_t version; const csim_registry_ops_t *registry; const
+  csim_log_ops_t *log; sim_registry_t *reg; }`; `csim_registry_ops_t {
+  int (*register_service)(sim_registry_t *, const sim_service_ops_t *); }`;
+  `int csim_plugin_init(const csim_api_t *)`.  The header is self-contained
+  (pulls `sim_service.h` + `sim_observer.h`).  Growing the struct later is
+  ABI-safe only if version-gated (the plugin checks `api->version`); bump the
+  version when it grows.
+- **Reuse `sim_service_ops_t`** as the registered interface — a name + four
+  function pointers, no internal-state field, so it is "functions," not an
+  internal struct (stop-condition compliant).
+- **Register-only, runner attaches.**  `register_service` only appends to the
+  catalog (no `sim_runtime_t` dependency).  The runner records
+  `n0 = service_count` before the plugin-load loop, loads each plugin (which
+  bumps `service_count`), then attaches `services[n0..service_count)` via
+  `sim_service_attach`, honoring the `attach<0` error policy.  The loop sits
+  **after the last built-in attach** so plugins observe last and the no-plugin
+  path is a literal no-op (→ byte-identical).
+- **Loader = `src/sim/sim_plugin.c`**: `dlopen(path, RTLD_NOW|RTLD_LOCAL)` (not
+  `RTLD_DEEPBIND` — the plugin reaches the host only through the passed
+  `csim_api`, never by dlsym-ing host symbols), `dlsym("csim_plugin_init")`,
+  version check, build the api (`register_service` points straight at
+  `sim_registry_register_service`, `reg = &g_registry`), call, error-report.
+  **No new host link flags** — dlopen already works (native motes prove it: no
+  `-ldl`, no `-rdynamic`).
+- **Determinism**: the packet sink prints once at `SIM_OBS_SIM_STOP`, never
+  per-frame.  **Build**: `plugins/packet_sink.c` →
+  `build/plugins/packet_sink.so` via `-shared -fPIC -O2` (no `-flto`);
+  `test_runner` does not depend on the `.so`.
+- **Plugin sources**: `--plugin <path>` (CLI) + config v2 `plugins[]` (path
+  vs `builtin:NAME` discriminator; the 48-byte field truncates long paths —
+  detect + error).
+
+Milestones (one commit each, full validation gate before each):
+
+63. Docs: this §3.23 (mirrors §3.18–§3.22); §9 Phase 9 points here.
+64. ABI header (`csim_plugin.h`) + host loader (`sim_plugin.c`), dormant (no
+    caller) — byte-identical for all configs.
+65. `--plugin <path>` CLI + the post-attach load+attach loop + the example
+    packet-sink `.so` + the Makefile rule/`plugins` target + a load test (tally
+    at SIM_STOP; missing `.so` degrades cleanly).
+66. Config-v2 `plugins[]` consumption (path-vs-builtin discriminator +
+    truncation guard) + an example v2 config + a test.
+67. Close-out (docs only): §3.23 status, §9 Phase 9 done, Decisions Log,
+    CLAUDE.md — the refactor is complete (Phases 1–10).
+
+Validation gate per milestone: §3.22's gate plus the **no-plugin cross-build
+empty-diff** (the load loop is a no-op without a plugin, so existing behavior
+stays byte-identical); the plugin path is validated functionally (the new
+tests), not by diff.
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -2509,6 +2592,13 @@ Stop condition:
 
 ### Phase 9 - Dynamic plugin ABI
 
+The canonical task list is **§3.23 above (milestones M63–M67)**; land them in
+order, one commit per milestone.  The notes below summarize the scope; where
+they disagree with §3.23 (written later, against the post-Phase-10 code),
+§3.23 wins.  v1 ships `register_service` only (the example is a packet-sink
+service); platform/medium/mote-type registration is deferred per the stop
+condition.
+
 Goal: optional external plugin loading.
 
 Prerequisites:
@@ -2822,6 +2912,18 @@ the same patch.
   `js_node.h` stay (node-impl, not chip headers).  Global RF stat getters
   (`cc2420_get_rx_stats` etc.) stay single runner calls via neutral `extern`
   (process-global, not per-node).  Phase 9 (dlopen) follows.
+- **Phase 9 task list is §3.23 (M63–M67), done after Phase 10.** Optional
+  external plugin loading via `dlopen`: a plugin `.so` exports
+  `csim_plugin_init(const csim_api_t *)` and registers a service through the
+  passed `csim_api` vtable.  **v1 ABI is services-only** (`register_service`);
+  platform/medium/mote-type registration is DEFERRED (their descriptor
+  catalogs don't exist — §5/§6 work — and adding them would export internal
+  structs, the stop condition).  Reuses `sim_service_ops_t` (an interface, not
+  an internal state struct) + the clean value `sim_observer_event_t`; the
+  plugin never touches `sim_runtime_t`/`sim_registry_t` internals.  Loader
+  uses `RTLD_NOW|RTLD_LOCAL`, no `-rdynamic`/`-ldl` (the plugin reaches the
+  host only through the passed vtable).  The example is a packet-sink service
+  (prints a frame tally once at SIM_STOP).  This is the final phase.
 - **Terminology**: "service" for built-in components via `sim_service_ops_t`,
   "plugin" for dynamic-loaded services only (§2.1).
 - **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.
