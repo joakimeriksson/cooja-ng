@@ -1843,6 +1843,15 @@ sim_restart:
         }
     }
 
+    /* M72: a config naming a non-built-in medium ("lossy" etc.) is resolved
+     * after plugins load.  Until then it falls through to the default-UDGM
+     * setup below; suppress that default's banner so only the real medium is
+     * announced.  For built-in "udgm"/"none"/no-medium configs this flag is
+     * false → the path is byte-identical. */
+    bool custom_medium = config_loaded && config.medium_name[0] &&
+        strcmp(config.medium_name, "udgm") != 0 &&
+        strcmp(config.medium_name, "none") != 0;
+
     if (config_loaded && config.medium_type == 1) {
         radio_medium_configure_udgm(&radio_medium,
             config.tx_range, config.interference_range,
@@ -1862,7 +1871,7 @@ sim_restart:
             default_range, default_range * 2.0, 1.0, 1.0);
         radio_medium_compute_neighbors(&radio_medium);
     }
-    if (radio_medium.type == RADIO_MEDIUM_UDGM) {
+    if (radio_medium.type == RADIO_MEDIUM_UDGM && !custom_medium) {
         printf("Radio medium: UDGM (tx_range=%.1f m, interference=%.1f m, "
                "tx_ratio=%.2f, rx_ratio=%.2f)\n",
                radio_medium.udgm.tx_range, radio_medium.udgm.interference_range,
@@ -2158,6 +2167,36 @@ sim_restart:
             if (sim_service_attach(&sim_rt, ops, NULL) < 0)
                 fprintf(stderr, "plugin: failed to attach service '%s'\n",
                         ops && ops->name ? ops->name : "?");
+        }
+    }
+
+    /* M72: a config naming a non-built-in medium (custom_medium, computed
+     * above) is resolved here — after plugins load — by looking the name up in
+     * the registry and re-binding the medium to that policy.  The built-in
+     * path never enters this branch, so it stays byte-identical. */
+    if (custom_medium) {
+        const sim_medium_type_t *mt =
+            sim_registry_find_radio_medium(&g_registry, config.medium_name);
+        if (!mt) {
+            fprintf(stderr, "medium: unknown type '%s' (using default)\n",
+                    config.medium_name);
+        } else {
+            /* Run the named medium on the UDGM pipeline with its own policy.
+             * configure_udgm sets type+params (+ the built-in ops), then we
+             * override ops; positions + neighbors follow. */
+            radio_medium_configure_udgm(&radio_medium,
+                config.tx_range, config.interference_range,
+                config.success_ratio_tx, config.success_ratio_rx);
+            radio_medium.type = mt->pipeline;
+            radio_medium.ops  = mt->ops;
+            for (int i = 0; i < node_count; i++)
+                if (i < config.node_count && config.nodes[i].has_position)
+                    radio_medium_set_position(&radio_medium, i,
+                        config.nodes[i].x, config.nodes[i].y);
+            radio_medium_compute_neighbors(&radio_medium);
+            if (config.seed)
+                radio_medium_set_seed(&radio_medium, (uint32_t)config.seed);
+            printf("Radio medium: %s (plugin)\n", mt->name);
         }
     }
 

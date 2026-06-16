@@ -1,0 +1,24 @@
+{
+    "version": 2,
+    "title": "Medium-plugin demo: Sky + lossy radio-medium plugin (Phase 11)",
+    "timeout_ms": 60000,
+    "seed": 42,
+    "plugins": [
+        "build/plugins/lossy_medium.so"
+    ],
+    "medium": {
+        "type": "lossy",
+        "tx_range": 55.0,
+        "interference_range": 110.0,
+        "success_ratio_tx": 1.0,
+        "success_ratio_rx": 1.0
+    },
+    "mote_types": [
+        { "name": "sky-server", "kind": "emulated-elf", "cpu": "msp430", "soc": "msp430f1611", "board": "sky", "firmware": "firmware/sky/udp-server.sky" },
+        { "name": "sky-client", "kind": "emulated-elf", "cpu": "msp430", "soc": "msp430f1611", "board": "sky", "firmware": "firmware/sky/udp-client.sky" }
+    ],
+    "nodes": [
+        { "type": "sky-server", "id": 1, "x":  0.0, "y": 0.0 },
+        { "type": "sky-client", "id": 2, "x": 30.0, "y": 0.0 }
+    ]
+}

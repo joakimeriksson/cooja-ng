@@ -34,4 +34,15 @@ if [ "$rc" -ge 128 ]; then echo "FAIL: missing .so crashed (rc=$rc)"; exit 1; fi
 
 echo "PLUGIN OK: $t1"
 echo "PLUGIN OK: missing .so degraded cleanly (rc=$rc)"
+
+# --- Radio-medium plugin (Phase 11): the lossy medium selected by config v2 ---
+MED_SO=build/plugins/lossy_medium.so
+MED_CFG=configs/medium-plugin-sky-v2.json
+[ -f "$MED_SO" ] || { echo "FAIL: $MED_SO not built"; exit 1; }
+m1=$("$RUNNER" test "$MED_CFG" -t 30000 2>&1 | grep -E '^Radio medium:|^  Total RF bytes:')
+m2=$("$RUNNER" test "$MED_CFG" -t 30000 2>&1 | grep -E '^Radio medium:|^  Total RF bytes:')
+if ! echo "$m1" | grep -q 'Radio medium: lossy (plugin)'; then
+    echo "FAIL: lossy medium not selected"; echo " $m1"; exit 1; fi
+if [ "$m1" != "$m2" ]; then echo "FAIL: medium plugin not deterministic"; exit 1; fi
+echo "PLUGIN OK: medium plugin '$(echo "$m1" | head -1)' (deterministic)"
 exit 0

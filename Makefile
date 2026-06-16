@@ -1,6 +1,9 @@
 CC = cc
 CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -march=native -flto -MMD -MP
-LDFLAGS = -lm -lpthread -flto
+# -rdynamic exports the host's dynamic symbol table so a dlopen'd plugin can
+# resolve host library functions (e.g. the radio_medium accessors a medium
+# plugin uses).  Behavior-neutral (symbol visibility only).
+LDFLAGS = -lm -lpthread -flto -rdynamic
 
 # Auto-detect GNU Lightning
 LIGHTNING_CFLAGS := $(shell pkg-config --cflags lightning 2>/dev/null)
@@ -310,7 +313,7 @@ PLUGINS_BUILD_DIR = $(BUILD_DIR)/plugins
 $(PLUGINS_BUILD_DIR):
 	mkdir -p $(PLUGINS_BUILD_DIR)
 
-$(PLUGINS_BUILD_DIR)/packet_sink.so: plugins/packet_sink.c | $(PLUGINS_BUILD_DIR)
+$(PLUGINS_BUILD_DIR)/%.so: plugins/%.c | $(PLUGINS_BUILD_DIR)
 	$(CC) -shared -fPIC -O2 -std=c11 -I include/sim -I include/common $< -o $@
 
-plugins: $(PLUGINS_BUILD_DIR)/packet_sink.so
+plugins: $(PLUGINS_BUILD_DIR)/packet_sink.so $(PLUGINS_BUILD_DIR)/lossy_medium.so
