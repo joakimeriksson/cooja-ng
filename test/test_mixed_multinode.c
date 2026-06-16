@@ -41,6 +41,7 @@
 #include "sim_serial_bridge.h"
 #include "sim_external_command.h"
 #include "sim_radio_bus.h"
+#include "sim_plugin.h"
 #include "gdb_stub.h"
 #include "pcap_writer.h"
 #include "pcap_service.h"
@@ -1660,6 +1661,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int ui_port = 8080;
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
+    /* Optional plugin .so paths (--plugin PATH, repeatable) — Phase 9 M65 */
+    const char *plugin_paths[16];
+    int plugin_path_count = 0;
     sim_normalized_config_t config;
     int config_loaded = 0;
 
@@ -1699,6 +1703,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         }
         else if (strncmp(argv[i], "--pcap=", 7) == 0) {
             pcap_path = argv[i] + 7;
+        }
+        else if (strcmp(argv[i], "--plugin") == 0 && i + 1 < argc) {
+            if (plugin_path_count < (int)(sizeof(plugin_paths)/sizeof(plugin_paths[0])))
+                plugin_paths[plugin_path_count++] = argv[++i];
+            else { fprintf(stderr, "--plugin: too many plugins\n"); i++; }
         }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-q") == 0) verbose = 0;
@@ -2107,6 +2116,27 @@ sim_restart:
     sim_service_attach(&sim_rt,
                        sim_registry_find_service(&g_registry, "progress"),
                        &progress_svc);
+
+    /* M65: load any --plugin .so's (after the built-in services, so plugins
+     * observe last).  Register-then-attach: record the catalog size, load each
+     * plugin (which registers its services), then attach the newly-registered
+     * services.  When no plugin is given this whole block is a no-op, so the
+     * default path stays byte-identical. */
+    if (plugin_path_count > 0) {
+        int svc_before = g_registry.service_count;
+        for (int p = 0; p < plugin_path_count; p++) {
+            char err[256] = {0};
+            if (sim_plugin_load(plugin_paths[p], &g_registry, err, sizeof(err)) < 0)
+                fprintf(stderr, "plugin: %s: %s\n", plugin_paths[p], err);
+        }
+        for (int s = svc_before; s < g_registry.service_count; s++) {
+            const sim_service_ops_t *ops = g_registry.services[s];
+            if (sim_service_attach(&sim_rt, ops, NULL) < 0)
+                fprintf(stderr, "plugin: failed to attach service '%s'\n",
+                        ops && ops->name ? ops->name : "?");
+        }
+    }
+
     int64_t ui_interval_ns = 100LL * MS_TO_NS;  /* 100ms sim time between UI updates */
     int64_t next_ui_ns = sim_ns + ui_interval_ns;
 

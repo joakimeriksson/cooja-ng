@@ -66,7 +66,12 @@ typedef struct csim_api {
 
 /* The plugin's one exported symbol — dlsym()'d by the host loader.  The plugin
  * should check `api->version` and return < 0 if it is incompatible.  Return 0
- * on success; < 0 makes the host report the error and skip the plugin. */
+ * on success; < 0 makes the host report the error and skip the plugin.
+ *
+ * Lifetime: the `csim_api_t` *pointer* is valid only for the duration of this
+ * call — the host may pass a stack local.  To use the api later (e.g. from a
+ * service callback), copy the struct BY VALUE; the vtable pointers it holds
+ * (`registry`, `log`) and `reg` are stable for the process lifetime. */
 int csim_plugin_init(const csim_api_t *api);
 
 #ifdef __cplusplus

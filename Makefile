@@ -155,7 +155,7 @@ ifeq ($(CONTIKI_DIR),)
   CONTIKI_DIR = ../contiki-ng
 endif
 
-.PHONY: all clean test bench test-firmware test-arm cooja-tests chain-tests build-firmware configure
+.PHONY: all clean test bench test-firmware test-arm cooja-tests chain-tests build-firmware configure plugins
 
 all: $(BUILD_DIR)/test_runner
 
@@ -301,3 +301,16 @@ pgo:
 	$(CC) $(CFLAGS) -fprofile-instr-use=$(BUILD_DIR)/default.profdata \
 		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(LDFLAGS)
 	@echo "=== PGO build complete ==="
+
+# Phase 9: example plugin (.so).  Built on demand via `make plugins` — NOT a
+# prerequisite of test_runner, so `make` stays green without it.  Plain
+# -O2 -fPIC -shared (no -flto across the dlopen boundary); only
+# csim_plugin_init is exported.
+PLUGINS_BUILD_DIR = $(BUILD_DIR)/plugins
+$(PLUGINS_BUILD_DIR):
+	mkdir -p $(PLUGINS_BUILD_DIR)
+
+$(PLUGINS_BUILD_DIR)/packet_sink.so: plugins/packet_sink.c | $(PLUGINS_BUILD_DIR)
+	$(CC) -shared -fPIC -O2 -std=c11 -I include/sim -I include/common $< -o $@
+
+plugins: $(PLUGINS_BUILD_DIR)/packet_sink.so
