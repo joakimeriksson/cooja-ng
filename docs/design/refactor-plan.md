@@ -1651,20 +1651,35 @@ RF-stat line prints exactly once.  Closing check: `grep` for chip includes +
 
 ### 3.23 Dynamic-plugin-ABI milestones (canonical Phase 9 task list)
 
-> **Status: in progress (M63–M67).** Phase 9 (§9 / §7.2) is the last phase:
-> it adds **optional external plugin loading** via `dlopen`, the payoff of the
+> **Status: complete (M63–M67).** Phase 9 (§9 / §7.2) was the last phase:
+> it added **optional external plugin loading** via `dlopen`, the payoff of the
 > static registry.  A plugin is a `.so` exporting one symbol,
 > `csim_plugin_init(const csim_api_t *)`; the host loads it, hands it a
 > `csim_api_t` (a bundle of host capabilities), and the plugin registers a
 > service through it.  The example is a **packet sink** — an observer service
-> that tallies frames and prints once at sim-stop.  Numbering continues from
-> Phase 10 (M63–M67; Phase 9 is done *after* the Phase-10 shrink, since a
-> cleaner runtime surface de-risked the ABI).  Prereqs (all met): the static
-> registry is stable (Phase 8); config v2 already parses a `plugins[]` array
-> (inert since Phase 7); the runtime exposes no internal structs as required
-> plugin API.
-> Stop condition (§9 Phase 9): if the plugin API needs many internal fields,
-> stop and add explicit runtime functions instead of exporting structs.
+> that taps the kernel event stream and prints a tally once at teardown.
+> Numbering continued from Phase 10 (M63–M67; Phase 9 done *after* the
+> Phase-10 shrink, since a cleaner runtime surface de-risked the ABI).
+> Landed: M63 `ea130fb` (this §3.23 doc); M64 `b620037` (the ABI header
+> `csim_plugin.h` + the dormant host loader `sim_plugin.c` — dlopen
+> RTLD_NOW|RTLD_LOCAL, dlsym, version, error-report; no caller →
+> byte-identical); M65 `eef157b` (the `--plugin` CLI flag + the
+> register-then-attach load loop + the example `plugins/packet_sink.c` `.so` +
+> the Makefile `plugins` rule + `tools/check-plugin.sh`; no-plugin path
+> byte-identical); M66 `3b7bb74` (config v2 `plugins[]` consumption — path vs
+> `builtin:NAME` discriminator + the 48-byte truncation guard + an example v2
+> config); M67 (this commit — close-out).  All code milestones keep the
+> **no-plugin path byte-identical** (cross-build empty-diff); the plugin path
+> is validated functionally (a non-zero, deterministic tally; a missing `.so`
+> degrades cleanly).  **Phase 9 COMPLETE — the staged refactor (Phases 1–10)
+> is done.**
+> Stop condition honored (§9 Phase 9): the v1 ABI exposes only the `csim_api`
+> vtables, `sim_service_ops_t` (an interface), `sim_observer_event_t` (a value
+> struct), and `sim_runtime_t` (opaque); no plugin touches a kernel internal
+> field.  The found bug worth recording: the example first stored the
+> `csim_api*` pointer (a host stack local) and crashed at teardown — the ABI
+> contract is now "the api *pointer* is call-scoped; copy the struct by value;
+> its vtable sub-pointers are process-stable."
 
 Scope decision locked — **v1 ABI is services-only**:
 
@@ -2912,10 +2927,14 @@ the same patch.
   `js_node.h` stay (node-impl, not chip headers).  Global RF stat getters
   (`cc2420_get_rx_stats` etc.) stay single runner calls via neutral `extern`
   (process-global, not per-node).  Phase 9 (dlopen) follows.
-- **Phase 9 task list is §3.23 (M63–M67), done after Phase 10.** Optional
+- **Phase 9 is complete (§3.23, M63–M67), done after Phase 10.** Optional
   external plugin loading via `dlopen`: a plugin `.so` exports
   `csim_plugin_init(const csim_api_t *)` and registers a service through the
-  passed `csim_api` vtable.  **v1 ABI is services-only** (`register_service`);
+  passed `csim_api` vtable.  **The staged refactor (Phases 1–10) is done.**
+  ABI contract: the `csim_api*` is call-scoped (copy by value to retain); its
+  vtable sub-pointers are process-stable.  Loader uses `RTLD_NOW|RTLD_LOCAL`,
+  no `-rdynamic`/`-ldl`; the example `.so` builds `-shared -fPIC` (no LTO) and
+  is not a `make` prerequisite; the no-plugin path stays byte-identical.  **v1 ABI is services-only** (`register_service`);
   platform/medium/mote-type registration is DEFERRED (their descriptor
   catalogs don't exist — §5/§6 work — and adding them would export internal
   structs, the stop condition).  Reuses `sim_service_ops_t` (an interface, not

@@ -47,6 +47,14 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
 
+```sh
+# Dynamic plugins (Phase 9) — dlopen a .so that registers a service
+make plugins                                    # builds build/plugins/packet_sink.so
+./build/test_runner test configs/test-rpl-udp-sky.json --plugin build/plugins/packet_sink.so
+./build/test_runner test configs/plugin-demo-sky-v2.json   # config v2 "plugins": [...]
+tools/check-plugin.sh                           # plugin smoke check (tally + missing-.so)
+```
+
 ## Project Structure
 
 ```
@@ -60,7 +68,7 @@ src/
   native/             Native Cooja motes (dlopen) + JS app motes (QuickJS)
   ui/                 WebSocket/state bridge (observation only)
 include/
-  sim/                Kernel headers (sim_runtime.h, sim_mote.h, sim_radio_bus.h, sim_board.h, sim_registry.h)
+  sim/                Kernel headers (sim_runtime.h, sim_mote.h, sim_radio_bus.h, sim_board.h, sim_registry.h, csim_plugin.h)
   common/, msp430/, arm/, native/, ui/
 test/                 Test runner, correctness, benchmarks, firmware, multinode
 firmware/sky/         Pre-compiled Contiki-NG firmware for Tmote Sky
@@ -74,7 +82,8 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_runtime.c` | `sim_runtime_t` container: now_ns, unified event queue, radio medium, mote slots + generations, observer fan-out, `sim_runtime_run_until()` event pump |
 | `sim_radio_bus.c` | Full RF delivery path (Phase 5): per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer, emulated RX core (deliver/queue/drain), frame-complete policy (air-time + collision windows, RXFIFO backpressure, dual 192 µs auto-ACK windows), native/JS frame path, channel push/pull, channel-busy query, bus-owned RX/frame stats |
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
-| `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, and services; `csim_register_builtin_{platforms,mote_types,services}` populate it by *reference* to the existing tables; board/kind accessors forward to the existing bodies, services resolve by name via the owned name→ops catalog. No dlopen (Phase 9) |
+| `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, and services; `csim_register_builtin_{platforms,mote_types,services}` populate it by *reference* to the existing tables; board/kind accessors forward to the existing bodies, services resolve by name via the owned name→ops catalog |
+| `sim_plugin.c` | Dynamic plugin loader (Phase 9): `sim_plugin_load` dlopens a `.so` (RTLD_NOW\|RTLD_LOCAL), resolves `csim_plugin_init`, and hands it a `csim_api_t` (the v1 ABI = `register_service` only) so external plugins register a service. The example is `plugins/packet_sink.c`. ABI in `include/sim/csim_plugin.h` |
 | `sim_config.c` | JSON config loader (Phase 7): `sim_config_load` dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
 | `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
@@ -108,7 +117,7 @@ node kinds (MSP430/ARM/native/JS). All four kinds' ops tables are module-owned
 now — Phase 6 M38 moved the MSP430/ARM execute/serial adapters into their
 modules (the radio-bus dependency cleared in Phase 5, the GDB-stub dependency
 in Phase 6 M37), retiring the runner-side injection. See
-`docs/design/refactor-plan.md` §3.15–§3.22 for the completed Phase 1–8 + 10
+`docs/design/refactor-plan.md` §3.15–§3.23 for the completed Phase 1–10
 milestones (Phase 5 extracted the RF-delivery policy into `sim_radio_bus.c`
 and retired `--threads`; Phase 6 extracted the observation/optional features
 into `src/services/` behind a `sim_service_ops_t` host and moved the emulated
@@ -117,9 +126,11 @@ Phase 8 routed the runner's board/mote-kind/service lookups through one
 static `sim_registry_t`; Phase 10 shrank the runner to a pure frontend —
 the emulated MSP430/ARM chip coupling moved behind mote ops
 (`dump_diagnostics`/`apply_startup_delay`/`program_counter`) so the runner
-includes no chip headers and never switches on `NODE_MSP430`/`NODE_ARM`; the
-native host-process scheduling policy is the documented deferral). Phase 9
-(dlopen plugin ABI) is the remaining phase.
+includes no chip headers and never switches on `NODE_MSP430`/`NODE_ARM`;
+Phase 9 added the dlopen plugin ABI (`csim_plugin.h` + `sim_plugin.c`, v1 =
+register a service; example `plugins/packet_sink.c`). The native host-process
+scheduling policy is the one documented deferral. **The staged refactor
+(Phases 1–10) is complete.**
 
 ### MSP430 Source Files (src/msp430/)
 
