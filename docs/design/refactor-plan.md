@@ -1747,6 +1747,98 @@ empty-diff** (the load loop is a no-op without a plugin, so existing behavior
 stays byte-identical); the plugin path is validated functionally (the new
 tests), not by diff.
 
+### 3.24 Pluggable-radio-medium milestones (canonical Phase 11 task list)
+
+> **Status: in progress (M68–M72).** Phase 11 makes the radio medium's
+> **policy** pluggable (Cooja-style swappable `RadioMedium`).  Today the medium
+> is a concrete `radio_medium_t` selected by a 2-value enum
+> (`RADIO_MEDIUM_NONE`/`UDGM`); this phase turns the built-ins into registered
+> implementations and lets an external `.so` register a custom medium selected
+> by config `medium.type: "<name>"`, reusing the Phase-8 registry + the Phase-9
+> plugin loader.  Numbering continues from Phase 9 (M68–M72).  Perf is a
+> non-issue: the medium is ~0% of runtime per the Phase-Timing breakdown, and
+> the indirect call lands on the already-rare per-frame decision, not the
+> per-byte hot path.
+
+The architectural finding the phase rests on — the medium splits into
+**generic bookkeeping (stays)** vs **pluggable policy (3 seams)**:
+
+- Generic: node positions/channels/spectrum/rx_enabled, the per-radio
+  spectrum+channel matching (`sim_radio_bus_pick_receiver_radio`,
+  `radio_pair_match`), frame-boundary tracking, the rx-decision cache, the RNG
+  (`rng_next`), and the neighbor *lists* the bus/runner read directly.
+- Pluggable policy — exactly three functions in `src/common/radio_medium.c`:
+  `udgm_reception_prob` (distance→per-frame reception probability),
+  `radio_medium_get_rssi` (the linear-dB RSSI model), and
+  `radio_medium_compute_neighbors` (fills the TX/interference lists).
+
+Design decisions locked for this phase:
+
+- **A policy-only 3-function vtable** `sim_medium_ops_t {name, reception_prob,
+  get_rssi, compute_neighbors}`; `radio_medium_t` gains a trailing
+  `const sim_medium_ops_t *ops`.  The three internal policy sites delegate
+  through `rm->ops`; the built-in `csim_udgm_ops` points at the **existing
+  function bodies** → byte-identical (the §3.21 "registry references existing
+  bodies" pattern).  The public symbols the unit suite calls
+  (`radio_medium_get_rssi`/`_compute_neighbors`) stay as thin delegating
+  wrappers.  Asymmetric/DGRM-style media are already expressible (ordered
+  `(sender,receiver)` + the op owns the neighbor fill).  **No interference/SINR
+  op** — a medium influences interference via which nodes land in
+  `interference_neighbors[]`, which `compute_neighbors` owns; additive-SINR is a
+  future phase.
+- **`reception_prob` returns a clamped `[0,1]`, NOT a bool.**  The generic code
+  keeps the dice roll (`rng_next < prob`) and the `prob<=0`/`prob>=1` no-draw
+  short-circuits **verbatim** at both call sites — the two sites have *different*
+  draw discipline (`filter_frame_radio` short-circuits with zero draws; the
+  cached `filter_byte_radio` path always draws once per frame).  The op must NOT
+  call the RNG.  This keeps the RNG sequence — and every probabilistic config's
+  output — byte-identical.
+- **NONE keeps its bypass fast-paths.**  Never route NONE through ops (would
+  mutate frame trackers + change draw counts).  All three
+  `rm->type == RADIO_MEDIUM_NONE` early-returns stay; the NONE ops pointer is
+  documentation, never dereferenced.
+- **Registry**: `sim_medium_type_t {name, pipeline (UDGM|NONE), ops}` +
+  `sim_registry_register_radio_medium`/`_find` (mirroring `register_service`,
+  the §4.4-sketched but Phase-8-deferred function) + `csim_register_builtin_media`
+  ("udgm","none").  Config `medium.type` resolves the name → binds `rm->ops`.  A
+  plugin medium uses the **UDGM pipeline** with its own **policy**
+  (`{pipeline=UDGM, ops=plugin}`), never NONE.
+- **Ordering**: the medium is configured before plugins load, so the existing
+  config→medium block stays byte-identical for built-in names, and a **new
+  post-plugin-load resolve** handles an *unrecognized* name (look it up, set
+  `type=UDGM`/`ops`, re-run `compute_neighbors`).  The built-in path never enters
+  the new branch.
+- **Plugin ABI v2** (additive): append `register_radio_medium` to the **end** of
+  `csim_registry_ops_t`, bump `CSIM_PLUGIN_API_VERSION 1u→2u`.  A v1 plugin stays
+  compatible (it never reads the appended field); the plugin-side version check
+  becomes `< MIN` (additive-only contract: append, never reorder/remove).
+- **Plugin accessors** keep `radio_medium_t` opaque to a plugin medium:
+  `radio_medium_node_count`/`_node_pos`/`_udgm_params` (read) +
+  `_clear_neighbors`/`_add_neighbor`/`_add_interferer` (write).
+- **Example**: a fixed reception probability + constant RSSI + full-disc-neighbors
+  medium (visibly distinct from UDGM's distance falloff; reuses the full pipeline
+  + dice-roll determinism).
+
+Milestones (one commit each, full validation gate before each):
+
+68. Docs: this §3.24 (mirrors §3.18–§3.23); §6 / §9 Phase 11 point here.
+69. The medium policy vtable over UDGM/NONE (`common/` only; built-in ops point
+    at the existing bodies; NONE bypass untouched).  Byte-identical — the 235
+    radio-medium + 120 radio-bus suites are the total detector.
+70. Registry `register_radio_medium` + `csim_register_builtin_media` + config
+    `medium.type` by name binding `rm->ops`.  Byte-identical for "udgm"/"none".
+71. Plugin ABI v2 (`register_radio_medium` appended + macro→2u + loader +
+    packet_sink `<1u` fix) + the plugin accessors + the example medium `.so` +
+    a config + a test + the deferred post-plugin medium binding.  Additive (the
+    no-custom-medium path stays byte-identical).
+72. Close-out (docs only): §3.24 status, §6/§9, Decisions Log, CLAUDE.md.
+
+Validation gate per milestone: §3.23's gate plus the 235 radio-medium + 120
+radio-bus suites (the M69 detector) and `tools/check-config-equivalence.sh` /
+`tools/check-plugin.sh`.  M69–M70 are byte-identical → cross-build empty-diff;
+M71 keeps the built-in path byte-identical and functional-tests the custom
+medium.
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -2672,6 +2764,38 @@ Success metric:
 - New platforms can be added by registering descriptors/adapters, not editing
   scheduler code.
 
+### Phase 11 - Pluggable radio medium
+
+The canonical task list is **§3.24 above (milestones M68–M72)**; land them in
+order, one commit per milestone.
+
+Goal: make the radio medium's policy swappable (Cooja-style), the first
+consumer of the §6.2 medium model and the Phase-9 ABI's `register_radio_medium`
+(deferred at Phase 9).
+
+Tasks:
+
+- Add a policy-only `sim_medium_ops_t` vtable (reception probability, RSSI,
+  neighbor computation); the built-in UDGM/NONE become its implementations.
+- Add `register_radio_medium` to the registry + `csim_register_builtin_media`;
+  resolve config `medium.type` by name.
+- Extend the plugin ABI (v2, additive) with `register_radio_medium` + medium
+  accessors; add one example medium plugin.
+
+Validation:
+
+```sh
+make
+./build/test_runner radio-medium
+./build/test_runner all
+```
+
+Stop condition:
+
+- Do not add an interference/SINR op (a medium shapes interference through its
+  neighbor lists); keep `reception_prob` returning a probability so the generic
+  dice-roll — and the RNG sequence — stays identical.
+
 ## 10. Testing Matrix
 
 Use the smallest test that covers the change.
@@ -2943,6 +3067,16 @@ the same patch.
   uses `RTLD_NOW|RTLD_LOCAL`, no `-rdynamic`/`-ldl` (the plugin reaches the
   host only through the passed vtable).  The example is a packet-sink service
   (prints a frame tally once at SIM_STOP).  This is the final phase.
+- **Phase 11 task list is §3.24 (M68–M72).** Make the radio medium's *policy*
+  pluggable: a 3-function `sim_medium_ops_t` (reception_prob / get_rssi /
+  compute_neighbors) over the generic medium bookkeeping; UDGM/NONE become
+  registered implementations; `register_radio_medium` (deferred at Phase 9)
+  lands in the registry + the plugin ABI v2 (additive — append the field, bump
+  the macro, plugin checks `version >= MIN`).  **`reception_prob` returns a
+  probability, not a bool** — the generic code keeps the dice roll so the RNG
+  sequence stays byte-identical; **NONE keeps its bypass** (never routed through
+  ops).  No interference/SINR op (a medium shapes interference via its neighbor
+  lists; additive-SINR is a later phase).  Example: a fixed-probability medium.
 - **Terminology**: "service" for built-in components via `sim_service_ops_t`,
   "plugin" for dynamic-loaded services only (§2.1).
 - **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.
