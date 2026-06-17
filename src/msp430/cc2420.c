@@ -781,6 +781,12 @@ static void set_reg(cc2420_t *r, int addr, uint16_t value) {
     r->registers[addr] = value;
 
     switch (addr) {
+    case CC2420_REG_TXCTRL:
+        /* Phase 12: push PA_LEVEL (bits 4:0, max 31) so the medium scales
+         * range by output power, matching Cooja's CC2420 indicator. */
+        if (r->host && r->host->radio_set_power)
+            r->host->radio_set_power(r->host->radio_user_data, 0, value & 0x1f, 31);
+        break;
     case CC2420_REG_MDMCTRL0:
         r->adr_decode = (value & CC2420_ADR_DECODE) != 0;
         r->auto_crc = (value & CC2420_ADR_AUTOCRC) != 0;

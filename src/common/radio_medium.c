@@ -63,13 +63,28 @@ static double rng_next(radio_medium_t *rm) {
     return (double)(x & 0x7FFFFFFF) / (double)0x7FFFFFFF;
 }
 
+/* --- Output-power range scaling (Phase 12, Cooja UDGM) ---
+ *
+ * Effective TX range = tx_range * (indicator/max), scaled by the SENDER's
+ * radio.  power_max == 0 is the "not pushed" sentinel → ratio 1.0 with NO
+ * division, so an un-pushed radio's range is byte-identical with the fixed
+ * pre-Phase-12 range. */
+static inline double sender_power_ratio(const radio_medium_t *rm, int node, int radio) {
+    const radio_t *r = &rm->nodes[node].radios[radio];
+    if (r->power_max <= 0) return 1.0;            /* sentinel: not pushed */
+    double ratio = (double)r->power_indicator / (double)r->power_max;
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    return ratio;
+}
+
 /* --- UDGM distance-based reception probability --- */
 
 static double udgm_reception_prob(const radio_medium_t *rm, int sender, int receiver) {
     double dx = rm->nodes[sender].x - rm->nodes[receiver].x;
     double dy = rm->nodes[sender].y - rm->nodes[receiver].y;
     double dist_sq = dx * dx + dy * dy;
-    double range = rm->udgm.tx_range;
+    double range = rm->udgm.tx_range * sender_power_ratio(rm, sender, 0);
     double range_sq = range * range;
 
     if (range_sq <= 0.0)
@@ -296,6 +311,14 @@ void radio_medium_set_radio_rx_enabled(radio_medium_t *rm, int node, int radio_i
     rm->nodes[node].radios[radio_idx].rx_enabled = on;
 }
 
+void radio_medium_set_radio_power(radio_medium_t *rm, int node, int radio_idx,
+                                  int indicator, int max) {
+    if (!valid_node(rm, node) || !valid_radio(radio_idx)) return;
+    radio_t *r = &rm->nodes[node].radios[radio_idx];
+    r->power_indicator = indicator;
+    r->power_max = (max > 0) ? max : 0;   /* max<=0 → "full range" sentinel */
+}
+
 /* --- Legacy single-radio API --- */
 
 void radio_medium_set_channel(radio_medium_t *rm, int node, int channel) {
@@ -324,9 +347,17 @@ void radio_medium_set_channel(radio_medium_t *rm, int node, int channel) {
  * target; also csim_none_ops's — for NONE this runs with zero udgm params and
  * leaves all lists empty, exactly the prior behavior). */
 static void udgm_compute_neighbors(radio_medium_t *rm) {
-    double tx_range_sq = rm->udgm.tx_range * rm->udgm.tx_range;
-    double int_range_sq = rm->udgm.interference_range * rm->udgm.interference_range;
     for (int i = 0; i < rm->node_count; i++) {
+        /* Phase 12: ranges are the transmitter (i)'s power-scaled ranges, so
+         * neighbors[i]/interference_neighbors[i] are i's directional reach
+         * (Cooja getNeighbors/createConnections semantics).  Both bus
+         * consumers index these by sender.  At the power_max==0 sentinel the
+         * ratio is 1.0 → identical to the prior symmetric disc. */
+        double r_i = sender_power_ratio(rm, i, 0);
+        double tx_range  = rm->udgm.tx_range * r_i;
+        double int_range = rm->udgm.interference_range * r_i;
+        double tx_range_sq = tx_range * tx_range;
+        double int_range_sq = int_range * int_range;
         rm->neighbors[i].count = 0;
         rm->interference_neighbors[i].count = 0;
         for (int j = 0; j < rm->node_count; j++) {
@@ -493,7 +524,7 @@ static int8_t udgm_get_rssi(const radio_medium_t *rm, int sender, int receiver) 
     double dx = rm->nodes[sender].x - rm->nodes[receiver].x;
     double dy = rm->nodes[sender].y - rm->nodes[receiver].y;
     double dist = sqrt(dx * dx + dy * dy);
-    double range = rm->udgm.tx_range;
+    double range = rm->udgm.tx_range * sender_power_ratio(rm, sender, 0);
 
     if (range <= 0.0)
         return -90;
@@ -554,7 +585,7 @@ bool radio_medium_filter_byte_radio(radio_medium_t *rm,
     double dx = rm->nodes[sender].x - rm->nodes[receiver].x;
     double dy = rm->nodes[sender].y - rm->nodes[receiver].y;
     double dist_sq = dx * dx + dy * dy;
-    double range = rm->udgm.tx_range;
+    double range = rm->udgm.tx_range * sender_power_ratio(rm, sender, sender_radio);
     return dist_sq < (range * range);
 }
 

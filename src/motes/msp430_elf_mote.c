@@ -303,6 +303,7 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
      * onto radio slot 0 for this node. Same adapter as the ARM path. */
     plat->host.radio_user_data  = node;
     plat->host.radio_set_channel = env->radio_set_channel;
+    plat->host.radio_set_power   = env->radio_set_power;
     msp430_cpu_reset(&plat->cpu);
 
     /* Run past crt0 to main, then patch ds2411_id */

@@ -72,6 +72,13 @@ static void mock_radio_set_channel(void *user_data, int radio_idx, int channel) 
     m->last_radio_channel.channel   = channel;
 }
 
+static void mock_radio_set_power(void *user_data, int radio_idx,
+                                 int indicator, int max) {
+    mock_sim_host_t *m = (mock_sim_host_t *)user_data;
+    m->radio_set_power_calls++;
+    (void)radio_idx; (void)indicator; (void)max;
+}
+
 void mock_sim_host_init(mock_sim_host_t *mock) {
     memset(mock, 0, sizeof(*mock));
     /* The mock is its own cpu, gpio, and radio_user_data — every shim
@@ -85,6 +92,7 @@ void mock_sim_host_init(mock_sim_host_t *mock) {
     mock->host.set_input_pin    = mock_set_input_pin;
     mock->host.force_irq_edge   = mock_force_irq_edge;
     mock->host.radio_set_channel = mock_radio_set_channel;
+    mock->host.radio_set_power   = mock_radio_set_power;
 }
 
 void mock_sim_host_advance_ns(mock_sim_host_t *mock, int64_t delta_ns) {

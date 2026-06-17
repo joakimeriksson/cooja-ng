@@ -92,6 +92,12 @@ typedef struct {
     radio_spectrum_t spectrum;     /* RADIO_SPECTRUM_NONE = unregistered */
     int              channel;      /* band-local channel index, -1 = unknown */
     bool             rx_enabled;   /* chip currently in RX */
+    /* Output-power range scaling (Phase 12, Cooja-style): the effective TX
+     * range is tx_range * (power_indicator/power_max).  power_max == 0 is the
+     * "not pushed" sentinel → ratio 1.0 (full range), so an un-pushed radio is
+     * byte-identical with the pre-Phase-12 fixed range. */
+    int              power_indicator;
+    int              power_max;
 } radio_t;
 
 typedef struct {
@@ -242,6 +248,13 @@ void radio_medium_set_radio_channel(radio_medium_t *rm, int node, int radio_idx,
  * behavior. */
 void radio_medium_set_radio_rx_enabled(radio_medium_t *rm, int node, int radio_idx,
                                         bool on);
+
+/* Set a radio's current TX output-power indicator + its max (Phase 12).  The
+ * effective range for that radio's transmissions is scaled by
+ * indicator/max (Cooja UDGM semantics).  max <= 0 resets to the "full range"
+ * sentinel.  Recompute neighbors after changing power. */
+void radio_medium_set_radio_power(radio_medium_t *rm, int node, int radio_idx,
+                                  int indicator, int max);
 
 /* --- Legacy single-radio API (forwards to radio_idx == 0) --- */
 

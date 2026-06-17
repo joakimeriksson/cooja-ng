@@ -68,6 +68,7 @@ typedef struct mock_sim_host {
     int               schedule_calls;
     int               cancel_calls;
     int               radio_set_channel_calls;
+    int               radio_set_power_calls;
     mock_radio_channel_event_t last_radio_channel;
 } mock_sim_host_t;
 
@@ -91,6 +92,7 @@ static inline void mock_sim_host_reset_counters(mock_sim_host_t *mock) {
     mock->schedule_calls = 0;
     mock->cancel_calls = 0;
     mock->radio_set_channel_calls = 0;
+    mock->radio_set_power_calls = 0;
 }
 
 #endif /* MOCK_SIM_HOST_H */

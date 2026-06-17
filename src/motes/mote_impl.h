@@ -112,6 +112,8 @@ struct sim_mote_env {
 
     /* sim_host channel push (user_data = node). */
     void (*radio_set_channel)(void *node, int radio_idx, int channel);
+    /* sim_host TX-power push (Phase 12; user_data = node). */
+    void (*radio_set_power)(void *node, int radio_idx, int indicator, int max);
 
     /* cc2538 RF Core observer + channel callbacks (user_data = node). */
     void (*rfcore_state_change)(void *node, int old_state, int new_state);

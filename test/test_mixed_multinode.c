@@ -707,6 +707,18 @@ static void mixed_host_radio_set_channel(void *user_data, int radio_idx,
     mixed_node_radio_set_channel((mixed_node_t *)user_data, radio_idx, channel);
 }
 
+/* Phase 12: TX-power push → the medium scales range by indicator/max.  Range
+ * now depends on power, so recompute neighbors (firmware sets power once at
+ * init; a recompute keeps the directional lists current). */
+static void mixed_host_radio_set_power(void *user_data, int radio_idx,
+                                       int indicator, int max) {
+    mixed_node_t *node = (mixed_node_t *)user_data;
+    int idx = (int)(node - nodes);
+    if (idx < 0 || idx >= num_nodes) return;
+    radio_medium_set_radio_power(&radio_medium, idx, radio_idx, indicator, max);
+    radio_medium_compute_neighbors(&radio_medium);
+}
+
 /* cc2538_rfcore observer adapter (on-SoC, slot 0 = 2.4 GHz). */
 static void mixed_rfcore_channel_callback(void *user_data, int channel) {
     mixed_node_radio_set_channel((mixed_node_t *)user_data, /*radio_idx=*/0, channel);
@@ -1319,6 +1331,7 @@ static const sim_mote_env_t mixed_mote_env = {
     .uart_byte             = mixed_uart_callback,
     .chip_tx_byte          = mixed_rf_tx_chip_cb,
     .radio_set_channel     = mixed_host_radio_set_channel,
+    .radio_set_power       = mixed_host_radio_set_power,
     .rfcore_state_change   = mixed_rf_state_handler,
     .rfcore_channel_change = mixed_rfcore_channel_callback,
     .cc1200_channel_busy   = mixed_cc1200_channel_busy,

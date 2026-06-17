@@ -71,6 +71,12 @@ typedef struct sim_host {
      * Optional — chip drivers must NULL-check; harnesses that don't
      * model a medium leave this unwired. */
     void    (*radio_set_channel)(void *radio_user_data, int radio_idx, int channel);
+
+    /* Push the chip's current TX output-power indicator + its max to the
+     * medium so range scales with power (Phase 12, Cooja UDGM).  Optional —
+     * NULL-check; only CC2420 wires it today. */
+    void    (*radio_set_power)(void *radio_user_data, int radio_idx,
+                               int indicator, int max);
 } sim_host_t;
 
 #endif /* SIM_HOST_H */

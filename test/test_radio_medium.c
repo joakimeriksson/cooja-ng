@@ -331,6 +331,38 @@ static void test_distance_exact_tx_range_boundary(void) {
            "dist == tx_range, ratios 1.0: frame_filter passes");
 }
 
+/* Phase 12: effective TX range scales with the sender's output power
+ * (Cooja UDGM).  Exercises all three power-scaled policy sites + the
+ * power_max==0 "full range" sentinel. */
+static void test_power_scales_range(void) {
+    radio_medium_t rm;
+    radio_medium_init(&rm, 2);
+    radio_medium_configure_udgm(&rm, 50.0, 100.0, 1.0, 1.0);
+    radio_medium_set_position(&rm, 0,  0.0, 0.0);
+    radio_medium_set_position(&rm, 1, 40.0, 0.0);   /* dist 40 */
+
+    /* Full power (sentinel ratio 1.0): 40 < 50 → in range. */
+    ASSERT(radio_medium_filter_frame(&rm, 0, 1),
+           "full power: 40m within 50m range → frame delivers");
+    radio_medium_compute_neighbors(&rm);
+    ASSERT(rm.neighbors[0].count == 1, "full power: node 0 reaches node 1");
+    int8_t rssi_full = radio_medium_get_rssi(&rm, 0, 1);
+
+    /* Node 0 at 15/31 ≈ 0.484 → effective range ≈ 24m < 40m. */
+    radio_medium_set_radio_power(&rm, 0, 0, 15, 31);
+    ASSERT(!radio_medium_filter_frame(&rm, 0, 1),
+           "low power: 40m beyond ~24m range → frame drops");
+    radio_medium_compute_neighbors(&rm);
+    ASSERT(rm.neighbors[0].count == 0, "low power: node 0 no longer reaches 1");
+    ASSERT(radio_medium_get_rssi(&rm, 0, 1) < rssi_full,
+           "low power: weaker RSSI");
+
+    /* max==0 sentinel restores full range. */
+    radio_medium_set_radio_power(&rm, 0, 0, 0, 0);
+    ASSERT(radio_medium_filter_frame(&rm, 0, 1),
+           "power reset (sentinel): in range again");
+}
+
 /* radio_medium_compute_neighbors populates neighbor lists from
  * positions. 4-node square with side 30, tx_range=50:
  *
@@ -1287,6 +1319,7 @@ int run_radio_medium_tests(int verbose) {
     test_distance_outside_tx_range_drops();
     test_distance_beyond_interference_drops();
     test_distance_exact_tx_range_boundary();
+    test_power_scales_range();
     test_compute_neighbors_4node_square();
 
     /* Probabilistic loss + per-frame caching */

@@ -53,6 +53,7 @@ int arm_elf_mote_boot(mixed_node_t *node, int slot,
     arm_platform_set_console(plat, env->uart_byte, node);
     plat->host.radio_user_data  = node;
     plat->host.radio_set_channel = env->radio_set_channel;
+    plat->host.radio_set_power   = env->radio_set_power;
 
     cc2538_soc_t   *cc_soc   = arm_platform_cc2538(plat);
     nrf52840_soc_t *nrf_soc  = arm_platform_nrf52840(plat);
