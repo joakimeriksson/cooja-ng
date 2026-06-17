@@ -1852,6 +1852,48 @@ radio-bus suites (the M69 detector) and `tools/check-config-equivalence.sh` /
 M71 keeps the built-in path byte-identical and functional-tests the custom
 medium.
 
+### 3.25 Power-aware radio range (Phase 12)
+
+> **Status: complete (one code commit `3c2f5e5` + this docs commit).** csim's
+> radio range was a fixed `tx_range`; Cooja's UDGM scales it by the
+> transmitter's output power: `effective_range = tx_range ×
+> (indicator/max)`, per the SENDER's radio
+> (`UDGM.java:132/166/258/295`).  For the CC2420 the indicator is
+> `TXCTRL & 0x1f` (PA_LEVEL 0–31, max 31; `CC2420.java:1304-1311`).  This phase
+> makes csim power-aware to match.  (Pace note: planned as M74–M78 but landed
+> as one batched commit + docs once the PA verification showed it byte-identical
+> — the project pivoted to a lighter, faster cadence for feature work.)
+
+Design (landed):
+
+- **`radio_t` gains `power_indicator`/`power_max`**; `power_max == 0` is the
+  "not pushed → ratio 1.0" sentinel (memset-zero init, no division → byte-
+  identical with the prior fixed range).  A `sender_power_ratio` helper scales
+  all four `tx_range` sites by the **sender's** ratio:
+  `udgm_reception_prob`, `udgm_get_rssi`, the preamble reach gate, and
+  `udgm_compute_neighbors` — the last now **sender-directional**
+  (`neighbors[i]` = node i's power-scaled reach; both bus consumers already
+  index by sender).
+- **Plumbing mirrors the channel push**: a `radio_set_power` hook in
+  `sim_host_t` + `sim_mote_env_t` (stamped in the msp430/arm mote modules), the
+  runner adapter `mixed_host_radio_set_power` → `radio_medium_set_radio_power` +
+  a neighbor recompute, a `mock_sim_host` stub.  **CC2420 pushes**
+  `(TXCTRL & 0x1f, 31)` on a TXCTRL write (a new `set_reg` case; the reset
+  writes TXCTRL directly, bypassing `set_reg`, so the radio holds the sentinel
+  until firmware writes power).
+- **Byte-identical, verified empirically**: the sky/z1 firmware never writes
+  TXCTRL (it rides the reset default `0xA0FF` → PA = 31 = max), so the push is
+  inert and range is unchanged on every shipped config — the feature activates
+  (Cooja-accurately) only for firmware that lowers PA.  `test_power_scales_range`
+  proves the scaling on all three policy sites + the sentinel.
+
+Deferred / caveats: cc2538/cc1200/nrf don't push (no Cooja parity; their power
+registers are dBm-mapped, not 0–N indicators).  A plugin medium computing its
+own neighbors doesn't see per-radio power (a future accessor).  CC1200 CCA reads
+`neighbors[my_idx]` as "who I can hear," which under directional range is "who I
+reach" — matters only if a 2.4 GHz neighbor lowers PA (CC1200 doesn't push
+power).
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -2809,6 +2851,12 @@ Stop condition:
   neighbor lists); keep `reception_prob` returning a probability so the generic
   dice-roll — and the RNG sequence — stays identical.
 
+### Phase 12 - Power-aware radio range
+
+See **§3.25** (complete). Scale the medium's range by the transmitter's output
+power (Cooja UDGM parity); CC2420 pushes its PA_LEVEL. Byte-identical on every
+shipped config (firmware holds PA at max); activates for sub-max-power firmware.
+
 ## 10. Testing Matrix
 
 Use the smallest test that covers the change.
@@ -3094,6 +3142,13 @@ the same patch.
   sequence stays byte-identical; **NONE keeps its bypass** (never routed through
   ops).  No interference/SINR op (a medium shapes interference via its neighbor
   lists; additive-SINR is a later phase).  Example: a fixed-probability medium.
+- **Phase 12 (§3.25) is complete.** Power-aware range (Cooja UDGM parity): the
+  medium scales `tx_range` by the sender's `power_indicator/power_max`
+  (sentinel `power_max==0` → ratio 1.0 → byte-identical); CC2420 pushes
+  `TXCTRL & 0x1f` via a new `radio_set_power` host hook; `compute_neighbors`
+  became sender-directional.  Byte-identical on every shipped config (sky/z1
+  firmware never writes TXCTRL → PA stays max).  cc2538/cc1200/nrf deferred (no
+  Cooja parity / dBm registers).
 - **Terminology**: "service" for built-in components via `sim_service_ops_t`,
   "plugin" for dynamic-loaded services only (§2.1).
 - **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.

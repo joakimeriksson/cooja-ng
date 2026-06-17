@@ -255,6 +255,8 @@ Full state machine matching Java MSPSim's CC2420.java.
 
 **Auto-ACK:** If enabled (MDMCTRL0.AUTOACK) and frame has ACK_REQUEST bit and passes CRC + address filter, sends 5-byte ACK frame automatically.
 
+**TX power (Phase 12):** a TXCTRL write pushes PA_LEVEL (`& 0x1f`, max 31) to the radio medium via the `radio_set_power` host hook; the medium scales effective range by `indicator/max` (Cooja UDGM). Firmware that holds max PA is byte-identical with the old fixed range.
+
 **CRC:** CCITT-16 with bit reversal, matching CC2420 hardware behavior.
 
 ### Timer A/B
