@@ -307,13 +307,35 @@ static inline void emit_led_obs(int mote_index, int64_t time_ns,
     ev.u.led.on = on;
     sim_runtime_emit(&sim_rt, &ev);
 }
+/* Emit a radio-state transition (OFF/ON/TX/RX/INTF) onto the observer stream
+ * so a duty-cycle / energy service can accumulate time-in-state.  Only called
+ * while radio-state tracking is on; carries the sim_radio_state_t value. */
+static inline void emit_radio_state_obs(int mote_index, int64_t time_ns,
+                                        sim_radio_state_t state) {
+    sim_observer_event_t ev = { .kind = SIM_OBS_RADIO_STATE, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = -1 };
+    ev.u.radio_state.state = (int)state;
+    sim_runtime_emit(&sim_rt, &ev);
+}
+/* Emit a per-mote CPU power-time snapshot (cumulative active/LPM ns) for an
+ * energy service.  Called once per mote at end-of-run; totals are exact. */
+static inline void emit_cpu_state_obs(int mote_index, int64_t time_ns,
+                                      int64_t active_ns, int64_t lpm_ns) {
+    sim_observer_event_t ev = { .kind = SIM_OBS_CPU_STATE, .time_ns = time_ns,
+                                .mote_index = mote_index, .radio_idx = -1 };
+    ev.u.cpu.active_ns = active_ns;
+    ev.u.cpu.lpm_ns = lpm_ns;
+    sim_runtime_emit(&sim_rt, &ev);
+}
 
 /* RF state change callback — fires during CPU step for real-time timeline tracking.
  * TX and RX events are handled by explicit timeline events in the TX/delivery
  * handlers (with proper frame duration). This callback handles radio ON/OFF
  * transitions (ISRXON, ISRFOFF, tx_done return-to-RX). */
 static void mixed_rf_state_handler(void *user_data, int old_state, int new_state) {
-    if (!ui_service_active(&ui_svc) || radio_bus.in_delivery) return;
+    if ((!ui_service_active(&ui_svc) &&
+         !sim_runtime_radio_state_tracking(&sim_rt)) || radio_bus.in_delivery)
+        return;
     mixed_node_t *node = (mixed_node_t *)user_data;
     int idx = (int)(node - nodes);
 
@@ -322,24 +344,28 @@ static void mixed_rf_state_handler(void *user_data, int old_state, int new_state
     sim_radio_state_t sim_state =
         (sim_radio_state_t)arm_elf_mote_rf_sim_state(new_state);
 
-    /* Skip TX/RX events — explicit timeline events handle those with
-     * proper frame duration.  Only emit ON/OFF transitions here. */
+    /* Use CPU cycles for accurate intra-step timing (M53: computed in
+     * the ARM module so the runner needs no chip header). */
+    int64_t ts = arm_elf_mote_now_ns(&mote_store[idx]);
+
+    /* Skip TX/RX timeline events — explicit timeline events handle those with
+     * proper frame duration.  The energy stream still wants every transition. */
     if (sim_state == SIM_RADIO_TX || sim_state == SIM_RADIO_RX) {
-        node_states[idx].radio_state = sim_state;
+        if (sim_state != node_states[idx].radio_state) {
+            node_states[idx].radio_state = sim_state;
+            emit_radio_state_obs(idx, ts, sim_state);
+        }
         return;
     }
 
     if (sim_state != node_states[idx].radio_state) {
         node_states[idx].radio_state = sim_state;
-        tl_event_type_t etype;
-        switch (sim_state) {
-        case SIM_RADIO_ON:   etype = TL_RADIO_ON;   break;
-        default:             etype = TL_RADIO_OFF;   break;
+        if (ui_service_active(&ui_svc)) {
+            tl_event_type_t etype =
+                (sim_state == SIM_RADIO_ON) ? TL_RADIO_ON : TL_RADIO_OFF;
+            tl_radio_event(&timeline_svc.tl, node->id, ts, etype);
         }
-        /* Use CPU cycles for accurate intra-step timing (M53: computed in
-         * the ARM module so the runner needs no chip header). */
-        int64_t ts = arm_elf_mote_now_ns(&mote_store[idx]);
-        tl_radio_event(&timeline_svc.tl, node->id, ts, etype);
+        emit_radio_state_obs(idx, ts, sim_state);
     }
 }
 
@@ -355,6 +381,7 @@ static void update_radio_state(int idx) {
         (sim_radio_state_t)m->ops->ui_radio_state(m);
     if (new_state != node_states[idx].radio_state) {
         node_states[idx].radio_state = new_state;
+        int64_t ts = sim_runtime_now_ns(&sim_rt);
         if (ui_service_active(&ui_svc)) {
             tl_event_type_t etype;
             switch (new_state) {
@@ -364,8 +391,9 @@ static void update_radio_state(int idx) {
             case SIM_RADIO_INTF: etype = TL_RADIO_INTF; break;
             default:             etype = TL_RADIO_OFF;   break;
             }
-            tl_radio_event(&timeline_svc.tl, nodes[idx].id, sim_runtime_now_ns(&sim_rt), etype);
+            tl_radio_event(&timeline_svc.tl, nodes[idx].id, ts, etype);
         }
+        emit_radio_state_obs(idx, ts, new_state);
     }
 }
 
@@ -2022,6 +2050,7 @@ sim_restart:
                               &node_count, ui_describe_node, ui_move_node))
             fprintf(stderr, "Warning: failed to start UI server on port %d\n",
                     ui_port);
+        ui_svc.rt = &sim_rt;   /* plugin UI panels source */
     }
 
     /* Set initial simulation speed from config */
@@ -2154,9 +2183,12 @@ sim_restart:
                 fprintf(stderr, "plugin: %s: %s\n", plugin_paths[p], err);
         }
         /* Config v2 plugins[]: a "/"-bearing or ".so"-suffixed entry is a path
-         * to dlopen; otherwise it names a built-in service ("builtin:NAME" or
-         * "NAME") — validate it exists (attaching built-ins by name is the
-         * runner's existing flag-driven job, not the plugin path). */
+         * to dlopen; otherwise it names a COMPILED-IN service ("builtin:NAME"
+         * or bare "NAME") that the static registry already holds — attach it by
+         * name (Cooja's built-in-plugin style).  `attached_builtin` records
+         * whether any was attached so radio-state tracking turns on for them
+         * too. */
+        bool attached_builtin = false;
         for (int p = 0; config_loaded && p < config.plugin_count; p++) {
             const char *entry = config.plugins[p];
             if (!entry[0]) continue;  /* truncated entry (parser blanked it) */
@@ -2170,17 +2202,33 @@ sim_restart:
             } else {
                 const char *name = strncmp(entry, "builtin:", 8) == 0
                                        ? entry + 8 : entry;
-                if (!sim_registry_find_service(&g_registry, name))
+                const sim_service_ops_t *ops =
+                    sim_registry_find_service(&g_registry, name);
+                if (!ops)
                     fprintf(stderr, "plugin: unknown builtin service '%s'\n",
                             name);
+                else if (sim_service_attach(&sim_rt, ops, NULL) < 0)
+                    fprintf(stderr, "plugin: failed to attach builtin '%s' "
+                            "(needs config it wasn't given?)\n", name);
+                else
+                    attached_builtin = true;
             }
         }
+        /* Attach the dynamically-registered (.so) services — those appended to
+         * the catalog during this block.  Built-ins were attached by name above
+         * (they're already in the catalog, so this range excludes them). */
         for (int s = svc_before; s < g_registry.service_count; s++) {
             const sim_service_ops_t *ops = g_registry.services[s];
             if (sim_service_attach(&sim_rt, ops, NULL) < 0)
                 fprintf(stderr, "plugin: failed to attach service '%s'\n",
                         ops && ops->name ? ops->name : "?");
         }
+        /* A plugin service may want the radio-state stream (e.g. an energy /
+         * duty-cycle tracker).  Turn tracking on when any plugin service was
+         * attached (dynamic .so OR a named built-in), so SIM_OBS_RADIO_STATE
+         * flows headless.  No plugin → flag stays off → byte-identical. */
+        if (g_registry.service_count > svc_before || attached_builtin)
+            sim_runtime_set_radio_state_tracking(&sim_rt, true);
     }
 
     /* M72: a config naming a non-built-in medium (custom_medium, computed
@@ -2490,7 +2538,8 @@ sim_restart:
         /* Update per-node radio/LED state for timeline (M16: the ops'
          * NULL-ness encodes which mote kinds are polled — CC2538 pushes
          * radio state via async callback, natives/JS have neither). */
-        if (ui_service_active(&ui_svc)) {
+        if (ui_service_active(&ui_svc) ||
+            sim_runtime_radio_state_tracking(&sim_rt)) {
             for (int i = 0; i < node_count; i++) {
                 if (!node_active(i)) continue;
                 update_radio_state(i);
@@ -2721,6 +2770,28 @@ sim_restart:
             test_exit_code = st;
         }
     }
+    /* Final CPU power-time snapshot per mote, before services tear down (an
+     * energy service reads it in its destroy).  Only when radio-state tracking
+     * is on (a plugin is loaded); the mote op is NULL for kinds with no CPU
+     * power model (native/JS), which are simply skipped. */
+    if (sim_runtime_radio_state_tracking(&sim_rt)) {
+        for (int i = 0; i < node_count; i++) {
+            const sim_mote_t *m = &mote_store[i];
+            if (!m->ops->cpu_power_ns) continue;
+            int64_t active_ns = 0, lpm_ns = 0;
+            m->ops->cpu_power_ns(m, &active_ns, &lpm_ns);
+            emit_cpu_state_obs(i, sim_runtime_now_ns(&sim_rt), active_ns, lpm_ns);
+        }
+    }
+
+    /* Debug aid: dump the published plugin UI panels (CSIM_DUMP_PANELS=1).
+     * Lets the panel data path be verified headlessly, with no browser. */
+    if (getenv("CSIM_DUMP_PANELS")) {
+        char *pj = sim_runtime_ui_panels_json(&sim_rt);
+        fprintf(stderr, "UI panels: %s\n", pj ? pj : "(none)");
+        free(pj);
+    }
+
     ss_cleanup();
 
     /* Cleanup UI server */

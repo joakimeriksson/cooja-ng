@@ -15,6 +15,10 @@
 #include "js_test_service.h"      /* js_test_service_ops    */
 #include "gdb_service.h"          /* gdb_service_ops        */
 
+/* Compiled-in example "plugin": the energy estimator as a built-in service,
+ * selectable by config name (its engine is shared with plugins/energest.so). */
+extern const sim_service_ops_t energest_service_ops;
+
 #include <string.h>
 
 /* Register the built-in library services that ship as exported ops structs.
@@ -30,6 +34,7 @@ void csim_register_builtin_services(sim_registry_t *r) {
     sim_registry_register_service(r, &json_test_service_ops);
     sim_registry_register_service(r, &js_test_service_ops);
     sim_registry_register_service(r, &gdb_service_ops);
+    sim_registry_register_service(r, &energest_service_ops);
 }
 
 int sim_registry_register_service(sim_registry_t *r,

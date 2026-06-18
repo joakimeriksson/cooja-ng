@@ -1,0 +1,17 @@
+{
+    "version": 2,
+    "title": "Energest as a COMPILED-IN plugin, selected by name (no .so)",
+    "timeout_ms": 60000,
+    "seed": 42,
+    "plugins": [
+        "energest"
+    ],
+    "mote_types": [
+        { "name": "sky-server", "kind": "emulated-elf", "cpu": "msp430", "soc": "msp430f1611", "board": "sky", "firmware": "firmware/sky/udp-server.sky" },
+        { "name": "sky-client", "kind": "emulated-elf", "cpu": "msp430", "soc": "msp430f1611", "board": "sky", "firmware": "firmware/sky/udp-client.sky" }
+    ],
+    "nodes": [
+        { "type": "sky-server", "id": 1 },
+        { "type": "sky-client", "id": 2 }
+    ]
+}

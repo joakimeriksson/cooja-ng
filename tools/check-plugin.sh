@@ -45,4 +45,19 @@ if ! echo "$m1" | grep -q 'Radio medium: lossy (plugin)'; then
     echo "FAIL: lossy medium not selected"; echo " $m1"; exit 1; fi
 if [ "$m1" != "$m2" ]; then echo "FAIL: medium plugin not deterministic"; exit 1; fi
 echo "PLUGIN OK: medium plugin '$(echo "$m1" | head -1)' (deterministic)"
+
+# --- Energy plugin (energest): a COMPILED-IN plugin selected by config name ---
+# (no .so — config plugins:["energest"] resolves to the built-in service).
+EN_CFG=configs/plugin-energest-builtin-v2.json
+e1=$("$RUNNER" test "$EN_CFG" -t "$T" 2>&1 | grep -E '^energest: network total')
+e2=$("$RUNNER" test "$EN_CFG" -t "$T" 2>&1 | grep -E '^energest: network total')
+if [ -z "$e1" ]; then echo "FAIL: no energest total line (built-in not attached?)"; exit 1; fi
+if [ "$e1" != "$e2" ]; then echo "FAIL: energest not deterministic"; echo " $e1"; echo " $e2"; exit 1; fi
+# A radio that was tracked at all charges some energy.
+if echo "$e1" | grep -qE '~0\.000 mJ'; then echo "FAIL: energest charged nothing: $e1"; exit 1; fi
+# The per-mote line carries the CPU/LPM axis (SIM_OBS_CPU_STATE snapshot).
+em=$("$RUNNER" test "$EN_CFG" -t "$T" 2>&1 | grep -E '^energest:  mote ' | head -1)
+if ! echo "$em" | grep -qE 'cpu [0-9].* lpm [0-9]'; then
+    echo "FAIL: energest missing cpu/lpm axis: $em"; exit 1; fi
+echo "PLUGIN OK: energest built-in by name '$e1' (radio+cpu/lpm, deterministic)"
 exit 0

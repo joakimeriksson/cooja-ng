@@ -220,6 +220,16 @@ typedef struct sim_mote_ops {
      * PC=0x0000 for non-MSP430 kinds, matching the prior behavior where only
      * MSP430 read a PC). */
     uint32_t (*program_counter)(const sim_mote_t *m);
+
+    /* ---- CPU power-time accounting (energy services) -----------------
+     *
+     * OPTIONAL: report the mote CPU's cumulative time spent ACTIVE (executing)
+     * and in low-power mode (MSP430 LPM / ARM WFI), in nanoseconds.  The CPU
+     * accrues lpm_ns at each fast-forward; active_ns = elapsed − lpm_ns.  NULL
+     * for kinds with no CPU power model (native/JS).  Consumed by the
+     * end-of-run SIM_OBS_CPU_STATE emit. */
+    void (*cpu_power_ns)(const sim_mote_t *m, int64_t *active_ns,
+                         int64_t *lpm_ns);
 } sim_mote_ops_t;
 
 struct sim_mote {

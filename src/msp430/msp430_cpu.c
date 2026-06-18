@@ -988,9 +988,13 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             if (cpu->interrupts_enabled && cpu->interrupt_max >= 0) {
                 /* Will service interrupt next iteration */
             } else {
+                int64_t prev = cpu->cycles;
                 int64_t target = cpu->next_event_cycle;
                 if (target > cpu->cycle_limit) target = cpu->cycle_limit;
                 cpu->cycles = target;
+                if (target > prev)
+                    cpu->lpm_ns += msp430_cycles_to_ns(target - prev,
+                                                       cpu->cpu_freq_hz);
                 /* Process events that became due during LPM fast-forward */
                 if (cpu->cycles >= cpu->next_event_cycle)
                     execute_events(cpu);

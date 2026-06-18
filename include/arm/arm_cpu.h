@@ -122,6 +122,7 @@ typedef struct arm_cpu {
     bool      interrupts_enabled;
     bool      cpu_off;            /* WFI sleep */
     bool      stopping;
+    int64_t   lpm_ns;             /* cumulative time fast-forwarded in WFI (energy) */
     uint8_t   wild_trapped;       /* ARM_WILD_TRAP one-shot diagnostic */
     uint8_t   lr_trapped;         /* ARM_LR_WATCH one-shot diagnostic */
 

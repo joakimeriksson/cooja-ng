@@ -84,6 +84,25 @@ typedef struct sim_runtime {
     sim_service_slot_t services[SIM_RUNTIME_MAX_SERVICES];
     int                service_count;
     int                service_observer_handle;
+
+    /* When true, the runner polls per-node radio state every loop iteration
+     * and emits SIM_OBS_RADIO_STATE transitions.  Off by default (so headless
+     * runs do no extra work and stay byte-identical); turned on by the live UI
+     * or by loading any plugin — a duty-cycle / energy service consumes the
+     * stream.  See sim_runtime_set_radio_state_tracking(). */
+    bool               radio_state_tracking;
+
+    /* Plugin UI panels (v3 csim_ui_ops): a small id→latest-JSON table a plugin
+     * fills via sim_runtime_ui_publish_panel(); the websocket UI service
+     * broadcasts them as a {"type":"panels"} frame.  Empty unless a plugin
+     * publishes, so headless runs are unaffected. */
+#define SIM_RUNTIME_MAX_PANELS 8
+#define SIM_RUNTIME_PANEL_ID_LEN 32
+    struct {
+        char  id[SIM_RUNTIME_PANEL_ID_LEN];
+        char *json;                 /* owned; replaced on re-publish */
+    }                  ui_panels[SIM_RUNTIME_MAX_PANELS];
+    int                ui_panel_count;
 } sim_runtime_t;
 
 /* Zero-initialize the runtime; does NOT init the event queue or radio medium
@@ -99,6 +118,25 @@ void sim_runtime_destroy(sim_runtime_t *sim);
 static inline int64_t sim_runtime_now_ns(const sim_runtime_t *sim) {
     return sim->now_ns;
 }
+
+/* Enable/disable per-node radio-state polling + SIM_OBS_RADIO_STATE emission
+ * (see the radio_state_tracking field).  Idempotent; safe before the run. */
+static inline void sim_runtime_set_radio_state_tracking(sim_runtime_t *sim,
+                                                        bool on) {
+    if (sim) sim->radio_state_tracking = on;
+}
+static inline bool sim_runtime_radio_state_tracking(const sim_runtime_t *sim) {
+    return sim && sim->radio_state_tracking;
+}
+
+/* Publish/replace a named plugin UI panel (the v3 csim_ui_ops sink).  `json`
+ * is copied; a NULL/empty id or a full table is ignored.  Cheap no-op effect
+ * when no UI is attached (the value is just stored). */
+void sim_runtime_ui_publish_panel(sim_runtime_t *sim, const char *id,
+                                  const char *json);
+/* Build a malloc'd JSON object string {"<id>":<json>,...} of all published
+ * panels, or NULL if none.  Caller frees.  Consumed by the UI service. */
+char *sim_runtime_ui_panels_json(const sim_runtime_t *sim);
 
 /* ============================================================
  * Scheduling wrappers — Phase 1 milestone 3.

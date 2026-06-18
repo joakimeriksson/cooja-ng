@@ -890,7 +890,11 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         !cpu->wfi_skip_guard(cpu->wfi_skip_user)) {
                         int64_t target = cpu->event_queue->fire_cycle;
                         if (target > cpu->cycle_limit) target = cpu->cycle_limit;
-                        if (target > cpu->cycles) cpu->cycles = target;
+                        if (target > cpu->cycles) {
+                            cpu->lpm_ns += arm_cycles_to_ns(target - cpu->cycles,
+                                                            cpu->cpu_freq_hz);
+                            cpu->cycles = target;
+                        }
                         cpu->cpu_off = false;
                         arm_wfi_skipped++;
                         continue;
@@ -903,7 +907,11 @@ int arm_step(arm_cpu_t *cpu, int count) {
             }
             if (cpu->event_queue) {
                 arm_wfi_noirq++;
-                cpu->cycles = cpu->event_queue->fire_cycle;
+                int64_t target = cpu->event_queue->fire_cycle;
+                if (target > cpu->cycles)
+                    cpu->lpm_ns += arm_cycles_to_ns(target - cpu->cycles,
+                                                    cpu->cpu_freq_hz);
+                cpu->cycles = target;
                 continue;
             }
             break;

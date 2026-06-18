@@ -49,12 +49,16 @@ Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet)
 
 ```sh
 # Dynamic plugins (Phase 9) — dlopen a .so that registers a service or medium
-make plugins                                    # builds packet_sink.so + lossy_medium.so
+make plugins                                    # packet_sink.so + lossy_medium.so + energest.so
 ./build/test_runner test configs/test-rpl-udp-sky.json --plugin build/plugins/packet_sink.so
 ./build/test_runner test configs/plugin-demo-sky-v2.json   # config v2 "plugins": [...]
+# Energy estimation — a COMPILED-IN plugin (built-in service) selected by config
+# name; per-mote radio duty cycle + CPU/LPM energy (PowerTracker/Energest); also
+# publishes a live web-UI panel (v3 ui ABI). No .so to ship.
+./build/test_runner test configs/plugin-energest-builtin-v2.json   # "plugins": ["energest"]
 # Pluggable radio medium (Phase 11) — config medium.type names a plugin medium
 ./build/test_runner test configs/medium-plugin-sky-v2.json # "medium": {"type": "lossy"}
-tools/check-plugin.sh                           # plugin smoke check (service + medium)
+tools/check-plugin.sh                           # plugin smoke check (service + medium + energy)
 ```
 
 ## Project Structure
@@ -85,7 +89,7 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_radio_bus.c` | Full RF delivery path (Phase 5): per-sender byte clock, frame assembler (802.15.4 + 802.15.4g), medium-filtered per-receiver dispatch (SYNC/PER_BYTE/BATCH), RX-stall timer, emulated RX core (deliver/queue/drain), frame-complete policy (air-time + collision windows, RXFIFO backpressure, dual 192 µs auto-ACK windows), native/JS frame path, channel push/pull, channel-busy query, bus-owned RX/frame stats |
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
 | `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, services, and radio media; `csim_register_builtin_{platforms,mote_types,services,media}` populate it; services + media (Phase 11: "udgm"/"none" + plugins) resolve by name via owned name→ops catalogs |
-| `sim_plugin.c` | Dynamic plugin loader (Phase 9): `sim_plugin_load` dlopens a `.so` (RTLD_NOW\|RTLD_LOCAL), resolves `csim_plugin_init`, and hands it a `csim_api_t` (the v1 ABI = `register_service` only) so external plugins register a service. The example is `plugins/packet_sink.c`. ABI in `include/sim/csim_plugin.h` |
+| `sim_plugin.c` | Dynamic plugin loader (Phase 9): `sim_plugin_load` dlopens a `.so` (RTLD_NOW\|RTLD_LOCAL), resolves `csim_plugin_init`, and hands it a `csim_api_t` so the plugin registers a service. ABI is additive/version-gated (`include/sim/csim_plugin.h`): v1 `register_service`, v2 `+register_radio_medium`, v3 `+ui->publish_panel` (a plugin draws a live web-UI panel — see [`docs/design/ui-plugins.md`](docs/design/ui-plugins.md)). Dynamic `.so` examples: `plugins/packet_sink.c` (service), `plugins/lossy_medium.c` (medium). A plugin can also be **compiled in** as a built-in service (registered in `sim_registry.c`) and selected by config name (`"plugins": ["energest"]`, Cooja's built-in-plugin style) — example: the energy estimator `src/services/energest_{engine,service}.c` |
 | `sim_config.c` | JSON config loader (Phase 7): `sim_config_load` dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
 | `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |

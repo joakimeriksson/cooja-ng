@@ -550,6 +550,18 @@ static uint32_t msp_mote_program_counter(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.msp.cpu.reg[MSP430_PC];
 }
 
+/* CPU active/LPM time for the energy stream.  lpm_ns is accrued at each LPM
+ * fast-forward; active = elapsed (sim_time_ns) − lpm_ns. */
+static void msp_mote_cpu_power_ns(const sim_mote_t *m, int64_t *active_ns,
+                                  int64_t *lpm_ns) {
+    const msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
+    int64_t lpm = cpu->lpm_ns;
+    int64_t active = cpu->sim_time_ns - lpm;
+    if (active < 0) active = 0;
+    if (active_ns) *active_ns = active;
+    if (lpm_ns)    *lpm_ns    = lpm;
+}
+
 static void msp_mote_step_until(sim_mote_t *m, int64_t target) {
     msp430_step_until(&MOTE_IMPL(m)->plat.msp.cpu, target);
 }
@@ -721,4 +733,5 @@ const sim_mote_ops_t msp430_elf_mote_ops = {
     .rx_pre_sync     = msp_mote_rx_pre_sync,
     .dump_diagnostics = msp430_elf_mote_dump_diagnostics,
     .program_counter = msp_mote_program_counter,
+    .cpu_power_ns = msp_mote_cpu_power_ns,
 };

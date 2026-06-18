@@ -41,8 +41,9 @@ extern "C" {
  * host always satisfies an older plugin; a v1 plugin keeps working on a v2
  * host because it never reads past the field it knows.
  *   v1: register_service.
- *   v2: + register_radio_medium (Phase 11). */
-#define CSIM_PLUGIN_API_VERSION 2u
+ *   v2: + register_radio_medium (Phase 11).
+ *   v3: + ui->publish_panel (a plugin contributes a live panel to the web UI). */
+#define CSIM_PLUGIN_API_VERSION 3u
 
 /* Opaque to the plugin — it only passes the pointer back into the registry
  * vtable, never dereferences it. */
@@ -70,11 +71,27 @@ typedef struct csim_log_ops {
     void (*printf)(const char *fmt, ...);
 } csim_log_ops_t;
 
+/* v3 UI capability (gate on api->version >= 3 AND api->ui != NULL).  A plugin
+ * publishes a named panel to the live web UI: `id` keys the panel (stable
+ * across updates — a new call to the same id REPLACES it), `panel_json` is a
+ * small JSON object the generic front-end renderer understands:
+ *     {"title":"<heading>","rows":[["<label>","<value>"], ...]}
+ * or {"title":"...","text":"<multiline>"}.  Call it from on_event/poll/destroy
+ * with the `sim` handle the callback received.  When no UI is attached the call
+ * is a cheap no-op (the panel is stored but never broadcast).  `sim` is the
+ * opaque sim_runtime_t the plugin already holds — it is not dereferenced by the
+ * plugin.  May be NULL on a host older than v3. */
+typedef struct csim_ui_ops {
+    void (*publish_panel)(sim_runtime_t *sim, const char *id,
+                          const char *panel_json);
+} csim_ui_ops_t;
+
 typedef struct csim_api {
     uint32_t                   version;   /* = CSIM_PLUGIN_API_VERSION */
     const csim_registry_ops_t *registry;  /* non-NULL in v1 */
     const csim_log_ops_t      *log;       /* may be NULL */
     sim_registry_t            *reg;        /* the registry to register into */
+    const csim_ui_ops_t       *ui;        /* v3: may be NULL on older hosts */
 } csim_api_t;
 
 /* The plugin's one exported symbol — dlsym()'d by the host loader.  The plugin

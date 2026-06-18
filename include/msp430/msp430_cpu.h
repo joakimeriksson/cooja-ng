@@ -144,6 +144,7 @@ typedef struct msp430_cpu {
     bool      interrupts_enabled;
     bool      cpu_off;
     bool      stopping;
+    int64_t   lpm_ns;             /* cumulative time fast-forwarded in LPM (energy) */
 
     /* Interrupt source callbacks */
     interrupt_handler_fn *interrupt_handler; /* per-vector callback */

@@ -9,6 +9,7 @@
  * callbacks.  The wall-clock pacing and loop control stay in the runner.
  */
 #include "websocket_ui_service.h"
+#include "sim_runtime.h"      /* sim_runtime_ui_panels_json (plugin UI panels) */
 
 #include "cJSON.h"
 
@@ -245,6 +246,24 @@ void ui_service_broadcast(websocket_ui_service_t *svc, int64_t sim_ns) {
     if (json) {
         ws_server_broadcast(svc->server, json, (int)strlen(json));
         free(json);
+    }
+
+    /* Plugin UI panels — a small text frame, independent of the full/CBOR
+     * state paths.  Sent every broadcast tick so panels track live; the
+     * front-end replaces its panel set from this message. */
+    if (has_clients && svc->rt) {
+        char *panels = sim_runtime_ui_panels_json(svc->rt);
+        if (panels) {
+            size_t need = strlen(panels) + 40;
+            char *msg = malloc(need);
+            if (msg) {
+                int len = snprintf(msg, need,
+                                   "{\"type\":\"panels\",\"panels\":%s}", panels);
+                ws_server_broadcast(svc->server, msg, len);
+                free(msg);
+            }
+            free(panels);
+        }
     }
 }
 

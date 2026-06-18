@@ -38,9 +38,57 @@ void sim_runtime_destroy(sim_runtime_t *sim) {
     /* sim_event_queue_t and radio_medium_t do not own dynamically
      * allocated memory in the current implementation, so destroy is a
      * no-op beyond resetting state. */
+    for (int i = 0; i < sim->ui_panel_count; i++) {
+        free(sim->ui_panels[i].json);
+        sim->ui_panels[i].json = NULL;
+    }
+    sim->ui_panel_count = 0;
     sim->run_state = SIM_RUN_STOPPED;
     sim->now_ns = 0;
     sim->end_ns = 0;
+}
+
+void sim_runtime_ui_publish_panel(sim_runtime_t *sim, const char *id,
+                                  const char *json) {
+    if (!sim || !id || !id[0] || !json) return;
+    int slot = -1;
+    for (int i = 0; i < sim->ui_panel_count; i++) {
+        if (strncmp(sim->ui_panels[i].id, id, SIM_RUNTIME_PANEL_ID_LEN) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (sim->ui_panel_count >= SIM_RUNTIME_MAX_PANELS) return;
+        slot = sim->ui_panel_count++;
+        snprintf(sim->ui_panels[slot].id, SIM_RUNTIME_PANEL_ID_LEN, "%s", id);
+        sim->ui_panels[slot].json = NULL;
+    }
+    char *copy = strdup(json);
+    if (!copy) return;          /* keep the prior value on OOM */
+    free(sim->ui_panels[slot].json);
+    sim->ui_panels[slot].json = copy;
+}
+
+char *sim_runtime_ui_panels_json(const sim_runtime_t *sim) {
+    if (!sim || sim->ui_panel_count <= 0) return NULL;
+    /* Compose {"id":<json>,...} by concatenation — the stored values are
+     * already JSON objects, so no escaping or cJSON dependency is needed. */
+    size_t cap = 2;
+    for (int i = 0; i < sim->ui_panel_count; i++)
+        cap += strlen(sim->ui_panels[i].id) + strlen(sim->ui_panels[i].json) + 6;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t off = 0;
+    out[off++] = '{';
+    for (int i = 0; i < sim->ui_panel_count; i++) {
+        off += (size_t)snprintf(out + off, cap - off, "%s\"%s\":%s",
+                                i ? "," : "",
+                                sim->ui_panels[i].id, sim->ui_panels[i].json);
+    }
+    out[off++] = '}';
+    out[off] = '\0';
+    return out;
 }
 
 /* ============================================================

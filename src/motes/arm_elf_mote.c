@@ -403,6 +403,18 @@ static int64_t arm_mote_instructions(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.arm.cpu.instructions;
 }
 
+/* CPU active/WFI time for the energy stream.  lpm_ns is accrued at each WFI
+ * fast-forward; active = elapsed (sim_time_ns) − lpm_ns. */
+static void arm_mote_cpu_power_ns(const sim_mote_t *m, int64_t *active_ns,
+                                  int64_t *lpm_ns) {
+    const arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    int64_t lpm = cpu->lpm_ns;
+    int64_t active = cpu->sim_time_ns - lpm;
+    if (active < 0) active = 0;
+    if (active_ns) *active_ns = active;
+    if (lpm_ns)    *lpm_ns    = lpm;
+}
+
 static void arm_mote_step_until(sim_mote_t *m, int64_t target) {
     arm_step_until(&MOTE_IMPL(m)->plat.arm.cpu, target);
 }
@@ -565,4 +577,5 @@ const sim_mote_ops_t arm_elf_mote_ops = {
     .rx_byte_sync    = arm_mote_rx_byte_sync,
     .rx_pre_sync     = NULL, /* MSP430-only pre-sync tick */
     .apply_startup_delay = arm_mote_apply_startup_delay,
+    .cpu_power_ns    = arm_mote_cpu_power_ns,
 };

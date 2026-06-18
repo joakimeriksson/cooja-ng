@@ -84,6 +84,11 @@ typedef struct websocket_ui_service {
     /* Live global stats the runner refreshes each broadcast. */
     int stat_rf_bytes, stat_uart_bytes;
     int stat_rx_frames_queued, stat_rx_frames_collided;
+
+    /* Runtime handle for plugin UI panels (set by the runner after start);
+     * NULL = no panel source.  ui_service_broadcast reads the published
+     * panels through it and ships a {"type":"panels"} frame. */
+    struct sim_runtime *rt;
 } websocket_ui_service_t;
 
 /* Start the UI: open the ws_server on `port`, load ui/index.html, wire the

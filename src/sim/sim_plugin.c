@@ -9,6 +9,7 @@
 #include "sim_plugin.h"
 #include "csim_plugin.h"
 #include "sim_registry.h"
+#include "sim_runtime.h"   /* sim_runtime_ui_publish_panel (the v3 ui sink) */
 
 #include <dlfcn.h>
 #include <stdarg.h>
@@ -32,6 +33,12 @@ static const csim_log_ops_t g_log_ops = {
 static const csim_registry_ops_t g_registry_ops = {
     .register_service      = sim_registry_register_service,
     .register_radio_medium = sim_registry_register_radio_medium,
+};
+
+/* v3 UI capability: the publish-panel sink writes into the runtime the plugin
+ * passes back (the opaque sim_runtime_t it received in its callbacks). */
+static const csim_ui_ops_t g_ui_ops = {
+    .publish_panel = sim_runtime_ui_publish_panel,
 };
 
 int sim_plugin_load(const char *path, sim_registry_t *reg,
@@ -60,6 +67,7 @@ int sim_plugin_load(const char *path, sim_registry_t *reg,
         .registry = &g_registry_ops,
         .log      = &g_log_ops,
         .reg      = reg,
+        .ui       = &g_ui_ops,
     };
     int rc = plugin_init(&api);
     if (rc != 0) {

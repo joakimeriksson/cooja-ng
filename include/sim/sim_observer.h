@@ -40,6 +40,19 @@ typedef enum sim_observer_kind {
     SIM_OBS_PACKET_FRAME,
     SIM_OBS_SIM_START,
     SIM_OBS_SIM_STOP,
+    /* A per-node radio-state transition (OFF/ON/TX/RX/INTF).  Carries the new
+     * state in u.radio_state.state (values match ui/sim_state.h's
+     * sim_radio_state_t: 0=OFF 1=ON 2=TX 3=RX 4=INTF — kept as a plain int so
+     * this kernel header stays independent of the UI header).  Emitted only
+     * while radio-state tracking is on (the live UI, or any loaded plugin —
+     * see sim_runtime_set_radio_state_tracking()); a duty-cycle / energy
+     * service accumulates time-in-state from this stream. */
+    SIM_OBS_RADIO_STATE,
+    /* A per-mote CPU power-time snapshot: cumulative active and low-power-mode
+     * (LPM/WFI) nanoseconds in u.cpu.  Emitted at end-of-run (one per mote) for
+     * an energy service; carries totals, not a transition, so the last snapshot
+     * is exact.  Only when radio-state tracking is on. */
+    SIM_OBS_CPU_STATE,
 } sim_observer_kind_t;
 
 typedef struct sim_observer_event {
@@ -67,6 +80,8 @@ typedef struct sim_observer_event {
             bool is_tx;             /* true = sender side, false = receiver side */
             const char *summary;    /* packet-analyzer summary text; NULL if none */
         } frame;
+        struct { int state; } radio_state;  /* SIM_OBS_RADIO_STATE: new state */
+        struct { int64_t active_ns, lpm_ns; } cpu; /* SIM_OBS_CPU_STATE totals */
     } u;
 } sim_observer_event_t;
 

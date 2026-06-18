@@ -18,6 +18,14 @@ header h1 { font-size: 14px; color: var(--accent); font-weight: 600; }
 .left-panel { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 #canvas-wrap { flex: 1; position: relative; min-width: 0; overflow: hidden; }
 canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg); cursor: grab; }
+/* Plugin UI panels — generic overlay, one box per published panel. */
+#plugin-panels { position: absolute; top: 8px; left: 8px; z-index: 3; display: flex; flex-direction: column; gap: 6px; pointer-events: none; max-width: 320px; }
+.plugin-panel { background: var(--header-bg); border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; font-size: 11px; box-shadow: 0 1px 4px rgba(0,0,0,0.3); pointer-events: auto; opacity: 0.94; }
+.plugin-panel h4 { margin: 0 0 4px; font-size: 11px; color: var(--accent); font-weight: 600; }
+.plugin-panel table { border-collapse: collapse; }
+.plugin-panel td { padding: 1px 6px 1px 0; white-space: nowrap; }
+.plugin-panel td:first-child { color: var(--muted); }
+.plugin-panel pre { margin: 0; white-space: pre-wrap; }
 #timeline-wrap { height: 0; border-top: 1px solid var(--border); overflow: hidden; transition: height 0.2s; position: relative; flex-shrink: 0; }
 #timeline-wrap.open { height: 200px; }
 #timeline-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--header-bg); cursor: grab; z-index: 1; }
@@ -97,7 +105,10 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
 </header>
 <div class="main">
   <div class="left-panel">
-    <div id="canvas-wrap"><canvas id="topo"></canvas></div>
+    <div id="canvas-wrap"><canvas id="topo"></canvas>
+      <!-- Plugin UI panels: filled generically from {"type":"panels"} frames. -->
+      <div id="plugin-panels"></div>
+    </div>
     <div id="timeline-wrap"><canvas id="timeline-canvas"></canvas></div>
   </div>
   <div class="sidebar" id="sidebar">
@@ -681,8 +692,9 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
           const d = decodeCBOR(ev.data);
           handleCBORDelta(d);
         } else {
-          // Text frame: JSON (full state)
+          // Text frame: JSON (full state or plugin panels)
           const msg = JSON.parse(ev.data);
+          if (msg.type === 'panels') { renderPluginPanels(msg.panels); return; }
           if (msg.type === 'full') { console.log('Full state:', msg.nodes?.length, 'nodes'); handleFullState(msg); }
           else handleFullState(msg); // Legacy
         }
@@ -723,6 +735,41 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
     sidebarBuilt = false;
     mergeConsole(state);
     mergeTimeline(state);
+  }
+
+  // Generic plugin-panel renderer: one box per panel id. Each panel is
+  // {title, rows:[[label,value],...]} or {title, text:"..."}. The page knows
+  // nothing plugin-specific — any plugin that calls ui->publish_panel shows up.
+  function renderPluginPanels(panels) {
+    const host = document.getElementById('plugin-panels');
+    if (!host || !panels) return;
+    host.innerHTML = '';
+    for (const id of Object.keys(panels)) {
+      const p = panels[id] || {};
+      const box = document.createElement('div');
+      box.className = 'plugin-panel';
+      const h = document.createElement('h4');
+      h.textContent = p.title || id;
+      box.appendChild(h);
+      if (Array.isArray(p.rows)) {
+        const tbl = document.createElement('table');
+        for (const r of p.rows) {
+          const tr = document.createElement('tr');
+          for (const cell of r) {
+            const td = document.createElement('td');
+            td.textContent = cell;
+            tr.appendChild(td);
+          }
+          tbl.appendChild(tr);
+        }
+        box.appendChild(tbl);
+      } else if (typeof p.text === 'string') {
+        const pre = document.createElement('pre');
+        pre.textContent = p.text;
+        box.appendChild(pre);
+      }
+      host.appendChild(box);
+    }
   }
 
   function handleDelta(msg) {
