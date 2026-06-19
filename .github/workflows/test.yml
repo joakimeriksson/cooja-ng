@@ -53,6 +53,17 @@ jobs:
       - name: Radio medium unit tests
         run: ./build/test_runner radio-medium
 
+      - name: Radio bus unit tests
+        run: ./build/test_runner radio-bus
+
+      - name: Version smoke
+        run: ./build/test_runner --version
+
+      - name: Plugin system (build + smoke: service, medium, energy, UI)
+        run: |
+          make plugins
+          tools/check-plugin.sh
+
       - name: cc2538dk RPL-UDP convergence (with -d 100)
         # Pins the -d (per-node startup-delay spread) mechanism end-to-end:
         # the cc2538dk RPL-UDP pair must converge with the staggered start.

@@ -24,6 +24,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "csim_version.h"
+
 /* MSP430 test functions */
 extern int run_correctness_tests(int verbose);
 extern int run_benchmarks(void);
@@ -53,6 +55,14 @@ extern int run_radio_bus_tests(int verbose);
 
 int main(int argc, char **argv) {
     int verbose = 0;
+
+    /* --version / -V: print version and exit (before anything else). */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+            printf("%s %s\n", CSIM_NAME, CSIM_VERSION);
+            return 0;
+        }
+    }
 
     /* Check for -v flag */
     for (int i = 1; i < argc; i++) {

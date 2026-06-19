@@ -330,7 +330,7 @@ Real, currently reproducible quirks in the *standalone CLI shortcuts* — none a
 3. **`test_firmware.c` reports `timertest.sky` as PASS** even when the firmware itself prints `FW: FAIL: count > 10 failed at timertest.c:166`.  The runner only matches `EXIT`.  Cosmetic.
 4. **The deferred-PHYEND fix that unblocked nRF54L15 has not been ported to nrf52840.**  That platform works today, but the same critical-section-during-TX scenario would surface if a faster RPL config exercises it.
 
-Active development state in [`PLAN.md`](PLAN.md); most recently verified totals in [`STATUS.txt`](STATUS.txt).
+Release history and per-version notes in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
