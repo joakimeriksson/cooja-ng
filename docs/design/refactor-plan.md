@@ -1894,6 +1894,45 @@ own neighbors doesn't see per-radio power (a future accessor).  CC1200 CCA reads
 reach" — matters only if a 2.4 GHz neighbor lowers PA (CC1200 doesn't push
 power).
 
+### 3.26 Energy estimation + plugin-ABI v3 (post-refactor feature work)
+
+> **Status: complete (one squashed commit `ebc32fc`).** Not a refactor phase —
+> the staged refactor (Phases 1–12) is done; this is feature work on top of the
+> finished plugin model.  It adds a PowerTracker/Energest-style energy estimator
+> and the kernel + ABI capabilities it required.  All additive: byte-identical
+> unless a plugin is loaded/named (sky + cc2538 RPL-UDP cross-build empty-diff).
+
+- **Observer additions.** `SIM_OBS_RADIO_STATE` (per-node OFF/ON/TX/RX/INTF
+  transitions — defined since Phase 1 but never emitted) is now emitted by the
+  runner, gated by a runtime `radio_state_tracking` flag (off by default; turned
+  on when a plugin is loaded/named, so headless non-plugin runs do no extra work
+  and stay byte-identical).  `SIM_OBS_CPU_STATE` carries a per-mote CPU
+  active/LPM snapshot: each core accrues `lpm_ns` at its LPM/WFI fast-forward (a
+  passive counter), a `cpu_power_ns` mote op reports cumulative `(active, lpm)`,
+  and the runner emits one exact snapshot per mote at end-of-run.
+- **Plugin ABI v3** (`CSIM_PLUGIN_API_VERSION 3`, append-only, version-gated):
+  `csim_ui_ops.publish_panel(sim, id, json)` lets a plugin draw a live panel in
+  the web UI.  Panels ride a small `{"type":"panels"}` WebSocket frame
+  (independent of the full-state JSON / CBOR delta paths) and a single generic
+  `renderPluginPanels()` in `ui/index.html` draws `{title, rows|text}` — no
+  plugin-specific front-end code.  Design write-up: `docs/design/ui-plugins.md`.
+- **Compile-in plugins selectable by config name.** A config `"plugins":
+  ["energest"]` (bare name, not a `.so` path) now **attaches** a built-in
+  service from the static registry — the name branch was validate-only before.
+  This is csim's analogue of Cooja's built-in plugins; dynamic `"plugins":
+  ["path.so"]` still works.  One feature = one provider: a built-in and a
+  same-named `.so` collide in the registry, so an in-tree plugin ships as *either*
+  a `.so` *or* a built-in, not both.
+- **energest** is the worked example: a host-agnostic engine
+  (`src/services/energest_engine.c`) driven by a `publish`+`log` sink, shipped
+  compiled-in (`energest_service.c`, registered in `sim_registry.c`).  The
+  engine/sink split keeps an out-of-tree `.so` form trivial.  `packet_sink` /
+  `lossy_medium` remain the dynamic `.so` examples.
+
+Deferred / caveats: ARM CPU active-current is modelled with MSP430-class figures
+(indicative, not calibrated); LEDs are on the observer stream but not yet an
+energy axis; panels are display-only (no panel→plugin command path).
+
 ## 4. Core API Sketches
 
 These are design sketches for the contracts the refactor should converge on.
@@ -3149,6 +3188,15 @@ the same patch.
   became sender-directional.  Byte-identical on every shipped config (sky/z1
   firmware never writes TXCTRL → PA stays max).  cc2538/cc1200/nrf deferred (no
   Cooja parity / dBm registers).
+- **Energy estimation + plugin-ABI v3 (§3.26) is complete** (post-refactor
+  feature work, commit `ebc32fc`).  Observer additions (`SIM_OBS_RADIO_STATE`
+  emitted under a `radio_state_tracking` gate; `SIM_OBS_CPU_STATE` from per-core
+  `lpm_ns` + the `cpu_power_ns` mote op); plugin ABI v3 (`publish_panel` — a
+  plugin draws a live web-UI panel, generic `{title,rows|text}` renderer);
+  config `"plugins": ["name"]` attaches a **compiled-in** built-in service by
+  name (Cooja built-in-plugin style).  Worked example: the energy estimator
+  (`energest_engine.c` + `energest_service.c`).  Byte-identical unless a plugin
+  is loaded/named.
 - **Terminology**: "service" for built-in components via `sim_service_ops_t`,
   "plugin" for dynamic-loaded services only (§2.1).
 - **JIT lives at the CPU-arch layer** (§5), not at runtime/mote/platform.

@@ -49,7 +49,7 @@ Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet)
 
 ```sh
 # Dynamic plugins (Phase 9) — dlopen a .so that registers a service or medium
-make plugins                                    # packet_sink.so + lossy_medium.so + energest.so
+make plugins                                    # packet_sink.so + lossy_medium.so
 ./build/test_runner test configs/test-rpl-udp-sky.json --plugin build/plugins/packet_sink.so
 ./build/test_runner test configs/plugin-demo-sky-v2.json   # config v2 "plugins": [...]
 # Energy estimation — a COMPILED-IN plugin (built-in service) selected by config
@@ -106,6 +106,14 @@ runner), `js_test_service.c` (JS test-engine line feed), `gdb_service.c`
 UI: ws_server + console + serialization). The end-of-run statistics stay
 runner-side (type-specific diagnostics that read chip memory + firmware
 symbols).
+
+A later addition is the energy estimator, shipped as a **compiled-in plugin**:
+`energest_engine.c` (host-agnostic core — per-mote radio duty cycle + Energest
+CPU/LPM/TX/LISTEN energy from the `SIM_OBS_RADIO_STATE`/`SIM_OBS_CPU_STATE`
+observer stream, driven by a `publish`+`log` sink) and `energest_service.c`
+(the built-in wrapper, registered in `sim_registry.c`, selectable by config
+name `"plugins": ["energest"]`). It also publishes a live web-UI panel via the
+v3 plugin ABI. See [`docs/design/ui-plugins.md`](docs/design/ui-plugins.md).
 
 ### Mote Modules (src/motes/)
 
