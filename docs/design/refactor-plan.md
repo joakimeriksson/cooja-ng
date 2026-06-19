@@ -10,6 +10,17 @@ This is a refactor plan, not a rewrite plan. The CPU emulators, radio chip
 drivers, firmware tests, and Cooja timing compatibility are valuable working
 assets. The goal is to move them behind stable contracts.
 
+The target model is **ports and adapters** (hexagonal): a simulation kernel
+(`sim_runtime_t` + the service host + the radio medium) is the core, and CPUs,
+radio chips, propagation policies, observation features, and plugins are
+adapters behind narrow vtable ports (`sim_mote_ops_t`, `sim_service_ops_t`,
+`sim_medium_ops_t`, `sim_host_t`, `csim_api`, the `sim_observer_event_t`
+stream). The binding rule throughout these phases is dependency inversion — the
+core never branches on a concrete adapter type ("add an op, don't switch on
+`NODE_MSP430`"). It is pragmatic, not dogmatic: the core exposes a concrete
+`sim_runtime_t` and the runner is still a fat driving adapter, but the
+dependency arrows point inward.
+
 ## 1. Current State
 
 ### 1.1 What the project already has

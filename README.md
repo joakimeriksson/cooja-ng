@@ -227,6 +227,33 @@ The nrf54l15 is slow because the GRTC is modeled at full 1 MHz and every TX defe
 
 ## Architecture
 
+**Ports and adapters.**  At the structural level Cooja-NG is a ports-and-adapters
+(hexagonal) design.  A small simulation **kernel** — `sim_runtime_t` (clock,
+unified event queue, radio bus, mote slots) plus the service host and the radio
+medium — is the core, and it depends on nothing concrete: it talks only to a
+handful of narrow vtable **ports**, and everything platform- or
+feature-specific is an **adapter** behind one of them.
+
+| Port (interface) | Adapters (implementations) |
+|---|---|
+| `sim_mote_ops_t` — "a node" | MSP430-ELF, ARM-ELF (CC2538/Firefly/nRF52840/nRF54L15), native Cooja mote, JS app mote |
+| `sim_service_ops_t` — "an observer/feature" | timeline, pcap, progress, gdb, websocket-UI, energest, JSON/JS test engines |
+| `sim_medium_ops_t` — "a propagation policy" | UDGM, NONE, and plugin media |
+| `sim_host_t` — chip→host callbacks | the runner's radio channel/power/byte hooks |
+| `csim_api` (`csim_plugin.h`) — the dlopen boundary | external `.so` plugins (service / medium / UI panel) |
+| `sim_observer_event_t` — the outbound event stream | anything that subscribes |
+
+The enforced rule is **dependency inversion**: the kernel never branches on a
+node's type — *"add an op, don't `switch` on `NODE_MSP430`"* — so the runner
+includes no chip headers and a new SoC, radio policy, feature, or plugin slots
+in by implementing a port, not by editing the core.  The plugin ABI is the
+strictest port: a plugin reaches the host *only* through the passed vtable,
+never a kernel struct.  (Pragmatic C, not dogma: the kernel exposes a concrete
+`sim_runtime_t` rather than an opaque handle, and the `test_runner` frontend is
+still a fat driving adapter — but the dependency arrows point inward.)  The
+staged refactor that established this boundary is tracked in
+[`docs/design/refactor-plan.md`](docs/design/refactor-plan.md).
+
 **Dual time domains.**  Every CPU tracks `cycles` (CPU-cycle count, the unit the interpreter advances) and `sim_time_ns` (ns-precise wall clock, the unit peripherals and inter-node coordination use).  Reconciled at three sync points: before each event callback, at the end of `*_step_until()`, and inside `*_set_frequency()` on DCO calibration.  This is what lets one node speed up after DCO cal while another is still booting, or an MSP430 and a CC2538 (different MHz) share the same medium.
 
 **Hot path.**
