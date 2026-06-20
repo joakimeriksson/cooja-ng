@@ -148,6 +148,7 @@ static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
 #define NRF_UARTE_TXD_MAXCNT       0x548
 #define NRF_UARTE_TXD_AMOUNT       0x54C
 #define NRF_UARTE_INT_ENDTX        (1u << 8)
+#define NRF_UARTE_INT_TXSTOPPED    (1u << 22)  /* int-driven shell/console TX "ready" */
 
 static int nrf_uart_read(void *user_data, uint32_t addr) {
     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
@@ -189,7 +190,11 @@ static void uarte_start_tx(nrf_uart_state_t *uart) {
      * returns — what the driver's ENDTX→STOPTX PPI link would yield (csim
      * doesn't model PPI).  The init/poll path then exits its TXSTOPPED spin. */
     uart->txstopped  = 1;
-    if ((uart->intenset & NRF_UARTE_INT_ENDTX) && soc->plat->cpu.nvic)
+    /* The interrupt-driven console/shell driver waits on TXSTOPPED (not ENDTX)
+     * as its "TX ready" signal; raise the IRQ for either so it feeds the next
+     * chunk until its buffer drains. */
+    if ((uart->intenset & (NRF_UARTE_INT_ENDTX | NRF_UARTE_INT_TXSTOPPED)) &&
+        soc->plat->cpu.nvic)
         arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, uart->irq_num);
 }
 
@@ -220,7 +225,16 @@ static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF_UARTE_EVENTS_ENDTX:   uart->endtx      = value & 1; break;
         case NRF_UARTE_EVENTS_TXSTARTED: uart->txstarted = value & 1; break;
         case NRF_UARTE_EVENTS_TXSTOPPED: uart->txstopped = value & 1; break;
-        case NRF_UARTE_INTENSET:       uart->intenset |= value; break;
+        case NRF_UARTE_INTENSET:
+            uart->intenset |= value;
+            /* int-driven TX bootstrap: enabling TXSTOPPED while the event is
+             * already latched fires the IRQ now, kicking the first TX. */
+            if ((value & NRF_UARTE_INT_TXSTOPPED) && uart->txstopped &&
+                ((nrf52840_soc_t *)uart->soc)->plat->cpu.nvic)
+                arm_nvic_set_pending(
+                    (arm_nvic_t *)((nrf52840_soc_t *)uart->soc)->plat->cpu.nvic,
+                    uart->irq_num);
+            break;
         case NRF_UARTE_INTENCLR:       uart->intenset &= ~value; break;
         default: break;
     }
