@@ -31,20 +31,13 @@ python3 -m venv --without-pip ~/zephyr-venv          # PEP 668: build pip inside
 
 export PATH=~/zephyr-venv/bin:$PATH
 export ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb GNUARMEMB_TOOLCHAIN_PATH=/usr
-west build -b nrf52840dk/nrf52840 zephyr/samples/hello_world \
-    -- -DDTC_OVERLAY_FILE=legacy-uart.overlay
+west build -b nrf52840dk/nrf52840 zephyr/samples/hello_world
 ```
 
-The overlay forces the **non-DMA legacy UART** (`uart_nrfx_uart`), whose
-register window csim models:
-
-```dts
-/* legacy-uart.overlay */
-&uart0 { compatible = "nordic,nrf-uart"; };
-```
-
-Then run the resulting `build/zephyr/zephyr.elf` (renamed to a
-`*.nrf52840-dk` path so the board registry picks the platform).
+No board overlay or config changes are needed — the stock image (default
+**UARTE** EasyDMA console) runs as-is. Then run the resulting
+`build/zephyr/zephyr.elf` (renamed to a `*.nrf52840-dk` path so the board
+registry picks the platform).
 
 ## What the emulator provides
 
@@ -56,16 +49,17 @@ Contiki used (see commit history):
   events, so the spin never exited (the actual boot blocker).
 - **RTC1** (`0x40011000`, IRQ 17) — Zephyr's `nrf_rtc_timer` system clock
   (Contiki uses RTC0).
+- **UARTE EasyDMA TX** (`TASKS_STARTTX` + `TXD.PTR`/`TXD.MAXCNT` →
+  `EVENTS_ENDTX`/`TXSTOPPED`) — the default Zephyr console. csim's transfer is
+  instantaneous, so it latches `TXSTOPPED` immediately (what the driver's
+  `ENDTX→STOPTX` PPI link would produce; csim doesn't model PPI). The legacy
+  non-DMA UART (Contiki's path, and Zephyr with a `nordic,nrf-uart` overlay)
+  also still works.
 - The `ARM_MMIO_TRACE=1` diagnostic (logs the first access to each unmapped
   peripheral page) is how the missing registers were found — useful for any
   future firmware bring-up.
 
 ## Limitations
 
-- **Console needs the legacy-UART overlay.** The default `nrf52840dk` console
-  is **UARTE** (EasyDMA), which csim does not model yet — an unmodified Zephyr
-  image boots but prints nothing. Modelling the UARTE TX path
-  (`TASKS_STARTTX`/`TXD.PTR`/`TXD.MAXCNT` → `EVENTS_ENDTX`) would let stock
-  images print without the overlay.
 - Single-node console demo only; Zephyr's 802.15.4 networking on csim's radio
   medium is untried.

@@ -29,10 +29,20 @@ typedef struct nrf_clock_state {
  *   spin on EVENTS_TXDRDY (0x11C) until set
  *   clear EVENTS_TXDRDY (write 0). */
 typedef struct nrf_uart_state {
-    uint32_t enable;          /* offset 0x500 */
+    uint32_t enable;          /* offset 0x500 (4 = legacy UART, 8 = UARTE) */
     uint32_t txdrdy;          /* offset 0x11C */
     arm_uart_tx_callback tx_cb;
     void                *tx_user;
+    /* UARTE EasyDMA TX (stock Zephyr console; Contiki uses the legacy path). */
+    void    *soc;             /* back-pointer to read the DMA buffer from RAM */
+    int      irq_num;         /* UARTE0_UART0 IRQ = 2 on nRF52840 */
+    uint32_t txd_ptr;         /* offset 0x544 — TX DMA source address */
+    uint32_t txd_maxcnt;      /* offset 0x548 — byte count to send */
+    uint32_t txd_amount;      /* offset 0x54C — bytes actually sent (read-back) */
+    uint32_t intenset;        /* offset 0x304 (ENDTX = bit 8) */
+    uint32_t endtx;           /* offset 0x120 — TX DMA complete event */
+    uint32_t txstarted;       /* offset 0x150 — TX started event */
+    uint32_t txstopped;       /* offset 0x158 — TX stopped (= TX inactive) */
 } nrf_uart_state_t;
 
 /* RTC0 at 0x4000B000.

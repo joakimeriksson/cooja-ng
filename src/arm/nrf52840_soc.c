@@ -135,15 +135,61 @@ static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
 #define NRF_UART_EVENTS_TXDRDY     0x11C
 #define NRF_UART_ENABLE            0x500
 #define NRF_UART_TXD               0x51C
+/* UARTE EasyDMA TX (shares the 0x40002000 page; stock Zephyr console path). */
+#define NRF_UARTE_IRQ              2
+#define NRF_UARTE_TASKS_STARTTX    0x008
+#define NRF_UARTE_TASKS_STOPTX     0x00C
+#define NRF_UARTE_EVENTS_ENDTX     0x120
+#define NRF_UARTE_EVENTS_TXSTARTED 0x150
+#define NRF_UARTE_EVENTS_TXSTOPPED 0x158
+#define NRF_UARTE_INTENSET         0x304
+#define NRF_UARTE_INTENCLR         0x308
+#define NRF_UARTE_TXD_PTR          0x544
+#define NRF_UARTE_TXD_MAXCNT       0x548
+#define NRF_UARTE_TXD_AMOUNT       0x54C
+#define NRF_UARTE_INT_ENDTX        (1u << 8)
 
 static int nrf_uart_read(void *user_data, uint32_t addr) {
     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
     uint32_t off = addr - NRF_UART0_BASE;
     switch (off) {
-        case NRF_UART_EVENTS_TXDRDY: return (int)uart->txdrdy;
-        case NRF_UART_ENABLE:        return (int)uart->enable;
+        case NRF_UART_EVENTS_TXDRDY:     return (int)uart->txdrdy;
+        case NRF_UART_ENABLE:            return (int)uart->enable;
+        /* UARTE EasyDMA TX read-backs. */
+        case NRF_UARTE_EVENTS_ENDTX:     return (int)uart->endtx;
+        case NRF_UARTE_EVENTS_TXSTARTED: return (int)uart->txstarted;
+        case NRF_UARTE_EVENTS_TXSTOPPED: return (int)uart->txstopped;
+        case NRF_UARTE_TXD_PTR:          return (int)uart->txd_ptr;
+        case NRF_UARTE_TXD_MAXCNT:       return (int)uart->txd_maxcnt;
+        case NRF_UARTE_TXD_AMOUNT:       return (int)uart->txd_amount;
+        case NRF_UARTE_INTENSET:
+        case NRF_UARTE_INTENCLR:         return (int)uart->intenset;
         default: return 0;
     }
+}
+
+/* UARTE TASKS_STARTTX: DMA `maxcnt` bytes from RAM at `txd_ptr` straight out
+ * the console, then latch ENDTX/TXSTARTED (and raise the IRQ if enabled).
+ * Instant transfer — no per-byte baud timing, same lenience as the legacy
+ * path. */
+static void uarte_start_tx(nrf_uart_state_t *uart) {
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)uart->soc;
+    arm_cpu_t *cpu = &soc->plat->cpu;
+    uint32_t n = uart->txd_maxcnt;
+    if (n > 4096) n = 4096;                 /* sanity bound */
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t b = arm_read8(cpu, uart->txd_ptr + i);
+        if (uart->tx_cb) uart->tx_cb(uart->tx_user, b);
+    }
+    uart->txd_amount = n;
+    uart->txstarted  = 1;
+    uart->endtx      = 1;                    /* poll_out spins on this */
+    /* csim's transfer is instantaneous, so TX is inactive the moment STARTTX
+     * returns — what the driver's ENDTX→STOPTX PPI link would yield (csim
+     * doesn't model PPI).  The init/poll path then exits its TXSTOPPED spin. */
+    uart->txstopped  = 1;
+    if ((uart->intenset & NRF_UARTE_INT_ENDTX) && soc->plat->cpu.nvic)
+        arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, uart->irq_num);
 }
 
 static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
@@ -164,6 +210,16 @@ static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF_UART_ENABLE:
             uart->enable = value;
             break;
+        /* UARTE EasyDMA TX path. */
+        case NRF_UARTE_TASKS_STARTTX:  if (value == 1) uarte_start_tx(uart); break;
+        case NRF_UARTE_TASKS_STOPTX:   if (value == 1) uart->txstopped = 1; break;
+        case NRF_UARTE_TXD_PTR:        uart->txd_ptr    = value; break;
+        case NRF_UARTE_TXD_MAXCNT:     uart->txd_maxcnt = value; break;
+        case NRF_UARTE_EVENTS_ENDTX:   uart->endtx      = value & 1; break;
+        case NRF_UARTE_EVENTS_TXSTARTED: uart->txstarted = value & 1; break;
+        case NRF_UARTE_EVENTS_TXSTOPPED: uart->txstopped = value & 1; break;
+        case NRF_UARTE_INTENSET:       uart->intenset |= value; break;
+        case NRF_UARTE_INTENCLR:       uart->intenset &= ~value; break;
         default: break;
     }
 }
@@ -1130,9 +1186,12 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     plat->host.schedule_ns = nrf_host_schedule_ns;
     plat->host.cancel      = nrf_host_cancel;
 
-    /* CLOCK and UART register windows. */
+    /* CLOCK and UART register windows.  The UART page serves both the legacy
+     * UART (Contiki) and UARTE EasyDMA (stock Zephyr) register maps. */
     arm_register_io(&plat->cpu, NRF_CLOCK_BASE, NRF_CLOCK_SIZE,
                     nrf_clock_read, nrf_clock_write, &soc->clock);
+    soc->uart0.soc     = soc;
+    soc->uart0.irq_num = NRF_UARTE_IRQ;
     arm_register_io(&plat->cpu, NRF_UART0_BASE, NRF_UART0_SIZE,
                     nrf_uart_read, nrf_uart_write, &soc->uart0);
 

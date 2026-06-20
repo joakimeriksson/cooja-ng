@@ -1,7 +1,0 @@
-/* Cooja-NG: force the non-DMA legacy nRF UART (the register window csim
- * models) instead of Zephyr's default UARTE EasyDMA console.
- * Build: west build -b nrf52840dk/nrf52840 samples/hello_world \
- *          -- -DDTC_OVERLAY_FILE=.../zephyr-legacy-uart.overlay   */
-&uart0 {
-    compatible = "nordic,nrf-uart";
-};
