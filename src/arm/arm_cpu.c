@@ -2413,8 +2413,25 @@ int arm_step(arm_cpu_t *cpu, int count) {
                                     ((arm_nvic_t *)cpu->nvic)->has_pending)
                                     arm_nvic_check_pending((arm_nvic_t *)cpu->nvic);
                                 break;
-                            case 17: cpu->basepri = val & 0xFF; break;
-                            case 19: cpu->faultmask = val & 1; break;
+                            case 17: cpu->basepri = val & 0xFF;
+                                /* Lowering BASEPRI may unmask a pending IRQ. */
+                                if (cpu->nvic &&
+                                    ((arm_nvic_t *)cpu->nvic)->has_pending)
+                                    arm_nvic_check_pending((arm_nvic_t *)cpu->nvic);
+                                break;
+                            case 18: /* BASEPRI_MAX: writes BASEPRI only if it
+                                      * raises the masking (higher priority / a
+                                      * smaller non-zero value). */
+                                if ((val & 0xFFu) != 0 &&
+                                    (cpu->basepri == 0 ||
+                                     (val & 0xFFu) < cpu->basepri))
+                                    cpu->basepri = val & 0xFF;
+                                break;
+                            case 19: cpu->faultmask = val & 1;
+                                if (cpu->faultmask == 0 && cpu->nvic &&
+                                    ((arm_nvic_t *)cpu->nvic)->has_pending)
+                                    arm_nvic_check_pending((arm_nvic_t *)cpu->nvic);
+                                break;
                             case 20: { /* CONTROL */
                                 bool new_psp = (val & 2) != 0;
                                 /* In thread mode, flipping SPSEL swaps the

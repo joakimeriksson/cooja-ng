@@ -290,6 +290,16 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
         return;
     }
 
+    /* Respect BASEPRI / FAULTMASK.  Cortex-M's BASEPRI, when non-zero, masks
+     * every exception whose priority is numerically >= BASEPRI (i.e. not
+     * strictly higher priority).  Zephyr's irq_lock() uses BASEPRI (not PRIMASK)
+     * on Cortex-M, so without this an IRQ (e.g. the RNG) fires INSIDE the
+     * scheduler's critical section and reads half-updated ready_q state — which
+     * crashed the Zephyr boot.  The masked exception stays pending until
+     * BASEPRI/FAULTMASK is lowered (an ISER/PRIMASK/BASEPRI write re-checks). */
+    if (cpu->faultmask & 1) return;
+    if (cpu->basepri != 0 && best_prio >= (int)(cpu->basepri & 0xFFu)) return;
+
     /* Check if we can preempt the current handler */
     if (nvic->active_exception > 0) {
         int active_prio = arm_nvic_get_priority(nvic, nvic->active_exception);
