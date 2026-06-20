@@ -2308,11 +2308,17 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         int rd = (hw2 >> 8) & 0xF;
                         int sysm = hw2 & 0xFF;
                         switch (sysm) {
-                            case 0: cpu->reg[rd] = cpu->xpsr; break;
-                            case 1: cpu->reg[rd] = cpu->xpsr & 0x1FF; break; /* IPSR */
-                            case 2: cpu->reg[rd] = cpu->xpsr & (1u << 24); break; /* EPSR */
-                            case 5: case 6: case 7:
-                                cpu->reg[rd] = cpu->xpsr; break; /* Combined */
+                            case 0: cpu->reg[rd] = cpu->xpsr; break;       /* APSR */
+                            case 1: cpu->reg[rd] = cpu->xpsr & 0x1FF; break; /* IAPSR */
+                            case 2: cpu->reg[rd] = cpu->xpsr & (1u << 24); break; /* EAPSR */
+                            case 3: cpu->reg[rd] = cpu->xpsr; break;       /* XPSR (full) */
+                            /* IPSR (SYSm=5) is the exception number only — bits
+                             * [8:0].  Zephyr's _isr_wrapper does `mrs IPSR; sub
+                             * #16` to index the SW ISR table, so returning the
+                             * full xPSR here mis-dispatches every IRQ. */
+                            case 5: cpu->reg[rd] = cpu->xpsr & 0x1FFu; break; /* IPSR */
+                            case 6: case 7:
+                                cpu->reg[rd] = cpu->xpsr; break; /* (I)EPSR (approx) */
                             case 8: cpu->reg[rd] = cpu->msp; break;
                             case 9: cpu->reg[rd] = cpu->psp; break;
                             case 16: cpu->reg[rd] = cpu->primask; break;
