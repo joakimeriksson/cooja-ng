@@ -198,6 +198,7 @@ typedef struct nrf_rng_state {
     uint32_t intenset;        /* offset 0x304 (bit 0 = VALRDY) */
     uint32_t shorts;          /* offset 0x200 */
     bool     running;
+    bool     first_byte_delivered; /* true after the first VALRDY fires */
     uint32_t prng_state;      /* xorshift32 seeded per-node */
     int      irq_num;         /* RNG IRQ = 13 on nRF52840 */
     void    *soc;             /* back-pointer for the VALRDY IRQ */

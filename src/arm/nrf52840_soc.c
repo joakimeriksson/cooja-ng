@@ -1003,7 +1003,14 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
 #define NRF_RNG_VALUE             0x508
 #define NRF_RNG_INT_VALRDY        (1u << 0)
 #define NRF_RNG_IRQ               13      /* RNG_IRQn on nRF52840 */
-#define NRF_RNG_VALRDY_CYCLES     10000   /* ~156 µs/byte @ 64 MHz — paced like HW */
+/* RNG VALRDY pacing.  The initial delay is large enough that the first
+ * byte fires well AFTER Zephyr's prepare_multithreading() has run —
+ * otherwise any ISR during pre-kernel triggers z_arm_exc_exit's PendSV
+ * check while ready_q.cache is still NULL, crashing the boot.  Once the
+ * first byte is delivered (POST_KERNEL), subsequent bytes use fast
+ * pacing so the entropy pool fills quickly for nrf_802154_random_init. */
+#define NRF_RNG_VALRDY_CYCLES_INITIAL  500000  /* ~7.8 ms @ 64 MHz */
+#define NRF_RNG_VALRDY_CYCLES_FAST     1000    /* ~15.6 µs @ 64 MHz */
 
 /* Paced VALRDY generator.  Real HW produces one random byte roughly every
  * ~167 µs and raises VALRDY each time; the entropy_nrf5 driver takes one byte
@@ -1015,8 +1022,11 @@ static void nrf_rng_arm(nrf_rng_state_t *rng) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)rng->soc;
     if (!soc || !soc->plat || !rng->valrdy_event) return;
     if (!rng->running || !(rng->intenset & NRF_RNG_INT_VALRDY)) return;
+    int64_t delay = rng->first_byte_delivered
+                  ? NRF_RNG_VALRDY_CYCLES_FAST
+                  : NRF_RNG_VALRDY_CYCLES_INITIAL;
     arm_schedule_event(&soc->plat->cpu, (arm_event_t *)rng->valrdy_event,
-                       (int64_t)soc->plat->cpu.cycles + NRF_RNG_VALRDY_CYCLES);
+                       (int64_t)soc->plat->cpu.cycles + delay);
 }
 
 static void nrf_rng_event_cb(void *user_data, cpu_event_t *event) {
@@ -1025,6 +1035,7 @@ static void nrf_rng_event_cb(void *user_data, cpu_event_t *event) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)rng->soc;
     if (!soc || !soc->plat || !rng->running) return;
     rng->evt_valrdy = 1;
+    rng->first_byte_delivered = true;
     if ((rng->intenset & NRF_RNG_INT_VALRDY) && soc->plat->cpu.nvic)
         arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, rng->irq_num);
     nrf_rng_arm(rng);   /* keep producing while running + enabled */
@@ -1057,8 +1068,12 @@ static void nrf_rng_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF_RNG_TASKS_START:
             if (value == 1) {
                 rng->running = true;
+                rng->first_byte_delivered = false;
                 /* First byte: instant for pollers (Contiki reads VALRDY then
-                 * VALUE); the paced event drives interrupt-driven consumers. */
+                 * VALUE); the paced event drives interrupt-driven consumers.
+                 * The initial VALRDY event is intentionally delayed (see
+                 * NRF_RNG_VALRDY_CYCLES_INITIAL) so it cannot fire during
+                 * Zephyr's pre-kernel phase. */
                 rng->evt_valrdy = 1;
                 nrf_rng_arm(rng);
             }
