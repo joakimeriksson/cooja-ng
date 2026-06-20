@@ -45,14 +45,28 @@ does all the work.** (Only the sample's own `overlay-802154.conf`, which is how
 the sample selects 802.15.4, is used — that's the sample's config, not a
 modification.) So the console must be modelled, not configured around.
 
-Stock net samples use **deferred logging** over the **interrupt/async UARTE TX**
-path, which csim doesn't model → 0 bytes (even the boot banner, routed through
-`LOG_PRINTK`, is buffered and flushed by the log thread via async TX). Model it:
-trace the UART page (`0x40002xxx`) to see the exact TX sequence (FIFO fill +
-`TASKS_STARTTX` + `ENDTX`-IRQ chaining, possibly multi-buffer via a `TXD.PTR`
-list), then extend csim's UARTE model to deliver those bytes and raise the
-`ENDTX` IRQ so the driver's TX ISR feeds the next chunk.
-- **Verify:** stock echo prints its boot banner + `net`/`802154` debug logs.
+**Investigated (2026-06-20) — NOT a csim gap.** The stock `echo_server`
+802.15.4 build has **no log backend** (`CONFIG_LOG_BACKEND_UART` not set; no
+RTT/net backend — only `LOG_BACKEND_SHOW_*` formatting), with
+`CONFIG_LOG=y` + `CONFIG_LOG_PRINTK=y`. So its logs *and* the `printk` boot
+banner route into the log system and are dropped — on real hardware too, in this
+exact config. csim's UART is fine (hello_world prints; the interrupt-driven
+`is_tx_ready`/`tx_start` path uses the `TXSTOPPED`/`ENDTX` events csim already
+sets). The data-TX path is simply never called because nothing flushes to a
+UART backend.
+
+Consequences for the plan (stock firmware, no config changes):
+- **Don't model "async UART" for this** — it wouldn't help; there's no backend
+  feeding it.
+- **Observe the radio without the console:** csim's `Total RF bytes` counter +
+  `NRF_RADIO_TRACE` show TX/RX directly; use those (not logs) to verify Phases
+  2–4. App-level "echo worked" confirmation needs a sample whose stock config
+  *does* output (some net samples enable `LOG_BACKEND_UART`; or the
+  `*-shell`/CLI variants) — pick the firmware by what it prints, don't change it.
+- The live block is upstream: net init reaches idle with **0 RADIO accesses**,
+  so the `nrf_802154` driver isn't completing its radio setup (silently, since
+  there's no log output). Finding *why* needs either a printing sample or
+  emulator-side tracing of the driver's init call path.
 
 ### Phase 1 — `nrf_802154` init reaches the RADIO
 With console visible, find where net init blocks (debug logs + spin PC). Model
