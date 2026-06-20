@@ -605,6 +605,9 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
 #define RADIO_INT_CRCOK        (1u << 12)
 #define RADIO_INT_CRCERROR     (1u << 13)
 #define RADIO_INT_FRAMESTART   (1u << 14)
+#define RADIO_INT_EDEND        (1u << 16)
+#define RADIO_INT_CCAIDLE      (1u << 17)
+#define RADIO_INT_CCABUSY      (1u << 18)
 #define RADIO_INT_TXREADY      (1u << 21)
 #define RADIO_INT_RXREADY      (1u << 22)
 #define RADIO_INT_MHRMATCH     (1u << 23)
@@ -645,6 +648,9 @@ static uint32_t radio_event_offset(uint32_t int_mask) {
         case RADIO_INT_CRCOK:      return RADIO_EVENTS_CRCOK;
         case RADIO_INT_CRCERROR:   return RADIO_EVENTS_CRCERROR;
         case RADIO_INT_FRAMESTART: return RADIO_EVENTS_FRAMESTART;
+        case RADIO_INT_EDEND:      return RADIO_EVENTS_EDEND;
+        case RADIO_INT_CCAIDLE:    return RADIO_EVENTS_CCAIDLE;
+        case RADIO_INT_CCABUSY:    return RADIO_EVENTS_CCABUSY;
         case RADIO_INT_TXREADY:    return RADIO_EVENTS_TXREADY;
         case RADIO_INT_RXREADY:    return RADIO_EVENTS_RXREADY;
         case RADIO_INT_PHYEND:     return RADIO_EVENTS_PHYEND;
@@ -692,6 +698,12 @@ static void radio_apply_shorts_after_event(nrf52840_soc_t *soc, uint32_t event_m
             case SHORT_CCAIDLE_TXEN:
                 radio_trigger_task(soc, RADIO_TASKS_TXEN);
                 break;
+            case SHORT_RXREADY_CCASTART:
+                radio_trigger_task(soc, RADIO_TASKS_CCASTART);
+                break;
+            case SHORT_CCAIDLE_STOP:
+                radio_trigger_task(soc, RADIO_TASKS_STOP);
+                break;
         }
     }
 }
@@ -707,7 +719,13 @@ void nrf_radio_disable_cb(void *user_data, cpu_event_t *event) {
     (void)event;
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
-    /* Now we can latch the event and fire the interrupt. */
+    /* Only complete the transition if we're still in the DISABLE
+     * intermediate state.  If the firmware issued another task (e.g.
+     * TASKS_RXEN immediately after TASKS_DISABLE), the state has
+     * already moved on and we must not stomp it back to DISABLED. */
+    if (r->state != NRF_RADIO_STATE_TXDISABLE &&
+        r->state != NRF_RADIO_STATE_RXDISABLE)
+        return;
     r->state = NRF_RADIO_STATE_DISABLED;
     radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
     radio_apply_shorts_after_event(soc, SHORT_DISABLED_TXEN);
@@ -725,6 +743,7 @@ static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state) {
             radio_event(soc, &r->evt_rxready, RADIO_INT_RXREADY);
             radio_apply_shorts_after_event(soc, SHORT_READY_START);
             radio_apply_shorts_after_event(soc, SHORT_RXREADY_START);
+            radio_apply_shorts_after_event(soc, SHORT_RXREADY_CCASTART);
             break;
         case NRF_RADIO_STATE_TXIDLE:
             radio_event(soc, &r->evt_ready,   RADIO_INT_READY);
@@ -753,12 +772,29 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             /* Per nRF52840 PS, TXEN is only legal from DISABLED, but
              * Contiki's nrf52840-ieee driver fires TXEN directly from
              * RXIDLE (after STOP) and depends on hardware to handle the
-             * implicit transition. Mirror that lenience. */
+             * implicit transition. Mirror that lenience.
+             * If we're in a DISABLE intermediate state (deferred event
+             * pending), cancel it and fire DISABLED synchronously first
+             * so the driver's DISABLED poll resolves, then proceed. */
+            if (r->state == NRF_RADIO_STATE_TXDISABLE ||
+                r->state == NRF_RADIO_STATE_RXDISABLE) {
+                if (r->disable_event && soc->plat)
+                    arm_cancel_event(&soc->plat->cpu, (arm_event_t *)r->disable_event);
+                r->state = NRF_RADIO_STATE_DISABLED;
+                radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
+            }
             if (r->state != NRF_RADIO_STATE_TX &&
                 r->state != NRF_RADIO_STATE_TXRU)
                 radio_set_state(soc, NRF_RADIO_STATE_TXIDLE);
             break;
         case RADIO_TASKS_RXEN:
+            if (r->state == NRF_RADIO_STATE_TXDISABLE ||
+                r->state == NRF_RADIO_STATE_RXDISABLE) {
+                if (r->disable_event && soc->plat)
+                    arm_cancel_event(&soc->plat->cpu, (arm_event_t *)r->disable_event);
+                r->state = NRF_RADIO_STATE_DISABLED;
+                radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
+            }
             if (r->state != NRF_RADIO_STATE_RX &&
                 r->state != NRF_RADIO_STATE_RXRU)
                 radio_set_state(soc, NRF_RADIO_STATE_RXIDLE);
@@ -835,7 +871,7 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             break;
         case RADIO_TASKS_CCASTART:
             /* No interference model — always idle. */
-            radio_event(soc, &r->evt_ccaidle, 0);
+            radio_event(soc, &r->evt_ccaidle, RADIO_INT_CCAIDLE);
             radio_apply_shorts_after_event(soc, SHORT_CCAIDLE_TXEN);
             radio_apply_shorts_after_event(soc, SHORT_CCAIDLE_STOP);
             break;
@@ -843,7 +879,7 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             radio_event(soc, &r->evt_rssiend, 0);
             break;
         case RADIO_TASKS_EDSTART:
-            radio_event(soc, &r->evt_edend,   0);
+            radio_event(soc, &r->evt_edend,   RADIO_INT_EDEND);
             break;
         default:
             break;
