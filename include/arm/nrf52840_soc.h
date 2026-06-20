@@ -167,6 +167,7 @@ typedef struct nrf_radio_state {
     uint32_t evt_phyend;       /* 0x16C */
 
     int      irq_num;          /* RADIO IRQ = 1 */
+    void    *disable_event;    /* deferred DISABLED event (opaque cpu_event_t *) */
     /* RX byte parser state — incoming on-air bytes feed this. */
     int      rx_phase;         /* nrf_rx_phase_t enum */
     int      rx_remaining;

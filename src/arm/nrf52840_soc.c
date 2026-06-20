@@ -672,6 +672,24 @@ static void radio_apply_shorts_after_event(nrf52840_soc_t *soc, uint32_t event_m
     }
 }
 
+/* Ramp-down delay for TASKS_DISABLE.  Real nRF52840 takes ~6 µs to
+ * transition from any active state to DISABLED.  The firmware clears
+ * EVENTS_DISABLED then spins until it reads back 1 — if we set it
+ * synchronously in the same instruction, the firmware clears it before
+ * the poll starts and spins forever. */
+#define NRF_RADIO_DISABLE_CYCLES  384   /* ~6 µs @ 64 MHz */
+
+void nrf_radio_disable_cb(void *user_data, cpu_event_t *event) {
+    (void)event;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
+    nrf_radio_state_t *r = &soc->radio;
+    /* Now we can latch the event and fire the interrupt. */
+    r->state = NRF_RADIO_STATE_DISABLED;
+    radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
+    radio_apply_shorts_after_event(soc, SHORT_DISABLED_TXEN);
+    radio_apply_shorts_after_event(soc, SHORT_DISABLED_RXEN);
+}
+
 static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state) {
     nrf_radio_state_t *r = &soc->radio;
     r->state = new_state;
@@ -691,6 +709,10 @@ static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state) {
             radio_apply_shorts_after_event(soc, SHORT_TXREADY_START);
             break;
         case NRF_RADIO_STATE_DISABLED:
+            /* DISABLED events are now deferred via nrf_radio_disable_cb
+             * (see RADIO_TASKS_DISABLE).  If we get here from a non-DISABLE
+             * path (e.g. direct state write), fire synchronously as
+             * fallback. */
             radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
             radio_apply_shorts_after_event(soc, SHORT_DISABLED_TXEN);
             radio_apply_shorts_after_event(soc, SHORT_DISABLED_RXEN);
@@ -762,7 +784,30 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             if (r->state == NRF_RADIO_STATE_TX)  r->state = NRF_RADIO_STATE_TXIDLE;
             break;
         case RADIO_TASKS_DISABLE:
-            radio_set_state(soc, NRF_RADIO_STATE_DISABLED);
+            /* Defer the DISABLED event so the firmware's
+             * "clear EVENTS_DISABLED → poll" pattern works.  Set an
+             * intermediate state immediately so SHORTS don't re-trigger,
+             * and schedule the real DISABLED event after ramp-down. */
+            if (r->state == NRF_RADIO_STATE_DISABLED) {
+                /* Already disabled — just fire the event synchronously
+                 * (no ramp-down needed). */
+                radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
+            } else {
+                if (r->state == NRF_RADIO_STATE_TX ||
+                    r->state == NRF_RADIO_STATE_TXIDLE)
+                    r->state = NRF_RADIO_STATE_TXDISABLE;
+                else if (r->state == NRF_RADIO_STATE_RX ||
+                         r->state == NRF_RADIO_STATE_RXIDLE)
+                    r->state = NRF_RADIO_STATE_RXDISABLE;
+                else
+                    r->state = NRF_RADIO_STATE_RXDISABLE; /* catch-all */
+                /* Schedule the DISABLED event after ramp-down delay */
+                if (r->disable_event && soc->plat) {
+                    arm_schedule_event(&soc->plat->cpu,
+                        (arm_event_t *)r->disable_event,
+                        (int64_t)soc->plat->cpu.cycles + NRF_RADIO_DISABLE_CYCLES);
+                }
+            }
             break;
         case RADIO_TASKS_CCASTART:
             /* No interference model — always idle. */
@@ -1355,6 +1400,16 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     soc->radio.irq_num = NRF_RADIO_IRQ;
     soc->radio.state   = NRF_RADIO_STATE_DISABLED;
     soc->radio.power   = 1;       /* powered up by default */
+    {
+        /* Deferred-disable event: fires EVENTS_DISABLED after a short
+         * ramp-down delay so the firmware's clear-then-poll pattern works
+         * (see radio_trigger_task TASKS_DISABLE). */
+        extern void nrf_radio_disable_cb(void *, cpu_event_t *);
+        cpu_event_t *dev = (cpu_event_t *)calloc(1, sizeof(*dev));
+        dev->callback  = nrf_radio_disable_cb;
+        dev->user_data = soc;
+        soc->radio.disable_event = dev;
+    }
     arm_register_io(&plat->cpu, NRF_RADIO_BASE, NRF_RADIO_SIZE,
                     nrf_radio_read, nrf_radio_write, soc);
 
