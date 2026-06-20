@@ -967,6 +967,19 @@ int arm_step(arm_cpu_t *cpu, int count) {
             if (cpu->event_queue) {
                 arm_wfi_noirq++;
                 int64_t target = cpu->event_queue->fire_cycle;
+                /* Cap at the slice horizon.  Without this, idle firmware whose
+                 * only pending event is far away (e.g. Zephyr's tickless RTC
+                 * parks its compare ~256 s out) would fast-forward straight
+                 * past the horizon.  If the event is beyond the slice, idle to
+                 * the horizon and END the slice — the runner advances time and
+                 * re-enters; otherwise jump to the event and process it. */
+                if (target > cpu->cycle_limit) {
+                    if (cpu->cycle_limit > cpu->cycles)
+                        cpu->lpm_ns += arm_cycles_to_ns(
+                            cpu->cycle_limit - cpu->cycles, cpu->cpu_freq_hz);
+                    cpu->cycles = cpu->cycle_limit;
+                    break;
+                }
                 if (target > cpu->cycles)
                     cpu->lpm_ns += arm_cycles_to_ns(target - cpu->cycles,
                                                     cpu->cpu_freq_hz);

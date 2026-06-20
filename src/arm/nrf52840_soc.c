@@ -284,40 +284,60 @@ static uint32_t rtc_period_for_prescaler(uint32_t prescaler, uint32_t cpu_freq_h
     return (uint32_t)period;
 }
 
-static void rtc_tick_event_cb(void *user_data, cpu_event_t *event) {
+/* Tickless scheduling: instead of one event per LFCLK tick (32768/s — which
+ * makes idle-heavy firmware like Zephyr crawl), schedule a SINGLE event at the
+ * next moment something enabled is due — the nearest of TICK (only if its
+ * interrupt is on), OVRFLW, or an enabled COMPARE.  COUNTER is always derived
+ * from elapsed cycles (rtc_compute_counter), so reads stay exact between
+ * wake-ups.  Re-armed whenever CC / INTEN / the counter base changes. */
+static void rtc_reschedule(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
+    if (!rtc->running || rtc->tick_period_cycles == 0) {
+        arm_cancel_event(&plat->cpu, (arm_event_t *)rtc->tick_event);
+        return;
+    }
+    int64_t now_cycles = (int64_t)plat->cpu.cycles;
+    uint32_t now = rtc_compute_counter(rtc, now_cycles);
+    uint64_t best = UINT64_MAX;                 /* ticks from `now` */
+    if (rtc->intenset & RTC_INT_TICK) best = 1;
+    if (rtc->intenset & RTC_INT_OVRFLW) {
+        uint64_t d = 0x1000000u - now;          /* ticks to wrap (now < 2^24) */
+        if (d < best) best = d;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (rtc->intenset & (RTC_INT_COMPARE_0 << i)) {
+            uint32_t d = (rtc->cc[i] - now) & 0xFFFFFFu;
+            if (d == 0) d = 0x1000000u;         /* equal now → next match a wrap away */
+            if (d < best) best = d;
+        }
+    }
+    if (best == UINT64_MAX) {                    /* nothing enabled to wake for */
+        arm_cancel_event(&plat->cpu, (arm_event_t *)rtc->tick_event);
+        return;
+    }
+    int64_t period = (int64_t)rtc->tick_period_cycles;
+    int64_t into_tick = (now_cycles - rtc->counter_anchor_cycles) % period;
+    int64_t fire = now_cycles - into_tick + (int64_t)best * period;
+    arm_schedule_event(&plat->cpu, (arm_event_t *)rtc->tick_event, fire);
+}
+
+static void rtc_event_cb(void *user_data, cpu_event_t *event) {
     nrf_rtc_state_t *rtc = (nrf_rtc_state_t *)user_data;
     nrf52840_soc_t *soc = (nrf52840_soc_t *)rtc->soc;
     arm_platform_t *plat = soc->plat;
     if (!plat || !rtc->running) return;
 
-    /* Counter advances by one tick each event firing. Re-anchor so reads
-     * stay consistent without divisions for callers that read COUNTER
-     * between ticks. */
-    rtc->counter_at_anchor = (rtc->counter_at_anchor + 1) & 0xFFFFFFu;
-    rtc->counter_anchor_cycles = event->fire_cycle;
-
-    rtc->evt_tick = 1;
-    if (rtc->counter_at_anchor == 0) rtc->evt_ovrflw = 1;
-
-    /* Compare events */
-    for (int i = 0; i < 4; i++) {
-        if (rtc->cc[i] == rtc->counter_at_anchor)
-            rtc->evt_compare[i] = 1;
-    }
-
-    /* Raise IRQ if any enabled event is now latched. */
+    uint32_t cnt = rtc_compute_counter(rtc, event->fire_cycle);
     bool fire = false;
-    if ((rtc->intenset & RTC_INT_TICK)   && rtc->evt_tick)   fire = true;
-    if ((rtc->intenset & RTC_INT_OVRFLW) && rtc->evt_ovrflw) fire = true;
+    if (rtc->intenset & RTC_INT_TICK)              { rtc->evt_tick = 1;   fire = true; }
+    if ((rtc->intenset & RTC_INT_OVRFLW) && cnt==0) { rtc->evt_ovrflw = 1; fire = true; }
     for (int i = 0; i < 4; i++)
-        if ((rtc->intenset & (RTC_INT_COMPARE_0 << i)) && rtc->evt_compare[i])
-            fire = true;
+        if ((rtc->intenset & (RTC_INT_COMPARE_0 << i)) && rtc->cc[i] == cnt) {
+            rtc->evt_compare[i] = 1; fire = true;
+        }
     if (fire && plat->cpu.nvic)
         arm_nvic_set_pending((arm_nvic_t *)plat->cpu.nvic, rtc->irq_num);
 
-    /* Reschedule next tick. */
-    int64_t next = event->fire_cycle + (int64_t)rtc->tick_period_cycles;
-    arm_schedule_event(&plat->cpu, (arm_event_t *)rtc->tick_event, next);
+    rtc_reschedule(rtc, plat);
 }
 
 static void rtc_start(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
@@ -326,8 +346,7 @@ static void rtc_start(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
     rtc->tick_period_cycles =
         rtc_period_for_prescaler(rtc->prescaler, plat->cpu.cpu_freq_hz);
     rtc->counter_anchor_cycles = (int64_t)plat->cpu.cycles;
-    arm_schedule_event(&plat->cpu, (arm_event_t *)rtc->tick_event,
-                       (int64_t)plat->cpu.cycles + (int64_t)rtc->tick_period_cycles);
+    rtc_reschedule(rtc, plat);
 }
 
 static void rtc_stop(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
@@ -367,6 +386,9 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf_rtc_state_t *rtc = (nrf_rtc_state_t *)user_data;
     arm_platform_t *plat = ((nrf52840_soc_t *)rtc->soc)->plat;
     uint32_t off = addr - rtc->base;
+    /* Writes that change WHEN the next event is due must re-arm the tickless
+     * schedule (CC / INTEN / counter base / prescaler). */
+    bool resched = false;
     switch (off) {
         case RTC_TASKS_START: if (value == 1) rtc_start(rtc, plat); break;
         case RTC_TASKS_STOP:  if (value == 1) rtc_stop(rtc, plat);  break;
@@ -374,12 +396,14 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
             if (value == 1) {
                 rtc->counter_at_anchor = 0;
                 rtc->counter_anchor_cycles = (int64_t)plat->cpu.cycles;
+                resched = true;
             }
             break;
         case RTC_TASKS_TRIGOVRFLW:
             if (value == 1) {
                 rtc->counter_at_anchor = 0xFFFFF0;
                 rtc->counter_anchor_cycles = (int64_t)plat->cpu.cycles;
+                resched = true;
             }
             break;
         case RTC_EVENTS_TICK:    rtc->evt_tick = value & 1; break;
@@ -390,8 +414,8 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
         case RTC_EVENTS_COMPARE_0 + 12:
             rtc->evt_compare[(off - RTC_EVENTS_COMPARE_0) / 4] = value & 1;
             break;
-        case RTC_INTENSET: rtc->intenset |= value; break;
-        case RTC_INTENCLR: rtc->intenset &= ~value; break;
+        case RTC_INTENSET: rtc->intenset |= value; resched = true; break;
+        case RTC_INTENCLR: rtc->intenset &= ~value; resched = true; break;
         case RTC_EVTENSET: rtc->evtenset |= value; break;
         case RTC_EVTENCLR: rtc->evtenset &= ~value; break;
         case RTC_PRESCALER:
@@ -399,13 +423,16 @@ static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
             if (rtc->running)
                 rtc->tick_period_cycles =
                     rtc_period_for_prescaler(rtc->prescaler, plat->cpu.cpu_freq_hz);
+            resched = true;
             break;
         case RTC_CC_0:      case RTC_CC_0 + 4:
         case RTC_CC_0 + 8:  case RTC_CC_0 + 12:
             rtc->cc[(off - RTC_CC_0) / 4] = value & 0xFFFFFFu;
+            resched = true;
             break;
         default: break;
     }
+    if (resched && rtc->running) rtc_reschedule(rtc, plat);
 }
 
 /* ============================================================
@@ -1204,7 +1231,7 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     soc->rtc0.base    = NRF_RTC0_BASE;
     soc->rtc0.soc     = soc;
     cpu_event_t *tev0 = (cpu_event_t *)calloc(1, sizeof(*tev0));
-    tev0->callback  = rtc_tick_event_cb;
+    tev0->callback  = rtc_event_cb;
     tev0->user_data = &soc->rtc0;
     soc->rtc0.tick_event = tev0;
     arm_register_io(&plat->cpu, NRF_RTC0_BASE, NRF_RTC0_SIZE,
@@ -1214,7 +1241,7 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     soc->rtc1.base    = NRF_RTC1_BASE;
     soc->rtc1.soc     = soc;
     cpu_event_t *tev1 = (cpu_event_t *)calloc(1, sizeof(*tev1));
-    tev1->callback  = rtc_tick_event_cb;
+    tev1->callback  = rtc_event_cb;
     tev1->user_data = &soc->rtc1;
     soc->rtc1.tick_event = tev1;
     arm_register_io(&plat->cpu, NRF_RTC1_BASE, NRF_RTC1_SIZE,
