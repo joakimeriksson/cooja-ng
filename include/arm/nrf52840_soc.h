@@ -229,6 +229,30 @@ typedef struct nrf_ficr_state {
  * starting from the preamble. */
 typedef void (*nrf_radio_tx_listener_t)(void *user_data, uint8_t byte);
 
+/* PPI at 0x4001F000 — Programmable Peripheral Interconnect.  Each enabled
+ * channel routes a peripheral EVENT (CH[n].EEP) to a peripheral TASK
+ * (CH[n].TEP) in hardware, no CPU.  nrf_802154 uses it to trigger the RADIO
+ * ramp-up (TASKS_RXEN/TXEN) and chain the TIMER ↔ RADIO timing — so without it
+ * the radio never enables.  We model it behaviourally: store the channel
+ * config; when csim raises an EVENT, fire the TASKS of every enabled channel
+ * whose EEP matches. */
+typedef struct nrf_ppi_state {
+    uint32_t chen;          /* enabled-channel bitmask (CHEN/CHENSET/CHENCLR) */
+    uint32_t eep[20];       /* CH[n].EEP — event endpoint address */
+    uint32_t tep[20];       /* CH[n].TEP — task endpoint address */
+    void    *soc;           /* back-pointer to trigger tasks */
+} nrf_ppi_state_t;
+
+/* EGU0/SWI0 at 0x40014000 — Event Generator Unit.  nrf_802154 chains
+ * RADIO EVENTS_DISABLED → EGU TASKS_TRIGGER[n] → EGU EVENTS_TRIGGERED[n] →
+ * RADIO TASKS_RXEN through PPI; the EGU is the hop in the middle.  16 channels.*/
+typedef struct nrf_egu_state {
+    uint32_t events;        /* EVENTS_TRIGGERED[0..15] bitmask */
+    uint32_t intenset;      /* 0x304 */
+    int      irq_num;       /* SWI0_EGU0 = 20 */
+    void    *soc;
+} nrf_egu_state_t;
+
 typedef struct nrf52840_soc {
     nrf_clock_state_t clock;
     nrf_uart_state_t  uart0;
@@ -237,6 +261,8 @@ typedef struct nrf52840_soc {
     nrf_radio_state_t radio;
     nrf_timer_state_t timer[5];
     nrf_rng_state_t   rng;
+    nrf_ppi_state_t   ppi;
+    nrf_egu_state_t   egu0;
     nrf_ficr_state_t  ficr;
     arm_platform_t   *plat;   /* back-pointer for event-callback NVIC access */
     /* Radio TX listener installed by the harness. */

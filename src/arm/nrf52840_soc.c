@@ -631,12 +631,36 @@ static void radio_emit_tx(nrf52840_soc_t *soc);
 
 #define nrf_crc_add(crc, data) ieee802154_crc_add((crc), (data))
 
-/* Raise IRQ if any of the latched events have INTENSET bit set. */
+void nrf_ppi_event_notify(nrf52840_soc_t *soc, uint32_t event_addr);
+
+/* Map an event's INTENSET bit to its EVENTS_ register offset (for PPI routing). */
+static uint32_t radio_event_offset(uint32_t int_mask) {
+    switch (int_mask) {
+        case RADIO_INT_READY:      return RADIO_EVENTS_READY;
+        case RADIO_INT_ADDRESS:    return RADIO_EVENTS_ADDRESS;
+        case RADIO_INT_PAYLOAD:    return RADIO_EVENTS_PAYLOAD;
+        case RADIO_INT_END:        return RADIO_EVENTS_END;
+        case RADIO_INT_DISABLED:   return RADIO_EVENTS_DISABLED;
+        case RADIO_INT_BCMATCH:    return RADIO_EVENTS_BCMATCH;
+        case RADIO_INT_CRCOK:      return RADIO_EVENTS_CRCOK;
+        case RADIO_INT_CRCERROR:   return RADIO_EVENTS_CRCERROR;
+        case RADIO_INT_FRAMESTART: return RADIO_EVENTS_FRAMESTART;
+        case RADIO_INT_TXREADY:    return RADIO_EVENTS_TXREADY;
+        case RADIO_INT_RXREADY:    return RADIO_EVENTS_RXREADY;
+        case RADIO_INT_PHYEND:     return RADIO_EVENTS_PHYEND;
+        default: return 0;
+    }
+}
+
+/* Raise IRQ if any of the latched events have INTENSET bit set, and route the
+ * event through PPI (nrf_802154 chains RADIO events → tasks in hardware). */
 static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask) {
     nrf_radio_state_t *r = &soc->radio;
     *evt_field = 1;
     if ((r->intenset & int_mask) && soc->plat && soc->plat->cpu.nvic)
         arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, r->irq_num);
+    uint32_t off = radio_event_offset(int_mask);
+    if (off) nrf_ppi_event_notify(soc, NRF_RADIO_BASE + off);
 }
 
 /* Apply SHORTS that fire on entering a state. The driver enables
@@ -1191,6 +1215,93 @@ static void nrf_rng_write(void *user_data, uint32_t addr, uint32_t value) {
 }
 
 /* ============================================================
+ * PPI at 0x4001F000 — Programmable Peripheral Interconnect.
+ * Routes EVENT → TASK in hardware.  nrf_802154 uses it to ramp the RADIO up
+ * (TASKS_RXEN/TXEN) off a TIMER/event, so the radio never enables without it.
+ * ============================================================ */
+#define NRF_PPI_BASE       0x4001F000u
+#define NRF_PPI_CHEN       0x500
+#define NRF_PPI_CHENSET    0x504
+#define NRF_PPI_CHENCLR    0x508
+#define NRF_PPI_CH_EEP0    0x510   /* CH[n].EEP = 0x510 + n*8, TEP = +4 */
+
+static int nrf_ppi_read(void *user_data, uint32_t addr) {
+    nrf_ppi_state_t *ppi = (nrf_ppi_state_t *)user_data;
+    uint32_t off = addr - NRF_PPI_BASE;
+    if (off == NRF_PPI_CHEN || off == NRF_PPI_CHENSET || off == NRF_PPI_CHENCLR)
+        return (int)ppi->chen;
+    if (off >= NRF_PPI_CH_EEP0 && off < NRF_PPI_CH_EEP0 + 20 * 8) {
+        uint32_t i = (off - NRF_PPI_CH_EEP0) / 8;
+        return (off & 4) ? (int)ppi->tep[i] : (int)ppi->eep[i];
+    }
+    return 0;
+}
+
+static void nrf_ppi_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf_ppi_state_t *ppi = (nrf_ppi_state_t *)user_data;
+    uint32_t off = addr - NRF_PPI_BASE;
+    if (getenv("NRF_PPI_TRACE")) fprintf(stderr, "[ppiW] 0x%03x = 0x%08x\n", off, value);
+    if (off == NRF_PPI_CHEN || off == NRF_PPI_CHENSET) { ppi->chen |= value; return; }
+    if (off == NRF_PPI_CHENCLR) { ppi->chen &= ~value; return; }
+    if (off >= NRF_PPI_CH_EEP0 && off < NRF_PPI_CH_EEP0 + 20 * 8) {
+        uint32_t i = (off - NRF_PPI_CH_EEP0) / 8;
+        if (off & 4) ppi->tep[i] = value; else ppi->eep[i] = value;
+        return;
+    }
+}
+
+/* Called whenever csim raises a peripheral EVENT (passes the absolute event
+ * register address).  Fires the TASK of every enabled channel whose EEP matches
+ * — i.e. the hardware event→task routing nrf_802154 relies on. */
+void nrf_ppi_event_notify(nrf52840_soc_t *soc, uint32_t event_addr) {
+    nrf_ppi_state_t *ppi = &soc->ppi;
+    if (!ppi->chen) return;
+    for (int i = 0; i < 20; i++) {
+        if ((ppi->chen & (1u << i)) && ppi->eep[i] == event_addr && ppi->tep[i])
+            arm_write32(&soc->plat->cpu, ppi->tep[i], 1);
+    }
+}
+
+/* ============================================================
+ * EGU0/SWI0 at 0x40014000 — Event Generator Unit.
+ * TASKS_TRIGGER[n] (0x000+n*4) latches EVENTS_TRIGGERED[n] (0x100+n*4), which
+ * routes onward through PPI (and raises the SWI IRQ if enabled).
+ * ============================================================ */
+#define NRF_EGU0_BASE      0x40014000u
+#define NRF_EGU_IRQ        20      /* SWI0_EGU0 */
+
+static void nrf_egu_fire(nrf_egu_state_t *egu, int n) {
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)egu->soc;
+    egu->events |= (1u << n);
+    nrf_ppi_event_notify(soc, NRF_EGU0_BASE + 0x100 + n * 4);
+    if ((egu->intenset & (1u << n)) && soc->plat && soc->plat->cpu.nvic)
+        arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, egu->irq_num);
+}
+
+static int nrf_egu_read(void *user_data, uint32_t addr) {
+    nrf_egu_state_t *egu = (nrf_egu_state_t *)user_data;
+    uint32_t off = addr - NRF_EGU0_BASE;
+    if (off >= 0x100 && off < 0x140) return (egu->events >> ((off - 0x100) / 4)) & 1;
+    if (off == 0x304 || off == 0x308) return (int)egu->intenset;
+    return 0;
+}
+
+static void nrf_egu_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf_egu_state_t *egu = (nrf_egu_state_t *)user_data;
+    uint32_t off = addr - NRF_EGU0_BASE;
+    if (off < 0x40) {                       /* TASKS_TRIGGER[0..15] */
+        if (value == 1) nrf_egu_fire(egu, off / 4);
+        return;
+    }
+    if (off >= 0x100 && off < 0x140) {      /* EVENTS_TRIGGERED ack */
+        if (!(value & 1)) egu->events &= ~(1u << ((off - 0x100) / 4));
+        return;
+    }
+    if (off == 0x304) { egu->intenset |= value; return; }
+    if (off == 0x308) { egu->intenset &= ~value; return; }
+}
+
+/* ============================================================
  * FICR at 0x10000000 — only DEVICEADDR pair is useful here.
  *
  * Per nRF52840 PS, FICR is in the same 0x10000000 page as UICR;
@@ -1439,6 +1550,17 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     soc->rng.valrdy_event = rev;
     arm_register_io(&plat->cpu, NRF_RNG_BASE, 0x1000,
                     nrf_rng_read, nrf_rng_write, &soc->rng);
+
+    /* PPI — event→task routing nrf_802154 uses to ramp the radio. */
+    soc->ppi.soc = soc;
+    arm_register_io(&plat->cpu, NRF_PPI_BASE, 0x1000,
+                    nrf_ppi_read, nrf_ppi_write, &soc->ppi);
+
+    /* EGU0/SWI0 — the hop in the RADIO_DISABLED → EGU → RADIO_RXEN PPI chain. */
+    soc->egu0.soc     = soc;
+    soc->egu0.irq_num = NRF_EGU_IRQ;
+    arm_register_io(&plat->cpu, NRF_EGU0_BASE, 0x1000,
+                    nrf_egu_read, nrf_egu_write, &soc->egu0);
 
     /* FICR — default values; harness patches DEVICEADDR0/1 per node. */
     soc->ficr.deviceaddr0 = 0x00000000;
