@@ -94,7 +94,7 @@ Per-board details live in [`devices/`](devices/) and the SoC source files under 
 
 - **TI CC2538** — UART, GPIO, GPTimer, Sleep Timer, IOC, SSI, on-chip RF Core (802.15.4 with FFSM filter and frame IRQs).
 - **TI CC1200** (off-SoC) — event-driven SPI peripheral, register-level fidelity, IOCFG-driven GPIO events, full software auto-ACK, 73-test mock-host suite.
-- **Nordic nRF52840** — CLOCK/HFCLK/LFCLK, RTC0–2, TIMER0–4, GPIO/GPIOTE, PPI, RNG, NVMC, FICR (per-node DEVICEID), UARTE EasyDMA, and a full 802.15.4 RADIO (PACKETPTR EasyDMA, SHORTS, INTENSET, BCMATCH, hardware-style auto-ACK).
+- **Nordic nRF52840** — CLOCK/HFCLK/LFCLK (+ STAT/SRC status regs), RTC0/RTC1, TIMER0–4, GPIO/GPIOTE, PPI, RNG, NVMC, FICR (per-node DEVICEID), legacy UART, and a full 802.15.4 RADIO (PACKETPTR EasyDMA, SHORTS, INTENSET, BCMATCH, hardware-style auto-ACK).  **Boots Zephyr OS** as well as Contiki-NG — the `nrf52840dk` `hello_world` prints over UART; see [`docs/zephyr.md`](docs/zephyr.md).
 - **Nordic nRF54L15** — Cortex-M33 family with GRTC (1 MHz syscounter, RELATIVE_COMPARE + RELATIVE_SYSCOUNTER), DPPI (32-channel publish/subscribe), EGU (software-event bridge to NVIC), TIMER10/20–24, per-node FICR.DEVICEID, UARTE20 EasyDMA, and an 802.15.4 RADIO with deferred PHYEND so the driver's NVIC-disabling critical section exits before the IRQ fires.  2-node RPL-UDP exchanges request/response end-to-end.
 
 Shared 802.15.4 helpers live in [`include/common/ieee_802154.h`](include/common/ieee_802154.h) (PHY constants + CCITT-16 FCS used by all four radios) and [`include/arm/nrf_radio_common.h`](include/arm/nrf_radio_common.h) (one `nrf_radio_emit_ieee802154_frame()` for both nRF radios).
