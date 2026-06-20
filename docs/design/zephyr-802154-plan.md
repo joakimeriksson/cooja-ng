@@ -40,18 +40,19 @@ a fallback for cases the behavioural shortcut can't cover.
 ## Phases (each ≈ one focused session)
 
 ### Phase 0 — Console visibility (prerequisite, smallest)
-Without output we're blind. Two options:
-- **Fast (config):** build echo with the console forced to polling
-  (`CONFIG_UART_INTERRUPT_DRIVEN=n`, or a UART-poll log backend). If that makes
-  output appear, use it for all bring-up debugging — no emulator work.
-- **Proper (model):** model the interrupt/async UARTE TX path. Trace the UART
-  page (`0x40002xxx`) with `ARM_MMIO_TRACE`/`NRF_RADIO_TRACE`-style logging to
-  see the exact sequence (likely FIFO fill + `TASKS_STARTTX` + `ENDTX` IRQ
-  chaining, possibly multi-buffer via `TXD.PTR` list). Extend the UARTE model
-  (deliver bytes, raise `ENDTX` IRQ, handle the next buffer).
-- **Verify:** echo prints its boot banner + `net`/`802154` debug logs.
-- **Recommendation:** do the config workaround first to unblock Phases 1–4;
-  circle back to the proper async-UART model before shipping a demo.
+**Constraint: the Zephyr firmware is STOCK — no config/overlay changes. csim
+does all the work.** (Only the sample's own `overlay-802154.conf`, which is how
+the sample selects 802.15.4, is used — that's the sample's config, not a
+modification.) So the console must be modelled, not configured around.
+
+Stock net samples use **deferred logging** over the **interrupt/async UARTE TX**
+path, which csim doesn't model → 0 bytes (even the boot banner, routed through
+`LOG_PRINTK`, is buffered and flushed by the log thread via async TX). Model it:
+trace the UART page (`0x40002xxx`) to see the exact TX sequence (FIFO fill +
+`TASKS_STARTTX` + `ENDTX`-IRQ chaining, possibly multi-buffer via a `TXD.PTR`
+list), then extend csim's UARTE model to deliver those bytes and raise the
+`ENDTX` IRQ so the driver's TX ISR feeds the next chunk.
+- **Verify:** stock echo prints its boot banner + `net`/`802154` debug logs.
 
 ### Phase 1 — `nrf_802154` init reaches the RADIO
 With console visible, find where net init blocks (debug logs + spin PC). Model

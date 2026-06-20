@@ -152,6 +152,7 @@ static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
 static int nrf_uart_read(void *user_data, uint32_t addr) {
     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
     uint32_t off = addr - NRF_UART0_BASE;
+    if (getenv("NRF_UART_TRACE")) fprintf(stderr, "[uartR] 0x%03x\n", off);
     switch (off) {
         case NRF_UART_EVENTS_TXDRDY:     return (int)uart->txdrdy;
         case NRF_UART_ENABLE:            return (int)uart->enable;
@@ -195,6 +196,7 @@ static void uarte_start_tx(nrf_uart_state_t *uart) {
 static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
     uint32_t off = addr - NRF_UART0_BASE;
+    if (getenv("NRF_UART_TRACE")) fprintf(stderr, "[uartW] 0x%03x = 0x%08x\n", off, value);
     switch (off) {
         case NRF_UART_TXD:
             /* Forward to console callback if installed. Set TXDRDY so
