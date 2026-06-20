@@ -711,6 +711,7 @@ static int nrf_radio_read(void *user_data, uint32_t addr) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
     uint32_t off = addr - NRF_RADIO_BASE;
+    if (getenv("NRF_RADIO_TRACE")) fprintf(stderr, "[radioR] 0x%03x\n", off);
     switch (off) {
         case RADIO_STATE:        return (int)r->state;
         case RADIO_EVENTS_READY:        return (int)r->evt_ready;
@@ -762,6 +763,7 @@ static void nrf_radio_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
     uint32_t off = addr - NRF_RADIO_BASE;
+    if (getenv("NRF_RADIO_TRACE")) fprintf(stderr, "[radioW] 0x%03x = 0x%08x\n", off, value);
 
     /* Tasks: trigger on write of 1 */
     if (off <= RADIO_TASKS_CCASTOP) {
