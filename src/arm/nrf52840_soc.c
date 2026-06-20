@@ -1,20 +1,23 @@
 /*
- * nRF52840 SoC — minimum-viable peripheral set.
+ * nRF52840 SoC peripheral model.
  *
- * Models just enough to run a real Contiki-NG nrf52840 firmware build
- * (UART console variant) up to the point where it emits its first
- * printf:
+ * Runs real Contiki-NG nrf52840 firmware AND boots Zephyr OS (the
+ * nrf52840dk hello_world prints over UART).  Modelled peripherals:
  *
- *   - CLOCK (0x40000000): HFCLK/LFCLK start-task ↔ event handshake.
- *     Without this, boot spins forever in the HFCLKSTART loop.
+ *   - CLOCK (0x40000000): HFCLK/LFCLK start-task ↔ event handshake, plus
+ *     the HFCLKSTAT/LFCLKSTAT/LFCLKSRC status registers Zephyr's
+ *     clock_control_nrf spin-waits on (lfclk_spinwait).
+ *   - UART0 legacy window (0x40002000): TXD + EVENTS_TXDRDY (the non-DMA
+ *     driver; Contiki uses it natively, Zephyr via a `nordic,nrf-uart`
+ *     devicetree overlay — the UARTE EasyDMA path is not modelled).
+ *   - RTC0 (0x4000B000, Contiki clock) + RTC1 (0x40011000, Zephyr's
+ *     nrf_rtc_timer system clock): counter + COMPARE + TICK/OVRFLW + IRQ.
+ *   - RADIO (0x40001000): 802.15.4 TX/RX state machine + EasyDMA frames.
+ *   - TIMER0..4, RNG, FICR.
  *
- *   - UART0 legacy window (0x40002000): TXD register + EVENTS_TXDRDY.
- *     `uart0_writeb` writes a byte and spins on TXDRDY; we set it
- *     immediately after the byte arrives.
- *
- * Everything else (RTC, TIMER, GPIO, GPIOTE, RADIO, PPI, NVMC, RNG)
- * is intentionally NOT modelled yet — the L0–L4 ladder will add them
- * as firmware traps on each missing peripheral.
+ * Still unmodelled (firmware that needs them will trap; ARM_MMIO_TRACE=1
+ * surfaces the first access to each missing peripheral page): GPIO/GPIOTE
+ * (writes ignored), NVMC, PPI, SPI/TWI.
  */
 #include "nrf52840_soc.h"
 #include "arm_cpu.h"
@@ -61,6 +64,14 @@ static void nrf_host_cancel(void *cpu, cpu_event_t *ev) {
 #define NRF_CLOCK_TASKS_LFCLKSTART 0x008
 #define NRF_CLOCK_EVENTS_HFCLKSTARTED 0x100
 #define NRF_CLOCK_EVENTS_LFCLKSTARTED 0x104
+/* Status / source registers — Zephyr's clock_control_nrf spin-waits on these
+ * (lfclk_spinwait polls LFCLKSTAT.STATE); Contiki only used the events. */
+#define NRF_CLOCK_HFCLKRUN         0x408
+#define NRF_CLOCK_HFCLKSTAT        0x40C
+#define NRF_CLOCK_LFCLKRUN         0x414
+#define NRF_CLOCK_LFCLKSTAT        0x418
+#define NRF_CLOCK_LFCLKSRC         0x518
+#define NRF_CLOCK_STAT_STATE       (1u << 16)   /* "clock is running" */
 
 static int nrf_clock_read(void *user_data, uint32_t addr) {
     nrf_clock_state_t *clock = (nrf_clock_state_t *)user_data;
@@ -68,6 +79,17 @@ static int nrf_clock_read(void *user_data, uint32_t addr) {
     switch (off) {
         case NRF_CLOCK_EVENTS_HFCLKSTARTED: return (int)clock->hfclkstarted;
         case NRF_CLOCK_EVENTS_LFCLKSTARTED: return (int)clock->lfclkstarted;
+        case NRF_CLOCK_HFCLKRUN:  return clock->hfclkstarted ? 1 : 0;
+        case NRF_CLOCK_HFCLKSTAT:
+            /* SRC=XTAL(1) + STATE=running once started. */
+            return clock->hfclkstarted ? (int)(NRF_CLOCK_STAT_STATE | 1u) : 0;
+        case NRF_CLOCK_LFCLKRUN:  return clock->lfclkstarted ? 1 : 0;
+        case NRF_CLOCK_LFCLKSTAT:
+            /* Report the configured source as running once started — what
+             * Zephyr's lfclk_spinwait waits for (STATE bit + SRC match). */
+            return (int)((clock->lfclksrc & 3u) |
+                         (clock->lfclkstarted ? NRF_CLOCK_STAT_STATE : 0u));
+        case NRF_CLOCK_LFCLKSRC:  return (int)clock->lfclksrc;
         default: return 0;
     }
 }
@@ -87,6 +109,9 @@ static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
             break;
         case NRF_CLOCK_EVENTS_LFCLKSTARTED:
             clock->lfclkstarted = value & 1;
+            break;
+        case NRF_CLOCK_LFCLKSRC:
+            clock->lfclksrc = value;
             break;
         default: break;
     }
@@ -159,6 +184,10 @@ static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
 #define NRF_RTC0_BASE          0x4000B000u
 #define NRF_RTC0_SIZE          0x1000u
 #define NRF_RTC0_IRQ           11
+/* RTC1 — same peripheral, used by Zephyr's nrf_rtc_timer as the system clock. */
+#define NRF_RTC1_BASE          0x40011000u
+#define NRF_RTC1_SIZE          0x1000u
+#define NRF_RTC1_IRQ           17
 #define NRF_LFCLK_HZ           32768u
 
 #define RTC_TASKS_START        0x000
@@ -200,8 +229,8 @@ static uint32_t rtc_period_for_prescaler(uint32_t prescaler, uint32_t cpu_freq_h
 }
 
 static void rtc_tick_event_cb(void *user_data, cpu_event_t *event) {
-    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
-    nrf_rtc_state_t *rtc = &soc->rtc0;
+    nrf_rtc_state_t *rtc = (nrf_rtc_state_t *)user_data;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)rtc->soc;
     arm_platform_t *plat = soc->plat;
     if (!plat || !rtc->running) return;
 
@@ -255,10 +284,9 @@ static void rtc_stop(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
 }
 
 static int nrf_rtc_read(void *user_data, uint32_t addr) {
-    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
-    nrf_rtc_state_t *rtc = &soc->rtc0;
-    arm_platform_t *plat = soc->plat;
-    uint32_t off = addr - NRF_RTC0_BASE;
+    nrf_rtc_state_t *rtc = (nrf_rtc_state_t *)user_data;
+    arm_platform_t *plat = ((nrf52840_soc_t *)rtc->soc)->plat;
+    uint32_t off = addr - rtc->base;
     switch (off) {
         case RTC_EVENTS_TICK:    return (int)rtc->evt_tick;
         case RTC_EVENTS_OVRFLW:  return (int)rtc->evt_ovrflw;
@@ -280,10 +308,9 @@ static int nrf_rtc_read(void *user_data, uint32_t addr) {
 }
 
 static void nrf_rtc_write(void *user_data, uint32_t addr, uint32_t value) {
-    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
-    nrf_rtc_state_t *rtc = &soc->rtc0;
-    arm_platform_t *plat = soc->plat;
-    uint32_t off = addr - NRF_RTC0_BASE;
+    nrf_rtc_state_t *rtc = (nrf_rtc_state_t *)user_data;
+    arm_platform_t *plat = ((nrf52840_soc_t *)rtc->soc)->plat;
+    uint32_t off = addr - rtc->base;
     switch (off) {
         case RTC_TASKS_START: if (value == 1) rtc_start(rtc, plat); break;
         case RTC_TASKS_STOP:  if (value == 1) rtc_stop(rtc, plat);  break;
@@ -1109,16 +1136,28 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     arm_register_io(&plat->cpu, NRF_UART0_BASE, NRF_UART0_SIZE,
                     nrf_uart_read, nrf_uart_write, &soc->uart0);
 
-    /* RTC0 — Contiki's clock source.  Allocate the recurring TICK
-     * event and pre-fill its callback / user_data; rtc_start arms it. */
+    /* RTC0 (Contiki's clock source) + RTC1 (Zephyr's nrf_rtc_timer system
+     * clock).  Same model, two instances; each owns its recurring TICK event,
+     * keyed by its own base + IRQ.  rtc_start arms the event. */
     soc->rtc0.irq_num = NRF_RTC0_IRQ;
-    cpu_event_t *tev = (cpu_event_t *)calloc(1, sizeof(*tev));
-    tev->callback  = rtc_tick_event_cb;
-    tev->user_data = soc;
-    soc->rtc0.tick_event = tev;
-    soc->rtc0.soc = soc;
+    soc->rtc0.base    = NRF_RTC0_BASE;
+    soc->rtc0.soc     = soc;
+    cpu_event_t *tev0 = (cpu_event_t *)calloc(1, sizeof(*tev0));
+    tev0->callback  = rtc_tick_event_cb;
+    tev0->user_data = &soc->rtc0;
+    soc->rtc0.tick_event = tev0;
     arm_register_io(&plat->cpu, NRF_RTC0_BASE, NRF_RTC0_SIZE,
-                    nrf_rtc_read, nrf_rtc_write, soc);
+                    nrf_rtc_read, nrf_rtc_write, &soc->rtc0);
+
+    soc->rtc1.irq_num = NRF_RTC1_IRQ;
+    soc->rtc1.base    = NRF_RTC1_BASE;
+    soc->rtc1.soc     = soc;
+    cpu_event_t *tev1 = (cpu_event_t *)calloc(1, sizeof(*tev1));
+    tev1->callback  = rtc_tick_event_cb;
+    tev1->user_data = &soc->rtc1;
+    soc->rtc1.tick_event = tev1;
+    arm_register_io(&plat->cpu, NRF_RTC1_BASE, NRF_RTC1_SIZE,
+                    nrf_rtc_read, nrf_rtc_write, &soc->rtc1);
 
     /* RADIO — on-chip 2.4 GHz multi-protocol radio. */
     soc->radio.irq_num = NRF_RADIO_IRQ;
@@ -1161,6 +1200,10 @@ static void nrf52840_soc_destroy(arm_platform_t *plat) {
         if (soc->rtc0.tick_event) {
             arm_cancel_event(&plat->cpu, (arm_event_t *)soc->rtc0.tick_event);
             free(soc->rtc0.tick_event);
+        }
+        if (soc->rtc1.tick_event) {
+            arm_cancel_event(&plat->cpu, (arm_event_t *)soc->rtc1.tick_event);
+            free(soc->rtc1.tick_event);
         }
         free(soc);
     }

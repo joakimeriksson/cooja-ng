@@ -402,6 +402,10 @@ int arm_elf_mote_rf_sim_state(int rf_state) {
 static int64_t arm_mote_instructions(const sim_mote_t *m) {
     return MOTE_IMPL(m)->plat.arm.cpu.instructions;
 }
+/* Current PC — for the end-of-run per-node summary (e.g. spotting a boot spin). */
+static uint32_t arm_mote_program_counter(const sim_mote_t *m) {
+    return MOTE_IMPL(m)->plat.arm.cpu.reg[ARM_PC];
+}
 
 /* CPU active/WFI time for the energy stream.  lpm_ns is accrued at each WFI
  * fast-forward; active = elapsed (sim_time_ns) − lpm_ns. */
@@ -578,4 +582,5 @@ const sim_mote_ops_t arm_elf_mote_ops = {
     .rx_pre_sync     = NULL, /* MSP430-only pre-sync tick */
     .apply_startup_delay = arm_mote_apply_startup_delay,
     .cpu_power_ns    = arm_mote_cpu_power_ns,
+    .program_counter = arm_mote_program_counter,
 };

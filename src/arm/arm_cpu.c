@@ -34,6 +34,27 @@ static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
     return best;
 }
 
+/* Diagnostic (ARM_MMIO_TRACE=1): log the FIRST access to each unmapped
+ * peripheral page.  Surfaces exactly which peripheral a new firmware needs
+ * that the SoC model is missing — e.g. bringing up Zephyr on the nRF.
+ * Behaviour-neutral: only emits under the env var. */
+static void trace_unmapped_mmio(uint32_t addr, int is_write, uint32_t val) {
+    static int enabled = -1;
+    if (enabled == -1) enabled = getenv("ARM_MMIO_TRACE") ? 1 : 0;
+    if (!enabled) return;
+    if (addr < 0x40000000u || addr >= 0x60000000u) return;  /* APB/AHB only */
+    static uint32_t seen[256];
+    static int nseen = 0;
+    uint32_t page = addr & ~0xFFFu;
+    for (int i = 0; i < nseen; i++) if (seen[i] == page) return;
+    if (nseen < 256) seen[nseen++] = page;
+    if (is_write)
+        fprintf(stderr, "[mmio] UNMAPPED W 0x%08x = 0x%08x (page 0x%08x)\n",
+                addr, val, page);
+    else
+        fprintf(stderr, "[mmio] UNMAPPED R 0x%08x (page 0x%08x)\n", addr, page);
+}
+
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
     if (cpu->rom && addr < cpu->rom_size) {
@@ -60,6 +81,7 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
     }
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) return r->read(r->user_data, addr);
+    trace_unmapped_mmio(addr, 0, 0);
     return 0;
 }
 
@@ -232,6 +254,7 @@ void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     }
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) r->write(r->user_data, addr, val);
+    else trace_unmapped_mmio(addr, 1, val);
 }
 
 void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
@@ -245,6 +268,7 @@ void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
     if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) r->write(r->user_data, addr, val);
+    else trace_unmapped_mmio(addr, 1, val);
 }
 
 void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
@@ -256,6 +280,7 @@ void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
     if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
     arm_io_region_t *r = find_io_region(cpu, addr);
     if (r) r->write(r->user_data, addr, val);
+    else trace_unmapped_mmio(addr, 1, val);
 }
 
 /* --- Inline fetch helpers --- */

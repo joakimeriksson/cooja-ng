@@ -20,6 +20,7 @@
 typedef struct nrf_clock_state {
     uint32_t hfclkstarted;   /* offset 0x100 — set when HFCLK is up */
     uint32_t lfclkstarted;   /* offset 0x104 — set when LFCLK is up */
+    uint32_t lfclksrc;       /* offset 0x518 — selected LF source (0=RC,1=XTAL,2=Synth) */
 } nrf_clock_state_t;
 
 /* Legacy UART0 register window of the UARTE0 peripheral at 0x40002000.
@@ -63,7 +64,8 @@ typedef struct nrf_rtc_state {
     int64_t  counter_anchor_cycles;   /* cpu->cycles at COUNTER=0 reference point */
     uint32_t counter_at_anchor;       /* COUNTER value at the anchor */
     uint32_t tick_period_cycles;      /* CPU cycles per RTC tick after prescaler */
-    int      irq_num;                 /* RTC0 IRQ = 11 on nRF52840 */
+    int      irq_num;                 /* RTC0 IRQ = 11, RTC1 = 17 on nRF52840 */
+    uint32_t base;                    /* peripheral base (RTC0 0x4000B000, RTC1 0x40011000) */
     /* Recurring TICK event, re-scheduled by its own callback. */
     void    *tick_event;              /* opaque arm_event_t * */
     void    *soc;                     /* back-pointer for the event callback */
@@ -206,6 +208,7 @@ typedef struct nrf52840_soc {
     nrf_clock_state_t clock;
     nrf_uart_state_t  uart0;
     nrf_rtc_state_t   rtc0;
+    nrf_rtc_state_t   rtc1;   /* Zephyr's nrf_rtc_timer system clock */
     nrf_radio_state_t radio;
     nrf_timer_state_t timer[5];
     nrf_rng_state_t   rng;
