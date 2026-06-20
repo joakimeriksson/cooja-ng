@@ -18,9 +18,19 @@
 /* CLOCK + POWER share base 0x40000000 on nRF52840 (peripheral ID 0).
  * We only model the four start-task / event pairs the boot path uses. */
 typedef struct nrf_clock_state {
-    uint32_t hfclkstarted;   /* offset 0x100 — set when HFCLK is up */
-    uint32_t lfclkstarted;   /* offset 0x104 — set when LFCLK is up */
+    /* Run-state (drives HFCLKSTAT/LFCLKSTAT spin-waits): set on START, kept
+     * separate from the latched EVENT so an ISR clearing the event doesn't make
+     * the clock look stopped. */
+    uint32_t hfclkstarted;   /* HFCLK running */
+    uint32_t lfclkstarted;   /* LFCLK running */
+    /* Latched events (offset 0x100/0x104), cleared by the ISR.  nrf_802154's
+     * RSCH waits on the HFCLKSTARTED *interrupt* (POWER_CLOCK IRQ) to approve
+     * its radio precondition — without it the radio never enables. */
+    uint32_t evt_hfclkstarted;
+    uint32_t evt_lfclkstarted;
     uint32_t lfclksrc;       /* offset 0x518 — selected LF source (0=RC,1=XTAL,2=Synth) */
+    uint32_t intenset;       /* offset 0x304 (bit0=HFCLKSTARTED, bit1=LFCLKSTARTED) */
+    void    *soc;            /* back-pointer for the POWER_CLOCK IRQ */
 } nrf_clock_state_t;
 
 /* Legacy UART0 register window of the UARTE0 peripheral at 0x40002000.

@@ -72,13 +72,23 @@ static void nrf_host_cancel(void *cpu, cpu_event_t *ev) {
 #define NRF_CLOCK_LFCLKSTAT        0x418
 #define NRF_CLOCK_LFCLKSRC         0x518
 #define NRF_CLOCK_STAT_STATE       (1u << 16)   /* "clock is running" */
+/* CLOCK interrupt (POWER + CLOCK share IRQ 0).  nrf_802154's RSCH waits on the
+ * HFCLKSTARTED interrupt to approve its radio precondition; the nrfx clock
+ * driver / on-off manager waits on LFCLKSTARTED.  Contiki polls the events
+ * (INTENSET stays 0) → no IRQ → byte-identical. */
+#define NRF_CLOCK_INTENSET         0x304
+#define NRF_CLOCK_INTENCLR         0x308
+#define NRF_CLOCK_INT_HFCLKSTARTED (1u << 0)
+#define NRF_CLOCK_INT_LFCLKSTARTED (1u << 1)
+#define NRF_POWER_CLOCK_IRQ        0
 
 static int nrf_clock_read(void *user_data, uint32_t addr) {
     nrf_clock_state_t *clock = (nrf_clock_state_t *)user_data;
     uint32_t off = addr - NRF_CLOCK_BASE;
     switch (off) {
-        case NRF_CLOCK_EVENTS_HFCLKSTARTED: return (int)clock->hfclkstarted;
-        case NRF_CLOCK_EVENTS_LFCLKSTARTED: return (int)clock->lfclkstarted;
+        /* EVENTS = the latched event (ISR clears), separate from run-state. */
+        case NRF_CLOCK_EVENTS_HFCLKSTARTED: return (int)clock->evt_hfclkstarted;
+        case NRF_CLOCK_EVENTS_LFCLKSTARTED: return (int)clock->evt_lfclkstarted;
         case NRF_CLOCK_HFCLKRUN:  return clock->hfclkstarted ? 1 : 0;
         case NRF_CLOCK_HFCLKSTAT:
             /* SRC=XTAL(1) + STATE=running once started. */
@@ -90,25 +100,46 @@ static int nrf_clock_read(void *user_data, uint32_t addr) {
             return (int)((clock->lfclksrc & 3u) |
                          (clock->lfclkstarted ? NRF_CLOCK_STAT_STATE : 0u));
         case NRF_CLOCK_LFCLKSRC:  return (int)clock->lfclksrc;
+        case NRF_CLOCK_INTENSET:
+        case NRF_CLOCK_INTENCLR:  return (int)clock->intenset;
         default: return 0;
     }
+}
+
+/* Raise the POWER_CLOCK IRQ (0) for any enabled + latched CLOCK event. */
+static void nrf_clock_irq(nrf_clock_state_t *clock) {
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)clock->soc;
+    if (!soc || !soc->plat || !soc->plat->cpu.nvic) return;
+    if (((clock->intenset & NRF_CLOCK_INT_HFCLKSTARTED) && clock->evt_hfclkstarted) ||
+        ((clock->intenset & NRF_CLOCK_INT_LFCLKSTARTED) && clock->evt_lfclkstarted))
+        arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, NRF_POWER_CLOCK_IRQ);
 }
 
 static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf_clock_state_t *clock = (nrf_clock_state_t *)user_data;
     uint32_t off = addr - NRF_CLOCK_BASE;
+    if (getenv("NRF_CLOCK_TRACE")) fprintf(stderr, "[clkW] 0x%03x = 0x%08x\n", off, value);
     switch (off) {
-        case NRF_CLOCK_TASKS_HFCLKSTART:
-            if (value == 1) clock->hfclkstarted = 1;
+        case NRF_CLOCK_TASKS_HFCLKSTART:    /* run-state + latched event + IRQ */
+            if (value == 1) { clock->hfclkstarted = 1;
+                              clock->evt_hfclkstarted = 1; nrf_clock_irq(clock); }
             break;
         case NRF_CLOCK_TASKS_LFCLKSTART:
-            if (value == 1) clock->lfclkstarted = 1;
+            if (value == 1) { clock->lfclkstarted = 1;
+                              clock->evt_lfclkstarted = 1; nrf_clock_irq(clock); }
             break;
-        case NRF_CLOCK_EVENTS_HFCLKSTARTED:
-            clock->hfclkstarted = value & 1;
+        case NRF_CLOCK_EVENTS_HFCLKSTARTED:   /* ISR clears the event only */
+            clock->evt_hfclkstarted = value & 1;
             break;
         case NRF_CLOCK_EVENTS_LFCLKSTARTED:
-            clock->lfclkstarted = value & 1;
+            clock->evt_lfclkstarted = value & 1;
+            break;
+        case NRF_CLOCK_INTENSET:
+            clock->intenset |= value;
+            nrf_clock_irq(clock);   /* enable-while-latched → fire now */
+            break;
+        case NRF_CLOCK_INTENCLR:
+            clock->intenset &= ~value;
             break;
         case NRF_CLOCK_LFCLKSRC:
             clock->lfclksrc = value;
@@ -1289,6 +1320,7 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
 
     /* CLOCK and UART register windows.  The UART page serves both the legacy
      * UART (Contiki) and UARTE EasyDMA (stock Zephyr) register maps. */
+    soc->clock.soc = soc;
     arm_register_io(&plat->cpu, NRF_CLOCK_BASE, NRF_CLOCK_SIZE,
                     nrf_clock_read, nrf_clock_write, &soc->clock);
     soc->uart0.soc     = soc;
