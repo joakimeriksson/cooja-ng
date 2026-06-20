@@ -8,14 +8,21 @@ Contiki-NG. The bundled example prints the classic banner:
 Hello World! nrf52840dk/nrf52840
 ```
 
-## Run the bundled example
+## Run the bundled examples
 
 ```sh
+# Single-thread hello_world
 ./build/test_runner nrf52840-dk-multinode \
     firmware/nrf52840-dk/zephyr-hello-world.nrf52840-dk -t 2000 -n 1
+
+# Two threads + timers (samples/synchronization) — they alternate every ~565 ms
+./build/test_runner nrf52840-dk-multinode \
+    firmware/nrf52840-dk/zephyr-synchronization.nrf52840-dk -t 3000 -n 1
 ```
 
-The firmware is a pre-built `samples/hello_world` for `nrf52840dk/nrf52840`.
+Pre-built Zephyr samples for `nrf52840dk/nrf52840`.  The synchronization sample
+exercises the system timer (`k_msleep`) **and** thread context switching
+(PendSV / MSP↔PSP banking).
 
 ## How it was built
 
@@ -55,9 +62,27 @@ Contiki used (see commit history):
   `ENDTX→STOPTX` PPI link would produce; csim doesn't model PPI). The legacy
   non-DMA UART (Contiki's path, and Zephyr with a `nordic,nrf-uart` overlay)
   also still works.
-- The `ARM_MMIO_TRACE=1` diagnostic (logs the first access to each unmapped
-  peripheral page) is how the missing registers were found — useful for any
-  future firmware bring-up.
+- **MRS IPSR** (SYSm=5) now returns just the exception number, so Zephyr's
+  `_isr_wrapper` dispatches the right ISR — without this every interrupt
+  mis-dispatched and the tickless RTC1 clock never advanced.
+- **Banked MSP/PSP** across exception entry/return + `CONTROL.SPSEL`, so the
+  PendSV context switch works and threads actually run (Contiki used MSP only,
+  so it never exercised this).
+
+### Bring-up debugging toolkit
+
+These env-gated scopes (behaviour-neutral; in `src/arm/`) are what made the
+above tractable — reach for them when porting a new OS or peripheral:
+
+| Env var | What it shows |
+|---|---|
+| `ARM_MMIO_TRACE=1` | first access to each **unmapped peripheral page** (find missing peripherals) |
+| `ARM_EXC_TRACE=1` | **exception entry/return** (exc/EXC_RETURN, SP, PC) — ISR dispatch + context switches |
+| `NRF_RX_TRACE=1` | nRF radio RX framing |
+
+Plus the end-of-run per-node `PC=0x…` (the ARM `program_counter` op) →
+`arm-none-eabi-addr2line -e <elf> <pc>` resolves a boot spin to a source line.
+The per-mote GDB stub is also available for interactive inspection.
 
 ## Limitations
 
