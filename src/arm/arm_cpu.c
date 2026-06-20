@@ -438,8 +438,25 @@ EVENT_QUEUE_IMPL(arm, arm_cpu_t, arm_event_t)
 
 /* --- Exception entry/return --- */
 
+/* Banked stack pointer: cpu->reg[ARM_SP] is always the ACTIVE SP.  Handler
+ * mode (IPSR != 0) always uses MSP; thread mode uses PSP iff CONTROL.SPSEL
+ * (cpu->use_psp).  The INACTIVE bank's value lives in cpu->msp / cpu->psp. */
+static inline bool arm_sp_is_psp(const arm_cpu_t *cpu) {
+    return ((cpu->xpsr & 0x1FFu) == 0) && cpu->use_psp;
+}
+
+/* Exception entry/return tracer (ARM_EXC_TRACE=1).  Behaviour-neutral; the
+ * key scope for context-switch (PendSV) and ISR-dispatch bring-up. */
+static void arm_exc_trace(const char *what, uint32_t a, uint32_t b, uint32_t c) {
+    static int en = -1;
+    if (en < 0) en = getenv("ARM_EXC_TRACE") ? 1 : 0;
+    if (en) fprintf(stderr, "[exc] %-6s exc/lr=0x%08x sp=0x%08x pc=0x%08x\n",
+                    what, a, b, c);
+}
+
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
-    /* Push exception frame: R0-R3, R12, LR, ReturnAddr, xPSR */
+    /* Push exception frame on the ACTIVE stack (PSP or MSP). */
+    bool from_psp = arm_sp_is_psp(cpu);
     uint32_t sp = cpu->reg[ARM_SP];
     uint32_t sp_align = sp & 4u; /* Non-zero if 4-byte but not 8-byte aligned */
     sp &= ~7u; /* 8-byte align */
@@ -466,6 +483,11 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     cpu->reg[ARM_SP] = sp;
     cpu->it_state = 0; /* Clear IT state for handler */
 
+    /* The handler runs on MSP.  Save the frame'd stack to its bank, then make
+     * MSP active.  (If we were already on MSP, keep the bank in sync.) */
+    if (from_psp) { cpu->psp = sp; cpu->reg[ARM_SP] = cpu->msp; }
+    else          { cpu->msp = sp; }
+
     /* Set EXC_RETURN in LR.
      * 0xFFFFFFF1 = Return to Handler mode (nested interrupt), MSP
      * 0xFFFFFFF9 = Return to Thread mode, MSP
@@ -486,6 +508,7 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
 
     cpu->cpu_off = false; /* Wake from WFI */
     cpu->cycles += 12; /* Exception entry latency */
+    arm_exc_trace("enter", (uint32_t)exception_num, cpu->reg[ARM_SP], cpu->reg[ARM_PC]);
 }
 
 void arm_check_pending_exceptions(arm_cpu_t *cpu) {
@@ -494,8 +517,14 @@ void arm_check_pending_exceptions(arm_cpu_t *cpu) {
 }
 
 static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
-    /* Pop exception frame */
-    uint32_t sp = cpu->reg[ARM_SP];
+    /* The handler ran on MSP — sync the bank before re-banking. */
+    cpu->msp = cpu->reg[ARM_SP];
+
+    /* The frame to unstack is on the stack EXC_RETURN selects: bit 2 set =
+     * return to Thread mode using PSP (0xFFFFFFFD); else MSP (0xF1 handler,
+     * 0xF9 thread). */
+    bool ret_psp = (exc_return & 0x4u) != 0;
+    uint32_t sp = ret_psp ? cpu->psp : cpu->msp;
 
     cpu->reg[0]      = arm_read32(cpu, sp + 0);
     cpu->reg[1]      = arm_read32(cpu, sp + 4);
@@ -510,16 +539,20 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     cpu->it_state = (uint8_t)(((cpu->xpsr >> 25) & 0x3) |
                               (((cpu->xpsr >> 10) & 0x3F) << 2));
 
-    /* Account for stack alignment padding (xPSR bit 9) */
-    cpu->reg[ARM_SP] = sp + 32 + ((cpu->xpsr & (1u << 9)) ? 4 : 0);
+    /* Unstacked SP (account for the alignment padding in xPSR bit 9). */
+    uint32_t newsp = sp + 32 + ((cpu->xpsr & (1u << 9)) ? 4 : 0);
 
-    /* Restore execution mode from EXC_RETURN.
-     * 0xFFFFFFF1: Return to Handler mode (nested) — keep IPSR from popped xPSR
-     * 0xFFFFFFF9/FD: Return to Thread mode — clear IPSR */
-    if ((exc_return & 0xF) == 0x9 || (exc_return & 0xF) == 0xD) {
-        cpu->xpsr &= ~0x1FFu; /* Clear IPSR -> Thread mode */
+    /* Restore execution mode + re-bank the active SP from EXC_RETURN. */
+    if ((exc_return & 0xF) == 0x1) {
+        /* Return to (outer) Handler mode, MSP — IPSR kept from popped xPSR. */
+        cpu->msp = newsp;
+        cpu->reg[ARM_SP] = newsp;
+    } else {
+        cpu->xpsr &= ~0x1FFu; /* Thread mode -> clear IPSR */
+        cpu->use_psp = ret_psp;
+        if (ret_psp) cpu->psp = newsp; else cpu->msp = newsp;
+        cpu->reg[ARM_SP] = newsp;   /* active SP for the returned-to thread */
     }
-    /* else: 0xFFFFFFF1 — IPSR already restored from popped xPSR (outer handler) */
 
     /* Restore active exception from the IPSR of the state we're returning to */
     if (cpu->nvic) {
@@ -529,6 +562,7 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     }
 
     cpu->cycles += 12;
+    arm_exc_trace("return", exc_return, cpu->reg[ARM_SP], cpu->reg[ARM_PC]);
 }
 
 /* --- APSR flag helpers --- */
@@ -2319,8 +2353,12 @@ int arm_step(arm_cpu_t *cpu, int count) {
                             case 5: cpu->reg[rd] = cpu->xpsr & 0x1FFu; break; /* IPSR */
                             case 6: case 7:
                                 cpu->reg[rd] = cpu->xpsr; break; /* (I)EPSR (approx) */
-                            case 8: cpu->reg[rd] = cpu->msp; break;
-                            case 9: cpu->reg[rd] = cpu->psp; break;
+                            /* Banked: the active SP lives in reg[ARM_SP], the
+                             * inactive bank in cpu->msp / cpu->psp. */
+                            case 8: cpu->reg[rd] = arm_sp_is_psp(cpu) ? cpu->msp
+                                                 : cpu->reg[ARM_SP]; break; /* MSP */
+                            case 9: cpu->reg[rd] = arm_sp_is_psp(cpu) ? cpu->reg[ARM_SP]
+                                                 : cpu->psp; break;        /* PSP */
                             case 16: cpu->reg[rd] = cpu->primask; break;
                             case 17: cpu->reg[rd] = cpu->basepri; break;
                             case 19: cpu->reg[rd] = cpu->faultmask; break;
@@ -2336,8 +2374,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                             case 0: /* APSR */
                                 cpu->xpsr = (cpu->xpsr & 0x0FFFFFFF) | (val & 0xF0000000);
                                 break;
-                            case 8: cpu->msp = val; cpu->reg[ARM_SP] = val; break;
-                            case 9: cpu->psp = val; break;
+                            case 8: if (arm_sp_is_psp(cpu)) cpu->msp = val;
+                                    else cpu->reg[ARM_SP] = val; break; /* MSP */
+                            case 9: if (arm_sp_is_psp(cpu)) cpu->reg[ARM_SP] = val;
+                                    else cpu->psp = val; break;         /* PSP */
                             case 16:
                                 cpu->primask = val & 1;
                                 /* Like CPSIE i above — when PRIMASK clears,
@@ -2349,9 +2389,20 @@ int arm_step(arm_cpu_t *cpu, int count) {
                                 break;
                             case 17: cpu->basepri = val & 0xFF; break;
                             case 19: cpu->faultmask = val & 1; break;
-                            case 20: /* CONTROL */
-                                cpu->use_psp = (val & 2) != 0;
+                            case 20: { /* CONTROL */
+                                bool new_psp = (val & 2) != 0;
+                                /* In thread mode, flipping SPSEL swaps the
+                                 * active stack (save old bank, load new). */
+                                if ((cpu->xpsr & 0x1FFu) == 0 &&
+                                    new_psp != cpu->use_psp) {
+                                    if (new_psp) { cpu->msp = cpu->reg[ARM_SP];
+                                                   cpu->reg[ARM_SP] = cpu->psp; }
+                                    else         { cpu->psp = cpu->reg[ARM_SP];
+                                                   cpu->reg[ARM_SP] = cpu->msp; }
+                                }
+                                cpu->use_psp = new_psp;
                                 break;
+                            }
                             default: break;
                         }
                     }
