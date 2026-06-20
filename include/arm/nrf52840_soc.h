@@ -199,6 +199,9 @@ typedef struct nrf_rng_state {
     uint32_t shorts;          /* offset 0x200 */
     bool     running;
     uint32_t prng_state;      /* xorshift32 seeded per-node */
+    int      irq_num;         /* RNG IRQ = 13 on nRF52840 */
+    void    *soc;             /* back-pointer for the VALRDY IRQ */
+    void    *valrdy_event;    /* paced VALRDY generator (opaque cpu_event_t *) */
 } nrf_rng_state_t;
 
 /* FICR at 0x10000000 — factory information. csim only models the

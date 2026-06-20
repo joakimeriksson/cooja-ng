@@ -1001,6 +1001,34 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
 #define NRF_RNG_INTENCLR          0x308
 #define NRF_RNG_CONFIG            0x504
 #define NRF_RNG_VALUE             0x508
+#define NRF_RNG_INT_VALRDY        (1u << 0)
+#define NRF_RNG_IRQ               13      /* RNG_IRQn on nRF52840 */
+#define NRF_RNG_VALRDY_CYCLES     10000   /* ~156 µs/byte @ 64 MHz — paced like HW */
+
+/* Paced VALRDY generator.  Real HW produces one random byte roughly every
+ * ~167 µs and raises VALRDY each time; the entropy_nrf5 driver takes one byte
+ * per interrupt until its pool is full, then disables the interrupt.  Delivering
+ * bytes *instantly* (back to back with no time between) storms the NVIC and
+ * corrupts the exception frame, so we pace them through a scheduled event.
+ * Contiki polls VALRDY (INTENSET stays 0) so it never arms this → byte-identical.*/
+static void nrf_rng_arm(nrf_rng_state_t *rng) {
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)rng->soc;
+    if (!soc || !soc->plat || !rng->valrdy_event) return;
+    if (!rng->running || !(rng->intenset & NRF_RNG_INT_VALRDY)) return;
+    arm_schedule_event(&soc->plat->cpu, (arm_event_t *)rng->valrdy_event,
+                       (int64_t)soc->plat->cpu.cycles + NRF_RNG_VALRDY_CYCLES);
+}
+
+static void nrf_rng_event_cb(void *user_data, cpu_event_t *event) {
+    (void)event;
+    nrf_rng_state_t *rng = (nrf_rng_state_t *)user_data;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)rng->soc;
+    if (!soc || !soc->plat || !rng->running) return;
+    rng->evt_valrdy = 1;
+    if ((rng->intenset & NRF_RNG_INT_VALRDY) && soc->plat->cpu.nvic)
+        arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, rng->irq_num);
+    nrf_rng_arm(rng);   /* keep producing while running + enabled */
+}
 
 static uint8_t rng_next(nrf_rng_state_t *rng) {
     uint32_t s = rng->prng_state ? rng->prng_state : 0x12345678u;
@@ -1027,18 +1055,31 @@ static void nrf_rng_write(void *user_data, uint32_t addr, uint32_t value) {
     uint32_t off = addr - NRF_RNG_BASE;
     switch (off) {
         case NRF_RNG_TASKS_START:
-            if (value == 1) { rng->running = true; rng->evt_valrdy = 1; }
+            if (value == 1) {
+                rng->running = true;
+                /* First byte: instant for pollers (Contiki reads VALRDY then
+                 * VALUE); the paced event drives interrupt-driven consumers. */
+                rng->evt_valrdy = 1;
+                nrf_rng_arm(rng);
+            }
             break;
         case NRF_RNG_TASKS_STOP:
-            if (value == 1) rng->running = false;
+            if (value == 1) {
+                rng->running = false;
+                if (rng->valrdy_event)
+                    arm_cancel_event(&((nrf52840_soc_t *)rng->soc)->plat->cpu,
+                                     (arm_event_t *)rng->valrdy_event);
+            }
             break;
         case NRF_RNG_EVENTS_VALRDY:
-            /* Firmware acks VALRDY by writing 0.  If the RNG is still running,
-             * immediately re-set it — our PRNG delivers bytes instantly. */
+            /* Firmware acks VALRDY by writing 0.  Pollers (Contiki) see it
+             * re-set instantly (PRNG is always ready); interrupt-driven
+             * consumers get the next byte from the paced event, not here. */
             rng->evt_valrdy = (value & 1) ? 1 : (rng->running ? 1 : 0);
             break;
         case NRF_RNG_SHORTS:        rng->shorts     = value;     break;
-        case NRF_RNG_INTENSET:      rng->intenset  |= value;     break;
+        case NRF_RNG_INTENSET:      rng->intenset  |= value;
+                                    nrf_rng_arm(rng); break;
         case NRF_RNG_INTENCLR:      rng->intenset  &= ~value;    break;
         default: break;
     }
@@ -1274,6 +1315,12 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
 
     /* RNG */
     soc->rng.prng_state = 0xDEADBEEF;
+    soc->rng.irq_num    = NRF_RNG_IRQ;
+    soc->rng.soc        = soc;
+    cpu_event_t *rev = (cpu_event_t *)calloc(1, sizeof(*rev));
+    rev->callback   = nrf_rng_event_cb;
+    rev->user_data  = &soc->rng;
+    soc->rng.valrdy_event = rev;
     arm_register_io(&plat->cpu, NRF_RNG_BASE, 0x1000,
                     nrf_rng_read, nrf_rng_write, &soc->rng);
 
