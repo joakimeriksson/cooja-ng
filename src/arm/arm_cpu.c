@@ -221,8 +221,21 @@ uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
     return 0;
 }
 
+/* ARM_WATCH=0xADDR — log every 32-bit write to that SRAM word (PC+LR). */
+static uint32_t arm_watch_addr = (uint32_t)-1;
+static uint32_t arm_get_watch_addr(void) {
+    if (arm_watch_addr == (uint32_t)-1) {
+        const char *e = getenv("ARM_WATCH");
+        arm_watch_addr = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
+    }
+    return arm_watch_addr;
+}
+
 void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     addr &= ~3u;
+    if (__builtin_expect(arm_get_watch_addr() != 0, 0) && addr == arm_watch_addr)
+        fprintf(stderr, "[watch] *0x%08x = 0x%08x  pc=0x%08x lr=0x%08x\n",
+                addr, val, cpu->reg[ARM_PC], cpu->reg[ARM_LR]);
     if (addr >= cpu->sram_base && addr < cpu->sram_end) {
         uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
