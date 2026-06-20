@@ -108,13 +108,34 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         nvic->ispr[idx] &= ~value;
         return;
     }
-    /* NVIC_IPR */
+    /* NVIC_IPR — NVIC->IP[] is a byte array; CMSIS NVIC_SetPriority writes it
+     * one byte at a time.  Treat an aligned write whose value exceeds a byte as
+     * a packed 4-IRQ word; otherwise a single-byte priority write (which the
+     * old 4-byte-always path would have clobbered the 3 neighbours of). */
     if (offset >= NVIC_IPR_BASE && offset < NVIC_IPR_BASE + 240) {
-        int base_idx = offset - NVIC_IPR_BASE;
-        nvic->ipr[base_idx]     = value & 0xFF;
-        nvic->ipr[base_idx + 1] = (value >> 8) & 0xFF;
-        nvic->ipr[base_idx + 2] = (value >> 16) & 0xFF;
-        nvic->ipr[base_idx + 3] = (value >> 24) & 0xFF;
+        int idx = offset - NVIC_IPR_BASE;
+        if ((offset & 3u) == 0 && value > 0xFFu) {
+            for (int b = 0; b < 4 && idx + b < 240; b++)
+                nvic->ipr[idx + b] = (value >> (8 * b)) & 0xFF;
+        } else {
+            nvic->ipr[idx] = value & 0xFF;
+        }
+        return;
+    }
+
+    /* System-handler priorities SHPR1-3 (0xD18-0xD23) are equally byte-
+     * addressable.  CMSIS sets PendSV (0xD22), SysTick (0xD23), SVCall, and the
+     * fault handlers via single-byte writes; the word-only cases below dropped
+     * them, leaving PendSV at priority 0 (highest) so it wrongly preempted
+     * active ISRs (corrupting the stack on an ISR-triggered context switch). */
+    if (offset >= 0xD18 && offset <= 0xD23) {
+        int idx = offset - 0xD18;
+        if ((offset & 3u) == 0 && value > 0xFFu) {
+            for (int b = 0; b < 4 && idx + b < 12; b++)
+                nvic->shpr[idx + b] = (value >> (8 * b)) & 0xFF;
+        } else {
+            nvic->shpr[idx] = value & 0xFF;
+        }
         return;
     }
 
