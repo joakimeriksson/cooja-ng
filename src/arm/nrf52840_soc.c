@@ -1076,6 +1076,15 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                  * keys off (IRQ + PPI chains); fire it last, with its mask. */
                 radio_event(soc, &r->evt_phyend,   RADIO_INT_PHYEND);
 
+                /* Apply SHORTS that fire on frame completion. The
+                 * nrf_802154 driver uses END_DISABLE and PHYEND_DISABLE
+                 * to auto-disable the radio after RX, so the ACK TX
+                 * path can reconfigure for TX. */
+                radio_apply_shorts_after_event(soc, SHORT_END_DISABLE);
+                radio_apply_shorts_after_event(soc, SHORT_PHYEND_DISABLE);
+                radio_apply_shorts_after_event(soc, SHORT_END_START);
+                radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
+
                 /* Hardware-style auto-ACK for unicast Data frames that
                  * have the ACK_REQUEST bit set. Real nRF52840 silicon
                  * achieves sub-200 µs ACK turnaround via PPI + TIMER +

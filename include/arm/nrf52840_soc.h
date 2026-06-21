@@ -200,7 +200,10 @@ typedef struct nrf_timer_state {
     uint32_t evt_compare[6];
     uint32_t intenset;
     uint32_t shorts;
+    int      irq_num;         /* TIMER0=8, TIMER1=9, TIMER2=10, TIMER3=26, TIMER4=27 */
     struct nrf52840_soc *soc; /* back-pointer for cpu access */
+    void    *compare_event;   /* single deferred event for the next CC match */
+    int      next_cc;         /* which CC[i] the pending event is for (-1=none) */
 } nrf_timer_state_t;
 
 /* RNG at 0x4000D000 — random byte generator. */
