@@ -824,6 +824,9 @@ static void nrf_radio_ramp_cb(void *user_data, cpu_event_t *event) {
     (void)event;
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
+    if (getenv("NRF_RADIO_TRACE"))
+        fprintf(stderr, "[ramp] cb fired state=%d @cyc=%lld\n", r->state,
+                (long long)soc->plat->cpu.cycles);
     if (r->state == NRF_RADIO_STATE_RXRU)
         radio_set_state(soc, NRF_RADIO_STATE_RXIDLE);
     else if (r->state == NRF_RADIO_STATE_TXRU)
@@ -833,6 +836,9 @@ static void nrf_radio_ramp_cb(void *user_data, cpu_event_t *event) {
 /* Enter the RXRU/TXRU ramp state and schedule its 40 µs completion. */
 static void radio_start_rampup(nrf52840_soc_t *soc, uint32_t ru_state) {
     soc->radio.state = ru_state;
+    if (getenv("NRF_RADIO_TRACE"))
+        fprintf(stderr, "[ramp] start state=%d ev=%p @cyc=%lld\n", ru_state,
+                (void*)soc->radio.ramp_event, (long long)soc->plat->cpu.cycles);
     if (soc->radio.ramp_event && soc->plat)
         arm_schedule_event(&soc->plat->cpu, (arm_event_t *)soc->radio.ramp_event,
                            (int64_t)soc->plat->cpu.cycles + RADIO_RAMP_UP_CYCLES);
@@ -1036,7 +1042,10 @@ static int nrf_radio_read(void *user_data, uint32_t addr) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
     uint32_t off = addr - NRF_RADIO_BASE;
-    if (getenv("NRF_RADIO_TRACE")) fprintf(stderr, "[radioR] 0x%03x\n", off);
+    if (getenv("NRF_RADIO_TRACE")) {
+        if (off == RADIO_STATE) fprintf(stderr, "[radioR] STATE = %d\n", r->state);
+        else fprintf(stderr, "[radioR] 0x%03x\n", off);
+    }
     switch (off) {
         case RADIO_STATE:        return (int)r->state;
         case RADIO_EVENTS_READY:        return (int)r->evt_ready;
