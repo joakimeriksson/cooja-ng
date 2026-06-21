@@ -53,6 +53,18 @@ typedef struct nrf_uart_state {
     uint32_t endtx;           /* offset 0x120 — TX DMA complete event */
     uint32_t txstarted;       /* offset 0x150 — TX started event */
     uint32_t txstopped;       /* offset 0x158 — TX stopped (= TX inactive) */
+    /* UARTE EasyDMA RX (console shell input).  A ring buffers injected console
+     * bytes; one is DMA'd per STARTRX / ENDRX-ack so the firmware self-paces. */
+    uint32_t rxd_ptr;         /* offset 0x534 — RX DMA dest address */
+    uint32_t rxd_maxcnt;      /* offset 0x538 */
+    uint32_t rxd_amount;      /* offset 0x53C — bytes received (read-back) */
+    uint32_t endrx;           /* offset 0x110 — RX DMA complete event */
+    uint32_t rxstarted;       /* offset 0x14C */
+    uint32_t rxdrdy;          /* offset 0x108 */
+    uint32_t shorts;          /* offset 0x200 (ENDRX_STARTRX = bit 5) */
+    int      rx_armed;        /* STARTRX active, awaiting a byte */
+    uint8_t  rx_ring[512];    /* injected console input awaiting delivery */
+    int      rx_head, rx_tail;
 } nrf_uart_state_t;
 
 /* RTC0 at 0x4000B000.
@@ -301,6 +313,9 @@ typedef struct nrf52840_soc {
  * and to push received bytes into the radio. */
 void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, void *user_data);
 void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte);
+
+/* Inject host console bytes into the UARTE RX ring (shell input). */
+void nrf_uart_feed_rx(nrf_uart_state_t *uart, const uint8_t *buf, int len);
 
 /* nRF52840 RADIO state enum values (per PS v1.7 §6.20.15.39). */
 #define NRF_RADIO_STATE_DISABLED   0

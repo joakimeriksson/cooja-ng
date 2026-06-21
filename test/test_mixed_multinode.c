@@ -2535,6 +2535,37 @@ sim_restart:
             time_step += get_time_ms() - t_phase;
         }
 
+        /* One-shot console injection for headless shell-driven tests:
+         * feed CSIM_NODE0_INPUT to node 0 once the shell is up (after a short
+         * settle).  `\n`/`\r` escapes become newlines.  Used to e.g. make one
+         * RIOT node the RPL root over its UART shell. */
+        {
+            static int s_inj_done[16] = {0};
+            int64_t now = sim_runtime_now_ns(&sim_rt);
+            for (int ni = 0; ni < num_nodes && ni < 16; ni++) {
+                if (s_inj_done[ni]) continue;
+                char ev[28];  snprintf(ev, sizeof ev, "CSIM_NODE%d_INPUT", ni);
+                const char *in = getenv(ev);
+                if (!in) { s_inj_done[ni] = 1; continue; }
+                char atk[28]; snprintf(atk, sizeof atk, "CSIM_NODE%d_AT_MS", ni);
+                const char *atv = getenv(atk);
+                int64_t at_ns = atv ? (int64_t)atol(atv) * 1000000LL : 500000000LL;
+                if (now < at_ns) continue;
+                uint8_t cmd[512]; int n = 0;
+                for (const char *p = in; *p && n < (int)sizeof(cmd); p++) {
+                    if (p[0] == '\\' && p[1] == 'n')      { cmd[n++] = '\n'; p++; }
+                    else if (p[0] == '\\' && p[1] == 'r') { cmd[n++] = '\r'; p++; }
+                    else cmd[n++] = (uint8_t)*p;
+                }
+                inject_serial(ni, cmd, n);
+                /* Wake the node with a full slice's room so its CPU runs past
+                 * idle WFI (wake → cpsie i → take the UART RX IRQ); the rest of
+                 * the bytes drain in-slice via ENDRX-ack. */
+                sim_schedule_mote_wakeup_if_earlier(&sim_rt, ni, now + 1000000LL);
+                s_inj_done[ni] = 1;
+            }
+        }
+
         /* Update per-node radio/LED state for timeline (M16: the ops'
          * NULL-ness encodes which mote kinds are polled — CC2538 pushes
          * radio state via async callback, natives/JS have neither). */

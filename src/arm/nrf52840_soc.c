@@ -180,6 +180,55 @@ static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
 #define NRF_UARTE_TXD_AMOUNT       0x54C
 #define NRF_UARTE_INT_ENDTX        (1u << 8)
 #define NRF_UARTE_INT_TXSTOPPED    (1u << 22)  /* int-driven shell/console TX "ready" */
+/* UARTE EasyDMA RX (console shell input). */
+#define NRF_UARTE_TASKS_STARTRX    0x000
+#define NRF_UARTE_TASKS_STOPRX     0x004
+#define NRF_UARTE_EVENTS_RXDRDY    0x108
+#define NRF_UARTE_EVENTS_ENDRX     0x110
+#define NRF_UARTE_EVENTS_RXSTARTED 0x14C
+#define NRF_UARTE_SHORTS           0x200
+#define NRF_UARTE_RXD_PTR          0x534
+#define NRF_UARTE_RXD_MAXCNT       0x538
+#define NRF_UARTE_RXD_AMOUNT       0x53C
+#define NRF_UARTE_INT_ENDRX        (1u << 4)
+#define NRF_UARTE_SHORT_ENDRX_STARTRX (1u << 5)
+#define NRF_UARTE_SHORT_ENDRX_STOPRX  (1u << 6)
+
+/* Deliver one buffered console byte via EasyDMA: write it to the RX buffer in
+ * RAM, latch ENDRX/RXDRDY, raise the IRQ, and apply the ENDRX_STARTRX/STOPRX
+ * short.  Called when the firmware arms RX (STARTRX) or acks the previous byte
+ * (clears ENDRX) — so input self-paces to the driver's consumption rate. */
+static void uarte_deliver_rx(nrf_uart_state_t *uart) {
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)uart->soc;
+    if (getenv("NRF_UART_TRACE"))
+        fprintf(stderr, "[uartRX] deliver armed=%d endrx=%d ring=%d->%d\n",
+                uart->rx_armed, uart->endrx, uart->rx_tail, uart->rx_head);
+    if (!uart->rx_armed || uart->endrx) return;          /* not ready */
+    if (uart->rx_head == uart->rx_tail) return;          /* ring empty */
+    uint8_t b = uart->rx_ring[uart->rx_tail];
+    uart->rx_tail = (uart->rx_tail + 1) % (int)sizeof(uart->rx_ring);
+    if (uart->rxd_ptr) arm_write8(&soc->plat->cpu, uart->rxd_ptr, b);
+    uart->rxd_amount = 1;
+    uart->rxdrdy     = 1;
+    uart->rxstarted  = 1;
+    uart->endrx      = 1;
+    /* ENDRX_STARTRX re-arms RX in hardware; ENDRX_STOPRX (or no short) stops. */
+    if (uart->shorts & NRF_UARTE_SHORT_ENDRX_STOPRX)        uart->rx_armed = 0;
+    else if (!(uart->shorts & NRF_UARTE_SHORT_ENDRX_STARTRX)) uart->rx_armed = 0;
+    if ((uart->intenset & NRF_UARTE_INT_ENDRX) && soc->plat->cpu.nvic)
+        arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, uart->irq_num);
+}
+
+/* Enqueue host console input; deliver immediately if the firmware is waiting. */
+void nrf_uart_feed_rx(nrf_uart_state_t *uart, const uint8_t *buf, int len) {
+    for (int i = 0; i < len; i++) {
+        int next = (uart->rx_head + 1) % (int)sizeof(uart->rx_ring);
+        if (next == uart->rx_tail) break;                /* ring full */
+        uart->rx_ring[uart->rx_head] = buf[i];
+        uart->rx_head = next;
+    }
+    uarte_deliver_rx(uart);
+}
 
 static int nrf_uart_read(void *user_data, uint32_t addr) {
     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
@@ -197,6 +246,14 @@ static int nrf_uart_read(void *user_data, uint32_t addr) {
         case NRF_UARTE_TXD_AMOUNT:       return (int)uart->txd_amount;
         case NRF_UARTE_INTENSET:
         case NRF_UARTE_INTENCLR:         return (int)uart->intenset;
+        /* UARTE EasyDMA RX read-backs. */
+        case NRF_UARTE_EVENTS_ENDRX:     return (int)uart->endrx;
+        case NRF_UARTE_EVENTS_RXDRDY:    return (int)uart->rxdrdy;
+        case NRF_UARTE_EVENTS_RXSTARTED: return (int)uart->rxstarted;
+        case NRF_UARTE_RXD_PTR:          return (int)uart->rxd_ptr;
+        case NRF_UARTE_RXD_MAXCNT:       return (int)uart->rxd_maxcnt;
+        case NRF_UARTE_RXD_AMOUNT:       return (int)uart->rxd_amount;
+        case NRF_UARTE_SHORTS:           return (int)uart->shorts;
         default: return 0;
     }
 }
@@ -267,6 +324,18 @@ static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
                     uart->irq_num);
             break;
         case NRF_UARTE_INTENCLR:       uart->intenset &= ~value; break;
+        /* UARTE EasyDMA RX path (console shell input). */
+        case NRF_UARTE_TASKS_STARTRX:  if (value == 1) { uart->rx_armed = 1; uarte_deliver_rx(uart); } break;
+        case NRF_UARTE_TASKS_STOPRX:   if (value == 1) uart->rx_armed = 0; break;
+        case NRF_UARTE_EVENTS_ENDRX:
+            uart->endrx = value & 1;
+            if (!uart->endrx) uarte_deliver_rx(uart);   /* firmware acked → next byte */
+            break;
+        case NRF_UARTE_EVENTS_RXDRDY:    uart->rxdrdy    = value & 1; break;
+        case NRF_UARTE_EVENTS_RXSTARTED: uart->rxstarted = value & 1; break;
+        case NRF_UARTE_RXD_PTR:          uart->rxd_ptr    = value; break;
+        case NRF_UARTE_RXD_MAXCNT:       uart->rxd_maxcnt = value; break;
+        case NRF_UARTE_SHORTS:           uart->shorts     = value; break;
         default: break;
     }
 }

@@ -527,12 +527,17 @@ static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
         cpu->next_event_cycle - cpu->cycles, cpu->cpu_freq_hz);
 }
 
-/* ARM: feed the console UART RX register directly (CC2538-family boards
- * only; Nordic consoles are output-only today). */
+/* ARM: feed the console UART RX register directly.  CC2538-family boards take
+ * the legacy UART RX register; Nordic boards take the UARTE EasyDMA RX ring. */
 static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len) {
-    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
-    for (int i = 0; i < len; i++)
-        cc2538_uart_receive_byte(&soc->uart0, buf[i]);
+    arm_platform_t *plat = &MOTE_IMPL(m)->plat.arm;
+    cc2538_soc_t   *cc  = arm_platform_cc2538(plat);
+    nrf52840_soc_t *nrf = arm_platform_nrf52840(plat);
+    if (cc)
+        for (int i = 0; i < len; i++)
+            cc2538_uart_receive_byte(&cc->uart0, buf[i]);
+    else if (nrf)
+        nrf_uart_feed_rx(&nrf->uart0, buf, len);
     return len;
 }
 
