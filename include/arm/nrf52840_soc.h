@@ -229,6 +229,19 @@ typedef struct nrf_rng_state {
     void    *valrdy_event;    /* paced VALRDY generator (opaque cpu_event_t *) */
 } nrf_rng_state_t;
 
+/* TEMP at 0x4000C000 — on-die temperature sensor.  nrf_802154 measures die
+ * temperature periodically for radio calibration: it writes TASKS_START and
+ * blocks on a "device_sync_sem" until the DATARDY interrupt.  Without a model
+ * that read hangs forever, stalling the system workq (and DAD).  We complete it
+ * instantly: TASKS_START → EVENTS_DATARDY + IRQ; TEMP reads back a fixed ~25 C
+ * (100 in 0.25 C units). */
+typedef struct nrf_temp_state {
+    uint32_t evt_datardy;     /* offset 0x100 */
+    uint32_t intenset;        /* offset 0x304 (bit 0 = DATARDY) */
+    int      irq_num;         /* TEMP IRQ = 12 on nRF52840 */
+    void    *soc;             /* back-pointer for the DATARDY IRQ */
+} nrf_temp_state_t;
+
 /* FICR at 0x10000000 — factory information. csim only models the
  * DEVICEADDR pair (used by the platform glue to derive the IEEE
  * EUI-64). The multinode harness writes per-node values here. */
@@ -274,6 +287,7 @@ typedef struct nrf52840_soc {
     nrf_radio_state_t radio;
     nrf_timer_state_t timer[5];
     nrf_rng_state_t   rng;
+    nrf_temp_state_t  temp;
     nrf_ppi_state_t   ppi;
     nrf_egu_state_t   egu0;
     nrf_ficr_state_t  ficr;

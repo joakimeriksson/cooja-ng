@@ -1584,6 +1584,50 @@ static void nrf_ficr_write(void *user_data, uint32_t addr, uint32_t value) {
 }
 
 /* ============================================================
+ * TEMP at 0x4000C000 — on-die temperature sensor.
+ * nrf_802154 measures die temperature periodically for radio calibration; the
+ * driver writes TASKS_START and blocks on a semaphore until DATARDY.  Complete
+ * it instantly so the read returns and the workq (and DAD) proceeds.
+ * ============================================================ */
+#define NRF_TEMP_BASE            0x4000C000u
+#define NRF_TEMP_TASKS_START     0x000
+#define NRF_TEMP_TASKS_STOP      0x004
+#define NRF_TEMP_EVENTS_DATARDY  0x100
+#define NRF_TEMP_INTENSET        0x304
+#define NRF_TEMP_INTENCLR        0x308
+#define NRF_TEMP_TEMP            0x508
+#define NRF_TEMP_INT_DATARDY     (1u << 0)
+
+static int nrf_temp_read(void *user_data, uint32_t addr) {
+    nrf_temp_state_t *temp = (nrf_temp_state_t *)user_data;
+    switch (addr - NRF_TEMP_BASE) {
+        case NRF_TEMP_EVENTS_DATARDY: return (int)temp->evt_datardy;
+        case NRF_TEMP_INTENSET:       return (int)temp->intenset;
+        case NRF_TEMP_TEMP:           return 100;  /* 25.0 C in 0.25 C units */
+        default:                      return 0;
+    }
+}
+
+static void nrf_temp_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf_temp_state_t *temp = (nrf_temp_state_t *)user_data;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)temp->soc;
+    switch (addr - NRF_TEMP_BASE) {
+        case NRF_TEMP_TASKS_START:
+            /* Measurement completes immediately: latch DATARDY + raise IRQ. */
+            temp->evt_datardy = 1;
+            if ((temp->intenset & NRF_TEMP_INT_DATARDY) && soc && soc->plat &&
+                soc->plat->cpu.nvic)
+                arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, temp->irq_num);
+            break;
+        case NRF_TEMP_TASKS_STOP:     break;
+        case NRF_TEMP_EVENTS_DATARDY: temp->evt_datardy = value & 1; break;  /* ISR clears */
+        case NRF_TEMP_INTENSET:       temp->intenset |= value; break;
+        case NRF_TEMP_INTENCLR:       temp->intenset &= ~value; break;
+        default:                      break;
+    }
+}
+
+/* ============================================================
  * TIMER0..4 — minimum for rtimer_arch_now()
  *
  * 16 MHz base clock, scaled by 2^PRESCALER. Counter increments
@@ -1927,6 +1971,12 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     soc->ficr.deviceaddr1 = 0x0000F4CE;     /* upper bytes used as MAC OUI fragment */
     arm_register_io(&plat->cpu, NRF_FICR_BASE, 0x1000,
                     nrf_ficr_read, nrf_ficr_write, &soc->ficr);
+
+    /* TEMP — die temperature sensor (nrf_802154 radio calibration). */
+    soc->temp.soc = soc;
+    soc->temp.irq_num = 12;     /* TEMP IRQ on nRF52840 */
+    arm_register_io(&plat->cpu, NRF_TEMP_BASE, 0x1000,
+                    nrf_temp_read, nrf_temp_write, &soc->temp);
 }
 
 static void nrf52840_soc_destroy(arm_platform_t *plat) {
