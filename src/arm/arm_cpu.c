@@ -23,6 +23,9 @@ void arm_pcw_init(void) {
     for (char *t = strtok(buf, ","); t && arm_pcw_count < ARM_PCW_MAX; t = strtok(NULL, ","))
         arm_pcw_addr[arm_pcw_count++] = (uint32_t)strtoul(t, 0, 16);
 }
+/* Memory-change watch: ARM_MEM_WATCH="0xaddr" logs every change of the byte at
+ * that address with the writing PC.  Diagnostic only. */
+uint32_t arm_memw_addr; int arm_memw_last = -1; int arm_memw_init_done;
 __attribute__((destructor,used)) static void arm_pcw_dump(void) {
     for (int i = 0; i < arm_pcw_count; i++)
         fprintf(stderr, "PC-WATCH 0x%08x: hits=%llu first=%lld last=%lld\n",
@@ -1024,6 +1027,17 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     if (arm_pcw_n[i] == 0) arm_pcw_first[i] = cpu->cycles;
                     arm_pcw_n[i]++; arm_pcw_last[i] = cpu->cycles;
                 }
+            extern uint32_t arm_memw_addr; extern int arm_memw_last, arm_memw_init_done;
+            if (!arm_memw_init_done) { arm_memw_init_done = 1;
+                char *m = getenv("ARM_MEM_WATCH"); if (m) arm_memw_addr = (uint32_t)strtoul(m, 0, 16); }
+            if (arm_memw_addr) {
+                int v = (int)arm_read8(cpu, arm_memw_addr);
+                if (v != arm_memw_last) {
+                    fprintf(stderr, "[memw] cyc=%lld [0x%08x] %d->%d pc=0x%08x\n",
+                            (long long)cpu->cycles, arm_memw_addr, arm_memw_last, v, pc);
+                    arm_memw_last = v;
+                }
+            }
         }
 
         arm_sp_audit_check(cpu);
