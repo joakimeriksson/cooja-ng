@@ -1,5 +1,14 @@
 # Zephyr nRF52840 DAD-stall — test / debug plan
 
+> **RESOLVED 2026-06-21 (commit `ad8105e`).** Track A (inspect from inside) won:
+> dumping the Zephyr thread list showed every thread `PENDING` with `sysworkq`
+> blocked on the TEMP driver's `device_sync_sem` — csim wasn't modelling the
+> **TEMP peripheral** (0x4000C000), so `nrf_802154`'s periodic calibration temp
+> read hung the work-queue DAD runs on. Modelling TEMP fixed it; the two-node
+> UDP echo now runs end-to-end (RF 60913 B, 0 timeouts). No hardware test needed.
+> The methodology below is kept as a record.
+
+
 Stock Zephyr `echo_server` / `echo_client` (with the sample's own
 `overlay-802154.conf`) reach `net_config` but **never complete Duplicate Address
 Detection** on csim's emulated nRF52840 → `Network initialization failed (-116)`.
