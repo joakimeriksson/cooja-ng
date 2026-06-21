@@ -713,7 +713,12 @@ static void radio_apply_shorts_after_event(nrf52840_soc_t *soc, uint32_t event_m
  * EVENTS_DISABLED then spins until it reads back 1 — if we set it
  * synchronously in the same instruction, the firmware clears it before
  * the poll starts and spins forever. */
-#define NRF_RADIO_DISABLE_CYCLES  384   /* ~6 µs @ 64 MHz */
+/* Delay just long enough that the firmware's "clear EVENTS_DISABLED →
+ * read EVENTS_DISABLED" busy-wait resolves (2 instructions ≈ 4 cycles),
+ * but short enough that the DISABLED → PPI → TXEN chain fires BEFORE
+ * the driver clears the PPI channels (which happens in the CRCOK ISR
+ * epilogue, ~20-50 instructions after the SHORTS triggered DISABLE). */
+#define NRF_RADIO_DISABLE_CYCLES  10
 
 void nrf_radio_disable_cb(void *user_data, cpu_event_t *event) {
     (void)event;
@@ -1076,12 +1081,23 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                  * keys off (IRQ + PPI chains); fire it last, with its mask. */
                 radio_event(soc, &r->evt_phyend,   RADIO_INT_PHYEND);
 
-                /* Apply SHORTS that fire on frame completion. The
-                 * nrf_802154 driver uses END_DISABLE and PHYEND_DISABLE
-                 * to auto-disable the radio after RX, so the ACK TX
-                 * path can reconfigure for TX. */
-                radio_apply_shorts_after_event(soc, SHORT_END_DISABLE);
-                radio_apply_shorts_after_event(soc, SHORT_PHYEND_DISABLE);
+                /* Apply SHORTS for frame completion.  PHYEND_DISABLE /
+                 * END_DISABLE: set state to DISABLED and latch the
+                 * event, but do NOT process DISABLED_TXEN/DISABLED_RXEN
+                 * shorts or PPI here.  On real hardware the 6 µs
+                 * ramp-down runs in parallel with the CRCOK ISR which
+                 * reconfigures PPI CH7 from RXEN to TXEN; the DISABLED
+                 * event then chains through PPI→EGU→TXEN for the ACK.
+                 * csim can't run the ISR in parallel, so we just set
+                 * the state — the ISR will see DISABLED, reconfigure
+                 * PPI, and the driver's own explicit re-enable path
+                 * fires the chain (via its TASKS_RXEN/TXEN write after
+                 * configuring PPI). */
+                if (r->shorts & (SHORT_END_DISABLE | SHORT_PHYEND_DISABLE)) {
+                    r->state = NRF_RADIO_STATE_DISABLED;
+                    r->evt_disabled = 1;
+                    /* Do NOT fire PPI or DISABLED_TXEN/RXEN shorts */
+                }
                 radio_apply_shorts_after_event(soc, SHORT_END_START);
                 radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
 
@@ -1284,11 +1300,47 @@ static int nrf_ppi_read(void *user_data, uint32_t addr) {
     return 0;
 }
 
+/* Check if a PPI event address (absolute) points at a currently-latched
+ * RADIO or EGU event.  Returns true if the event register reads as 1.
+ * Used for level-sensitive PPI: if you enable a channel while its EEP is
+ * already high, the task fires immediately — matching real PPI hardware. */
+static bool ppi_event_is_latched(nrf52840_soc_t *soc, uint32_t event_addr) {
+    /* RADIO events at NRF_RADIO_BASE + 0x100..0x16C */
+    if (event_addr >= NRF_RADIO_BASE + 0x100 &&
+        event_addr < NRF_RADIO_BASE + 0x200) {
+        return arm_read32(&soc->plat->cpu, event_addr) != 0;
+    }
+    /* EGU0 events at 0x40014100..0x4001413C */
+    if (event_addr >= 0x40014100u && event_addr < 0x40014140u) {
+        int n = (int)(event_addr - 0x40014100u) / 4;
+        return (soc->egu0.events >> n) & 1;
+    }
+    return false;
+}
+
 static void nrf_ppi_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf_ppi_state_t *ppi = (nrf_ppi_state_t *)user_data;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)ppi->soc;
     uint32_t off = addr - NRF_PPI_BASE;
     if (getenv("NRF_PPI_TRACE")) fprintf(stderr, "[ppiW] 0x%03x = 0x%08x\n", off, value);
-    if (off == NRF_PPI_CHEN || off == NRF_PPI_CHENSET) { ppi->chen |= value; return; }
+    if (off == NRF_PPI_CHEN || off == NRF_PPI_CHENSET) {
+        uint32_t newly_enabled = value & ~ppi->chen;
+        ppi->chen |= value;
+        /* Level-sensitive: if a newly-enabled channel's EEP event is
+         * already latched, fire its TEP immediately.  This is how real
+         * PPI works and is critical for the nrf_802154 ACK path: the
+         * ISR reconfigures CH7 (EGU→TXEN), re-enables the channel,
+         * and expects the already-latched EGU TRIGGERED event to fire
+         * TXEN immediately. */
+        if (soc) {
+            for (int i = 0; i < 20; i++) {
+                if ((newly_enabled & (1u << i)) && ppi->eep[i] && ppi->tep[i] &&
+                    ppi_event_is_latched(soc, ppi->eep[i]))
+                    arm_write32(&soc->plat->cpu, ppi->tep[i], 1);
+            }
+        }
+        return;
+    }
     if (off == NRF_PPI_CHENCLR) { ppi->chen &= ~value; return; }
     if (off >= NRF_PPI_CH_EEP0 && off < NRF_PPI_CH_EEP0 + 20 * 8) {
         uint32_t i = (off - NRF_PPI_CH_EEP0) / 8;
@@ -1408,6 +1460,10 @@ static void nrf_ficr_write(void *user_data, uint32_t addr, uint32_t value) {
 
 #define TIMER_BASE_HZ          16000000u
 
+/* Forward declarations for timer compare event scheduling. */
+static void timer_schedule_next_compare(nrf_timer_state_t *t);
+static void timer_cancel_compare(nrf_timer_state_t *t);
+
 static uint32_t timer_bit_mask(uint32_t bitmode) {
     switch (bitmode) {
         case 0: return 0xFFFFu;        /* 16-bit */
@@ -1465,6 +1521,7 @@ static void nrf_timer_write(void *user_data, uint32_t addr, uint32_t value) {
     }
     if (off >= TIMER_CC_0 && off < TIMER_CC_0 + 6 * 4) {
         t->cc[(off - TIMER_CC_0) / 4] = value;
+        if (t->running) timer_schedule_next_compare(t);
         return;
     }
     switch (off) {
@@ -1473,6 +1530,7 @@ static void nrf_timer_write(void *user_data, uint32_t addr, uint32_t value) {
                 t->counter_at_start = timer_compute_counter(t, (int64_t)cpu->cycles, cpu->cpu_freq_hz);
                 t->start_cycles = (int64_t)cpu->cycles;
                 t->running = true;
+                timer_schedule_next_compare(t);
             }
             break;
         case TIMER_TASKS_STOP:
@@ -1481,12 +1539,14 @@ static void nrf_timer_write(void *user_data, uint32_t addr, uint32_t value) {
                 t->counter_at_start = timer_compute_counter(t, (int64_t)cpu->cycles, cpu->cpu_freq_hz);
                 t->start_cycles = (int64_t)cpu->cycles;
                 t->running = false;
+                timer_cancel_compare(t);
             }
             break;
         case TIMER_TASKS_CLEAR:
             if (value == 1) {
                 t->counter_at_start = 0;
                 t->start_cycles = (int64_t)cpu->cycles;
+                if (t->running) timer_schedule_next_compare(t);
             }
             break;
         case TIMER_SHORTS:    t->shorts    = value; break;
@@ -1496,6 +1556,82 @@ static void nrf_timer_write(void *user_data, uint32_t addr, uint32_t value) {
         case TIMER_BITMODE:   t->bitmode   = value & 3; break;
         case TIMER_PRESCALER: t->prescaler = value & 0xF; break;
         default: break;
+    }
+}
+
+/* --- TIMER COMPARE event scheduling ---
+ * The nrf_802154 ACK path uses TIMER0 CC1 + PPI to trigger RADIO TXEN
+ * at the exact turnaround time. Without COMPARE events firing, the PPI
+ * chain never executes and ACKs never transmit. */
+
+static void timer_compare_fire(nrf_timer_state_t *t, int i) {
+    nrf52840_soc_t *soc = t->soc;
+    if (!soc || !soc->plat) return;
+    t->evt_compare[i] = 1;
+    uint32_t int_bit = (1u << (16 + i));
+    if ((t->intenset & int_bit) && soc->plat->cpu.nvic)
+        arm_nvic_set_pending((arm_nvic_t *)soc->plat->cpu.nvic, t->irq_num);
+    nrf_ppi_event_notify(soc, t->base + TIMER_EVENTS_COMPARE_0 + (uint32_t)i * 4);
+    if (t->shorts & (1u << i)) {          /* COMPARE[i]_CLEAR */
+        t->counter_at_start = 0;
+        t->start_cycles = (int64_t)soc->plat->cpu.cycles;
+    }
+    if (t->shorts & (1u << (8 + i))) {    /* COMPARE[i]_STOP */
+        t->counter_at_start = timer_compute_counter(t, (int64_t)soc->plat->cpu.cycles, soc->plat->cpu.cpu_freq_hz);
+        t->running = false;
+    }
+}
+
+static void timer_compare_event_cb(void *user_data, cpu_event_t *event) {
+    (void)event;
+    nrf_timer_state_t *t = (nrf_timer_state_t *)user_data;
+    if (!t->soc || !t->soc->plat || !t->running) return;
+    int i = t->next_cc;
+    if (i < 0 || i >= 6) return;
+    t->next_cc = -1;
+    timer_compare_fire(t, i);
+    timer_schedule_next_compare(t);
+}
+
+static void timer_schedule_next_compare(nrf_timer_state_t *t) {
+    nrf52840_soc_t *soc = t->soc;
+    if (!soc || !soc->plat || !t->running || !t->compare_event) return;
+    arm_cpu_t *cpu = &soc->plat->cpu;
+    uint32_t mask = timer_bit_mask(t->bitmode);
+    uint32_t now = timer_compute_counter(t, (int64_t)cpu->cycles, cpu->cpu_freq_hz);
+    uint64_t tick_hz = (uint64_t)TIMER_BASE_HZ >> t->prescaler;
+    if (tick_hz == 0) tick_hz = 1;
+
+    int best_i = -1;
+    int64_t best_delta = INT64_MAX;
+    for (int i = 0; i < 6; i++) {
+        /* Only schedule if something listens: INTENSET bit or PPI EEP. */
+        uint32_t int_bit = (1u << (16 + i));
+        bool has_listener = (t->intenset & int_bit) != 0;
+        if (!has_listener) {
+            uint32_t evt_addr = t->base + TIMER_EVENTS_COMPARE_0 + (uint32_t)i * 4;
+            for (int p = 0; p < 20 && !has_listener; p++)
+                if ((soc->ppi.chen & (1u << p)) && soc->ppi.eep[p] == evt_addr)
+                    has_listener = true;
+        }
+        if (!has_listener) continue;
+        uint32_t ticks = (t->cc[i] - now) & mask;
+        if (ticks == 0) ticks = mask + 1;
+        int64_t dc = (int64_t)ticks * (int64_t)cpu->cpu_freq_hz / (int64_t)tick_hz;
+        if (dc < 1) dc = 1;  /* avoid 0-delay infinite reschedule */
+        if (dc < best_delta) { best_delta = dc; best_i = i; }
+    }
+    if (best_i >= 0) {
+        t->next_cc = best_i;
+        arm_schedule_event(cpu, (arm_event_t *)t->compare_event,
+                           (int64_t)cpu->cycles + best_delta);
+    }
+}
+
+static void timer_cancel_compare(nrf_timer_state_t *t) {
+    if (t->compare_event && t->soc && t->soc->plat) {
+        arm_cancel_event(&t->soc->plat->cpu, (arm_event_t *)t->compare_event);
+        t->next_cc = -1;
     }
 }
 
@@ -1579,12 +1715,21 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
         0x4001A000u,  /* TIMER3 */
         0x4001B000u   /* TIMER4 */
     };
-    for (int i = 0; i < 5; i++) {
-        soc->timer[i].base = timer_bases[i];
-        soc->timer[i].soc  = soc;
-        soc->timer[i].bitmode = 0;          /* 16-bit default */
-        arm_register_io(&plat->cpu, timer_bases[i], 0x1000,
-                        nrf_timer_read, nrf_timer_write, &soc->timer[i]);
+    {
+        static const int timer_irqs[5] = { 8, 9, 10, 26, 27 };
+        for (int i = 0; i < 5; i++) {
+            soc->timer[i].base    = timer_bases[i];
+            soc->timer[i].soc     = soc;
+            soc->timer[i].irq_num = timer_irqs[i];
+            soc->timer[i].bitmode = 0;
+            soc->timer[i].next_cc = -1;
+            cpu_event_t *cev = (cpu_event_t *)calloc(1, sizeof(*cev));
+            cev->callback  = timer_compare_event_cb;
+            cev->user_data = &soc->timer[i];
+            soc->timer[i].compare_event = cev;
+            arm_register_io(&plat->cpu, timer_bases[i], 0x1000,
+                            nrf_timer_read, nrf_timer_write, &soc->timer[i]);
+        }
     }
 
     /* RNG */
