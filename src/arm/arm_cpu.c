@@ -952,25 +952,16 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
                 if (nvic->has_pending) {
                     arm_wfi_pending++;
-                    /* IRQ pending + PRIMASK set ⇒ firmware is genuinely
-                     * idle (waiting for the critical section to exit so
-                     * the IRQ can fire). Fast-forward to the next
-                     * scheduled event provided no peripheral has
-                     * cycle-tight state in flight. */
-                    if (cpu->primask && cpu->event_queue &&
-                        cpu->wfi_skip_guard &&
-                        !cpu->wfi_skip_guard(cpu->wfi_skip_user)) {
-                        int64_t target = cpu->event_queue->fire_cycle;
-                        if (target > cpu->cycle_limit) target = cpu->cycle_limit;
-                        if (target > cpu->cycles) {
-                            cpu->lpm_ns += arm_cycles_to_ns(target - cpu->cycles,
-                                                            cpu->cpu_freq_hz);
-                            cpu->cycles = target;
-                        }
-                        cpu->cpu_off = false;
-                        arm_wfi_skipped++;
-                        continue;
-                    }
+                    /* A pending interrupt wakes WFI on real Cortex-M regardless
+                     * of PRIMASK; the code right after WFI (Zephyr's
+                     * arch_cpu_idle does `wfi; cpsie i`) then clears PRIMASK and
+                     * takes the IRQ.  So wake at the CURRENT cycle and let the
+                     * firmware service it — do NOT fast-forward to the next
+                     * event.  (MSPSim's LPM loop likewise never jumps past a
+                     * pending interrupt: it services it at that cycle.)
+                     * Fast-forwarding here skewed Zephyr's tickless system clock
+                     * far past the WFI, so its timeout ISR announced late and
+                     * starved the kernel's timers — DAD never matured. */
                     arm_wfi_blocked++;
                     cpu->cpu_off = false;
                     arm_nvic_check_pending(nvic);
