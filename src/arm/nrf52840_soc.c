@@ -811,6 +811,33 @@ static void nrf_radio_tx_done_cb(void *user_data, cpu_event_t *event) {
     radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
 }
 
+/* RXEN/TXEN ramp-up: the RADIO does not reach RXIDLE/TXIDLE instantly — it ramps
+ * for RX_RAMP_UP_TIME/TX_RAMP_UP_TIME = 40 µs (nrf_802154_procedures_duration.h),
+ * sitting in RXRU/TXRU.  nrf_802154 sequences off this (it polls STATE==TXRU and
+ * paces its TIMER from the ramp), so collapsing it to zero desyncs the driver.
+ * 40 µs @ 64 MHz = 2560 cycles. */
+#define RADIO_RAMP_UP_CYCLES   2560
+
+/* Ramp-up completion: RXRU→RXIDLE / TXRU→TXIDLE (fires READY + RX/TXREADY and
+ * applies the *READY_START / RXREADY_CCASTART shorts via radio_set_state). */
+static void nrf_radio_ramp_cb(void *user_data, cpu_event_t *event) {
+    (void)event;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
+    nrf_radio_state_t *r = &soc->radio;
+    if (r->state == NRF_RADIO_STATE_RXRU)
+        radio_set_state(soc, NRF_RADIO_STATE_RXIDLE);
+    else if (r->state == NRF_RADIO_STATE_TXRU)
+        radio_set_state(soc, NRF_RADIO_STATE_TXIDLE);
+}
+
+/* Enter the RXRU/TXRU ramp state and schedule its 40 µs completion. */
+static void radio_start_rampup(nrf52840_soc_t *soc, uint32_t ru_state) {
+    soc->radio.state = ru_state;
+    if (soc->radio.ramp_event && soc->plat)
+        arm_schedule_event(&soc->plat->cpu, (arm_event_t *)soc->radio.ramp_event,
+                           (int64_t)soc->plat->cpu.cycles + RADIO_RAMP_UP_CYCLES);
+}
+
 /* Force-complete a deferred TX still in flight.  nrf_802154 arms the next
  * operation (RXEN to await the ACK) the moment it has finished issuing the
  * transmit, before our modelled air-time elapses — so without this the pending
@@ -874,8 +901,11 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 r->state = NRF_RADIO_STATE_DISABLED;
                 radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
             }
-            if (r->state != NRF_RADIO_STATE_TX &&
-                r->state != NRF_RADIO_STATE_TXRU)
+            if (r->state == NRF_RADIO_STATE_DISABLED)
+                radio_start_rampup(soc, NRF_RADIO_STATE_TXRU);
+            else if (r->state != NRF_RADIO_STATE_TX &&
+                     r->state != NRF_RADIO_STATE_TXRU &&
+                     r->state != NRF_RADIO_STATE_TXIDLE)
                 radio_set_state(soc, NRF_RADIO_STATE_TXIDLE);
             break;
         case RADIO_TASKS_RXEN:
@@ -890,8 +920,11 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 r->state = NRF_RADIO_STATE_DISABLED;
                 radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
             }
-            if (r->state != NRF_RADIO_STATE_RX &&
-                r->state != NRF_RADIO_STATE_RXRU)
+            if (r->state == NRF_RADIO_STATE_DISABLED)
+                radio_start_rampup(soc, NRF_RADIO_STATE_RXRU);
+            else if (r->state != NRF_RADIO_STATE_RX &&
+                     r->state != NRF_RADIO_STATE_RXRU &&
+                     r->state != NRF_RADIO_STATE_RXIDLE)
                 radio_set_state(soc, NRF_RADIO_STATE_RXIDLE);
             break;
         case RADIO_TASKS_START:
@@ -955,14 +988,17 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                  * (no ramp-down needed). */
                 radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
             } else {
+                /* Abort any in-flight ramp-up or deferred transmit. */
+                if (r->ramp_event && soc->plat)
+                    arm_cancel_event(&soc->plat->cpu, (arm_event_t *)r->ramp_event);
+                if (r->tx_event && soc->plat)
+                    arm_cancel_event(&soc->plat->cpu, (arm_event_t *)r->tx_event);
                 if (r->state == NRF_RADIO_STATE_TX ||
-                    r->state == NRF_RADIO_STATE_TXIDLE)
+                    r->state == NRF_RADIO_STATE_TXIDLE ||
+                    r->state == NRF_RADIO_STATE_TXRU)
                     r->state = NRF_RADIO_STATE_TXDISABLE;
-                else if (r->state == NRF_RADIO_STATE_RX ||
-                         r->state == NRF_RADIO_STATE_RXIDLE)
-                    r->state = NRF_RADIO_STATE_RXDISABLE;
                 else
-                    r->state = NRF_RADIO_STATE_RXDISABLE; /* catch-all */
+                    r->state = NRF_RADIO_STATE_RXDISABLE; /* RX/RXIDLE/RXRU/catch-all */
                 /* Schedule the DISABLED event after ramp-down delay */
                 if (r->disable_event && soc->plat) {
                     arm_schedule_event(&soc->plat->cpu,
@@ -1817,6 +1853,11 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
         txe->callback  = nrf_radio_tx_done_cb;
         txe->user_data = soc;
         soc->radio.tx_event = txe;
+        /* Deferred RXEN/TXEN ramp-up event (RXRU/TXRU → idle after 40 µs). */
+        cpu_event_t *rue = (cpu_event_t *)calloc(1, sizeof(*rue));
+        rue->callback  = nrf_radio_ramp_cb;
+        rue->user_data = soc;
+        soc->radio.ramp_event = rue;
     }
     arm_register_io(&plat->cpu, NRF_RADIO_BASE, NRF_RADIO_SIZE,
                     nrf_radio_read, nrf_radio_write, soc);
