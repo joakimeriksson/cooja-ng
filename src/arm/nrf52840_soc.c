@@ -811,6 +811,18 @@ static void nrf_radio_tx_done_cb(void *user_data, cpu_event_t *event) {
     radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
 }
 
+/* Force-complete a deferred TX still in flight.  nrf_802154 arms the next
+ * operation (RXEN to await the ACK) the moment it has finished issuing the
+ * transmit, before our modelled air-time elapses — so without this the pending
+ * tx_event would later find state != TX and drop the frame on the floor.  When
+ * the firmware moves the radio on, finish the transmit synchronously instead. */
+static void radio_complete_pending_tx(nrf52840_soc_t *soc) {
+    if (soc->radio.state != NRF_RADIO_STATE_TX) return;
+    if (soc->radio.tx_event && soc->plat)
+        arm_cancel_event(&soc->plat->cpu, (arm_event_t *)soc->radio.tx_event);
+    nrf_radio_tx_done_cb(soc, NULL);
+}
+
 static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state) {
     nrf_radio_state_t *r = &soc->radio;
     r->state = new_state;
@@ -867,6 +879,10 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 radio_set_state(soc, NRF_RADIO_STATE_TXIDLE);
             break;
         case RADIO_TASKS_RXEN:
+            /* If a deferred TX is still in flight, finish it before switching
+             * to RX (the driver arms RXEN to receive the ACK right after the
+             * transmit) so the frame is actually sent. */
+            radio_complete_pending_tx(soc);
             if (r->state == NRF_RADIO_STATE_TXDISABLE ||
                 r->state == NRF_RADIO_STATE_RXDISABLE) {
                 if (r->disable_event && soc->plat)
