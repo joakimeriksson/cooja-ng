@@ -185,6 +185,10 @@ typedef struct nrf_radio_state {
      * never carries stale bytes across a TX cycle. */
     uint8_t  rx_incoming[256];
     int      rx_incoming_len;
+    /* A TASKS_RXEN that arrived while a received-frame CRCOK was still pending
+     * service is deferred (the radio must read DISABLED until nrf_802154's
+     * rxframe_finish completes); the ramp-up starts when the ISR clears CRCOK. */
+    int      rxen_pending;
 } nrf_radio_state_t;
 
 /* TIMER0..4 at 0x40008000 / 0x40009000 / 0x4000A000 / 0x4001A000 / 0x4001B000.

@@ -920,9 +920,17 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 r->state = NRF_RADIO_STATE_DISABLED;
                 radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
             }
-            if (r->state == NRF_RADIO_STATE_DISABLED)
-                radio_start_rampup(soc, NRF_RADIO_STATE_RXRU);
-            else if (r->state != NRF_RADIO_STATE_RX &&
+            if (r->state == NRF_RADIO_STATE_DISABLED) {
+                /* If a just-received frame's CRCOK is still awaiting its ISR
+                 * (rxframe_finish busy-waits for STATE==DISABLED), the firmware
+                 * re-arming RX here would ramp the radio out of DISABLED before
+                 * the ISR runs — and it would spin out.  Defer the ramp-up until
+                 * the ISR clears CRCOK (handled in the EVENTS_CRCOK write). */
+                if (r->evt_crcok)
+                    r->rxen_pending = 1;
+                else
+                    radio_start_rampup(soc, NRF_RADIO_STATE_RXRU);
+            } else if (r->state != NRF_RADIO_STATE_RX &&
                      r->state != NRF_RADIO_STATE_RXRU &&
                      r->state != NRF_RADIO_STATE_RXIDLE)
                 radio_set_state(soc, NRF_RADIO_STATE_RXIDLE);
@@ -1099,7 +1107,16 @@ static void nrf_radio_write(void *user_data, uint32_t addr, uint32_t value) {
             case RADIO_EVENTS_DEVMISS:      r->evt_devmiss    = value & 1; break;
             case RADIO_EVENTS_RSSIEND:      r->evt_rssiend    = value & 1; break;
             case RADIO_EVENTS_BCMATCH:      r->evt_bcmatch    = value & 1; break;
-            case RADIO_EVENTS_CRCOK:        r->evt_crcok      = value & 1; break;
+            case RADIO_EVENTS_CRCOK:
+                r->evt_crcok = value & 1;
+                /* The ISR dispatcher clears CRCOK BEFORE running rxframe_finish
+                 * (which busy-waits STATE==DISABLED), so just drop the deferred
+                 * re-arm here and keep the radio DISABLED.  The driver's own
+                 * receive_frame_received (after rxframe_finish) re-arms RX, and
+                 * by then evt_crcok is clear so that RXEN ramps normally. */
+                if (!(value & 1))
+                    r->rxen_pending = 0;
+                break;
             case RADIO_EVENTS_CRCERROR:     r->evt_crcerror   = value & 1; break;
             case RADIO_EVENTS_FRAMESTART:   r->evt_framestart = value & 1; break;
             case RADIO_EVENTS_EDEND:        r->evt_edend      = value & 1; break;
