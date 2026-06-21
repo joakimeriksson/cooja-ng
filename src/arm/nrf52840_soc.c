@@ -1749,7 +1749,14 @@ static void nrf_timer_write(void *user_data, uint32_t addr, uint32_t value) {
             }
             break;
         case TIMER_SHORTS:    t->shorts    = value; break;
-        case TIMER_INTENSET:  t->intenset |= value; break;
+        case TIMER_INTENSET:
+            /* Enabling a COMPARE interrupt must (re)schedule its event: drivers
+             * commonly write CC[chan] first and INTENSET second (e.g. RIOT's
+             * nrf5x timer_set / ztimer), so the CC-write reschedule saw no
+             * listener yet.  Without this the compare never fires. */
+            t->intenset |= value;
+            if (t->running) timer_schedule_next_compare(t);
+            break;
         case TIMER_INTENCLR:  t->intenset &= ~value; break;
         case TIMER_MODE:      t->mode      = value & 3; break;
         case TIMER_BITMODE:   t->bitmode   = value & 3; break;
