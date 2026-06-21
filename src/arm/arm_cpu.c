@@ -1072,7 +1072,8 @@ int arm_step(arm_cpu_t *cpu, int count) {
          * faults).  One-shot per-CPU; dump enough register state to
          * reverse-engineer which prior instruction redirected PC.
          * Enabled via ARM_WILD_TRAP. */
-        if (getenv("ARM_WILD_TRAP") && pc >= cpu->sram_base && pc < cpu->sram_end) {
+        if (getenv("ARM_WILD_TRAP") &&
+            ((pc >= cpu->sram_base && pc < cpu->sram_end) || pc >= 0x40000000u)) {
             if (!cpu->wild_trapped) {
                 cpu->wild_trapped = 1;
                 fprintf(stderr,
@@ -2807,6 +2808,27 @@ int arm_step(arm_cpu_t *cpu, int count) {
                                 cpu->xpsr |= APSR_Q;
                         }
                     }
+                } else if (op_misc == 8 && !(hw1 & 0x100)) {
+                    /* M4 parallel add, byte (hw1=0xFA8.): UADD8 (op2_misc=4) /
+                     * SADD8 (op2_misc=0).  These set the per-byte APSR.GE[3:0]
+                     * flags that SEL reads — newlib's optimized strlen/strcmp
+                     * pair UADD8+SEL to find a zero byte in a word. */
+                    uint32_t a = cpu->reg[rn], b = cpu->reg[rm];
+                    uint32_t res = 0, ge = 0;
+                    for (int i = 0; i < 4; i++) {
+                        uint32_t ba = (a >> (i*8)) & 0xFF, bb = (b >> (i*8)) & 0xFF;
+                        if (op2_misc == 0) {              /* SADD8 (signed) */
+                            int32_t s = (int32_t)(int8_t)ba + (int32_t)(int8_t)bb;
+                            res |= (uint32_t)(s & 0xFF) << (i*8);
+                            if (s >= 0) ge |= 1u << i;
+                        } else {                          /* UADD8 (unsigned) */
+                            uint32_t s = ba + bb;
+                            res |= (s & 0xFF) << (i*8);
+                            if (s >= 0x100) ge |= 1u << i;
+                        }
+                    }
+                    cpu->reg[rd] = res;
+                    cpu->xpsr = (cpu->xpsr & ~(0xFu << 16)) | (ge << 16);
                 } else if (op_misc == 8) {
                     /* SMULL RdLo, RdHi, Rn, Rm (hw1=0xFB8.)
                        hw2[15:12]=RdLo(=ra), hw2[11:8]=RdHi(=rd) */
@@ -2859,8 +2881,19 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         uint64_t result = (uint64_t)cpu->reg[rn] * (uint64_t)cpu->reg[rm];
                         cpu->reg[ra] = (uint32_t)result;          /* RdLo */
                         cpu->reg[rd] = (uint32_t)(result >> 32);  /* RdHi */
+                    } else if (op2_misc == 8) {
+                        /* M4 SEL Rd, Rn, Rm (hw1=0xFAA.): per-byte select by
+                         * APSR.GE[3:0] (set by UADD8/SADD8) — Rn where GE=1, else Rm. */
+                        uint32_t a = cpu->reg[rn], b = cpu->reg[rm];
+                        uint32_t ge = (cpu->xpsr >> 16) & 0xF, res = 0;
+                        for (int i = 0; i < 4; i++) {
+                            uint32_t byte = (ge & (1u << i)) ? ((a >> (i*8)) & 0xFF)
+                                                            : ((b >> (i*8)) & 0xFF);
+                            res |= byte << (i*8);
+                        }
+                        cpu->reg[rd] = res;
                     }
-                    /* hw1=0xFAA. is reserved/unused on Cortex-M3 */
+                    /* other hw1=0xFAA. parallel ops unused by current firmware */
                 } else if (op_misc == 0xB) {
                     if (op2_misc == 8) {
                         /* CLZ (Count Leading Zeros) */
