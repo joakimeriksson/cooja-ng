@@ -1209,28 +1209,24 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                  * collided bytes already. */
                 radio_event(soc, &r->evt_payload,  RADIO_INT_PAYLOAD);
                 radio_event(soc, &r->evt_end,      RADIO_INT_END);
-                radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
-                /* PHYEND is the 802.15.4 RX/TX completion event nrf_802154
-                 * keys off (IRQ + PPI chains); fire it last, with its mask. */
+                /* PHYEND has no RX interrupt enabled (nrf_802154 keys RX off
+                 * CRCOK), so latch it but it raises no ISR here. */
                 radio_event(soc, &r->evt_phyend,   RADIO_INT_PHYEND);
 
-                /* Apply SHORTS for frame completion.  PHYEND_DISABLE /
-                 * END_DISABLE: set state to DISABLED and latch the
-                 * event, but do NOT process DISABLED_TXEN/DISABLED_RXEN
-                 * shorts or PPI here.  On real hardware the 6 µs
-                 * ramp-down runs in parallel with the CRCOK ISR which
-                 * reconfigures PPI CH7 from RXEN to TXEN; the DISABLED
-                 * event then chains through PPI→EGU→TXEN for the ACK.
-                 * csim can't run the ISR in parallel, so we just set
-                 * the state — the ISR will see DISABLED, reconfigure
-                 * PPI, and the driver's own explicit re-enable path
-                 * fires the chain (via its TASKS_RXEN/TXEN write after
-                 * configuring PPI). */
+                /* Apply the END/PHYEND_DISABLE short BEFORE raising CRCOK.
+                 * nrf_802154's CRCOK ISR (irq_handler_crcok) runs rxframe_finish(),
+                 * which busy-waits for STATE==DISABLED — on silicon the END_DISABLE
+                 * short completes a few cycles after CRCOK, during that wait.  csim
+                 * takes the ISR synchronously the moment CRCOK is raised, so the
+                 * radio must ALREADY read DISABLED or rxframe_finish spins out its
+                 * whole MAX_RAMPDOWN budget (3200 cycles) and the receive stalls.
+                 * Latch DISABLED but don't fire PPI / DISABLED_* shorts here — the
+                 * driver's CRCOK ISR reconfigures PPI and re-enables explicitly. */
                 if (r->shorts & (SHORT_END_DISABLE | SHORT_PHYEND_DISABLE)) {
                     r->state = NRF_RADIO_STATE_DISABLED;
                     r->evt_disabled = 1;
-                    /* Do NOT fire PPI or DISABLED_TXEN/RXEN shorts */
                 }
+                radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
                 radio_apply_shorts_after_event(soc, SHORT_END_START);
                 radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
 
