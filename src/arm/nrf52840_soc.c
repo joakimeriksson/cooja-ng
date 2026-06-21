@@ -782,6 +782,35 @@ void nrf_radio_disable_cb(void *user_data, cpu_event_t *event) {
     radio_apply_shorts_after_event(soc, SHORT_DISABLED_RXEN);
 }
 
+/* 802.15.4 air-time: 250 kbps = 32 µs/byte = 2048 cycles @ 64 MHz, plus a
+ * 6-byte SHR+PHR preamble overhead.  Modelling real TX air-time (instead of an
+ * instant transmit) is what keeps nrf_802154's calibrated busy-wait/poll in
+ * sync — its PHYEND IRQ then lands DURING the wait, not before the firmware has
+ * even cleared the event. */
+#define RADIO_TX_BYTE_CYCLES   2048
+#define RADIO_TX_SHR_PHR_BYTES 6
+
+/* Deferred TX completion: fires the post-transmit events (PAYLOAD/END/PHYEND),
+ * pushes the frame onto the medium, and applies the post-TX shorts — one
+ * air-time after TASKS_START, while the radio sat in TX state. */
+static void nrf_radio_tx_done_cb(void *user_data, cpu_event_t *event) {
+    (void)event;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
+    nrf_radio_state_t *r = &soc->radio;
+    /* If the firmware aborted (DISABLE/STOP) mid-air, the state has moved on. */
+    if (r->state != NRF_RADIO_STATE_TX)
+        return;
+    radio_emit_tx(soc);
+    radio_event(soc, &r->evt_payload,  RADIO_INT_PAYLOAD);
+    radio_event(soc, &r->evt_end,      RADIO_INT_END);
+    radio_event(soc, &r->evt_phyend,   RADIO_INT_PHYEND);
+    r->state = NRF_RADIO_STATE_TXIDLE;
+    radio_apply_shorts_after_event(soc, SHORT_END_DISABLE);
+    radio_apply_shorts_after_event(soc, SHORT_PHYEND_DISABLE);
+    radio_apply_shorts_after_event(soc, SHORT_END_START);
+    radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
+}
+
 static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state) {
     nrf_radio_state_t *r = &soc->radio;
     r->state = new_state;
@@ -853,28 +882,27 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             /* TXIDLE → TX → (instantly transmit) → TXIDLE.
              * RXIDLE → RX (stay there until a frame arrives). */
             if (r->state == NRF_RADIO_STATE_TXIDLE) {
-                /* Walk PACKETPTR, build the on-air frame, push bytes
-                 * out via the TX listener (multinode harness installs
-                 * one). Then fire post-TX events and return to TXIDLE. */
+                /* Begin transmitting: enter TX state, fire the start-of-frame
+                 * events now (ADDRESS/FRAMESTART), and DEFER the completion
+                 * (PAYLOAD/END/PHYEND + the frame emission + shorts) by one
+                 * air-time so the driver's busy-wait/poll and PHYEND IRQ land
+                 * correctly.  Firing the whole transmit instantly desynced
+                 * nrf_802154's calibrated delays → a re-transmit storm. */
                 /* Drop any buffered RX bytes — they pre-date our own TX
                  * and are stale. */
                 r->rx_incoming_len = 0;
                 r->state = NRF_RADIO_STATE_TX;
-                radio_emit_tx(soc);
                 radio_event(soc, &r->evt_address,    RADIO_INT_ADDRESS);
                 radio_event(soc, &r->evt_framestart, RADIO_INT_FRAMESTART);
-                radio_event(soc, &r->evt_payload,    RADIO_INT_PAYLOAD);
-                radio_event(soc, &r->evt_end,        RADIO_INT_END);
-                /* PHYEND is the 802.15.4 TX-completion event nrf_802154 waits
-                 * on (IRQ + the PHYEND_DISABLE short); fire it with its mask,
-                 * same as the RX path — without the IRQ the driver blocks in
-                 * its transmit wait forever. */
-                radio_event(soc, &r->evt_phyend,     RADIO_INT_PHYEND);
-                r->state = NRF_RADIO_STATE_TXIDLE;
-                radio_apply_shorts_after_event(soc, SHORT_END_DISABLE);
-                radio_apply_shorts_after_event(soc, SHORT_PHYEND_DISABLE);
-                radio_apply_shorts_after_event(soc, SHORT_END_START);
-                radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
+                if (r->tx_event && soc->plat) {
+                    uint32_t phr = arm_read8(&soc->plat->cpu, r->packetptr);
+                    if (phr < 2 || phr > 127) phr = 127;
+                    int64_t air = (int64_t)(RADIO_TX_SHR_PHR_BYTES + phr) *
+                                  RADIO_TX_BYTE_CYCLES;
+                    arm_schedule_event(&soc->plat->cpu,
+                        (arm_event_t *)r->tx_event,
+                        (int64_t)soc->plat->cpu.cycles + air);
+                }
             } else if (r->state == NRF_RADIO_STATE_RXIDLE) {
                 /* Sit in RX waiting for external bytes (delivered via
                  * nrf_radio_receive_byte). Reset the byte parser. */
@@ -895,7 +923,11 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             break;
         case RADIO_TASKS_STOP:
             if (r->state == NRF_RADIO_STATE_RX)  r->state = NRF_RADIO_STATE_RXIDLE;
-            if (r->state == NRF_RADIO_STATE_TX)  r->state = NRF_RADIO_STATE_TXIDLE;
+            if (r->state == NRF_RADIO_STATE_TX) {
+                r->state = NRF_RADIO_STATE_TXIDLE;
+                if (r->tx_event && soc->plat)
+                    arm_cancel_event(&soc->plat->cpu, (arm_event_t *)r->tx_event);
+            }
             break;
         case RADIO_TASKS_DISABLE:
             /* Defer the DISABLED event so the firmware's
@@ -1764,6 +1796,11 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
         dev->callback  = nrf_radio_disable_cb;
         dev->user_data = soc;
         soc->radio.disable_event = dev;
+        /* Deferred TX-completion event (PHYEND one air-time after START). */
+        cpu_event_t *txe = (cpu_event_t *)calloc(1, sizeof(*txe));
+        txe->callback  = nrf_radio_tx_done_cb;
+        txe->user_data = soc;
+        soc->radio.tx_event = txe;
     }
     arm_register_io(&plat->cpu, NRF_RADIO_BASE, NRF_RADIO_SIZE,
                     nrf_radio_read, nrf_radio_write, soc);
