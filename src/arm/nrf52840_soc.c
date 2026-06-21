@@ -1071,8 +1071,10 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                  * collided bytes already. */
                 radio_event(soc, &r->evt_payload,  RADIO_INT_PAYLOAD);
                 radio_event(soc, &r->evt_end,      RADIO_INT_END);
-                radio_event(soc, &r->evt_phyend,   0);
                 radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
+                /* PHYEND is the 802.15.4 RX/TX completion event nrf_802154
+                 * keys off (IRQ + PPI chains); fire it last, with its mask. */
+                radio_event(soc, &r->evt_phyend,   RADIO_INT_PHYEND);
 
                 /* Hardware-style auto-ACK for unicast Data frames that
                  * have the ACK_REQUEST bit set. Real nRF52840 silicon
