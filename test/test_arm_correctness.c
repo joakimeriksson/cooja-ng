@@ -454,6 +454,51 @@ static void test_adc_sbc(void) {
         assert_true("NEG sets N flag", (cpu.xpsr & APSR_N) != 0);
         arm_cpu_destroy(&cpu);
     }
+
+    /* ADC V-flag with carry-in crossing the sign boundary.
+     * 0x80000000 + 0x7FFFFFFF + C(1) = 0 : signed (-2^31)+(2^31-1)+1 = 0, no
+     * overflow → V must be 0. The bug folded carry-in into operand b
+     * (0x7FFFFFFF+1=0x80000000), flipping its sign bit and yielding V=1. */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        write_thumb16(&cpu, CODE_BASE, 0x4148); /* ADCS r0, r1 */
+        cpu.reg[0] = 0x80000000;
+        cpu.reg[1] = 0x7FFFFFFF;
+        cpu.xpsr |= APSR_C;                     /* carry-in = 1 */
+        arm_step(&cpu, 1);
+        assert_eq("ADCS r0,r1 (0x80000000+0x7FFFFFFF+1) = 0", 0, cpu.reg[0]);
+        assert_true("ADCS sets Z", (cpu.xpsr & APSR_Z) != 0);
+        assert_true("ADCS sets C", (cpu.xpsr & APSR_C) != 0);
+        assert_true("ADCS V clear (no signed overflow)", (cpu.xpsr & APSR_V) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* Same boundary case for the 32-bit ADC.W (register form). */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        write_thumb32(&cpu, CODE_BASE, 0xEB50, 0x0001); /* ADCS.W r0, r0, r1 */
+        cpu.reg[0] = 0x80000000;
+        cpu.reg[1] = 0x7FFFFFFF;
+        cpu.xpsr |= APSR_C;
+        arm_step(&cpu, 1);
+        assert_eq("ADCS.W r0,r0,r1 = 0", 0, cpu.reg[0]);
+        assert_true("ADCS.W V clear (no signed overflow)", (cpu.xpsr & APSR_V) == 0);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* SDIV INT_MIN/-1 must yield INT_MIN (ARMv7-M), not crash (C UB → SIGFPE). */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        write_thumb32(&cpu, CODE_BASE, 0xFB91, 0xF0F2); /* SDIV r0, r1, r2 */
+        cpu.reg[1] = 0x80000000;
+        cpu.reg[2] = 0xFFFFFFFF;
+        arm_step(&cpu, 1);
+        assert_eq("SDIV INT_MIN/-1 = INT_MIN", 0x80000000, cpu.reg[0]);
+        arm_cpu_destroy(&cpu);
+    }
 }
 
 /* ===================================================================

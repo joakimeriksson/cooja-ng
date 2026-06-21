@@ -1308,7 +1308,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     case 0x5: { /* ADC */
                         int carry_in = (cpu->xpsr & APSR_C) ? 1 : 0;
                         uint64_t result = (uint64_t)cpu->reg[rd] + cpu->reg[rm] + carry_in;
-                        set_add_flags(cpu, cpu->reg[rd], cpu->reg[rm] + carry_in, result);
+                        /* V uses the two true operands (carry-in is already in
+                         * `result`); folding ci into b corrupts overflow when
+                         * rm+ci crosses 0x7FFFFFFF→0x80000000. */
+                        set_add_flags(cpu, cpu->reg[rd], cpu->reg[rm], result);
                         cpu->reg[rd] = (uint32_t)result;
                         break;
                     }
@@ -2085,7 +2088,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         uint64_t r64 = (uint64_t)rn_val + rm_val + ci;
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
-                        if (S) set_add_flags(cpu, rn_val, rm_val + ci, r64);
+                        if (S) set_add_flags(cpu, rn_val, rm_val, r64);
                         break;
                     }
                     case 0xB: { /* SBC */
@@ -2188,7 +2191,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         uint64_t r64 = (uint64_t)rn_val + imm_val + ci;
                         result = (uint32_t)r64;
                         cpu->reg[rd] = result;
-                        if (S) set_add_flags(cpu, rn_val, imm_val + ci, r64);
+                        if (S) set_add_flags(cpu, rn_val, imm_val, r64);
                         break;
                     }
                     case 0xB: { /* SBC */
@@ -2742,6 +2745,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         int32_t denom = (int32_t)cpu->reg[rm];
                         if (denom == 0)
                             cpu->reg[rd] = 0;
+                        else if (denom == -1 && cpu->reg[rn] == 0x80000000u)
+                            /* INT_MIN / -1 overflows int32 (C UB → SIGFPE on
+                             * x86); ARMv7-M defines the result as INT_MIN. */
+                            cpu->reg[rd] = 0x80000000u;
                         else
                             cpu->reg[rd] = (uint32_t)((int32_t)cpu->reg[rn] / denom);
                     } else {
