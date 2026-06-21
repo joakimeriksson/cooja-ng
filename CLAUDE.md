@@ -43,6 +43,10 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 
 # nRF52840 Development Kit (PCA10056, same SoC + SEGGER UART)
 ./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/udp-server.nrf52840-dk firmware/nrf52840-dk/udp-client.nrf52840-dk -t 60000
+
+# Stock Zephyr 802.15.4 (echo_server/echo_client, only the sample's overlay-802154.conf).
+# Two-node UDP echo over 802.15.4/6LoWPAN/IPv6/RPL; server logs "Received and replied", 0 timeouts.
+./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/zephyr-echo-server.nrf52840-dk firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
