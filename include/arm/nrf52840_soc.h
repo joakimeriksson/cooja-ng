@@ -86,8 +86,12 @@ typedef struct nrf_rtc_state {
     uint32_t tick_period_cycles;      /* CPU cycles per RTC tick after prescaler */
     int      irq_num;                 /* RTC0 IRQ = 11, RTC1 = 17 on nRF52840 */
     uint32_t base;                    /* peripheral base (RTC0 0x4000B000, RTC1 0x40011000) */
-    /* Recurring TICK event, re-scheduled by its own callback. */
+    /* Recurring TICK/OVRFLW event, re-scheduled by its own callback. */
     void    *tick_event;              /* opaque arm_event_t * */
+    /* One dedicated event per COMPARE channel, each scheduled at the exact
+     * cycle COUNTER will equal CC[i] — no shared-event contention, no
+     * cnt==CC[i] guard.  Fires once on its edge, re-arms a wrap later. */
+    void    *compare_event[4];        /* opaque arm_event_t *[4] */
     void    *soc;                     /* back-pointer for the event callback */
 } nrf_rtc_state_t;
 

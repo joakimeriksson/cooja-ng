@@ -331,15 +331,28 @@ static uint32_t rtc_period_for_prescaler(uint32_t prescaler, uint32_t cpu_freq_h
     return (uint32_t)period;
 }
 
-/* Tickless scheduling: instead of one event per LFCLK tick (32768/s — which
- * makes idle-heavy firmware like Zephyr crawl), schedule a SINGLE event at the
- * next moment something enabled is due — the nearest of TICK (only if its
- * interrupt is on), OVRFLW, or an enabled COMPARE.  COUNTER is always derived
- * from elapsed cycles (rtc_compute_counter), so reads stay exact between
- * wake-ups.  Re-armed whenever CC / INTEN / the counter base changes. */
-static void rtc_reschedule(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
+/* Compute the exact CPU cycle at which COUNTER will next equal `now+ticks`,
+ * aligned to a tick boundary so rtc_compute_counter(fire) lands precisely on
+ * that counter value. */
+static int64_t rtc_fire_cycle(const nrf_rtc_state_t *rtc, int64_t now_cycles,
+                              uint64_t ticks) {
+    int64_t period = (int64_t)rtc->tick_period_cycles;
+    int64_t into_tick = (now_cycles - rtc->counter_anchor_cycles) % period;
+    return now_cycles - into_tick + (int64_t)ticks * period;
+}
+
+/* Tickless scheduling: COUNTER is always derived from elapsed cycles
+ * (rtc_compute_counter), so reads stay exact between wake-ups.  The recurring
+ * TICK and the OVRFLW wrap share one event (rtc_arm_periodic); each of the four
+ * COMPARE channels gets its OWN event scheduled at the exact cycle COUNTER will
+ * equal CC[i] (rtc_arm_compare).  Per-channel events remove the old
+ * single-shared-event contention and the fragile cnt==CC[i] guard: a channel
+ * fires exactly once on its edge, then re-arms a full wrap later (matching the
+ * hardware's latch-then-refire-on-COUNTER==CC behaviour). */
+static void rtc_arm_periodic(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
+    arm_event_t *ev = (arm_event_t *)rtc->tick_event;
     if (!rtc->running || rtc->tick_period_cycles == 0) {
-        arm_cancel_event(&plat->cpu, (arm_event_t *)rtc->tick_event);
+        arm_cancel_event(&plat->cpu, ev);
         return;
     }
     int64_t now_cycles = (int64_t)plat->cpu.cycles;
@@ -350,23 +363,38 @@ static void rtc_reschedule(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
         uint64_t d = 0x1000000u - now;          /* ticks to wrap (now < 2^24) */
         if (d < best) best = d;
     }
-    for (int i = 0; i < 4; i++) {
-        if (rtc->intenset & (RTC_INT_COMPARE_0 << i)) {
-            uint32_t d = (rtc->cc[i] - now) & 0xFFFFFFu;
-            if (d == 0) d = 0x1000000u;         /* equal now → next match a wrap away */
-            if (d < best) best = d;
-        }
-    }
-    if (best == UINT64_MAX) {                    /* nothing enabled to wake for */
-        arm_cancel_event(&plat->cpu, (arm_event_t *)rtc->tick_event);
+    if (best == UINT64_MAX) {                    /* nothing periodic enabled */
+        arm_cancel_event(&plat->cpu, ev);
         return;
     }
-    int64_t period = (int64_t)rtc->tick_period_cycles;
-    int64_t into_tick = (now_cycles - rtc->counter_anchor_cycles) % period;
-    int64_t fire = now_cycles - into_tick + (int64_t)best * period;
-    arm_schedule_event(&plat->cpu, (arm_event_t *)rtc->tick_event, fire);
+    arm_schedule_event(&plat->cpu, ev, rtc_fire_cycle(rtc, now_cycles, best));
 }
 
+/* Schedule COMPARE channel i's dedicated event at the exact cycle COUNTER next
+ * equals CC[i].  Gated on the channel's interrupt being enabled, preserving the
+ * prior behaviour of only waking for INTEN-armed compares. */
+static void rtc_arm_compare(nrf_rtc_state_t *rtc, arm_platform_t *plat, int i) {
+    arm_event_t *ev = (arm_event_t *)rtc->compare_event[i];
+    if (!ev) return;
+    if (!rtc->running || rtc->tick_period_cycles == 0 ||
+        !(rtc->intenset & (RTC_INT_COMPARE_0 << i))) {
+        arm_cancel_event(&plat->cpu, ev);
+        return;
+    }
+    int64_t now_cycles = (int64_t)plat->cpu.cycles;
+    uint32_t now = rtc_compute_counter(rtc, now_cycles);
+    uint32_t d = (rtc->cc[i] - now) & 0xFFFFFFu;
+    if (d == 0) d = 0x1000000u;                 /* equal now → next match a wrap away */
+    arm_schedule_event(&plat->cpu, ev, rtc_fire_cycle(rtc, now_cycles, d));
+}
+
+/* Re-arm every source — used on register writes and start. */
+static void rtc_reschedule(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
+    rtc_arm_periodic(rtc, plat);
+    for (int i = 0; i < 4; i++) rtc_arm_compare(rtc, plat, i);
+}
+
+/* Shared TICK / OVRFLW callback. */
 static void rtc_event_cb(void *user_data, cpu_event_t *event) {
     nrf_rtc_state_t *rtc = (nrf_rtc_state_t *)user_data;
     nrf52840_soc_t *soc = (nrf52840_soc_t *)rtc->soc;
@@ -377,14 +405,29 @@ static void rtc_event_cb(void *user_data, cpu_event_t *event) {
     bool fire = false;
     if (rtc->intenset & RTC_INT_TICK)              { rtc->evt_tick = 1;   fire = true; }
     if ((rtc->intenset & RTC_INT_OVRFLW) && cnt==0) { rtc->evt_ovrflw = 1; fire = true; }
-    for (int i = 0; i < 4; i++)
-        if ((rtc->intenset & (RTC_INT_COMPARE_0 << i)) && rtc->cc[i] == cnt) {
-            rtc->evt_compare[i] = 1; fire = true;
-        }
     if (fire && plat->cpu.nvic)
         arm_nvic_set_pending((arm_nvic_t *)plat->cpu.nvic, rtc->irq_num);
 
-    rtc_reschedule(rtc, plat);
+    rtc_arm_periodic(rtc, plat);
+}
+
+/* Per-channel COMPARE callback: fires the one channel this event belongs to,
+ * then re-arms it (next COUNTER==CC[i] is a full wrap away — the latched edge). */
+static void rtc_compare_cb(void *user_data, cpu_event_t *event) {
+    nrf_rtc_state_t *rtc = (nrf_rtc_state_t *)user_data;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)rtc->soc;
+    arm_platform_t *plat = soc->plat;
+    if (!plat || !rtc->running) return;
+    for (int i = 0; i < 4; i++) {
+        if (event != (cpu_event_t *)rtc->compare_event[i]) continue;
+        if (rtc->intenset & (RTC_INT_COMPARE_0 << i)) {
+            rtc->evt_compare[i] = 1;
+            if (plat->cpu.nvic)
+                arm_nvic_set_pending((arm_nvic_t *)plat->cpu.nvic, rtc->irq_num);
+        }
+        rtc_arm_compare(rtc, plat, i);
+        return;
+    }
 }
 
 static void rtc_start(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
@@ -403,6 +446,8 @@ static void rtc_stop(nrf_rtc_state_t *rtc, arm_platform_t *plat) {
     rtc->counter_anchor_cycles = (int64_t)plat->cpu.cycles;
     rtc->running = false;
     arm_cancel_event(&plat->cpu, (arm_event_t *)rtc->tick_event);
+    for (int i = 0; i < 4; i++)
+        arm_cancel_event(&plat->cpu, (arm_event_t *)rtc->compare_event[i]);
 }
 
 static int nrf_rtc_read(void *user_data, uint32_t addr) {
@@ -1677,6 +1722,12 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     tev0->callback  = rtc_event_cb;
     tev0->user_data = &soc->rtc0;
     soc->rtc0.tick_event = tev0;
+    for (int i = 0; i < 4; i++) {
+        cpu_event_t *cev = (cpu_event_t *)calloc(1, sizeof(*cev));
+        cev->callback  = rtc_compare_cb;
+        cev->user_data = &soc->rtc0;
+        soc->rtc0.compare_event[i] = cev;
+    }
     arm_register_io(&plat->cpu, NRF_RTC0_BASE, NRF_RTC0_SIZE,
                     nrf_rtc_read, nrf_rtc_write, &soc->rtc0);
 
@@ -1687,6 +1738,12 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
     tev1->callback  = rtc_event_cb;
     tev1->user_data = &soc->rtc1;
     soc->rtc1.tick_event = tev1;
+    for (int i = 0; i < 4; i++) {
+        cpu_event_t *cev = (cpu_event_t *)calloc(1, sizeof(*cev));
+        cev->callback  = rtc_compare_cb;
+        cev->user_data = &soc->rtc1;
+        soc->rtc1.compare_event[i] = cev;
+    }
     arm_register_io(&plat->cpu, NRF_RTC1_BASE, NRF_RTC1_SIZE,
                     nrf_rtc_read, nrf_rtc_write, &soc->rtc1);
 
@@ -1764,13 +1821,17 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
 static void nrf52840_soc_destroy(arm_platform_t *plat) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)plat->soc;
     if (soc) {
-        if (soc->rtc0.tick_event) {
-            arm_cancel_event(&plat->cpu, (arm_event_t *)soc->rtc0.tick_event);
-            free(soc->rtc0.tick_event);
-        }
-        if (soc->rtc1.tick_event) {
-            arm_cancel_event(&plat->cpu, (arm_event_t *)soc->rtc1.tick_event);
-            free(soc->rtc1.tick_event);
+        nrf_rtc_state_t *rtcs[2] = { &soc->rtc0, &soc->rtc1 };
+        for (int r = 0; r < 2; r++) {
+            if (rtcs[r]->tick_event) {
+                arm_cancel_event(&plat->cpu, (arm_event_t *)rtcs[r]->tick_event);
+                free(rtcs[r]->tick_event);
+            }
+            for (int i = 0; i < 4; i++)
+                if (rtcs[r]->compare_event[i]) {
+                    arm_cancel_event(&plat->cpu, (arm_event_t *)rtcs[r]->compare_event[i]);
+                    free(rtcs[r]->compare_event[i]);
+                }
         }
         free(soc);
     }
