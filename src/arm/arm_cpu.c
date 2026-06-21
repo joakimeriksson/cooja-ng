@@ -10,6 +10,25 @@
 #include <stdio.h>
 
 uint64_t arm_wfi_total, arm_wfi_pending, arm_wfi_skipped, arm_wfi_blocked, arm_wfi_noirq;
+
+/* Multi-address PC watch: ARM_PC_WATCH="0xaaa,0xbbb,...".  Counts hits + first/
+ * last cycle per address, dumped at exit.  Diagnostic only. */
+#define ARM_PCW_MAX 12
+uint32_t arm_pcw_addr[ARM_PCW_MAX]; uint64_t arm_pcw_n[ARM_PCW_MAX];
+int64_t arm_pcw_first[ARM_PCW_MAX], arm_pcw_last[ARM_PCW_MAX]; int arm_pcw_count = -1;
+void arm_pcw_init(void) {
+    arm_pcw_count = 0;
+    char *w = getenv("ARM_PC_WATCH"); if (!w) return;
+    char buf[256]; snprintf(buf, sizeof buf, "%s", w);
+    for (char *t = strtok(buf, ","); t && arm_pcw_count < ARM_PCW_MAX; t = strtok(NULL, ","))
+        arm_pcw_addr[arm_pcw_count++] = (uint32_t)strtoul(t, 0, 16);
+}
+__attribute__((destructor,used)) static void arm_pcw_dump(void) {
+    for (int i = 0; i < arm_pcw_count; i++)
+        fprintf(stderr, "PC-WATCH 0x%08x: hits=%llu first=%lld last=%lld\n",
+            arm_pcw_addr[i], (unsigned long long)arm_pcw_n[i],
+            (long long)arm_pcw_first[i], (long long)arm_pcw_last[i]);
+}
 __attribute__((destructor,used)) static void arm_wfi_dump(void) {
     if (!getenv("ARM_WFI_STATS")) return;
     fprintf(stderr, "WFI-STATS: total=%llu pending=%llu skipped=%llu blocked=%llu noirq=%llu\n",
@@ -994,6 +1013,18 @@ int arm_step(arm_cpu_t *cpu, int count) {
         }
 
         uint32_t pc = cpu->reg[ARM_PC];
+
+        {
+            extern int arm_pcw_count; extern void arm_pcw_init(void);
+            extern uint32_t arm_pcw_addr[]; extern uint64_t arm_pcw_n[];
+            extern int64_t arm_pcw_first[], arm_pcw_last[];
+            if (arm_pcw_count < 0) arm_pcw_init();
+            for (int i = 0; i < arm_pcw_count; i++)
+                if ((pc & ~1u) == (arm_pcw_addr[i] & ~1u)) {
+                    if (arm_pcw_n[i] == 0) arm_pcw_first[i] = cpu->cycles;
+                    arm_pcw_n[i]++; arm_pcw_last[i] = cpu->cycles;
+                }
+        }
 
         arm_sp_audit_check(cpu);
 
