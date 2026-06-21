@@ -2626,7 +2626,12 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         break;
                 }
                 if (rt == ARM_PC) {
-                    if ((val & 0xF0000000) == 0xF0000000)
+                    if (size != 2) {
+                        /* A byte/halfword "load" with Rt=PC is not a load — it's
+                         * a PLD/PLI/PLDW preload hint (NOP on Cortex-M, which has
+                         * no cache).  libc strlen/memcpy/memchr emit these; doing
+                         * the load wrote a byte into PC and crashed.  Skip it. */
+                    } else if ((val & 0xF0000000) == 0xF0000000)
                         exception_return(cpu, val);
                     else
                         cpu->reg[ARM_PC] = val & ~1u;
