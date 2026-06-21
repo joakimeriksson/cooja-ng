@@ -865,7 +865,11 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 radio_event(soc, &r->evt_framestart, RADIO_INT_FRAMESTART);
                 radio_event(soc, &r->evt_payload,    RADIO_INT_PAYLOAD);
                 radio_event(soc, &r->evt_end,        RADIO_INT_END);
-                radio_event(soc, &r->evt_phyend,     0);
+                /* PHYEND is the 802.15.4 TX-completion event nrf_802154 waits
+                 * on (IRQ + the PHYEND_DISABLE short); fire it with its mask,
+                 * same as the RX path — without the IRQ the driver blocks in
+                 * its transmit wait forever. */
+                radio_event(soc, &r->evt_phyend,     RADIO_INT_PHYEND);
                 r->state = NRF_RADIO_STATE_TXIDLE;
                 radio_apply_shorts_after_event(soc, SHORT_END_DISABLE);
                 radio_apply_shorts_after_event(soc, SHORT_PHYEND_DISABLE);
