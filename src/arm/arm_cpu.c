@@ -26,6 +26,7 @@ void arm_pcw_init(void) {
 /* Memory-change watch: ARM_MEM_WATCH="0xaddr" logs every change of the byte at
  * that address with the writing PC.  Diagnostic only. */
 uint32_t arm_memw_addr; int arm_memw_last = -1; int arm_memw_init_done;
+uint32_t arm_zt_kernel; int arm_zt_done, arm_zt_init;
 __attribute__((destructor,used)) static void arm_pcw_dump(void) {
     for (int i = 0; i < arm_pcw_count; i++)
         fprintf(stderr, "PC-WATCH 0x%08x: hits=%llu first=%lld last=%lld\n",
@@ -1027,6 +1028,30 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     if (arm_pcw_n[i] == 0) arm_pcw_first[i] = cpu->cycles;
                     arm_pcw_n[i]++; arm_pcw_last[i] = cpu->cycles;
                 }
+            /* ZEPHYR_THREADS=0x<_kernel addr>: one-shot dump of the Zephyr
+             * thread list (CONFIG_THREAD_MONITOR) at the stall — name, state,
+             * and the wait-queue each thread is pended on.  Offsets are for the
+             * echo-s-nd build (z_kernel.threads +40, k_thread.next_thread +140,
+             * .name +144, base.thread_state +16, base.pended_on +8). */
+            extern uint32_t arm_zt_kernel; extern int arm_zt_done, arm_zt_init;
+            if (!arm_zt_init) { arm_zt_init = 1;
+                char *z = getenv("ZEPHYR_THREADS"); if (z) arm_zt_kernel = (uint32_t)strtoul(z, 0, 16); }
+            if (arm_zt_kernel && !arm_zt_done && cpu->cycles > 20000000) {
+                arm_zt_done = 1;
+                uint32_t t = arm_read32(cpu, arm_zt_kernel + 40);
+                fprintf(stderr, "[zthreads] cyc=%lld _kernel=0x%08x\n",
+                        (long long)cpu->cycles, arm_zt_kernel);
+                int guard = 0;
+                while (t >= 0x20000000 && t < 0x20040000 && guard++ < 32) {
+                    char nm[20]; int i;
+                    for (i = 0; i < 19; i++) { nm[i] = (char)arm_read8(cpu, t + 144 + i); if (!nm[i]) break; }
+                    nm[i] = 0;
+                    fprintf(stderr, "  thr 0x%08x '%s' state=0x%02x pended_on=0x%08x prio=%d\n",
+                            t, nm, (unsigned)arm_read8(cpu, t + 16), arm_read32(cpu, t + 8),
+                            (int8_t)arm_read8(cpu, t + 17));
+                    t = arm_read32(cpu, t + 140);
+                }
+            }
             extern uint32_t arm_memw_addr; extern int arm_memw_last, arm_memw_init_done;
             if (!arm_memw_init_done) { arm_memw_init_done = 1;
                 char *m = getenv("ARM_MEM_WATCH"); if (m) arm_memw_addr = (uint32_t)strtoul(m, 0, 16); }
