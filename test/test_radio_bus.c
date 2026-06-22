@@ -489,7 +489,11 @@ static void test_reentrant_depth(void) {
  * ============================================================ */
 
 static void test_rx_stall(void) {
-    fixture_t f;
+    /* fixture_t embeds sim_runtime_t + sim_radio_bus_t (~5 MB each); this is the
+     * only test that needs two live at once, and two on the stack overflow an
+     * 8 MB stack (segfaults on macOS and smaller ulimits; survived the Linux CI
+     * runner by luck). Keep them in static storage — fx_init re-inits each. */
+    static fixture_t f;
     fx_init(&f, 2);
     sim_radio_bus_register(&f.bus, 0, &mock_ops, &f.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
     /* Receiver with an rx_stall op → the bus arms the watchdog. */
@@ -518,7 +522,7 @@ static void test_rx_stall(void) {
     ASSERT(expired, "timer at deadline truly expires");
 
     /* A receiver WITHOUT an rx_stall op never arms the watchdog. */
-    fixture_t g;
+    static fixture_t g;          /* static: see the note on `f` above */
     fx_init(&g, 2);
     sim_radio_bus_register(&g.bus, 0, &mock_ops, &g.rx[0], SIM_RADIO_DELIVERY_PER_BYTE, 0);
     sim_radio_bus_register(&g.bus, 1, &mock_ops, &g.rx[1], SIM_RADIO_DELIVERY_PER_BYTE, 0);
