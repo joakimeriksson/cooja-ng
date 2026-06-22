@@ -13,6 +13,11 @@ dodag [2001:db8::1 | R: 512 | OP: Router | PIO: on | ...]
   parent [addr: fe80::ec6a:6574:72b9:6c63 | rank: 256]
 ```
 
+> **Experimental / best-effort.** Contiki-NG is csim's primary, fully-validated
+> target (it passes the upstream Cooja test suite). RIOT support is newer and
+> narrower — the cases documented here work end-to-end, but coverage is limited
+> to `gnrc_networking` on `nrf52840dk` and the known gaps under *Limitations*.
+
 ## Build a firmware
 
 No Zephyr-style SDK is needed — RIOT builds with `make` and the system

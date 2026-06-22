@@ -8,6 +8,11 @@ Contiki-NG. The bundled example prints the classic banner:
 Hello World! nrf52840dk/nrf52840
 ```
 
+> **Experimental / best-effort.** Contiki-NG is csim's primary, fully-validated
+> target (it passes the upstream Cooja test suite). Zephyr support is newer and
+> narrower — the cases documented here work end-to-end, but coverage is limited
+> to the `nrf52840dk` samples below and the known gaps under *Limitations*.
+
 ## Run the bundled examples
 
 ```sh
