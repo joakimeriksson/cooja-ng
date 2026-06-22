@@ -1260,8 +1260,19 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
      * RXIDLE → RX state walk.  Buffer is cleared on TX entry so we
      * never carry stale bytes across a TX cycle. */
     if (r->state != NRF_RADIO_STATE_RX) {
-        if (r->rx_incoming_len < (int)sizeof(r->rx_incoming))
-            r->rx_incoming[r->rx_incoming_len++] = byte;
+        /* Only buffer bytes that arrive while the radio is actually arming for
+         * RX (RXRU ramp / RXIDLE awaiting START) — e.g. an auto-ACK 192 µs after
+         * our own TX, before the RXEN→RX walk finishes; those replay when RX is
+         * reached.  A DISABLED radio (or one busy in a TX state) is NOT
+         * listening — drop the bytes, exactly as hardware does.  Buffering them
+         * let an idle node whose radio sits DISABLED between sends accumulate
+         * many frames of stale bytes in rx_incoming, which then replayed as
+         * garbage and corrupted the next real RX (RIOT RPL: node never saw a
+         * clean DIO). */
+        if (r->state == NRF_RADIO_STATE_RXRU || r->state == NRF_RADIO_STATE_RXIDLE) {
+            if (r->rx_incoming_len < (int)sizeof(r->rx_incoming))
+                r->rx_incoming[r->rx_incoming_len++] = byte;
+        }
         return;
     }
     arm_cpu_t *cpu = &soc->plat->cpu;
