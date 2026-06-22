@@ -1876,9 +1876,13 @@ sim_restart:
     if (node_count == 1) {
         radio_medium_set_position(&radio_medium, 0, 0.0, 0.0);
     } else {
+        /* Placement radius (default 20 m). Override with CSIM_NODE_RADIUS to put
+         * nodes within tx_range for reliable single-hop links (e.g. a RIOT RPL
+         * root + node where the leaf must hear the DIOs). */
+        const char *rad_env = getenv("CSIM_NODE_RADIUS");
+        double radius = rad_env ? atof(rad_env) : 20.0;
         for (int i = 0; i < node_count; i++) {
             double angle = 2.0 * 3.14159265 * i / node_count;
-            double radius = 20.0;
             radio_medium_set_position(&radio_medium, i,
                 radius * cos(angle), radius * sin(angle));
         }
