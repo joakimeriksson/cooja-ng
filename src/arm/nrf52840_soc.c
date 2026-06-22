@@ -1179,7 +1179,20 @@ static void nrf_radio_write(void *user_data, uint32_t addr, uint32_t value) {
             case RADIO_EVENTS_READY:        r->evt_ready      = value & 1; break;
             case RADIO_EVENTS_ADDRESS:      r->evt_address    = value & 1; break;
             case RADIO_EVENTS_PAYLOAD:      r->evt_payload    = value & 1; break;
-            case RADIO_EVENTS_END:          r->evt_end        = value & 1; break;
+            case RADIO_EVENTS_END:
+                r->evt_end = value & 1;
+                /* RIOT's nrf802154 driver consumes a received frame via
+                 * EVENTS_END + CRCSTATUS and never clears EVENTS_CRCOK.  So when
+                 * the frame is consumed (END cleared), drop the stale latched
+                 * CRCOK — otherwise the driver's *subsequent* RX re-arm (RXEN)
+                 * sees CRCOK still set, gets deferred (rxen_pending), and the
+                 * radio parks DISABLED forever (the node goes deaf after its
+                 * first frame).  Zephyr's nrf_802154 clears CRCOK itself, before
+                 * its re-arm, so the latch is already gone here and this is a
+                 * no-op for it. */
+                if (!(value & 1))
+                    r->evt_crcok = 0;
+                break;
             case RADIO_EVENTS_DISABLED:     r->evt_disabled   = value & 1; break;
             case RADIO_EVENTS_DEVMATCH:     r->evt_devmatch   = value & 1; break;
             case RADIO_EVENTS_DEVMISS:      r->evt_devmiss    = value & 1; break;
@@ -1254,6 +1267,8 @@ void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, 
  * delivers a byte to this node. */
 void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
     nrf_radio_state_t *r = &soc->radio;
+    if (getenv("NRF_RXBYTE_TRACE"))
+        fprintf(stderr, "[rxbyte] state=%d\n", r->state);
     /* Outside RX: buffer the byte for replay on next RX entry.  This
      * catches auto-ACK bytes that arrive 192 µs after our own TX,
      * before the driver has finished the TXIDLE → DISABLED → RXEN →
