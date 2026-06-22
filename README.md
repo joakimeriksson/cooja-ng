@@ -58,7 +58,7 @@ make cooja-tests VERBOSE=1
 
 | Target | Notes |
 |---|---|
-| `make` | Default release build (`-O3 -flto -march=native`), JIT auto-detected via pkg-config |
+| `make` | Default release build (`-O3 -flto`, native CPU tuning: `-march=native` on x86 / `-mcpu=native` on arm64), JIT auto-detected via pkg-config |
 | `make debug` | `-O0 -g -DDEBUG`, no LTO |
 | `make pgo` | Two-stage profile-guided optimization, ~40 % faster on hot loops |
 | `make clean` | Remove `build/` |

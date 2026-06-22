@@ -59,15 +59,15 @@ flowchart TB
     end
 
     %% ---- Sim core ----
-    subgraph CORE["Simulation Core — src/common, src/native"]
+    subgraph CORE["Simulation Core — src/common, src/sim, src/native"]
         DRIVER["test_mixed_multinode.c<br/>round-robin, ns-stepped<br/>1 ms tick → step_until per node"]
         CFG["sim_config.c<br/>JSON scenarios (configs/*.json)"]
         EVQ["sim_event_queue.c<br/>per-node cycle/ns events"]
         TL["timeline.c<br/>TX/RX/INTF/on/off ring buffer"]
-        RM["radio_medium.c<br/>UDGM • tx_range / interference_range<br/>frame assembler, sync delivery"]
+        RM["radio_medium.c<br/>UDGM policy • tx_range / interference_range<br/>(frame assembly in src/sim/sim_radio_bus.c)"]
         PA["packet_analyzer.c<br/>802.15.4 / 6LoWPAN / RPL decode"]
         PCAP["pcap_writer.c<br/>Wireshark .pcap"]
-        GDB["gdb_stub.c<br/>RSP for ARM Cortex-M3"]
+        GDB["gdb_stub.c + arm_gdb.c<br/>RSP for ARM (Cortex-M)"]
         JST["js_test_engine.c<br/>scripted assertions"]
     end
 
@@ -76,16 +76,16 @@ flowchart TB
         direction LR
         subgraph MSP["MSP430 node — src/msp430"]
             MCPU["msp430_cpu.c<br/>computed-goto interp<br/>+ GNU Lightning JIT (hot blocks)"]
-            MCFG["msp430_config / clock<br/>F1611 • F149 • F2617 • F5437 • CC430"]
+            MCFG["msp430_config / clock<br/>F1611 • F149 • F2617 • F5437<br/>CC430 • FR5969 (FRAM/CS)"]
             MPER["timer A/B • USART/USCI/eUSCI<br/>GPIO P1–P10 • BCS or CS clock<br/>MPY / MPY32 multiplier"]
             MRF["cc2420.c<br/>SPI radio FSM<br/>auto-ACK, CRC, RXFIFO buffer"]
             MELF["msp430_elf.c"]
         end
-        subgraph ARM["ARM Cortex-M3 node — src/arm"]
-            ACPU["arm_cpu.c<br/>Thumb / Thumb-2 + IT blocks"]
-            ACFG["arm_config (CC2538)"]
-            APER["NVIC • SysTick • SleepTimer<br/>UART • GPIO • GPT • SysCtrl • IOC"]
-            ARF["cc2538_rfcore.c<br/>on-chip 802.15.4<br/>FFSM filter, RXFIFO inject"]
+        subgraph ARM["ARM Cortex-M3/M4/M33 node — src/arm"]
+            ACPU["arm_cpu.c<br/>Thumb / Thumb-2 + IT blocks<br/>M4 DSP/VFP • ARMv8-M (M33)"]
+            ACFG["arm_config<br/>CC2538 (M3) • nRF52840 (M4F)<br/>nRF54L15 (M33)"]
+            APER["NVIC • SysTick • timers • UART(E)<br/>GPIO • CLOCK/SysCtrl • RTC/GRTC<br/>VFP (arm_vfp.c) • TEMP/RNG"]
+            ARF["cc2538_rfcore.c • nrf52840_soc.c<br/>nrf54l15_soc.c — on-chip 802.15.4<br/>(nrf_radio_common.c shared helpers)"]
             AELF["arm_elf.c"]
         end
         subgraph NAT["Native node — src/native"]
@@ -98,18 +98,18 @@ flowchart TB
     end
 
     %% ---- Firmware ----
-    subgraph FW["Pre-built Contiki-NG firmware"]
-        FW1["firmware/sky/*.sky<br/>(MSP430 ELF)"]
-        FW2["firmware/fr5969/*.msp430fr5969<br/>(MSP430FR ELF)"]
-        FW3["firmware/cc2538dk/*.cc2538dk<br/>(ARM ELF)"]
+    subgraph FW["Pre-built guest firmware (Contiki-NG · Zephyr · RIOT)"]
+        FW1["firmware/sky/*.sky • z1/*.z1<br/>(MSP430 ELF)"]
+        FW2["firmware/cc2538dk/*.cc2538dk<br/>zoul-firefly/*.zoul-firefly (ARM ELF)"]
+        FW3["firmware/nrf52840-{dk,dongle}/*<br/>nrf54l15-dk/* (ARM ELF)"]
     end
 
     %% ---- Tests ----
     subgraph TST["test/ — build/test_runner"]
-        T1["correctness / arm-correctness<br/>(68 + 33 insn tests)"]
+        T1["correctness / arm-correctness<br/>(72 + 153 insn tests)"]
         T2["firmware / arm-firmware"]
-        T3["multinode / arm-multinode<br/>(mixed MSP430 + ARM)"]
-        T4["bench • timeline (76 unit)"]
+        T3["multinode / arm-multinode / nrf*-multinode<br/>zoul-firefly-multinode (mixed MSP430+ARM)"]
+        T4["bench • timeline (76) • radio-medium (241)<br/>radio-bus (120) • cc1200-mock-host (73)"]
     end
 
     %% ---- Edges ----
@@ -142,6 +142,7 @@ flowchart TB
 
     FW1 -. ELF .-> MELF
     FW2 -. ELF .-> AELF
+    FW3 -. ELF .-> AELF
 
     MRF <-->|byte stream + INTF| RM
     ARF <-->|byte stream + INTF| RM
@@ -187,7 +188,7 @@ tabled in `CLAUDE.md`. The rest of the tree:
 | `pcap_writer.c`     | libpcap nanosecond-precision writer for Wireshark consumption                                                   |
 | `radio_medium.c`    | Per-radio medium: spectrum + channel + RX-enabled gating, distance-based RX probability, xorshift32 PRNG, 802.15.4 + 802.15.4g frame trackers. Detailed reference: [`docs/radio-medium.md`](radio-medium.md). |
 | `sim_event_queue.c` | Min-heap event queue keyed on `(time_ns, seq)` for FIFO at equal times (matches COOJA)                          |
-| `sim_threads.c`     | Optional thread pool with atomic spin barrier for parallel per-node steps                                       |
+| `mock_sim_host.c`   | Standalone `sim_host_t` implementation backing the host-only chip-driver unit suites (`cc1200-mock-host`, `radio-medium`, `radio-bus`) — no CPU required |
 | `timeline.c`        | Ring buffer of TX/RX/INTF/LED/log events, JSON + CBOR serialization                                             |
 
 ### `src/native/` — non-emulated node types
@@ -197,7 +198,6 @@ tabled in `CLAUDE.md`. The rest of the tree:
 | `native_node.c` | `TARGET=cooja` Contiki-NG `.cooja` shared lib loaded via `dlopen` (per-node temp copy); exposes `cooja_init/cooja_tick` |
 | `native_radio.c` | Bridges native Cooja frame-based radio (`simInDataBuffer`) ↔ byte-stream 802.15.4 used by CC2420/CC2538 |
 | `js_node.c` | JS application mote: per-node QuickJS runtime, single-threaded, ticked from the main loop (distinct from `js_test_engine.c`) |
-| `sim_config.c` | JSON scenario loader (`configs/*.json`) — node positions, firmware paths, radio model |
 
 ### `src/ui/` — observation/visualization bridge
 
@@ -210,13 +210,17 @@ tabled in `CLAUDE.md`. The rest of the tree:
 
 | File | Purpose |
 |------|---------|
-| `test_main.c` | Dispatcher for all subcommands (`correctness`, `bench`, `firmware`, `multinode`, `arm-*`, `timeline`) |
-| `test_correctness.c` | 68 MSP430 instruction-level correctness tests (port of MSPSim's `CorrectnessTests.java`) |
-| `test_arm_correctness.c` | 33 ARM Cortex-M3 instruction-level tests |
+| `test_main.c` | Dispatcher for all subcommands (`correctness`, `bench`, `firmware`, `multinode`, `arm-correctness`, `arm-firmware`, `arm-multinode`, `zoul-firefly-multinode`, `nrf52840-{dk,dongle}-multinode`, `nrf54l15-dk-multinode`, `mixed-multinode`, `test`, `cc1200-mock-host`, `radio-medium`, `radio-bus`, `timeline`) |
+| `test_correctness.c` | 72 MSP430 instruction-level correctness tests (port of MSPSim's `CorrectnessTests.java`) |
+| `test_arm_correctness.c` | 153 ARM instruction-level tests — Thumb/Thumb-2, M4 DSP + FPv4-SP VFP, ARMv8-M (M33) load-acquire/store-release |
 | `test_benchmark.c` | MSP430 micro-benchmarks + firmware benchmarks (port of `PerformanceBenchmark.java`) |
 | `test_firmware.c` | MSP430 firmware boot tests; loads ELF, monitors USART output |
-| `test_arm_firmware.c` | ARM firmware boot tests; loads CC2538 ELF, monitors UART |
-| `test_mixed_multinode.c` | Heterogeneous multi-node sim driver (MSP430 + ARM + native + JS); auto-detects platform from file extension |
+| `test_arm_firmware.c` | ARM firmware boot tests; loads CC2538 / zoul-firefly ELF, monitors UART banner |
+| `test_mixed_multinode.c` | Heterogeneous multi-node sim driver (MSP430 + ARM + native + JS); auto-detects platform from file extension. Backs every `*-multinode` subcommand |
+| `test_mock_host.c` | `sim_host_t` mock + smoke tests for the host-only chip-driver harness |
+| `test_cc1200.c` | 73 CC1200 sub-GHz radio chip tests (mock host, no CPU) |
+| `test_radio_medium.c` | 241 radio-medium routing / range / interference tests |
+| `test_radio_bus.c` | 120 `sim_radio_bus` frame-assembly / delivery-mode / auto-ACK tests |
 | `test_timeline.c` | 76 unit tests for timeline ring buffer, serialization, sub-ms timestamp precision |
 
 ### `tools/` — scripts (selected)
@@ -331,7 +335,8 @@ Boards differ in *which* chips sit outside the SoC and *how* they connect. csim 
 | **openmote** | CC2538 (Cortex-M3) | RF Core *on-chip* | —          | Same as cc2538dk; only board glue (LEDs / button) differs               |
 | **zoul-firefly** | CC2538 (Cortex-M3) | RF Core *on-chip*; CC1200 *off* (sub-GHz) | — | RF Core same as cc2538dk. CC1200 driver (`src/arm/cc1200.c`, `sim_host_t`-only) over SSI0 (`src/arm/cc2538_ssi.c`) with CSn=PB5, RESET=PC7, GDO0=PB4, GDO2=PB0. Per-node radio fan-out in `test_mixed_multinode.c` feeds delivered bytes to both chips; `radio_medium`'s reserved sub-GHz channel range (≥`RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE`) plus a `cross_band_drop()` filter keeps the two bands isolated without a true dual-radio refactor. |
 | **nrf52840-dongle** | nRF52840 (Cortex-M4F) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic PCA10059 USB Dongle. Single-chip — no off-SoC peripherals. SoC bundle in `src/arm/nrf52840_soc.c` (CLOCK / RTC0 / TIMER0..4 / UARTE0 legacy window / RADIO with EasyDMA + SHORTS / RNG / FICR.DEVICEADDR for per-node IEEE EUI-64). M4 DSP halfword multiply in `src/arm/arm_cpu.c`; FPv4-SP-D16 single-precision VFP in `src/arm/arm_vfp.c`. VTOR=0x1000 because PCA10059 reserves 0x0..0xfff for the Open Bootloader. Reaches L6 (RPL-UDP) — two nodes form a DODAG and exchange `hello N` over the on-chip 2.4 GHz radio. |
-| **nrf52840-dk** | nRF52840 (Cortex-M4F) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic PCA10056 Development Kit, identical SoC to the Dongle. Reuses `nrf52840_soc.c` verbatim — only board glue differs: 4× LEDs at P0.13–P0.16, 4× buttons at P0.11/P0.12/P0.24/P0.25, console via SEGGER VCP, no bootloader region so VTOR=0x0. Same L6 result as the Dongle; DK ↔ Dongle interop works (same on-air format, same channel). |
+| **nrf52840-dk** | nRF52840 (Cortex-M4F) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic PCA10056 Development Kit, identical SoC to the Dongle. Reuses `nrf52840_soc.c` verbatim — only board glue differs: 4× LEDs at P0.13–P0.16, 4× buttons at P0.11/P0.12/P0.24/P0.25, console via SEGGER VCP, no bootloader region so VTOR=0x0. Same L6 result as the Dongle; DK ↔ Dongle interop works (same on-air format, same channel). Also runs stock unmodified **Zephyr** 802.15.4 echo as a regression test. |
+| **nrf54l15-dk** | nRF54L15 (Cortex-M33, ARMv8-M) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic nRF54L15-DK. Newer SoC family — SoC bundle in `src/arm/nrf54l15_soc.c`: GRTC global timer (live-counter reads, RELATIVE/absolute COMPARE), TIMER, EGU10 → NVIC IRQ, RADIO (edge-triggered TX/RX with debounce, deferred PHYEND/END), FICR.DEVICEID per node. ARMv8-M core support (load-acquire / store-release) in `arm_cpu.c`. On-air format shared with the nRF52840 via `nrf_radio_common.c`. |
 
 ### Five bridge APIs that wire any off-SoC chip
 
