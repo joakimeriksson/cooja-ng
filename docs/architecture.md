@@ -1,5 +1,50 @@
 # CSIM / Cooja-NG Architecture
 
+At a glance — stock guest firmware down through the emulated mote and the
+simulation kernel to the shared radio medium:
+
+```text
+                   C O O J A · N G
+       a C re-implementation of Cooja / MSPSim
+
+╭──────────────────────────────────────────────────────╮
+│  GUEST FIRMWARE — stock, unmodified                  │
+│    Contiki-NG  ·  Zephyr (exp)  ·  RIOT (exp)        │
+│    RPL/6LoWPAN    echo UDP/        gnrc 2-node       │
+│    TSCH · CoAP    802.15.4         RPL DODAG         │
+╰──────────────────────────────────────────────────────╯
+                           │  ELF loaded · crt0 → main()
+                           ▼
+╭──────────────────────────────────────────────────────╮
+│  EMULATED MOTE — one per node                        │
+│    CPU   MSP430 (interp+JIT) · ARM CM3/M4/M33        │
+│          ⟷  SPI / MMIO  ⟷                            │
+│    PERIPH  CC2420 CC1200 cc2538-RF nRF-RADIO         │
+│            TIMER RTC UART(E) GPIO CLOCK TEMP …       │
+╰──────────────────────────────────────────────────────╯
+                           │  sim_mote_ops_t vtable (MSP430·ARM·native·JS)
+                           ▼
+╭──────────────────────────────────────────────────────╮
+│  SIMULATION KERNEL  src/sim/                         │
+│    sim_runtime    ns clock · event queue · pump      │
+│    sim_radio_bus  per-byte RF · frame assembler      │
+│    sim_registry   boards·motes·services·media        │
+│    sim_config     JSON v1 / v2                       │
+│    ├ services  timeline pcap gdb ui energest         │
+│    └ plugins (dlopen)  service · medium · ui         │
+╰──────────────────────────────────────────────────────╯
+                           │  TX ▲ RX bytes
+                           ▼
+╭──────────────────────────────────────────────────────╮
+│  RADIO MEDIUM  src/common/ — UDGM                    │
+│    range · interference · power-aware · neighbors    │
+╰──────────────────────────────────────────────────────╯
+
+  FRONTEND  test_runner — load · pump · diagnostics
+```
+
+Detailed component / data-flow graph:
+
 ```mermaid
 flowchart TB
     %% ---- Browser ----
