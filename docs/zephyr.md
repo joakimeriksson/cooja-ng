@@ -18,11 +18,19 @@ Hello World! nrf52840dk/nrf52840
 # Two threads + timers (samples/synchronization) — they alternate every ~565 ms
 ./build/test_runner nrf52840-dk-multinode \
     firmware/nrf52840-dk/zephyr-synchronization.nrf52840-dk -t 3000 -n 1
+
+# 802.15.4 networking: stock echo_server <-> echo_client (UDP over 6LoWPAN/IPv6/RPL)
+# Server logs "Received and replied"; full two-node round-trip, 0 timeouts.
+./build/test_runner nrf52840-dk-multinode \
+    firmware/nrf52840-dk/zephyr-echo-server.nrf52840-dk \
+    firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000
 ```
 
 Pre-built Zephyr samples for `nrf52840dk/nrf52840`.  The synchronization sample
 exercises the system timer (`k_msleep`) **and** thread context switching
-(PendSV / MSP↔PSP banking).
+(PendSV / MSP↔PSP banking).  The echo samples (`samples/net/sockets/echo_*`
+with only the sample's own `overlay-802154.conf`) exercise the **on-chip
+802.15.4 radio + the full 6LoWPAN/IPv6/RPL stack** end-to-end.
 
 ## How it was built
 
@@ -69,6 +77,16 @@ Contiki used (see commit history):
   PendSV context switch works and threads actually run (Contiki used MSP only,
   so it never exercised this).
 
+For the 802.15.4 echo, two more were needed:
+
+- **TEMP sensor** (`0x4000C000`) — `nrf_802154` periodically measures die
+  temperature for radio calibration and *blocks the system work-queue* on
+  `device_sync_sem` until the `DATARDY` interrupt. With no TEMP model that read
+  hung forever, so DAD never completed (`Network init failed -116`). csim
+  completes it instantly: `TASKS_START` → `EVENTS_DATARDY` + IRQ, `TEMP` ≈ 25 °C.
+- **UARTE EasyDMA RX** (`STARTRX`/`RXD.PTR`/`ENDRX`) — the input half of the
+  console, for shell-driven samples (shared with the RIOT path, `docs/riot.md`).
+
 ### Bring-up debugging toolkit
 
 These env-gated scopes (behaviour-neutral; in `src/arm/`) are what made the
@@ -86,5 +104,10 @@ The per-mote GDB stub is also available for interactive inspection.
 
 ## Limitations
 
-- Single-node console demo only; Zephyr's 802.15.4 networking on csim's radio
-  medium is untried.
+- The stock echo samples have **no log backend in the 802.15.4 build** (their
+  `printk`/LOG output is dropped — on real hardware too, in that config), so the
+  echo server's own confirmation is what's visible; verify with the
+  `Received and replied` log, `Total RF bytes`, and 0 timeouts rather than a
+  boot banner.
+- OpenThread (Thread/mesh on top of 802.15.4) is a further step — see
+  `docs/design/zephyr-802154-plan.md` (needs the QSPI settings backend).
