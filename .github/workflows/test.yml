@@ -59,7 +59,7 @@ jobs:
       - name: Version smoke
         run: ./build/test_runner --version
 
-      - name: Plugin system (build + smoke: service, medium, energy, UI)
+      - name: "Plugin system (build + smoke: service, medium, energy, UI)"
         run: |
           make plugins
           tools/check-plugin.sh
@@ -74,6 +74,40 @@ jobs:
         # 20 s of sim is enough to verify the CC1200 RX path: each
         # node should print at least one "Received" line.
         run: ./build/test_runner zoul-firefly-multinode firmware/zoul-firefly/nullnet-broadcast-subghz.zoul-firefly -t 20000 -q
+
+      - name: nRF52840-DK Contiki RPL-UDP (40s sim)
+        # The runner exits 0 regardless, so assert on the firmware's own
+        # reception count (no -q — that suppresses the firmware console).
+        run: |
+          ./build/test_runner nrf52840-dk-multinode \
+            firmware/nrf52840-dk/udp-server.nrf52840-dk \
+            firmware/nrf52840-dk/udp-client.nrf52840-dk -t 40000 > out.txt 2>&1
+          n=$(grep -ciE 'Received (request|response)' out.txt || true)
+          echo "RPL-UDP receptions: $n"; [ "$n" -ge 2 ]
+
+      - name: nRF52840-Dongle Contiki RPL-UDP (40s sim)
+        run: |
+          ./build/test_runner nrf52840-dongle-multinode \
+            firmware/nrf52840-dongle/udp-server.nrf52840-dongle \
+            firmware/nrf52840-dongle/udp-client.nrf52840-dongle -t 40000 > out.txt 2>&1
+          n=$(grep -ciE 'Received (request|response)' out.txt || true)
+          echo "RPL-UDP receptions: $n"; [ "$n" -ge 2 ]
+
+      - name: nRF52840-DK Zephyr 802.15.4 echo (stock echo_server/client, 40s sim)
+        # Experimental Zephyr path; the echo build has no log backend, so assert
+        # on the server's own "Received and replied" line.
+        run: |
+          ./build/test_runner nrf52840-dk-multinode \
+            firmware/nrf52840-dk/zephyr-echo-server.nrf52840-dk \
+            firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000 > out.txt 2>&1
+          n=$(grep -c 'Received and replied' out.txt || true)
+          echo "echo replies: $n"; [ "$n" -ge 5 ]
+
+      - name: Determinism guard (sky RPL-UDP run twice → byte-identical)
+        run: tools/check-determinism.sh multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 20000
+
+      - name: Config v1 <-> v2 equivalence (chain-4node-sky)
+        run: tools/check-config-equivalence.sh configs/chain-4node-sky.json configs/chain-4node-sky-v2.json
 
 # TODO: add a third job that builds with GNU Lightning enabled to cover
 # the JIT path in src/msp430/msp430_jit.c. Verify the Ubuntu apt package
