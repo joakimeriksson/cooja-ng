@@ -309,13 +309,22 @@ pgo:
 
 # Phase 9: example plugin (.so).  Built on demand via `make plugins` — NOT a
 # prerequisite of test_runner, so `make` stays green without it.  Plain
-# -O2 -fPIC -shared (no -flto across the dlopen boundary); only
-# csim_plugin_init is exported.
+# -O2 -fPIC, no -flto across the dlopen boundary; only csim_plugin_init is
+# exported.  A medium plugin (lossy_medium) calls host radio_medium_* symbols,
+# undefined at plugin-link time: Linux -shared defers them to dlopen, but
+# macOS/clang rejects undefined symbols unless told -undefined dynamic_lookup
+# (the host exports them via -rdynamic on Linux / by default on macOS).
 PLUGINS_BUILD_DIR = $(BUILD_DIR)/plugins
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+  PLUGIN_LDFLAGS = -dynamiclib -undefined dynamic_lookup
+else
+  PLUGIN_LDFLAGS = -shared
+endif
 $(PLUGINS_BUILD_DIR):
 	mkdir -p $(PLUGINS_BUILD_DIR)
 
 $(PLUGINS_BUILD_DIR)/%.so: plugins/%.c | $(PLUGINS_BUILD_DIR)
-	$(CC) -shared -fPIC -O2 -std=c11 -I include/sim -I include/common $< -o $@
+	$(CC) $(PLUGIN_LDFLAGS) -fPIC -O2 -std=c11 -I include/sim -I include/common $< -o $@
 
 plugins: $(PLUGINS_BUILD_DIR)/packet_sink.so $(PLUGINS_BUILD_DIR)/lossy_medium.so
