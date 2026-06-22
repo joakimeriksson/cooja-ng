@@ -1,5 +1,17 @@
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -march=native -flto -MMD -MP
+
+# Native CPU tuning. x86 uses -march=native; ARM (Apple Silicon) uses
+# -mcpu=native — the idiomatic ARM tuning flag. -march=native on arm64 is
+# miscompiled by Apple clang under -flto (corrupts ELF loading / firmware
+# boot), so it must not be used there.
+ARCH := $(shell uname -m)
+ifeq ($(filter arm64 aarch64,$(ARCH)),)
+  NATIVE_FLAG := -march=native
+else
+  NATIVE_FLAG := -mcpu=native
+endif
+
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs $(NATIVE_FLAG) -flto -MMD -MP
 # -rdynamic exports the host's dynamic symbol table so a dlopen'd plugin can
 # resolve host library functions (e.g. the radio_medium accessors a medium
 # plugin uses).  Behavior-neutral (symbol visibility only).
@@ -285,7 +297,7 @@ debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
 # Profile-guided optimization (Apple Clang)
-PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -march=native
+PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs $(NATIVE_FLAG)
 PGO_LDFLAGS = -lm -lpthread
 ifneq ($(LIGHTNING_LIBS),)
   PGO_CFLAGS += $(LIGHTNING_CFLAGS) -DHAVE_LIGHTNING
