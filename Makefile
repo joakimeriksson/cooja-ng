@@ -280,7 +280,7 @@ configure:
 	@echo "Wrote csim.conf: CONTIKI_DIR=$(CONTIKI_DIR)"
 
 # Debug build
-debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs -DDEBUG
+debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -DDEBUG
 debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
