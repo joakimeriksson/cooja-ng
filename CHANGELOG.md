@@ -5,7 +5,7 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/); this project
 uses [Semantic Versioning](https://semver.org/) once it reaches 1.0 — until
 then, 0.x minor releases may adjust the CLI, config, and plugin ABI.
 
-## [0.1.0] — 2026-06-19
+## [0.1.0] — 2026-06-22
 
 First public release. A fast, multi-architecture C re-implementation of the
 parts of Cooja and MSPSim needed to run the upstream Contiki-NG test suite
@@ -21,6 +21,13 @@ faithful peripheral behaviour.
   (on-chip RF Core), Zolertia Firefly (+ CC1200 sub-GHz), and Nordic nRF52840 /
   nRF54L15 (on-chip 802.15.4) platforms.
 - **Native Cooja motes** (`dlopen`) and **JS app motes** (QuickJS).
+- **Multi-RTOS**: Contiki-NG is the primary, fully-validated target; csim also
+  boots stock **Zephyr OS** (incl. 802.15.4 `echo_server`/`echo_client` over
+  UDP) and **RIOT OS** (`gnrc_networking` forming a 2-node RPL DODAG) on the
+  nRF52840 — experimental / best-effort. The nRF52840 model grew the fidelity
+  these need: UARTE EasyDMA RX, the TEMP sensor, RADIO/TIMER/RTC behaviour, and
+  Cortex-M4 ops (PLD/PLI hint, parallel UADD8/SADD8 + SEL with APSR.GE). See
+  [`docs/zephyr.md`](docs/zephyr.md) and [`docs/riot.md`](docs/riot.md).
 
 ### Simulation kernel
 - Single-threaded, event-driven kernel (`sim_runtime_t`): ns-precise clock,
@@ -49,7 +56,9 @@ faithful peripheral behaviour.
 - Passes the upstream Contiki-NG Cooja test suite (**89 / 89**, including the
   TUN/border-router cases) via `tools/run-cooja-tests.sh`, plus instruction,
   firmware, radio-medium/bus, chip-driver, and plugin unit suites.
-- CI on Linux (gcc) and macOS (clang).
+- CI on Linux (gcc) and macOS (clang) gating the unit suites plus nRF52840
+  networking (Contiki RPL-UDP on DK + Dongle, stock Zephyr 802.15.4 echo) and
+  determinism / config-equivalence guards.
 
 ### Known limitations
 See [README "Known issues"](README.md#known-issues). Notably: a default
