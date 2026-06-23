@@ -163,6 +163,14 @@ typedef struct arm_cpu {
      * (CC2538 CCA) or fall back to flash_base. */
     uint32_t  vtor_default;
 
+    /* Optional co-processor stepped in lockstep after each execute slice,
+     * sharing this CPU's memory + IO bus. The nRF54L15 FLPR (RV32E) uses
+     * this: nrf54l_vpr_launch() sets both, and the ARM execute tick calls
+     * coproc_step(coproc, delta_cycles) once the M33 slice has advanced.
+     * NULL on every SoC that has no co-processor. */
+    void  *coproc;
+    void (*coproc_step)(void *coproc, int64_t delta_cycles);
+
     /* Cortex-M4F VFP — single-precision (32 × s0..s31). Stored as raw
      * 32-bit words; arm_vfp.c interprets them per the IEEE 754 binary32
      * format when arithmetic ops touch them. fpscr holds the FP status

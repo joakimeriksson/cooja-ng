@@ -2049,6 +2049,76 @@ static void nrf54l_timer_setup(nrf54l_timer_state_t *t, arm_platform_t *plat,
 
 
 /* ============================================================
+ * VPR00 — FLPR (RV32E) launch control + SPU00 permission gate
+ *
+ * The M33 releases the FLPR from reset (Zephyr nordic_vpr_launcher
+ * sequence). We latch INITPC/CPURUN and the SPU SECATTR bit; on the
+ * CPURUN 0->1 edge, with SECATTR set, the RV32E core is started over
+ * the shared SRAM. See docs/design/riscv-vpr-plan.md.
+ * ============================================================ */
+#define NRF54L_VPR00_BASE     0x5004C000u
+#define NRF54L_VPR00_SIZE     0x1000u
+#define NRF54L_VPR_CPURUN     0x800u   /* offset within the VPR page */
+#define NRF54L_VPR_INITPC     0x808u
+
+#define NRF54L_SPU00_BASE     0x50040000u
+#define NRF54L_SPU00_SIZE     0x1000u
+#define NRF54L_SPU_PERIPH12   0x530u   /* PERIPH[12].PERM = 0x500 + 12*4 */
+#define NRF54L_SPU_SECATTR    (1u << 4)
+
+/* Implemented in src/riscv/nrf54l_vpr.c: instantiate + co-step the RV32E
+ * FLPR core over the shared bus. */
+void nrf54l_vpr_launch(nrf54l_vpr_state_t *vpr);
+
+static int nrf54l_vpr_read(void *user, uint32_t addr) {
+    nrf54l_vpr_state_t *vpr = user;
+    switch (addr - NRF54L_VPR00_BASE) {
+        case NRF54L_VPR_CPURUN: return (int)vpr->cpurun;
+        case NRF54L_VPR_INITPC: return (int)vpr->initpc;
+        default:                return 0;
+    }
+}
+
+static void nrf54l_vpr_write(void *user, uint32_t addr, uint32_t value) {
+    nrf54l_vpr_state_t *vpr = user;
+    switch (addr - NRF54L_VPR00_BASE) {
+        case NRF54L_VPR_INITPC:
+            vpr->initpc = value;
+            return;
+        case NRF54L_VPR_CPURUN:
+            /* Rising edge releases the FLPR. The real VPR only fetches when
+             * its SPU SECATTR matches the (Secure) access — mirror that gate
+             * so a missing SECATTR write surfaces instead of silently running. */
+            if ((value & 1u) && !(vpr->cpurun & 1u)) {
+                vpr->cpurun = value;
+                if (vpr->spu_periph12 & NRF54L_SPU_SECATTR)
+                    nrf54l_vpr_launch(vpr);
+                else
+                    fprintf(stderr, "[VPR] CPURUN=1 but SPU SECATTR clear — "
+                                    "FLPR will not fetch (as on HW)\n");
+            } else {
+                vpr->cpurun = value;
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+static int nrf54l_spu_read(void *user, uint32_t addr) {
+    nrf54l_vpr_state_t *vpr = user;
+    if ((addr - NRF54L_SPU00_BASE) == NRF54L_SPU_PERIPH12)
+        return (int)vpr->spu_periph12;
+    return 0;
+}
+
+static void nrf54l_spu_write(void *user, uint32_t addr, uint32_t value) {
+    nrf54l_vpr_state_t *vpr = user;
+    if ((addr - NRF54L_SPU00_BASE) == NRF54L_SPU_PERIPH12)
+        vpr->spu_periph12 = value;
+}
+
+/* ============================================================
  * SoC lifecycle
  * ============================================================ */
 static void nrf54l15_soc_init(arm_platform_t *plat) {
@@ -2103,6 +2173,17 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
                         nrf54l_dppic_bases[i], NRF54L_DPPIC_SIZE,
                         nrf54l_dppic_read, nrf54l_dppic_write, &soc->dppi);
     }
+
+    /* VPR00 launch control + SPU00 permission gate — FLPR coprocessor.
+     * spu_periph12 reset default 0x8001000a matches HW so the flpr-host
+     * "SPU PERIPH[12] before=... after=..." log reads identically. */
+    soc->vpr.plat         = plat;
+    soc->vpr.spu_periph12 = 0x8001000au;
+    soc->vpr.flpr         = NULL;
+    arm_register_io(&plat->cpu, NRF54L_VPR00_BASE, NRF54L_VPR00_SIZE,
+                    nrf54l_vpr_read, nrf54l_vpr_write, &soc->vpr);
+    arm_register_io(&plat->cpu, NRF54L_SPU00_BASE, NRF54L_SPU00_SIZE,
+                    nrf54l_spu_read, nrf54l_spu_write, &soc->vpr);
 
     /* GRTC — Contiki tick source + MPSL timeslot timer. */
     soc->grtc.plat    = plat;

@@ -62,7 +62,11 @@ const arm_config_t nrf54l15_config = {
     .rom_size         = 0,
     .flash_size       = 1536 * 1024,
     .flash_base       = 0x00000000,
-    .sram_size        = 192 * 1024,
+    /* 256 KB RAM (0x20000000..0x20040000). Must span the FLPR partition:
+     * the RV32E coprocessor's exec memory (0x20028000), data/stack
+     * (0x20030000..0x2003f000) and the M33<->FLPR shared counter
+     * (0x2003f000) all live in the top 96 KB. See riscv-vpr-plan.md. */
+    .sram_size        = 256 * 1024,
     .sram_base        = 0x20000000,
     .default_cpu_freq = 128000000,    /* 128 MHz */
     .num_irqs         = 64,           /* upper bound; tighten once PS is in hand */

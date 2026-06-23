@@ -412,6 +412,25 @@ typedef struct nrf54l_ficr_state {
     uint32_t deviceid1;     /* INFO.DEVICEID[1] @ 0x00FFC308 */
 } nrf54l_ficr_state_t;
 
+/* VPR (FLPR RV32E coprocessor) launch control + SPU permission gate.
+ * The M33 (Contiki's flpr-host) releases the FLPR from reset with the
+ * Zephyr nordic_vpr_launcher sequence:
+ *   1. memcpy blob -> 0x20028000 (shared SRAM)
+ *   2. SPU00.PERIPH[12].PERM |= SECATTR (Secure)   @ 0x50040530
+ *   3. VPR00.INITPC = exec_addr                     @ 0x5004C808
+ *   4. VPR00.CPURUN = 1                             @ 0x5004C800
+ * csim latches these and, on the CPURUN 0->1 edge (with SECATTR set),
+ * spins up an RV32E core (rv->flpr) pointed at the shared SRAM. */
+struct riscv_cpu; /* fwd decl — defined in include/riscv/riscv_cpu.h */
+typedef struct nrf54l_vpr_state {
+    arm_platform_t   *plat;
+    uint32_t          initpc;        /* VPR00.INITPC          @ +0x808 */
+    uint32_t          cpurun;        /* VPR00.CPURUN          @ +0x800 */
+    uint32_t          spu_periph12;  /* SPU00.PERIPH[12].PERM @ 0x50040530 */
+    int               launched;      /* set once the FLPR has been started */
+    struct riscv_cpu *flpr;          /* RV32E core, NULL until launched */
+} nrf54l_vpr_state_t;
+
 typedef struct nrf54l15_soc {
     nrf54l_global_clock_state_t global_clock;
     nrf54l_uarte_state_t        uarte20;
@@ -419,6 +438,7 @@ typedef struct nrf54l15_soc {
     nrf54l_dppi_state_t         dppi;
     nrf54l_radio_state_t        radio;
     nrf54l_ficr_state_t         ficr;
+    nrf54l_vpr_state_t          vpr;
     /* Three EGU instances at 0x5001_5000 (EGU00), 0x5008_7000 (EGU10),
      * 0x500C_7000 (EGU20).  Channel allocation across instances is
      * domain-local on real HW; csim collapses to the global DPPI. */

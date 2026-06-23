@@ -11,7 +11,7 @@ else
   NATIVE_FLAG := -mcpu=native
 endif
 
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs $(NATIVE_FLAG) -flto -MMD -MP
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs $(NATIVE_FLAG) -flto -MMD -MP
 # -rdynamic exports the host's dynamic symbol table so a dlopen'd plugin can
 # resolve host library functions (e.g. the radio_medium accessors a medium
 # plugin uses).  Behavior-neutral (symbol visibility only).
@@ -27,6 +27,7 @@ SERVICES_SRC_DIR = src/services
 MOTES_SRC_DIR = src/motes
 MSP430_SRC_DIR = src/msp430
 ARM_SRC_DIR = src/arm
+RISCV_SRC_DIR = src/riscv
 NATIVE_SRC_DIR = src/native
 UI_SRC_DIR = src/ui
 LIB_SRC_DIR = lib
@@ -38,6 +39,7 @@ SERVICES_BUILD_DIR = build/services
 MOTES_BUILD_DIR = build/motes
 MSP430_BUILD_DIR = build/msp430
 ARM_BUILD_DIR = build/arm
+RISCV_BUILD_DIR = build/riscv
 NATIVE_BUILD_DIR = build/native
 UI_BUILD_DIR = build/ui
 LIB_BUILD_DIR = build/lib
@@ -74,6 +76,10 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/cc2538_sleeptimer.c \
               $(ARM_SRC_DIR)/cc2538_ssi.c \
               $(ARM_SRC_DIR)/cc1200.c
+
+# RISC-V — RV32E FLPR coprocessor (nRF54L15). See docs/design/riscv-vpr-plan.md.
+RISCV_SOURCES = $(RISCV_SRC_DIR)/riscv_cpu.c \
+                $(RISCV_SRC_DIR)/nrf54l_vpr.c
 
 COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/radio_medium.c \
@@ -147,6 +153,7 @@ SERVICES_OBJECTS = $(patsubst $(SERVICES_SRC_DIR)/%.c, $(SERVICES_BUILD_DIR)/%.o
 MOTES_OBJECTS = $(patsubst $(MOTES_SRC_DIR)/%.c, $(MOTES_BUILD_DIR)/%.o, $(MOTES_SOURCES))
 OBJECTS = $(patsubst $(MSP430_SRC_DIR)/%.c, $(MSP430_BUILD_DIR)/%.o, $(SOURCES))
 ARM_OBJECTS = $(patsubst $(ARM_SRC_DIR)/%.c, $(ARM_BUILD_DIR)/%.o, $(ARM_SOURCES))
+RISCV_OBJECTS = $(patsubst $(RISCV_SRC_DIR)/%.c, $(RISCV_BUILD_DIR)/%.o, $(RISCV_SOURCES))
 NATIVE_OBJECTS = $(patsubst $(NATIVE_SRC_DIR)/%.c, $(NATIVE_BUILD_DIR)/%.o, $(NATIVE_SOURCES))
 UI_OBJECTS = $(patsubst $(UI_SRC_DIR)/%.c, $(UI_BUILD_DIR)/%.o, $(UI_SOURCES))
 LIB_OBJECTS = $(patsubst $(LIB_SRC_DIR)/%.c, $(LIB_BUILD_DIR)/%.o, $(LIB_SOURCES))
@@ -184,6 +191,9 @@ $(MSP430_BUILD_DIR):
 
 $(ARM_BUILD_DIR):
 	mkdir -p $(ARM_BUILD_DIR)
+
+$(RISCV_BUILD_DIR):
+	mkdir -p $(RISCV_BUILD_DIR)
 
 $(NATIVE_BUILD_DIR):
 	mkdir -p $(NATIVE_BUILD_DIR)
@@ -227,6 +237,9 @@ $(MSP430_BUILD_DIR)/%.o: $(MSP430_SRC_DIR)/%.c | $(MSP430_BUILD_DIR)
 $(ARM_BUILD_DIR)/%.o: $(ARM_SRC_DIR)/%.c | $(ARM_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(RISCV_BUILD_DIR)/%.o: $(RISCV_SRC_DIR)/%.c | $(RISCV_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(NATIVE_BUILD_DIR)/%.o: $(NATIVE_SRC_DIR)/%.c | $(NATIVE_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -243,7 +256,7 @@ $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(RISCV_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Auto-generated header dependencies (from -MMD). Catches the case where
@@ -297,7 +310,7 @@ debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
 # Profile-guided optimization (Apple Clang)
-PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I lib -I lib/quickjs $(NATIVE_FLAG)
+PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I lib -I lib/quickjs $(NATIVE_FLAG)
 PGO_LDFLAGS = -lm -lpthread
 ifneq ($(LIGHTNING_LIBS),)
   PGO_CFLAGS += $(LIGHTNING_CFLAGS) -DHAVE_LIGHTNING
@@ -309,14 +322,14 @@ pgo:
 	rm -rf $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(PGO_CFLAGS) -fprofile-instr-generate \
-		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(PGO_LDFLAGS)
+		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(RISCV_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(PGO_LDFLAGS)
 	@echo "=== PGO Step 2: Collecting profile data ==="
 	LLVM_PROFILE_FILE="$(BUILD_DIR)/default.profraw" ./$(BUILD_DIR)/test_runner bench
 	LLVM_PROFILE_FILE="$(BUILD_DIR)/default.profraw" ./$(BUILD_DIR)/test_runner correctness
 	xcrun llvm-profdata merge -output=$(BUILD_DIR)/default.profdata $(BUILD_DIR)/default.profraw
 	@echo "=== PGO Step 3: Optimized build ==="
 	$(CC) $(CFLAGS) -fprofile-instr-use=$(BUILD_DIR)/default.profdata \
-		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(LDFLAGS)
+		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(RISCV_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(LDFLAGS)
 	@echo "=== PGO build complete ==="
 
 # Phase 9: example plugin (.so).  Built on demand via `make plugins` — NOT a

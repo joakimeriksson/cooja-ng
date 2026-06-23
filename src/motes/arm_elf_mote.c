@@ -346,7 +346,12 @@ int64_t arm_elf_mote_tick(mixed_node_t *node, int64_t sim_ns) {
     cpu->sim_time_ns = sim_ns;
     cpu->anchor_sim_time_ns = sim_ns;
     cpu->anchor_cycles = cpu->cycles;
+    int64_t cycles_before = cpu->cycles;
     int64_t returned_us = arm_step_micros(cpu, jump_us, 1);
+    /* Lockstep co-processor (nRF54L15 FLPR RV32E): advance it by the same
+     * cycle budget the M33 just spent, sharing one wall-clock timeline. */
+    if (cpu->coproc_step)
+        cpu->coproc_step(cpu->coproc, cpu->cycles - cycles_before);
     cpu->sim_time_ns = sim_ns;
     cpu->anchor_sim_time_ns = sim_ns;
     cpu->anchor_cycles = cpu->cycles;
