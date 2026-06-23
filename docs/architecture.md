@@ -18,7 +18,8 @@ simulation kernel to the shared radio medium:
 ╭──────────────────────────────────────────────────────╮
 │  EMULATED MOTE — one per node                        │
 │    CPU   MSP430 (interp+JIT) · ARM CM3/M4/M33        │
-│          ⟷  SPI / MMIO  ⟷                            │
+│          · RV32E (nRF54L15 FLPR, dual-core)          │
+│          ⟷  SPI / MMIO · shared SRAM  ⟷              │
 │    PERIPH  CC2420 CC1200 cc2538-RF nRF-RADIO         │
 │            TIMER RTC UART(E) GPIO CLOCK TEMP …       │
 ╰──────────────────────────────────────────────────────╯
@@ -87,6 +88,8 @@ flowchart TB
             APER["NVIC • SysTick • timers • UART(E)<br/>GPIO • CLOCK/SysCtrl • RTC/GRTC<br/>VFP (arm_vfp.c) • TEMP/RNG"]
             ARF["cc2538_rfcore.c • nrf52840_soc.c<br/>nrf54l15_soc.c — on-chip 802.15.4<br/>(nrf_radio_common.c shared helpers)"]
             AELF["arm_elf.c"]
+            FLPR["riscv_cpu.c — RV32E FLPR co-core<br/>(nRF54L15) shares SRAM, co-stepped<br/>via nrf54l_vpr.c on CPURUN"]
+            ACPU -. shared bus .- FLPR
         end
         subgraph NAT["Native node — src/native"]
             NCPU["native_node.c<br/>host-compiled app"]
@@ -174,8 +177,15 @@ flowchart TB
 
 ## File inventory
 
-`src/msp430/`, `src/arm/`, and `src/sim/` (simulation kernel) are already
-tabled in `CLAUDE.md`. The rest of the tree:
+`src/msp430/`, `src/arm/`, `src/riscv/`, and `src/sim/` (simulation kernel)
+are already tabled in `CLAUDE.md`. The rest of the tree:
+
+### `src/riscv/` — RV32E coprocessor (nRF54L15 FLPR)
+
+| File | Purpose |
+|------|---------|
+| `riscv_cpu.c` | RV32E (`rv32e_zicsr_zifencei`) interpreter — base RV32I + CSR + `fence.i` + M-mode traps. Borrows the host M33's memory/IO bus, so SRAM + peripherals are one shared address space (no separate ELF load on the demo path: the M33 writes the blob into shared SRAM at run time). |
+| `nrf54l_vpr.c` | SoC↔core bridge: on the M33's VPR `CPURUN` 0→1 edge (Zephyr `nordic_vpr_launcher` sequence) start the FLPR at `INITPC`, then co-step it after each ARM execute slice via a SoC-agnostic `coproc` hook on `arm_cpu_t`. See [`docs/design/riscv-vpr-plan.md`](design/riscv-vpr-plan.md). |
 
 ### `src/common/` — shared infrastructure
 
@@ -336,7 +346,8 @@ Boards differ in *which* chips sit outside the SoC and *how* they connect. csim 
 | **zoul-firefly** | CC2538 (Cortex-M3) | RF Core *on-chip*; CC1200 *off* (sub-GHz) | — | RF Core same as cc2538dk. CC1200 driver (`src/arm/cc1200.c`, `sim_host_t`-only) over SSI0 (`src/arm/cc2538_ssi.c`) with CSn=PB5, RESET=PC7, GDO0=PB4, GDO2=PB0. Per-node radio fan-out in `test_mixed_multinode.c` feeds delivered bytes to both chips; `radio_medium`'s reserved sub-GHz channel range (≥`RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE`) plus a `cross_band_drop()` filter keeps the two bands isolated without a true dual-radio refactor. |
 | **nrf52840-dongle** | nRF52840 (Cortex-M4F) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic PCA10059 USB Dongle. Single-chip — no off-SoC peripherals. SoC bundle in `src/arm/nrf52840_soc.c` (CLOCK / RTC0 / TIMER0..4 / UARTE0 legacy window / RADIO with EasyDMA + SHORTS / RNG / FICR.DEVICEADDR for per-node IEEE EUI-64). M4 DSP halfword multiply in `src/arm/arm_cpu.c`; FPv4-SP-D16 single-precision VFP in `src/arm/arm_vfp.c`. VTOR=0x1000 because PCA10059 reserves 0x0..0xfff for the Open Bootloader. Reaches L6 (RPL-UDP) — two nodes form a DODAG and exchange `hello N` over the on-chip 2.4 GHz radio. |
 | **nrf52840-dk** | nRF52840 (Cortex-M4F) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic PCA10056 Development Kit, identical SoC to the Dongle. Reuses `nrf52840_soc.c` verbatim — only board glue differs: 4× LEDs at P0.13–P0.16, 4× buttons at P0.11/P0.12/P0.24/P0.25, console via SEGGER VCP, no bootloader region so VTOR=0x0. Same L6 result as the Dongle; DK ↔ Dongle interop works (same on-air format, same channel). Also runs stock unmodified **Zephyr** 802.15.4 echo as a regression test. |
-| **nrf54l15-dk** | nRF54L15 (Cortex-M33, ARMv8-M) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic nRF54L15-DK. Newer SoC family — SoC bundle in `src/arm/nrf54l15_soc.c`: GRTC global timer (live-counter reads, RELATIVE/absolute COMPARE), TIMER, EGU10 → NVIC IRQ, RADIO (edge-triggered TX/RX with debounce, deferred PHYEND/END), FICR.DEVICEID per node. ARMv8-M core support (load-acquire / store-release) in `arm_cpu.c`. On-air format shared with the nRF52840 via `nrf_radio_common.c`. |
+| **nrf54l15-dk** | nRF54L15 (Cortex-M33, ARMv8-M) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic nRF54L15-DK. Newer SoC family — SoC bundle in `src/arm/nrf54l15_soc.c`: GRTC global timer (live-counter reads, RELATIVE/absolute COMPARE), TIMER, EGU10 → NVIC IRQ, RADIO (edge-triggered TX/RX with debounce, deferred PHYEND/END), FICR.DEVICEID per node. ARMv8-M core support (load-acquire / store-release) in `arm_cpu.c`. On-air format shared with the nRF52840 via `nrf_radio_common.c`. Also models GPIO P0/P1/P2 (OUT/DIR) and the VPR/SPU FLPR-launch registers (see below). |
+| **nrf54l15-dk + FLPR** | nRF54L15 **FLPR** = RV32E (RISC-V) coprocessor | — (uses the M33's radio) | shared SRAM | **Dual-core / cross-ISA.** The M33 (`flpr-host`) copies the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register (SPU SECATTR-gated, matching HW); the RV32E core (`hello-vpr`) then runs **unmodified Contiki-NG**. The FLPR core (`src/riscv/`) shares the M33's bus, so SRAM + GRTC + GPIO are one address space; it is co-stepped after each M33 slice. Verified end-to-end: `[FLPR] tick` advances ~2/sec, LED0=P2.9 blinks 1 Hz (RISC-V) and LED1=P1.10 blinks 2 Hz (M33). Plan + register map: [`design/riscv-vpr-plan.md`](design/riscv-vpr-plan.md). |
 
 ### Five bridge APIs that wire any off-SoC chip
 

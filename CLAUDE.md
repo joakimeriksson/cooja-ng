@@ -47,6 +47,12 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # Stock Zephyr 802.15.4 (echo_server/echo_client, only the sample's overlay-802154.conf).
 # Two-node UDP echo over 802.15.4/6LoWPAN/IPv6/RPL; server logs "Received and replied", 0 timeouts.
 ./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/zephyr-echo-server.nrf52840-dk firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000
+
+# nRF54L15 FLPR dual-core / RISC-V (Contiki-NG nrf-vpr). One M33 image launches
+# the RV32E FLPR; the M33 prints "[FLPR] tick N" (advances ~2/sec). Add --ui 8080
+# to watch LED0 (P2.9, 1 Hz, RISC-V) + LED1 (P1.10, 2 Hz, M33) blink in the browser.
+# CSIM_GPIO_TRACE=1 dumps timestamped GPIO OUT changes.
+./build/test_runner mixed-multinode firmware/nrf54l15-dk/flpr-host.nrf54l15-dk -t 4000
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
@@ -75,11 +81,12 @@ src/
   common/             Shared infrastructure: event queue, radio medium, ELF loader, GDB stub
   msp430/             MSP430 emulator source files
   arm/                ARM Cortex-M3/M4/M33 emulator source files
+  riscv/              RV32E emulator (nRF54L15 FLPR coprocessor) + SoC bridge
   native/             Native Cooja motes (dlopen) + JS app motes (QuickJS)
   ui/                 WebSocket/state bridge (observation only)
 include/
   sim/                Kernel headers (sim_runtime.h, sim_mote.h, sim_radio_bus.h, sim_board.h, sim_registry.h, csim_plugin.h)
-  common/, msp430/, arm/, native/, ui/
+  common/, msp430/, arm/, riscv/, native/, ui/
 test/                 Test runner, correctness, benchmarks, firmware, multinode
 firmware/sky/         Pre-compiled Contiki-NG firmware for Tmote Sky
 firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
@@ -183,6 +190,15 @@ scheduling policy is the one documented deferral. **The staged refactor
 | `cc2538_ioc.c` | IO Controller: pin mux, pad configuration |
 | `cc2538_rfcore.c` | RF Core: 802.15.4 TX/RX, FFSM address registers, RFRND |
 | `cc2538_sleeptimer.c` | Sleep Timer: 32kHz counter, compare match interrupts |
+| `nrf52840_soc.c` | nRF52840 SoC bundle: CLOCK/RTC/TIMER/UARTE/RADIO (EasyDMA)/RNG/TEMP/FICR |
+| `nrf54l15_soc.c` | nRF54L15 SoC bundle: GRTC/DPPI/RADIO/EGU/TIMER/UARTE/FICR, **GPIO P0-P2**, and the **VPR/SPU FLPR-launch registers** (CPURUN/INITPC + SECATTR gate) |
+
+### RISC-V Source Files (src/riscv/)
+
+| File | Purpose |
+|------|---------|
+| `riscv_cpu.c` | RV32E interpreter (`rv32e_zicsr_zifencei`): base RV32I + CSR + `fence.i` + M-mode traps. Shares the host M33's memory/IO bus, so SRAM + peripherals are one address space. No M/C/F/D |
+| `nrf54l_vpr.c` | Bridge: on the M33's VPR `CPURUN` edge, instantiate the FLPR over the shared bus and co-step it after each ARM execute slice (SoC-agnostic `coproc` hook on `arm_cpu_t`) |
 
 ## Architecture
 
@@ -314,6 +330,8 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **zoul-firefly** | CC2538 (ARM Cortex-M3) | Yes (on-chip) + CC1200 (off-SoC sub-GHz) | UART0 | Zolertia Firefly — dual-band |
 | **nrf52840-dongle** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10059 USB Dongle, M4F + FPv4-SP-D16, VTOR=0x1000 (Open Bootloader region at 0x0..0xfff) |
 | **nrf52840-dk** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10056 Development Kit, same SoC as Dongle, VTOR=0x0, SEGGER VCP console |
+| **nrf54l15-dk** | nRF54L15 (ARM Cortex-M33, ARMv8-M) | Yes (on-chip 2.4 GHz) | UARTE20 | Nordic nRF54L15-DK, 256 KB RAM, GRTC/DPPI fabric, VTOR=0x0 |
+| **nrf54l15-dk + FLPR** | nRF54L15 **FLPR (RV32E, RISC-V)** coprocessor | — (uses the M33's radio) | shared SRAM | **Dual-core / cross-ISA**: the M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register; the RV32E core (`hello-vpr`) then runs **unmodified Contiki-NG** alongside the M33. ISA `rv32e_zicsr_zifencei` (no M/C). See [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md) |
 
 ## MCU Configurations
 
