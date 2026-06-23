@@ -332,7 +332,7 @@ Real, currently reproducible quirks in the *standalone CLI shortcuts* — none a
 1. **`./build/test_runner multinode` (no firmware) hangs.**  The default-firmware shortcut routes to `firmware/sky/nullnet-broadcast.sky` and gets stuck after init.  Workaround: use a JSON config or explicit firmware pair.
 2. **nRF54L15 RPL-UDP convergence is slow (~30 s sim).**  End-to-end works (DIO → DAO → DAO-ACK → UDP request/response), but RPL takes longer to settle than nrf52840 because of the deferred-PHYEND model and 1 MHz GRTC fidelity.  CSMA retransmits visible in the packet log; cosmetic.
 3. **`test_firmware.c` reports `timertest.sky` as PASS** even when the firmware itself prints `FW: FAIL: count > 10 failed at timertest.c:166`.  The runner only matches `EXIT`.  Cosmetic.
-4. **The deferred-PHYEND fix that unblocked nRF54L15 has not been ported to nrf52840.**  That platform works today, but the same critical-section-during-TX scenario would surface if a faster RPL config exercises it.
+4. *(resolved — was: "the deferred-PHYEND fix has not been ported to nrf52840")* nrf52840 is **not** exposed to the critical-section-during-TX race: it fires PHYEND/END at full frame air-time (`(6+len)·32 µs`, ≥~350 µs after `TASKS_START`; `nrf52840_soc.c`), which already lands the IRQ during the driver's busy-wait, well after its NVIC-disabling critical section. nRF54L15 uses a *different* 100 µs defer only because it delivers the frame at TX-start (synchronous model) and a full-air-time defer would leave it stuck in TX when the peer's ACK arrives — not because nrf52840 lacks protection. The timing is per-frame air-time, independent of RPL rate.
 
 Release history and per-version notes in [`CHANGELOG.md`](CHANGELOG.md).
 
