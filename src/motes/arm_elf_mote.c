@@ -556,13 +556,22 @@ static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
 }
 
 static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
-    cc2538_soc_t *soc = arm_platform_cc2538(&MOTE_IMPL(m)->plat.arm);
-    if (!soc)
-        return;  /* Nordic boards: no LED model wired up */
-    uint32_t pc_data = soc->gpio.ports[2].data;
-    leds[0] = (pc_data >> 0) & 1;  /* red */
-    leds[1] = (pc_data >> 1) & 1;  /* yellow */
-    leds[2] = (pc_data >> 2) & 1;  /* green */
+    arm_platform_t *plat = &MOTE_IMPL(m)->plat.arm;
+    cc2538_soc_t *soc = arm_platform_cc2538(plat);
+    if (soc) {
+        uint32_t pc_data = soc->gpio.ports[2].data;
+        leds[0] = (pc_data >> 0) & 1;  /* red */
+        leds[1] = (pc_data >> 1) & 1;  /* yellow */
+        leds[2] = (pc_data >> 2) & 1;  /* green */
+        return;
+    }
+    nrf54l15_soc_t *nl = arm_platform_nrf54l15(plat);
+    if (nl) {
+        /* nRF54L15-DK demo wiring: LED0 = P2.9 (FLPR), LED1 = P1.10 (M33). */
+        leds[0] = (nl->gpio[2].out >> 9)  & 1;
+        leds[1] = (nl->gpio[1].out >> 10) & 1;
+        leds[2] = 0;
+    }
 }
 
 static void *arm_mote_get_interface(sim_mote_t *m, int iface) {
