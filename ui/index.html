@@ -221,6 +221,7 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
   // Per-node "known state" — survives even when old events are evicted
   let nodeRadioState = {};  // nodeId -> 'off'|'on'|'tx'|'rx'|'intf'
   let nodeRadioBaseState = {};  // state before first event in buffer
+  let nodeLedBaseState = {};    // [l0,l1,l2] on/off before first buffered event
   let nodeLedState = {};    // nodeId -> [bool, bool, bool]
 
   // Timeline zoom/pan state
@@ -659,6 +660,10 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
           const evicted = arr.shift();
           if (['tx','rx','off','on','intf'].includes(evicted.e))
             nodeRadioBaseState[nid] = evicted.e;
+          else if (evicted.e === 'led_on' || evicted.e === 'led_off') {
+            if (!nodeLedBaseState[nid]) nodeLedBaseState[nid] = [false, false, false];
+            nodeLedBaseState[nid][evicted.v] = evicted.e === 'led_on';
+          }
         }
         if (['tx','rx','off','on','intf'].includes(tev.e)) {
           nodeRadioState[nid] = tev.e;
@@ -725,6 +730,7 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
     nodeRadioState = {};
     nodeRadioBaseState = {};
     nodeLedState = {};
+    nodeLedBaseState = {};
     packetLog = [];
     pktLogRendered = 0;
     // Rebuild packet log header
@@ -825,6 +831,10 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
         // before the first event in the buffer
         if (evicted.e === 'tx' || evicted.e === 'rx' || evicted.e === 'off' || evicted.e === 'on' || evicted.e === 'intf')
           nodeRadioBaseState[nid] = evicted.e;
+        else if (evicted.e === 'led_on' || evicted.e === 'led_off') {
+          if (!nodeLedBaseState[nid]) nodeLedBaseState[nid] = [false, false, false];
+          nodeLedBaseState[nid][evicted.v] = evicted.e === 'led_on';
+        }
       }
 
       // Track current state per node (survives event eviction)
@@ -1210,10 +1220,14 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; backgro
 
       // LED bars (below radio bar)
       const ledColors = [t.tlLed0, t.tlLed1, t.tlLed2];
-      const knownLeds = nodeLedState[node.id] || [false, false, false];
+      // State before the first buffered event (LEDs power on OFF); the
+      // pre-window replay below advances it to the true state at startMs.
+      // Using the *current* live state here back-dated a long spurious bar
+      // from the left edge to the first transition.
+      const ledBase = nodeLedBaseState[node.id] || [false, false, false];
       for (let l = 0; l < 3; l++) {
         let lPrevX = labelW;
-        let lOn = knownLeds[l]; // start with known state
+        let lOn = ledBase[l];
         const ledY = y + barH + 2 + l * (ledH + 1);
         for (const ev of events) {
           if (ev.e !== 'led_on' && ev.e !== 'led_off') continue;
