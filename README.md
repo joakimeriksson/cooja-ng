@@ -225,9 +225,10 @@ Measured on Apple Silicon (PGO build) and Linux x86-64 (release).  See `bench` f
 | MSP430 2-node RPL-UDP (Linux x86-64 release) | ~250× real-time |
 | CC2538DK 2-node RPL-UDP (interpreter) | ~4× real-time |
 | nRF52840 2-node RPL-UDP (interpreter) | ~9× real-time |
-| nRF54L15 2-node RPL-UDP (interpreter, deferred PHYEND) | ~0.1× real-time |
+| nRF54L15 2-node RPL-UDP (interpreter) | ~100× real-time |
+| nRF54L15 FLPR dual-core demo (M33 + RV32E, `flpr-host`) | ~0.1× real-time |
 
-The nrf54l15 is slow because the GRTC is modeled at full 1 MHz and every TX defers PHYEND through the event queue — correctness-over-speed.  Speed is the next optimisation once the RPL-UDP regression has stabilised.
+nRF54L15 RPL-UDP runs ~100× real-time (it sleeps in WFI when the radio is idle, which the emulator fast-forwards).  The **FLPR dual-core demo** is the slow one (~0.1×): the `hello-vpr` firmware uses *polled* etimers, so the RV32E core busy-spins on the GRTC clock between ticks — ~360 M instructions for a 4 s sim, almost all of it polling.  That's a faithful emulation of the firmware, not an emulator inefficiency; the fix is interrupt-driven etimers (GRTC CC3) in Contiki's `nrf-vpr` port, plus modelling RV32E `WFI` as idle in csim.  See the FLPR row in [Platforms](#platforms) and `docs/design/riscv-vpr-plan.md`.
 
 ## Architecture
 
@@ -320,7 +321,7 @@ Deeper notes on each subsystem in [`CLAUDE.md`](CLAUDE.md) and [`docs/architectu
 | `arm-firmware` (cc2538dk + nRF bring-up) | **PASS** |
 | `zoul-firefly-multinode` RPL-UDP | **6 / 6 hello cycles** in 60 s, ~9× real-time |
 | `nrf52840-dongle-multinode` RPL-UDP | UDP request/response round-trip, ~9× real-time |
-| `nrf54l15-dk-multinode` RPL-UDP | UDP request/response end-to-end (slow, ~0.1× real-time) |
+| `nrf54l15-dk-multinode` RPL-UDP | UDP request/response end-to-end (~100× real-time) |
 | **Cooja test suite (89 tests, with `--with-tun`)** | **89 / 89 PASS** |
 
 Cooja-suite coverage: all 27 `07-simulation-base/*` (RPL-Lite, TSCH, Orchestra, multicast, IPv6, stack guard, data structures) including the once-stubborn `26-tsch-drift-z1` (16 s); all 12 `09-ipv6/*`; all 9 `13-ieee802154/*`; all 14 `14-rpl-lite/*` and 19 `15-rpl-classic/*` (including 28-h simulated DAG stability tests); all 8 `17-tun-rpl-br/*` with real `tun0` + `tunslip6`, including `10-native-nat64-cooja` (214 s, UDP+TCP echo through the NAT64 gateway).
@@ -330,7 +331,7 @@ Cooja-suite coverage: all 27 `07-simulation-base/*` (RPL-Lite, TSCH, Orchestra, 
 Real, currently reproducible quirks in the *standalone CLI shortcuts* — none affect the Cooja test wrapper, JSON-config flow, or production use.
 
 1. **`./build/test_runner multinode` (no firmware) hangs.**  The default-firmware shortcut routes to `firmware/sky/nullnet-broadcast.sky` and gets stuck after init.  Workaround: use a JSON config or explicit firmware pair.
-2. **nRF54L15 RPL-UDP convergence is slow (~30 s sim).**  End-to-end works (DIO → DAO → DAO-ACK → UDP request/response), but RPL takes longer to settle than nrf52840 because of the deferred-PHYEND model and 1 MHz GRTC fidelity.  CSMA retransmits visible in the packet log; cosmetic.
+2. **nRF54L15 RPL-UDP takes ~30 s of *simulated* time to converge.**  End-to-end works (DIO → DAO → DAO-ACK → UDP request/response); RPL settles a bit later than nrf52840 (deferred-PHYEND model + 1 MHz GRTC timing fidelity), with CSMA retransmits visible in the packet log.  This is simulated-time-to-converge, not wall-clock — the run itself executes at ~100× real-time.  Cosmetic.
 3. **`test_firmware.c` reports `timertest.sky` as PASS** even when the firmware itself prints `FW: FAIL: count > 10 failed at timertest.c:166`.  The runner only matches `EXIT`.  Cosmetic.
 4. *(resolved — was: "the deferred-PHYEND fix has not been ported to nrf52840")* nrf52840 is **not** exposed to the critical-section-during-TX race: it fires PHYEND/END at full frame air-time (`(6+len)·32 µs`, ≥~350 µs after `TASKS_START`; `nrf52840_soc.c`), which already lands the IRQ during the driver's busy-wait, well after its NVIC-disabling critical section. nRF54L15 uses a *different* 100 µs defer only because it delivers the frame at TX-start (synchronous model) and a full-air-time defer would leave it stuck in TX when the peer's ACK arrives — not because nrf52840 lacks protection. The timing is per-frame air-time, independent of RPL rate.
 
