@@ -18,6 +18,7 @@ firmware/*.cc2538dk    ──►│  ARM Cortex-M3 + CC2538 RF Core (on-chip)   
 firmware/*.zoul-firefly►──│  ARM Cortex-M3 + CC2538 + CC1200 sub-GHz     │    timeline,
 firmware/*.nrf52840-dk ──►│  ARM Cortex-M4F + Nordic 802.15.4 radio      │    web UI,
 firmware/*.nrf54l15-dk ──►│  ARM Cortex-M33 + Nordic 802.15.4 + DPPI/GRTC│    COOJA.testlog
+   └─ + RV32E FLPR  ──────►│  RISC-V coprocessor, dual-core, shared SRAM  │
 firmware/*.cooja       ──►│  Native Cooja motes (dlopen)                 │
                           │                                              │
                           │  shared event queue • per-radio medium       │
@@ -25,6 +26,8 @@ firmware/*.cooja       ──►│  Native Cooja motes (dlopen)                
                           │  JS-driven assertions                        │
                           └──────────────────────────────────────────────┘
 ```
+
+**Multi-ISA:** MSP430, ARM Cortex-M3/M4F/M33, and **RISC-V** — the latter via the nRF54L15's FLPR (an RV32E coprocessor) running unmodified Contiki-NG, dual-core alongside the M33 over shared SRAM. (RV32E is `rv32e_zicsr_zifencei` — base integer + CSR + fence.i, in the coprocessor role; not yet a standalone RISC-V networking node.)
 
 Designed for: headless CI for the Contiki-NG test suite, network research with hundreds of mixed-architecture nodes, and single-firmware debugging with deterministic seeds.  Roughly an order of magnitude faster than Cooja + MSPSim, no JVM dependency, builds with `make` on Linux and macOS.  Not a full Cooja replacement — no GTK GUI, no Java plugin ecosystem, no closed-source motes.
 
