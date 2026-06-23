@@ -431,6 +431,19 @@ typedef struct nrf54l_vpr_state {
     struct riscv_cpu *flpr;          /* RV32E core, NULL until launched */
 } nrf54l_vpr_state_t;
 
+/* GPIO port (P0/P1/P2). Minimal model: OUT/DIR register file with the
+ * SET/CLR aliases. Enough to drive + observe the demo LEDs — LED0 on
+ * P2.9 (FLPR) and LED1 on P1.10 (M33). out_toggles counts OUT-bit
+ * transitions so a test can assert the blink actually happens. */
+typedef struct nrf54l_gpio_state {
+    arm_platform_t *plat;
+    uint32_t        base;
+    int             port;         /* 0/1/2 for diagnostics */
+    uint32_t        out;          /* OUT latch */
+    uint32_t        dir;          /* DIR (1 = output) */
+    uint64_t        out_toggles;  /* total OUT-bit flips since reset */
+} nrf54l_gpio_state_t;
+
 typedef struct nrf54l15_soc {
     nrf54l_global_clock_state_t global_clock;
     nrf54l_uarte_state_t        uarte20;
@@ -439,6 +452,7 @@ typedef struct nrf54l15_soc {
     nrf54l_radio_state_t        radio;
     nrf54l_ficr_state_t         ficr;
     nrf54l_vpr_state_t          vpr;
+    nrf54l_gpio_state_t         gpio[3];   /* P0, P1, P2 */
     /* Three EGU instances at 0x5001_5000 (EGU00), 0x5008_7000 (EGU10),
      * 0x500C_7000 (EGU20).  Channel allocation across instances is
      * domain-local on real HW; csim collapses to the global DPPI. */

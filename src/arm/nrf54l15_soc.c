@@ -2119,6 +2119,53 @@ static void nrf54l_spu_write(void *user, uint32_t addr, uint32_t value) {
 }
 
 /* ============================================================
+ * GPIO P0/P1/P2 — minimal OUT/DIR model (drives + observes LEDs)
+ * Register map (NRF_GPIO_Type): OUT 0x00, OUTSET 0x04, OUTCLR 0x08,
+ * IN 0x0c, DIR 0x10, DIRSET 0x14, DIRCLR 0x18. Ports: P0 0x5010A000,
+ * P1 0x500D8200 (LED1=P1.10), P2 0x50050400 (LED0=P2.9).
+ * ============================================================ */
+#define NRF54L_P0_BASE     0x5010A000u
+#define NRF54L_P1_BASE     0x500D8200u
+#define NRF54L_P2_BASE     0x50050400u
+#define NRF54L_GPIO_SIZE   0x100u
+
+static void nrf54l_gpio_set_out(nrf54l_gpio_state_t *g, uint32_t newout) {
+    uint32_t changed = (g->out ^ newout) & g->dir;
+    if (changed) {
+        for (uint32_t m = changed; m; m &= m - 1) g->out_toggles++;
+        if (getenv("CSIM_GPIO_TRACE")) {
+            int64_t t = g->plat ? g->plat->cpu.sim_time_ns : 0;
+            fprintf(stderr, "[GPIO] %9.3f P%d.OUT 0x%08x -> 0x%08x (changed 0x%08x)\n",
+                    t / 1e9, g->port, g->out, newout, changed);
+        }
+    }
+    g->out = newout;
+}
+
+static int nrf54l_gpio_read(void *user, uint32_t addr) {
+    nrf54l_gpio_state_t *g = user;
+    switch (addr - g->base) {
+        case 0x00: case 0x04: case 0x08: return (int)g->out;  /* OUT/SET/CLR */
+        case 0x0c: return (int)g->out;                        /* IN (loopback) */
+        case 0x10: case 0x14: case 0x18: return (int)g->dir;  /* DIR/SET/CLR */
+        default:   return 0;
+    }
+}
+
+static void nrf54l_gpio_write(void *user, uint32_t addr, uint32_t value) {
+    nrf54l_gpio_state_t *g = user;
+    switch (addr - g->base) {
+        case 0x00: nrf54l_gpio_set_out(g, value);            return; /* OUT    */
+        case 0x04: nrf54l_gpio_set_out(g, g->out |  value);  return; /* OUTSET */
+        case 0x08: nrf54l_gpio_set_out(g, g->out & ~value);  return; /* OUTCLR */
+        case 0x10: g->dir  =  value; return;                          /* DIR    */
+        case 0x14: g->dir |=  value; return;                          /* DIRSET */
+        case 0x18: g->dir &= ~value; return;                          /* DIRCLR */
+        default:   return;
+    }
+}
+
+/* ============================================================
  * SoC lifecycle
  * ============================================================ */
 static void nrf54l15_soc_init(arm_platform_t *plat) {
@@ -2172,6 +2219,17 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
         arm_register_io(&plat->cpu,
                         nrf54l_dppic_bases[i], NRF54L_DPPIC_SIZE,
                         nrf54l_dppic_read, nrf54l_dppic_write, &soc->dppi);
+    }
+
+    /* GPIO P0/P1/P2 — drives + observes the demo LEDs (LED0=P2.9 FLPR,
+     * LED1=P1.10 M33). */
+    uint32_t gpio_bases[3] = { NRF54L_P0_BASE, NRF54L_P1_BASE, NRF54L_P2_BASE };
+    for (int p = 0; p < 3; p++) {
+        soc->gpio[p].plat = plat;
+        soc->gpio[p].base = gpio_bases[p];
+        soc->gpio[p].port = p;
+        arm_register_io(&plat->cpu, gpio_bases[p], NRF54L_GPIO_SIZE,
+                        nrf54l_gpio_read, nrf54l_gpio_write, &soc->gpio[p]);
     }
 
     /* VPR00 launch control + SPU00 permission gate — FLPR coprocessor.
