@@ -31,6 +31,13 @@
  *   CSIM_GE_AVG_DROP   average frame-drop probability      (default 0.20)
  *   CSIM_GE_BURST_LEN  mean BAD-state dwell, in frames      (default 1.0 = i.i.d.)
  *   CSIM_GE_SEED       PRNG seed for the Markov transitions (default 1)
+ *   CSIM_GE_WARMUP_FRAMES  deliver the first N frames loss-free, before the GE
+ *                      channel engages (default 0).  This isolates a later phase
+ *                      of interest (e.g. an EDHOC handshake) from earlier
+ *                      loss-sensitive network setup (RPL DODAG formation), which
+ *                      would otherwise dominate the outcome.  Counted globally
+ *                      over all frames; the Markov chains stay in their initial
+ *                      state until warmup completes.
  *
  * Build via the Makefile `plugins` target; select with
  *   "plugins": ["build/plugins/gilbert_elliott_medium.so"],
@@ -60,6 +67,12 @@ static unsigned char ge_init[GE_MAX_NODES][GE_MAX_NODES];
  * deterministic, so a fixed seed yields a fixed run. */
 static uint32_t ge_rng_state = 1u;
 
+/* Loss-free warmup: deliver the first ge_warmup_frames frames unconditionally,
+ * counted globally, so an earlier setup phase (RPL) is not confounded with the
+ * measured phase.  ge_frames counts frames the channel has been asked about. */
+static unsigned long ge_warmup_frames = 0ul;
+static unsigned long ge_frames = 0ul;
+
 static double ge_rng_uniform(void) {
     uint32_t x = ge_rng_state;
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
@@ -80,6 +93,11 @@ static double ge_reception_prob(const radio_medium_t *rm, int sender,
         sender >= GE_MAX_NODES || receiver >= GE_MAX_NODES) {
         return 1.0;   /* out of range: don't drop */
     }
+    if (ge_frames < ge_warmup_frames) {
+        ge_frames++;
+        return 1.0;   /* warmup: deliver loss-free, chain stays at initial state */
+    }
+    ge_frames++;
     if (!ge_init[sender][receiver]) {
         ge_state[sender][receiver] =
             (unsigned char)ge_initial_state(ge_pi_bad, ge_rng_uniform());
@@ -147,12 +165,16 @@ int csim_plugin_init(const csim_api_t *api) {
 
     ge_calibrate(avg_drop, burst_len, &ge_p, &ge_r, &ge_pi_bad);
     ge_rng_state = (uint32_t)seed ? (uint32_t)seed : 1u;
+    ge_warmup_frames = (unsigned long)ge_env_double("CSIM_GE_WARMUP_FRAMES", 0.0);
+    ge_frames = 0ul;
     memset(ge_init, 0, sizeof(ge_init));
 
     if (api->log && api->log->printf) {
         api->log->printf("[gilbert-elliott] avg_drop=%.4f burst_len=%.2f "
-                         "seed=%u -> p(G->B)=%.5f r(B->G)=%.5f pi_bad=%.4f\n",
-                         avg_drop, burst_len, ge_rng_state, ge_p, ge_r, ge_pi_bad);
+                         "seed=%u warmup=%lu -> p(G->B)=%.5f r(B->G)=%.5f "
+                         "pi_bad=%.4f\n",
+                         avg_drop, burst_len, ge_rng_state, ge_warmup_frames,
+                         ge_p, ge_r, ge_pi_bad);
     }
 
     return api->registry->register_radio_medium(api->reg, &ge_type) < 0 ? -1 : 0;
