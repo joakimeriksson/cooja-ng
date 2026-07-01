@@ -128,6 +128,14 @@ static void track_byte_802154(radio_medium_t *rm, int sender, int sender_radio,
         if (byte == 0x00) {
             ft->zero_count = 1;
             ft->state = FRAME_PREAMBLE;
+            /* A new preamble has begun: the previous frame is fully on air.
+             * Clear frame_id so the preamble bytes are filtered against the
+             * sender's LIVE channel (radio_pair_match's "outside a frame"
+             * path) rather than the *previous* frame's channel snapshot.
+             * Without this, when a sender hops channels between frames (TSCH),
+             * the new preamble is gated on the old channel and dropped, so the
+             * receiver PHY never sees preamble+SFD and can't lock the frame. */
+            ft->frame_id = 0;
         }
         break;
 
