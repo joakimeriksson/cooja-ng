@@ -122,19 +122,62 @@ static void ana_write(void *user_data, uint32_t addr, uint32_t value) {
 #define SOC_ADC_BASE 0x400D7000
 #define SOC_ADC_SIZE 0x1000
 
+/* SOC_ADC register offsets (SOC_ADC_BASE = 0x400D7000). */
+#define SOC_ADC_ADCCON1  0x00   /* bits[3:2] RCTRL: 01 = clock RNG LFSR once */
+#define SOC_ADC_RNDL     0x14   /* RNG low byte  (writing shifts old->high)  */
+#define SOC_ADC_RNDH     0x18   /* RNG high byte                             */
+#define ADCCON1_RCTRL0   0x04
+#define ADCCON1_RCTRL1   0x08
+
+/* Clock the CC2538 hardware RNG once. The chip is a 16-bit LFSR; we model
+ * it with a maximal-length Galois LFSR (poly mask 0xB400, period 65535).
+ * We don't reproduce the exact silicon bit sequence (the real RNG is
+ * analog-entropy seeded), only its observable contract: seedable, advances
+ * one step per RCTRL0 pulse, never stuck for a non-zero seed. Firmware
+ * (cc2538-prng.c) seeds it from the node's CSPRNG / 64-bit address, so each
+ * mote gets its own stream — which is what TSCH scan-channel selection and
+ * CSMA backoff rely on. Before this existed the register read returned a
+ * constant 0, so random_rand() was always 0 (TSCH stuck scanning ch 15). */
+static inline void soc_adc_rng_clock(cc2538_soc_t *soc) {
+    uint16_t s = soc->rng_lfsr;
+    if (s == 0) s = 0xACE1;  /* guard: never let a zero state stall */
+    uint16_t lsb = s & 1u;
+    s >>= 1;
+    if (lsb) s ^= 0xB400u;
+    soc->rng_lfsr = s;
+}
+
 static int soc_adc_read(void *user_data, uint32_t addr) {
-    (void)user_data;
+    cc2538_soc_t *soc = arm_platform_cc2538((arm_platform_t *)user_data);
     uint32_t offset = addr - SOC_ADC_BASE;
     switch (offset) {
-        case 0x00: return 0x80;  /* ADCCON1: EOC=1 (conversion complete) */
+        case SOC_ADC_ADCCON1: return 0x80;  /* EOC=1 (conversion complete) */
         case 0x0C: return 0x80;  /* ADCL: ADC result low (mid-range) */
         case 0x10: return 0x20;  /* ADCH: ADC result high (mid-range) */
+        case SOC_ADC_RNDL: return soc ? (int)(soc->rng_lfsr & 0xFF) : 0;
+        case SOC_ADC_RNDH: return soc ? (int)((soc->rng_lfsr >> 8) & 0xFF) : 0;
         default:   return 0;
     }
 }
 
 static void soc_adc_write(void *user_data, uint32_t addr, uint32_t value) {
-    (void)user_data; (void)addr; (void)value;
+    cc2538_soc_t *soc = arm_platform_cc2538((arm_platform_t *)user_data);
+    if (!soc) return;
+    uint32_t offset = addr - SOC_ADC_BASE;
+    switch (offset) {
+        case SOC_ADC_ADCCON1:
+            /* RCTRL == 01 (RCTRL0 set, RCTRL1 clear) clocks the LFSR once. */
+            if ((value & ADCCON1_RCTRL0) && !(value & ADCCON1_RCTRL1))
+                soc_adc_rng_clock(soc);
+            break;
+        case SOC_ADC_RNDL:
+            /* Writing RNDL moves the old low byte to RNDH and loads the new
+             * low byte — two consecutive writes load a 16-bit seed. */
+            soc->rng_lfsr = (uint16_t)((soc->rng_lfsr << 8) | (value & 0xFF));
+            break;
+        default:
+            break;
+    }
 }
 
 #define SSI0_BASE 0x40008000
@@ -288,6 +331,9 @@ static void cc2538_soc_init(arm_platform_t *plat) {
     cc2538_soc_t *soc = (cc2538_soc_t *)calloc(1, sizeof(*soc));
     plat->soc = soc;
     const arm_platform_config_t *config = plat->config;
+
+    /* Non-zero RNG seed so reads before firmware seeding aren't stuck. */
+    soc->rng_lfsr = 0xACE1;
 
     /* System Control */
     cc2538_sys_ctrl_init(&soc->sys_ctrl, &plat->cpu);

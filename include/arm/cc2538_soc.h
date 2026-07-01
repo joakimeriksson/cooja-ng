@@ -38,6 +38,7 @@ typedef struct cc2538_soc {
     cc1200_t            cc1200;          /* used only when has_cc1200 */
     void               *udma;            /* opaque uDMA state */
     void               *usb;             /* opaque USB stub state */
+    uint16_t            rng_lfsr;        /* SOC_ADC hardware RNG LFSR state */
 } cc2538_soc_t;
 
 extern const arm_soc_ops_t cc2538_soc_ops;
