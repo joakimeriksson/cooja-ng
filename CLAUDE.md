@@ -409,8 +409,10 @@ Same event-driven kernel as MSP430, with CC2538 RF Core for 802.15.4 radio:
 | 2-node nullnet (20s sim) | ~800x real-time |
 | 2-node RPL-UDP (60s sim) | ~2400x real-time |
 
-### ARM (CC2538, interpreter only)
+### ARM (interpreter only)
 
 | Benchmark | Speed |
 |-----------|-------|
-| 2-node RPL-UDP (60s sim) | ~4x real-time |
+| CC2538 2-node RPL-UDP (60s sim) | ~260x real-time |
+| nRF52840 2-node RPL-UDP (60s sim) | ~340x real-time |
+| nRF52840 2-node TSCH (60s sim) | ~11x real-time |

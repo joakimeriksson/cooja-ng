@@ -58,6 +58,17 @@ static void nrf_host_cancel(void *cpu, cpu_event_t *ev) {
  * csim flips the event immediately. Firmware that polls is happy;
  * firmware that uses an interrupt would need NVIC wiring (not yet).
  * ============================================================ */
+/* Debug-trace env flags, latched once per process.  These used to call
+ * getenv() on EVERY MMIO access; firmware busy-polls RADIO/TIMER registers
+ * (TSCH slot waits, driver PHYEND polls), and getenv's lock made those
+ * probes ~47%% of total simulation wall time (measured with sample(1)). */
+static int nrf_trace_flag(int *cache, const char *name) {
+    if (__builtin_expect(*cache < 0, 0)) *cache = getenv(name) != NULL;
+    return *cache;
+}
+static int trc_clock = -1, trc_uart = -1, trc_radio = -1,
+           trc_rxbyte = -1, trc_rx = -1, trc_ppi = -1;
+
 #define NRF_CLOCK_BASE            0x40000000u
 #define NRF_CLOCK_SIZE            0x1000u
 #define NRF_CLOCK_TASKS_HFCLKSTART 0x000
@@ -118,7 +129,7 @@ static void nrf_clock_irq(nrf_clock_state_t *clock) {
 static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf_clock_state_t *clock = (nrf_clock_state_t *)user_data;
     uint32_t off = addr - NRF_CLOCK_BASE;
-    if (getenv("NRF_CLOCK_TRACE")) fprintf(stderr, "[clkW] 0x%03x = 0x%08x\n", off, value);
+    if (nrf_trace_flag(&trc_clock, "NRF_CLOCK_TRACE")) fprintf(stderr, "[clkW] 0x%03x = 0x%08x\n", off, value);
     switch (off) {
         case NRF_CLOCK_TASKS_HFCLKSTART:    /* run-state + latched event + IRQ */
             if (value == 1) { clock->hfclkstarted = 1;
@@ -200,7 +211,7 @@ static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
  * (clears ENDRX) — so input self-paces to the driver's consumption rate. */
 static void uarte_deliver_rx(nrf_uart_state_t *uart) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)uart->soc;
-    if (getenv("NRF_UART_TRACE"))
+    if (nrf_trace_flag(&trc_uart, "NRF_UART_TRACE"))
         fprintf(stderr, "[uartRX] deliver armed=%d endrx=%d ring=%d->%d\n",
                 uart->rx_armed, uart->endrx, uart->rx_tail, uart->rx_head);
     if (!uart->rx_armed || uart->endrx) return;          /* not ready */
@@ -233,7 +244,7 @@ void nrf_uart_feed_rx(nrf_uart_state_t *uart, const uint8_t *buf, int len) {
 static int nrf_uart_read(void *user_data, uint32_t addr) {
     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
     uint32_t off = addr - NRF_UART0_BASE;
-    if (getenv("NRF_UART_TRACE")) fprintf(stderr, "[uartR] 0x%03x\n", off);
+    if (nrf_trace_flag(&trc_uart, "NRF_UART_TRACE")) fprintf(stderr, "[uartR] 0x%03x\n", off);
     switch (off) {
         case NRF_UART_EVENTS_TXDRDY:     return (int)uart->txdrdy;
         case NRF_UART_ENABLE:            return (int)uart->enable;
@@ -289,7 +300,7 @@ static void uarte_start_tx(nrf_uart_state_t *uart) {
 static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
     uint32_t off = addr - NRF_UART0_BASE;
-    if (getenv("NRF_UART_TRACE")) fprintf(stderr, "[uartW] 0x%03x = 0x%08x\n", off, value);
+    if (nrf_trace_flag(&trc_uart, "NRF_UART_TRACE")) fprintf(stderr, "[uartW] 0x%03x = 0x%08x\n", off, value);
     switch (off) {
         case NRF_UART_TXD:
             /* Forward to console callback if installed. Set TXDRDY so
@@ -910,7 +921,7 @@ static void nrf_radio_ramp_cb(void *user_data, cpu_event_t *event) {
     (void)event;
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
-    if (getenv("NRF_RADIO_TRACE"))
+    if (nrf_trace_flag(&trc_radio, "NRF_RADIO_TRACE"))
         fprintf(stderr, "[ramp] cb fired state=%d @cyc=%lld\n", r->state,
                 (long long)soc->plat->cpu.cycles);
     if (r->state == NRF_RADIO_STATE_RXRU)
@@ -922,7 +933,7 @@ static void nrf_radio_ramp_cb(void *user_data, cpu_event_t *event) {
 /* Enter the RXRU/TXRU ramp state and schedule its 40 µs completion. */
 static void radio_start_rampup(nrf52840_soc_t *soc, uint32_t ru_state) {
     soc->radio.state = ru_state;
-    if (getenv("NRF_RADIO_TRACE"))
+    if (nrf_trace_flag(&trc_radio, "NRF_RADIO_TRACE"))
         fprintf(stderr, "[ramp] start state=%d ev=%p @cyc=%lld\n", ru_state,
                 (void*)soc->radio.ramp_event, (long long)soc->plat->cpu.cycles);
     if (soc->radio.ramp_event && soc->plat)
@@ -1157,7 +1168,7 @@ static int nrf_radio_read(void *user_data, uint32_t addr) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
     uint32_t off = addr - NRF_RADIO_BASE;
-    if (getenv("NRF_RADIO_TRACE")) {
+    if (nrf_trace_flag(&trc_radio, "NRF_RADIO_TRACE")) {
         if (off == RADIO_STATE) fprintf(stderr, "[radioR] STATE = %d\n", r->state);
         else fprintf(stderr, "[radioR] 0x%03x\n", off);
     }
@@ -1212,7 +1223,7 @@ static void nrf_radio_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
     nrf_radio_state_t *r = &soc->radio;
     uint32_t off = addr - NRF_RADIO_BASE;
-    if (getenv("NRF_RADIO_TRACE")) fprintf(stderr, "[radioW] 0x%03x = 0x%08x\n", off, value);
+    if (nrf_trace_flag(&trc_radio, "NRF_RADIO_TRACE")) fprintf(stderr, "[radioW] 0x%03x = 0x%08x\n", off, value);
 
     /* Tasks: trigger on write of 1 */
     if (off <= RADIO_TASKS_CCASTOP) {
@@ -1313,7 +1324,7 @@ void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, 
  * delivers a byte to this node. */
 void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
     nrf_radio_state_t *r = &soc->radio;
-    if (getenv("NRF_RXBYTE_TRACE"))
+    if (nrf_trace_flag(&trc_rxbyte, "NRF_RXBYTE_TRACE"))
         fprintf(stderr, "[rxbyte] n=%u state=%d phase=%d byte=%02x @ %.6f\n",
                 soc->ficr.deviceaddr1, r->state, r->rx_phase, byte,
                 (double)arm_cycles_to_ns(soc->plat->cpu.cycles, soc->plat->cpu.cpu_freq_hz)/1e9);
@@ -1443,7 +1454,7 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                     }
                 }
 
-                if (getenv("NRF_RX_TRACE")) {
+                if (nrf_trace_flag(&trc_rx, "NRF_RX_TRACE")) {
                     fprintf(stderr, "[nrf-rx] frame off=%d phr=", r->rx_offset);
                     int dump = r->rx_offset > 24 ? 24 : r->rx_offset;
                     for (int i = 0; i < dump; i++)
@@ -1620,7 +1631,7 @@ static void nrf_ppi_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf_ppi_state_t *ppi = (nrf_ppi_state_t *)user_data;
     nrf52840_soc_t *soc = (nrf52840_soc_t *)ppi->soc;
     uint32_t off = addr - NRF_PPI_BASE;
-    if (getenv("NRF_PPI_TRACE")) fprintf(stderr, "[ppiW] 0x%03x = 0x%08x\n", off, value);
+    if (nrf_trace_flag(&trc_ppi, "NRF_PPI_TRACE")) fprintf(stderr, "[ppiW] 0x%03x = 0x%08x\n", off, value);
     if (off == NRF_PPI_CHEN || off == NRF_PPI_CHENSET) {
         uint32_t newly_enabled = value & ~ppi->chen;
         ppi->chen |= value;

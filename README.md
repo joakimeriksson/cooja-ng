@@ -223,8 +223,8 @@ Measured on Apple Silicon (PGO build) and Linux x86-64 (release).  See `bench` f
 | MSP430 2-node nullnet (60 s sim) | ~500× real-time |
 | MSP430 2-node RPL-UDP (60 s sim, Apple Silicon PGO) | ~1600× real-time |
 | MSP430 2-node RPL-UDP (Linux x86-64 release) | ~250× real-time |
-| CC2538DK 2-node RPL-UDP (interpreter) | ~4× real-time |
-| nRF52840 2-node RPL-UDP (interpreter) | ~9× real-time |
+| CC2538DK 2-node RPL-UDP (interpreter) | ~260× real-time |
+| nRF52840 2-node RPL-UDP (interpreter) | ~340× real-time |
 | nRF54L15 2-node RPL-UDP (interpreter) | ~100× real-time |
 | nRF54L15 FLPR dual-core demo (M33 + RV32E, `flpr-host`) | ~0.1× real-time |
 

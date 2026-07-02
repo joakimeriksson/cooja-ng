@@ -1071,8 +1071,14 @@ int arm_step(arm_cpu_t *cpu, int count) {
          * (anywhere code shouldn't be executing — XN region on real HW
          * faults).  One-shot per-CPU; dump enough register state to
          * reverse-engineer which prior instruction redirected PC.
-         * Enabled via ARM_WILD_TRAP. */
-        if (getenv("ARM_WILD_TRAP") &&
+         * Enabled via ARM_WILD_TRAP.
+         *
+         * Latched: runs once per executed instruction; an unlatched
+         * getenv() here was ~35% of simulation wall time (sample(1)). */
+        static int wild_trap_env = -1;
+        if (__builtin_expect(wild_trap_env < 0, 0))
+            wild_trap_env = getenv("ARM_WILD_TRAP") != NULL;
+        if (__builtin_expect(wild_trap_env, 0) &&
             ((pc >= cpu->sram_base && pc < cpu->sram_end) || pc >= 0x40000000u)) {
             if (!cpu->wild_trapped) {
                 cpu->wild_trapped = 1;
@@ -3011,9 +3017,19 @@ int arm_step(arm_cpu_t *cpu, int count) {
          * value.  Useful for tracing where bogus return addresses come
          * from when chasing wild-PC bugs.  Set ARM_LR_WATCH=<value>
          * (e.g. 0x20003bb9) — checks against `value` and `value^1`
-         * (with/without thumb bit).  One-shot per-CPU. */
-        if (getenv("ARM_LR_WATCH") && !cpu->lr_trapped) {
-            uint32_t want = (uint32_t)strtoul(getenv("ARM_LR_WATCH"), NULL, 0);
+         * (with/without thumb bit).  One-shot per-CPU.
+         *
+         * Latched: this runs once per executed instruction, and an
+         * unlatched getenv() here (libc env lock) measured ~25% of total
+         * simulation wall time (sample(1), nRF52840 TSCH run). */
+        static const char *lr_watch_env;
+        static int lr_watch_probed;
+        if (__builtin_expect(!lr_watch_probed, 0)) {
+            lr_watch_env = getenv("ARM_LR_WATCH");
+            lr_watch_probed = 1;
+        }
+        if (__builtin_expect(lr_watch_env != NULL, 0) && !cpu->lr_trapped) {
+            uint32_t want = (uint32_t)strtoul(lr_watch_env, NULL, 0);
             uint32_t lr = cpu->reg[ARM_LR];
             if (lr == want || lr == (want ^ 1u)) {
                 cpu->lr_trapped = 1;
