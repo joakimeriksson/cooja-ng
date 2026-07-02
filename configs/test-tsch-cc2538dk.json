@@ -1,0 +1,15 @@
+{
+  "title": "TSCH cc2538dk association + held-sync test",
+  "timeout_ms": 240000,
+  "nodes": [
+    { "firmware": "firmware/cc2538dk/tsch-node.cc2538dk", "id": 1 },
+    { "firmware": "firmware/cc2538dk/tsch-node.cc2538dk", "id": 2 }
+  ],
+  "test": {
+    "steps": [
+      { "wait": "starting as coordinator", "node": 1, "timeout_ms": 20000 },
+      { "wait": "association done", "node": 2, "timeout_ms": 150000 },
+      { "wait": "drift", "node": 2, "count": 3, "timeout_ms": 120000 }
+    ]
+  }
+}

@@ -42,3 +42,15 @@
 - **Purpose**: regression test for stock-Zephyr 802.15.4 networking on csim's
   nRF52840 (DAD + two-node UDP echo). The server logs `Received and replied`.
 
+
+## tsch-node.nrf52840-dk
+
+- **Source**: contiki-ng commit `36a1ab5e3` (local tree, 2026-07-02)
+- **Source path**: `examples/6tisch/simple-node` (file: `node.c`)
+- **TARGET**: `nrf52840`
+- **BOARD**: `dk`
+- **Local patch**: `node.c` coordinator guard removed — `if(node_id == 1) NETSTACK_ROUTING.root_start();` compiled on ALL targets (upstream gates it to COOJA/Z1), so node 1 self-selects TSCH coordinator in the emulator
+- **Toolchain**: arm-none-eabi-gcc 15.2.1 (host build)
+- **Built**: 2026-07-02 by Joakim Eriksson / Claude
+- **Build command**: `make TARGET=nrf52840 BOARD=dk` in examples/6tisch/simple-node
+- **Purpose**: 2-node TSCH regression (association + held sync + EACK'd keepalives); node 1 becomes coordinator, node 2 associates

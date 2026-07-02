@@ -1,0 +1,15 @@
+{
+  "title": "TSCH nRF52840-DK association + held-sync test",
+  "timeout_ms": 90000,
+  "nodes": [
+    { "firmware": "firmware/nrf52840-dk/tsch-node.nrf52840-dk", "id": 1 },
+    { "firmware": "firmware/nrf52840-dk/tsch-node.nrf52840-dk", "id": 2 }
+  ],
+  "test": {
+    "steps": [
+      { "wait": "starting as coordinator", "node": 1, "timeout_ms": 5000 },
+      { "wait": "update time source", "node": 2, "timeout_ms": 30000 },
+      { "wait": "drift", "node": 2, "count": 3, "timeout_ms": 80000 }
+    ]
+  }
+}
