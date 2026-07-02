@@ -247,6 +247,7 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
             rf->rxfifo_rd = 0;
             rf->rx_overflow = false;
             rf->fifop_signal = false;
+            rf->fsmstat1 &= ~(1u << 5);  /* abort mid-frame: SFD flag drops */
             /* Do NOT clear rx_incoming here: those are bytes from future
              * transmissions buffered because the radio was busy.  They
              * will be delivered when ISRXON is next called. */
@@ -710,6 +711,17 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                     rf->mt_sfd_ovf_capture = (uint32_t)(mt_ticks >> 16) & 0xFFFFFF;
                 }
                 rfcore_set_state(rf, RF_STATE_RX);
+                /* FSMSTAT1.SFD (bit 5): high from SFD detection until the
+                 * frame completes (any rfcore_set_state recomputes fsmstat1
+                 * and drops it).  The Contiki driver's receiving_packet()
+                 * is exactly this bit; TSCH's RX slot busy-waits on it to
+                 * stamp rx_start_time at the SFD.  Without it the wait only
+                 * exited on FIFOP (frame COMPLETE), rx_start_time was one
+                 * packet-duration late, and the enhanced ACK — scheduled at
+                 * rx_start_time + packet_duration + TsTxAckDelay — went out
+                 * one packet-duration late, missing the sender's ACK window
+                 * every time (TSCH could associate but never hold sync). */
+                rf->fsmstat1 |= (1 << 5);
                 rf->rfirqf0 |= RFIRQF0_SFD;
                 rfcore_check_interrupts(rf);
                 rf->rx_frame_state = RF_RX_LENGTH;
