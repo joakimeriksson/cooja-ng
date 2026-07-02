@@ -109,12 +109,23 @@ int arm_elf_mote_boot(mixed_node_t *node, int slot,
 
         /* FICR.DEVICEADDR per-node — Contiki uses these to derive the
          * IEEE EUI-64 (Nordic OUI f4:ce:36 prepended in platform.c).
-         * Seed with a per-node hash so addresses are distinct. */
+         *
+         * platform.c copies DEVICEADDR[0] little-endian into the EUI's
+         * last 4 bytes, and node_id_init() derives node_id from the last
+         * TWO linkaddr bytes — i.e. DEVICEADDR[0]'s top two bytes:
+         *   node_id = (b2 << 8) | b3   (b3 = bits 31..24, b2 = 23..16)
+         * Put the mote's node id there (Cooja-style deterministic ids —
+         * matches the cc2538 repeated-node-id scheme) so single-image
+         * firmware like 6tisch/simple-node gets node_id == 1 on node 1
+         * and can self-select the coordinator.  Keep a per-node hash in
+         * the low half for EUI uniqueness/entropy. */
         uint32_t h = (uint32_t)node_id;
         h ^= h << 13; h ^= h >> 17; h ^= h << 5;
         h *= 2654435761u;
         h ^= h >> 16;
-        nrf_soc->ficr.deviceaddr0 = h;
+        nrf_soc->ficr.deviceaddr0 = ((uint32_t)(node_id & 0xFF) << 24)
+                                  | ((uint32_t)((node_id >> 8) & 0xFF) << 16)
+                                  | (h & 0xFFFF);
         nrf_soc->ficr.deviceaddr1 = (uint32_t)node_id;
         nrf_soc->rng.prng_state   = h ? h : 0xDEADBEEF;
 
