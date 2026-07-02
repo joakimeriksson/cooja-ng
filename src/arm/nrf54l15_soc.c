@@ -1008,6 +1008,16 @@ static void nrf54l_radio_emit_tx(nrf54l_radio_state_t *r);
  * filter by node tag (low 16 bits of cpu pointer) via NRF54L_RADIO_NODE. */
 static int nrf54l_radio_trace_enabled = -1;
 static uint32_t nrf54l_radio_trace_node = 0;
+/* Debug-trace env flags, latched once per process — unlatched getenv() in
+ * MMIO/byte-rate paths measured as the dominant simulation cost elsewhere
+ * (see arm_cpu.c ARM_WILD_TRAP / nrf52840_soc.c nrf_trace_flag). */
+static int nrf54l_trace_flag(int *cache, const char *name) {
+    if (__builtin_expect(*cache < 0, 0)) *cache = getenv(name) ? 1 : 0;
+    return *cache;
+}
+static int trc54_rxstall = -1, trc54_rxdrop = -1, trc54_task = -1,
+           trc54_timer = -1, trc54_gpio = -1;
+
 static void nrf54l_radio_trace_probe(void) {
     const char *e = getenv("NRF54L_RADIO_TRACE");
     nrf54l_radio_trace_enabled = (e && *e && *e != '0') ? 1 : 0;
@@ -1418,7 +1428,7 @@ void nrf54l_radio_rx_stall(nrf54l15_soc_t *soc) {
         r->rx_phase == NRF54L_RX_WAIT_PREAMBLE ||
         r->rx_phase == NRF54L_RX_WAIT_SFD)
         return;
-    if (nrf54l_radio_trace_active(r) || getenv("NRF54L_RX_STALL_TRACE"))
+    if (nrf54l_radio_trace_active(r) || nrf54l_trace_flag(&trc54_rxstall, "NRF54L_RX_STALL_TRACE"))
         fprintf(stderr, "[radio cpu=0x%04x cyc=%lld RX_STALL phase=%d remaining=%d]\n",
                 (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
                 (long long)r->plat->cpu.cycles, r->rx_phase, r->rx_remaining);
@@ -1477,7 +1487,7 @@ void nrf54l_radio_set_tx_listener(nrf54l15_soc_t *soc,
 void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
     nrf54l_radio_state_t *r = &soc->radio;
     if (r->state != NRF54L_RADIO_STATE_RX) {
-        if (nrf54l_radio_trace_active(r) || getenv("NRF54L_RX_DROP_TRACE"))
+        if (nrf54l_radio_trace_active(r) || nrf54l_trace_flag(&trc54_rxdrop, "NRF54L_RX_DROP_TRACE"))
             fprintf(stderr, "[radio cpu=0x%04x cyc=%lld RX_DROP state=%s byte=0x%02x]\n",
                     (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
                     (long long)r->plat->cpu.cycles,
@@ -1635,7 +1645,7 @@ static void nrf54l_radio_write(void *user_data, uint32_t addr, uint32_t value) {
     /* SUBSCRIBE — bind/unbind DPPI channel. */
     if (off >= R_SUBSCRIBE_BASE && off < R_SUBSCRIBE_END) {
         int idx = R_SUBSCRIBE_INDEX(off);
-        if (getenv("NRF54L_RADIO_TASK_TRACE") && (value & 0x80000000u)) {
+        if (nrf54l_trace_flag(&trc54_task, "NRF54L_RADIO_TASK_TRACE") && (value & 0x80000000u)) {
             const char *names[] = {
                 "TXEN","RXEN","START","STOP","DISABLE","RSSISTART",
                 "BCSTART","BCSTOP","EDSTART","EDSTOP","CCASTART","CCASTOP"
@@ -1801,7 +1811,7 @@ static void nrf54l_timer_compare_fired(void *user, cpu_event_t *ev) {
     int published = ((pub & 0x80000000u) && t->dppi);
     if (published)
         nrf54l_dppi_publish(t->dppi, (int)(pub & 0x1Fu));
-    if (getenv("NRF54L_TIMER_TRACE")) {
+    if (nrf54l_trace_flag(&trc54_timer, "NRF54L_TIMER_TRACE")) {
         fprintf(stderr, "[timer cpu=0x%04x cyc=%lld base=0x%x CC[%d]=%u irq=%d pub=0x%x]\n",
                 (unsigned)((uintptr_t)&t->plat->cpu & 0xFFFF),
                 (long long)t->plat->cpu.cycles,
@@ -1936,7 +1946,7 @@ static int nrf54l_timer_read(void *user_data, uint32_t addr) {
 static void nrf54l_timer_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf54l_timer_state_t *t = (nrf54l_timer_state_t *)user_data;
     uint32_t off = addr & 0xFFFu;
-    if (getenv("NRF54L_TIMER_TRACE")) {
+    if (nrf54l_trace_flag(&trc54_timer, "NRF54L_TIMER_TRACE")) {
         const char *kind = "?";
         if (off < 0x80) kind = "TASK";
         else if (off >= 0x140 && off < 0x180) kind = "EVENTS_COMPARE";
@@ -2133,7 +2143,7 @@ static void nrf54l_gpio_set_out(nrf54l_gpio_state_t *g, uint32_t newout) {
     uint32_t changed = (g->out ^ newout) & g->dir;
     if (changed) {
         for (uint32_t m = changed; m; m &= m - 1) g->out_toggles++;
-        if (getenv("CSIM_GPIO_TRACE")) {
+        if (nrf54l_trace_flag(&trc54_gpio, "CSIM_GPIO_TRACE")) {
             int64_t t = g->plat ? g->plat->cpu.sim_time_ns : 0;
             fprintf(stderr, "[GPIO] %9.3f P%d.OUT 0x%08x -> 0x%08x (changed 0x%08x)\n",
                     t / 1e9, g->port, g->out, newout, changed);

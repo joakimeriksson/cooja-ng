@@ -28,6 +28,15 @@
 /* Air-side bit-stream timing — 50 kbps 2-FSK as configured by Contiki  */
 /* ------------------------------------------------------------------ */
 
+/* CC1200_TIMING_PROBE, latched once — the unlatched getenv() sat in the
+ * per-SPI-byte exchange path (see arm_cpu.c getenv latching rationale). */
+static int cc1200_timing_probe_flag = -1;
+static int cc1200_timing_probe(void) {
+    if (__builtin_expect(cc1200_timing_probe_flag < 0, 0))
+        cc1200_timing_probe_flag = getenv("CC1200_TIMING_PROBE") ? 1 : 0;
+    return cc1200_timing_probe_flag;
+}
+
 #define CC1200_BYTE_PERIOD_NS    160000   /* 8 bits @ 50 kbps */
 #define CC1200_RESET_TIME_NS     200000   /* SRES → IDLE, ~200 µs in real HW */
 
@@ -243,7 +252,7 @@ static uint8_t fifo_pop_tx(cc1200_t *c) {
  * CC2538 RFCore's rfcore_check_interrupts(RFIRQF0_RXPKTDONE), and
  * nRF52840's radio_event(&evt_end). */
 static void frame_done_now(cc1200_t *c) {
-    if (getenv("CC1200_TIMING_PROBE"))
+    if (cc1200_timing_probe())
         fprintf(stderr, "[t=%lld cc1200@%p RX_DONE GPIO0↓ rx_count=%d]\n",
                 (long long)HOST_NOW_NS(c), (void*)c, c->rx_count);
     c->sig_pkt_sync_rxtx = false;
@@ -576,7 +585,7 @@ static void marcstate_event_cb(void *user_data, cpu_event_t *ev) {
     (void)ev;
     cc1200_t *c = (cc1200_t *)user_data;
     uint8_t target = c->marc_pending;
-    if (getenv("CC1200_TIMING_PROBE"))
+    if (cc1200_timing_probe())
         fprintf(stderr, "[t=%lld cc1200@%p MARC_FIRE 0x%02x→0x%02x]\n",
                 (long long)HOST_NOW_NS(c), (void*)c, c->marcstate, target);
     c->marcstate = target;
@@ -678,7 +687,7 @@ static void chip_reset(cc1200_t *c) {
 
 static void handle_strobe(cc1200_t *c, uint8_t strobe) {
     c->stat_strobe_count++;
-    if (getenv("CC1200_TIMING_PROBE")) {
+    if (cc1200_timing_probe()) {
         const char *name;
         switch (strobe) {
         case CC1200_STROBE_SRES:    name = "SRES";    break;
