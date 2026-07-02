@@ -311,9 +311,20 @@ void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
      * regressed 4-node RPL convergence — see 9ebe99a investigation),
      * so it stays BATCH. */
     bool nrf54l = arm_platform_nrf54l15(&node->plat.arm) != NULL;
-    sim_radio_delivery_mode_t mode =
-        (nrf54l || arm_platform_cc2538(&node->plat.arm) != NULL)
-        ? SIM_RADIO_DELIVERY_PER_BYTE : SIM_RADIO_DELIVERY_BATCH;
+    /* All ARM radio models take per-byte delivery now.  nRF52840 was the
+     * last BATCH holdout ("DMA-style"), but its RX state machine is
+     * per-byte internally (WAIT_PREAMBLE→SFD→PHR→PAYLOAD) and BATCH
+     * collapsed the whole frame onto the end-of-air instant: FRAMESTART,
+     * the PHR byte, and CRCOK all landed at once, so the Contiki driver's
+     * poll-mode receiving_packet() (powered && RX && PHR valid && no CRC
+     * event) could never observe a frame IN FLIGHT.  TSCH's ACK wait
+     * relies on exactly that to extend past its deadline — with BATCH
+     * every enhanced ACK arrived whole after the deadline (radio already
+     * off → bus queued it) and unicast TX never got acknowledged.
+     * Per-byte delivery spreads bytes over real air time, same as
+     * cc2538/nrf54l15. */
+    sim_radio_delivery_mode_t mode = SIM_RADIO_DELIVERY_PER_BYTE;
+    (void)0;
     sim_radio_bus_register(bus, slot,
                            nrf54l ? &arm54l_radio_ops : &arm_radio_ops,
                            node, mode, /*caps=*/0);

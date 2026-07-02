@@ -186,6 +186,9 @@ typedef struct nrf_radio_state {
     void    *disable_event;    /* deferred DISABLED event (opaque cpu_event_t *) */
     void    *tx_event;         /* deferred TX-completion event (PHYEND after air-time) */
     void    *ramp_event;       /* deferred RXRU/TXRU → RXIDLE/TXIDLE ramp-up (40 µs) */
+    void    *ack_event;        /* deferred chip auto-ACK (192 µs turnaround) */
+    uint8_t  ack_pending[16];  /* staged auto-ACK on-air bytes */
+    int      ack_pending_len;
     /* RX byte parser state — incoming on-air bytes feed this. */
     int      rx_phase;         /* nrf_rx_phase_t enum */
     int      rx_remaining;

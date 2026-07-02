@@ -869,7 +869,8 @@ static void nrf_radio_tx_done_cb(void *user_data, cpu_event_t *event) {
     /* If the firmware aborted (DISABLE/STOP) mid-air, the state has moved on. */
     if (r->state != NRF_RADIO_STATE_TX)
         return;
-    radio_emit_tx(soc);
+    /* Frame bytes already went to the medium at TASKS_START (start of
+     * air) — this callback only completes the events/shorts. */
     radio_event(soc, &r->evt_payload,  RADIO_INT_PAYLOAD);
     radio_event(soc, &r->evt_end,      RADIO_INT_END);
     radio_event(soc, &r->evt_phyend,   RADIO_INT_PHYEND);
@@ -878,6 +879,22 @@ static void nrf_radio_tx_done_cb(void *user_data, cpu_event_t *event) {
     radio_apply_shorts_after_event(soc, SHORT_PHYEND_DISABLE);
     radio_apply_shorts_after_event(soc, SHORT_END_START);
     radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
+}
+
+/* Deferred chip auto-ACK: real 802.15.4 acknowledges 12 symbols (192 µs)
+ * after the frame ends — the sender needs that turnaround to get its own
+ * radio from TX back into RX.  Emitting the ACK synchronously at
+ * rx-complete (the old behaviour) put the ACK's preamble on the air while
+ * the peer was still walking TX→DISABLED→RXEN; those bytes were dropped
+ * (only RXRU/RXIDLE buffer) and the ACK never frame-synced. */
+static void nrf_radio_ack_cb(void *user_data, cpu_event_t *event) {
+    (void)event;
+    nrf52840_soc_t *soc = (nrf52840_soc_t *)user_data;
+    nrf_radio_state_t *r = &soc->radio;
+    if (r->ack_pending_len <= 0 || soc->radio_tx_cb == NULL) return;
+    for (int i = 0; i < r->ack_pending_len; i++)
+        soc->radio_tx_cb(soc->radio_tx_user, r->ack_pending[i]);
+    r->ack_pending_len = 0;
 }
 
 /* RXEN/TXEN ramp-up: the RADIO does not reach RXIDLE/TXIDLE instantly — it ramps
@@ -1026,6 +1043,35 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                 r->state = NRF_RADIO_STATE_TX;
                 radio_event(soc, &r->evt_address,    RADIO_INT_ADDRESS);
                 radio_event(soc, &r->evt_framestart, RADIO_INT_FRAMESTART);
+                /* Emit the frame to the medium NOW, at start-of-air; the
+                 * per-byte bus spreads the bytes over their true air time
+                 * for each receiver.  Emission used to happen in
+                 * nrf_radio_tx_done_cb, one air-time later, which put
+                 * every frame on the air one frame-duration LATE: a TSCH
+                 * node syncing to this radio's EBs inherited that lateness
+                 * into its whole slot grid, and its unicast replies then
+                 * missed the coordinator's on-grid RX window (every
+                 * keepalive NOACK).  The completion events (PAYLOAD/END/
+                 * PHYEND + post-TX shorts) stay deferred by one air-time
+                 * below, so nrf_802154's calibrated busy-waits still see
+                 * PHYEND at the right time. */
+                /* Serialize with a still-staged deferred auto-ACK: the
+                 * driver may start its own TX inside the 192 us ACK
+                 * turnaround (e.g. RPL replying to the very frame being
+                 * acked).  Flush the ACK onto the bus first — the bus's
+                 * per-sender byte clock then air-schedules the ACK and
+                 * this frame back-to-back, instead of interleaving two
+                 * byte streams into garbage. */
+                /* Firmware is transmitting (typically its OWN ack for
+                 * the frame we just received): cancel any staged chip
+                 * auto-ACK so acknowledgements are never duplicated. */
+                if (r->ack_pending_len > 0) {
+                    if (r->ack_event && soc->plat)
+                        arm_cancel_event(&soc->plat->cpu,
+                                         (arm_event_t *)r->ack_event);
+                    r->ack_pending_len = 0;
+                }
+                radio_emit_tx(soc);
                 if (r->tx_event && soc->plat) {
                     uint32_t phr = arm_read8(&soc->plat->cpu, r->packetptr);
                     if (phr < 2 || phr > 127) phr = 127;
@@ -1268,7 +1314,9 @@ void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, 
 void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
     nrf_radio_state_t *r = &soc->radio;
     if (getenv("NRF_RXBYTE_TRACE"))
-        fprintf(stderr, "[rxbyte] state=%d\n", r->state);
+        fprintf(stderr, "[rxbyte] n=%u state=%d phase=%d byte=%02x @ %.6f\n",
+                soc->ficr.deviceaddr1, r->state, r->rx_phase, byte,
+                (double)arm_cycles_to_ns(soc->plat->cpu.cycles, soc->plat->cpu.cpu_freq_hz)/1e9);
     /* Outside RX: buffer the byte for replay on next RX entry.  This
      * catches auto-ACK bytes that arrive 192 µs after our own TX,
      * before the driver has finished the TXIDLE → DISABLED → RXEN →
@@ -1351,47 +1399,47 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                 radio_apply_shorts_after_event(soc, SHORT_END_START);
                 radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
 
-                /* Hardware-style auto-ACK for unicast Data frames that
-                 * have the ACK_REQUEST bit set. Real nRF52840 silicon
-                 * achieves sub-200 µs ACK turnaround via PPI + TIMER +
-                 * SHORTS choreography (set up by Nordic's 802.15.4
-                 * driver). The Contiki nrf driver leaves that path
-                 * unconfigured and relies on CSMA's software ACK
-                 * (`CSMA_SEND_SOFT_ACK`), but csim's tick granularity
-                 * makes the software path arrive after the sender's
-                 * CSMA_ACK_WAIT_TIME — driving a retx storm that's
-                 * pure simulator artefact.  Emit the ACK synchronously
-                 * inside the chip model, same convention as cc2538
-                 * (cc2538_rfcore.c). The firmware's later software
-                 * ACK arrives as a duplicate and is harmlessly dropped
-                 * at the sender (already acked, seqno already cleared).
-                 *
-                 * Layout in PACKETPTR: [PHR][FCF0][FCF1][DSN][...].
-                 * Per IEEE 802.15.4 FCF: bit 0:2 = frame type, bit 5 =
-                 * ACK_REQUEST. Broadcast frames never set ACK_REQUEST. */
+                /* Deferred chip auto-ACK, 96 us out — a stand-in for
+                 * firmware stacks whose own ACK path isn't modelled
+                 * (Zephyr's nrf_802154 hardware ACK choreography).  Two
+                 * gates keep it from DUPLICATING acknowledgements:
+                 *  - frame version 2 (802.15.4e/TSCH) never gets one:
+                 *    those need MAC-built ENHANCED ACKs, and a fabricated
+                 *    imm-ACK burned the sender's ACK slot as NOACK;
+                 *  - if the firmware transmits ANYTHING before the 96 us
+                 *    elapse (Contiki's stack sends its own ACK ~60 us
+                 *    after rx-complete), the staged fiction is cancelled
+                 *    at TASKS_START — otherwise the two identical ACKs
+                 *    interleaved on air and corrupted each other. */
                 if (soc->radio_tx_cb && r->rx_offset > 4) {
                     uint8_t fcf0       = arm_read8(cpu, r->packetptr + 1);
+                    uint8_t fcf1       = arm_read8(cpu, r->packetptr + 2);
                     uint8_t dsn        = arm_read8(cpu, r->packetptr + 3);
                     int     frame_type = fcf0 & 0x07;
                     int     ack_req    = (fcf0 >> 5) & 1;
-                    if (frame_type == 0x1 /* Data */ && ack_req) {
+                    int     frame_ver  = (fcf1 >> 4) & 0x3;
+                    if (frame_type == 0x1 /* Data */ && ack_req && frame_ver < 2) {
                         uint8_t ack_fcf0 = 0x02; /* frame type = ACK */
                         uint8_t ack_fcf1 = 0x00;
                         uint16_t crc = 0;
                         crc = nrf_crc_add(crc, ack_fcf0);
                         crc = nrf_crc_add(crc, ack_fcf1);
                         crc = nrf_crc_add(crc, dsn);
-                        nrf_radio_tx_listener_t cb = soc->radio_tx_cb;
-                        void *ud                   = soc->radio_tx_user;
+                        int n = 0;
                         for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
-                            cb(ud, IEEE802154_PREAMBLE_BYTE);
-                        cb(ud, IEEE802154_SFD);
-                        cb(ud, 5);              /* PHR: FCF(2)+DSN(1)+FCS(2) */
-                        cb(ud, ack_fcf0);
-                        cb(ud, ack_fcf1);
-                        cb(ud, dsn);
-                        cb(ud, (uint8_t)(crc & 0xFF));
-                        cb(ud, (uint8_t)((crc >> 8) & 0xFF));
+                            r->ack_pending[n++] = IEEE802154_PREAMBLE_BYTE;
+                        r->ack_pending[n++] = IEEE802154_SFD;
+                        r->ack_pending[n++] = 5; /* PHR: FCF(2)+DSN(1)+FCS(2) */
+                        r->ack_pending[n++] = ack_fcf0;
+                        r->ack_pending[n++] = ack_fcf1;
+                        r->ack_pending[n++] = dsn;
+                        r->ack_pending[n++] = (uint8_t)(crc & 0xFF);
+                        r->ack_pending[n++] = (uint8_t)((crc >> 8) & 0xFF);
+                        r->ack_pending_len = n;
+                        if (r->ack_event && soc->plat)
+                            arm_schedule_event(&soc->plat->cpu,
+                                (arm_event_t *)r->ack_event,
+                                (int64_t)soc->plat->cpu.cycles + 96LL * 64);
                     }
                 }
 
@@ -2034,6 +2082,11 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
         rue->callback  = nrf_radio_ramp_cb;
         rue->user_data = soc;
         soc->radio.ramp_event = rue;
+        /* Deferred chip auto-ACK (192 µs after RX end). */
+        cpu_event_t *ake = (cpu_event_t *)calloc(1, sizeof(*ake));
+        ake->callback  = nrf_radio_ack_cb;
+        ake->user_data = soc;
+        soc->radio.ack_event = ake;
     }
     arm_register_io(&plat->cpu, NRF_RADIO_BASE, NRF_RADIO_SIZE,
                     nrf_radio_read, nrf_radio_write, soc);
