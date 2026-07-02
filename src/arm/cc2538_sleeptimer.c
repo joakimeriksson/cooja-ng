@@ -44,8 +44,13 @@ static void sleeptimer_schedule_compare(cc2538_sleeptimer_t *st) {
 
     /* Convert delta ticks directly to CPU cycles:
      * delta_cycles = delta * cpu_freq / 32768
-     * Use 128-bit arithmetic to avoid overflow. */
-    int64_t delta_cycles = (int64_t)((__int128)delta * st->cpu->cpu_freq_hz
+     * Use 128-bit arithmetic to avoid overflow.  Round UP: the compare
+     * must fire when the counter has reached the compare value.  With
+     * floor the event fired up to one tick early, so an ISR reading the
+     * counter saw compare-1 (30.5 us early) — poison for TSCH slot
+     * timing that immediately schedules the next deadline from "now". */
+    int64_t delta_cycles = (int64_t)(((__int128)delta * st->cpu->cpu_freq_hz
+                                      + SLEEPTIMER_FREQ_HZ - 1)
                                      / SLEEPTIMER_FREQ_HZ);
 
     arm_schedule_event(st->cpu, &st->compare_event,
@@ -57,10 +62,31 @@ static void sleeptimer_compare_fire(void *user_data, arm_event_t *ev) {
     cc2538_sleeptimer_t *st = (cc2538_sleeptimer_t *)user_data;
     (void)ev;
 
-    /* Update base to current time (use cycles-derived ns, not sim_time_ns) */
-    st->base_count = sleeptimer_get_count(st);
-    st->base_ns = sleeptimer_now_ns(st);
-
+    /* Re-anchor base on the exact TICK BOUNDARY, not on "now".
+     *
+     * The old code set base_count = floor(current count) and
+     * base_ns = now, silently discarding the fractional tick
+     * (0..30.5 us) at every compare fire.  TSCH fires several rtimer
+     * compares per active slot, phase-locked to the slot grid, so the
+     * discarded fraction was systematic — an activity-proportional
+     * clock loss (~100 us per slotframe) that differed between
+     * coordinator and node and walked their slot grids apart by
+     * ~300 us/s.  Sync collapsed within seconds of association and
+     * every keepalive missed the peer's RX window (CSMA never noticed:
+     * it has no long-horizon absolute timing).
+     *
+     * Advance base_count by the whole elapsed ticks and base_ns by
+     * exactly those ticks' duration, preserving the sub-tick phase.
+     * Residual integer-division error is <1 ns per fire (~0.1 ppm),
+     * well under the 9 ppm measured on real zoul hardware. */
+    int64_t now = sleeptimer_now_ns(st);
+    int64_t elapsed = now - st->base_ns;
+    if (elapsed > 0) {
+        uint64_t ticks = (uint64_t)elapsed * SLEEPTIMER_FREQ_HZ / 1000000000ULL;
+        st->base_count += (uint32_t)ticks;
+        st->base_ns += (int64_t)((__int128)ticks * 1000000000ULL
+                                 / SLEEPTIMER_FREQ_HZ);
+    }
 
     /* Set interrupt pending — wakes CPU from WFI */
     arm_nvic_set_pending(st->nvic, st->irq);
