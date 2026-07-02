@@ -1916,9 +1916,17 @@ static void timer_schedule_next_compare(nrf_timer_state_t *t) {
                     has_listener = true;
         }
         if (!has_listener) continue;
-        uint32_t ticks = (t->cc[i] - now) & mask;
-        if (ticks == 0) ticks = mask + 1;
-        int64_t dc = (int64_t)ticks * (int64_t)cpu->cpu_freq_hz / (int64_t)tick_hz;
+        /* Distance to the compare value on the wrapping counter.  Do the
+         * "equal means a full wrap" case in 64-bit: with BITMODE=32 the
+         * mask is 0xFFFFFFFF and a uint32 mask+1 overflowed to 0, which
+         * the dc<1 clamp turned into a compare event every single CPU
+         * cycle.  Contiki's rtimer-arch starts TIMER0 (32-bit, CC0=0,
+         * COMPARE0 int enabled) with counter==CC0, hitting exactly this:
+         * a boot-time interrupt storm that pinned the CPU in the TIMER0
+         * ISR so TSCH slot operation never ran. */
+        uint64_t ticks = (uint64_t)((t->cc[i] - now) & mask);
+        if (ticks == 0) ticks = (uint64_t)mask + 1;
+        int64_t dc = (int64_t)(ticks * (uint64_t)cpu->cpu_freq_hz / tick_hz);
         if (dc < 1) dc = 1;  /* avoid 0-delay infinite reschedule */
         if (dc < best_delta) { best_delta = dc; best_i = i; }
     }
