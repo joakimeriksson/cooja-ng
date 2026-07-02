@@ -169,8 +169,9 @@ flowchart TB
 - **Radio medium is policy, the radio bus is transport.** `radio_medium.c`
   does UDGM range/channel filtering; `src/sim/sim_radio_bus.c` owns the TX
   byte clock, frame assembly, and per-receiver delivery modes — SYNC
-  (native), PER_BYTE (CC2420 / cc2538_rfcore / nrf54l15 take one kernel
-  `RX_BYTE` event per on-air byte), BATCH (nrf52840, JS).
+  (native), PER_BYTE (CC2420 / cc2538_rfcore / nrf52840 / nrf54l15 take one
+  kernel `RX_BYTE` event per on-air byte — required for TSCH, whose slot
+  timing polls receiving_packet() while a frame is in flight), BATCH (JS).
 - **Timeline + WebSocket are observation-only.** They subscribe to the kernel
   observer stream; removing them doesn't change simulation outcomes.
 - **JIT is MSP430-only**, optional, gated on GNU Lightning at build time.

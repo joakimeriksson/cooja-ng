@@ -44,6 +44,13 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # nRF52840 Development Kit (PCA10056, same SoC + SEGGER UART)
 ./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/udp-server.nrf52840-dk firmware/nrf52840-dk/udp-client.nrf52840-dk -t 60000
 
+# TSCH (802.15.4e time-slotted channel hopping) — 2-node association + HELD
+# sync (>=3 periodic drift reports prove the enhanced-ACK/EB sync loop is
+# alive, not just association). Contiki-NG 6tisch/simple-node; node 1
+# self-selects coordinator (node_id==1).
+./build/test_runner test configs/test-tsch-cc2538dk.json      # ~240s sim
+./build/test_runner test configs/test-tsch-nrf52840-dk.json   # ~25s sim
+
 # Stock Zephyr 802.15.4 (echo_server/echo_client, only the sample's overlay-802154.conf).
 # Two-node UDP echo over 802.15.4/6LoWPAN/IPv6/RPL; server logs "Received and replied", 0 timeouts.
 ./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/zephyr-echo-server.nrf52840-dk firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000
@@ -364,8 +371,9 @@ the per-slot mote objects.
    step_micros) and returns the mote's next wakeup time
 4. RF TX: chip TX callbacks feed `sim_radio_bus_tx_byte()` (per-sender byte
    clock + frame assembler + medium filter), which dispatches per receiver
-   delivery mode: SYNC (native), PER_BYTE (CC2420 / cc2538 / nrf54l15 — one
-   kernel RX_BYTE event per on-air byte), BATCH (nrf52840 DMA-style, JS)
+   delivery mode: SYNC (native), PER_BYTE (CC2420 / cc2538 / nrf52840 /
+   nrf54l15 — one kernel RX_BYTE event per on-air byte; what makes TSCH's
+   receiving_packet()-based slot timing work), BATCH (JS)
 
 Per-mote cycle accounting inside the execute slices handles nodes running at
 different CPU frequencies after DCO calibration.

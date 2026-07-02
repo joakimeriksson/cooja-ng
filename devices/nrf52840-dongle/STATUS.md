@@ -104,10 +104,13 @@ Explicitly **not** part of this port:
   SETUP transfers, EasyDMA → bulk-IN endpoint) is real work. The L0–L6
   ladder is run with `NRF52840_NATIVE_USB=0` so console routes to the
   legacy UART register window, which csim already models.
-- **PPI for TSCH.** Programmable Peripheral Interconnect is needed for
-  TSCH's tight slot timing (TIMER → RADIO TASKS_TXEN, RADIO
-  EVENTS_END → TIMER CAPTURE). RPL-UDP over CSMA doesn't exercise it.
-  Whoever picks up TSCH on nRF first will need to model PPI.
+- ~~**PPI for TSCH.**~~ **DONE (2026-07-02).** TSCH works on nRF52840:
+  PPI timestamping (FRAMESTART/END → TIMER0 CAPTURE) is modeled, the
+  radio moved to per-byte delivery with start-of-air TX emission, and
+  the TIMER 32-bit compare wrap + FICR node-id seeding were fixed.
+  2-node association holds indefinitely at −7 ppm drift with all
+  keepalives enhanced-ACKed. Regression:
+  `./build/test_runner test configs/test-tsch-nrf52840-dk.json`.
 - **BLE.** The nRF52840 RADIO is multi-protocol; csim only models
   802.15.4 mode. BLE timing, LL state machine, advertising channels —
   not in scope.
@@ -183,7 +186,6 @@ make
 - The 4 VFP bugs the unit tests caught (see commit 70c79d4) are a
   reminder that VFP encoding is fiddly. Adding new VFP opcodes? Add
   the correctness test in the same commit.
-- TSCH on nRF needs PPI. The RADIO model fires events synchronously
-  through state transitions; tight timing isn't faithful. PPI would
-  also need a way to trigger tasks on events without going through
-  the CPU.
+- ~~TSCH on nRF needs PPI~~ — resolved 2026-07-02; TSCH works (see
+  above). Radio timing is per-byte faithful now (start-of-air TX
+  emission, per-byte RX).
