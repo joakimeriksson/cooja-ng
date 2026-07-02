@@ -49,9 +49,10 @@ static void sleeptimer_schedule_compare(cc2538_sleeptimer_t *st) {
      * floor the event fired up to one tick early, so an ISR reading the
      * counter saw compare-1 (30.5 us early) — poison for TSCH slot
      * timing that immediately schedules the next deadline from "now". */
-    int64_t delta_cycles = (int64_t)(((__int128)delta * st->cpu->cpu_freq_hz
-                                      + SLEEPTIMER_FREQ_HZ - 1)
-                                     / SLEEPTIMER_FREQ_HZ);
+    /* delta <= 2^32, cpu_freq <= ~2^27 -> product < 2^59, fits int64. */
+    int64_t delta_cycles = ((int64_t)delta * st->cpu->cpu_freq_hz
+                            + SLEEPTIMER_FREQ_HZ - 1)
+                           / SLEEPTIMER_FREQ_HZ;
 
     arm_schedule_event(st->cpu, &st->compare_event,
                        st->cpu->cycles + delta_cycles);
@@ -84,8 +85,8 @@ static void sleeptimer_compare_fire(void *user_data, arm_event_t *ev) {
     if (elapsed > 0) {
         uint64_t ticks = (uint64_t)elapsed * SLEEPTIMER_FREQ_HZ / 1000000000ULL;
         st->base_count += (uint32_t)ticks;
-        st->base_ns += (int64_t)((__int128)ticks * 1000000000ULL
-                                 / SLEEPTIMER_FREQ_HZ);
+        /* ticks < 2^33 between fires -> ticks * 1e9 < 2^63, fits int64. */
+        st->base_ns += (int64_t)(ticks * 1000000000ULL / SLEEPTIMER_FREQ_HZ);
     }
 
     /* Set interrupt pending — wakes CPU from WFI */

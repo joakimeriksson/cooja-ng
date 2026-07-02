@@ -86,6 +86,8 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
     if (offset >= NVIC_ISER_BASE && offset < NVIC_ISER_BASE + 32) {
         int idx = (offset - NVIC_ISER_BASE) / 4;
         nvic->iser[idx] |= value;
+        nvic->scan_valid = false;
+        nvic->has_pending = true;   /* newly-enabled IRQ may already be pending */
         arm_nvic_check_pending(nvic);
         return;
     }
@@ -93,12 +95,15 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
     if (offset >= NVIC_ICER_BASE && offset < NVIC_ICER_BASE + 32) {
         int idx = (offset - NVIC_ICER_BASE) / 4;
         nvic->iser[idx] &= ~value;
+        nvic->scan_valid = false;
         return;
     }
     /* NVIC_ISPR (set-pending) */
     if (offset >= NVIC_ISPR_BASE && offset < NVIC_ISPR_BASE + 32) {
         int idx = (offset - NVIC_ISPR_BASE) / 4;
         nvic->ispr[idx] |= value;
+        nvic->scan_valid = false;
+        nvic->has_pending = true;
         arm_nvic_check_pending(nvic);
         return;
     }
@@ -106,6 +111,7 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
     if (offset >= NVIC_ICPR_BASE && offset < NVIC_ICPR_BASE + 32) {
         int idx = (offset - NVIC_ICPR_BASE) / 4;
         nvic->ispr[idx] &= ~value;
+        nvic->scan_valid = false;
         return;
     }
     /* NVIC_IPR — NVIC->IP[] is a byte array; CMSIS NVIC_SetPriority writes it
@@ -120,6 +126,7 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         } else {
             nvic->ipr[idx] = value & 0xFF;
         }
+        nvic->scan_valid = false;
         return;
     }
 
@@ -136,6 +143,7 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         } else {
             nvic->shpr[idx] = value & 0xFF;
         }
+        nvic->scan_valid = false;
         return;
     }
 
@@ -144,20 +152,26 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             if (value & (1u << 28)) { /* PENDSVSET */
                 nvic->pending_exception = EXC_PENDSV;
                 nvic->has_pending = true;
+                nvic->scan_valid = false;
                 arm_nvic_check_pending(nvic);
             }
             if (value & (1u << 27)) { /* PENDSVCLR */
-                if (nvic->pending_exception == EXC_PENDSV)
+                if (nvic->pending_exception == EXC_PENDSV) {
                     nvic->pending_exception = -1;
+                    nvic->scan_valid = false;
+                }
             }
             if (value & (1u << 26)) { /* PENDSTSET */
                 nvic->pending_exception = EXC_SYSTICK;
                 nvic->has_pending = true;
+                nvic->scan_valid = false;
                 arm_nvic_check_pending(nvic);
             }
             if (value & (1u << 25)) { /* PENDSTCLR */
-                if (nvic->pending_exception == EXC_SYSTICK)
+                if (nvic->pending_exception == EXC_SYSTICK) {
                     nvic->pending_exception = -1;
+                    nvic->scan_valid = false;
+                }
             }
             break;
         case SCB_VTOR:
@@ -180,18 +194,21 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             nvic->ccr = value;
             break;
         case SCB_SHPR1:
+            nvic->scan_valid = false;
             nvic->shpr[0] = value & 0xFF;
             nvic->shpr[1] = (value >> 8) & 0xFF;
             nvic->shpr[2] = (value >> 16) & 0xFF;
             nvic->shpr[3] = (value >> 24) & 0xFF;
             break;
         case SCB_SHPR2:
+            nvic->scan_valid = false;
             nvic->shpr[4] = value & 0xFF;
             nvic->shpr[5] = (value >> 8) & 0xFF;
             nvic->shpr[6] = (value >> 16) & 0xFF;
             nvic->shpr[7] = (value >> 24) & 0xFF;
             break;
         case SCB_SHPR3:
+            nvic->scan_valid = false;
             nvic->shpr[8] = value & 0xFF;
             nvic->shpr[9] = (value >> 8) & 0xFF;
             nvic->shpr[10] = (value >> 16) & 0xFF;
@@ -223,6 +240,7 @@ void arm_nvic_set_pending(arm_nvic_t *nvic, int irq_num) {
     int bit = irq_num % 32;
     nvic->ispr[idx] |= (1u << bit);
     nvic->has_pending = true;
+    nvic->scan_valid = false;
     arm_nvic_check_pending(nvic);
 }
 
@@ -231,6 +249,7 @@ void arm_nvic_clear_pending(arm_nvic_t *nvic, int irq_num) {
     int idx = irq_num / 32;
     int bit = irq_num % 32;
     nvic->ispr[idx] &= ~(1u << bit);
+    nvic->scan_valid = false;
 }
 
 int arm_nvic_get_priority(arm_nvic_t *nvic, int exception_num) {
@@ -256,33 +275,45 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
     /* Check PRIMASK */
     if (cpu->primask & 1) return;
 
-    int best_exc = -1;
-    int best_prio = 256;
+    int best_exc, best_prio;
+    if (nvic->scan_valid) {
+        /* Fast path: pending/enable/priority state unchanged since the
+         * last full scan — reuse its result.  This is the per-instruction
+         * case while an exception stays pending but masked. */
+        best_exc  = nvic->scan_exc;
+        best_prio = nvic->scan_prio;
+    } else {
+        best_exc = -1;
+        best_prio = 256;
 
-    /* Check system exceptions (PendSV, SysTick) */
-    if (nvic->pending_exception > 0) {
-        int prio = arm_nvic_get_priority(nvic, nvic->pending_exception);
-        if (prio < best_prio) {
-            best_prio = prio;
-            best_exc = nvic->pending_exception;
+        /* Check system exceptions (PendSV, SysTick) */
+        if (nvic->pending_exception > 0) {
+            int prio = arm_nvic_get_priority(nvic, nvic->pending_exception);
+            if (prio < best_prio) {
+                best_prio = prio;
+                best_exc = nvic->pending_exception;
+            }
         }
-    }
 
-    /* Check external IRQs */
-    for (int i = 0; i < 8; i++) {
-        uint32_t pending_enabled = nvic->ispr[i] & nvic->iser[i];
-        if (pending_enabled == 0) continue;
-        for (int bit = 0; bit < 32; bit++) {
-            if (pending_enabled & (1u << bit)) {
-                int irq = i * 32 + bit;
-                int exc = irq + 16;
-                int prio = arm_nvic_get_priority(nvic, exc);
-                if (prio < best_prio) {
-                    best_prio = prio;
-                    best_exc = exc;
+        /* Check external IRQs */
+        for (int i = 0; i < 8; i++) {
+            uint32_t pending_enabled = nvic->ispr[i] & nvic->iser[i];
+            if (pending_enabled == 0) continue;
+            for (int bit = 0; bit < 32; bit++) {
+                if (pending_enabled & (1u << bit)) {
+                    int irq = i * 32 + bit;
+                    int exc = irq + 16;
+                    int prio = arm_nvic_get_priority(nvic, exc);
+                    if (prio < best_prio) {
+                        best_prio = prio;
+                        best_exc = exc;
+                    }
                 }
             }
         }
+        nvic->scan_exc   = best_exc;
+        nvic->scan_prio  = best_prio;
+        nvic->scan_valid = true;
     }
 
     if (best_exc < 0) {
@@ -306,6 +337,7 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
         if (best_prio >= active_prio) return; /* Cannot preempt, stay pending */
     }
     nvic->has_pending = false;
+    nvic->scan_valid = false;   /* we consume the pending bit below */
 
     /* Clear pending bit */
     if (best_exc >= 16) {

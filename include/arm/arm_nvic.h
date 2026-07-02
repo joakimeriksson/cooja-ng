@@ -61,6 +61,16 @@ typedef struct arm_nvic {
     /* Flag: set when there may be serviceable pending interrupts.
      * Checked in the main execution loop to avoid scanning ISPR on every insn. */
     bool      has_pending;
+
+    /* Memo of the last full pending scan: the winning (exception, priority)
+     * pair, valid until any pending/enable/priority state mutates.  While an
+     * exception stays pending but MASKED (BASEPRI critical section, or the
+     * running handler can't be preempted — TSCH spends whole slots there),
+     * arm_step re-checks every instruction; without this memo each re-check
+     * re-scanned all 8 ISPR words + priorities (~14% of simulation time). */
+    bool      scan_valid;
+    int       scan_exc;    /* -1 = nothing pending+enabled */
+    int       scan_prio;
 } arm_nvic_t;
 
 /* Initialize NVIC and register IO regions */

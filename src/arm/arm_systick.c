@@ -26,6 +26,7 @@ static void systick_fire(void *user_data, arm_event_t *ev) {
     /* Generate interrupt if TICKINT is set */
     if (st->csr & SYST_CSR_TICKINT) {
         st->nvic->pending_exception = EXC_SYSTICK;
+        st->nvic->scan_valid = false;
         st->nvic->has_pending = true;
         arm_nvic_check_pending(st->nvic);
     }
