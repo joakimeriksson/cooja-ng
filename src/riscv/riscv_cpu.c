@@ -28,10 +28,17 @@
 #define CAUSE_BREAKPOINT       3
 #define CAUSE_ECALL_M          11
 
+/* Memoized compressed-op expansion: rvc_expand(c) (defined below) is a pure
+ * function of the 16-bit word, and hot loops replay a handful of them, so cache
+ * word -> 32-bit form (0xFFFFFFFF = not yet computed; 0 = illegal). */
+static uint32_t rvc_cache[65536];
+static int      rvc_cache_ready;
+
 void riscv_cpu_init(riscv_cpu_t *rv, struct arm_cpu *bus, uint32_t initpc) {
     memset(rv, 0, sizeof(*rv));
     rv->bus = bus;
     rv->pc  = initpc;
+    if (!rvc_cache_ready) { memset(rvc_cache, 0xFF, sizeof(rvc_cache)); rvc_cache_ready = 1; }
 }
 
 /* --- memory: borrow the host bus so SRAM + IO are shared with the M33 --- */
@@ -167,6 +174,12 @@ static uint32_t rvc_expand(uint16_t ci) {
     return 0;
 }
 
+static inline uint32_t rvc_lookup(uint16_t c) {
+    uint32_t v = rvc_cache[c];
+    if (v == 0xFFFFFFFFu) { v = rvc_expand(c); rvc_cache[c] = v; }
+    return v;
+}
+
 /* Machine-mode interrupt: take the highest-priority enabled+pending IRQ,
  * entering via mtvec (direct mode, which the nrf-vpr firmware uses). Also wakes
  * the hart from WFI (rv->halted). Standard RISC-V trap entry: MPIE<-MIE, MIE<-0,
@@ -196,25 +209,24 @@ static int riscv_take_pending_irq(riscv_cpu_t *rv) {
 int riscv_step(riscv_cpu_t *rv, int n) {
     int i;
     for (i = 0; i < n; i++) {
-        if (riscv_take_pending_irq(rv)) continue; /* also un-halts on wake */
+        if ((rv->mip & rv->mie) && riscv_take_pending_irq(rv)) continue; /* rare; also un-halts */
         if (rv->halted) break;
 
         uint32_t pc = rv->pc;
         if (pc & 1u) { take_trap(rv, CAUSE_INSN_MISALIGNED, pc, pc); continue; }
 
-        /* Fetch: a 16-bit compressed op (low 2 bits != 0b11) expands to its
-         * 32-bit form; otherwise a full 32-bit word. */
-        uint32_t insn = ld16(rv, pc);
-        uint32_t next;
-        if ((insn & 3u) == 3u) {
-            /* 32-bit op: with the C extension it may be only 2-byte aligned, so
-             * read the high half separately — a single ld32 would 4-byte-align
-             * and fetch the wrong word. */
-            insn |= (uint32_t)ld16(rv, pc + 2u) << 16;
+        /* Fetch. Fast path: a 4-byte-aligned PC does one ld32 (covers a full
+         * 32-bit op, or a compressed op in its low half). Only a 2-byte-aligned
+         * PC — possible under the C extension — needs the split 16+16 read, and
+         * only then for a full 32-bit op (a single ld32 would misalign). */
+        uint32_t insn, next;
+        uint32_t lo = (pc & 2u) ? ld16(rv, pc) : ld32(rv, pc);
+        if ((lo & 3u) == 3u) {                       /* 32-bit op */
+            insn = (pc & 2u) ? (lo | ((uint32_t)ld16(rv, pc + 2u) << 16)) : lo;
             next = pc + 4u;
-        } else {
-            uint32_t comp = insn;
-            insn = rvc_expand((uint16_t)comp);
+        } else {                                     /* 16-bit compressed */
+            uint32_t comp = lo & 0xffffu;
+            insn = rvc_lookup((uint16_t)comp);
             if (insn == 0u) { take_trap(rv, CAUSE_ILLEGAL_INSN, comp, pc); continue; }
             next = pc + 2u;
         }
