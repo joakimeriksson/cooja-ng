@@ -206,8 +206,13 @@ int riscv_step(riscv_cpu_t *rv, int n) {
          * 32-bit form; otherwise a full 32-bit word. */
         uint32_t insn = ld16(rv, pc);
         uint32_t next;
-        if ((insn & 3u) == 3u) { insn = ld32(rv, pc); next = pc + 4u; }
-        else {
+        if ((insn & 3u) == 3u) {
+            /* 32-bit op: with the C extension it may be only 2-byte aligned, so
+             * read the high half separately — a single ld32 would 4-byte-align
+             * and fetch the wrong word. */
+            insn |= (uint32_t)ld16(rv, pc + 2u) << 16;
+            next = pc + 4u;
+        } else {
             uint32_t comp = insn;
             insn = rvc_expand((uint16_t)comp);
             if (insn == 0u) { take_trap(rv, CAUSE_ILLEGAL_INSN, comp, pc); continue; }
