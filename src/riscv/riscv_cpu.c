@@ -87,6 +87,86 @@ static void take_trap(riscv_cpu_t *rv, uint32_t cause, uint32_t tval, uint32_t e
     rv->trap_pc = epc;
 }
 
+/* ---- RV32C: expand a 16-bit compressed insn to its 32-bit equivalent ----
+ * The FLPR blob is built -march=rv32emc, so gcc emits compressed ops. Rather
+ * than a second decoder, decompress each to its canonical 32-bit form and run
+ * the existing path. Returns 0 (an illegal encoding) for reserved/unsupported
+ * forms. 3-bit reg fields map to x8..x15 (fine for RV32E). */
+#define CB(x,b)        (((uint32_t)(x) >> (b)) & 1u)
+#define CBITS(x,hi,lo) (((uint32_t)(x) >> (lo)) & ((1u << ((hi)-(lo)+1)) - 1u))
+static inline uint32_t rvc_sext(uint32_t v, int bits) { uint32_t m = 1u << (bits-1); return (v ^ m) - m; }
+static inline uint32_t enc_i(uint32_t op,uint32_t rd,uint32_t f3,uint32_t rs1,uint32_t imm){
+    return op | (rd<<7) | (f3<<12) | (rs1<<15) | ((imm & 0xfffu)<<20); }
+static inline uint32_t enc_r(uint32_t op,uint32_t rd,uint32_t f3,uint32_t rs1,uint32_t rs2,uint32_t f7){
+    return op | (rd<<7) | (f3<<12) | (rs1<<15) | (rs2<<20) | (f7<<25); }
+static inline uint32_t enc_s(uint32_t op,uint32_t f3,uint32_t rs1,uint32_t rs2,uint32_t imm){
+    return op | ((imm&0x1fu)<<7) | (f3<<12) | (rs1<<15) | (rs2<<20) | (((imm>>5)&0x7fu)<<25); }
+static inline uint32_t enc_b(uint32_t op,uint32_t f3,uint32_t rs1,uint32_t rs2,uint32_t imm){
+    return op | (((imm>>11)&1u)<<7)|(((imm>>1)&0xfu)<<8)|(f3<<12)|(rs1<<15)|(rs2<<20)
+             |(((imm>>5)&0x3fu)<<25)|(((imm>>12)&1u)<<31); }
+static inline uint32_t enc_j(uint32_t op,uint32_t rd,uint32_t imm){
+    return op | (rd<<7) | (((imm>>12)&0xffu)<<12)|(((imm>>11)&1u)<<20)
+             |(((imm>>1)&0x3ffu)<<21)|(((imm>>20)&1u)<<31); }
+
+static uint32_t rvc_expand(uint16_t ci) {
+    uint32_t c = ci;
+    uint32_t f3 = CBITS(c,15,13);
+    uint32_t rdp = 8u + CBITS(c,9,7), rs2p = 8u + CBITS(c,4,2);
+    uint32_t rd = CBITS(c,11,7), rs2 = CBITS(c,6,2);
+    /* CJ / CB format immediates */
+    uint32_t immj = (CB(c,12)<<11)|(CB(c,11)<<4)|(CBITS(c,10,9)<<8)|(CB(c,8)<<10)
+                  |(CB(c,7)<<6)|(CB(c,6)<<7)|(CBITS(c,5,3)<<1)|(CB(c,2)<<5);
+    uint32_t immb = (CB(c,12)<<8)|(CBITS(c,11,10)<<3)|(CBITS(c,6,5)<<6)|(CBITS(c,4,3)<<1)|(CB(c,2)<<5);
+    uint32_t sh = (CB(c,12)<<5)|CBITS(c,6,2);
+    switch (c & 3u) {
+    case 0: switch (f3) {
+        case 0: { uint32_t imm=(CBITS(c,10,7)<<6)|(CBITS(c,12,11)<<4)|(CB(c,5)<<3)|(CB(c,6)<<2);
+                  return imm ? enc_i(0x13, 8u+CBITS(c,4,2), 0, 2, imm) : 0; } /* C.ADDI4SPN */
+        case 2: { uint32_t off=(CB(c,5)<<6)|(CBITS(c,12,10)<<3)|(CB(c,6)<<2);
+                  return enc_i(0x03, 8u+CBITS(c,4,2), 2, rdp, off); }          /* C.LW */
+        case 6: { uint32_t off=(CB(c,5)<<6)|(CBITS(c,12,10)<<3)|(CB(c,6)<<2);
+                  return enc_s(0x23, 2, rdp, rs2p, off); }                     /* C.SW */
+        default: return 0; }
+    case 1: switch (f3) {
+        case 0: return enc_i(0x13, rd, 0, rd, rvc_sext(sh,6));                 /* C.ADDI/NOP */
+        case 1: return enc_j(0x6f, 1, rvc_sext(immj,12));                      /* C.JAL (RV32) */
+        case 2: return enc_i(0x13, rd, 0, 0, rvc_sext(sh,6));                  /* C.LI */
+        case 3:
+            if (rd==2) { uint32_t imm=(CB(c,12)<<9)|(CBITS(c,4,3)<<7)|(CB(c,5)<<6)|(CB(c,2)<<5)|(CB(c,6)<<4);
+                         return imm ? enc_i(0x13,2,0,2,rvc_sext(imm,10)) : 0; } /* C.ADDI16SP */
+            else       { uint32_t nz=(CB(c,12)<<5)|CBITS(c,6,2);
+                         return nz ? (0x37u|(rd<<7)|((rvc_sext(nz,6)<<12)&0xfffff000u)) : 0; } /* C.LUI */
+        case 4: { uint32_t f2=CBITS(c,11,10);
+            if (f2==0) return enc_i(0x13, rdp, 5, rdp, sh & 0x1fu);            /* C.SRLI */
+            if (f2==1) return enc_i(0x13, rdp, 5, rdp, 0x400u|(sh & 0x1fu));   /* C.SRAI */
+            if (f2==2) return enc_i(0x13, rdp, 7, rdp, rvc_sext(sh,6));        /* C.ANDI */
+            if (CB(c,12)) return 0;                                            /* SUBW/ADDW: RV64 */
+            switch (CBITS(c,6,5)) {
+            case 0: return enc_r(0x33, rdp, 0, rdp, rs2p, 0x20);               /* C.SUB */
+            case 1: return enc_r(0x33, rdp, 4, rdp, rs2p, 0x00);               /* C.XOR */
+            case 2: return enc_r(0x33, rdp, 6, rdp, rs2p, 0x00);               /* C.OR  */
+            default:return enc_r(0x33, rdp, 7, rdp, rs2p, 0x00); }             /* C.AND */
+        }
+        case 5: return enc_j(0x6f, 0, rvc_sext(immj,12));                     /* C.J */
+        case 6: return enc_b(0x63, 0, rdp, 0, rvc_sext(immb,9));              /* C.BEQZ */
+        default:return enc_b(0x63, 1, rdp, 0, rvc_sext(immb,9)); }            /* C.BNEZ */
+    case 2: switch (f3) {
+        case 0: return enc_i(0x13, rd, 1, rd, sh & 0x1fu);                    /* C.SLLI */
+        case 2: { uint32_t off=(CBITS(c,3,2)<<6)|(CB(c,12)<<5)|(CBITS(c,6,4)<<2);
+                  return enc_i(0x03, rd, 2, 2, off); }                        /* C.LWSP */
+        case 4:
+            if (!CB(c,12)) return rs2 ? enc_r(0x33,rd,0,0,rs2,0)              /* C.MV */
+                                      : enc_i(0x67,0,0,rd,0);                 /* C.JR */
+            if (rd==0 && rs2==0) return enc_i(0x73,0,0,0,1);                  /* C.EBREAK */
+            return rs2 ? enc_r(0x33,rd,0,rd,rs2,0)                            /* C.ADD */
+                       : enc_i(0x67,1,0,rd,0);                               /* C.JALR */
+        case 6: { uint32_t off=(CBITS(c,8,7)<<6)|(CBITS(c,12,9)<<2);
+                  return enc_s(0x23, 2, 2, rs2, off); }                       /* C.SWSP */
+        default: return 0; }
+    }
+    return 0;
+}
+
 /* Machine-mode interrupt: take the highest-priority enabled+pending IRQ,
  * entering via mtvec (direct mode, which the nrf-vpr firmware uses). Also wakes
  * the hart from WFI (rv->halted). Standard RISC-V trap entry: MPIE<-MIE, MIE<-0,
@@ -122,9 +202,18 @@ int riscv_step(riscv_cpu_t *rv, int n) {
         uint32_t pc = rv->pc;
         if (pc & 1u) { take_trap(rv, CAUSE_INSN_MISALIGNED, pc, pc); continue; }
 
-        uint32_t insn = ld32(rv, pc);
+        /* Fetch: a 16-bit compressed op (low 2 bits != 0b11) expands to its
+         * 32-bit form; otherwise a full 32-bit word. */
+        uint32_t insn = ld16(rv, pc);
+        uint32_t next;
+        if ((insn & 3u) == 3u) { insn = ld32(rv, pc); next = pc + 4u; }
+        else {
+            uint32_t comp = insn;
+            insn = rvc_expand((uint16_t)comp);
+            if (insn == 0u) { take_trap(rv, CAUSE_ILLEGAL_INSN, comp, pc); continue; }
+            next = pc + 2u;
+        }
         rv->cycles++;
-
 
         uint32_t opcode = insn & 0x7fu;
         uint32_t rd     = (insn >> 7)  & 0x1fu;
@@ -132,7 +221,6 @@ int riscv_step(riscv_cpu_t *rv, int n) {
         uint32_t rs2    = (insn >> 20) & 0x1fu;
         uint32_t funct3 = (insn >> 12) & 7u;
         uint32_t funct7 = (insn >> 25) & 0x7fu;
-        uint32_t next   = pc + 4u;
 
         #define R(idx)     (rv->x[(idx)])
         #define SET(d, v)  do { if (d) rv->x[(d)] = (uint32_t)(v); } while (0)
@@ -227,10 +315,23 @@ int riscv_step(riscv_cpu_t *rv, int n) {
             break;
         }
         case 0x33: { /* OP (register-register) */
-            if (funct7 == 0x01) { /* M extension is absent on rv32e here */
-                take_trap(rv, CAUSE_ILLEGAL_INSN, insn, pc); goto cont;
-            }
             uint32_t a = R(rs1), b = R(rs2), v;
+            if (funct7 == 0x01) { /* RV32M: mul / div / rem */
+                switch (funct3) {
+                case 0: v = (uint32_t)((int32_t)a * (int32_t)b); break;                         /* MUL    */
+                case 1: v = (uint32_t)(((int64_t)(int32_t)a * (int64_t)(int32_t)b) >> 32); break;/* MULH   */
+                case 2: v = (uint32_t)(((int64_t)(int32_t)a * (int64_t)b) >> 32); break;         /* MULHSU */
+                case 3: v = (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32); break;                /* MULHU  */
+                case 4: { int32_t x=(int32_t)a,y=(int32_t)b;                                     /* DIV    */
+                          v = (y==0)?0xffffffffu:(x==(int32_t)0x80000000u&&y==-1)?(uint32_t)x:(uint32_t)(x/y); break; }
+                case 5: v = (b==0)?0xffffffffu:a/b; break;                                       /* DIVU   */
+                case 6: { int32_t x=(int32_t)a,y=(int32_t)b;                                     /* REM    */
+                          v = (y==0)?a:(x==(int32_t)0x80000000u&&y==-1)?0u:(uint32_t)(x%y); break; }
+                default:v = (b==0)?a:a%b; break;                                                 /* REMU   */
+                }
+                SET(rd, v);
+                break;
+            }
             switch (funct3) {
                 case 0: v = (funct7 & 0x20) ? a - b : a + b; break;    /* SUB/ADD */
                 case 1: v = a << (b & 31); break;                      /* SLL  */
