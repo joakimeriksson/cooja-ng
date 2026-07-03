@@ -191,6 +191,7 @@ static int riscv_take_pending_irq(riscv_cpu_t *rv) {
     uint32_t cause = (irq & (1u << 11)) ? 11u    /* machine external */
                    : (irq & (1u << 7))  ? 7u     /* machine timer    */
                                         : 3u;    /* machine software */
+    rv->mip &= ~(1u << cause);  /* edge-ack: the source re-asserts per event */
     rv->halted = 0;
     rv->mepc   = rv->pc;
     rv->mcause = 0x80000000u | cause;
