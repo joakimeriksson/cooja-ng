@@ -87,9 +87,36 @@ static void take_trap(riscv_cpu_t *rv, uint32_t cause, uint32_t tval, uint32_t e
     rv->trap_pc = epc;
 }
 
+/* Machine-mode interrupt: take the highest-priority enabled+pending IRQ,
+ * entering via mtvec (direct mode, which the nrf-vpr firmware uses). Also wakes
+ * the hart from WFI (rv->halted). Standard RISC-V trap entry: MPIE<-MIE, MIE<-0,
+ * MPP<-M, mepc<-pc, mcause<-(interrupt|cause). Returns 1 if an IRQ was taken. */
+#define RV_MSTATUS_MIE  (1u << 3)
+static int riscv_take_pending_irq(riscv_cpu_t *rv) {
+    uint32_t irq = rv->mip & rv->mie;
+    if (!irq || !(rv->mstatus & RV_MSTATUS_MIE)) return 0;
+    uint32_t cause = (irq & (1u << 11)) ? 11u    /* machine external */
+                   : (irq & (1u << 7))  ? 7u     /* machine timer    */
+                                        : 3u;    /* machine software */
+    rv->halted = 0;
+    rv->mepc   = rv->pc;
+    rv->mcause = 0x80000000u | cause;
+    rv->mtval  = 0;
+    uint32_t st  = rv->mstatus;
+    uint32_t mie = (st >> 3) & 1u;
+    st = (st & ~(1u << 7)) | (mie << 7);   /* MPIE <- MIE */
+    st = (st & ~(1u << 3));                 /* MIE  <- 0   */
+    st |= (3u << 11);                        /* MPP  <- M   */
+    rv->mstatus = st;
+    rv->pc      = rv->mtvec & ~3u;           /* direct mode */
+    rv->trap_pc = rv->mepc;
+    return 1;
+}
+
 int riscv_step(riscv_cpu_t *rv, int n) {
     int i;
     for (i = 0; i < n; i++) {
+        if (riscv_take_pending_irq(rv)) continue; /* also un-halts on wake */
         if (rv->halted) break;
 
         uint32_t pc = rv->pc;
@@ -239,7 +266,14 @@ int riscv_step(riscv_cpu_t *rv, int n) {
                     rv->mstatus = st;
                     next = rv->mepc;
                 }
-                /* WFI (0x105) and other privileged hints: treat as nop. */
+                else if (imm12 == 0x105) {      /* WFI: idle until an IRQ    */
+                    /* Retire wfi (pc already advanced to next), then halt; the
+                     * top-of-loop IRQ check un-halts and vectors when an enabled
+                     * interrupt becomes pending. Skips burning the co-step budget
+                     * while idle — the whole point of the fix. */
+                    rv->halted = 1;
+                }
+                /* other privileged hints: treat as nop. */
             } else {
                 /* Zicsr: CSRRW/S/C and immediate forms. */
                 uint32_t csr = insn >> 20;
