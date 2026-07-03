@@ -170,6 +170,10 @@ typedef struct arm_cpu {
      * NULL on every SoC that has no co-processor. */
     void  *coproc;
     void (*coproc_step)(void *coproc, int64_t delta_cycles);
+    /* Raise an interrupt on the coprocessor (set the given machine-interrupt
+     * pending bit + wake it from WFI). The nRF54L15 GRTC calls this when a
+     * compare in the FLPR's IRQ group (INTEN0 / GRTC_0) fires. */
+    void (*coproc_raise_irq)(void *coproc, uint32_t mip_bit);
 
     /* Cortex-M4F VFP — single-precision (32 × s0..s31). Stored as raw
      * 32-bit words; arm_vfp.c interprets them per the IEEE 754 binary32

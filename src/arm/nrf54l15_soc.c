@@ -487,6 +487,11 @@ static void nrf54l_grtc_compare_fire(void *user_data, cpu_event_t *event) {
     if (grtc->inten & (1u << idx)) {
         arm_nvic_set_pending(&grtc->plat->nvic, grtc->irq_num);
     }
+    /* FLPR's IRQ group (INTEN0 / GRTC_0): raise the RV32E machine external
+     * interrupt + wake it from WFI. Zephyr drives the VPR system tick exactly
+     * this way (nrf_grtc_timer on GRTC_0). The firmware's mie/MIE gate it. */
+    if ((grtc->inten_flpr & (1u << idx)) && grtc->plat->cpu.coproc_raise_irq)
+        grtc->plat->cpu.coproc_raise_irq(grtc->plat->cpu.coproc, 1u << 11); /* MEIP */
     /* Publish on the DPPI channel configured by PUBLISH_COMPARE[idx]
      * (bit 31 = EN, bits 4..0 = channel ID).  This is how MPSL routes
      * GRTC ticks to RADIO TASKS_TXEN / _RXEN. */
@@ -670,6 +675,11 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF54L_GRTC_INTEN2:    grtc->inten  = value;          break;
         case NRF54L_GRTC_INTENSET2: grtc->inten |= value;          break;
         case NRF54L_GRTC_INTENCLR2: grtc->inten &= ~value;         break;
+        /* INTEN0 = the FLPR's IRQ group (GRTC_0). Compares enabled here fire to
+         * the RV32E core, not the M33 NVIC. */
+        case NRF54L_GRTC_INTEN0:    grtc->inten_flpr  = value;     break;
+        case NRF54L_GRTC_INTENSET0: grtc->inten_flpr |= value;     break;
+        case NRF54L_GRTC_INTENCLR0: grtc->inten_flpr &= ~value;    break;
         default:
             /* Accept SHORTS, PUBLISH/SUBSCRIBE, MODE, INTEN0/1/3,
              * TASKS_CAPTURE[n], etc. as no-ops. */

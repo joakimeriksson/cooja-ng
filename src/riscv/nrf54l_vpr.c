@@ -22,6 +22,16 @@ static void flpr_costep(void *coproc, int64_t delta_cycles) {
     riscv_step_until(rv, rv->cycles + delta_cycles);
 }
 
+/* GRTC (or any SoC peripheral in the FLPR's IRQ group) raises an interrupt:
+ * latch the pending bit and wake the hart from WFI. The firmware's mie /
+ * mstatus.MIE gate whether it is actually taken. */
+static void flpr_raise_irq(void *coproc, uint32_t mip_bit) {
+    riscv_cpu_t *rv = (riscv_cpu_t *)coproc;
+    if (!rv) return;
+    rv->mip   |= mip_bit;
+    rv->halted = 0;
+}
+
 void nrf54l_vpr_launch(nrf54l_vpr_state_t *vpr) {
     if (vpr->launched) return;
 
@@ -34,8 +44,9 @@ void nrf54l_vpr_launch(nrf54l_vpr_state_t *vpr) {
 
     vpr->flpr     = rv;
     vpr->launched = 1;
-    plat->cpu.coproc      = rv;
-    plat->cpu.coproc_step = flpr_costep;
+    plat->cpu.coproc          = rv;
+    plat->cpu.coproc_step     = flpr_costep;
+    plat->cpu.coproc_raise_irq = flpr_raise_irq;
 
     fprintf(stderr, "[VPR] FLPR (RV32E) started at INITPC=0x%08x\n",
             vpr->initpc);

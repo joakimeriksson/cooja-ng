@@ -162,7 +162,8 @@ typedef struct nrf54l_grtc_state {
     nrf54l_grtc_cc_t     cc[NRF54L_GRTC_NUM_CC];
     uint32_t             evt_compare[NRF54L_GRTC_NUM_CC];
     uint32_t             publish_compare[NRF54L_GRTC_NUM_CC];  /* PUBLISH_COMPARE[n] */
-    uint32_t             inten;          /* INTEN0 — bit n = COMPARE[n] */
+    uint32_t             inten;          /* INTEN2 (app-core, GRTC_2) — bit n = COMPARE[n] */
+    uint32_t             inten_flpr;     /* INTEN0 (FLPR, GRTC_0) — routes to the RV32E core */
     uint32_t             captured_lo;    /* SYSCOUNTERL latched value */
     uint32_t             captured_hi;    /* SYSCOUNTERH latched value */
     int                  irq_num;        /* GRTC_2_IRQn = 228 */
