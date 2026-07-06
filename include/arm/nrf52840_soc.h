@@ -193,6 +193,13 @@ typedef struct nrf_radio_state {
     int      rx_phase;         /* nrf_rx_phase_t enum */
     int      rx_remaining;
     int      rx_offset;
+    /* Honest FCS check over the delivered byte stream: running CCITT-16
+     * (bit-reversed 802.15.4 idiom) over the MPDU, plus the two received
+     * FCS bytes.  crcstatus backs the CRCSTATUS register (1 = last frame
+     * OK) so interleaved/garbled frames fail CRC exactly as on silicon. */
+    uint16_t rx_crc;
+    uint8_t  rx_fcs[2];
+    uint32_t crcstatus;
     /* Cooja-style per-byte delivery: an auto-ACK arriving 192 µs after
      * our own TX can land before the driver has flipped state back to
      * RX.  Buffer bytes received outside RX state and replay them when

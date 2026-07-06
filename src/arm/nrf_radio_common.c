@@ -26,9 +26,13 @@ bool nrf_radio_emit_ieee802154_frame(arm_cpu_t *cpu, uint32_t packetptr,
     for (int i = 0; i < payload_len; i++)
         payload[i] = arm_read8(cpu, packetptr + 1 + (uint32_t)i);
 
+    /* True IEEE 802.15.4 FCS (LSB-first CCITT-16, computed via the
+     * bit-reversal idiom) — the same on-air convention CC2420/CC2538
+     * and the native frame-to-bytes bridge use, so receivers can
+     * verify one common FCS regardless of the sender's radio model. */
     uint16_t crc = 0;
     for (int i = 0; i < payload_len; i++)
-        crc = ieee802154_crc_add(crc, payload[i]);
+        crc = ieee802154_crc_add_bitrev(crc, payload[i]);
 
     for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
         cb(cb_user, IEEE802154_PREAMBLE_BYTE);
@@ -36,7 +40,7 @@ bool nrf_radio_emit_ieee802154_frame(arm_cpu_t *cpu, uint32_t packetptr,
     cb(cb_user, phr);
     for (int i = 0; i < payload_len; i++)
         cb(cb_user, payload[i]);
-    cb(cb_user, (uint8_t)(crc & 0xFF));
-    cb(cb_user, (uint8_t)((crc >> 8) & 0xFF));
+    cb(cb_user, ieee802154_bitrev((uint8_t)((crc >> 8) & 0xFF)));
+    cb(cb_user, ieee802154_bitrev((uint8_t)(crc & 0xFF)));
     return true;
 }

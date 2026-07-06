@@ -1011,7 +1011,6 @@ static void nrf54l_radio_emit_tx(nrf54l_radio_state_t *r);
 
 /* CCITT-16 CRC matching IEEE 802.15.4 FCS — shared with cc2420 /
  * cc2538_rfcore / nrf52840 via ieee_802154.h. */
-#define nrf54l_crc_add(crc, data) ieee802154_crc_add((crc), (data))
 
 /* NRF54L_RADIO_TRACE=1 — driver-level trace of radio activity (state
  * transitions, tasks, events, IRQs).  Cached on first call.  Optionally
@@ -1535,6 +1534,7 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
             arm_write8(cpu, r->packetptr, byte);
             r->rx_remaining = byte;
             r->rx_offset    = 1;
+            r->rx_crc       = 0;
             r->rx_phase     = NRF54L_RX_READ_PAYLOAD;
             /* nrf_802154 typically programs BCC=8 (after FRAMESTART) so it
              * gets a BCMATCH the moment PHR is in the buffer. The check
@@ -1551,6 +1551,10 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
             break;
         case NRF54L_RX_READ_PAYLOAD:
             arm_write8(cpu, r->packetptr + (uint32_t)r->rx_offset, byte);
+            if (r->rx_remaining > 2)
+                r->rx_crc = ieee802154_crc_add_bitrev(r->rx_crc, byte);
+            else
+                r->rx_fcs[2 - r->rx_remaining] = byte;
             r->rx_offset++;
             r->rx_remaining--;
             /* BCMATCH fires when BCC bits have been received.  BCC is in
@@ -1565,10 +1569,20 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
                 nrf54l_radio_fire_event(r, &r->evt_bcmatch, INT_BCMATCH, PUB_BCMATCH);
             }
             if (r->rx_remaining == 0) {
+                /* Frame complete — verify the FCS over the delivered
+                 * bytes so collision-garbled assemblies fail CRC exactly
+                 * as on silicon (see nrf52840_soc.c). */
+                int crc_ok =
+                    r->rx_fcs[0] == ieee802154_bitrev((uint8_t)((r->rx_crc >> 8) & 0xFF)) &&
+                    r->rx_fcs[1] == ieee802154_bitrev((uint8_t)(r->rx_crc & 0xFF));
+                r->crcstatus = crc_ok ? 1 : 0;
                 nrf54l_radio_fire_event(r, &r->evt_payload,  INT_PAYLOAD,  PUB_PAYLOAD);
                 nrf54l_radio_fire_event(r, &r->evt_end,      INT_END,      PUB_END);
                 nrf54l_radio_fire_event(r, &r->evt_phyend,   INT_PHYEND,   PUB_PHYEND);
-                nrf54l_radio_fire_event(r, &r->evt_crcok,    INT_CRCOK,    PUB_CRCOK);
+                if (crc_ok)
+                    nrf54l_radio_fire_event(r, &r->evt_crcok,    INT_CRCOK,    PUB_CRCOK);
+                else
+                    nrf54l_radio_fire_event(r, &r->evt_crcerror, INT_CRCERROR, PUB_CRCERROR);
 
                 /* No hardware-style auto-ACK: the Nordic 802.15.4 driver
                  * schedules its own ACK via TIMER+PPI in response to
@@ -1636,7 +1650,7 @@ static int nrf54l_radio_read(void *user_data, uint32_t addr) {
         case R_CRCINIT:             return (int)r->crcinit;
         case R_PACKETPTR:           return (int)r->packetptr;
         case R_BCC:                 return (int)r->bcc;
-        case R_CRCSTATUS:           return 1;     /* always CRC OK */
+        case R_CRCSTATUS:           return (int)r->crcstatus;
         case R_RXMATCH:             return 0;
         default:                    return 0;
     }

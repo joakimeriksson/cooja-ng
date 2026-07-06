@@ -757,7 +757,6 @@ static void radio_set_state(nrf52840_soc_t *soc, uint32_t new_state);
 static void radio_event(nrf52840_soc_t *soc, uint32_t *evt_field, uint32_t int_mask);
 static void radio_emit_tx(nrf52840_soc_t *soc);
 
-#define nrf_crc_add(crc, data) ieee802154_crc_add((crc), (data))
 
 void nrf_ppi_event_notify(nrf52840_soc_t *soc, uint32_t event_addr);
 
@@ -1196,7 +1195,7 @@ static int nrf_radio_read(void *user_data, uint32_t addr) {
         case RADIO_SHORTS:       return (int)r->shorts;
         case RADIO_INTENSET:
         case RADIO_INTENCLR:     return (int)r->intenset;
-        case RADIO_CRCSTATUS:    return 1;          /* always OK */
+        case RADIO_CRCSTATUS:    return (int)r->crcstatus;
         case RADIO_PACKETPTR:    return (int)r->packetptr;
         case RADIO_FREQUENCY:    return (int)r->frequency;
         case RADIO_TXPOWER:      return (int)r->txpower;
@@ -1377,16 +1376,27 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
             arm_write8(cpu, r->packetptr, byte);
             r->rx_remaining = byte;          /* PHR includes 2 FCS bytes */
             r->rx_offset    = 1;
+            r->rx_crc       = 0;
             r->rx_phase     = NRF_RX_READ_PAYLOAD;
             break;
         case NRF_RX_READ_PAYLOAD:
             arm_write8(cpu, r->packetptr + (uint32_t)r->rx_offset, byte);
+            if (r->rx_remaining > 2)
+                r->rx_crc = ieee802154_crc_add_bitrev(r->rx_crc, byte);
+            else
+                r->rx_fcs[2 - r->rx_remaining] = byte;
             r->rx_offset++;
             r->rx_remaining--;
             if (r->rx_remaining == 0) {
-                /* Frame complete. Always treat as CRC-OK for now —
-                 * generators sign their own CRCs and the medium drops
-                 * collided bytes already. */
+                /* Frame complete — verify the FCS over the bytes that
+                 * actually arrived.  Under collisions the per-byte medium
+                 * interleaves overlapping frames; on silicon those garbled
+                 * assemblies fail the hardware CRC and the driver never
+                 * sees them, so report CRCSTATUS honestly here too. */
+                int crc_ok =
+                    r->rx_fcs[0] == ieee802154_bitrev((uint8_t)((r->rx_crc >> 8) & 0xFF)) &&
+                    r->rx_fcs[1] == ieee802154_bitrev((uint8_t)(r->rx_crc & 0xFF));
+                r->crcstatus = crc_ok ? 1 : 0;
                 radio_event(soc, &r->evt_payload,  RADIO_INT_PAYLOAD);
                 radio_event(soc, &r->evt_end,      RADIO_INT_END);
                 /* PHYEND has no RX interrupt enabled (nrf_802154 keys RX off
@@ -1406,7 +1416,10 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                     r->state = NRF_RADIO_STATE_DISABLED;
                     r->evt_disabled = 1;
                 }
-                radio_event(soc, &r->evt_crcok,    RADIO_INT_CRCOK);
+                if (crc_ok)
+                    radio_event(soc, &r->evt_crcok,     RADIO_INT_CRCOK);
+                else
+                    radio_event(soc, &r->evt_crcerror,  RADIO_INT_CRCERROR);
                 radio_apply_shorts_after_event(soc, SHORT_END_START);
                 radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
 
@@ -1422,7 +1435,7 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                  *    after rx-complete), the staged fiction is cancelled
                  *    at TASKS_START — otherwise the two identical ACKs
                  *    interleaved on air and corrupted each other. */
-                if (soc->radio_tx_cb && r->rx_offset > 4) {
+                if (soc->radio_tx_cb && crc_ok && r->rx_offset > 4) {
                     uint8_t fcf0       = arm_read8(cpu, r->packetptr + 1);
                     uint8_t fcf1       = arm_read8(cpu, r->packetptr + 2);
                     uint8_t dsn        = arm_read8(cpu, r->packetptr + 3);
@@ -1433,9 +1446,9 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                         uint8_t ack_fcf0 = 0x02; /* frame type = ACK */
                         uint8_t ack_fcf1 = 0x00;
                         uint16_t crc = 0;
-                        crc = nrf_crc_add(crc, ack_fcf0);
-                        crc = nrf_crc_add(crc, ack_fcf1);
-                        crc = nrf_crc_add(crc, dsn);
+                        crc = ieee802154_crc_add_bitrev(crc, ack_fcf0);
+                        crc = ieee802154_crc_add_bitrev(crc, ack_fcf1);
+                        crc = ieee802154_crc_add_bitrev(crc, dsn);
                         int n = 0;
                         for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
                             r->ack_pending[n++] = IEEE802154_PREAMBLE_BYTE;
@@ -1444,8 +1457,8 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                         r->ack_pending[n++] = ack_fcf0;
                         r->ack_pending[n++] = ack_fcf1;
                         r->ack_pending[n++] = dsn;
-                        r->ack_pending[n++] = (uint8_t)(crc & 0xFF);
-                        r->ack_pending[n++] = (uint8_t)((crc >> 8) & 0xFF);
+                        r->ack_pending[n++] = ieee802154_bitrev((uint8_t)((crc >> 8) & 0xFF));
+                        r->ack_pending[n++] = ieee802154_bitrev((uint8_t)(crc & 0xFF));
                         r->ack_pending_len = n;
                         if (r->ack_event && soc->plat)
                             arm_schedule_event(&soc->plat->cpu,

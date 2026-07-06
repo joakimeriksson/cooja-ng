@@ -215,10 +215,19 @@ static void rfcore_strobe(cc2538_rfcore_t *rf, uint32_t strobe) {
                         memcpy(rf->rxfifo + rf->rxfifo_len,
                                rf->rx_incoming + frame_start, (size_t)total);
                         rf->rxfifo_len += total;
-                        /* Replace last 2 bytes with RSSI + CRC_OK|LQI */
-                        if (rf->rxfifo_len >= 2) {
+                        /* Replace last 2 bytes with RSSI + CRC_OK|LQI —
+                         * verifying the extracted frame's FCS first. */
+                        if (rf->rxfifo_len >= 2 && frame_len >= 2) {
+                            const uint8_t *mpdu = rf->rx_incoming + frame_start + 1;
+                            uint16_t crc = 0;
+                            for (int i = 0; i < frame_len - 2; i++)
+                                crc = crc_add_bitrev(crc, mpdu[i]);
+                            bool crc_ok =
+                                mpdu[frame_len - 2] == bitrev((crc >> 8) & 0xFF) &&
+                                mpdu[frame_len - 1] == bitrev(crc & 0xFF);
                             rf->rxfifo[rf->rxfifo_len - 2] = (uint8_t)(int8_t)(-50);
-                            rf->rxfifo[rf->rxfifo_len - 1] = 0x80 | 50;
+                            rf->rxfifo[rf->rxfifo_len - 1] =
+                                (uint8_t)((crc_ok ? 0x80 : 0x00) | 50);
                         }
                     }
                 }
@@ -735,6 +744,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
         case RF_RX_LENGTH:
             rf->rxlen = byte;
             rf->rx_byte_count = 0;
+            rf->rx_crc = 0;
             /* Write length byte to RXFIFO */
             if (rf->rxfifo_len < RF_RXFIFO_SIZE)
                 rf->rxfifo[rf->rxfifo_len++] = byte;
@@ -771,10 +781,25 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                 rf->rx_dsn = byte;
             }
 
+            /* Accumulate the FCS over the MPDU (all bytes except the
+             * trailing 2 FCS bytes) and latch the delivered FCS. */
+            if (rf->rx_byte_count < rf->rxlen - 2)
+                rf->rx_crc = crc_add_bitrev(rf->rx_crc, byte);
+            else if (rf->rx_byte_count == rf->rxlen - 2)
+                rf->rx_fcs[0] = byte;
+            else
+                rf->rx_fcs[1] = byte;
+
             rf->rx_byte_count++;
 
             /* Check if frame is complete */
             if (rf->rx_byte_count >= rf->rxlen) {
+                /* Verify the FCS over the bytes that actually arrived —
+                 * collision-interleaved assemblies must fail here just
+                 * as on silicon (hardware drops them via CRC_OK=0). */
+                bool crc_ok = rf->rxlen >= 2 &&
+                    rf->rx_fcs[0] == bitrev((rf->rx_crc >> 8) & 0xFF) &&
+                    rf->rx_fcs[1] == bitrev(rf->rx_crc & 0xFF);
                 /* Frame complete.  On real CC2538 hardware the last two
                  * FCS bytes in RXFIFO are replaced with metadata:
                  *   byte N-1 = RSSI (signed, we use a fixed value)
@@ -787,7 +812,8 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                     int lqi = (int)rf->rx_rssi + 110;
                     if (lqi < 20) lqi = 20;
                     if (lqi > 100) lqi = 100;
-                    rf->rxfifo[rf->rxfifo_len - 1] = (uint8_t)(0x80 | (lqi & 0x7F)); /* CRC_OK | LQI */
+                    rf->rxfifo[rf->rxfifo_len - 1] =
+                        (uint8_t)((crc_ok ? 0x80 : 0x00) | (lqi & 0x7F)); /* CRC_OK | LQI */
                 }
 
                 rf->rfirqf0 |= RFIRQF0_RXPKTDONE | RFIRQF0_FIFOP;
@@ -800,7 +826,7 @@ void cc2538_rfcore_receive_byte(cc2538_rfcore_t *rf, uint8_t byte) {
                  * we must NOT ACK.  This lets the sender's CSMA retransmit.
                  * ACK frame: preamble(4) + SFD(1) + len(1) + FCF(2) + DSN(1) + FCS(2) */
                 if ((rf->frmctrl0 & (1 << 5)) && rf->rx_ack_request &&
-                    rf->tx_callback && !rf->rx_overflow &&
+                    rf->tx_callback && !rf->rx_overflow && crc_ok &&
                     rfcore_dest_addr_matches(rf)) {
                     for (int i = 0; i < PREAMBLE_MIN; i++)
                         rf->tx_callback(rf->tx_user_data, 0x00);

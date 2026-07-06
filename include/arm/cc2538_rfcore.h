@@ -178,6 +178,8 @@ typedef struct cc2538_rfcore {
     int         zero_symbols;       /* Consecutive 0x00 preamble bytes */
     int         rxlen;              /* Expected frame length (from length byte) */
     int         rx_byte_count;      /* Bytes received in current frame payload */
+    uint16_t    rx_crc;             /* Running FCS over the delivered MPDU bytes */
+    uint8_t     rx_fcs[2];          /* Received FCS bytes (pre metadata overwrite) */
     uint8_t     rx_fcf0;            /* Frame Control Field byte 0 */
     uint8_t     rx_dsn;             /* Data Sequence Number */
     bool        rx_ack_request;     /* ACK requested in received frame */

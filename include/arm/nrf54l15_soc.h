@@ -240,6 +240,12 @@ typedef struct nrf54l_radio_state {
     int rx_phase;
     int rx_remaining;
     int rx_offset;
+    /* Honest FCS check over the delivered byte stream (see nrf52840):
+     * running CCITT-16 (bit-reversed 802.15.4 idiom) + received FCS
+     * bytes; crcstatus backs the CRCSTATUS register. */
+    uint16_t rx_crc;
+    uint8_t  rx_fcs[2];
+    uint32_t crcstatus;
     /* "Disable when frame ends." nrf_802154 issues TASKS_DISABLE from
      * its BCMATCH IRQ once the header has been parsed; on real HW the
      * in-flight bytes still finish their DMA write before the radio
