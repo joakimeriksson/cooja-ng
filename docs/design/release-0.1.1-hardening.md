@@ -1,8 +1,16 @@
 # Release Hardening Plan — 0.1.1 Stabilization
 
-Status: proposed (2026-07-07). Companion to [`refactor-plan.md`](refactor-plan.md).
+Status: in progress (2026-07-07). Companion to [`refactor-plan.md`](refactor-plan.md).
 Source: full subsystem audit (kernel / ARM / MSP430+common / motes-native-riscv /
 services-ui-runner), plus the radio-CRC fix already landed as `6bc0402`.
+
+**Progress:** Tranche A (A1–A6), Tranche B (B1–B7), Tranche C, and the §5 config
+triage (T4) are **done** and gated green on branch `fix/release-0.1.1-wave1`
+(6 commits). T3 (nRF54L15/nRF52840 multinode radio RX) is **root-caused**, left
+as a documented Known Issue (deep radio-timing work, not a release blocker).
+Remaining: the §4 stand-alone unit tests (ws-frame, elf-malformed, FLPR-WFI,
+NVIC-dual-pending, periodic-GPTimer — the fixes are integration-gated and DADD
+has its regression test), and §6 tag/PR. CHANGELOG `[0.1.1]` section written.
 
 ## 0. Framing and key decisions
 
