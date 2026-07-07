@@ -15,10 +15,18 @@ static int sys_ctrl_read(void *user_data, uint32_t addr) {
         case SYS_CTRL_CLOCK_CTRL: return (int)sc->clock_ctrl;
         case SYS_CTRL_CLOCK_STA: {
             uint32_t sta = sc->clock_sta;
-            if (sc->osc32k_pending > 0) {
-                sc->osc32k_pending--;
-                if (sc->osc32k_pending == 0)
-                    sc->clock_sta |= (1u << 26); /* OSC32K now stable */
+            /* OSC32K (32kHz osc, CLOCK_STA bit 26) self-stabilizes on read: a
+             * CLOCK_CTRL write (e.g. PM1/2 entry via select_16_mhz_rcosc) clears
+             * it; a couple of subsequent reads bring it back stable. Without this,
+             * lpm_exit()'s "wait for bit26 to clear, then set" poll on wake from
+             * PM1/2 spins forever (inside the rtimer ISR), wedging the node. The
+             * read returns the pre-update value so the firmware first observes it
+             * clear (its clear-wait passes) then set (its set-wait terminates). */
+            if (!(sc->clock_sta & (1u << 26))) {
+                if (++sc->osc32k_pending >= 2) {
+                    sc->clock_sta |= (1u << 26);
+                    sc->osc32k_pending = 0;
+                }
             }
             return (int)sta;
         }
@@ -57,14 +65,20 @@ static void sys_ctrl_write(void *user_data, uint32_t addr, uint32_t value) {
              *   [18]   HSOSC_STB  = 1 when RCOSC selected (OSC bit=1)
              *   [26]   OSC32K     = set after transition delay */
             {
-                int osc = (value >> 6) & 1;
-                sc->clock_sta = (value & 0x707) |           /* SYS_DIV, IO_DIV, OSC */
-                                (osc ? (1u << 18) : (1u << 19)); /* stable bit */
-                /* OSC32K transition: firmware expects bit 26 to be 0 first, then 1 */
-                if ((value >> 17) & 1)
-                    sc->osc32k_pending = 2; /* will set after 2 reads */
-                else
-                    sc->osc32k_pending = 0;
+                /* CLOCK_CTRL.OSC = bit 16 (SYS_CTRL_CLOCK_CTRL_OSC=0x10000):
+                 * 0=32MHz XOSC, 1=16MHz RCOSC. CLOCK_STA.OSC (also bit 16) must
+                 * mirror it so the firmware's select_16_mhz_rcosc()/
+                 * select_32_mhz_xosc() "wait for the switch" poll
+                 * (while(CLOCK_STA.OSC != selected)) terminates — otherwise a
+                 * cc2538 dropping to PM1/2 spins forever. The OSC switch is
+                 * modelled as instantaneous, so SOURCE_CHANGE (bit 20) stays 0. */
+                int osc = (value >> 16) & 1;
+                sc->clock_sta = (value & 0x707) |           /* SYS_DIV, IO_DIV */
+                                (osc ? ((1u << 18) | (1u << 16)) /* HSOSC_STB + OSC */
+                                     : (1u << 19));              /* XOSC_STB, OSC=0 */
+                /* clock_sta recompute above cleared OSC32K (bit 26); restart the
+                 * read-stabilization counter so it re-settles (see CLOCK_STA read). */
+                sc->osc32k_pending = 0;
             }
             /* Update CPU frequency */
             arm_cpu_set_frequency(sc->cpu, cc2538_sys_ctrl_get_sys_clock(sc));
@@ -106,7 +120,17 @@ uint32_t cc2538_sys_ctrl_get_sys_clock(cc2538_sys_ctrl_t *sc) {
      * CLOCK_CTRL.SYS_DIV[2:0] = divisor (0=32MHz, 1=16MHz, 2=8MHz, etc.)
      * OSC bit: 0=32MHz XOSC, 1=16MHz RCOSC */
     int sys_div = sc->clock_ctrl & 7;
-    int osc = (sc->clock_ctrl >> 6) & 1;
-    uint32_t base_freq = osc ? 16000000 : 32000000;
-    return base_freq >> sys_div;
+    /* CPU execution frequency is derived from the 32 MHz XOSC base, NOT the
+     * CLOCK_CTRL.OSC (bit 16) source-select. On silicon OSC=1 selects the 16 MHz
+     * HF-RCOSC, but firmware only does so transiently around PM1/2 entry, where
+     * the core is HALTED in deep sleep — it never executes a real workload at the
+     * RCOSC rate. This emulator does not halt the core in PM1/2 (it keeps stepping
+     * instructions), so honoring the RCOSC downshift made a node that dipped into
+     * lpm keep running its TSCH slot code at 8 MHz (16 MHz RCOSC >> SYS_DIV(1)),
+     * consuming 2x the sim-time and overshooting the (frequency-independent) rtimer
+     * slot deadlines every slot — the cc2538 TSCH "!dl-miss" storm that desynced the
+     * leaf. rtimer/SysTick time bases are frequency-independent, so pinning the CPU
+     * to the XOSC base is safe. The OSC bit is still mirrored into CLOCK_STA on a
+     * CLOCK_CTRL write so the firmware's switch-poll terminates (see sys_ctrl_write). */
+    return 32000000u >> sys_div;
 }
