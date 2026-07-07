@@ -22,6 +22,21 @@ extern "C" {
 /* RX frame queue for native-to-native delivery (replaces single pending slot) */
 #define NATIVE_RX_QUEUE_SIZE 8
 
+/* simIn/OutDataBuffer are COOJA_RADIO_BUFFER_SIZE (128) bytes each.  Frame
+ * lengths crossing the radio boundary are firmware-controlled (simOutSize) or
+ * medium-supplied and must be clamped to this before any copy — one helper so
+ * the direct fast path and the deferred queue path can't diverge. */
+#define COOJA_RADIO_FRAME_MAX 128
+/* Runaway guard for simLoggedLength (firmware-controlled): bounds an over-read
+ * of simLoggedData without truncating any realistic single log flush. */
+#define COOJA_LOG_MAX 8192
+
+static inline int native_clamp_frame_len(int len) {
+    if (len < 0) return 0;
+    if (len > COOJA_RADIO_FRAME_MAX) return COOJA_RADIO_FRAME_MAX;
+    return len;
+}
+
 typedef struct native_pending_frame {
     uint8_t data[128];
     int     len;

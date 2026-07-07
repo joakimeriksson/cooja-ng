@@ -418,6 +418,33 @@ static inline void write_sr_flags(msp430_cpu_t *cpu, uint32_t val) {
     cpu->reg[MSP430_SR] = val;
 }
 
+/* MSP430 DADD: BCD (binary-coded-decimal) addition of dst + src + carry-in,
+ * one 4-bit nibble at a time, propagating a decimal carry.  Sets C on decimal
+ * overflow out of the top nibble and clears V (spec-undefined; give it a
+ * defined value).  Z/N are left to the generic post-op status update, which
+ * only touches those two flags.  `*sr` carries the incoming C and receives the
+ * updated C/V; the BCD result is returned (caller masks to byte/word width).
+ * Shared by both execution paths so the two can't diverge — the previous
+ * copies both did a plain binary add with no decimal carry and no C flag. */
+static inline uint32_t msp430_dadd_bcd(uint32_t dst, uint32_t src,
+                                       uint32_t mask, uint32_t *sr) {
+    int carry = (*sr & SR_C) ? 1 : 0;
+    /* One nibble per hex digit of the operand width: 0xFF→2 (byte),
+     * 0xFFFF→4 (word), 0xFFFFF→5 (MSP430X 20-bit). */
+    int nibbles = 0;
+    for (uint32_t m = mask; m; m >>= 4) nibbles++;
+    uint32_t result = 0;
+    for (int i = 0; i < nibbles; i++) {
+        int shift = i * 4;
+        int digit = ((dst >> shift) & 0xF) + ((src >> shift) & 0xF) + carry;
+        if (digit > 9) { digit += 6; carry = 1; } else { carry = 0; }
+        result |= (uint32_t)(digit & 0xF) << shift;
+    }
+    *sr &= ~(SR_C | SR_V);
+    if (carry) *sr |= SR_C;
+    return result & mask;
+}
+
 /* Handle pending interrupts (after RETI) */
 static inline void handle_pending_interrupts(msp430_cpu_t *cpu) {
     reevaluate_interrupts(cpu);
@@ -590,7 +617,8 @@ static int execute_decoded(msp430_cpu_t *cpu, const decoded_insn_t *di, uint32_t
             break;
         }
         case OP_DADD:
-            dst = dst + src + ((sr & SR_C) ? 1 : 0);
+            dst = msp430_dadd_bcd(dst, src, mask, &sr);
+            write_sr_flags(cpu, sr);
             write_result = true;
             break;
         case OP_BIT:
@@ -2043,7 +2071,8 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             }
 
             case OP_DADD: {
-                dst = dst + src + ((sr & SR_C) ? 1 : 0);
+                dst = msp430_dadd_bcd(dst, src, mask, &sr);
+                write_sr_flags(cpu, sr);
                 write_result = true;
                 break;
             }

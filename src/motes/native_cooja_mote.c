@@ -344,6 +344,7 @@ static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
      * when the RX buffer is free, force-setting the packet timestamp TSCH
      * keys on; otherwise fall back to the deferred RX queue. */
     if (*nat->simInSize == 0) {
+        len = native_clamp_frame_len(len);   /* buffer is COOJA_RADIO_FRAME_MAX */
         memcpy(nat->simInDataBuffer, frame, (size_t)len);
         *nat->simInSize = len;
         if (nat->simLastPacketTimestamp)

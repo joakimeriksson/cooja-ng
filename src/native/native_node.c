@@ -291,6 +291,8 @@ void native_check_log_output(native_node_t *node) {
 
     if (node->log_callback) {
         int len = *node->simLoggedLength;
+        if (len < 0) len = 0;
+        if (len > COOJA_LOG_MAX) len = COOJA_LOG_MAX;   /* runaway guard */
         for (int i = 0; i < len; i++) {
             node->log_callback(node->log_callback_data,
                                (uint8_t)node->simLoggedData[i]);
@@ -308,7 +310,9 @@ void native_check_log_output(native_node_t *node) {
 void native_check_radio_tx(native_node_t *node) {
     if (node->radio_is_transmitting || *node->simOutSize <= 0) return;
 
-    int frame_len = *node->simOutSize;
+    /* simOutSize is firmware-controlled; clamp before reading the [128]
+     * simOutDataBuffer and before the length propagates to receivers. */
+    int frame_len = native_clamp_frame_len(*node->simOutSize);
     uint8_t *frame = (uint8_t *)node->simOutDataBuffer;
 
     /* Notify frame callback (for native-to-native) */
@@ -338,7 +342,7 @@ void native_check_radio_tx(native_node_t *node) {
 
 void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
                           int64_t arrival_ns, int sender_idx) {
-    if (len > 128) len = 128;
+    len = native_clamp_frame_len(len);
 
     native_rx_queue_t *q = &node->rx_queue;
 

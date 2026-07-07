@@ -211,6 +211,105 @@ static void test_arithmetic(void) {
 }
 
 /* ===================================================================
+ * DADD (BCD addition) tests — DADD #imm,R4 = 0xA034 (ADD opcode 5 -> A).
+ * Regression net for the fix that replaced a plain binary add (no decimal
+ * carry, no C flag) with real per-nibble BCD.
+ * =================================================================== */
+static void test_dadd(void) {
+    printf("--- DADD (BCD) instruction tests ---\n");
+
+    /* 9 DADD 1 = 0x10 (decimal 10), carry-in clear, carry-out clear */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f1611_config, 0x4000);
+        int pc = 0x4000;
+        WW(pc, 0x4032); pc += 2; WW(pc, 0x0000); pc += 2; /* MOV #0, SR  (C=0) */
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x0009); pc += 2; /* MOV #0x09, R4 */
+        WW(pc, 0xA034); pc += 2; WW(pc, 0x0001); pc += 2; /* DADD #0x01, R4 */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("DADD 0x09 + 0x01 = 0x10", 0x10, cpu.reg[4] & 0xFFFF);
+        assert_true("DADD 0x09+0x01 leaves C clear", (cpu.reg[MSP430_SR] & SR_C) == 0);
+        cleanup_cpu(&cpu);
+    }
+
+    /* Byte-mode DADD.B 0x99 + 0x01 = 0x00 with decimal carry-out (99+1=100).
+     * DADD.B #imm,R4 = 0xA074 (BW=1); byte op zeroes the upper register byte. */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f1611_config, 0x4000);
+        int pc = 0x4000;
+        WW(pc, 0x4032); pc += 2; WW(pc, 0x0000); pc += 2; /* MOV #0, SR */
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x0099); pc += 2; /* MOV #0x99, R4 */
+        WW(pc, 0xA074); pc += 2; WW(pc, 0x0001); pc += 2; /* DADD.B #0x01, R4 */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("DADD.B 0x99 + 0x01 = 0x00", 0x00, cpu.reg[4] & 0xFFFF);
+        assert_true("DADD.B 0x99+0x01 sets C", (cpu.reg[MSP430_SR] & SR_C) != 0);
+        cleanup_cpu(&cpu);
+    }
+
+    /* Word DADD 0x99 + 0x01 = 0x0100 (no carry past 4 nibbles) */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f1611_config, 0x4000);
+        int pc = 0x4000;
+        WW(pc, 0x4032); pc += 2; WW(pc, 0x0000); pc += 2; /* MOV #0, SR */
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x0099); pc += 2; /* MOV #0x99, R4 */
+        WW(pc, 0xA034); pc += 2; WW(pc, 0x0001); pc += 2; /* DADD #0x01, R4 */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("DADD 0x0099 + 0x0001 = 0x0100", 0x0100, cpu.reg[4] & 0xFFFF);
+        assert_true("DADD 0x0099+0x0001 leaves C clear", (cpu.reg[MSP430_SR] & SR_C) == 0);
+        cleanup_cpu(&cpu);
+    }
+
+    /* Word BCD carry ripple: 0x9999 DADD 0x0001 = 0x0000, C set */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f1611_config, 0x4000);
+        int pc = 0x4000;
+        WW(pc, 0x4032); pc += 2; WW(pc, 0x0000); pc += 2; /* MOV #0, SR */
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x9999); pc += 2; /* MOV #0x9999, R4 */
+        WW(pc, 0xA034); pc += 2; WW(pc, 0x0001); pc += 2; /* DADD #0x0001, R4 */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("DADD 0x9999 + 0x0001 = 0x0000", 0x0000, cpu.reg[4] & 0xFFFF);
+        assert_true("DADD 0x9999+0x0001 sets C", (cpu.reg[MSP430_SR] & SR_C) != 0);
+        cleanup_cpu(&cpu);
+    }
+
+    /* Carry-in folds in: C=1, 0x09 DADD 0x00 = 0x10 */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f1611_config, 0x4000);
+        int pc = 0x4000;
+        WW(pc, 0x4032); pc += 2; WW(pc, 0x0001); pc += 2; /* MOV #1, SR  (C=1) */
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x0009); pc += 2; /* MOV #0x09, R4 */
+        WW(pc, 0xA034); pc += 2; WW(pc, 0x0000); pc += 2; /* DADD #0x00, R4 */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("DADD 0x09 + 0 + carry = 0x10", 0x10, cpu.reg[4] & 0xFFFF);
+        cleanup_cpu(&cpu);
+    }
+
+    /* Multi-nibble, no carries: 0x1234 DADD 0x1234 = 0x2468 */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f1611_config, 0x4000);
+        int pc = 0x4000;
+        WW(pc, 0x4032); pc += 2; WW(pc, 0x0000); pc += 2; /* MOV #0, SR */
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x1234); pc += 2; /* MOV #0x1234, R4 */
+        WW(pc, 0xA034); pc += 2; WW(pc, 0x1234); pc += 2; /* DADD #0x1234, R4 */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("DADD 0x1234 + 0x1234 = 0x2468", 0x2468, cpu.reg[4] & 0xFFFF);
+        assert_true("DADD 0x1234+0x1234 leaves C clear", (cpu.reg[MSP430_SR] & SR_C) == 0);
+        cleanup_cpu(&cpu);
+    }
+}
+
+/* ===================================================================
  * Logical operation tests
  * =================================================================== */
 static void test_logical(void) {
@@ -935,6 +1034,7 @@ int run_correctness_tests(int v) {
 
     test_mov();
     test_arithmetic();
+    test_dadd();
     test_logical();
     test_jumps();
     test_byte_mode();
