@@ -43,7 +43,12 @@ static const sim_board_desc_t *default_board = &boards[0];
 
 const sim_board_desc_t *sim_board_for_path(const char *path) {
     if (!path) return default_board;
-    const char *dot = strrchr(path, '.');
+    /* Key on the basename's extension, not the last dot in the whole path —
+     * a dotted directory (e.g. build.out/firmware) otherwise resolved to a
+     * bogus "extension" and silently fell back to the Sky default board. */
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char *dot = strrchr(base, '.');
     if (!dot) return default_board;
     for (int i = 0; i < BOARD_COUNT; i++) {
         if (strcmp(dot, boards[i].extension) == 0)

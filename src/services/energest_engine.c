@@ -93,13 +93,21 @@ static void publish_panel(energest_engine_t *e, sim_runtime_t *sim, int64_t now)
                         (m->cpu_lpm_ns    / 1e9) * CPU_LPM_MA    * SUPPLY_V;
         double duty = tot_ns > 0 ? (100.0 * (double)on_ns / (double)tot_ns) : 0.0;
 
-        off += snprintf(buf + off, sizeof buf - off,
-                        "%s[\"mote %d\",\"duty %.1f%%  ~%.1f mJ\"]",
-                        rows ? "," : "", i, duty, radio_mj + cpu_mj);
+        /* Reserve room for the closing "]}"; if this row would truncate,
+         * roll it back and stop — a half-row plus a missing close emitted
+         * invalid JSON the front-end silently failed to parse. */
+        int remaining = (int)sizeof buf - off - 3;
+        int n = snprintf(buf + off, (size_t)(remaining > 0 ? remaining : 0),
+                         "%s[\"mote %d\",\"duty %.1f%%  ~%.1f mJ\"]",
+                         rows ? "," : "", i, duty, radio_mj + cpu_mj);
+        if (n < 0 || n >= remaining) {
+            buf[off] = '\0';   /* drop the truncated row */
+            break;
+        }
+        off += n;
         rows++;
     }
-    if (off < (int)sizeof buf)
-        snprintf(buf + off, sizeof buf - off, "]}");
+    snprintf(buf + off, sizeof buf - off, "]}");
     e->sink.publish(sim, "energest", buf);
 }
 

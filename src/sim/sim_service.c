@@ -12,6 +12,7 @@
 
 #include <assert.h>
 #include <stddef.h>
+#include <stdio.h>
 
 int sim_service_attach(sim_runtime_t *sim, const sim_service_ops_t *ops,
                        const void *cfg) {
@@ -72,6 +73,13 @@ void sim_service_dispatch_event(void *user, const sim_observer_event_t *ev) {
      * violated that contract. */
     static int dispatch_depth = 0;
     assert(dispatch_depth == 0 && "service on_event re-entered dispatch");
+    if (dispatch_depth != 0) {
+        /* Release builds (-DNDEBUG) compile the assert away — enforce the
+         * invariant for real: drop the re-entrant dispatch instead of
+         * recursively fanning out. */
+        fprintf(stderr, "sim_service: on_event re-entered dispatch — dropped\n");
+        return;
+    }
     dispatch_depth++;
     /* Snapshot the count so a service attached mid-dispatch isn't called
      * for the event that triggered it (mirrors sim_runtime_emit). */

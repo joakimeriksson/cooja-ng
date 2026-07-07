@@ -66,6 +66,14 @@ int sim_external_command_start(sim_external_command_t *ec, sim_runtime_t *sim,
     pid_t pid = fork();
     if (pid < 0) {
         perror("serial_socket: fork");
+        /* Undo the pre-fork setup: the runtime must not keep a fan-out
+         * observer pointing at a service the caller believes failed, and
+         * the testlog FILE* must not leak. */
+        if (ec->observer_handle >= 0) {
+            sim_runtime_unsubscribe(sim, ec->observer_handle);
+            ec->observer_handle = -1;
+        }
+        if (ec->testlog) { fclose(ec->testlog); ec->testlog = NULL; }
         return -1;
     }
     if (pid == 0) {

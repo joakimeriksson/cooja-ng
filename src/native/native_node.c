@@ -15,12 +15,13 @@
 #include <unistd.h>
 #include <dlfcn.h>
 
-/* Resolve a dlsym symbol, print error and return -1 on failure */
+/* Resolve a dlsym symbol; on failure jump to the cleanup ladder in
+ * native_node_init so the dl handle and temp file are not leaked. */
 #define RESOLVE_SYM(node, name, type) do { \
     (node)->name = (type)dlsym((node)->dl_handle, #name); \
     if (!(node)->name) { \
         fprintf(stderr, "native_node: dlsym(%s) failed: %s\n", #name, dlerror()); \
-        return -1; \
+        goto resolve_fail; \
     } \
 } while (0)
 
@@ -29,11 +30,12 @@
     (node)->name = (type)dlsym((node)->dl_handle, #name); \
 } while (0)
 
-static int copy_file(const char *src, const char *dst) {
+/* Copy src into an already-open destination stream (from mkstemps — the
+ * destination is created O_EXCL by the libc, never following a pre-planted
+ * symlink at a predictable name; CWE-377/59). Closes `out` either way. */
+static int copy_file_to(const char *src, FILE *out) {
     FILE *in = fopen(src, "rb");
-    if (!in) return -1;
-    FILE *out = fopen(dst, "wb");
-    if (!out) { fclose(in); return -1; }
+    if (!in) { fclose(out); return -1; }
 
     char buf[8192];
     size_t n;
@@ -43,7 +45,7 @@ static int copy_file(const char *src, const char *dst) {
         }
     }
     fclose(in);
-    fclose(out);
+    if (fclose(out) != 0) return -1;
     return 0;
 }
 
@@ -51,19 +53,30 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
     memset(node, 0, sizeof(*node));
     node->node_id = node_id;
 
-    /* Copy firmware to a per-node temp file for independent dlopen */
+    /* Copy firmware to a per-node temp file for independent dlopen.
+     * mkstemps gives an unpredictable name created O_EXCL (a fixed
+     * /tmp/csim_node_<id>_<pid> name was a symlink/planted-library vector
+     * on shared hosts). */
 #ifdef __APPLE__
     const char *ext = ".dylib";
 #else
     const char *ext = ".so";
 #endif
     snprintf(node->dl_path, sizeof(node->dl_path),
-             "/tmp/csim_node_%d_%d%s", node_id, (int)getpid(), ext);
+             "/tmp/csim_node_%d_XXXXXX%s", node_id, ext);
+    int tmp_fd = mkstemps(node->dl_path, (int)strlen(ext));
+    if (tmp_fd < 0) {
+        fprintf(stderr, "native_node: mkstemps(%s) failed\n", node->dl_path);
+        return -1;
+    }
     node->dl_path_is_temp = true;
 
-    if (copy_file(firmware_path, node->dl_path) != 0) {
+    FILE *tmp_out = fdopen(tmp_fd, "wb");
+    if (!tmp_out) { close(tmp_fd); unlink(node->dl_path); return -1; }
+    if (copy_file_to(firmware_path, tmp_out) != 0) {
         fprintf(stderr, "native_node: failed to copy %s -> %s\n",
                 firmware_path, node->dl_path);
+        unlink(node->dl_path);
         return -1;
     }
 
@@ -147,6 +160,15 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
     node->sim_time_ns = 0;
     printf("  Native node %d: initialized successfully\n", node_id);
     return 0;
+
+resolve_fail:
+    /* A required symbol was missing (RESOLVE_SYM) — release the dl handle
+     * and the temp copy instead of leaking one pair per failed attempt. */
+    dlclose(node->dl_handle);
+    node->dl_handle = NULL;
+    unlink(node->dl_path);
+    node->dl_path[0] = '\0';
+    return -1;
 }
 
 void native_node_destroy(native_node_t *node) {

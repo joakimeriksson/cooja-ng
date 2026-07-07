@@ -1,8 +1,9 @@
 {
-  "title": "Mixed Sky + Native RPL-UDP test",
+  "title": "Mixed-tier interop: emulated MSP430 Sky (RPL root) + native Cooja mote",
+  "note": "Demonstrates cross-tier 802.15.4 radio + RPL interop: the native mote joins the sky root's DAG (DIO/DAO/parent, bidirectional link-layer ACKs). udp-sender uses the simple-udp broadcast app, so this exercises the network stack rather than rpl-udp request/response payloads.",
   "timeout_ms": 60000,
   "nodes": [
-    { "firmware": "firmware/sky/udp-server.sky", "id": 1 },
-    { "firmware": "firmware/cooja/udp-client.cooja", "id": 2 }
+    { "firmware": "firmware/sky/udp-server.sky",    "id": 1 },
+    { "firmware": "firmware/cooja/udp-sender.cooja", "id": 2 }
   ]
 }

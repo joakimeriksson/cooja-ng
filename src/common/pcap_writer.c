@@ -50,14 +50,20 @@ int pcap_writer_open(pcap_writer_t *pw, const char *path, int link_type) {
     uint32_t snaplen  = PCAP_SNAPLEN;
     uint32_t network  = (uint32_t)link_type;
 
-    fwrite(&magic,    4, 1, pw->f);
-    fwrite(&v_major,  2, 1, pw->f);
-    fwrite(&v_minor,  2, 1, pw->f);
-    fwrite(&thiszone, 4, 1, pw->f);
-    fwrite(&sigfigs,  4, 1, pw->f);
-    fwrite(&snaplen,  4, 1, pw->f);
-    fwrite(&network,  4, 1, pw->f);
-    fflush(pw->f);
+    size_t ok = 0;
+    ok += fwrite(&magic,    4, 1, pw->f);
+    ok += fwrite(&v_major,  2, 1, pw->f);
+    ok += fwrite(&v_minor,  2, 1, pw->f);
+    ok += fwrite(&thiszone, 4, 1, pw->f);
+    ok += fwrite(&sigfigs,  4, 1, pw->f);
+    ok += fwrite(&snaplen,  4, 1, pw->f);
+    ok += fwrite(&network,  4, 1, pw->f);
+    if (ok != 7 || fflush(pw->f) != 0) {
+        fprintf(stderr, "pcap: short write on header for %s\n", path);
+        fclose(pw->f);
+        pw->f = NULL;
+        return -1;
+    }
 
     return 0;
 }
@@ -73,11 +79,21 @@ void pcap_writer_packet(pcap_writer_t *pw, int64_t time_ns,
     uint32_t incl_len = (uint32_t)incl;
     uint32_t orig_len = (uint32_t)len;
 
-    fwrite(&ts_sec,   4, 1, pw->f);
-    fwrite(&ts_nsec,  4, 1, pw->f);
-    fwrite(&incl_len, 4, 1, pw->f);
-    fwrite(&orig_len, 4, 1, pw->f);
-    fwrite(data, 1, (size_t)incl, pw->f);
+    size_t ok = 0;
+    ok += fwrite(&ts_sec,   4, 1, pw->f);
+    ok += fwrite(&ts_nsec,  4, 1, pw->f);
+    ok += fwrite(&incl_len, 4, 1, pw->f);
+    ok += fwrite(&orig_len, 4, 1, pw->f);
+    if (ok != 4 || fwrite(data, 1, (size_t)incl, pw->f) != (size_t)incl) {
+        /* Disk full / write error: stop capturing rather than silently
+         * producing a corrupt pcap (a partial record desyncs every
+         * subsequent record boundary). */
+        fprintf(stderr, "pcap: write error after %ld packets — capture stopped\n",
+                (long)pw->packet_count);
+        fclose(pw->f);
+        pw->f = NULL;
+        return;
+    }
 
     pw->packet_count++;
 }
