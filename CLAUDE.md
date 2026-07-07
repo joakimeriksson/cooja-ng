@@ -22,21 +22,21 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 
 ```sh
 # MSP430 tests
-./build/test_runner correctness -v    # 72 instruction-level tests
+./build/test_runner correctness -v    # 83 instruction-level tests
 ./build/test_runner bench             # 7 micro-benchmarks + 2 firmware benchmarks
 ./build/test_runner firmware          # Firmware integration tests (cputest.sky, timertest.sky)
 ./build/test_runner multinode         # 2-node nullnet-broadcast (default 20s)
 ./build/test_runner multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
 
 # ARM Cortex-M3/M4 tests
-./build/test_runner arm-correctness -v   # 146 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33)
+./build/test_runner arm-correctness -v   # 153 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33)
 ./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
 
 # Chip-driver + radio-medium unit suites
 ./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)
-./build/test_runner radio-medium            # 235 radio-medium routing tests
+./build/test_runner radio-medium            # 241 radio-medium routing tests
 
 # nRF52840 USB Dongle (PCA10059, Cortex-M4F + on-chip 802.15.4 radio)
 ./build/test_runner nrf52840-dongle-multinode firmware/nrf52840-dongle/udp-server.nrf52840-dongle firmware/nrf52840-dongle/udp-client.nrf52840-dongle -t 60000
