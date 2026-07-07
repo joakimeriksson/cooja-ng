@@ -239,6 +239,17 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
         }
 
         if (masked) header_len += 4;
+
+        /* Validate the declared length before any arithmetic that could
+         * overflow.  payload_len is attacker-controlled (up to 2^64-1 via
+         * the 127 form); fold it into a signed `total` and a crafted frame
+         * makes `total` negative, the `recv_len < total` guard pass, and the
+         * memmove below run wild.  Reject anything that cannot fit the fixed
+         * RECV_BUF, and require client frames to be masked per RFC 6455. */
+        if (!masked || payload_len > (uint64_t)(RECV_BUF - header_len)) {
+            close_client(srv, idx);
+            return;
+        }
         int total = header_len + (int)payload_len;
         if (c->recv_len < total) return;
 

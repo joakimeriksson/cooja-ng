@@ -61,8 +61,14 @@ static int can_inline(const decoded_insn_t *di) {
         if (di->dst_reg == MSP430_SR) return 0; /* SR writes have side effects */
         if (di->dst_reg == MSP430_PC) return 0; /* PC writes need special handling */
 
-        /* Reject operations we can't inline (carry-in, BCD) */
-        if (di->operation == OP_SUBC || di->operation == OP_DADD) return 0;
+        /* Reject operations we can't inline correctly.  ADDC joins SUBC/DADD:
+         * its carry-in occupies the one spare temp (JIT_V2), leaving no
+         * register to compute the overflow (V) flag the way OP_ADD does, so
+         * an inlined ADDC left V stale — a warm-block-only divergence from the
+         * interpreter that flipped signed branches (JGE/JL) after an ADDC.
+         * The interpreter computes ADDC's V correctly; let it. */
+        if (di->operation == OP_SUBC || di->operation == OP_DADD ||
+            di->operation == OP_ADDC) return 0;
 
         switch (di->src_kind) {
         case OPKIND_REG:

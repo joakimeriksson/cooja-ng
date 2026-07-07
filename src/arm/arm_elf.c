@@ -9,20 +9,25 @@ static elf_segment_route_t arm_route(void *ctx, uint32_t paddr,
                                       uint32_t vaddr, uint32_t size) {
     arm_cpu_t *cpu = ctx;
 
-    /* Try paddr first, then vaddr */
+    /* Try paddr first, then vaddr.  addr/size come from the ELF's
+     * p_paddr/p_filesz; compare without adding so a crafted addr near
+     * UINT32_MAX can't wrap `addr + size` past the region end and return a
+     * valid dest with an underflowed capacity. */
     uint32_t addr = paddr;
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (addr >= cpu->flash_base && addr + size <= cpu->flash_end)
+        if (addr >= cpu->flash_base && addr <= cpu->flash_end &&
+            size <= cpu->flash_end - addr)
             return (elf_segment_route_t){
                 cpu->flash + (addr - cpu->flash_base),
                 cpu->flash_end - addr
             };
-        if (addr >= cpu->sram_base && addr + size <= cpu->sram_end)
+        if (addr >= cpu->sram_base && addr <= cpu->sram_end &&
+            size <= cpu->sram_end - addr)
             return (elf_segment_route_t){
                 cpu->sram + (addr - cpu->sram_base),
                 cpu->sram_end - addr
             };
-        if (cpu->rom && addr < cpu->rom_size)
+        if (cpu->rom && addr < cpu->rom_size && size <= cpu->rom_size - addr)
             return (elf_segment_route_t){
                 cpu->rom + addr,
                 cpu->rom_size - addr

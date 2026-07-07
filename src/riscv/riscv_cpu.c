@@ -188,9 +188,10 @@ static inline uint32_t rvc_lookup(uint16_t c) {
 static int riscv_take_pending_irq(riscv_cpu_t *rv) {
     uint32_t irq = rv->mip & rv->mie;
     if (!irq || !(rv->mstatus & RV_MSTATUS_MIE)) return 0;
-    uint32_t cause = (irq & (1u << 11)) ? 11u    /* machine external */
-                   : (irq & (1u << 7))  ? 7u     /* machine timer    */
-                                        : 3u;    /* machine software */
+    /* Priority per the privileged spec: MEI > MSI > MTI. */
+    uint32_t cause = (irq & (1u << 11)) ? 11u    /* machine external  */
+                   : (irq & (1u << 3))  ? 3u     /* machine software  */
+                                        : 7u;    /* machine timer     */
     rv->mip &= ~(1u << cause);  /* edge-ack: the source re-asserts per event */
     rv->halted = 0;
     rv->mepc   = rv->pc;
@@ -210,7 +211,17 @@ static int riscv_take_pending_irq(riscv_cpu_t *rv) {
 int riscv_step(riscv_cpu_t *rv, int n) {
     int i;
     for (i = 0; i < n; i++) {
-        if ((rv->mip & rv->mie) && riscv_take_pending_irq(rv)) continue; /* rare; also un-halts */
+        if (rv->mip & rv->mie) {
+            /* A pending enabled interrupt resumes the hart from WFI
+             * regardless of mstatus.MIE (RISC-V WFI semantics): if MIE is
+             * set we also vector the trap, otherwise execution just falls
+             * through to the instruction after the wfi.  The old code only
+             * un-halted as a side effect of taking the trap, so a WFI with
+             * interrupts globally masked and a source already pending
+             * deadlocked the FLPR. */
+            rv->halted = 0;
+            if (riscv_take_pending_irq(rv)) continue;
+        }
         if (rv->halted) break;
 
         uint32_t pc = rv->pc;

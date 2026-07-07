@@ -36,6 +36,16 @@ int sim_config_load(sim_normalized_config_t *cfg, const char *json_path) {
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
 
+    /* ftell returns -1 on an unseekable stream (e.g. json_path is a
+     * directory — fopen "rb" of one succeeds on Linux).  Without this
+     * guard, len==-1 makes malloc(0) then fread((size_t)-1) and buf[-1]. */
+    #define SIM_CONFIG_MAX (16L * 1024L * 1024L)   /* 16 MB — no sane config approaches this */
+    if (len < 0 || len > SIM_CONFIG_MAX) {
+        fclose(f);
+        fprintf(stderr, "sim_config: '%s' is not a readable config file\n", json_path);
+        return -1;
+    }
+
     char *buf = malloc((size_t)len + 1);
     if (!buf) {
         fclose(f);

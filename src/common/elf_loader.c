@@ -106,11 +106,18 @@ uint32_t elf_find_symbol(const char *path, const char *symbol_name) {
     }
     if (!found_symtab) { fclose(f); return 0; }
 
-    /* Read strtab */
+    /* Read strtab.  sh_link/sh_size come from the file; validate the section
+     * index against e_shnum and cap the allocation so a malformed symtab
+     * can't drive an out-of-range fseek or a multi-GB malloc (DoS). */
+    if (symtab_hdr.sh_link >= ehdr.e_shnum) { fclose(f); return 0; }
     Elf32_Shdr strtab_hdr;
     fseek(f, ehdr.e_shoff + symtab_hdr.sh_link * ehdr.e_shentsize, SEEK_SET);
     if (fread(&strtab_hdr, sizeof(strtab_hdr), 1, f) != 1) { fclose(f); return 0; }
 
+    #define ELF_STRTAB_MAX (16u * 1024u * 1024u)   /* 16 MB — far above any real firmware */
+    if (strtab_hdr.sh_size == 0 || strtab_hdr.sh_size > ELF_STRTAB_MAX) {
+        fclose(f); return 0;
+    }
     char *strtab = (char *)malloc(strtab_hdr.sh_size);
     if (!strtab) { fclose(f); return 0; }
     fseek(f, strtab_hdr.sh_offset, SEEK_SET);

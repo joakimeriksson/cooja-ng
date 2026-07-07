@@ -8,7 +8,10 @@ static elf_segment_route_t msp430_route(void *ctx, uint32_t paddr,
                                          uint32_t vaddr, uint32_t size) {
     (void)vaddr;
     msp430_cpu_t *cpu = ctx;
-    if (paddr + size > cpu->max_mem)
+    /* paddr/size come straight from the ELF's p_paddr/p_filesz — check
+     * without adding, so a crafted paddr near UINT32_MAX can't wrap the
+     * sum past the bound and return a wild pointer. */
+    if (paddr >= cpu->max_mem || size > cpu->max_mem - paddr)
         return (elf_segment_route_t){NULL, 0};
     return (elf_segment_route_t){cpu->memory + paddr, cpu->max_mem - paddr};
 }
