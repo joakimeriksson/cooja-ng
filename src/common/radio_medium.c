@@ -246,6 +246,14 @@ void radio_medium_init(radio_medium_t *rm, int node_count) {
     memset(rm, 0, sizeof(*rm));
     rm->type = RADIO_MEDIUM_NONE;
     rm->ops = &csim_none_ops;
+    /* Every per-node array (incl. rx_decisions[MAX][MAX]) is fixed-size;
+     * an unclamped count would overflow them in every loop below. */
+    if (node_count < 0) node_count = 0;
+    if (node_count > RADIO_MEDIUM_MAX_NODES) {
+        fprintf(stderr, "radio_medium: node_count %d exceeds max %d — clamped\n",
+                node_count, RADIO_MEDIUM_MAX_NODES);
+        node_count = RADIO_MEDIUM_MAX_NODES;
+    }
     rm->node_count = node_count;
     rm->rng_state = 0x12345678;  /* default seed */
     rm->next_frame_id = 0;

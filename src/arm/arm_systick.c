@@ -23,9 +23,10 @@ static void systick_fire(void *user_data, arm_event_t *ev) {
     /* Set COUNTFLAG */
     st->csr |= SYST_CSR_COUNTFLAG;
 
-    /* Generate interrupt if TICKINT is set */
+    /* Generate interrupt if TICKINT is set.  OR into the pending mask —
+     * a PendSV pended before this tick must survive it. */
     if (st->csr & SYST_CSR_TICKINT) {
-        st->nvic->pending_exception = EXC_SYSTICK;
+        st->nvic->sys_pending |= (1u << EXC_SYSTICK);
         st->nvic->scan_valid = false;
         st->nvic->has_pending = true;
         arm_nvic_check_pending(st->nvic);

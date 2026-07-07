@@ -81,6 +81,18 @@ static void sync_counter(msp430_timer_t *timer) {
     }
 }
 
+/* Position within the up/down period (0..2*CCR0-1): 0..CCR0 counting up,
+ * CCR0+1..2*CCR0-1 counting down — the linear position behind sync_counter's
+ * triangle map, needed to schedule compare/overflow events in UPDOWN mode. */
+static int64_t updown_pos(msp430_timer_t *timer) {
+    int64_t period = (int64_t)timer->ccr[0] * 2;
+    if (period <= 0 || timer->cycles_per_tick <= 0) return 0;
+    int64_t cycctr = timer->cpu->cycles - timer->counter_start;
+    if (cycctr < 0) cycctr = 0;
+    int64_t tick_long = (int64_t)((double)cycctr / timer->cycles_per_tick);
+    return (tick_long + timer->counter_acc) % period;
+}
+
 /* Match MSPSim Timer.resetCounter(): snapshot counterAcc and counterStart.
  * Called after counter writes, mode changes, or frequency changes. */
 static void reset_counter(msp430_timer_t *timer) {
@@ -319,14 +331,20 @@ static void schedule_ccr_event(msp430_timer_t *timer, int ccr_idx) {
             }
         }
         break;
-    case TIMER_MC_UPDOWN:
-        /* Simplified: schedule like continuous for now */
-        if (ccr_val > counter) {
-            ticks_to_match = ccr_val - counter;
-        } else {
-            ticks_to_match = (0x10000 - counter) + ccr_val;
-        }
+    case TIMER_MC_UPDOWN: {
+        /* Triangle 0→CCR0→0, linear period 2*CCR0.  CCRn matches on the
+         * up-count at pos=ccr_val and on the down-count at pos=period-ccr_val
+         * (CCR0 collapses to the single apex).  Take the nearer match. */
+        int64_t period = (int64_t)timer->ccr[0] * 2;
+        if (period <= 0 || ccr_val > timer->ccr[0]) return; /* never matches */
+        int64_t pos = updown_pos(timer);
+        int64_t up_delta   = ((int64_t)ccr_val - pos + period) % period;
+        int64_t down_delta = ((period - (int64_t)ccr_val) - pos + period) % period;
+        if (up_delta == 0)   up_delta = period;
+        if (down_delta == 0) down_delta = period;
+        ticks_to_match = up_delta < down_delta ? up_delta : down_delta;
         break;
+    }
     default:
         return;
     }
@@ -359,9 +377,16 @@ static void schedule_overflow_event(msp430_timer_t *timer) {
             ticks_to_overflow = 0x10000;
         }
         break;
-    case TIMER_MC_UPDOWN:
-        ticks_to_overflow = 0x10000 - timer->counter;
+    case TIMER_MC_UPDOWN: {
+        /* TAIFG sets when the timer counts down through 0 — i.e. at each
+         * linear-period boundary (pos wraps to 0), not at 0x10000. */
+        int64_t period = (int64_t)timer->ccr[0] * 2;
+        if (period <= 0) return;
+        int64_t pos = updown_pos(timer);
+        ticks_to_overflow = period - pos;
+        if (ticks_to_overflow == 0) ticks_to_overflow = period;
         break;
+    }
     default:
         return;
     }

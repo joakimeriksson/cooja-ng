@@ -56,7 +56,12 @@ typedef struct arm_nvic {
 
     /* Currently active exception (0 = Thread mode) */
     int       active_exception;
-    int       pending_exception;  /* highest priority pending, -1 = none */
+    /* Pending system exceptions (PendSV/SysTick/...), bit N = exception N.
+     * A bitmask, not a single slot: PendSV pended for a context switch and a
+     * SysTick firing before it is taken must both stay pending — the old
+     * single int let the second SET silently overwrite the first, dropping
+     * the context switch. */
+    uint32_t  sys_pending;
 
     /* Flag: set when there may be serviceable pending interrupts.
      * Checked in the main execution loop to avoid scanning ISPR on every insn. */

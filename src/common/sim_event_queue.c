@@ -96,17 +96,20 @@ void sim_eq_schedule_gen(sim_event_queue_t *q, int node_idx, int64_t time_ns,
         fprintf(stderr, "WARNING: invalid event node index %d\n", node_idx);
         return;
     }
-    if (q->count >= SIM_EQ_MAX_EVENTS) {
-        fprintf(stderr, "WARNING: event queue full (%d events), dropping wakeup for node %d\n",
-                q->count, node_idx);
-        return;
-    }
+    /* Remove any existing wakeup for this node BEFORE the capacity check —
+     * a reschedule is net-zero on the count, so a full queue must replace
+     * the entry rather than drop the wakeup (which stalled the mote). */
     int existing = q->node_heap_idx[node_idx];
     if (existing >= 0) {
         /* Match Cooja scheduleNextWakeup(): rescheduling an already-queued
          * execute event removes the old queue entry and inserts a new one,
          * giving it a fresh same-time insertion order. */
         remove_heap_index(q, existing);
+    }
+    if (q->count >= SIM_EQ_MAX_EVENTS) {
+        fprintf(stderr, "WARNING: event queue full (%d events), dropping wakeup for node %d\n",
+                q->count, node_idx);
+        return;
     }
     int i = q->count++;
     q->heap[i].kind = SIM_EV_NODE_WAKEUP;

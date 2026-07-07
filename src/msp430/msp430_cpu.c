@@ -73,16 +73,23 @@ static inline int mem_read(msp430_cpu_t *cpu, uint32_t addr, bool word) {
 static inline void cache_invalidate(msp430_cpu_t *cpu, uint32_t addr) {
 #ifdef HAVE_LIGHTNING
     if (!cpu->compiled_cache) return;
-    /* Invalidate a small window around the written address.
-     * An instruction can be up to 6 bytes, and a block starting before
-     * the write could include this address. We clear entries for
-     * (addr-4)...(addr+2) to be safe. */
-    uint32_t lo = (addr >= 4) ? (addr - 4) >> 1 : 0;
+    /* A compiled block spans up to MAX_BLOCK_SIZE instructions x 6 bytes,
+     * so a block STARTING that far before the written address can still
+     * cover it.  Scan the whole reach and free only blocks whose actual
+     * [start_pc, end_pc) covers the written word — the old fixed
+     * (addr-4)..(addr+2) window missed writes into the interior of any
+     * block longer than a few instructions, leaving stale compiled code
+     * live after self-modifying-code stores. */
+    const uint32_t reach = MAX_BLOCK_SIZE * 6;
+    uint32_t lo = (addr >= reach) ? (addr - reach) >> 1 : 0;
     uint32_t hi = (addr + 2) >> 1;
     if (hi >= cpu->cache_size) hi = cpu->cache_size - 1;
     for (uint32_t i = lo; i <= hi; i++) {
-        if (cpu->compiled_cache[i]) {
-            msp430_jit_free((compiled_block_t *)cpu->compiled_cache[i]);
+        compiled_block_t *cb = (compiled_block_t *)cpu->compiled_cache[i];
+        if (!cb) continue;
+        /* Word write touches addr and addr+1 */
+        if (cb->end_pc > addr && cb->start_pc <= addr + 1) {
+            msp430_jit_free(cb);
             cpu->compiled_cache[i] = NULL;
             cpu->block_exec_count[i] = 0;
         }
@@ -1309,7 +1316,10 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             switch (rr_type) {
             case RRCM_OP: {
                 uint32_t dst_low = dst & ((1 << rr_count) - 1);
-                nxt_carry = (dst & (1 << (rr_count + 1))) ? SR_C : 0;
+                /* n rotates through carry pop original bits 0..n-1; the LAST
+                 * bit shifted out — original bit n-1 — is the final carry
+                 * (same convention as RRAM/RRUM below).  Was bit n+1. */
+                nxt_carry = (dst & (1 << (rr_count - 1))) ? SR_C : 0;
                 dst >>= rr_count;
                 if (rr_word) {
                     dst |= (dst_low << (17 - rr_count)) | (carry << (16 - rr_count));

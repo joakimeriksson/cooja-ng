@@ -38,14 +38,14 @@ static int nvic_read(void *user_data, uint32_t addr) {
         int idx = (offset - NVIC_IABR_BASE) / 4;
         return (int)nvic->iabr[idx];
     }
-    /* NVIC_IPR */
+    /* NVIC_IPR — assemble up to 4 bytes, clamped at the array end so an
+     * unaligned word read near the top of the range can't read past ipr[]. */
     if (offset >= NVIC_IPR_BASE && offset < NVIC_IPR_BASE + 240) {
-        /* Read 4 bytes at a time */
         int base_idx = offset - NVIC_IPR_BASE;
-        return nvic->ipr[base_idx] |
-               (nvic->ipr[base_idx + 1] << 8) |
-               (nvic->ipr[base_idx + 2] << 16) |
-               (nvic->ipr[base_idx + 3] << 24);
+        uint32_t val = 0;
+        for (int b = 0; b < 4 && base_idx + b < 240; b++)
+            val |= (uint32_t)nvic->ipr[base_idx + b] << (8 * b);
+        return (int)val;
     }
 
     /* System Control Block */
@@ -55,8 +55,19 @@ static int nvic_read(void *user_data, uint32_t addr) {
             uint32_t val = 0;
             if (nvic->active_exception > 0)
                 val |= nvic->active_exception & 0x1FF;
-            if (nvic->pending_exception > 0)
-                val |= ((nvic->pending_exception & 0x1FF) << 12) | (1u << 22);
+            if (nvic->sys_pending) {
+                /* VECTPENDING: report the highest-priority pending system
+                 * exception (lowest priority value wins). */
+                int best = 0, best_prio = 256;
+                for (int exc = 4; exc < 16; exc++) {
+                    if (!(nvic->sys_pending & (1u << exc))) continue;
+                    int prio = arm_nvic_get_priority(nvic, exc);
+                    if (prio < best_prio) { best_prio = prio; best = exc; }
+                }
+                val |= ((uint32_t)(best & 0x1FF) << 12) | (1u << 22);
+            }
+            if (nvic->sys_pending & (1u << EXC_SYSTICK)) val |= (1u << 26); /* PENDSTSET reads back */
+            if (nvic->sys_pending & (1u << EXC_PENDSV))  val |= (1u << 28); /* PENDSVSET reads back */
             return (int)val;
         }
         case SCB_VTOR:  return (int)nvic->vtor;
@@ -149,29 +160,25 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
 
     switch (offset) {
         case SCB_ICSR:
-            if (value & (1u << 28)) { /* PENDSVSET */
-                nvic->pending_exception = EXC_PENDSV;
-                nvic->has_pending = true;
-                nvic->scan_valid = false;
-                arm_nvic_check_pending(nvic);
-            }
             if (value & (1u << 27)) { /* PENDSVCLR */
-                if (nvic->pending_exception == EXC_PENDSV) {
-                    nvic->pending_exception = -1;
-                    nvic->scan_valid = false;
-                }
-            }
-            if (value & (1u << 26)) { /* PENDSTSET */
-                nvic->pending_exception = EXC_SYSTICK;
-                nvic->has_pending = true;
+                nvic->sys_pending &= ~(1u << EXC_PENDSV);
                 nvic->scan_valid = false;
-                arm_nvic_check_pending(nvic);
             }
             if (value & (1u << 25)) { /* PENDSTCLR */
-                if (nvic->pending_exception == EXC_SYSTICK) {
-                    nvic->pending_exception = -1;
-                    nvic->scan_valid = false;
-                }
+                nvic->sys_pending &= ~(1u << EXC_SYSTICK);
+                nvic->scan_valid = false;
+            }
+            if (value & (1u << 28)) { /* PENDSVSET */
+                nvic->sys_pending |= (1u << EXC_PENDSV);
+                nvic->has_pending = true;
+                nvic->scan_valid = false;
+                arm_nvic_check_pending(nvic);
+            }
+            if (value & (1u << 26)) { /* PENDSTSET */
+                nvic->sys_pending |= (1u << EXC_SYSTICK);
+                nvic->has_pending = true;
+                nvic->scan_valid = false;
+                arm_nvic_check_pending(nvic);
             }
             break;
         case SCB_VTOR:
@@ -224,7 +231,7 @@ void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu) {
     memset(nvic, 0, sizeof(*nvic));
     nvic->cpu = cpu;
     nvic->active_exception = 0;
-    nvic->pending_exception = -1;
+    nvic->sys_pending = 0;
     nvic->vtor = cpu->flash_base; /* SoC's flash base — VTOR points at the vector table */
     nvic->ccr = 0x200; /* STKALIGN=1 by default */
 
@@ -286,12 +293,16 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
         best_exc = -1;
         best_prio = 256;
 
-        /* Check system exceptions (PendSV, SysTick) */
-        if (nvic->pending_exception > 0) {
-            int prio = arm_nvic_get_priority(nvic, nvic->pending_exception);
-            if (prio < best_prio) {
-                best_prio = prio;
-                best_exc = nvic->pending_exception;
+        /* Check system exceptions (PendSV, SysTick, ...) — all pending bits
+         * compete by priority; none is lost when another is set. */
+        if (nvic->sys_pending) {
+            for (int exc = 4; exc < 16; exc++) {
+                if (!(nvic->sys_pending & (1u << exc))) continue;
+                int prio = arm_nvic_get_priority(nvic, exc);
+                if (prio < best_prio) {
+                    best_prio = prio;
+                    best_exc = exc;
+                }
             }
         }
 
@@ -343,9 +354,9 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
     if (best_exc >= 16) {
         int irq = best_exc - 16;
         nvic->ispr[irq / 32] &= ~(1u << (irq % 32));
+    } else {
+        nvic->sys_pending &= ~(1u << best_exc);
     }
-    if (best_exc == nvic->pending_exception)
-        nvic->pending_exception = -1;
 
     /* Enter exception */
     nvic->active_exception = best_exc;

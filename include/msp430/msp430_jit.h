@@ -22,6 +22,8 @@ typedef int (*compiled_fn)(msp430_cpu_t *cpu);
 typedef struct {
     compiled_fn   fn;          /* Native function pointer */
     int           length;      /* Number of MSP430 instructions */
+    uint32_t      start_pc;    /* First byte of source code covered */
+    uint32_t      end_pc;      /* One past the last source byte covered */
     jit_state_t  *jit_state;   /* For cleanup (owns the code) */
 } compiled_block_t;
 

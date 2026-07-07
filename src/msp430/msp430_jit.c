@@ -532,8 +532,14 @@ compiled_block_t *msp430_jit_compile(basic_block_t *block, msp430_cpu_t *cpu) {
     jit_clear_state();
 
     compiled_block_t *cb = (compiled_block_t *)malloc(sizeof(compiled_block_t));
+    if (!cb) {
+        jit_destroy_state();
+        return NULL;
+    }
     cb->fn = fn;
     cb->length = inst_count;
+    cb->start_pc = block->start_pc;
+    cb->end_pc = block->end_pc;
     cb->jit_state = _jit;
 
     return cb;
