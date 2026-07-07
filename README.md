@@ -27,7 +27,7 @@ firmware/*.cooja       ──►│  Native Cooja motes (dlopen)                
                           └──────────────────────────────────────────────┘
 ```
 
-**Multi-ISA:** MSP430, ARM Cortex-M3/M4F/M33, and **RISC-V** — the latter via the nRF54L15's FLPR (an RV32E coprocessor) running unmodified Contiki-NG, dual-core alongside the M33 over shared SRAM. (RV32E is `rv32e_zicsr_zifencei` — base integer + CSR + fence.i, in the coprocessor role; not yet a standalone RISC-V networking node.)
+**Multi-ISA:** MSP430, ARM Cortex-M3/M4F/M33, and **RISC-V** — the latter via the nRF54L15's FLPR (an RV32EMC coprocessor) running unmodified Contiki-NG, dual-core alongside the M33 over shared SRAM. (RV32EMC is `rv32emc_zicsr_zifencei` — base integer + M (mul/div/rem) + C (compressed) + CSR + fence.i, in the coprocessor role; not yet a standalone RISC-V networking node.)
 
 Designed for: headless CI for the Contiki-NG test suite, network research with hundreds of mixed-architecture nodes, and single-firmware debugging with deterministic seeds.  Roughly an order of magnitude faster than Cooja + MSPSim, no JVM dependency, builds with `make` on Linux and macOS.  Not a full Cooja replacement — no GTK GUI, no Java plugin ecosystem, no closed-source motes.
 
@@ -99,7 +99,7 @@ Per-board details live in [`devices/`](devices/) and the SoC source files under 
 - **TI CC1200** (off-SoC) — event-driven SPI peripheral, register-level fidelity, IOCFG-driven GPIO events, full software auto-ACK, 73-test mock-host suite.
 - **Nordic nRF52840** — CLOCK/HFCLK/LFCLK (+ STAT/SRC status regs), RTC0/RTC1, TIMER0–4, GPIO/GPIOTE, PPI, RNG, NVMC, FICR (per-node DEVICEID), UART (legacy + UARTE EasyDMA), and a full 802.15.4 RADIO (PACKETPTR EasyDMA, SHORTS, INTENSET, BCMATCH, hardware-style auto-ACK).  **Also boots stock Zephyr OS and RIOT OS** (experimental / best-effort; Contiki-NG is the primary, fully-validated target) — an unmodified `nrf52840dk` `hello_world` prints over the default UARTE console, stock Zephyr `echo_server`/`echo_client` exchange UDP over 802.15.4, and two RIOT `gnrc_networking` nodes form an RPL DODAG; see [`docs/zephyr.md`](docs/zephyr.md) and [`docs/riot.md`](docs/riot.md).
 - **Nordic nRF54L15** — Cortex-M33 family with GRTC (1 MHz syscounter, RELATIVE_COMPARE + RELATIVE_SYSCOUNTER), DPPI (32-channel publish/subscribe), EGU (software-event bridge to NVIC), TIMER10/20–24, per-node FICR.DEVICEID, UARTE20 EasyDMA, GPIO P0/P1/P2, and an 802.15.4 RADIO with deferred PHYEND so the driver's NVIC-disabling critical section exits before the IRQ fires.  Single-node bring-up and the FLPR dual-core launch (below) work; **multi-node 802.15.4 reception is a known open issue** — the radio-model receive path drops frames mid-reception (see [Known issues](#known-issues)).
-- **Nordic nRF54L15 FLPR (RISC-V / RV32E)** — the on-die **VPR coprocessor**, modelled as a second core (`src/riscv/`) that shares the M33's bus. The M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register (SPU SECATTR-gated, as on hardware); the RV32E core then runs **unmodified Contiki-NG** (`hello-vpr`) dual-core with the M33. Verified end-to-end: the M33 prints `[FLPR] tick N` (advancing ~2/sec) and LED0 (P2.9, RISC-V) / LED1 (P1.10, M33) blink at 1 Hz / 2 Hz — visible live in the web UI. ISA `rv32e_zicsr_zifencei` (base integer + CSR + `fence.i`; no M/C). Plan + register map: [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md).
+- **Nordic nRF54L15 FLPR (RISC-V / RV32EMC)** — the on-die **VPR coprocessor**, modelled as a second core (`src/riscv/`) that shares the M33's bus. The M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register (SPU SECATTR-gated, as on hardware); the RV32EMC core then runs **unmodified Contiki-NG** (`hello-vpr`) dual-core with the M33. Verified end-to-end: the M33 prints `[FLPR] tick N` (reaching `tick 80` by 60 s) and LED0 (P2.9, RISC-V) / LED1 (P1.10, M33) blink at 1 Hz / 2 Hz — visible live in the web UI. ISA `rv32emc_zicsr_zifencei` (base integer + M (mul/div/rem) + C (compressed) + CSR + `fence.i`). With interrupt-driven etimers both cores idle in `WFI` between events — ~714× real-time at 60 s (see [Performance](#performance)). Plan + register map: [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md).
 
 Shared 802.15.4 helpers live in [`include/common/ieee_802154.h`](include/common/ieee_802154.h) (PHY constants + CCITT-16 FCS used by all four radios) and [`include/arm/nrf_radio_common.h`](include/arm/nrf_radio_common.h) (one `nrf_radio_emit_ieee802154_frame()` for both nRF radios).
 
@@ -225,9 +225,17 @@ Measured on Apple Silicon (PGO build) and Linux x86-64 (release).  See `bench` f
 | MSP430 2-node RPL-UDP (Linux x86-64 release) | ~250× real-time |
 | CC2538DK 2-node RPL-UDP (interpreter) | ~300× real-time |
 | nRF52840 2-node RPL-UDP (interpreter) | ~360× real-time |
-| nRF54L15 FLPR dual-core demo (M33 + RV32E, `flpr-host`) | ~0.1× real-time |
+| nRF54L15 dual-core (M33 `flpr-host` + RV32EMC FLPR, both WFI-idle) | ~714× real-time (60 s sim) |
 
-The **FLPR dual-core demo** is the slow one (~0.1×): the `hello-vpr` firmware uses *polled* etimers, so the RV32E core busy-spins on the GRTC clock between ticks — ~360 M instructions for a 4 s sim, almost all of it polling.  That's a faithful emulation of the firmware, not an emulator inefficiency; the fix is interrupt-driven etimers (GRTC CC3) in Contiki's `nrf-vpr` port, plus modelling RV32E `WFI` as idle in csim.  See the FLPR row in [Platforms](#platforms) and `docs/design/riscv-vpr-plan.md`.  (A multi-node nRF54L15 802.15.4 throughput figure is omitted: reception does not yet work — see [Known issues](#known-issues).)
+**nRF54L15 dual-core (M33 `flpr-host` + RV32EMC FLPR) — both cores WFI-idle** (Linux x86-64 release):
+
+| Sim | Wall | Real-time |
+|---|---|---|
+| 5 s | 20 ms | 250× |
+| 20 s | 39 ms | 513× |
+| 60 s | 84 ms | 714× |
+
+Scales with sim length as the ~15 ms fixed boot cost amortizes — at 60 s it is **714× real-time**.  The FLPR ticks correctly throughout (59 samples over 60 s; last `tick 80` at 60.0 s), so both cores are genuinely running, just sleeping between events.  For context, this exact demo was **~0.15×** before the idle work (FLPR busy-polling the GRTC + M33 in the NOP-spin) — roughly a **~4,700× wall-clock speedup** at 60 s.  This requires the interrupt-driven `rv32emc` `flpr-host` firmware (GRTC-CC3 etimers + `WFI`) together with csim's RV32E `WFI`-as-idle modelling; the older *polled* firmware busy-spins the GRTC at ~0.15×.  See the FLPR row in [Platforms](#platforms) and `docs/design/riscv-vpr-plan.md`.  (A multi-node nRF54L15 802.15.4 throughput figure is omitted: reception does not yet work — see [Known issues](#known-issues).)
 
 ## Architecture
 

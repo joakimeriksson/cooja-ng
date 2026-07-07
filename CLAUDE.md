@@ -204,7 +204,7 @@ scheduling policy is the one documented deferral. **The staged refactor
 
 | File | Purpose |
 |------|---------|
-| `riscv_cpu.c` | RV32E interpreter (`rv32e_zicsr_zifencei`): base RV32I + CSR + `fence.i` + M-mode traps. Shares the host M33's memory/IO bus, so SRAM + peripherals are one address space. No M/C/F/D |
+| `riscv_cpu.c` | RV32EMC interpreter (`rv32emc_zicsr_zifencei`): base RV32I + M (mul/div/rem) + C (compressed) + CSR + `fence.i` + M-mode traps. Shares the host M33's memory/IO bus, so SRAM + peripherals are one address space. No F/D |
 | `nrf54l_vpr.c` | Bridge: on the M33's VPR `CPURUN` edge, instantiate the FLPR over the shared bus and co-step it after each ARM execute slice (SoC-agnostic `coproc` hook on `arm_cpu_t`) |
 
 ## Architecture
@@ -338,7 +338,7 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **nrf52840-dongle** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10059 USB Dongle, M4F + FPv4-SP-D16, VTOR=0x1000 (Open Bootloader region at 0x0..0xfff) |
 | **nrf52840-dk** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10056 Development Kit, same SoC as Dongle, VTOR=0x0, SEGGER VCP console |
 | **nrf54l15-dk** | nRF54L15 (ARM Cortex-M33, ARMv8-M) | Yes (on-chip 2.4 GHz) | UARTE20 | Nordic nRF54L15-DK, 256 KB RAM, GRTC/DPPI fabric, VTOR=0x0 |
-| **nrf54l15-dk + FLPR** | nRF54L15 **FLPR (RV32E, RISC-V)** coprocessor | — (uses the M33's radio) | shared SRAM | **Dual-core / cross-ISA**: the M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register; the RV32E core (`hello-vpr`) then runs **unmodified Contiki-NG** alongside the M33. ISA `rv32e_zicsr_zifencei` (no M/C). See [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md) |
+| **nrf54l15-dk + FLPR** | nRF54L15 **FLPR (RV32EMC, RISC-V)** coprocessor | — (uses the M33's radio) | shared SRAM | **Dual-core / cross-ISA**: the M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register; the RV32EMC core (`hello-vpr`) then runs **unmodified Contiki-NG** alongside the M33. ISA `rv32emc_zicsr_zifencei` (M + C). See [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md) |
 
 ## MCU Configurations
 
