@@ -1,0 +1,8 @@
+{
+  "title": "2-node nRF54L15-DK RPL-UDP (exercises per-instance radio/timer/EGU bindings)",
+  "timeout_ms": 60000,
+  "nodes": [
+    { "firmware": "firmware/nrf54l15-dk/udp-server.nrf54l15-dk", "id": 1, "x": 0.0, "y": 0.0 },
+    { "firmware": "firmware/nrf54l15-dk/udp-client.nrf54l15-dk", "id": 2, "x": 20.0, "y": 0.0 }
+  ]
+}

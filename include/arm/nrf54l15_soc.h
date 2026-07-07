@@ -197,11 +197,22 @@ typedef struct nrf54l_grtc_state {
 #define NRF54L_RADIO_NUM_SUBSCRIBES 12   /* TXEN..CCASTOP, contiguous 4-byte slots */
 #define NRF54L_RADIO_NUM_PUBLISHES  24   /* READY..CTEPRESENT */
 
+/* Per-SUBSCRIBE-slot DPPI binding.  Lives inside the owning radio instance
+ * (not a file-scope table) so two nRF54L15 nodes never share binding slots —
+ * a shared table let whichever node programmed a slot last own every node's
+ * DPPI callback, cross-wiring radio state between motes. */
+struct nrf54l_radio_state;
+typedef struct {
+    struct nrf54l_radio_state *radio;
+    uint32_t                   task_off;
+} nrf54l_radio_sub_binding_t;
+
 typedef struct nrf54l_radio_state {
     arm_platform_t      *plat;
     nrf54l_dppi_state_t *dppi;
     int                  irq_num_0;   /* RADIO_0 IRQn = 138 */
     int                  irq_num_1;   /* RADIO_1 IRQn = 139 */
+    nrf54l_radio_sub_binding_t sub_bindings[NRF54L_RADIO_NUM_SUBSCRIBES];
 
     uint32_t state;                   /* 0=DISABLED, 2=RXIDLE, 3=RX, 10=TXIDLE, 11=TX */
     uint32_t shorts;
@@ -364,6 +375,14 @@ typedef struct nrf54l_radio_state {
  */
 #define NRF54L_EGU_NUM_CHANNELS 16
 
+/* Per-channel DPPI binding, embedded in the owning EGU instance (see the
+ * radio binding note above — no shared file-scope table across nodes). */
+struct nrf54l_egu_state;
+typedef struct {
+    struct nrf54l_egu_state *egu;
+    int                      task_n;
+} nrf54l_egu_sub_binding_t;
+
 typedef struct nrf54l_egu_state {
     arm_platform_t      *plat;
     nrf54l_dppi_state_t *dppi;
@@ -371,6 +390,7 @@ typedef struct nrf54l_egu_state {
     uint32_t             publish[NRF54L_EGU_NUM_CHANNELS];
     uint32_t             subscribe[NRF54L_EGU_NUM_CHANNELS];
     int                  sub_channel[NRF54L_EGU_NUM_CHANNELS];
+    nrf54l_egu_sub_binding_t sub_bindings[NRF54L_EGU_NUM_CHANNELS];
     uint32_t             inten;
     int                  irq_num;
 } nrf54l_egu_state_t;
@@ -379,9 +399,19 @@ typedef struct nrf54l_egu_state {
  * Backing model: 32-bit counter at 16 MHz / 2^PRESCALER, derived from
  * sim_time_ns when needed.  Compare events fire from the CPU event queue. */
 #define NRF54L_TIMER_NUM_CC  6
+
+/* Per-CC compare-event firing context, embedded in the owning timer instance
+ * (was a file-scope timer_cc_ctx[2][6] shared across nodes). */
+struct nrf54l_timer_state;
+typedef struct {
+    struct nrf54l_timer_state *t;
+    int                        n;
+} nrf54l_timer_cc_ctx_t;
+
 typedef struct nrf54l_timer_state {
     arm_platform_t      *plat;
     nrf54l_dppi_state_t *dppi;
+    nrf54l_timer_cc_ctx_t cc_ctx[NRF54L_TIMER_NUM_CC];
     uint32_t             cc[NRF54L_TIMER_NUM_CC];
     uint32_t             events_compare[NRF54L_TIMER_NUM_CC];
     uint32_t             publish_compare[NRF54L_TIMER_NUM_CC];

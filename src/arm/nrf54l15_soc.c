@@ -722,16 +722,11 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
 /* Forward decl */
 static void egu_fire_event(nrf54l_egu_state_t *e, int n);
 
-/* SUBSCRIBE binding storage — one slot per (EGU, channel) — used to
- * dispatch DPPI publishes back into the right TASKS_TRIGGER[n]. */
-typedef struct {
-    nrf54l_egu_state_t *egu;
-    int                 task_n;
-} egu_sub_binding_t;
-static egu_sub_binding_t egu_sub_bindings[3 /* EGU instances */ * NRF54L_EGU_NUM_CHANNELS];
-
+/* SUBSCRIBE binding — the storage lives per-instance in
+ * nrf54l_egu_state_t::sub_bindings (see the header); the DPPI callback
+ * dispatches the publish back into the right instance's TASKS_TRIGGER[n]. */
 static void egu_sub_cb(void *user) {
-    egu_sub_binding_t *b = (egu_sub_binding_t *)user;
+    nrf54l_egu_sub_binding_t *b = (nrf54l_egu_sub_binding_t *)user;
     egu_fire_event(b->egu, b->task_n);
 }
 
@@ -773,13 +768,8 @@ static void nrf54l_egu_write(void *user_data, uint32_t addr, uint32_t value) {
     if (off >= E_SUBSCRIBE_BASE && off < E_SUBSCRIBE_BASE + 4 * NRF54L_EGU_NUM_CHANNELS) {
         int idx = (off - E_SUBSCRIBE_BASE) / 4;
         e->subscribe[idx] = value;
-        /* Find this instance's binding slot. */
-        int instance_off = 0;
-        nrf54l15_soc_t *soc = (nrf54l15_soc_t *)e->plat->soc;
-        if (e == &soc->egu00)      instance_off = 0;
-        else if (e == &soc->egu10) instance_off = NRF54L_EGU_NUM_CHANNELS;
-        else                        instance_off = 2 * NRF54L_EGU_NUM_CHANNELS;
-        egu_sub_binding_t *binding = &egu_sub_bindings[instance_off + idx];
+        /* Binding storage lives in this instance — no cross-node sharing. */
+        nrf54l_egu_sub_binding_t *binding = &e->sub_bindings[idx];
         if (e->sub_channel[idx] >= 0) {
             nrf54l_dppi_unsubscribe(e->dppi, e->sub_channel[idx], egu_sub_cb, binding);
             e->sub_channel[idx] = -1;
@@ -985,14 +975,10 @@ enum {
 #define NRF54L_RX_READ_PHR      IEEE802154_RX_READ_PHR
 #define NRF54L_RX_READ_PAYLOAD  IEEE802154_RX_READ_PAYLOAD
 
-/* SUBSCRIBE-slot binding — one per task-index 0..11, lives inside
- * the radio state.  DPPI subscriber callback receives a pointer to
- * one of these and triggers the task at `task_off`. */
-typedef struct {
-    nrf54l_radio_state_t *radio;
-    uint32_t              task_off;
-} radio_sub_binding_t;
-static radio_sub_binding_t radio_sub_bindings[NRF54L_RADIO_NUM_SUBSCRIBES];
+/* SUBSCRIBE-slot binding storage lives per-instance in
+ * nrf54l_radio_state_t::sub_bindings (see the header).  The DPPI subscriber
+ * callback receives a pointer to one of these and triggers the task at
+ * `task_off`. */
 static const uint32_t radio_sub_task_off[NRF54L_RADIO_NUM_SUBSCRIBES] = {
     R_TASKS_TXEN, R_TASKS_RXEN, R_TASKS_START, R_TASKS_STOP,
     R_TASKS_DISABLE, R_TASKS_RSSISTART, R_TASKS_BCSTART, R_TASKS_BCSTOP,
@@ -1349,7 +1335,7 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
 
 /* DPPI subscriber callback — bound once per SUBSCRIBE slot. */
 static void radio_sub_cb(void *user) {
-    radio_sub_binding_t *b = (radio_sub_binding_t *)user;
+    nrf54l_radio_sub_binding_t *b = (nrf54l_radio_sub_binding_t *)user;
     nrf54l_radio_trigger_task(b->radio, b->task_off);
 }
 
@@ -1682,16 +1668,16 @@ static void nrf54l_radio_write(void *user_data, uint32_t addr, uint32_t value) {
         /* Unbind previous channel if any. */
         if (r->sub_channel[idx] >= 0) {
             nrf54l_dppi_unsubscribe(r->dppi, r->sub_channel[idx],
-                                     radio_sub_cb, &radio_sub_bindings[idx]);
+                                     radio_sub_cb, &r->sub_bindings[idx]);
             r->sub_channel[idx] = -1;
         }
         /* Bind new channel if EN set. */
         if (value & 0x80000000u) {
             int ch = (int)(value & 0x1Fu);
-            radio_sub_bindings[idx].radio    = r;
-            radio_sub_bindings[idx].task_off = radio_sub_task_off[idx];
+            r->sub_bindings[idx].radio    = r;
+            r->sub_bindings[idx].task_off = radio_sub_task_off[idx];
             nrf54l_dppi_subscribe(r->dppi, ch,
-                                   radio_sub_cb, &radio_sub_bindings[idx]);
+                                   radio_sub_cb, &r->sub_bindings[idx]);
             r->sub_channel[idx] = ch;
         }
         return;
@@ -1852,9 +1838,9 @@ static void nrf54l_timer_compare_fired(void *user, cpu_event_t *ev) {
     }
 }
 
-/* Per-CC firing context lives in the event's user pointer. */
-static struct timer_cc_ctx { nrf54l_timer_state_t *t; int n; }
-    timer_cc_ctx[2 /* timers */][NRF54L_TIMER_NUM_CC];
+/* Per-CC firing context lives in the event's user pointer — storage is
+ * per-instance in nrf54l_timer_state_t::cc_ctx (see the header), so two
+ * nRF54L15 nodes' timers never share it. */
 
 static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
     arm_cancel_event(&t->plat->cpu, &t->ev_compare[n]);
@@ -1903,9 +1889,7 @@ static void nrf54l_timer_task(nrf54l_timer_state_t *t, uint32_t off) {
                 t->counter = (t->counter + 1) & nrf54l_timer_mask(t);
                 for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++) {
                     if (t->counter == (t->cc[n] & nrf54l_timer_mask(t)))
-                        nrf54l_timer_compare_fired(
-                            (void *)&timer_cc_ctx[t->base_addr == NRF54L_TIMER10_BASE ? 0 : 1][n],
-                            NULL);
+                        nrf54l_timer_compare_fired((void *)&t->cc_ctx[n], NULL);
                 }
             }
             break;
@@ -1924,7 +1908,7 @@ static void nrf54l_timer_task(nrf54l_timer_state_t *t, uint32_t off) {
 }
 
 static void timer_capture_sub_cb(void *user) {
-    struct timer_cc_ctx *ctx = (struct timer_cc_ctx *)user;
+    nrf54l_timer_cc_ctx_t *ctx = (nrf54l_timer_cc_ctx_t *)user;
     nrf54l_timer_capture(ctx->t, ctx->n);
 }
 static void timer_start_sub_cb(void *user) {
@@ -2008,15 +1992,14 @@ static void nrf54l_timer_write(void *user_data, uint32_t addr, uint32_t value) {
         int n = (off - 0x0C0) / 4;
         if (t->sub_capture_ch[n] >= 0)
             nrf54l_dppi_unsubscribe(t->dppi, t->sub_capture_ch[n],
-                                     timer_capture_sub_cb,
-                                     &timer_cc_ctx[t->base_addr == NRF54L_TIMER10_BASE ? 0 : 1][n]);
+                                     timer_capture_sub_cb, &t->cc_ctx[n]);
         t->subscribe_capture[n] = value;
         t->sub_capture_ch[n] = -1;
         if ((value & 0x80000000u) && t->dppi) {
             int ch = (int)(value & 0x1Fu);
             t->sub_capture_ch[n] = ch;
             nrf54l_dppi_subscribe(t->dppi, ch, timer_capture_sub_cb,
-                                   &timer_cc_ctx[t->base_addr == NRF54L_TIMER10_BASE ? 0 : 1][n]);
+                                   &t->cc_ctx[n]);
         }
         return;
     }
@@ -2063,7 +2046,7 @@ static void nrf54l_timer_write(void *user_data, uint32_t addr, uint32_t value) {
 
 static void nrf54l_timer_setup(nrf54l_timer_state_t *t, arm_platform_t *plat,
                                 nrf54l_dppi_state_t *dppi, uint32_t base,
-                                int irq_num, int slot) {
+                                int irq_num) {
     t->plat      = plat;
     t->dppi      = dppi;
     t->irq_num   = irq_num;
@@ -2071,10 +2054,10 @@ static void nrf54l_timer_setup(nrf54l_timer_state_t *t, arm_platform_t *plat,
     t->bitmode   = 0; /* 16-bit default per SVD */
     for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++) {
         t->sub_capture_ch[n] = -1;
-        timer_cc_ctx[slot][n].t = t;
-        timer_cc_ctx[slot][n].n = n;
+        t->cc_ctx[n].t = t;
+        t->cc_ctx[n].n = n;
         t->ev_compare[n].callback  = nrf54l_timer_compare_fired;
-        t->ev_compare[n].user_data = &timer_cc_ctx[slot][n];
+        t->ev_compare[n].user_data = &t->cc_ctx[n];
     }
     arm_register_io(&plat->cpu, base, NRF54L_TIMER_SIZE,
                     nrf54l_timer_read, nrf54l_timer_write, t);
@@ -2318,9 +2301,9 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
 
     /* TIMER10/20 — used by nrf_802154 lptimer backend (TIMER20). */
     nrf54l_timer_setup(&soc->timer10, plat, &soc->dppi,
-                       NRF54L_TIMER10_BASE, NRF54L_TIMER10_IRQ, 0);
+                       NRF54L_TIMER10_BASE, NRF54L_TIMER10_IRQ);
     nrf54l_timer_setup(&soc->timer20, plat, &soc->dppi,
-                       NRF54L_TIMER20_BASE, NRF54L_TIMER20_IRQ, 1);
+                       NRF54L_TIMER20_BASE, NRF54L_TIMER20_IRQ);
 }
 
 static void nrf54l15_soc_destroy(arm_platform_t *plat) {
