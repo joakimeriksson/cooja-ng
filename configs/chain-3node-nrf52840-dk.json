@@ -1,0 +1,25 @@
+{
+    "title": "3-node chain RPL-UDP: nRF52840 DK 3-node)",
+    "timeout_ms": 240000,
+    "seed": 42,
+    "startup_delay_ms": 1000,
+    "radiomedium": {
+        "type": "udgm",
+        "tx_range": 55.0,
+        "interference_range": 110.0,
+        "success_ratio_tx": 1.0,
+        "success_ratio_rx": 1.0
+    },
+    "nodes": [
+        { "firmware": "firmware/nrf52840-dk/udp-server.nrf52840-dk", "id": 1, "x":   0.0, "y": 0.0 },
+        { "firmware": "firmware/nrf52840-dk/udp-client.nrf52840-dk", "id": 2, "x":  50.0, "y": 0.0 },
+        { "firmware": "firmware/nrf52840-dk/udp-client.nrf52840-dk", "id": 3, "x": 100.0, "y": 0.0 }
+    ],
+    "test": {
+        "description": "Verify RPL-UDP convergence over 2 hops on nRF54L15 DK. Reduced to 3 nodes and longer timeout because emulation runs at ~0.1x real-time on this SoC.",
+        "validators": [
+            { "pattern": "Received request",  "node": 1, "min_count": 1 },
+            { "pattern": "Received response", "node": 3, "min_count": 1 }
+        ]
+    }
+}

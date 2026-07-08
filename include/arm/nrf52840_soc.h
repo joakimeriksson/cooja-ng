@@ -324,6 +324,10 @@ typedef struct nrf52840_soc {
 void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, void *user_data);
 void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte);
 
+/* Frame-stall recovery (multi-hop): abort a mid-flight reception truncated by
+ * a collision, emitting CRCERROR so the driver clears psdu_being_received. */
+void nrf_radio_rx_stall(nrf52840_soc_t *soc);
+
 /* Inject host console bytes into the UARTE RX ring (shell input). */
 void nrf_uart_feed_rx(nrf_uart_state_t *uart, const uint8_t *buf, int len);
 

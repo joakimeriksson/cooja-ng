@@ -1441,11 +1441,21 @@ void nrf54l_radio_rx_stall(nrf54l15_soc_t *soc) {
         fprintf(stderr, "[radio cpu=0x%04x cyc=%lld RX_STALL phase=%d remaining=%d]\n",
                 (unsigned)((uintptr_t)&r->plat->cpu & 0xFFFF),
                 (long long)r->plat->cpu.cycles, r->rx_phase, r->rx_remaining);
-    /* Abandon the frame. Fire PHYEND so PHYEND_DISABLE SHORTS chain
-     * disables the radio (matches the real-HW signal-loss path). */
+    /* Abandon the frame with a terminal CRC failure.  The parser had locked
+     * SFD, so ADDRESS/FRAMESTART already fired and the nrf_802154 driver set
+     * psdu_being_received; firing only PHYEND (no RX interrupt) leaves that flag
+     * set forever, and every later nrf_802154_transmit_raw then returns
+     * BUSY_CHANNEL (psdu_being_received_now) so the node can never TX/ACK/forward
+     * again — stalling RPL past the first hop.  Emit END+PHYEND+CRCERROR:
+     * CRCERROR raises the RX IRQ, the driver runs rxframe_finish() and clears the
+     * flag.  Physically accurate too — a receiver that locks SFD then loses signal
+     * clocks in noise and fails the FCS. */
     r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
     r->state    = NRF54L_RADIO_STATE_RXIDLE;
-    nrf54l_radio_fire_event(r, &r->evt_phyend, INT_PHYEND, PUB_PHYEND);
+    r->crcstatus = 0;
+    nrf54l_radio_fire_event(r, &r->evt_end,      INT_END,      PUB_END);
+    nrf54l_radio_fire_event(r, &r->evt_phyend,   INT_PHYEND,   PUB_PHYEND);
+    nrf54l_radio_fire_event(r, &r->evt_crcerror, INT_CRCERROR, PUB_CRCERROR);
     nrf54l_radio_apply_shorts(r, R_SHORT_PHYEND_DISABLE);
 }
 

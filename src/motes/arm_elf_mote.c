@@ -303,6 +303,21 @@ static const mote_radio_ops_t arm54l_radio_ops = {
     arm54l_radio_rx_stall, NULL /* current_channel */, NULL /* mark_collisions */
 };
 
+/* nrf52840 variant: same endpoint plus the RX-stall recovery op. Without it,
+ * a mid-frame reception truncated by a collision (routine on a multi-hop
+ * router that hears two neighbours) never fires a terminal RX event, so the
+ * nrf_802154 driver's psdu_being_received flag stays set and the node can
+ * never transmit again — breaking RPL past the first hop. */
+static void armnrf_radio_rx_stall(void *m) {
+    mixed_node_t *node = (mixed_node_t *)m;
+    nrf52840_soc_t *nrf_soc = arm_platform_nrf52840(&node->plat.arm);
+    if (nrf_soc) nrf_radio_rx_stall(nrf_soc);
+}
+static const mote_radio_ops_t armnrf_radio_ops = {
+    arm_radio_receive_byte, arm_radio_rxfifo_available, arm_radio_rx_busy,
+    armnrf_radio_rx_stall, NULL /* current_channel */, NULL /* mark_collisions */
+};
+
 void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
                                  sim_radio_bus_t *bus) {
     /* Chips with an rx_incoming buffer + state guard (cc2538_rfcore,
@@ -311,6 +326,7 @@ void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
      * regressed 4-node RPL convergence — see 9ebe99a investigation),
      * so it stays BATCH. */
     bool nrf54l = arm_platform_nrf54l15(&node->plat.arm) != NULL;
+    bool nrf52  = arm_platform_nrf52840(&node->plat.arm) != NULL;
     /* All ARM radio models take per-byte delivery now.  nRF52840 was the
      * last BATCH holdout ("DMA-style"), but its RX state machine is
      * per-byte internally (WAIT_PREAMBLE→SFD→PHR→PAYLOAD) and BATCH
@@ -325,9 +341,10 @@ void arm_elf_mote_register_radio(mixed_node_t *node, int slot,
      * cc2538/nrf54l15. */
     sim_radio_delivery_mode_t mode = SIM_RADIO_DELIVERY_PER_BYTE;
     (void)0;
-    sim_radio_bus_register(bus, slot,
-                           nrf54l ? &arm54l_radio_ops : &arm_radio_ops,
-                           node, mode, /*caps=*/0);
+    const mote_radio_ops_t *ops = nrf54l ? &arm54l_radio_ops
+                                : nrf52  ? &armnrf_radio_ops
+                                         : &arm_radio_ops;
+    sim_radio_bus_register(bus, slot, ops, node, mode, /*caps=*/0);
 }
 
 /* ============================================================

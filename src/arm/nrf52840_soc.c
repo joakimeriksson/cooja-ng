@@ -907,6 +907,39 @@ static void nrf_radio_ack_cb(void *user_data, cpu_event_t *event) {
     r->ack_pending_len = 0;
 }
 
+/* Abort a mid-flight reception when the driver tears the radio down (STOP/
+ * DISABLE) before the frame completes.  Once the parser has locked SFD,
+ * ADDRESS/FRAMESTART have fired and nrf_802154 has set psdu_being_received;
+ * without a terminal RX event that flag stays set forever and every later
+ * nrf_802154_transmit_raw returns BUSY_CHANNEL (can_terminate_current_operation
+ * → psdu_being_received_now), so the node can never transmit again — which
+ * stalls RPL join/forwarding on a multi-hop router that hears two neighbours.
+ * Emit END+PHYEND+CRCERROR: CRCERROR raises the RX IRQ so the driver runs
+ * rxframe_finish() and clears the flag.  No-op when no frame is locked. */
+static void radio_abort_inflight_rx(nrf52840_soc_t *soc) {
+    nrf_radio_state_t *r = &soc->radio;
+    if (r->state != NRF_RADIO_STATE_RX ||
+        r->rx_phase == NRF_RX_WAIT_PREAMBLE ||
+        r->rx_phase == NRF_RX_WAIT_SFD)
+        return;
+    r->rx_phase  = NRF_RX_WAIT_PREAMBLE;
+    r->crcstatus = 0;
+    /* Mirror the frame-complete terminal sequence, but with a CRC failure:
+     * END+PHYEND then (END/PHYEND_DISABLE short → DISABLED, latched before the
+     * CRC event so the driver's ISR sees STATE==DISABLED) then CRCERROR. */
+    radio_event(soc, &r->evt_end,    RADIO_INT_END);
+    radio_event(soc, &r->evt_phyend, RADIO_INT_PHYEND);
+    if (r->shorts & (SHORT_END_DISABLE | SHORT_PHYEND_DISABLE)) {
+        r->state = NRF_RADIO_STATE_DISABLED;
+        r->evt_disabled = 1;
+    }
+    radio_event(soc, &r->evt_crcerror, RADIO_INT_CRCERROR);
+    radio_apply_shorts_after_event(soc, SHORT_END_START);
+    radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
+    if (r->state == NRF_RADIO_STATE_RX)
+        r->state = NRF_RADIO_STATE_RXIDLE;
+}
+
 /* RXEN/TXEN ramp-up: the RADIO does not reach RXIDLE/TXIDLE instantly — it ramps
  * for RX_RAMP_UP_TIME/TX_RAMP_UP_TIME = 40 µs (nrf_802154_procedures_duration.h),
  * sitting in RXRU/TXRU.  nrf_802154 sequences off this (it polls STATE==TXRU and
@@ -1110,6 +1143,7 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
             }
             break;
         case RADIO_TASKS_STOP:
+            radio_abort_inflight_rx(soc);
             if (r->state == NRF_RADIO_STATE_RX)  r->state = NRF_RADIO_STATE_RXIDLE;
             if (r->state == NRF_RADIO_STATE_TX) {
                 r->state = NRF_RADIO_STATE_TXIDLE;
@@ -1127,6 +1161,9 @@ static void radio_trigger_task(nrf52840_soc_t *soc, uint32_t off) {
                  * (no ramp-down needed). */
                 radio_event(soc, &r->evt_disabled, RADIO_INT_DISABLED);
             } else {
+                /* A mid-frame reception aborted by this disable must still
+                 * clear the driver's psdu_being_received (see helper). */
+                radio_abort_inflight_rx(soc);
                 /* Abort any in-flight ramp-up or deferred transmit. */
                 if (r->ramp_event && soc->plat)
                     arm_cancel_event(&soc->plat->cpu, (arm_event_t *)r->ramp_event);
@@ -1316,6 +1353,45 @@ void nrf_radio_set_tx_listener(nrf52840_soc_t *soc, nrf_radio_tx_listener_t cb, 
     soc->radio_tx_user = user_data;
 }
 
+/* Frame-stall recovery (multi-hop): the kernel radio bus fires this when no
+ * RF byte has arrived for this mote within SIM_RADIO_RX_STALL_NS while a frame
+ * is mid-flight — i.e. a neighbour's TX was truncated (collision/abort) partway
+ * through our reception.  The parser had locked SFD, so ADDRESS/FRAMESTART
+ * already fired and nrf_802154 set psdu_being_received=true; but rx_remaining
+ * never reaches 0, so no CRCOK/CRCERROR fires and psdu_being_received stays set
+ * forever.  From then on every nrf_802154_transmit_raw returns BUSY_CHANNEL
+ * (can_terminate_current_operation → psdu_being_received_now) and the node can
+ * never TX/ACK/forward again — which breaks RPL convergence past the first hop.
+ * Abort by emitting END+PHYEND+CRCERROR: CRCERROR raises the RX IRQ so the
+ * driver runs rxframe_finish() and clears psdu_being_received.  This is also
+ * physically accurate — a receiver that locks SFD then loses signal clocks in
+ * noise and fails the FCS, i.e. a CRC error. */
+void nrf_radio_rx_stall(nrf52840_soc_t *soc) {
+    nrf_radio_state_t *r = &soc->radio;
+    if (r->state != NRF_RADIO_STATE_RX ||
+        r->rx_phase == NRF_RX_WAIT_PREAMBLE ||
+        r->rx_phase == NRF_RX_WAIT_SFD)
+        return;
+    if (nrf_trace_flag(&trc_rx, "NRF_RX_TRACE"))
+        fprintf(stderr, "[nrf-rx] RX_STALL phase=%d remaining=%d -> CRCERROR abort\n",
+                r->rx_phase, r->rx_remaining);
+    r->crcstatus = 0;
+    radio_event(soc, &r->evt_end,    RADIO_INT_END);
+    radio_event(soc, &r->evt_phyend, RADIO_INT_PHYEND);
+    /* Latch DISABLED before CRCERROR so the driver's ISR, which busy-waits
+     * for STATE==DISABLED, sees it immediately (same as frame-complete). */
+    if (r->shorts & (SHORT_END_DISABLE | SHORT_PHYEND_DISABLE)) {
+        r->state = NRF_RADIO_STATE_DISABLED;
+        r->evt_disabled = 1;
+    }
+    radio_event(soc, &r->evt_crcerror, RADIO_INT_CRCERROR);
+    radio_apply_shorts_after_event(soc, SHORT_END_START);
+    radio_apply_shorts_after_event(soc, SHORT_PHYEND_START);
+    if (r->state == NRF_RADIO_STATE_RX)
+        r->state = NRF_RADIO_STATE_RXIDLE;
+    r->rx_phase = NRF_RX_WAIT_PREAMBLE;
+}
+
 /* Push a single on-air byte into the receiver. Frames bytes through the
  * preamble/SFD/PHR/payload state machine, writes accepted bytes into
  * the PACKETPTR-pointed RAM buffer, and fires FRAMESTART/CRCOK/END
@@ -1370,7 +1446,11 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
             break;
         case NRF_RX_READ_PHR:
             if (byte < 2 || byte > 127) {
-                r->rx_phase = NRF_RX_WAIT_PREAMBLE;
+                /* Invalid PHR after SFD lock — ADDRESS/FRAMESTART already fired,
+                 * so nrf_802154 set psdu_being_received.  Abort with a terminal
+                 * CRCERROR so the driver clears it; otherwise the flag leaks and
+                 * blocks all future TX (multi-hop join/forward stall). */
+                radio_abort_inflight_rx(soc);
                 break;
             }
             arm_write8(cpu, r->packetptr, byte);
@@ -1442,7 +1522,28 @@ void nrf_radio_receive_byte(nrf52840_soc_t *soc, uint8_t byte) {
                     int     frame_type = fcf0 & 0x07;
                     int     ack_req    = (fcf0 >> 5) & 1;
                     int     frame_ver  = (fcf1 >> 4) & 0x3;
-                    if (frame_type == 0x1 /* Data */ && ack_req && frame_ver < 2) {
+                    int     dst_mode   = (fcf1 >> 2) & 0x3;
+                    /* Destination filter: only the addressed node may ACK.
+                     * Without this every neighbour that hears a unicast data
+                     * frame with the AR bit fabricates an ACK; in a 3+ node
+                     * network two ACKs collide at the sender, which then never
+                     * sees a clean one and retransmits until it gives up —
+                     * stalling RPL unicast (DAO/UDP) past the first hop.  The
+                     * extended dest address's first 4 bytes are the node's
+                     * FICR.DEVICEADDR0 (big-endian); compare against ours.
+                     * Only filter 64-bit addressing (what Contiki uses here);
+                     * leave other modes as-was so short-addr/Zephyr paths keep
+                     * their fabricated ACK. */
+                    int for_us = 1;
+                    if (dst_mode == 3 && r->rx_offset >= 14) {
+                        uint32_t dst =
+                            ((uint32_t)arm_read8(cpu, r->packetptr + 6) << 24) |
+                            ((uint32_t)arm_read8(cpu, r->packetptr + 7) << 16) |
+                            ((uint32_t)arm_read8(cpu, r->packetptr + 8) <<  8) |
+                             (uint32_t)arm_read8(cpu, r->packetptr + 9);
+                        for_us = (dst == soc->ficr.deviceaddr0);
+                    }
+                    if (frame_type == 0x1 /* Data */ && ack_req && frame_ver < 2 && for_us) {
                         uint8_t ack_fcf0 = 0x02; /* frame type = ACK */
                         uint8_t ack_fcf1 = 0x00;
                         uint16_t crc = 0;

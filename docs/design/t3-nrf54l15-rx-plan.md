@@ -27,7 +27,20 @@ the rx-disable timeout. One emit per frame; the redundant DPPI START is absorbed
 this one cause. `configs/test-2node-nrf54l15-dk.json` now passes end-to-end; no
 parity regressions (nrf52840, cc2538, MSP430, Zephyr, arm-correctness all green).
 
-## Still open — multi-hop (2026-07-08 investigation)
+## Multi-hop — RESOLVED (2026-07-08)
+
+The multi-hop failure is fixed for both nRF54L15 and nRF52840; full root cause
+and fix in [`nrf-multihop-forwarding-plan.md`](nrf-multihop-forwarding-plan.md)
+§Resolution. In short: a mid-frame **aborted reception** left the driver's
+`psdu_being_received` flag set (it needs a CRCOK/CRCERROR *with* its RX IRQ to
+clear, not the bare PHYEND the abort paths fired), so the router's every
+subsequent TX returned `BUSY_CHANNEL` and it wedged. Firing `END+PHYEND+CRCERROR`
+on abort clears it. nRF52840 additionally needed a destination-address check on
+the fabricated auto-ACK (two neighbours were both ACKing every unicast, colliding
+at the sender). `chain-3node-nrf54l15-dk`, `chain-3node/4node-nrf52840-dk` all
+pass. The original investigation notes are kept below for context.
+
+## Still open — multi-hop (2026-07-08 investigation) [superseded — see above]
 
 3+ node chains route the first hop but not the second: the far node (node 3)
 joins the DAG and sends UDP requests, but they don't reach the root. Findings so

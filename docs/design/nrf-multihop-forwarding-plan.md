@@ -1,5 +1,48 @@
 # nRF multi-hop 802.15.4 forwarding — investigation & fix plan
 
+Status: **RESOLVED (2026-07-08)** — nRF54L15 and nRF52840 multi-hop chains now
+route end-to-end. Predecessor: [`t3-nrf54l15-rx-plan.md`](t3-nrf54l15-rx-plan.md)
+(the single-hop nRF54L15 receive bug). The original investigation plan is kept
+below for context; the actual root cause and fix are in the Resolution.
+
+## Resolution (2026-07-08)
+
+The failure was **not** in 6LoWPAN forwarding (as this plan first assumed) — it
+was a radio-model bug shared in spirit by both nRF SoCs: **a driver-visible
+`psdu_being_received` flag that never got cleared when a reception was aborted.**
+Once set (on ADDRESS/FRAMESTART) but never cleared (needs a CRCOK/CRCERROR *with
+its RX interrupt*), `nrf_802154_transmit_raw` returns `BUSY_CHANNEL` forever
+(`can_terminate_current_operation → psdu_being_received_now`), so the router can
+never TX/ACK/forward again. Single-hop never hit it (no collisions → no aborted
+receptions); a multi-hop router hears two neighbours, so mid-frame aborts are
+routine.
+
+**nRF54L15** (`src/arm/nrf54l15_soc.c`, `nrf54l_radio_rx_stall`): a
+collision-truncated frame stalled mid-payload and the bus RX-stall watchdog fired
+only `PHYEND` (no IRQ) → flag stuck → router wedged in `DISABLED`. Fix: fire
+`END+PHYEND+CRCERROR` on the stall so the driver's RX IRQ clears the flag.
+
+**nRF52840** (`src/arm/nrf52840_soc.c`, `arm_elf_mote.c`) — two layers:
+1. *psdu leak*: a collision-corrupted **invalid PHR after SFD** reset the parser
+   silently after ADDRESS/FRAMESTART had already fired → same stuck flag (node
+   could only send DIS, never joined). Fix: a `radio_abort_inflight_rx` helper
+   (fires `END+PHYEND+CRCERROR`) called on invalid-PHR, on STOP/DISABLE
+   mid-frame, and via a newly-wired `rx_stall` op (`armnrf_radio_ops`).
+2. *spurious auto-ACK*: the fabricated auto-ACK had **no destination check**, so
+   every neighbour that heard a unicast data frame ACKed it → two ACKs collided
+   at the sender, which retransmitted forever and never established a route. Fix:
+   fabricate the ACK only when the frame's extended-dest address matches this
+   node's `FICR.DEVICEADDR0`.
+
+Verified: `chain-3node-nrf54l15-dk`, `chain-3node-nrf52840-dk`,
+`chain-4node-nrf52840-dk`/`-dongle` all PASS (node 4 routes 3 hops). No
+regressions — nRF52840 2-node RPL, TSCH nRF52840, Zephyr echo, nRF54L15 2-node,
+FLPR dual-core, cc2538/sky 4-node controls, and all unit suites stay green.
+
+---
+
+Original plan (for context):
+
 Status: proposed (2026-07-08). Self-contained handoff — assumes no prior context.
 Predecessor: [`t3-nrf54l15-rx-plan.md`](t3-nrf54l15-rx-plan.md) (the single-hop
 nRF54L15 receive bug, **fixed**; this is the remaining multi-hop issue).

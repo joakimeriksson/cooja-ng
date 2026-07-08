@@ -73,11 +73,32 @@ for the audit and plan.
   failed CRC. Scheduling `tx_end_event` in cycles fixes it. Regression test:
   `configs/test-2node-nrf54l15-dk.json`.
 
+### Fixed — nRF multi-hop 802.15.4 (nRF54L15 + nRF52840)
+- **3+ node RPL-UDP chains now route end-to-end on both nRF radios.** The bug was
+  in the radio model, not 6LoWPAN forwarding: when a reception was aborted
+  mid-frame (routine on a multi-hop router that hears two neighbours and gets
+  collision-truncated frames), the abort paths fired only a non-interrupting
+  `PHYEND`, so the `nrf_802154` driver's `psdu_being_received` flag — set on
+  ADDRESS/FRAMESTART, cleared only by a CRCOK/CRCERROR with its RX IRQ — stayed
+  set forever. Every later `nrf_802154_transmit_raw` then returned
+  `BUSY_CHANNEL` (`psdu_being_received_now`) and the router could never
+  TX/ACK/forward again. Single-hop never hit this (no collisions → no aborts).
+  - **nRF54L15** (`nrf54l15_soc.c`): the RX-stall watchdog now fires
+    `END+PHYEND+CRCERROR` instead of bare `PHYEND`.
+  - **nRF52840** (`nrf52840_soc.c`, `arm_elf_mote.c`): a `radio_abort_inflight_rx`
+    helper fires the terminal CRCERROR on an invalid-PHR-after-SFD, on a
+    STOP/DISABLE that interrupts a frame, and via a newly-wired `rx_stall` op.
+    Additionally, the fabricated auto-ACK now checks the frame's extended
+    destination address against this node's `FICR.DEVICEADDR0` — previously every
+    neighbour ACKed every unicast, so two ACKs collided at the sender and it
+    retransmitted until it gave up.
+  - Regression tests: `configs/chain-3node-nrf54l15-dk.json`,
+    `configs/chain-3node-nrf52840-dk.json`,
+    `configs/chain-4node-nrf52840-dk.json` (+ `-dongle`; node 4 relays 3 hops).
+    No regressions to nRF52840 2-node RPL, TSCH, Zephyr echo, nRF54L15 2-node,
+    FLPR dual-core, or the cc2538/sky controls.
+
 ### Known issues
-- **Multi-hop (3+ node) chains don't route past the first hop** — nRF54L15 and
-  nRF52840 alike. Single-hop now works; in a chain the far node joins the DAG and
-  sends, but its traffic isn't relayed across the second hop — a separate
-  6LoWPAN/RPL forwarding issue (`docs/design/t3-nrf54l15-rx-plan.md`).
 - The FLPR single-node dual-core demo works throughout.
 - **SVC is a no-op** (no SVCall exception) and **MSP430 CS HFXT** returns the
   DCO frequency — unmodeled; only affects firmware that uses them.
