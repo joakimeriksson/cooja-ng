@@ -64,13 +64,21 @@ for the audit and plan.
   mid-structure; firmware→board detection keys on the basename's extension;
   external-command service cleans up on `fork` failure.
 
+### Fixed — nRF54L15 radio (T3)
+- **Two-node nRF54L15 802.15.4 now routes end-to-end.** The radio's TX-completion
+  event was scheduled off the lagging `sim_time_ns`, so PHYEND fired ~1 cycle
+  after START instead of ~100 µs later; the whole TX collapsed into one cycle and
+  the driver's DPPI TXEN/START fan-out emitted each frame twice — two SFDs on air,
+  so a per-byte receiver mis-latched the second SFD as the PHR and every frame
+  failed CRC. Scheduling `tx_end_event` in cycles fixes it. Regression test:
+  `configs/test-2node-nrf54l15-dk.json`.
+
 ### Known issues
-- **nRF54L15 two-node radio and nRF52840 multi-hop chains do not route.**
-  The FLPR single-node dual-core feature works; two-node nRF54L15 reception is
-  broken by a stack of radio-timing bugs in the receive model (a deferred-disable
-  timeout that fires mid-frame, plus reception corruption failing CRC) —
-  pre-existing, unrelated to the 0.1.1 changes, root-caused in the plan (item
-  T3). nRF52840 4-node chains fail similarly (T1/T2).
+- **Multi-hop (3+ node) chains don't route past the first hop** — nRF54L15 and
+  nRF52840 alike. Single-hop now works; in a chain the far node joins the DAG and
+  sends, but its traffic isn't relayed across the second hop — a separate
+  6LoWPAN/RPL forwarding issue (`docs/design/t3-nrf54l15-rx-plan.md`).
+- The FLPR single-node dual-core demo works throughout.
 - **SVC is a no-op** (no SVCall exception) and **MSP430 CS HFXT** returns the
   DCO frequency — unmodeled; only affects firmware that uses them.
 

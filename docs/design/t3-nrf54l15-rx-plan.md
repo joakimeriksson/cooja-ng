@@ -1,8 +1,40 @@
 # T3 — nRF54L15 multi-node 802.15.4 receive: fix plan
 
-Status: proposed (2026-07-08). Companion to
-[`release-0.1.1-hardening.md`](release-0.1.1-hardening.md) §T3 (root-cause) and
-[`riscv-vpr-plan.md`](riscv-vpr-plan.md). Owner: TBD.
+Status: **RESOLVED for single-hop (2026-07-08)** — the receive-path root cause is
+fixed; multi-hop forwarding is a separate remaining issue (see Resolution).
+Companion to [`release-0.1.1-hardening.md`](release-0.1.1-hardening.md) §T3 and
+[`riscv-vpr-plan.md`](riscv-vpr-plan.md).
+
+## Resolution (2026-07-08)
+
+The two "layered bugs" below turned out to be **one root cause**: the nRF54L15
+TX-completion event (`tx_end_event`, which fires PAYLOAD/END/PHYEND and returns
+the radio to TXIDLE ~100 µs after `TASKS_START`) was scheduled via
+`arm_schedule_event_ns` off `sim_time_ns + air_dur_ns`. `sim_time_ns` lags the
+live cycle counter, so the fire-cycle landed in the past and **PHYEND fired ~1
+cycle after START instead of ~100 µs later**. That collapsed the whole TX into a
+single cycle, so the driver's DPPI TXEN/START fan-out (same task, a few µs apart)
+started a **second full emit of the same frame**. Two frames back-to-back put two
+SFDs (0x7A) on air; the per-byte receiver latched the *second* SFD as the PHR
+(length 0x7A = 122), every frame misaligned by one byte, the FCS landed in zeroed
+buffer, and CRC failed → the driver rejected the frame (the "mid-frame
+`TASKS_DISABLE`") and the peer never joined the DAG.
+
+Fix (commit on `fix/t3-nrf54l15-rx`): schedule `tx_end_event` in **cycles**
+(`cpu->cycles + ns_to_cycles(air_dur)`), the same cycle-vs-ns fix already used for
+the rx-disable timeout. One emit per frame; the redundant DPPI START is absorbed
+(state != TXIDLE). Both diagnosed symptoms (mid-frame DISABLE, CRC failure) were
+this one cause. `configs/test-2node-nrf54l15-dk.json` now passes end-to-end; no
+parity regressions (nrf52840, cc2538, MSP430, Zephyr, arm-correctness all green).
+
+**Still open:** 3+ node chains route the first hop but not the second — the far
+node joins the DAG and sends, but its traffic isn't relayed across the middle
+node. This is a distinct 6LoWPAN/RPL multi-hop forwarding issue (also blocks the
+nRF52840 4-node chains), not the receive-path bug fixed here. The investigation
+notes below remain the starting point for that.
+
+---
+
 
 ## 1. Problem
 
