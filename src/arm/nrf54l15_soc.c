@@ -1265,8 +1265,22 @@ static void nrf54l_radio_trigger_task(nrf54l_radio_state_t *r, uint32_t task_off
                 r->tx_end_event.callback  = nrf54l_radio_tx_end_cb;
                 r->tx_end_event.user_data = r;
                 r->tx_end_scheduled = 1;
-                int64_t now_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
-                arm_schedule_event_ns(cpu, &r->tx_end_event, now_ns + air_dur_ns);
+                /* Schedule by CYCLES, not _ns: sim_time_ns can lag the live
+                 * cycle counter, and arm_schedule_event_ns computes the fire
+                 * cycle off sim_time_ns — so `now_ns + air_dur_ns` often
+                 * landed in the past and PHYEND fired ~1 cycle after START
+                 * instead of ~100 µs later.  That collapsed the whole TX into
+                 * one cycle, so the driver's DPPI TXEN/START fan-out (which
+                 * fires the same task a few µs apart) started a SECOND full
+                 * emit of the same frame — two frames back-to-back on air, so
+                 * a per-byte receiver read the second SFD as the PHR and every
+                 * frame failed CRC.  Cycle-based scheduling keeps the radio in
+                 * TX for the whole air-time window, absorbing the redundant
+                 * START (state != TXIDLE) exactly as real HW does. */
+                int64_t air_cycles = cpu_ns_to_cycles(air_dur_ns,
+                                                      cpu->cpu_freq_hz);
+                arm_schedule_event(cpu, &r->tx_end_event,
+                                   cpu->cycles + air_cycles);
             } else if (r->state == NRF54L_RADIO_STATE_RXIDLE) {
                 r->state    = NRF54L_RADIO_STATE_RX;
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
