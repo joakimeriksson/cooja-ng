@@ -27,11 +27,41 @@ the rx-disable timeout. One emit per frame; the redundant DPPI START is absorbed
 this one cause. `configs/test-2node-nrf54l15-dk.json` now passes end-to-end; no
 parity regressions (nrf52840, cc2538, MSP430, Zephyr, arm-correctness all green).
 
-**Still open:** 3+ node chains route the first hop but not the second — the far
-node joins the DAG and sends, but its traffic isn't relayed across the middle
-node. This is a distinct 6LoWPAN/RPL multi-hop forwarding issue (also blocks the
-nRF52840 4-node chains), not the receive-path bug fixed here. The investigation
-notes below remain the starting point for that.
+## Still open — multi-hop (2026-07-08 investigation)
+
+3+ node chains route the first hop but not the second: the far node (node 3)
+joins the DAG and sends UDP requests, but they don't reach the root. Findings so
+far — this is a **distinct, nRF-radio-specific** issue, NOT the double-emit fix:
+
+- **Platform-localized to the nRF radios.** 3-node chains with the *same*
+  Contiki-NG rpl-udp firmware **pass** on Tmote Sky (MSP430/CC2420, node 3 gets
+  8 responses) and on CC2538 (ARM RF Core, 9 responses). They **fail** only on
+  nRF54L15 and nRF52840. So the kernel, radio medium, and RPL/6LoWPAN forwarding
+  are all fine; the bug is in the nRF radio model (`nrf52840_soc.c` /
+  `nrf54l15_soc.c` — they share the deferred-PHYEND / driver-ACK machinery that
+  CC2538/CC2420 don't have).
+- **Node 2 (the nRF router) barely receives node 3's UDP requests** — ~1 of ~6
+  over 90 s (CRCOK trace, `phr=56` frames). It receives node 3's DIOs/DAOs and
+  sends its own UDP to the root reliably, so its routing/forwarding logic works;
+  the loss is on the radio RX side under concurrent load.
+- **Not the DISABLED-gap drops.** The nRF `receive_byte` drops bytes when the
+  radio isn't in `RX` (389 such drops in 3-node vs **0** in the working 2-node
+  case, almost all `state=DISABLED`), because the driver's DISABLE→RXEN re-arm
+  leaves brief (~1 µs) gaps that async third-node traffic lands in. But an
+  experiment that processed bytes during the DISABLED/RXIDLE gap did **not** fix
+  multi-hop — so the drops are a symptom, not the whole cause. (Contrast CC2538,
+  which "receives frames regardless of radio state" — perfect-reception leniency
+  — and works.)
+- **The one request node 2 did receive was not forwarded to the root** — so
+  there is also a receive→forward-TX turnaround failure (the nRF RX-then-
+  immediately-TX path), on top of the reception loss.
+
+Next steps: instrument node 2's receive→ACK→forward-TX sequence for a single
+node-3 UDP request end to end (does the forward TX even get emitted? does the
+root drop it?); compare the nRF RX-re-arm duty cycle against CC2538's; and decide
+between (a) a bounded perfect-reception / gap-buffer leniency like CC2538's and
+(b) tightening the RX→TX turnaround. Same class blocks the nRF52840 4-node
+chains, so a fix should be checked against both.
 
 ---
 
