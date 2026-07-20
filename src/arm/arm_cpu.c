@@ -349,6 +349,7 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->sram_end     = config->sram_base + config->sram_size;
     cpu->rom_size     = config->rom_size;
     cpu->vtor_default = config->vtor_default;
+    cpu->tz_enabled   = config->has_trustzone;  /* ARMv8-M security extension */
 
     cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
     cpu->sram  = (uint8_t *)calloc(config->sram_size,  1);
@@ -445,6 +446,24 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->msp = sp;
     cpu->reg[ARM_PC] = pc & ~1u; /* Clear thumb bit */
     cpu->xpsr = (1u << 24); /* Thumb bit in EPSR must be set */
+
+    /* TrustZone-M reset state. On a part that implements the security
+     * extension the core comes out of reset in Secure state, with the reset
+     * SP and PC taken from the *secure* vector table (which is what `vtor`
+     * already points at here). When tz_enabled is false this is all inert:
+     * `secure` stays false and the banked fields below are never read. */
+    cpu->secure    = cpu->tz_enabled;
+    cpu->msp_s     = cpu->tz_enabled ? sp : 0;
+    cpu->msp_ns    = 0;
+    cpu->psp_s     = 0;
+    cpu->psp_ns    = 0;
+    cpu->msplim_s  = 0;
+    cpu->msplim_ns = 0;
+    cpu->psplim_s  = 0;
+    cpu->psplim_ns = 0;
+    cpu->control_s = 0;
+    cpu->control_ns = 0;
+    cpu->vtor_s    = cpu->tz_enabled ? cpu->vtor : 0;
 }
 
 void arm_stop(arm_cpu_t *cpu) {
