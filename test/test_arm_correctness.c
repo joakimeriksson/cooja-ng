@@ -3,6 +3,7 @@
  */
 #include "arm_cpu.h"
 #include "arm_config.h"
+#include "arm_trustzone.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -1814,6 +1815,78 @@ static void test_ldrd_strd(void) {
     }
 }
 
+/* ===================================================================
+ * ARMv8-M TrustZone-M: SAU + IDAU security attribution (Phase 1)
+ * =================================================================== */
+static void tz_add_region(arm_cpu_t *cpu, unsigned r, uint32_t base,
+                          uint32_t limit, bool nsc) {
+    cpu->sau_rbar[r] = base & ~0x1fu;
+    cpu->sau_rlar[r] = (limit & ~0x1fu) | ARM_SAU_RLAR_ENABLE
+                       | (nsc ? ARM_SAU_RLAR_NSC : 0);
+}
+
+static void test_trustzone_sau(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SAU/IDAU attribution tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);           /* cc2538: tz_enabled == false */
+
+    /* Non-TZ SoC: attribution is always Non-secure regardless of SAU state. */
+    assert_eq("no-TZ SoC => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20000000));
+
+    /* Enable the extension for the engine tests. */
+    cpu.tz_enabled = true;
+    cpu.sau_sregions = 8;
+
+    /* SAU disabled, ALLNS=0 => entire space Secure. */
+    cpu.sau_ctrl = 0;
+    assert_eq("SAU off, ALLNS=0 => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x00000000));
+    assert_eq("SAU off, ALLNS=0 => SECURE (high)", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0xE000ED00));
+
+    /* SAU disabled, ALLNS=1 => entire space Non-secure. */
+    cpu.sau_ctrl = ARM_SAU_CTRL_ALLNS;
+    assert_eq("SAU off, ALLNS=1 => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20000000));
+
+    /* SAU enabled with one Non-secure region [0x20000000, 0x2000FFFF]. */
+    memset(cpu.sau_rbar, 0, sizeof(cpu.sau_rbar));
+    memset(cpu.sau_rlar, 0, sizeof(cpu.sau_rlar));
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    tz_add_region(&cpu, 0, 0x20000000, 0x2000FFFF, false);
+    assert_eq("in NS region => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20008000));
+    assert_eq("region base is inclusive", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20000000));
+    assert_eq("region limit low bits set (inclusive)", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x2000FFFF));
+    assert_eq("just below region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x1FFFFFFF));
+    assert_eq("just above region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x20010000));
+
+    /* NSC region => Secure, callable. */
+    tz_add_region(&cpu, 1, 0x00040000, 0x00040FFF, true);
+    assert_eq("in NSC region => NSC", ARM_SEC_NSC,
+              arm_security_attr(&cpu, 0x00040100));
+    assert_eq("outside all regions => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x00080000));
+
+    /* Overlapping regions => Secure (invalid), even if both are NS. */
+    tz_add_region(&cpu, 2, 0x30000000, 0x3000FFFF, false);
+    tz_add_region(&cpu, 3, 0x30008000, 0x3001FFFF, false);
+    assert_eq("overlapping NS regions => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x3000C000));
+    assert_eq("non-overlapping part of region 2 => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x30001000));
+
+    /* Disabled region is ignored. */
+    cpu.sau_rlar[0] &= ~ARM_SAU_RLAR_ENABLE;
+    assert_eq("disabled region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x20008000));
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -1838,6 +1911,7 @@ int run_arm_correctness_tests(int v) {
     test_m4_dsp_halfword_multiply();
     test_m4_vfp();
     test_anti_replay_ops();
+    test_trustzone_sau();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

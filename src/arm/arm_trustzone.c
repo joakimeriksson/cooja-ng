@@ -1,0 +1,103 @@
+/*
+ * ARMv8-M Security Extension (TrustZone-M) — security attribution engine.
+ *
+ * SAU + IDAU address attribution per the ARMv8-M ARM (DDI 0553). The SAU +
+ * IDAU combination follows the QEMU `v8m_security_lookup` model so that QEMU
+ * and Renode remain valid functional oracles for differential testing
+ * (docs/design/trustzone-m-plan.md, Phase 1).
+ *
+ * Scope note: this compilation unit is the pure attribution *engine*. Wiring
+ * it into the load/store hot path (enforcement) and into the memory-mapped
+ * SAU_* registers happens in later increments; keeping the engine standalone
+ * lets it be unit-tested directly with no way yet to enter Secure state.
+ */
+#include "arm_trustzone.h"
+#include "arm_cpu.h"
+
+/*
+ * SAU-only attribution.
+ *
+ *  - SAU disabled: the whole space is Secure, unless SAU_CTRL.ALLNS makes it
+ *    all Non-secure. (No region is NSC when the SAU is disabled.)
+ *  - SAU enabled: search the enabled regions. A single matching region makes
+ *    the address Non-secure, or NSC if the region's NSC bit is set. Zero
+ *    matches => Secure. More than one match => Secure (and region invalid),
+ *    matching hardware's "overlapping regions are treated as Secure".
+ *
+ * `*ns` = address is Non-secure; `*nsc` = address is Non-secure-callable
+ * (which is Secure memory, so *ns stays false in that case).
+ */
+void arm_sau_check(const arm_cpu_t *cpu, uint32_t addr, bool *ns, bool *nsc)
+{
+    *ns = false;
+    *nsc = false;
+
+    if (!(cpu->sau_ctrl & ARM_SAU_CTRL_ENABLE)) {
+        /* Disabled: ALLNS decides. */
+        *ns = (cpu->sau_ctrl & ARM_SAU_CTRL_ALLNS) != 0;
+        return;
+    }
+
+    bool matched = false;
+    for (unsigned r = 0; r < cpu->sau_sregions && r < 8; r++) {
+        if (!(cpu->sau_rlar[r] & ARM_SAU_RLAR_ENABLE))
+            continue;
+        /* Base is 32-byte aligned (bits 4:0 == 0); limit's low 5 bits read
+         * as 1, so the region spans [base, limit|0x1f] inclusive. */
+        uint32_t base  = cpu->sau_rbar[r] & ~0x1fu;
+        uint32_t limit = (cpu->sau_rlar[r] & ~0x1fu) | 0x1fu;
+        if (addr < base || addr > limit)
+            continue;
+
+        if (matched) {
+            /* Overlapping match => Secure, and the earlier decision is void. */
+            *ns = false;
+            *nsc = false;
+            return;
+        }
+        matched = true;
+        if (cpu->sau_rlar[r] & ARM_SAU_RLAR_NSC)
+            *nsc = true;   /* Secure, callable */
+        else
+            *ns = true;    /* Non-secure */
+    }
+}
+
+/* Default IDAU: attribute nothing — leave the decision to the SAU. */
+arm_idau_result_t arm_idau_check_default(uint32_t addr)
+{
+    (void)addr;
+    arm_idau_result_t r = { .ns = true, .nsc = false, .exempt = false };
+    return r;
+}
+
+/*
+ * Combine SAU and IDAU. The IDAU can only ever make an address *more* secure:
+ * if the IDAU says Secure (idau.ns == false), the result is Secure, and the
+ * NSC attribute survives only if the IDAU also permits it. This mirrors the
+ * QEMU combination and the ARM ARM `SecurityCheck` pseudocode.
+ */
+arm_sec_attr_t arm_security_attr(const arm_cpu_t *cpu, uint32_t addr)
+{
+    if (!cpu->tz_enabled)
+        return ARM_SEC_NONSECURE;
+
+    bool ns, nsc;
+    arm_sau_check(cpu, addr, &ns, &nsc);
+
+    arm_idau_result_t idau = arm_idau_check_default(addr);
+
+    if (idau.exempt)
+        return ARM_SEC_SECURE;
+
+    if (!idau.ns) {
+        /* IDAU forces Secure. */
+        ns = false;
+        if (!idau.nsc)
+            nsc = false;
+    }
+
+    if (ns)
+        return ARM_SEC_NONSECURE;
+    return nsc ? ARM_SEC_NSC : ARM_SEC_SECURE;
+}

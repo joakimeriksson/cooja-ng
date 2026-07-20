@@ -206,6 +206,16 @@ typedef struct arm_cpu {
     uint32_t  control_s, control_ns; /* banked CONTROL (nPRIV/SPSEL/FPCA/SFPA) */
     uint32_t  vtor_s;                /* secure vector table offset (VTOR_S) */
 
+    /* Security Attribution Unit (SAU) — Phase 1. Programmable regions that,
+     * together with the SoC IDAU (the Nordic SPU on nRF54L15), decide the
+     * security attribute of each address. Registers at 0xE000EDD0.. See
+     * arm_trustzone.c / arm_security_attr(). */
+    uint32_t  sau_ctrl;              /* SAU_CTRL: bit0 ENABLE, bit1 ALLNS */
+    uint32_t  sau_rnr;               /* SAU_RNR: region number register */
+    uint32_t  sau_rbar[8];           /* SAU_RBAR[]: region base (bits 31:5) */
+    uint32_t  sau_rlar[8];           /* SAU_RLAR[]: limit(31:5)|NSC(1)|ENABLE(0) */
+    uint8_t   sau_sregions;          /* number of implemented SAU regions (0/4/8) */
+
     /* ROM utility traps */
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
     uint32_t  rom_util_memset;    /* Address of rom_util_memset entry */
