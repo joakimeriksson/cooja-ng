@@ -125,26 +125,39 @@ transition point (SG, BXNS/BLXNS, secure exception entry/exit, with a
 `TZ SG=... BXNS=... SECEXC=... cycles=...`). Cheap once the mechanism exists;
 this is the "impossible on silicon without intrusive probes" capability.
 
-## Validation strategy (the two-oracle triangle)
+## Validation strategy
 
-- **Conformance suite first, firmware second.** Directed tests from the
-  ARMv8-M ARM: attribution-table cases, SG-from-non-NSC fault, BLXNS frame
-  layout, the EXC_RETURN matrix, integrity-signature validation. This closes
-  the gaps the "on demand when firmware traps" path silently leaves.
-- **Functional oracle = Renode.** Renode has independent (tlib/QEMU-lineage)
-  TrustZone-M support — SAU/IDAU attribution + NSC, secure exception exit
-  (`ES/S/SPSEL/MODE/FType/DCRS` in tlib `arch/arm/helper.c`), secure interrupt
-  targeting (verified in `renode-infrastructure` `CortexM.cs`/`NVIC.cs`). Run
-  the *same* secure/NS firmware image in Renode and csim and diff behaviour.
-  Renode is **functional, not cycle-accurate** — use it for "does the right
-  thing," never for cost. Caveat: confirm Renode's nRF54L15 **SPU** fidelity
-  before trusting it for SPU-attribution specifically.
-- **Timing anchor = real nRF54L15 DK.** Per-transition cycle costs via DWT
-  `CYCCNT` (the paper's Testbed 1). csim's cost model is calibrated and
-  validated against silicon, not against Renode.
+**The authoritative oracle is the real nRF54L15 DK — not another emulator.**
+Renode/QEMU are themselves models; validating csim against them only proves
+csim agrees with *their* interpretation of ARMv8-M, and would propagate their
+bugs. Silicon is the only thing that can settle a disagreement, and for the
+Nordic **SPU** (chip-specific IDAU behaviour) it is the *only* authority.
+
+Layered so the fast loop stays fast and the truth stays authoritative:
+
+- **Inner loop — ARM ARM conformance suite (fast, automatable).** Directed
+  tests from the architecture manual: attribution-table cases, SG-from-non-NSC
+  fault, BLXNS frame layout, the EXC_RETURN matrix, integrity-signature
+  validation. Pinned to the *spec*. (Phase 1's `test_trustzone_sau` is the
+  first of these.) Where silicon later surprises us, the HW capture overrides
+  the spec-derived expectation.
+- **Authoritative oracle — nRF54L15 DK, via capture-and-replay.** Hardware is
+  ground truth but low-bandwidth (you cannot cheaply diff internal state on
+  silicon). So: run small directed firmware on the DK that exercises each
+  primitive (SG, BXNS/BLXNS, secure exception, ±FP context, SPU attribution),
+  capture ground truth **once** — architectural state via GDB/semihosting,
+  per-transition cycle cost via DWT `CYCCNT` — and freeze those as **golden
+  vectors**. csim regresses against real-silicon captures, for both function
+  and timing. This is the paper's Testbed 1.
+- **Renode = development aid only, never an authority.** It has independent
+  (tlib/QEMU-lineage) TrustZone-M support — SAU/IDAU + NSC, secure exception
+  exit (`ES/S/SPSEL/MODE/FType/DCRS`), secure interrupt targeting — which is
+  useful for *seeing internal state while debugging* a divergence. But it does
+  not decide correctness, and it is not cycle-accurate, so it never informs
+  the cost model. If Renode and the DK disagree, the DK wins.
 - **Firmware:** start with a hand-built minimal secure veneer (SG entries
   wrapping AES + key storage = P1/P2), not full TF-M. Maps directly to the
-  partition schemes.
+  partition schemes, and is the same image captured on the DK above.
 
 ## Staged plan + effort
 
@@ -156,7 +169,7 @@ this is the "impossible on silicon without intrusive probes" capability.
 | 3 | Secure exception entry/return, integrity sig, lazy FP, SecureFault | ~4–5 days |
 | 4 | NVIC target-security + banked priority + SysTick | ~2 days |
 | 5 | Transition instrumentation + harness plumbing | ~1 day |
-| — | Conformance suite + Renode diff + DK calibration (spread across 1–4) | ~3–4 days |
+| — | ARM ARM conformance suite + **DK golden-vector capture/replay** (authoritative); Renode only as debug aid (spread across 1–4) | ~3–4 days |
 
 Guard behind the existing `arm_config` capability so nRF52840 (M4, no TZ) and
 the CC2538/MSP430 targets are unaffected.
