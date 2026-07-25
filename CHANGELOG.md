@@ -67,8 +67,10 @@ for that audit and its plan.
 - JSON simulation configs (v1 + v2), a live WebSocket UI, PCAP capture,
   activity timeline, per-mote GDB stub, and a JS/JSON test engine.
 - Runs the upstream Contiki-NG Cooja test suite via `tools/run-cooja-tests.sh`
-  — **85 / 85 headless, 0 failures** of 93 total; the remaining 8 are the
-  TUN/border-router cases, which need `--with-tun` and root. Plus instruction,
+  — **92 / 93**: all 85 headless tests, plus 7 of the 8 TUN/border-router cases
+  (those need `--with-tun` and root). The one failure,
+  `09-native-border-router-cooja-frag`, is a pre-existing limitation and not a
+  regression — it fails identically on the first tagged tree. Plus instruction,
   firmware, radio-medium/bus, chip-driver, and plugin unit suites.
 - CI on Linux (gcc) and macOS (clang) gating the unit suites plus nRF52840
   networking (Contiki RPL-UDP on DK + Dongle, stock Zephyr 802.15.4 echo) and
@@ -170,6 +172,9 @@ domain, not a regression); the Firefly sub-GHz chain has an ACK-turnaround
 residual after sustained traffic; native host-process scheduling is a
 documented deferral; the energest ARM CPU current is MSP430-class (indicative).
 **SVC is a no-op** (no SVCall exception) and **MSP430 CS HFXT** returns the DCO
-frequency — unmodeled; only affects firmware that uses them.
+frequency — unmodeled; only affects firmware that uses them. Fragmented traffic
+across the *native* border router does not round-trip
+(`17-tun-rpl-br/09-native-border-router-cooja-frag`, the suite's one failure);
+the embedded `tunslip6` path handles the same 1200-byte pings fine.
 
 [0.1.0]: https://github.com/joakimeriksson/cooja-ng/releases/tag/v0.1.0

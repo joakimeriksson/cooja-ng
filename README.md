@@ -2,7 +2,7 @@
 
 A fast, multi-architecture emulator and network simulator for Contiki-NG, written in portable C.  Cooja-NG (codename `csim`) is a clean-room re-implementation of the parts of Cooja and MSPSim needed to run the upstream Contiki-NG test suite headlessly, with a strong focus on simulation speed, deterministic timing, and faithful peripheral behaviour.
 
-**Status:** the Contiki-NG Cooja test suite runs green — **85 / 85** headless tests pass, 0 failures.  The suite is 93 tests in total; the remaining 8 are the TUN/border-router cases, which need `--with-tun` and root.  See [Test results](#test-results).
+**Status:** the Contiki-NG Cooja test suite runs **92 / 93** — all 85 headless tests, plus 7 of the 8 TUN/border-router cases (those need `--with-tun` and root).  The single failure, `09-native-border-router-cooja-frag`, is a pre-existing limitation rather than a regression: it fails identically on the first tagged tree.  See [Test results](#test-results) and [Known issues](#known-issues).
 
 Architecture and refactor direction are tracked in
 [`docs/design/refactor-plan.md`](docs/design/refactor-plan.md), including the
@@ -329,13 +329,15 @@ Deeper notes on each subsystem in [`CLAUDE.md`](CLAUDE.md) and [`docs/architectu
 | `zoul-firefly-multinode` RPL-UDP | **6 / 6 hello cycles** in 60 s, ~9× real-time |
 | `nrf52840-dongle-multinode` RPL-UDP | UDP request/response round-trip, ~9× real-time |
 | `nrf54l15-dk-multinode` RPL-UDP | UDP request/response end-to-end (~100× real-time) |
-| **Cooja test suite (93 tests)** | **85 / 85 headless PASS**, 0 failures; 8 TUN cases need `--with-tun` + root |
+| **Cooja test suite (93 tests)** | **92 / 93 PASS** — 85 / 85 headless, plus 7 / 8 TUN (`--with-tun` + root) |
 
-Cooja-suite coverage: all 27 `07-simulation-base/*` (RPL-Lite, TSCH, Orchestra, multicast, IPv6, stack guard, data structures) including the once-stubborn `26-tsch-drift-z1` (16 s); all 12 `09-ipv6/*`; all 9 `13-ieee802154/*`; all 14 `14-rpl-lite/*` and 19 `15-rpl-classic/*` (including 28-h simulated DAG stability tests); all 3 `21-security-protocols/*` (EDHOC); and, with `--with-tun` + root, all 8 `17-tun-rpl-br/*` against a real `tun0` + `tunslip6`, including `10-native-nat64-cooja` (214 s, UDP+TCP echo through the NAT64 gateway).
+Cooja-suite coverage: all 27 `07-simulation-base/*` (RPL-Lite, TSCH, Orchestra, multicast, IPv6, stack guard, data structures) including the once-stubborn `26-tsch-drift-z1` (16 s); all 12 `09-ipv6/*`; all 9 `13-ieee802154/*`; all 14 `14-rpl-lite/*` and 19 `15-rpl-classic/*` (including 28-h simulated DAG stability tests); all 3 `21-security-protocols/*` (EDHOC); and, with `--with-tun` + root, 7 of the 8 `17-tun-rpl-br/*` against a real `tun0` + `tunslip6`, including `10-native-nat64-cooja` (213 s, UDP+TCP echo through the NAT64 gateway) — the exception is `09-native-border-router-cooja-frag`, see [Known issues](#known-issues).
 
 ## Known issues
 
-Real, currently reproducible quirks in the *standalone CLI shortcuts* — none affect the Cooja test wrapper, JSON-config flow, or production use.
+Real, currently reproducible quirks.  The first is a genuine functional gap; the rest are limitations of the *standalone CLI shortcuts* and do not affect the Cooja test wrapper, JSON-config flow, or production use.
+
+**`17-tun-rpl-br/09-native-border-router-cooja-frag` fails** (the only failing test in the suite; 92 / 93).  Fragmented traffic over the *native* border-router path gets no replies — `ping6 -s 1200` to `fd00::204:4:4:4` reports 5 transmitted, 0 received, 100% loss, after the router has started and the network has formed.  The variable is isolated: `08-border-router-cooja-frag` uses byte-identical ping parameters (`fd00::204:4:4:4 60 1200 4`) and passes over the embedded `tunslip6` path, while `07-native-border-router-cooja` passes over the native path at the default 56-byte size.  So it is specifically *fragmentation across the native border router*, where `border-router.native` runs on the host and does the 6LoWPAN work itself over the serial socket.  Not a serial-bridge overflow — those buffers are 64 KB.  **Pre-existing, not a regression:** the first tagged tree (`6f190e9`) fails identically (117 s, same 100% loss), verified in a clean worktree build.
 
 1. **`./build/test_runner multinode` (no firmware) hangs.**  The default-firmware shortcut routes to `firmware/sky/nullnet-broadcast.sky` and gets stuck after init.  Workaround: use a JSON config or explicit firmware pair.
 2. *(resolved — was: "multi-hop 3+ node chains don't route past the first hop")* nRF54L15 and nRF52840 multi-hop RPL-UDP chains now route end-to-end (`chain-3node-nrf54l15-dk`, `chain-3node`/`chain-4node-nrf52840-dk`; node 4 relays 3 hops).  Root cause was a radio-model bug, not 6LoWPAN forwarding: a mid-frame **aborted reception** left the `nrf_802154` driver's `psdu_being_received` flag set (the abort paths fired only a non-interrupting PHYEND; the flag needs a CRCOK/**CRCERROR** with its RX IRQ to clear), so the router's every later `nrf_802154_transmit_raw` returned `BUSY_CHANNEL` and it wedged.  Firing `END+PHYEND+CRCERROR` on abort clears it; nRF52840 additionally needed a destination-address check on the fabricated auto-ACK (two neighbours were ACKing every unicast, colliding at the sender).  Details: [`docs/design/nrf-multihop-forwarding-plan.md`](docs/design/nrf-multihop-forwarding-plan.md) §Resolution.
