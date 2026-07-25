@@ -185,7 +185,7 @@ are already tabled in `CLAUDE.md`. The rest of the tree:
 
 | File | Purpose |
 |------|---------|
-| `riscv_cpu.c` | RV32E (`rv32e_zicsr_zifencei`) interpreter — base RV32I + CSR + `fence.i` + M-mode traps. Borrows the host M33's memory/IO bus, so SRAM + peripherals are one shared address space (no separate ELF load on the demo path: the M33 writes the blob into shared SRAM at run time). |
+| `riscv_cpu.c` | RV32EMC (`rv32emc_zicsr_zifencei`) interpreter — base RV32I/E + **M** (mul/div/rem) + **C** (compressed) + CSR + `fence.i` + M-mode traps/interrupts + WFI idle. Borrows the host M33's memory/IO bus, so SRAM + peripherals are one shared address space (no separate ELF load on the demo path: the M33 writes the blob into shared SRAM at run time). |
 | `nrf54l_vpr.c` | SoC↔core bridge: on the M33's VPR `CPURUN` 0→1 edge (Zephyr `nordic_vpr_launcher` sequence) start the FLPR at `INITPC`, then co-step it after each ARM execute slice via a SoC-agnostic `coproc` hook on `arm_cpu_t`. See [`docs/design/riscv-vpr-plan.md`](design/riscv-vpr-plan.md). |
 
 ### `src/common/` — shared infrastructure
