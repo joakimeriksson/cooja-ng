@@ -119,9 +119,12 @@ static int run_firmware_test(const firmware_test_entry_t *entry, int max_instruc
             return 1;
         }
     } else {
-        printf("  WARN: Firmware did not complete within %d instructions (%d UART bytes received)\n",
+        /* A firmware that never self-reports (hung, stuck, or starved of
+         * instructions) is a failure, not a pass — returning 0 here made a
+         * hang indistinguishable from success in the suite's exit status. */
+        printf("  FAIL: Firmware did not complete within %d instructions (%d UART bytes received)\n",
                max_instructions, state.total_bytes);
-        return 0;
+        return 1;
     }
 }
 

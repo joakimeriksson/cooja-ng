@@ -2,7 +2,7 @@
 
 A fast, multi-architecture emulator and network simulator for Contiki-NG, written in portable C.  Cooja-NG (codename `csim`) is a clean-room re-implementation of the parts of Cooja and MSPSim needed to run the upstream Contiki-NG test suite headlessly, with a strong focus on simulation speed, deterministic timing, and faithful peripheral behaviour.
 
-**Status:** the full Contiki-NG Cooja test suite passes — **89 / 89** including the TUN/border-router cases.  See [Test results](#test-results).
+**Status:** the Contiki-NG Cooja test suite runs green — **85 / 85** headless tests pass, 0 failures.  The suite is 93 tests in total; the remaining 8 are the TUN/border-router cases, which need `--with-tun` and root.  See [Test results](#test-results).
 
 Architecture and refactor direction are tracked in
 [`docs/design/refactor-plan.md`](docs/design/refactor-plan.md), including the
@@ -52,7 +52,7 @@ make
 ./build/test_runner mixed-multinode \
     firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
 
-# The full Contiki-NG Cooja test suite (89 tests, ~10–15 min warm)
+# The full Contiki-NG Cooja test suite (93 tests, ~10–15 min warm)
 make configure CONTIKI_DIR=$(pwd)/../contiki-ng
 make cooja-tests VERBOSE=1
 ```
@@ -165,7 +165,7 @@ make cooja-tests PATTERN='14-rpl-lite*'            # subset
 # Force a rebuild against current Contiki sources
 ./tools/run-cooja-tests.sh --clean
 
-# All 89 tests including TUN border-router cases.
+# All 93 tests including TUN border-router cases.
 # One-time: setcap so tunslip6 doesn't need sudo per run.
 sudo setcap cap_net_admin+eip ../contiki-ng/tools/serial-io/tunslip6
 ./tools/run-cooja-tests.sh --with-tun -v 2>&1 | tee cooja-tests-tun.log
@@ -329,9 +329,9 @@ Deeper notes on each subsystem in [`CLAUDE.md`](CLAUDE.md) and [`docs/architectu
 | `zoul-firefly-multinode` RPL-UDP | **6 / 6 hello cycles** in 60 s, ~9× real-time |
 | `nrf52840-dongle-multinode` RPL-UDP | UDP request/response round-trip, ~9× real-time |
 | `nrf54l15-dk-multinode` RPL-UDP | UDP request/response end-to-end (~100× real-time) |
-| **Cooja test suite (89 tests, with `--with-tun`)** | **89 / 89 PASS** |
+| **Cooja test suite (93 tests)** | **85 / 85 headless PASS**, 0 failures; 8 TUN cases need `--with-tun` + root |
 
-Cooja-suite coverage: all 27 `07-simulation-base/*` (RPL-Lite, TSCH, Orchestra, multicast, IPv6, stack guard, data structures) including the once-stubborn `26-tsch-drift-z1` (16 s); all 12 `09-ipv6/*`; all 9 `13-ieee802154/*`; all 14 `14-rpl-lite/*` and 19 `15-rpl-classic/*` (including 28-h simulated DAG stability tests); all 8 `17-tun-rpl-br/*` with real `tun0` + `tunslip6`, including `10-native-nat64-cooja` (214 s, UDP+TCP echo through the NAT64 gateway).
+Cooja-suite coverage: all 27 `07-simulation-base/*` (RPL-Lite, TSCH, Orchestra, multicast, IPv6, stack guard, data structures) including the once-stubborn `26-tsch-drift-z1` (16 s); all 12 `09-ipv6/*`; all 9 `13-ieee802154/*`; all 14 `14-rpl-lite/*` and 19 `15-rpl-classic/*` (including 28-h simulated DAG stability tests); all 3 `21-security-protocols/*` (EDHOC); and, with `--with-tun` + root, all 8 `17-tun-rpl-br/*` against a real `tun0` + `tunslip6`, including `10-native-nat64-cooja` (214 s, UDP+TCP echo through the NAT64 gateway).
 
 ## Known issues
 
@@ -339,7 +339,7 @@ Real, currently reproducible quirks in the *standalone CLI shortcuts* — none a
 
 1. **`./build/test_runner multinode` (no firmware) hangs.**  The default-firmware shortcut routes to `firmware/sky/nullnet-broadcast.sky` and gets stuck after init.  Workaround: use a JSON config or explicit firmware pair.
 2. *(resolved — was: "multi-hop 3+ node chains don't route past the first hop")* nRF54L15 and nRF52840 multi-hop RPL-UDP chains now route end-to-end (`chain-3node-nrf54l15-dk`, `chain-3node`/`chain-4node-nrf52840-dk`; node 4 relays 3 hops).  Root cause was a radio-model bug, not 6LoWPAN forwarding: a mid-frame **aborted reception** left the `nrf_802154` driver's `psdu_being_received` flag set (the abort paths fired only a non-interrupting PHYEND; the flag needs a CRCOK/**CRCERROR** with its RX IRQ to clear), so the router's every later `nrf_802154_transmit_raw` returned `BUSY_CHANNEL` and it wedged.  Firing `END+PHYEND+CRCERROR` on abort clears it; nRF52840 additionally needed a destination-address check on the fabricated auto-ACK (two neighbours were ACKing every unicast, colliding at the sender).  Details: [`docs/design/nrf-multihop-forwarding-plan.md`](docs/design/nrf-multihop-forwarding-plan.md) §Resolution.
-3. **`test_firmware.c` reports `timertest.sky` as PASS** even when the firmware itself prints `FW: FAIL: count > 10 failed at timertest.c:166`.  The runner only matches `EXIT`.  Cosmetic.
+3. *(resolved — was: "`test_firmware.c` reports `timertest.sky` as PASS even when the firmware prints `FAIL`")* `timertest.sky` now self-reports `OK:` for both assertions (`ticka0 >= 100`, `count > 10`) and then `EXIT`, so the reported PASS is genuine; the runner does match a leading `FAIL:` line.  A related false-green was fixed at the same time: a firmware that never self-reports (hung, stuck, or out of instructions) used to print `WARN` and return success, making a hang indistinguishable from a pass in the suite's exit status — it is now a `FAIL`.
 4. *(resolved — was: "the deferred-PHYEND fix has not been ported to nrf52840")* nrf52840 is **not** exposed to the critical-section-during-TX race: it fires PHYEND/END at full frame air-time (`(6+len)·32 µs`, ≥~350 µs after `TASKS_START`; `nrf52840_soc.c`), which already lands the IRQ during the driver's busy-wait, well after its NVIC-disabling critical section. nRF54L15 uses a *different* 100 µs defer only because it delivers the frame at TX-start (synchronous model) and a full-air-time defer would leave it stuck in TX when the peer's ACK arrives — not because nrf52840 lacks protection. The timing is per-frame air-time, independent of RPL rate.
 
 Release history and per-version notes in [`CHANGELOG.md`](CHANGELOG.md).
