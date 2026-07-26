@@ -66,11 +66,9 @@ for that audit and its plan.
 ### Tooling & tests
 - JSON simulation configs (v1 + v2), a live WebSocket UI, PCAP capture,
   activity timeline, per-mote GDB stub, and a JS/JSON test engine.
-- Runs the upstream Contiki-NG Cooja test suite via `tools/run-cooja-tests.sh`
-  — **92 / 93**: all 85 headless tests, plus 7 of the 8 TUN/border-router cases
-  (those need `--with-tun` and root). The one failure,
-  `09-native-border-router-cooja-frag`, is a pre-existing limitation and not a
-  regression — it fails identically on the first tagged tree. Plus instruction,
+- Passes the upstream Contiki-NG Cooja test suite via `tools/run-cooja-tests.sh`
+  — **93 / 93**, 0 failed / 0 skipped: all 85 headless tests plus all 8
+  TUN/border-router cases (those need `--with-tun` and root). Plus instruction,
   firmware, radio-medium/bus, chip-driver, and plugin unit suites.
 - CI on Linux (gcc) and macOS (clang) gating the unit suites plus nRF52840
   networking (Contiki RPL-UDP on DK + Dongle, stock Zephyr 802.15.4 echo) and
@@ -165,6 +163,31 @@ for that audit and its plan.
     No regressions to nRF52840 2-node RPL, TSCH, Zephyr echo, nRF54L15 2-node,
     FLPR dual-core, or the cc2538/sky controls.
 
+### Hardening — serial socket (native border router)
+- **`17-tun-rpl-br/09-native-border-router-cooja-frag` now passes; the Cooja
+  suite is 93/93.** A 1200-byte ping through `border-router.native` used to get
+  5 transmitted / 0 received, with the router dying on `slip_send overflow`.
+  The cause was a race against a 31 ms window that csim lost by being too fast.
+  SLIP has no flow control, so Contiki substitutes a fixed
+  `SLIP_DEV_CONF_SEND_DELAY` of `CLOCK_SECOND/32` = 31 ms and drains one SLIP
+  packet per `slip_flushbuf()`. That timer is a passive `struct timer` posting
+  no event, and the native platform gives `select()` a flat 1 s
+  `SELECT_TIMEOUT` when idle — so inside the window nothing is scheduled to
+  wake the router, and its only early wake-up is one of our bytes. A host-side
+  1200-byte ping fragments into 13 SLIP packets queued in one unpaced burst; a
+  reply landing inside the window consumed that wake-up while flushing was
+  still forbidden, so the loop slept a full second per fragment and the
+  2048-byte queue overflowed fatally. Measured flush→reply latency: csim
+  0.2–26.5 ms (0 of 13 above the threshold) vs Cooja 0.0–47.3 ms (5 of 14
+  above) — Cooja is not correct here, only lucky, and stalls a second whenever
+  it loses. Protocol traffic is identical in both (one 7–8 byte `!R`
+  confirmation per fragment), so this is not a throughput or framing
+  difference. Fixed by modelling the USB-CDC host link a real slip-radio sits
+  behind (default 40 ms wall-clock, `CSIM_SERIAL_TX_LATENCY_MS`, `0` disables)
+  — the latency that makes Contiki's 31 ms constant work on hardware, and
+  which neither simulator modelled. Result: 5/5 replies, 0% loss, versus
+  Cooja's 3/5–5/5. Removal criteria are documented in `sim_serial_bridge.c`.
+
 ### Known limitations
 See [README "Known issues"](README.md#known-issues). Notably: a default
 circular topology with many nodes (`-n 16`) does not converge (one collision
@@ -172,9 +195,8 @@ domain, not a regression); the Firefly sub-GHz chain has an ACK-turnaround
 residual after sustained traffic; native host-process scheduling is a
 documented deferral; the energest ARM CPU current is MSP430-class (indicative).
 **SVC is a no-op** (no SVCall exception) and **MSP430 CS HFXT** returns the DCO
-frequency — unmodeled; only affects firmware that uses them. Fragmented traffic
-across the *native* border router does not round-trip
-(`17-tun-rpl-br/09-native-border-router-cooja-frag`, the suite's one failure);
-the embedded `tunslip6` path handles the same 1200-byte pings fine.
+frequency — unmodeled; only affects firmware that uses them. The serial socket
+carries a deliberate 40 ms wall-clock host-link latency (see below) that a
+future flow-controlled link should remove.
 
 [0.1.0]: https://github.com/joakimeriksson/cooja-ng/releases/tag/v0.1.0
