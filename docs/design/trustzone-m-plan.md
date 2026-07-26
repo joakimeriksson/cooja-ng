@@ -159,6 +159,36 @@ Layered so the fast loop stays fast and the truth stays authoritative:
   wrapping AES + key storage = P1/P2), not full TF-M. Maps directly to the
   partition schemes, and is the same image captured on the DK above.
 
+## Confirmed execution steps (2026-07-26)
+
+Ordered, individually-tested increments. Conformance firmware is the existing
+Contiki-NG `examples/platform-specific/nrf/trustzone/` suite (nRF54L15-only),
+built `BOARD=nrf54l15/dk` so one binary runs on csim and the DK.
+
+- **[done]** Phase 0 — security state + banked register storage.
+- **[done]** Phase 1 engine — `arm_security_attr()` SAU/IDAU attribution (+14 tests).
+- **[done] Step 1** — memory-mapped SAU registers (`0xE000EDD0`) in the SCS/NVIC
+  region, Secure-only RAZ/WI (+9 tests; 176 total green).
+- **Step 2** — hot-path enforcement: call `arm_security_attr()` in the load/store
+  chokepoint, raise SecureFault on illegal NS→S access.
+- **Step 3** — transition instructions: `SG` / `BXNS` / `BLXNS` / `TT`.
+- **Step 4** — secure exception model: banked stacking, integrity signature,
+  lazy FP, extended EXC_RETURN, secure vector fetch, SecureFault escalation.
+- **Step 5** — NVIC banking: target-security (`NVIC_ITNS`), banked priority/SysTick.
+- **Step 6 (milestone)** — set `has_trustzone=true` on `nrf54l15_config`; boot the
+  `trustzone/` minimal secure image (secure boot → SPU config → SG veneer →
+  `tz_api_println()` → hand to NS). First "csim runs real TrustZone firmware".
+- **Step 7** — transition instrumentation (per-node SG/BXNS/secure-exc counts).
+- **Step 8** — boot `trustzone/rpl-udp` (secure-owned radio + NS radio proxy = P3).
+
+Parallel HW track (non-blocking): DK capture toolchain (JLink/GDB + DWT `CYCCNT`
++ semihosting) on the current non-TZ nRF54L15 first, then per-primitive golden
+vectors (SG/BXNS/secure-exc ±FP, **SPU attribution captured from silicon**) as
+csim regression fixtures for Steps 3–5 + 7.
+
+**Done when** csim boots `trustzone/rpl-udp` on `nrf54l15/dk`, counts transitions
+network-wide, and per-primitive costs match DK golden vectors within HW spread.
+
 ## Staged plan + effort
 
 | Phase | Work | Est. |

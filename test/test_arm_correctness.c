@@ -4,6 +4,7 @@
 #include "arm_cpu.h"
 #include "arm_config.h"
 #include "arm_trustzone.h"
+#include "arm_nvic.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -1887,6 +1888,55 @@ static void test_trustzone_sau(void) {
               arm_security_attr(&cpu, 0x20008000));
 }
 
+/* Program the SAU through the memory-mapped SCS registers (as firmware does)
+ * and confirm read-back, attribution, and Secure-only RAZ/WI. */
+static void test_trustzone_sau_mmio(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SAU memory-mapped register tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    arm_nvic_t nvic;
+    arm_nvic_init(&nvic, &cpu);      /* registers the SCS IO region */
+
+    /* Emulate a TZ part in Secure state. */
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+
+    /* SAU_TYPE reports the implemented region count. */
+    assert_eq("SAU_TYPE reads region count", 8, arm_read32(&cpu, 0xE000EDD4));
+
+    /* Program region 0 = [0x20000000, 0x2000FFFF], Non-secure. */
+    arm_write32(&cpu, 0xE000EDD8, 0);            /* SAU_RNR = 0 */
+    arm_write32(&cpu, 0xE000EDDC, 0x20000000);   /* SAU_RBAR */
+    arm_write32(&cpu, 0xE000EDE0, 0x2000FFE1);   /* SAU_RLAR: limit|ENABLE */
+    arm_write32(&cpu, 0xE000EDD0, 1);            /* SAU_CTRL: ENABLE */
+
+    assert_eq("SAU_RBAR read-back", 0x20000000, arm_read32(&cpu, 0xE000EDDC));
+    assert_eq("SAU_RLAR read-back", 0x2000FFE1, arm_read32(&cpu, 0xE000EDE0));
+    assert_eq("SAU_CTRL read-back", 1, arm_read32(&cpu, 0xE000EDD0));
+
+    /* Attribution reflects the memory-programmed region. */
+    assert_eq("mmio-programmed region => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20008000));
+    assert_eq("outside mmio region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x10000000));
+
+    /* Program region 1 as NSC via the indexed RNR/RLAR interface. */
+    arm_write32(&cpu, 0xE000EDD8, 1);            /* SAU_RNR = 1 */
+    arm_write32(&cpu, 0xE000EDDC, 0x00040000);
+    arm_write32(&cpu, 0xE000EDE0, 0x00040FE3);   /* limit|NSC|ENABLE */
+    assert_eq("mmio NSC region => NSC", ARM_SEC_NSC,
+              arm_security_attr(&cpu, 0x00040100));
+
+    /* Secure-only: Non-secure accesses RAZ/WI. */
+    cpu.secure = false;
+    assert_eq("SAU_CTRL RAZ from Non-secure", 0, arm_read32(&cpu, 0xE000EDD0));
+    arm_write32(&cpu, 0xE000EDD0, 0);            /* WI: must not clear ENABLE */
+    cpu.secure = true;
+    assert_eq("SAU_CTRL unchanged after NS write (WI)", 1,
+              arm_read32(&cpu, 0xE000EDD0));
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -1912,6 +1962,7 @@ int run_arm_correctness_tests(int v) {
     test_m4_vfp();
     test_anti_replay_ops();
     test_trustzone_sau();
+    test_trustzone_sau_mmio();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

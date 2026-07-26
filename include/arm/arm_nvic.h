@@ -29,6 +29,14 @@
 #define SCB_SHCSR   0xD24  /* System Handler Control and State Register */
 #define SCB_CPUID   0xD00  /* CPUID Base Register */
 
+/* ARMv8-M Security Attribution Unit (SAU) register offsets within the SCS.
+ * Secure-only (RAZ/WI from Non-secure). See arm_trustzone.c. */
+#define SAU_CTRL    0xDD0  /* SAU Control Register */
+#define SAU_TYPE    0xDD4  /* SAU Type Register (SREGION count, read-only) */
+#define SAU_RNR     0xDD8  /* SAU Region Number Register */
+#define SAU_RBAR    0xDDC  /* SAU Region Base Address Register */
+#define SAU_RLAR    0xDE0  /* SAU Region Limit Address Register */
+
 typedef struct arm_nvic {
     arm_cpu_t *cpu;
 

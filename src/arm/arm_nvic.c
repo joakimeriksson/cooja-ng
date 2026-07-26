@@ -2,6 +2,7 @@
  * ARM Cortex-M3 Nested Vectored Interrupt Controller
  */
 #include "arm_nvic.h"
+#include "arm_trustzone.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -84,6 +85,26 @@ static int nvic_read(void *user_data, uint32_t addr) {
             return nvic->shpr[8] | (nvic->shpr[9] << 8) |
                    (nvic->shpr[10] << 16) | (nvic->shpr[11] << 24);
         case SCB_SHCSR: return (int)nvic->shcsr;
+
+        /* SAU — Secure-only; reads as zero (RAZ) from Non-secure. */
+        case SAU_CTRL:
+        case SAU_TYPE:
+        case SAU_RNR:
+        case SAU_RBAR:
+        case SAU_RLAR: {
+            arm_cpu_t *cpu = nvic->cpu;
+            if (!arm_cpu_is_secure(cpu))
+                return 0;
+            uint32_t r = cpu->sau_rnr;
+            switch (offset) {
+                case SAU_CTRL: return (int)cpu->sau_ctrl;
+                case SAU_TYPE: return (int)cpu->sau_sregions;   /* SREGION count */
+                case SAU_RNR:  return (int)cpu->sau_rnr;
+                case SAU_RBAR: return (r < cpu->sau_sregions) ? (int)cpu->sau_rbar[r] : 0;
+                case SAU_RLAR: return (r < cpu->sau_sregions) ? (int)cpu->sau_rlar[r] : 0;
+            }
+            return 0;
+        }
     }
 
     return 0;
@@ -224,6 +245,38 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         case SCB_SHCSR:
             nvic->shcsr = value;
             break;
+
+        /* SAU — Secure-only; writes are ignored (WI) from Non-secure. */
+        case SAU_CTRL:
+        case SAU_TYPE:
+        case SAU_RNR:
+        case SAU_RBAR:
+        case SAU_RLAR: {
+            arm_cpu_t *cpu = nvic->cpu;
+            if (!arm_cpu_is_secure(cpu))
+                break;
+            uint32_t r = cpu->sau_rnr;
+            switch (offset) {
+                case SAU_CTRL:
+                    cpu->sau_ctrl = value & (ARM_SAU_CTRL_ENABLE | ARM_SAU_CTRL_ALLNS);
+                    break;
+                case SAU_TYPE:
+                    break;  /* read-only */
+                case SAU_RNR:
+                    /* Region number; out-of-range values are held but select no region. */
+                    cpu->sau_rnr = value & 0xFFu;
+                    break;
+                case SAU_RBAR:
+                    if (r < cpu->sau_sregions)
+                        cpu->sau_rbar[r] = value & 0xFFFFFFE0u;  /* base[31:5] */
+                    break;
+                case SAU_RLAR:
+                    if (r < cpu->sau_sregions)
+                        cpu->sau_rlar[r] = value & 0xFFFFFFE3u;  /* limit[31:5]|NSC|ENABLE */
+                    break;
+            }
+            break;
+        }
     }
 }
 

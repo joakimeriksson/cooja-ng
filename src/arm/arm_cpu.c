@@ -464,6 +464,16 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->control_s = 0;
     cpu->control_ns = 0;
     cpu->vtor_s    = cpu->tz_enabled ? cpu->vtor : 0;
+
+    /* SAU: the Cortex-M33 implements 8 regions. Zero when there is no
+     * security extension (the registers then RAZ/WI). */
+    cpu->sau_ctrl = 0;
+    cpu->sau_rnr  = 0;
+    cpu->sau_sregions = cpu->tz_enabled ? 8 : 0;
+    for (int i = 0; i < 8; i++) {
+        cpu->sau_rbar[i] = 0;
+        cpu->sau_rlar[i] = 0;
+    }
 }
 
 void arm_stop(arm_cpu_t *cpu) {
