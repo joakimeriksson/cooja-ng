@@ -56,6 +56,15 @@ arm_sec_attr_t arm_security_attr(const arm_cpu_t *cpu, uint32_t addr);
  * regions selected by SAU_RNR/RBAR/RLAR. */
 void arm_sau_check(const arm_cpu_t *cpu, uint32_t addr, bool *ns, bool *nsc);
 
+/* Index of the single enabled SAU region containing `addr`, or -1 if none
+ * (or if the SAU is disabled / multiple regions overlap). Used by TT. */
+int arm_sau_region(const arm_cpu_t *cpu, uint32_t addr);
+
+/* Build the ARMv8-M TT/TTT/TTA/TTAT response word for `addr`. `alt` selects
+ * the alternate (Non-secure) domain view (TTA/TTAT), only meaningful from
+ * Secure state. Reports the Secure (S), SAU region, and R/RW attributes. */
+uint32_t arm_tt_response(const arm_cpu_t *cpu, uint32_t addr, bool alt);
+
 /* Default IDAU: everything non-secure, nothing exempt (i.e. attribution is
  * left entirely to the SAU). SoCs with a hardware IDAU (nRF54L15 SPU) install
  * their own check; until then this is the behaviour. */

@@ -1955,6 +1955,24 @@ int arm_step(arm_cpu_t *cpu, int count) {
             int op2_5 = (hw1 >> 4) & 0x7F;
             int op_hw2 = (hw2 >> 15) & 1;
 
+            /* ARMv8-M TT / TTT / TTA / TTAT — test target attributes.
+             * hw1 = 0xE84|Rn, hw2 = 0xF|Rd|A|T|000000. Distinguished from
+             * LDRD/STRD (same hw1 range) by hw2[15:12]==0xF, which those
+             * never have (Rt=PC is invalid there). Gated on tz_enabled, so
+             * non-TZ decode is entirely unaffected. */
+            if (cpu->tz_enabled &&
+                (hw1 & 0xFFF0) == 0xE840 && (hw2 & 0xF03F) == 0xF000) {
+                int rn = hw1 & 0xF;
+                int rd = (hw2 >> 8) & 0xF;
+                bool alt = (hw2 >> 7) & 1;          /* A: alternate domain */
+                if (rn != 15 && rd != 15 && rd != 13) {
+                    /* TTA/TTAT (alt) are only valid from Secure state. */
+                    bool ok = !alt || cpu->secure;
+                    cpu->reg[rd] = ok ? arm_tt_response(cpu, cpu->reg[rn], alt) : 0;
+                }
+                goto insn_done;
+            }
+
             if (op1 == 1 && (op2_5 & 0x64) == 0x00) {
                 /* Load/Store multiple, SRS, RFE */
                 int W = (hw1 >> 5) & 1;

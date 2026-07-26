@@ -118,3 +118,49 @@ void arm_record_secure_fault(arm_cpu_t *cpu, uint32_t addr)
     cpu->sfar = addr;
     cpu->secure_fault_pending = true;
 }
+
+int arm_sau_region(const arm_cpu_t *cpu, uint32_t addr)
+{
+    if (!(cpu->sau_ctrl & ARM_SAU_CTRL_ENABLE))
+        return -1;
+    int found = -1;
+    for (unsigned r = 0; r < cpu->sau_sregions && r < 8; r++) {
+        if (!(cpu->sau_rlar[r] & ARM_SAU_RLAR_ENABLE))
+            continue;
+        uint32_t base  = cpu->sau_rbar[r] & ~0x1fu;
+        uint32_t limit = (cpu->sau_rlar[r] & ~0x1fu) | 0x1fu;
+        if (addr >= base && addr <= limit) {
+            if (found >= 0)
+                return -1;   /* overlap => region invalid */
+            found = (int)r;
+        }
+    }
+    return found;
+}
+
+/* TT response bit positions (ARMv8-M). */
+#define ARM_TT_SREGION_SHIFT 8
+#define ARM_TT_SRVALID  (1u << 17)
+#define ARM_TT_R        (1u << 18)
+#define ARM_TT_RW       (1u << 19)
+#define ARM_TT_S        (1u << 22)
+
+uint32_t arm_tt_response(const arm_cpu_t *cpu, uint32_t addr, bool alt)
+{
+    (void)alt;  /* alternate-domain (TTA/TTAT) refinement deferred */
+    uint32_t resp = 0;
+
+    arm_sec_attr_t attr = arm_security_attr(cpu, addr);
+    if (attr != ARM_SEC_NONSECURE)
+        resp |= ARM_TT_S;   /* Secure or NSC */
+
+    int region = arm_sau_region(cpu, addr);
+    if (region >= 0) {
+        resp |= ((uint32_t)region << ARM_TT_SREGION_SHIFT) & 0xFF00u;
+        resp |= ARM_TT_SRVALID;
+    }
+
+    /* Without an MPU model, memory is treated as read/write accessible. */
+    resp |= ARM_TT_R | ARM_TT_RW;
+    return resp;
+}

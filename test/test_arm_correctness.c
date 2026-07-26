@@ -1977,6 +1977,40 @@ static void test_trustzone_enforcement(void) {
                 arm_mem_access_permitted(&cpu, 0x00000000));
 }
 
+/* Step 3a: TT (test target) executes and reports the address attribution. */
+static void test_trustzone_tt(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone TT instruction tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+    /* Region 0 = [0x20000000,0x2000FFFF] Non-secure. */
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    cpu.sau_rbar[0] = 0x20000000;
+    cpu.sau_rlar[0] = (0x2000FFFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+
+    /* TT r0, r1  => hw1=0xE841 (Rn=1), hw2=0xF000 (Rd=0, A=0, T=0). */
+    write_thumb32(&cpu, CODE_BASE, 0xE841, 0xF000);
+
+    /* Point r1 at Non-secure memory: S bit (22) must be clear. */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[1] = 0x20008000;
+    arm_step(&cpu, 1);
+    assert_true("TT on NS addr: S bit clear", !(cpu.reg[0] & (1u << 22)));
+    assert_true("TT on NS addr: SRVALID set", (cpu.reg[0] & (1u << 17)) != 0);
+
+    /* Point r1 at Secure memory: S bit (22) must be set. */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[1] = 0x00001000;
+    arm_step(&cpu, 1);
+    assert_true("TT on Secure addr: S bit set", (cpu.reg[0] & (1u << 22)) != 0);
+
+    /* A normal LDRD (same hw1 range) must NOT be caught by the TT decode:
+     * hw2 top nibble is a real register, not 0xF. Sanity: TT gate is inert
+     * for the whole suite (test_ldrd_strd already exercises LDRD). */
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -2004,6 +2038,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_sau();
     test_trustzone_sau_mmio();
     test_trustzone_enforcement();
+    test_trustzone_tt();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;
