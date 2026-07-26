@@ -75,6 +75,9 @@ make plugins                                    # packet_sink.so + lossy_medium.
 ./build/test_runner test configs/plugin-energest-builtin-v2.json   # "plugins": ["energest"]
 # Pluggable radio medium (Phase 11) — config medium.type names a plugin medium
 ./build/test_runner test configs/medium-plugin-sky-v2.json # "medium": {"type": "lossy"}
+# Gilbert-Elliott burst-loss medium — 2-state Markov; knobs via CSIM_GE_* env
+make test-ge                                    # statistical model validation (drop rate, burst length)
+CSIM_GE_AVG_DROP=0.2 CSIM_GE_BURST_LEN=8 ./build/test_runner test configs/medium-plugin-gilbert-elliott.json
 tools/check-plugin.sh                           # plugin smoke check (service + medium + energy)
 ```
 
