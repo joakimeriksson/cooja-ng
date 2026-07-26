@@ -4,6 +4,7 @@
 #include "arm_cpu.h"
 #include "arm_config.h"
 #include "arm_nvic.h"
+#include "arm_trustzone.h"
 #include "gdb_stub.h"
 #include <stdlib.h>
 #include <string.h>
@@ -114,8 +115,25 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * These check SRAM first (most common data target), then flash,
  * then fall back to the public functions for IO/ROM/bitband. */
 
+/* TrustZone-M data-access enforcement gate. The common case — no security
+ * extension, or executing Secure — is a single predicted-true branch with no
+ * added cost. When a Non-secure access is refused by the attribution unit it
+ * records a SecureFault and returns true; the caller then suppresses the
+ * access (read yields 0, write is dropped) until the secure exception model
+ * (Step 4) takes the pending fault. Dormant until Non-secure execution exists
+ * (Step 3), so it changes no current behaviour. */
+static inline bool arm_tz_blocks(arm_cpu_t *cpu, uint32_t addr) {
+    if (__builtin_expect(!cpu->tz_enabled || cpu->secure, 1))
+        return false;
+    if (arm_mem_access_permitted(cpu, addr))
+        return false;
+    arm_record_secure_fault(cpu, addr);
+    return true;
+}
+
 static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
+    if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8) |
@@ -131,6 +149,7 @@ static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline uint16_t mem_read16(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~1u;
+    if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
@@ -143,6 +162,7 @@ static inline uint16_t mem_read16(arm_cpu_t *cpu, uint32_t addr) {
 }
 
 static inline uint8_t mem_read8(arm_cpu_t *cpu, uint32_t addr) {
+    if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1))
         return cpu->sram[addr - cpu->sram_base];
     if (addr >= cpu->flash_base && addr < cpu->flash_end)
@@ -152,6 +172,7 @@ static inline uint8_t mem_read8(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     addr &= ~3u;
+    if (arm_tz_blocks(cpu, addr)) return;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
@@ -165,6 +186,7 @@ static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
 
 static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
     addr &= ~1u;
+    if (arm_tz_blocks(cpu, addr)) return;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
@@ -175,6 +197,7 @@ static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
 }
 
 static inline void mem_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
+    if (arm_tz_blocks(cpu, addr)) return;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         cpu->sram[addr - cpu->sram_base] = val;
         return;
@@ -474,6 +497,9 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
         cpu->sau_rbar[i] = 0;
         cpu->sau_rlar[i] = 0;
     }
+    cpu->sfsr = 0;
+    cpu->sfar = 0;
+    cpu->secure_fault_pending = false;
 }
 
 void arm_stop(arm_cpu_t *cpu) {

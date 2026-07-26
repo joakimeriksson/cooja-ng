@@ -1937,6 +1937,46 @@ static void test_trustzone_sau_mmio(void) {
               arm_read32(&cpu, 0xE000EDD0));
 }
 
+/* Step 2: data-access enforcement decision + SecureFault recording. */
+static void test_trustzone_enforcement(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone data-access enforcement tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.sau_sregions = 8;
+    /* Region 0 = [0x20000000,0x2000FFFF] Non-secure; everything else Secure. */
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    cpu.sau_rbar[0] = 0x20000000;
+    cpu.sau_rlar[0] = (0x2000FFFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+
+    /* Secure state may reach any address. */
+    cpu.secure = true;
+    assert_true("Secure may access Secure mem",
+                arm_mem_access_permitted(&cpu, 0x00000000));
+    assert_true("Secure may access NS mem",
+                arm_mem_access_permitted(&cpu, 0x20008000));
+
+    /* Non-secure state may reach only Non-secure memory. */
+    cpu.secure = false;
+    assert_true("NS may access NS mem",
+                arm_mem_access_permitted(&cpu, 0x20008000));
+    assert_true("NS may NOT access Secure mem",
+                !arm_mem_access_permitted(&cpu, 0x00000000));
+
+    /* Recording a fault latches SFSR.AUVIOL|SFARVALID, SFAR, and pending. */
+    cpu.sfsr = 0; cpu.sfar = 0; cpu.secure_fault_pending = false;
+    arm_record_secure_fault(&cpu, 0x00001234);
+    assert_true("SFSR.AUVIOL set", (cpu.sfsr & ARM_SFSR_AUVIOL) != 0);
+    assert_true("SFSR.SFARVALID set", (cpu.sfsr & ARM_SFSR_SFARVALID) != 0);
+    assert_eq("SFAR holds faulting address", 0x00001234, cpu.sfar);
+    assert_true("SecureFault pending", cpu.secure_fault_pending);
+
+    /* Enforcement is disabled entirely when the SoC has no extension. */
+    cpu.tz_enabled = false;
+    assert_true("no-TZ SoC: all accesses permitted",
+                arm_mem_access_permitted(&cpu, 0x00000000));
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -1963,6 +2003,7 @@ int run_arm_correctness_tests(int v) {
     test_anti_replay_ops();
     test_trustzone_sau();
     test_trustzone_sau_mmio();
+    test_trustzone_enforcement();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

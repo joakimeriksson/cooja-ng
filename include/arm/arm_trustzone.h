@@ -29,6 +29,16 @@ typedef enum {
 #define ARM_SAU_RLAR_ENABLE   (1u << 0)
 #define ARM_SAU_RLAR_NSC      (1u << 1)
 
+/* SecureFault Status Register (SFSR) bit fields. */
+#define ARM_SFSR_INVEP     (1u << 0)  /* invalid secure-gateway entry point */
+#define ARM_SFSR_INVIS     (1u << 1)  /* invalid integrity signature */
+#define ARM_SFSR_INVER     (1u << 2)  /* invalid exception return */
+#define ARM_SFSR_AUVIOL    (1u << 3)  /* attribution-unit violation (data) */
+#define ARM_SFSR_INVTRAN   (1u << 4)  /* invalid transition */
+#define ARM_SFSR_LSPERR    (1u << 5)  /* lazy state preservation error */
+#define ARM_SFSR_SFARVALID (1u << 6)  /* SFAR holds a valid address */
+#define ARM_SFSR_LSERR     (1u << 7)  /* lazy state error */
+
 /* Result of an IDAU attribution check for one address. */
 typedef struct {
     bool ns;        /* IDAU considers the address non-secure */
@@ -50,5 +60,15 @@ void arm_sau_check(const arm_cpu_t *cpu, uint32_t addr, bool *ns, bool *nsc);
  * left entirely to the SAU). SoCs with a hardware IDAU (nRF54L15 SPU) install
  * their own check; until then this is the behaviour. */
 arm_idau_result_t arm_idau_check_default(uint32_t addr);
+
+/* Data-access enforcement (Step 2). True if the current security state may
+ * access `addr` for data: Non-secure may reach only Non-secure memory; Secure
+ * may reach anything; always true when the SoC has no security extension. */
+bool arm_mem_access_permitted(const arm_cpu_t *cpu, uint32_t addr);
+
+/* Record an attribution-unit SecureFault (SFSR.AUVIOL) for `addr`: latches
+ * SFSR/SFAR and marks the fault pending. The exception is taken later by the
+ * secure exception model (Step 4). */
+void arm_record_secure_fault(arm_cpu_t *cpu, uint32_t addr);
 
 #endif /* ARM_TRUSTZONE_H */

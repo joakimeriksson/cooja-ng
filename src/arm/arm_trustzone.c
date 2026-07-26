@@ -101,3 +101,20 @@ arm_sec_attr_t arm_security_attr(const arm_cpu_t *cpu, uint32_t addr)
         return ARM_SEC_NONSECURE;
     return nsc ? ARM_SEC_NSC : ARM_SEC_SECURE;
 }
+
+bool arm_mem_access_permitted(const arm_cpu_t *cpu, uint32_t addr)
+{
+    /* No extension, or running Secure: every address is reachable. */
+    if (!cpu->tz_enabled || cpu->secure)
+        return true;
+    /* Non-secure: only Non-secure memory is reachable. NSC and Secure are
+     * both Secure memory for data purposes, so both are refused. */
+    return arm_security_attr(cpu, addr) == ARM_SEC_NONSECURE;
+}
+
+void arm_record_secure_fault(arm_cpu_t *cpu, uint32_t addr)
+{
+    cpu->sfsr |= ARM_SFSR_AUVIOL | ARM_SFSR_SFARVALID;
+    cpu->sfar = addr;
+    cpu->secure_fault_pending = true;
+}

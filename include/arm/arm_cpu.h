@@ -43,6 +43,7 @@
 #define EXC_MEMMANAGE   4
 #define EXC_BUSFAULT    5
 #define EXC_USAGEFAULT  6
+#define EXC_SECUREFAULT 7   /* ARMv8-M security extension */
 #define EXC_SVCALL     11
 #define EXC_PENDSV     14
 #define EXC_SYSTICK    15
@@ -215,6 +216,13 @@ typedef struct arm_cpu {
     uint32_t  sau_rbar[8];           /* SAU_RBAR[]: region base (bits 31:5) */
     uint32_t  sau_rlar[8];           /* SAU_RLAR[]: limit(31:5)|NSC(1)|ENABLE(0) */
     uint8_t   sau_sregions;          /* number of implemented SAU regions (0/4/8) */
+
+    /* SecureFault state (Phase 1/Step 2). Set when a Non-secure access is
+     * refused by the attribution unit; the exception is *taken* by the
+     * secure exception model (Step 4). */
+    uint32_t  sfsr;                  /* SecureFault Status Register */
+    uint32_t  sfar;                  /* SecureFault Address Register */
+    bool      secure_fault_pending;  /* a SecureFault has been recorded */
 
     /* ROM utility traps */
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
