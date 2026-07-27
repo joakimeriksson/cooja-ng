@@ -230,6 +230,12 @@ typedef struct arm_cpu {
     bool      exc_crossed_domain;    /* current exception switched security */
     bool      exc_bg_secure;         /* background security state to restore */
 
+    /* World-transition instrumentation (Step 7). Counted per node; the thing
+     * silicon cannot expose without intrusive probes. */
+    uint64_t  tz_sg_count;           /* SG entries (NS->S) */
+    uint64_t  tz_bxns_count;         /* BXNS returns to Non-secure */
+    uint64_t  tz_secexc_count;       /* secure exceptions taken from NS */
+
     /* ROM utility traps */
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
     uint32_t  rom_util_memset;    /* Address of rom_util_memset entry */

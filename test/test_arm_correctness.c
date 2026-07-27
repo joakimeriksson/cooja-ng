@@ -2079,7 +2079,46 @@ static void test_trustzone_transitions(void) {
         cpu2.reg[ARM_PC] = CODE_BASE;
         arm_step(&cpu2, 1);
         assert_true("SG from non-NSC: stays Non-secure", !cpu2.secure);
+        assert_eq("SG NOP: no transition counted", 0, (int)cpu2.tz_sg_count);
     }
+}
+
+/* Step 7: world-transition instrumentation counts SG/BXNS/secure-exception. */
+static void test_trustzone_instrumentation(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone transition-counter tests ---\n");
+
+    /* One BXNS => one counted Non-secure return. */
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+    cpu.reg[ARM_SP] = 0x30010000;
+    cpu.msp_ns = 0x20010000;
+    write_thumb16(&cpu, CODE_BASE, 0x4704);   /* BXNS r0 */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[0] = 0x20008000;
+    arm_step(&cpu, 1);
+    assert_eq("BXNS counted", 1, (int)cpu.tz_bxns_count);
+    assert_eq("no SG counted", 0, (int)cpu.tz_sg_count);
+
+    /* One SG => one counted NS->S entry. */
+    arm_cpu_t cpu2;
+    setup_arm(&cpu2);
+    cpu2.tz_enabled = true;
+    cpu2.secure = false;
+    cpu2.sau_sregions = 8;
+    cpu2.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    cpu2.sau_rbar[0] = ARM_FLASH_BASE & ~0x1fu;
+    cpu2.sau_rlar[0] = ((ARM_FLASH_BASE + 0x1FFFF) & ~0x1fu)
+                       | ARM_SAU_RLAR_ENABLE | ARM_SAU_RLAR_NSC;
+    cpu2.reg[ARM_SP] = 0x20010000;
+    cpu2.msp_s = 0x30010000;
+    write_thumb32(&cpu2, CODE_BASE, 0xE97F, 0xE97F);
+    cpu2.reg[ARM_PC] = CODE_BASE;
+    cpu2.reg[ARM_LR] = 0x00000201;
+    arm_step(&cpu2, 1);
+    assert_eq("SG counted", 1, (int)cpu2.tz_sg_count);
 }
 
 /* Step 4: a Non-secure illegal access faults, the SecureFault is taken into
@@ -2182,6 +2221,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_transitions();
     test_trustzone_secure_exception();
     test_trustzone_nvic_itns();
+    test_trustzone_instrumentation();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

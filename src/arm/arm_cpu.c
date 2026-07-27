@@ -502,6 +502,9 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->secure_fault_pending = false;
     cpu->exc_crossed_domain = false;
     cpu->exc_bg_secure = false;
+    cpu->tz_sg_count = 0;
+    cpu->tz_bxns_count = 0;
+    cpu->tz_secexc_count = 0;
 }
 
 void arm_stop(arm_cpu_t *cpu) {
@@ -660,6 +663,8 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     if (cpu->tz_enabled && target_secure != tz_bg_secure) {
         arm_switch_security_state(cpu, target_secure);
         cpu->exc_crossed_domain = true;
+        if (target_secure)
+            cpu->tz_secexc_count++;
     }
     uint32_t vtor = (cpu->tz_enabled && target_secure) ? cpu->vtor_s : cpu->vtor;
 
@@ -1640,8 +1645,10 @@ int arm_step(arm_cpu_t *cpu, int count) {
                                 /* FNC_RETURN / EXC_RETURN — Step 4 refines. */
                                 exception_return(cpu, target);
                             } else {
-                                if ((target & 1) == 0)
+                                if ((target & 1) == 0) {
                                     arm_switch_security_state(cpu, false);
+                                    cpu->tz_bxns_count++;
+                                }
                                 cpu->reg[ARM_PC] = target & ~1u;
                             }
                         } else if (link) {
@@ -2060,6 +2067,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     arm_security_attr(cpu, pc) == ARM_SEC_NSC) {
                     arm_switch_security_state(cpu, true);
                     cpu->reg[ARM_LR] &= ~1u;
+                    cpu->tz_sg_count++;
                 }
                 goto insn_done;
             }
