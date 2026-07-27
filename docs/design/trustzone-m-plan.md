@@ -179,17 +179,20 @@ built `BOARD=nrf54l15/dk` so one binary runs on csim and the DK.
 - **[DONE] Step 6** — `has_trustzone=true` on `nrf54l15_config`; existing
   firmware runs byte-identically (Secure world, enforcement inert).
 - **[DONE] Step 7** — per-node transition instrumentation (SG/BXNS/secure-exc).
-- **[FIRMWARE TRACK] Step 8** — booting the real Contiki-NG `trustzone/` split
-  image is blocked by a Contiki-NG build issue with arm-gcc 15.2 (objects built
-  for ARM v4T vs the v8-M.mainline link). Emulator is ready; this is a firmware
-  build-config fix, not emulator work. The emulator's SG/BXNS/TT/SecureFault
-  paths are already validated by directed execution tests (see
-  test_arm_correctness.c: 214 pass).
+- **[DONE] Step 8** — BLXNS + FNC_RETURN implemented; csim boots the **real**
+  Contiki-NG `trustzone/` split image (`tz-boot` harness). The secure world
+  initializes TrustZone, configures SAU/IDAU + the non-secure environment,
+  routes IRQs (NVIC_ITNS), and hands off to Non-secure ("Non-secure world"
+  banner); security state flips correctly, 9 world transitions (4 SG + 5 BXNS)
+  counted. The arm-gcc 15.2 firmware build blocker was fixed upstream-style in
+  `contiki-ng-nrf54l15` (`arch/cpu/arm/cortex-m/Makefile.cortex-m`: re-tag the
+  attribute-less CMSE import lib; guarded `--no-warn-rwx-segments`).
 
-**Emulator status: COMPLETE.** ~40 TrustZone execution/conformance tests; the
-non-TZ path is byte-identical (all MSP430/ARM/multinode suites green). Remaining
-work is the firmware track (build the split image / veneer services) and the HW
-track (DK golden-vector capture) — both outside the emulator.
+**PLAN COMPLETE.** All emulator steps done + tested (~40 TZ tests, ARM 214/214,
+non-TZ path byte-identical, all suites green), and the real split firmware boots
+in csim. Remaining is the HW track (DK golden-vector capture — the authoritative
+oracle) and deeper firmware exercise (radio/timer-driven rpl-udp, secure
+services), both outside the core emulator.
 
 Parallel HW track (non-blocking): DK capture toolchain (JLink/GDB + DWT `CYCCNT`
 + semihosting) on the current non-TZ nRF54L15 first, then per-primitive golden
