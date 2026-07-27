@@ -282,15 +282,17 @@ int main(int argc, char **argv) {
         printf("  final state: %s, PC=0x%08x\n",
                arm_cpu_is_secure(&plat.cpu) ? "Secure" : "Non-secure",
                plat.cpu.reg[15]);
-        /* Success = the secure world handed off to Non-secure (banner) AND
-         * real world transitions were exercised. ("sec ret" is behind
-         * #if TEST_SECURE_FAULT in the example and off by default.) */
-        int ok = tz_boot_saw_ns && !arm_cpu_is_secure(&plat.cpu) &&
-                 (plat.cpu.tz_sg_count > 0 || plat.cpu.tz_bxns_count > 0);
+        /* Success = the secure world (the SoC resets Secure) handed off to
+         * Non-secure AND real world transitions were exercised. This is
+         * app-independent; a matched banner ("Non-secure world" in the minimal
+         * example) is reported as extra confirmation when present. */
+        unsigned long long transitions =
+            plat.cpu.tz_sg_count + plat.cpu.tz_bxns_count;
+        int ok = !arm_cpu_is_secure(&plat.cpu) && transitions > 0;
         (void)tz_boot_saw_secret;
-        printf("  %s: NS handoff=%d, transitions=%llu\n",
-               ok ? "PASS" : "INCOMPLETE", tz_boot_saw_ns,
-               (unsigned long long)(plat.cpu.tz_sg_count + plat.cpu.tz_bxns_count));
+        printf("  %s: reached Non-secure=%d, transitions=%llu%s\n",
+               ok ? "PASS" : "INCOMPLETE", !arm_cpu_is_secure(&plat.cpu),
+               transitions, tz_boot_saw_ns ? " (banner seen)" : "");
         arm_platform_destroy(&plat);
         return ok ? 0 : 1;
     }
