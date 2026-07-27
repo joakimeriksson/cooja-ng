@@ -2190,6 +2190,71 @@ static void test_trustzone_nvic_itns(void) {
               arm_read32(&cpu, 0xE000E380));
 }
 
+/* Step 8: BLXNS (Secure->NS call) and FNC_RETURN (NS->Secure return), the
+ * friendly veneer round-trip, plus the tampered-signature violation. */
+static void test_trustzone_blxns(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone BLXNS/FNC_RETURN tests ---\n");
+
+    /* --- Successful round-trip: BLXNS out, BX FNC_RETURN back --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = true;
+        cpu.use_psp = false;
+        cpu.sau_sregions = 8;
+        cpu.reg[ARM_SP] = 0x20007F00;    /* Secure stack (SRAM) */
+        cpu.msp_ns = 0x20006F00;         /* Non-secure stack */
+
+        /* BLXNS r0 = 0x4784; the NS callee is a lone BX LR. */
+        write_thumb16(&cpu, CODE_BASE, 0x4784);
+        write_thumb16(&cpu, CODE_BASE + 0x40, 0x4770);   /* BX LR */
+        cpu.reg[0] = (CODE_BASE + 0x40) | 1;
+        cpu.reg[ARM_PC] = CODE_BASE;
+
+        arm_step(&cpu, 1);   /* BLXNS */
+        assert_true("BLXNS: now Non-secure", !cpu.secure);
+        assert_eq("BLXNS: LR = FNC_RETURN", 0xFEFFFFFFu, cpu.reg[ARM_LR]);
+        assert_eq("BLXNS: PC = NS callee", CODE_BASE + 0x40, cpu.reg[ARM_PC]);
+        assert_eq("BLXNS: S->NS counted", 1, (int)cpu.tz_bxns_count);
+
+        arm_step(&cpu, 1);   /* BX LR (= FNC_RETURN) */
+        assert_true("FNC_RETURN: back to Secure", cpu.secure);
+        assert_eq("FNC_RETURN: PC = secure return", CODE_BASE + 2,
+                  cpu.reg[ARM_PC]);
+        assert_eq("FNC_RETURN: secure MSP restored", 0x20007F00,
+                  cpu.reg[ARM_SP]);
+        assert_true("FNC_RETURN: no integrity fault", !cpu.secure_fault_pending);
+    }
+
+    /* --- Violation: a Non-secure callee that corrupts the saved integrity
+     * signature must raise a SecureFault (INVIS) on return. --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = true;
+        cpu.sau_sregions = 8;
+        cpu.reg[ARM_SP] = 0x20007F00;
+        cpu.msp_ns = 0x20006F00;
+        write_thumb16(&cpu, CODE_BASE, 0x4784);          /* BLXNS r0 */
+        write_thumb16(&cpu, CODE_BASE + 0x40, 0x4770);   /* BX LR */
+        cpu.reg[0] = (CODE_BASE + 0x40) | 1;
+        cpu.reg[ARM_PC] = CODE_BASE;
+        arm_step(&cpu, 1);   /* BLXNS pushes frame at 0x20007EF8 */
+
+        /* Tamper with the integrity signature on the secure stack. */
+        arm_write32(&cpu, 0x20007F00 - 8 + 4, 0xDEADBEEF);
+        arm_step(&cpu, 1);   /* BX LR -> FNC_RETURN (fault detected + taken) */
+        /* SFSR.INVIS is the durable evidence; the pending flag is consumed the
+         * same step when the SecureFault is taken into the handler. */
+        assert_true("tampered signature: SFSR.INVIS recorded",
+                    (cpu.sfsr & ARM_SFSR_INVIS) != 0);
+        assert_true("tampered signature: returned to Secure to fault",
+                    cpu.secure);
+    }
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -2222,6 +2287,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_secure_exception();
     test_trustzone_nvic_itns();
     test_trustzone_instrumentation();
+    test_trustzone_blxns();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;
