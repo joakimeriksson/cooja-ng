@@ -16,6 +16,7 @@
 #define NVIC_ICPR_BASE  0x280   /* Interrupt Clear-Pending Registers */
 #define NVIC_IABR_BASE  0x300   /* Interrupt Active Bit Registers */
 #define NVIC_IPR_BASE   0x400   /* Interrupt Priority Registers */
+#define NVIC_ITNS_BASE  0x380   /* Interrupt Target Non-secure (ARMv8-M) */
 
 /* System Control Block offsets */
 #define SCB_ICSR    0xD04  /* Interrupt Control and State Register */
@@ -48,6 +49,10 @@ typedef struct arm_nvic {
 
     /* Active bits: 1 = IRQ currently being serviced */
     uint32_t  iabr[8];
+
+    /* ARMv8-M target-security: bit set => IRQ targets Non-secure. Reset 0
+     * (all interrupts Secure). Secure-only registers. */
+    uint32_t  itns[8];
 
     /* Priority: 8-bit priority per IRQ (only upper bits used) */
     uint8_t   ipr[NVIC_MAX_IRQ];
@@ -103,5 +108,9 @@ uint32_t arm_nvic_get_vector(arm_nvic_t *nvic, int exception_num);
 
 /* Get priority for an exception number */
 int arm_nvic_get_priority(arm_nvic_t *nvic, int exception_num);
+
+/* ARMv8-M: does `exception_num` target the Secure state? External IRQs use
+ * NVIC_ITNS; SecureFault and (for now) other system exceptions are Secure. */
+bool arm_nvic_targets_secure(const arm_nvic_t *nvic, int exception_num);
 
 #endif /* ARM_NVIC_H */

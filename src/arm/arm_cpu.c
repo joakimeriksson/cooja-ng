@@ -591,8 +591,16 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
      * targets Secure; other exceptions keep the current domain until NVIC
      * target-security banking (Step 5). Entirely gated on tz_enabled. */
     bool tz_bg_secure = cpu->secure;
-    bool target_secure = cpu->tz_enabled &&
-        (exception_num == EXC_SECUREFAULT ? true : cpu->secure);
+    bool target_secure = false;
+    if (cpu->tz_enabled) {
+        if (exception_num == EXC_SECUREFAULT)
+            target_secure = true;
+        else if (exception_num >= 16 && cpu->nvic)
+            target_secure = arm_nvic_targets_secure(
+                (arm_nvic_t *)cpu->nvic, exception_num);
+        else
+            target_secure = cpu->secure;   /* system exceptions: current domain */
+    }
 
     /* Push exception frame on the ACTIVE stack (PSP or MSP). */
     bool from_psp = arm_sp_is_psp(cpu);

@@ -2122,6 +2122,35 @@ static void test_trustzone_secure_exception(void) {
               cpu.reg[ARM_PC]);
 }
 
+/* Step 5: NVIC target-security (NVIC_ITNS) decides an IRQ's security state. */
+static void test_trustzone_nvic_itns(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone NVIC target-security tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    arm_nvic_t nvic;
+    arm_nvic_init(&nvic, &cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+
+    /* Default: IRQ targets Secure. */
+    assert_true("default IRQ -> Secure", arm_nvic_targets_secure(&nvic, 16 + 5));
+
+    /* Program IRQ 5 as Non-secure via memory-mapped NVIC_ITNS[0]. */
+    arm_write32(&cpu, 0xE000E380, (1u << 5));
+    assert_eq("ITNS[0] read-back", (1u << 5), arm_read32(&cpu, 0xE000E380));
+    assert_true("IRQ5 now -> Non-secure", !arm_nvic_targets_secure(&nvic, 16 + 5));
+    assert_true("IRQ6 still -> Secure", arm_nvic_targets_secure(&nvic, 16 + 6));
+
+    /* ITNS is Secure-only: Non-secure read RAZ, write WI. */
+    cpu.secure = false;
+    assert_eq("ITNS RAZ from Non-secure", 0, arm_read32(&cpu, 0xE000E380));
+    arm_write32(&cpu, 0xE000E380, 0xFFFFFFFF);   /* WI */
+    cpu.secure = true;
+    assert_eq("ITNS unchanged after NS write (WI)", (1u << 5),
+              arm_read32(&cpu, 0xE000E380));
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -2152,6 +2181,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_tt();
     test_trustzone_transitions();
     test_trustzone_secure_exception();
+    test_trustzone_nvic_itns();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

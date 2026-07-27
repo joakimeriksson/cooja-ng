@@ -39,6 +39,11 @@ static int nvic_read(void *user_data, uint32_t addr) {
         int idx = (offset - NVIC_IABR_BASE) / 4;
         return (int)nvic->iabr[idx];
     }
+    /* NVIC_ITNS (ARMv8-M) — Secure-only; RAZ from Non-secure. */
+    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 32) {
+        if (!arm_cpu_is_secure(nvic->cpu)) return 0;
+        return (int)nvic->itns[(offset - NVIC_ITNS_BASE) / 4];
+    }
     /* NVIC_IPR — assemble up to 4 bytes, clamped at the array end so an
      * unaligned word read near the top of the range can't read past ipr[]. */
     if (offset >= NVIC_IPR_BASE && offset < NVIC_IPR_BASE + 240) {
@@ -128,6 +133,12 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         int idx = (offset - NVIC_ICER_BASE) / 4;
         nvic->iser[idx] &= ~value;
         nvic->scan_valid = false;
+        return;
+    }
+    /* NVIC_ITNS (ARMv8-M target-security) — Secure-only; WI from Non-secure. */
+    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 32) {
+        if (arm_cpu_is_secure(nvic->cpu))
+            nvic->itns[(offset - NVIC_ITNS_BASE) / 4] = value;
         return;
     }
     /* NVIC_ISPR (set-pending) */
@@ -278,6 +289,16 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             break;
         }
     }
+}
+
+bool arm_nvic_targets_secure(const arm_nvic_t *nvic, int exception_num) {
+    if (exception_num < 16)
+        return true;   /* system exceptions: Secure (refined later) */
+    int irq = exception_num - 16;
+    if (irq >= 256)
+        return true;
+    /* ITNS bit set => Non-secure target. */
+    return !(nvic->itns[irq >> 5] & (1u << (irq & 31)));
 }
 
 void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu) {
