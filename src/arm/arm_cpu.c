@@ -536,6 +536,43 @@ static inline bool arm_sp_is_psp(const arm_cpu_t *cpu) {
     return ((cpu->xpsr & 0x1FFu) == 0) && cpu->use_psp;
 }
 
+/* --- TrustZone-M security-state SP banking (Step 3b) ---
+ * On a secure<->non-secure transition the whole {MSP,PSP,CONTROL} set is
+ * banked. csim keeps the active SP in reg[ARM_SP] and the inactive one in
+ * cpu->msp/psp; these helpers translate between that representation and the
+ * per-security-state banks (msp_s/ns, psp_s/ns, control_s/ns). */
+static void arm_tz_save_sp_bank(arm_cpu_t *cpu, bool secure) {
+    uint32_t lmsp, lpsp;
+    if (arm_sp_is_psp(cpu)) { lpsp = cpu->reg[ARM_SP]; lmsp = cpu->msp; }
+    else                    { lmsp = cpu->reg[ARM_SP]; lpsp = cpu->psp; }
+    if (secure) {
+        cpu->msp_s = lmsp; cpu->psp_s = lpsp; cpu->control_s = cpu->use_psp ? 2 : 0;
+    } else {
+        cpu->msp_ns = lmsp; cpu->psp_ns = lpsp; cpu->control_ns = cpu->use_psp ? 2 : 0;
+    }
+}
+
+static void arm_tz_load_sp_bank(arm_cpu_t *cpu, bool secure) {
+    uint32_t lmsp, lpsp, ctrl;
+    if (secure) { lmsp = cpu->msp_s; lpsp = cpu->psp_s; ctrl = cpu->control_s; }
+    else        { lmsp = cpu->msp_ns; lpsp = cpu->psp_ns; ctrl = cpu->control_ns; }
+    cpu->use_psp = (ctrl & 2) != 0;
+    if (arm_sp_is_psp(cpu)) { cpu->reg[ARM_SP] = lpsp; cpu->msp = lmsp; }
+    else                    { cpu->reg[ARM_SP] = lmsp; cpu->psp = lpsp; }
+}
+
+/* Switch security state, banking the stack pointers. No-op without the
+ * extension or when already in the target state. Thread-mode transitions
+ * (SG/BXNS); exception-driven banking is handled by the secure exception
+ * model (Step 4). */
+static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
+    if (!cpu->tz_enabled || cpu->secure == to_secure)
+        return;
+    arm_tz_save_sp_bank(cpu, cpu->secure);
+    cpu->secure = to_secure;
+    arm_tz_load_sp_bank(cpu, to_secure);
+}
+
 /* Exception entry/return tracer (ARM_EXC_TRACE=1).  Behaviour-neutral; the
  * key scope for context-switch (PendSV) and ISR-dispatch bring-up. */
 static void arm_exc_trace(const char *what, uint32_t a, uint32_t b, uint32_t c) {
@@ -1547,16 +1584,33 @@ int arm_step(arm_cpu_t *cpu, int count) {
                         cpu->reg[d] = m_val;
                         if (d == ARM_PC) cpu->reg[ARM_PC] &= ~1u;
                         break;
-                    case 3: /* BX / BLX */
-                        if (hw1 & (1 << 7)) {
-                            /* BLX Rm */
+                    case 3: { /* BX / BLX / BXNS / BLXNS */
+                        bool link = (hw1 & (1 << 7)) != 0;
+                        /* The Non-secure variant (bit[2]) is only meaningful
+                         * when executing Secure; in Non-secure it decodes as
+                         * plain BX/BLX. */
+                        bool ns_variant = (hw1 & (1 << 2)) && cpu->tz_enabled
+                                          && cpu->secure;
+                        if (ns_variant && !link) {
+                            /* BXNS Rm: branch, switching to Non-secure iff the
+                             * target's bit[0] is 0 (SG clears it on entry). */
+                            uint32_t target = m_val;
+                            if ((target & 0xF0000000) == 0xF0000000) {
+                                /* FNC_RETURN / EXC_RETURN — Step 4 refines. */
+                                exception_return(cpu, target);
+                            } else {
+                                if ((target & 1) == 0)
+                                    arm_switch_security_state(cpu, false);
+                                cpu->reg[ARM_PC] = target & ~1u;
+                            }
+                        } else if (link) {
+                            /* BLX Rm (BLXNS stacking deferred to Step 4). */
                             cpu->reg[ARM_LR] = (cpu->reg[ARM_PC]) | 1;
                             arm_sp_audit_push(cpu, cpu->reg[ARM_PC], m_val);
                             cpu->reg[ARM_PC] = m_val & ~1u;
                         } else {
                             /* BX Rm */
                             uint32_t target = m_val;
-                            /* Check for exception return */
                             if ((target & 0xF0000000) == 0xF0000000) {
                                 exception_return(cpu, target);
                             } else {
@@ -1564,6 +1618,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                             }
                         }
                         break;
+                    }
                 }
             }
             goto insn_done;
@@ -1954,6 +2009,19 @@ int arm_step(arm_cpu_t *cpu, int count) {
             int op1 = (hw1 >> 11) & 3;
             int op2_5 = (hw1 >> 4) & 0x7F;
             int op_hw2 = (hw2 >> 15) & 1;
+
+            /* ARMv8-M SG — Secure Gateway (0xE97FE97F). When executed from a
+             * Non-secure-callable region while Non-secure, it switches to
+             * Secure and clears LR[0] so the paired BXNS returns to NS.
+             * Elsewhere (already Secure, or not from NSC) it is a NOP. */
+            if (cpu->tz_enabled && insn32 == 0xE97FE97Fu) {
+                if (!cpu->secure &&
+                    arm_security_attr(cpu, pc) == ARM_SEC_NSC) {
+                    arm_switch_security_state(cpu, true);
+                    cpu->reg[ARM_LR] &= ~1u;
+                }
+                goto insn_done;
+            }
 
             /* ARMv8-M TT / TTT / TTA / TTAT — test target attributes.
              * hw1 = 0xE84|Rn, hw2 = 0xF|Rd|A|T|000000. Distinguished from

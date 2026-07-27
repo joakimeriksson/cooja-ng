@@ -2011,6 +2011,77 @@ static void test_trustzone_tt(void) {
      * for the whole suite (test_ldrd_strd already exercises LDRD). */
 }
 
+/* Step 3b: SG (NS->S) and BXNS (S->NS) state transitions + SP banking. */
+static void test_trustzone_transitions(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SG/BXNS transition tests ---\n");
+
+    /* --- BXNS: Secure -> Non-secure --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = true;
+        cpu.use_psp = false;
+        cpu.sau_sregions = 8;
+        cpu.reg[ARM_SP] = 0x30010000;   /* active Secure MSP */
+        cpu.msp_ns = 0x20010000;        /* banked Non-secure MSP */
+
+        /* BXNS r0 = 0x4704. Target bit0 == 0 => switch to Non-secure. */
+        write_thumb16(&cpu, CODE_BASE, 0x4704);
+        cpu.reg[ARM_PC] = CODE_BASE;
+        cpu.reg[0] = 0x20008000;        /* NS target, bit0 clear */
+        arm_step(&cpu, 1);
+
+        assert_true("BXNS: now Non-secure", !cpu.secure);
+        assert_eq("BXNS: PC = target", 0x20008000, cpu.reg[ARM_PC]);
+        assert_eq("BXNS: active SP swapped to NS bank", 0x20010000,
+                  cpu.reg[ARM_SP]);
+        assert_eq("BXNS: Secure MSP preserved in bank", 0x30010000, cpu.msp_s);
+    }
+
+    /* --- SG: Non-secure -> Secure, from an NSC region --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = false;             /* start Non-secure */
+        cpu.use_psp = false;
+        cpu.sau_sregions = 8;
+        cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+        /* Mark the code/flash region Non-secure-callable so SG is legal. */
+        cpu.sau_rbar[0] = ARM_FLASH_BASE & ~0x1fu;
+        cpu.sau_rlar[0] = ((ARM_FLASH_BASE + 0x1FFFF) & ~0x1fu)
+                          | ARM_SAU_RLAR_ENABLE | ARM_SAU_RLAR_NSC;
+        cpu.reg[ARM_SP] = 0x20010000;   /* active NS MSP */
+        cpu.msp_s = 0x30010000;         /* banked Secure MSP */
+
+        /* SG = 0xE97FE97F. */
+        write_thumb32(&cpu, CODE_BASE, 0xE97F, 0xE97F);
+        cpu.reg[ARM_PC] = CODE_BASE;
+        cpu.reg[ARM_LR] = 0x00000201;   /* bit0 set; SG must clear it */
+        arm_step(&cpu, 1);
+
+        assert_true("SG: now Secure", cpu.secure);
+        assert_eq("SG: LR bit0 cleared", 0x00000200, cpu.reg[ARM_LR]);
+        assert_eq("SG: PC advanced past 32-bit insn", CODE_BASE + 4,
+                  cpu.reg[ARM_PC]);
+        assert_eq("SG: active SP swapped to Secure bank", 0x30010000,
+                  cpu.reg[ARM_SP]);
+        assert_eq("SG: NS MSP preserved in bank", 0x20010000, cpu.msp_ns);
+
+        /* SG from Non-secure but NOT an NSC region is a NOP (no switch). */
+        arm_cpu_t cpu2;
+        setup_arm(&cpu2);
+        cpu2.tz_enabled = true;
+        cpu2.secure = false;
+        cpu2.sau_sregions = 8;          /* SAU disabled => flash is Secure, not NSC */
+        write_thumb32(&cpu2, CODE_BASE, 0xE97F, 0xE97F);
+        cpu2.reg[ARM_PC] = CODE_BASE;
+        arm_step(&cpu2, 1);
+        assert_true("SG from non-NSC: stays Non-secure", !cpu2.secure);
+    }
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -2039,6 +2110,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_sau_mmio();
     test_trustzone_enforcement();
     test_trustzone_tt();
+    test_trustzone_transitions();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;
