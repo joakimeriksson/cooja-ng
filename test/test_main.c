@@ -25,6 +25,28 @@
 #include <stdlib.h>
 
 #include "csim_version.h"
+#include "arm_cpu.h"
+#include "arm_platform.h"
+#include "arm_elf.h"
+
+/* TrustZone split-image boot (tz-boot mode): capture UART and flag the
+ * secure->non-secure handoff and the SG-veneer round-trip. */
+static int tz_boot_saw_ns = 0;      /* "Non-secure world" printed */
+static int tz_boot_saw_secret = 0;  /* "sec ret" printed (SG round-trip) */
+static char tz_boot_line[256];
+static int tz_boot_linepos = 0;
+static void tz_boot_tx(void *user_data, uint8_t byte) {
+    (void)user_data;
+    if (byte == '\n' || tz_boot_linepos == sizeof(tz_boot_line) - 1) {
+        tz_boot_line[tz_boot_linepos] = '\0';
+        if (tz_boot_linepos > 0) printf("  FW: %s\n", tz_boot_line);
+        if (strstr(tz_boot_line, "Non-secure world")) tz_boot_saw_ns = 1;
+        if (strstr(tz_boot_line, "sec ret"))          tz_boot_saw_secret = 1;
+        tz_boot_linepos = 0;
+    } else if (byte != '\r') {
+        tz_boot_line[tz_boot_linepos++] = (char)byte;
+    }
+}
 
 /* MSP430 test functions */
 extern int run_correctness_tests(int verbose);
@@ -218,6 +240,59 @@ int main(int argc, char **argv) {
         } else {
             failures += run_mixed_multinode_test(extra_argc, extra_argv);
         }
+    }
+
+    /* TrustZone-M split-image boot: load a secure + a normal-world ELF into
+     * one nRF54L15 node and run, watching for the secure->non-secure handoff
+     * and the SG-veneer round-trip.
+     *   tz-boot <secure.nrf> <normal.nrf> [max_instrs] */
+    if (strcmp(mode, "tz-boot") == 0) {
+        if (argc < 4) {
+            printf("Usage: test_runner tz-boot <secure.elf> <normal.elf> [max_instrs]\n");
+            return 1;
+        }
+        long max_instrs = (argc >= 5) ? strtol(argv[4], NULL, 0) : 20000000;
+
+        const arm_platform_config_t *pcfg = arm_platform_find("nrf54l15-dk");
+        arm_platform_t plat;
+        arm_platform_init(&plat, pcfg);
+
+        if (arm_load_elf(&plat.cpu, argv[2]) != 0) {
+            printf("  FAIL: cannot load secure image %s\n", argv[2]);
+            return 1;
+        }
+        if (arm_load_elf(&plat.cpu, argv[3]) != 0) {
+            printf("  FAIL: cannot load normal-world image %s\n", argv[3]);
+            return 1;
+        }
+        printf("  Loaded secure=%s normal=%s; TZ=%d\n", argv[2], argv[3],
+               arm_cpu_has_trustzone(&plat.cpu));
+
+        arm_platform_set_console(&plat, tz_boot_tx, NULL);
+        arm_cpu_reset(&plat.cpu);
+        arm_step(&plat.cpu, (int)max_instrs);
+
+        printf("\n  --- TrustZone transition counters ---\n");
+        printf("  SG entries (NS->S):       %llu\n",
+               (unsigned long long)plat.cpu.tz_sg_count);
+        printf("  BXNS returns (S->NS):     %llu\n",
+               (unsigned long long)plat.cpu.tz_bxns_count);
+        printf("  secure exceptions:        %llu\n",
+               (unsigned long long)plat.cpu.tz_secexc_count);
+        printf("  final state: %s, PC=0x%08x\n",
+               arm_cpu_is_secure(&plat.cpu) ? "Secure" : "Non-secure",
+               plat.cpu.reg[15]);
+        /* Success = the secure world handed off to Non-secure (banner) AND
+         * real world transitions were exercised. ("sec ret" is behind
+         * #if TEST_SECURE_FAULT in the example and off by default.) */
+        int ok = tz_boot_saw_ns && !arm_cpu_is_secure(&plat.cpu) &&
+                 (plat.cpu.tz_sg_count > 0 || plat.cpu.tz_bxns_count > 0);
+        (void)tz_boot_saw_secret;
+        printf("  %s: NS handoff=%d, transitions=%llu\n",
+               ok ? "PASS" : "INCOMPLETE", tz_boot_saw_ns,
+               (unsigned long long)(plat.cpu.tz_sg_count + plat.cpu.tz_bxns_count));
+        arm_platform_destroy(&plat);
+        return ok ? 0 : 1;
     }
 
     /* Nordic nRF54L15 Development Kit (PCA10156) multinode wrapper. */

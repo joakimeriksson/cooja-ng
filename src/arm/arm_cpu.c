@@ -578,6 +578,24 @@ static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
     arm_tz_load_sp_bank(cpu, to_secure);
 }
 
+/* ARMv8-M FNC_RETURN (0xFExxxxxx): return from a Non-secure callee to the
+ * Secure caller that invoked it via BLXNS. Restore Secure state (and its
+ * stack), then pop the return address + integrity signature BLXNS pushed. A
+ * corrupted signature raises a SecureFault (INVIS). */
+static void arm_fnc_return(arm_cpu_t *cpu, uint32_t magic) {
+    (void)magic;
+    arm_switch_security_state(cpu, true);
+    uint32_t sp = cpu->reg[ARM_SP];
+    uint32_t ret = arm_read32(cpu, sp + 0);
+    uint32_t sig = arm_read32(cpu, sp + 4);
+    if (sig != 0xFEFA125Au) {
+        cpu->sfsr |= ARM_SFSR_INVIS;
+        cpu->secure_fault_pending = true;
+    }
+    cpu->reg[ARM_SP] = sp + 8;
+    cpu->reg[ARM_PC] = ret & ~1u;
+}
+
 /* Exception entry/return tracer (ARM_EXC_TRACE=1).  Behaviour-neutral; the
  * key scope for context-switch (PendSV) and ISR-dispatch bring-up. */
 static void arm_exc_trace(const char *what, uint32_t a, uint32_t b, uint32_t c) {
@@ -1637,12 +1655,27 @@ int arm_step(arm_cpu_t *cpu, int count) {
                          * plain BX/BLX. */
                         bool ns_variant = (hw1 & (1 << 2)) && cpu->tz_enabled
                                           && cpu->secure;
-                        if (ns_variant && !link) {
-                            /* BXNS Rm: branch, switching to Non-secure iff the
-                             * target's bit[0] is 0 (SG clears it on entry). */
-                            uint32_t target = m_val;
-                            if ((target & 0xF0000000) == 0xF0000000) {
-                                /* FNC_RETURN / EXC_RETURN — Step 4 refines. */
+                        uint32_t target = m_val;
+                        if (ns_variant && link) {
+                            /* BLXNS Rm: Secure -> Non-secure call. Save the
+                             * secure return address + integrity signature on
+                             * the Secure stack, set LR = FNC_RETURN, switch to
+                             * Non-secure, and branch. */
+                            uint32_t ret = cpu->reg[ARM_PC] | 1u;
+                            uint32_t sp = cpu->reg[ARM_SP] - 8;
+                            arm_write32(cpu, sp + 0, ret);
+                            arm_write32(cpu, sp + 4, 0xFEFA125Au);
+                            cpu->reg[ARM_SP] = sp;
+                            cpu->reg[ARM_LR] = 0xFEFFFFFFu;   /* FNC_RETURN */
+                            arm_switch_security_state(cpu, false);
+                            cpu->tz_bxns_count++;
+                            cpu->reg[ARM_PC] = target & ~1u;
+                        } else if (ns_variant && !link) {
+                            /* BXNS Rm: FNC_RETURN / EXC_RETURN, else branch
+                             * switching to Non-secure iff target bit[0] == 0. */
+                            if ((target & 0xFF000000u) == 0xFE000000u) {
+                                arm_fnc_return(cpu, target);
+                            } else if ((target & 0xFF000000u) == 0xFF000000u) {
                                 exception_return(cpu, target);
                             } else {
                                 if ((target & 1) == 0) {
@@ -1652,14 +1685,18 @@ int arm_step(arm_cpu_t *cpu, int count) {
                                 cpu->reg[ARM_PC] = target & ~1u;
                             }
                         } else if (link) {
-                            /* BLX Rm (BLXNS stacking deferred to Step 4). */
+                            /* BLX Rm */
                             cpu->reg[ARM_LR] = (cpu->reg[ARM_PC]) | 1;
-                            arm_sp_audit_push(cpu, cpu->reg[ARM_PC], m_val);
-                            cpu->reg[ARM_PC] = m_val & ~1u;
+                            arm_sp_audit_push(cpu, cpu->reg[ARM_PC], target);
+                            cpu->reg[ARM_PC] = target & ~1u;
                         } else {
-                            /* BX Rm */
-                            uint32_t target = m_val;
-                            if ((target & 0xF0000000) == 0xF0000000) {
+                            /* BX Rm: a Non-secure FNC_RETURN returns to the
+                             * Secure caller (BLXNS partner); otherwise it is a
+                             * normal branch or an exception return. */
+                            if (cpu->tz_enabled && !cpu->secure &&
+                                (target & 0xFF000000u) == 0xFE000000u) {
+                                arm_fnc_return(cpu, target);
+                            } else if ((target & 0xF0000000) == 0xF0000000) {
                                 exception_return(cpu, target);
                             } else {
                                 cpu->reg[ARM_PC] = target & ~1u;
