@@ -2095,16 +2095,21 @@ int arm_step(arm_cpu_t *cpu, int count) {
             int op2_5 = (hw1 >> 4) & 0x7F;
             int op_hw2 = (hw2 >> 15) & 1;
 
-            /* ARMv8-M SG — Secure Gateway (0xE97FE97F). When executed from a
-             * Non-secure-callable region while Non-secure, it switches to
-             * Secure and clears LR[0] so the paired BXNS returns to NS.
-             * Elsewhere (already Secure, or not from NSC) it is a NOP. */
+            /* ARMv8-M SG — Secure Gateway (0xE97FE97F). From Non-secure state:
+             * if fetched from a Non-secure-callable region it switches to
+             * Secure and clears LR[0] so the paired BXNS returns to NS; if
+             * fetched from a non-NSC region it is an invalid entry point and
+             * raises a SecureFault (INVEP). In Secure state it is a NOP. */
             if (cpu->tz_enabled && insn32 == 0xE97FE97Fu) {
-                if (!cpu->secure &&
-                    arm_security_attr(cpu, pc) == ARM_SEC_NSC) {
-                    arm_switch_security_state(cpu, true);
-                    cpu->reg[ARM_LR] &= ~1u;
-                    cpu->tz_sg_count++;
+                if (!cpu->secure) {
+                    if (arm_security_attr(cpu, pc) == ARM_SEC_NSC) {
+                        arm_switch_security_state(cpu, true);
+                        cpu->reg[ARM_LR] &= ~1u;
+                        cpu->tz_sg_count++;
+                    } else {
+                        cpu->sfsr |= ARM_SFSR_INVEP;
+                        cpu->secure_fault_pending = true;
+                    }
                 }
                 goto insn_done;
             }

@@ -2078,8 +2078,10 @@ static void test_trustzone_transitions(void) {
         write_thumb32(&cpu2, CODE_BASE, 0xE97F, 0xE97F);
         cpu2.reg[ARM_PC] = CODE_BASE;
         arm_step(&cpu2, 1);
-        assert_true("SG from non-NSC: stays Non-secure", !cpu2.secure);
-        assert_eq("SG NOP: no transition counted", 0, (int)cpu2.tz_sg_count);
+        assert_eq("SG from non-NSC: no NS->S transition", 0,
+                  (int)cpu2.tz_sg_count);
+        assert_true("SG from non-NSC: SFSR.INVEP recorded",
+                    (cpu2.sfsr & ARM_SFSR_INVEP) != 0);
     }
 }
 
