@@ -500,6 +500,8 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->sfsr = 0;
     cpu->sfar = 0;
     cpu->secure_fault_pending = false;
+    cpu->exc_crossed_domain = false;
+    cpu->exc_bg_secure = false;
 }
 
 void arm_stop(arm_cpu_t *cpu) {
@@ -583,6 +585,15 @@ static void arm_exc_trace(const char *what, uint32_t a, uint32_t b, uint32_t c) 
 }
 
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
+    /* ARMv8-M: an exception may target Secure or Non-secure. The background
+     * frame is stacked on the CURRENT (background) stack; then, if the handler
+     * runs in the other security state, we bank across. SecureFault always
+     * targets Secure; other exceptions keep the current domain until NVIC
+     * target-security banking (Step 5). Entirely gated on tz_enabled. */
+    bool tz_bg_secure = cpu->secure;
+    bool target_secure = cpu->tz_enabled &&
+        (exception_num == EXC_SECUREFAULT ? true : cpu->secure);
+
     /* Push exception frame on the ACTIVE stack (PSP or MSP). */
     bool from_psp = arm_sp_is_psp(cpu);
     uint32_t sp = cpu->reg[ARM_SP];
@@ -628,11 +639,25 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
         cpu->reg[ARM_LR] = 0xFFFFFFF9; /* Return to Thread using MSP */
     }
 
-    /* Load vector */
-    uint32_t vector = arm_read32(cpu, cpu->vtor + exception_num * 4);
-    cpu->reg[ARM_PC] = vector & ~1u;
+    /* Enter Handler mode (set IPSR) before any security banking, so SP
+     * selection correctly resolves to MSP. */
     cpu->xpsr = (cpu->xpsr & ~0x1FFu) | (exception_num & 0x1FF);
     cpu->xpsr |= (1u << 24); /* Thumb bit */
+
+    /* ARMv8-M: if the handler runs in the other security state, bank across
+     * (the frame was stacked on the background stack above) and fetch from
+     * that state's vector table. Record the background state for return. */
+    cpu->exc_crossed_domain = false;
+    cpu->exc_bg_secure = tz_bg_secure;
+    if (cpu->tz_enabled && target_secure != tz_bg_secure) {
+        arm_switch_security_state(cpu, target_secure);
+        cpu->exc_crossed_domain = true;
+    }
+    uint32_t vtor = (cpu->tz_enabled && target_secure) ? cpu->vtor_s : cpu->vtor;
+
+    /* Load vector */
+    uint32_t vector = arm_read32(cpu, vtor + exception_num * 4);
+    cpu->reg[ARM_PC] = vector & ~1u;
 
     cpu->cpu_off = false; /* Wake from WFI */
     cpu->cycles += 12; /* Exception entry latency */
@@ -645,6 +670,14 @@ void arm_check_pending_exceptions(arm_cpu_t *cpu) {
 }
 
 static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
+    /* ARMv8-M: return to the background security state first, as the frame
+     * lives on that state's stack. Must precede the MSP sync below so the
+     * active SP is the background frame's, not the handler's. */
+    if (cpu->tz_enabled && cpu->exc_crossed_domain) {
+        arm_switch_security_state(cpu, cpu->exc_bg_secure);
+        cpu->exc_crossed_domain = false;
+    }
+
     /* The handler ran on MSP — sync the bank before re-banking. */
     cpu->msp = cpu->reg[ARM_SP];
 
@@ -3137,6 +3170,14 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         cpu->instructions++;
         remaining--;
+
+        /* ARMv8-M: take a recorded SecureFault (Step 2/4). It is the
+         * highest-priority configurable fault; escalation to secure HardFault
+         * when masked is not modelled. Gated on tz_enabled. */
+        if (cpu->tz_enabled && cpu->secure_fault_pending) {
+            cpu->secure_fault_pending = false;
+            arm_exception_entry(cpu, EXC_SECUREFAULT);
+        }
 
         /* Service any IRQ that became pending mid-instruction.  Peripherals
          * (radio, timer, etc.) call arm_nvic_set_pending → check_pending,

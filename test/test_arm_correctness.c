@@ -2082,6 +2082,46 @@ static void test_trustzone_transitions(void) {
     }
 }
 
+/* Step 4: a Non-secure illegal access faults, the SecureFault is taken into
+ * the Secure handler (via VTOR_S), and exception-return restores Non-secure. */
+static void test_trustzone_secure_exception(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SecureFault exception tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = false;               /* Non-secure background */
+    cpu.use_psp = false;
+    cpu.sau_sregions = 8;
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    /* Mark all of SRAM Non-secure; flash stays Secure. */
+    cpu.sau_rbar[0] = 0x20000000;
+    cpu.sau_rlar[0] = (0x20007FFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+
+    /* Secure vector table at flash base; SecureFault (exc 7) handler. */
+    cpu.vtor_s = ARM_FLASH_BASE;
+    write_flash32(&cpu, ARM_FLASH_BASE + 7 * 4, (CODE_BASE + 0x40) | 1);
+    write_thumb16(&cpu, CODE_BASE + 0x40, 0x4770);   /* BX LR at handler */
+
+    /* Non-secure code: LDR r0, [r1] where r1 points at Secure memory. */
+    write_thumb16(&cpu, CODE_BASE, 0x6808);          /* LDR r0, [r1, #0] */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[1] = 0x00001000;          /* Secure address */
+    cpu.reg[ARM_SP] = 0x20007F00;     /* NS stack (in SRAM) */
+    cpu.msp_s = 0x20007000;           /* Secure stack */
+
+    arm_step(&cpu, 1);   /* executes LDR, records + takes SecureFault */
+    assert_true("SecureFault taken: now Secure", cpu.secure);
+    assert_eq("SecureFault: PC = secure handler", CODE_BASE + 0x40,
+              cpu.reg[ARM_PC]);
+    assert_true("SecureFault: SFSR.AUVIOL set", (cpu.sfsr & ARM_SFSR_AUVIOL) != 0);
+    assert_eq("SecureFault: SFAR = faulting address", 0x00001000, cpu.sfar);
+
+    arm_step(&cpu, 1);   /* BX LR — exception return */
+    assert_true("SecureFault return: back to Non-secure", !cpu.secure);
+    assert_eq("SecureFault return: PC = instr after LDR", CODE_BASE + 2,
+              cpu.reg[ARM_PC]);
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -2111,6 +2151,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_enforcement();
     test_trustzone_tt();
     test_trustzone_transitions();
+    test_trustzone_secure_exception();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

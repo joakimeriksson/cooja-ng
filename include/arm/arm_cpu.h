@@ -224,6 +224,12 @@ typedef struct arm_cpu {
     uint32_t  sfar;                  /* SecureFault Address Register */
     bool      secure_fault_pending;  /* a SecureFault has been recorded */
 
+    /* Secure exception model (Step 4). When a secure exception is taken from
+     * Non-secure background, the background security state is stashed here and
+     * restored on exception return. (Single-level; nesting is a refinement.) */
+    bool      exc_crossed_domain;    /* current exception switched security */
+    bool      exc_bg_secure;         /* background security state to restore */
+
     /* ROM utility traps */
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
     uint32_t  rom_util_memset;    /* Address of rom_util_memset entry */
