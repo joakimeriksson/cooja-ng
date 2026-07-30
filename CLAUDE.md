@@ -29,7 +29,8 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
 
 # ARM Cortex-M3/M4 tests
-./build/test_runner arm-correctness -v   # 153 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33)
+./build/test_runner arm-correctness -v   # 224 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33),
+                                         # of which 71 are ARMv8-M TrustZone-M
 ./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
@@ -60,6 +61,17 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # to watch LED0 (P2.9, 1 Hz, RISC-V) + LED1 (P1.10, 2 Hz, M33) blink in the browser.
 # CSIM_GPIO_TRACE=1 dumps timestamped GPIO OUT changes.
 ./build/test_runner mixed-multinode firmware/nrf54l15-dk/flpr-host.nrf54l15-dk -t 4000
+
+# nRF54L15 TrustZone-M (ARMv8-M security extension). Loads a secure + a
+# normal-world ELF into ONE node, runs the secure world's SAU/IDAU + NS setup,
+# and watches for the handoff banner ("Non-secure world") plus the SG-veneer
+# round-trip; prints per-node SG / BXNS / secure-exception counters at the end.
+# The split images are NOT in this tree — build them from the contiki-ng-nrf54l15
+# checkout (branch trustzone-port-v2), so this is a manual harness, not a gate.
+TZ=~/work/contiki-ng-nrf54l15/examples/platform-specific/nrf/trustzone
+./build/test_runner tz-boot \
+    $TZ/secure-world/build/nrf/nrf54l15/dk/secure-world-example.nrf \
+    $TZ/normal-world/build/nrf/nrf54l15/dk/normal-world-example.nrf
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
@@ -187,10 +199,11 @@ scheduling policy is the one documented deferral. **The staged refactor
 
 | File | Purpose |
 |------|---------|
-| `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until |
+| `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until. On ARMv8-M also the **TrustZone-M** security state: banked SP/CONTROL, SG/BXNS/BLXNS/FNC_RETURN, TT/TTT/TTA/TTAT, secure exception entry/return with the integrity signature, and per-node transition counters |
+| `arm_trustzone.c` | **TrustZone-M attribution engine** (ARMv8-M security extension): SAU regions + SPU-as-IDAU, `arm_security_attr()`, memory-mapped SAU registers at `0xE000EDD0` (Secure-only, RAZ/WI from Non-secure), and `arm_tz_blocks()` hot-path access enforcement feeding SecureFault/SFSR. Gated per MCU by `has_trustzone` (nRF54L15 only) |
 | `arm_config.c` | MCU configurations: CC2538 (512KB flash, 32KB SRAM, 32MHz) |
 | `arm_elf.c` | ELF loader: loads sections into flash/SRAM, symbol lookup |
-| `arm_nvic.c` | NVIC: interrupt priority, pending/enable registers, exception entry/return |
+| `arm_nvic.c` | NVIC: interrupt priority, pending/enable registers, exception entry/return, ARMv8-M target-security banking (`NVIC_ITNS`) |
 | `arm_systick.c` | SysTick timer: periodic tick generation via event queue |
 | `arm_platform.c` | Platform bundles: CPU + all CC2538 peripherals |
 | `cc2538_uart.c` | UART: TX callback, status registers (TXFF/TXFE) |
@@ -340,7 +353,7 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **zoul-firefly** | CC2538 (ARM Cortex-M3) | Yes (on-chip) + CC1200 (off-SoC sub-GHz) | UART0 | Zolertia Firefly — dual-band |
 | **nrf52840-dongle** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10059 USB Dongle, M4F + FPv4-SP-D16, VTOR=0x1000 (Open Bootloader region at 0x0..0xfff) |
 | **nrf52840-dk** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10056 Development Kit, same SoC as Dongle, VTOR=0x0, SEGGER VCP console |
-| **nrf54l15-dk** | nRF54L15 (ARM Cortex-M33, ARMv8-M) | Yes (on-chip 2.4 GHz) | UARTE20 | Nordic nRF54L15-DK, 256 KB RAM, GRTC/DPPI fabric, VTOR=0x0 |
+| **nrf54l15-dk** | nRF54L15 (ARM Cortex-M33, ARMv8-M) | Yes (on-chip 2.4 GHz) | UARTE20 | Nordic nRF54L15-DK, 256 KB RAM, GRTC/DPPI fabric, VTOR=0x0. **The only platform with the ARMv8-M security extension (TrustZone-M) enabled** (`has_trustzone`) — see [`docs/design/trustzone-m-plan.md`](docs/design/trustzone-m-plan.md) |
 | **nrf54l15-dk + FLPR** | nRF54L15 **FLPR (RV32EMC, RISC-V)** coprocessor | — (uses the M33's radio) | shared SRAM | **Dual-core / cross-ISA**: the M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register; the RV32EMC core (`hello-vpr`) then runs **unmodified Contiki-NG** alongside the M33. ISA `rv32emc_zicsr_zifencei` (M + C). See [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md) |
 
 ## MCU Configurations

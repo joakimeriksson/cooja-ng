@@ -44,7 +44,7 @@ make
 
 # Unit tests (~5 seconds)
 ./build/test_runner correctness         # 83 MSP430 instruction tests
-./build/test_runner arm-correctness     # 153 ARM Cortex-M3/M4F/M33 tests
+./build/test_runner arm-correctness     # 224 ARM Cortex-M3/M4F/M33 tests (71 TrustZone-M)
 ./build/test_runner cc1200-mock-host    # 73 CC1200 chip-driver tests
 ./build/test_runner radio-medium        # 241 radio-medium routing tests
 
@@ -99,6 +99,7 @@ Per-board details live in [`devices/`](devices/) and the SoC source files under 
 - **TI CC1200** (off-SoC) — event-driven SPI peripheral, register-level fidelity, IOCFG-driven GPIO events, full software auto-ACK, 73-test mock-host suite.
 - **Nordic nRF52840** — CLOCK/HFCLK/LFCLK (+ STAT/SRC status regs), RTC0/RTC1, TIMER0–4, GPIO/GPIOTE, PPI, RNG, NVMC, FICR (per-node DEVICEID), UART (legacy + UARTE EasyDMA), and a full 802.15.4 RADIO (PACKETPTR EasyDMA, SHORTS, INTENSET, BCMATCH, hardware-style auto-ACK).  **Also boots stock Zephyr OS and RIOT OS** (experimental / best-effort; Contiki-NG is the primary, fully-validated target) — an unmodified `nrf52840dk` `hello_world` prints over the default UARTE console, stock Zephyr `echo_server`/`echo_client` exchange UDP over 802.15.4, and two RIOT `gnrc_networking` nodes form an RPL DODAG; see [`docs/zephyr.md`](docs/zephyr.md) and [`docs/riot.md`](docs/riot.md).
 - **Nordic nRF54L15** — Cortex-M33 family with GRTC (1 MHz syscounter, RELATIVE_COMPARE + RELATIVE_SYSCOUNTER), DPPI (32-channel publish/subscribe), EGU (software-event bridge to NVIC), TIMER10/20–24, per-node FICR.DEVICEID, UARTE20 EasyDMA, GPIO P0/P1/P2, and an 802.15.4 RADIO with deferred PHYEND so the driver's NVIC-disabling critical section exits before the IRQ fires.  2-node and **multi-hop (3+ node) RPL-UDP chains** both route end-to-end (`configs/chain-3node-nrf54l15-dk.json`).
+- **Nordic nRF54L15 TrustZone-M (ARMv8-M security extension)** — the M33 runs *secure/non-secure partitioned* firmware, not just non-secure.  Implements SAU + SPU-as-IDAU attribution, banked SP/CONTROL, the transition instruction surface (`SG`, `BXNS`, `BLXNS`/`FNC_RETURN`, `TT`/`TTT`/`TTA`/`TTAT`), secure exception entry/return with the integrity signature, `SecureFault`/SFSR, and NVIC target-security banking (`NVIC_ITNS`) — plus **per-node world-transition counters** (SG / BXNS / secure exception), which is the point: transition cost becomes measurable network-wide.  csim boots the **real** Contiki-NG `trustzone/` split image — the secure world configures SAU/IDAU, validates the non-secure image, routes IRQs, and hands off to Non-secure; two different split apps pass, so the harness is app-independent.  71 dedicated tests in `arm-correctness`.  See [`docs/design/trustzone-m-plan.md`](docs/design/trustzone-m-plan.md).
 - **Nordic nRF54L15 FLPR (RISC-V / RV32EMC)** — the on-die **VPR coprocessor**, modelled as a second core (`src/riscv/`) that shares the M33's bus. The M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register (SPU SECATTR-gated, as on hardware); the RV32EMC core then runs **unmodified Contiki-NG** (`hello-vpr`) dual-core with the M33. Verified end-to-end: the M33 prints `[FLPR] tick N` (reaching `tick 80` by 60 s) and LED0 (P2.9, RISC-V) / LED1 (P1.10, M33) blink at 1 Hz / 2 Hz — visible live in the web UI. ISA `rv32emc_zicsr_zifencei` (base integer + M (mul/div/rem) + C (compressed) + CSR + `fence.i`). With interrupt-driven etimers both cores idle in `WFI` between events — ~714× real-time at 60 s (see [Performance](#performance)). Plan + register map: [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md).
 
 Shared 802.15.4 helpers live in [`include/common/ieee_802154.h`](include/common/ieee_802154.h) (PHY constants + CCITT-16 FCS used by all four radios) and [`include/arm/nrf_radio_common.h`](include/arm/nrf_radio_common.h) (one `nrf_radio_emit_ieee802154_frame()` for both nRF radios).
@@ -117,7 +118,7 @@ Shared 802.15.4 helpers live in [`include/common/ieee_802154.h`](include/common/
 
 ```sh
 ./build/test_runner correctness         # 83 MSP430 instruction tests
-./build/test_runner arm-correctness     # 153 ARM (Thumb-2 + M4 DSP + M4 VFP)
+./build/test_runner arm-correctness     # 224 ARM (Thumb-2 + M4 DSP + VFP + ARMv8-M TrustZone)
 ./build/test_runner timeline            # 76 radio-event serializer tests
 ./build/test_runner cc1200-mock-host    # 73 CC1200 chip-driver tests
 ./build/test_runner radio-medium        # 235 multi-channel routing tests

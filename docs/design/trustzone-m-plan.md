@@ -1,12 +1,22 @@
 # TrustZone-M on csim: ARMv8-M security extension for the Cortex-M33 (nRF54L15)
 
-**Status:** plan, not started (2026-07-18).
+**Status: COMPLETE (emulator track).** Plan written 2026-07-18, implemented
+through 2026-07-26, re-verified 2026-07-30 on branch `trustzone`. Per-step
+record under *Confirmed execution steps*; current measured numbers under
+*Verified result*. The remaining work is the hardware track (DK golden-vector
+capture) and deeper firmware exercise — both outside the core emulator.
+
 **Goal:** implement the ARMv8-M security extension (TrustZone-M) in csim's
 Cortex-M33 emulation so that csim runs *real* secure/non-secure partitioned
 Contiki-NG firmware on the emulated nRF54L15, and counts+timestamps **every**
 world transition (SG entry, BXNS/BLXNS, secure exception) per node,
-network-wide. Today `src/arm/arm_config.c` documents the extension as "added on
-demand"; the M33 runs **non-secure-only**.
+network-wide.
+
+**Achieved.** The M33 is no longer non-secure-only: `nrf54l15_config` sets
+`has_trustzone = true`, the security extension lives in
+`src/arm/arm_trustzone.c` (attribution engine) plus the state/transition work in
+`src/arm/arm_cpu.c` and `src/arm/arm_nvic.c`, and csim boots the real
+Contiki-NG `trustzone/` split image with per-node transition counters.
 
 This is the enabler for the SenSys "IsoPartition" study (TEE-partitioning cost
 in 6TiSCH): the P0–P3 partition schemes only become measurable once the cut
@@ -188,11 +198,64 @@ built `BOARD=nrf54l15/dk` so one binary runs on csim and the DK.
   `contiki-ng-nrf54l15` (`arch/cpu/arm/cortex-m/Makefile.cortex-m`: re-tag the
   attribute-less CMSE import lib; guarded `--no-warn-rwx-segments`).
 
-**PLAN COMPLETE.** All emulator steps done + tested (~40 TZ tests, ARM 214/214,
-non-TZ path byte-identical, all suites green), and the real split firmware boots
-in csim. Remaining is the HW track (DK golden-vector capture — the authoritative
-oracle) and deeper firmware exercise (radio/timer-driven rpl-udp, secure
-services), both outside the core emulator.
+**PLAN COMPLETE.** All emulator steps done and tested; the real split firmware
+boots in csim. Remaining is the HW track (DK golden-vector capture — the
+authoritative oracle) and deeper firmware exercise (radio/timer-driven rpl-udp,
+secure services), both outside the core emulator.
+
+## Verified result (re-measured 2026-07-30, branch `trustzone` @ `87c92b3`)
+
+Branch is based on `main` @ `de7e41c` (the `v0.1.0` release commit) and contains
+every commit on `main`.
+
+**Test suites** — `arm-correctness` is **224 / 224**, of which **71 are
+TrustZone** (`main` is 153, so the TZ work is +71):
+
+| TZ test group | Tests |
+|---|---|
+| SAU/IDAU attribution | 14 |
+| SAU memory-mapped registers | 9 |
+| Data-access enforcement | 9 |
+| TT / TTT / TTA / TTAT | 3 |
+| SG / BXNS transitions | 11 |
+| SecureFault exceptions | 6 |
+| NVIC target-security (`NVIC_ITNS`) | 6 |
+| Transition counters | 3 |
+| BLXNS / FNC_RETURN | 10 |
+| **Total** | **71** |
+
+**No regression on the non-TZ path**, with `has_trustzone = true` live on the
+same SoC the release regression-tests: `correctness` PASS, `radio-medium`
+241/241, `cc1200-mock-host` 73/73, and `configs/test-2node-nrf54l15-dk.json`
+**TEST PASSED** (60013 ms simulated — identical to `main`).
+
+**Real split firmware boots** via the `tz-boot` harness. The secure world
+initializes TrustZone, configures SAU/IDAU and the non-secure environment,
+validates the NS image permissions and reset vector, routes IRQs
+(`ITNS[7]=0x00000008`), and jumps to the non-secure reset handler:
+
+| Split image | SG (NS→S) | BXNS (S→NS) | Total | Result |
+|---|---|---|---|---|
+| `trustzone/{secure,normal}-world` (`nrf54l15/dk`) | 389 | 390 | **779** | reaches Non-secure, banner + `sec ret` round-trip |
+| `trustzone/rpl-udp` (`nrf54l15/xiao`) | 16 | 17 | **33** | reaches Non-secure, boots the RPL-UDP server |
+
+Both end in `Non-secure` state with 0 secure exceptions, so the harness pass is
+app-independent rather than tied to one image. (The earlier "9 transitions
+(4 SG + 5 BXNS)" figure in Step 8 above was measured at that step, before the
+`tzbench` workload ran on; it is kept as the step's historical record.)
+
+Reproduce with:
+
+```sh
+TZ=~/work/contiki-ng-nrf54l15/examples/platform-specific/nrf/trustzone
+./build/test_runner tz-boot \
+    $TZ/secure-world/build/nrf/nrf54l15/dk/secure-world-example.nrf \
+    $TZ/normal-world/build/nrf/nrf54l15/dk/normal-world-example.nrf
+```
+
+The split images are **not** in the csim tree — they are built from the
+`contiki-ng-nrf54l15` checkout (branch `trustzone-port-v2`), so `tz-boot` is a
+manual harness rather than part of the default gate.
 
 Parallel HW track (non-blocking): DK capture toolchain (JLink/GDB + DWT `CYCCNT`
 + semihosting) on the current non-TZ nRF54L15 first, then per-primitive golden
