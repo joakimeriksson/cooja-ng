@@ -51,6 +51,12 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner test configs/test-tsch-cc2538dk.json      # ~240s sim
 ./build/test_runner test configs/test-tsch-nrf52840-dk.json   # ~25s sim
 
+# cc2538 TSCH with LPM enabled — fix-sensitive regression for the CC2538
+# SYS_CTRL clock bugs (CLOCK_CTRL.OSC switch + RCOSC downshift). The firmware
+# actually enters PM1/2, so it exercises the OSC-switch path that the plain
+# test-tsch-cc2538dk.json firmware never touches. Leaf prints "[LEAF] reachable".
+./build/test_runner test configs/test-tsch-lpm-cc2538dk.json  # ~60s sim
+
 # Stock Zephyr 802.15.4 (echo_server/echo_client, only the sample's overlay-802154.conf).
 # Two-node UDP echo over 802.15.4/6LoWPAN/IPv6/RPL; server logs "Received and replied", 0 timeouts.
 ./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/zephyr-echo-server.nrf52840-dk firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000

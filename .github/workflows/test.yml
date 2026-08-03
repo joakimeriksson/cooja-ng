@@ -69,6 +69,14 @@ jobs:
         # the cc2538dk RPL-UDP pair must converge with the staggered start.
         run: ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 30000 -d 100 -q
 
+      - name: cc2538dk TSCH with LPM (RCOSC clock-downshift regression, 60s sim)
+        # Fix-sensitive guard for the cc2538 SYS_CTRL clock bugs: this firmware
+        # actually enters PM1/2, so it exercises the CLOCK_CTRL.OSC switch path
+        # (unlike test-tsch-cc2538dk.json, whose firmware never lowers the
+        # oscillator). On unfixed main the leaf wedges / desyncs and never joins;
+        # with the cc2538_sys_ctrl fix it prints "[LEAF] reachable" (~33s sim).
+        run: ./build/test_runner test configs/test-tsch-lpm-cc2538dk.json
+
       - name: Zoul Firefly multinode (CC1200 nullnet, 20s sim)
         # The Firefly nullnet firmware sends a broadcast every 8 s, so
         # 20 s of sim is enough to verify the CC1200 RX path: each

@@ -1,0 +1,23 @@
+{
+    "title": "2-node cc2538dk TSCH with LPM enabled — RCOSC clock-downshift regression",
+    "timeout_ms": 60000,
+    "seed": 1,
+    "startup_delay_ms": 1000,
+    "radiomedium": {
+        "type": "udgm",
+        "tx_range": 50.0,
+        "interference_range": 100.0,
+        "success_ratio_tx": 1.0,
+        "success_ratio_rx": 1.0
+    },
+    "nodes": [
+        { "firmware": "firmware/cc2538dk/tsch-lpm-root.cc2538dk", "id": 1, "x":  0.0, "y": 0.0 },
+        { "firmware": "firmware/cc2538dk/tsch-lpm-leaf.cc2538dk", "id": 2, "x": 30.0, "y": 0.0 }
+    ],
+    "test": {
+        "description": "Two cc2538 nodes over TSCH with LPM enabled (node 1 = RPL root + TSCH coordinator, node 2 = leaf). Unlike the shipped test-tsch-cc2538dk.json — whose firmware never lowers the oscillator, so it is insensitive to the clock bug — this firmware actually enters PM1/2, which exercises the CLOCK_CTRL.OSC switch path. On unfixed main the firmware's oscillator-switch poll never terminates (the node wedges) and, once that is unblocked, the RCOSC downshift runs the leaf's TSCH slot code at half speed, producing a !dl-miss storm that desyncs it; either way the leaf never becomes reachable. With the cc2538_sys_ctrl clock fix the leaf joins the DAG and resolves the root. Pass criterion: the leaf prints '[LEAF] reachable' (~33 s simulated).",
+        "validators": [
+            { "pattern": "[LEAF] reachable", "node": 2, "min_count": 1 }
+        ]
+    }
+}
