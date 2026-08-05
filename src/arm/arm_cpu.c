@@ -996,13 +996,26 @@ int arm_step(arm_cpu_t *cpu, int count) {
         ? (uint16_t)(fl_mem[(a) - fl_base] | (fl_mem[(a) - fl_base + 1] << 8))\
         : fetch16(cpu, (a)))
 
+    /* Two more per-instruction obligations hoisted out of the loop, for the
+     * same reason as the flash window above: both are set once (gdb_stub by
+     * the GDB service at attach, the fw_* trap addresses by the ELF loader)
+     * and never change while a slice runs, but they live behind `cpu->` so
+     * the compiler must reload and re-test them on every instruction.
+     *
+     * MSP430's interpreter has neither obligation at all — it has no
+     * per-instruction GDB check and no ROM-trap dispatch — which is part of
+     * the measured ARM/MSP430 interpreter gap. */
+    gdb_stub_t *const gdb_stub = (gdb_stub_t *)cpu->gdb_stub;
+    const int fw_traps_armed = (cpu->fw_udivmoddi4 != 0) ||
+                               (cpu->fw_aeabi_uldivmod != 0);
+
     while (remaining > 0 && !cpu->stopping) {
         arm_trace_step(cpu);
         /* GDB stub: check breakpoint at current PC, then poll for halt
          * commands. If halted, stop the inner loop so the multinode
          * driver can pump the stub's command processor. */
-        if (cpu->gdb_stub) {
-            gdb_stub_t *g = (gdb_stub_t *)cpu->gdb_stub;
+        if (__builtin_expect(gdb_stub != NULL, 0)) {
+            gdb_stub_t *g = gdb_stub;
             uint32_t pc_check = cpu->reg[ARM_PC] & ~1u;
             if (gdb_stub_check_breakpoint(g, pc_check)) {
                 cpu->stopping = true;
@@ -1158,7 +1171,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
         }
 
         /* ROM utility traps */
-        if (handle_fw_trap(cpu)) {
+        if (__builtin_expect(fw_traps_armed, 0) && handle_fw_trap(cpu)) {
             cpu->instructions++;
             remaining--;
             continue;
