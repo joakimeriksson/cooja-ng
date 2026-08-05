@@ -973,6 +973,29 @@ static inline void arm_trace_step(arm_cpu_t *cpu) {
 int arm_step(arm_cpu_t *cpu, int count) {
     int remaining = count;
 
+    /* Hoist the flash window into locals for the whole slice.
+     *
+     * `flash`, `flash_base` and `flash_end` are set once in arm_cpu_init and
+     * never change afterwards, but the compiler cannot prove that: `flash` is
+     * a *pointer* member, so any store in the loop (mem_write, a peripheral
+     * callback, …) might alias it, forcing a reload of the pointer and both
+     * bounds on every single fetch.
+     *
+     * MSP430's interpreter has always done this — msp430_step_interpreter
+     * opens by caching `memory`/`max_mem` in locals — which is part of why it
+     * out-runs the ARM interpreter on the same host.
+     *
+     * FETCH16 keeps the flash fast path inline off these locals and falls back
+     * to the full fetch16() (ROM, SRAM, IO) for anything outside the window,
+     * so behaviour is unchanged: fetch16 checks flash first as well. */
+    const uint8_t *const fl_mem  = cpu->flash;
+    const uint32_t       fl_base = cpu->flash_base;
+    const uint32_t       fl_end  = cpu->flash_end;
+#define FETCH16(a)                                                          \
+    (__builtin_expect((a) >= fl_base && (a) < fl_end, 1)                     \
+        ? (uint16_t)(fl_mem[(a) - fl_base] | (fl_mem[(a) - fl_base + 1] << 8))\
+        : fetch16(cpu, (a)))
+
     while (remaining > 0 && !cpu->stopping) {
         arm_trace_step(cpu);
         /* GDB stub: check breakpoint at current PC, then poll for halt
@@ -1147,7 +1170,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
         }
 
         /* Fetch first halfword */
-        uint16_t hw1 = fetch16(cpu, pc);
+        uint16_t hw1 = FETCH16(pc);
         uint16_t top5 = hw1 >> 11;
 
         /* Periodic PC trace for debugging */
@@ -1931,7 +1954,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         t32_decode: {
             /* 32-bit Thumb-2 instruction */
-            uint16_t hw2 = fetch16(cpu, pc + 2);
+            uint16_t hw2 = FETCH16(pc + 2);
             cpu->reg[ARM_PC] = pc + 4;
             cpu->cycles += 1;
 
