@@ -11,11 +11,16 @@ else
   NATIVE_FLAG := -mcpu=native
 endif
 
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs $(NATIVE_FLAG) -flto -MMD -MP
+# PGO_FLAGS is empty for a normal build; `make pgo` re-invokes make with it set
+# (see the pgo target).  Threading it through CFLAGS/LDFLAGS rather than keeping
+# a second hand-copied flag string is deliberate: the old PGO_CFLAGS drifted out
+# of sync with CFLAGS and `make pgo` stopped compiling entirely.
+PGO_FLAGS =
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs $(NATIVE_FLAG) -flto -MMD -MP $(PGO_FLAGS)
 # -rdynamic exports the host's dynamic symbol table so a dlopen'd plugin can
 # resolve host library functions (e.g. the radio_medium accessors a medium
 # plugin uses).  Behavior-neutral (symbol visibility only).
-LDFLAGS = -lm -lpthread -flto -rdynamic
+LDFLAGS = -lm -lpthread -flto -rdynamic $(PGO_FLAGS)
 
 # Auto-detect GNU Lightning
 LIGHTNING_CFLAGS := $(shell pkg-config --cflags lightning 2>/dev/null)
@@ -252,7 +257,7 @@ $(LIB_BUILD_DIR)/%.o: $(LIB_SRC_DIR)/%.c | $(LIB_BUILD_DIR)
 
 # QuickJS needs relaxed warnings (upstream code)
 $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
-	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I lib/quickjs -DCONFIG_VERSION=\"2024-01-13\" -w -c $< -o $@
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I lib/quickjs -DCONFIG_VERSION=\"2024-01-13\" -w $(PGO_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -310,27 +315,63 @@ debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURC
 debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
-# Profile-guided optimization (Apple Clang)
-PGO_CFLAGS = -O3 -std=c11 -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I lib -I lib/quickjs $(NATIVE_FLAG)
-PGO_LDFLAGS = -lm -lpthread
-ifneq ($(LIGHTNING_LIBS),)
-  PGO_CFLAGS += $(LIGHTNING_CFLAGS) -DHAVE_LIGHTNING
-  PGO_LDFLAGS += $(LIGHTNING_LIBS)
+# ---------------------------------------------------------------------------
+# Profile-guided optimization
+#
+# Implemented as a *recursive* make so the PGO build reuses the same per-object
+# rules, include paths and defines as the normal build.  The previous version
+# hand-duplicated CFLAGS and the source list into PGO_CFLAGS; both drifted out
+# of sync with the real build (missing -I src/motes, -D_GNU_SOURCE, and the
+# whole src/{sim,services,motes} + quickjs source groups) until `make pgo` no
+# longer compiled at all.  Recursion makes that class of drift impossible.
+#
+# Works with both clang (-fprofile-instr-generate + llvm-profdata merge) and
+# gcc (-fprofile-generate, .gcda written beside each object).  Override the
+# profile tool if it is not on PATH:  make pgo PROFDATA=/path/to/llvm-profdata
+# ---------------------------------------------------------------------------
+CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -ci clang)
+ifeq ($(shell uname -s),Darwin)
+  PROFDATA ?= xcrun llvm-profdata
+else
+  PROFDATA ?= llvm-profdata
 endif
+
+# The training set.  The profile only describes paths these runs actually
+# execute; anything unexecuted is laid out as cold.  It used to be `bench` +
+# `correctness`, which are both MSP430-only — so every ARM hot path
+# (arm_step, t32_decode, condition_passed) was optimized blind.  ARM
+# instruction mix, ARM synthetic hot paths, and one real ARM firmware run are
+# included now; the firmware run supplies a realistic branch mix so the
+# profile does not overfit to the synthetic loops.
+PGO_TRAIN_ARM_FW = firmware/nrf52840-dk/zephyr-synchronization.nrf52840-dk
 
 pgo:
 	@echo "=== PGO Step 1: Instrumented build ==="
-	rm -rf $(BUILD_DIR)
-	mkdir -p $(BUILD_DIR)
-	$(CC) $(PGO_CFLAGS) -fprofile-instr-generate \
-		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(RISCV_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(PGO_LDFLAGS)
-	@echo "=== PGO Step 2: Collecting profile data ==="
-	LLVM_PROFILE_FILE="$(BUILD_DIR)/default.profraw" ./$(BUILD_DIR)/test_runner bench
-	LLVM_PROFILE_FILE="$(BUILD_DIR)/default.profraw" ./$(BUILD_DIR)/test_runner correctness
-	xcrun llvm-profdata merge -output=$(BUILD_DIR)/default.profdata $(BUILD_DIR)/default.profraw
-	@echo "=== PGO Step 3: Optimized build ==="
-	$(CC) $(CFLAGS) -fprofile-instr-use=$(BUILD_DIR)/default.profdata \
-		$(COMMON_SOURCES) $(SOURCES) $(ARM_SOURCES) $(RISCV_SOURCES) $(NATIVE_SOURCES) $(UI_SOURCES) $(LIB_SOURCES) $(TEST_SOURCES) -o $(BUILD_DIR)/test_runner $(LDFLAGS)
+	$(MAKE) clean
+ifeq ($(CC_IS_CLANG),0)
+	$(MAKE) PGO_FLAGS="-fprofile-generate"
+else
+	$(MAKE) PGO_FLAGS="-fprofile-instr-generate"
+endif
+	@echo "=== PGO Step 2: Collecting profile data (MSP430 + ARM) ==="
+	LLVM_PROFILE_FILE="$(BUILD_DIR)/msp-bench.profraw"  ./$(BUILD_DIR)/test_runner bench
+	LLVM_PROFILE_FILE="$(BUILD_DIR)/msp-corr.profraw"   ./$(BUILD_DIR)/test_runner correctness
+	LLVM_PROFILE_FILE="$(BUILD_DIR)/arm-corr.profraw"   ./$(BUILD_DIR)/test_runner arm-correctness
+	LLVM_PROFILE_FILE="$(BUILD_DIR)/arm-bench.profraw"  ./$(BUILD_DIR)/test_runner arm-bench
+	LLVM_PROFILE_FILE="$(BUILD_DIR)/arm-fw.profraw"     ./$(BUILD_DIR)/test_runner \
+		nrf52840-dk-multinode $(PGO_TRAIN_ARM_FW) -t 10000 -n 1 -q
+ifneq ($(CC_IS_CLANG),0)
+	$(PROFDATA) merge -output=$(BUILD_DIR)/default.profdata $(BUILD_DIR)/*.profraw
+endif
+	@echo "=== PGO Step 3: Optimized rebuild ==="
+	@# Keep the .profdata/.gcda; only the objects and binary are rebuilt.
+	rm -f $(BUILD_DIR)/test_runner
+	find $(BUILD_DIR) -name '*.o' -delete
+ifeq ($(CC_IS_CLANG),0)
+	$(MAKE) PGO_FLAGS="-fprofile-use -fprofile-correction -Wno-missing-profile"
+else
+	$(MAKE) PGO_FLAGS="-fprofile-instr-use=$(abspath $(BUILD_DIR))/default.profdata"
+endif
 	@echo "=== PGO build complete ==="
 
 # Phase 9: example plugin (.so).  Built on demand via `make plugins` — NOT a

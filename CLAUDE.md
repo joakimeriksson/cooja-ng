@@ -12,7 +12,15 @@ runtime extraction plan.
 ```sh
 make              # O3, LTO, auto-detects GNU Lightning for JIT
 make debug        # O0, -g, DEBUG flag
-make pgo          # Profile-guided optimization (~40% faster)
+make pgo          # Profile-guided optimization. Recursive make, so it reuses the
+                  # normal per-object rules (it can't drift out of sync with CFLAGS
+                  # again). Trains on MSP430 *and* ARM workloads — it was MSP430-only
+                  # before, so every ARM hot path was laid out blind. Works with
+                  # clang (llvm-profdata) and gcc (-fprofile-generate/use); override
+                  # the merge tool with `make pgo PROFDATA=/path/to/llvm-profdata`.
+                  # Measured on an *untrained* workload (chain-3node-nrf52840-dk):
+                  # ~1.55x on clang/arm64, ~1.18x on gcc/x86-64. arm-bench itself is
+                  # in the training set, so its 1.6-2.0x is an optimistic read.
 make clean        # Remove build/
 ```
 

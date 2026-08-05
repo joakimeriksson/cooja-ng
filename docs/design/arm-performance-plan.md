@@ -1,7 +1,8 @@
 # ARM Interpreter Performance Plan
 
-Status: **plan** (2026-08-01). Companion to [`refactor-plan.md`](refactor-plan.md)
-(§8 D5 overlaps Tier 0 here).
+Status: **in progress** (2026-08-01). §1 `arm-bench` and §3 Tier 1 (PGO) are
+**done and measured**; Tier 0, 2 and 3 are open. Companion to
+[`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0 here).
 
 **Why now.** ARM is the strategic platform — CC2538, nRF52840, nRF54L15,
 TrustZone-M, and the FLPR host all run on it — but it is the *only* emulated ISA
@@ -215,46 +216,93 @@ guard byte-identical (this touches the event pump, so that guard is mandatory).
 
 ---
 
-## 3. Tier 1 — repair PGO, and train it on ARM
+## 3. Tier 1 — repair PGO, and train it on ARM — **DONE**
 
-`CLAUDE.md` advertises `make pgo` as **"~40% faster"**. It does not compile:
+Landed. `make pgo` works again on both clang and gcc, trains on ARM as well as
+MSP430, and the measured gain is far larger than the claim it replaced.
+
+### 3.1 Measured result
+
+`arm-bench` medians of 3 runs; the **holdout** is wall-clock on
+`configs/chain-3node-nrf52840-dk.json` (240 s sim, ~152 M instructions), which
+is deliberately **not** in the training set.
+
+| | plain | PGO | speedup |
+|---|---|---|---|
+| **macOS / clang, Apple Silicon** | | | |
+| MSP430 `register-alu` | 392.9 | 640.0 MIPS | 1.63× |
+| MSP430 `branch-heavy` | 444.5 | 664.7 MIPS | 1.50× |
+| ARM `alu-reg` | 199.7 | 339.7 MIPS | 1.70× |
+| ARM `thumb2-dp` | 163.4 | 265.7 MIPS | 1.63× |
+| ARM `it-block` | 211.5 | 343.4 MIPS | 1.62× |
+| ARM `branch` | 202.5 | 347.9 MIPS | 1.72× |
+| ARM `mem-ldr-str` | 165.2 | 336.8 MIPS | 2.04× |
+| ARM `fw-zephyr-sync` | 195.4 | 330.2 MIPS | 1.69× |
+| ARM `fw-cc2538-udp` | 149.9 | 255.2 MIPS | 1.70× |
+| **holdout** (untrained) | 1.22 s | 0.79 s | **1.55×** |
+| **Linux / gcc, x86-64** | | | |
+| ARM `alu-reg` | 130.0 | 189.4 MIPS | 1.46× |
+| ARM `thumb2-dp` | 121.2 | 143.5 MIPS | 1.18× |
+| ARM `fw-zephyr-sync` | 141.4 | 185.7 MIPS | 1.31× |
+| **holdout** (untrained) | 1.58 s | 1.34 s | **1.18×** |
+
+**Read the holdout, not `arm-bench`.** `arm-bench` is *in* the training set, so
+its 1.6–2.0× is an optimistic upper bound — the compiler has seen exactly those
+loops. **1.55× (clang) / 1.18× (gcc) on untrained work is the honest number**,
+and it is still much better than the "~40%" the docs claimed. Correctness is
+unaffected: `correctness`, `arm-correctness` 153, `radio-medium` 241,
+`cc1200-mock-host` 73 all pass under PGO on both toolchains, with zero profile
+warnings from gcc.
+
+Note the clang/gcc gap is large and consistent. Not investigated; the plausible
+cause is that clang's PGO does more aggressive layout/inlining of the big
+computed-goto interpreter than gcc's. Worth a look if gcc becomes the primary
+distribution build — CI uses gcc on Linux.
+
+### 3.2 What was wrong, and what changed
+
+`CLAUDE.md` advertised `make pgo` as **"~40% faster"**. It did not compile:
 
 ```
 test/test_mixed_multinode.c:73:10: fatal error: 'mote_impl.h' file not found
 ```
 
-**Root cause: `PGO_CFLAGS` and the PGO source list are hand-duplicated copies of
-the real build that drifted.** They predate Phases 6–8, so relative to `CFLAGS`
-they are missing `-I src/motes`, `-D_GNU_SOURCE`, and four whole source groups
+**Root cause: `PGO_CFLAGS` and the PGO source list were hand-duplicated copies of
+the real build that drifted.** They predated Phases 6–8, so relative to `CFLAGS`
+they were missing `-I src/motes`, `-D_GNU_SOURCE`, and four whole source groups
 (`$(SIM_SOURCES)`, `$(SERVICES_SOURCES)`, `$(MOTES_SOURCES)`,
 `$(QUICKJS_SOURCES)`).
 
-**And even when it worked, it trained on the wrong thing:** the profile run is
+**And even when it worked, it trained on the wrong thing:** the profile run was
 `test_runner bench` + `test_runner correctness` — **both MSP430-only**. Every ARM
-hot path was laid out blind. The advertised 40% has never been measured for ARM.
+hot path was laid out blind, so the advertised 40% had never meant anything for
+ARM.
 
-Work:
+What changed:
 
-1. **Make drift impossible.** One `ALL_SOURCES` list shared by both the object
-   build and the PGO build; `PGO_CFLAGS = $(filter-out -flto -MMD -MP,$(CFLAGS))`
-   instead of a hand-copied flag string. QuickJS needs its private
-   `-DCONFIG_VERSION=...` `-w` (it has its own object rule today), so either
-   pass those in the single-command build or — cleaner — make `pgo` a **recursive
-   `make`** that reuses the normal per-object rules with added
-   `-fprofile-instr-{generate,use}`. The recursive form is preferred: it cannot
-   drift again by construction.
-2. **Train on ARM too:** add `arm-correctness` and a short
-   `nrf52840-dk-multinode zephyr-synchronization` run to the profile step, merging
-   all `.profraw` files.
-3. **Measure the real ARM delta** with `arm-bench` and correct the CLAUDE.md
-   claim to whatever it actually is, per ISA.
+1. **Drift made structurally impossible.** `pgo` is now a **recursive `make`**
+   that reuses the normal per-object rules, so there is no second copy of the
+   flags or the source list to fall out of sync. A single `PGO_FLAGS` variable
+   (empty for a normal build) is threaded through `CFLAGS`, `LDFLAGS` and the
+   QuickJS rule — which is why QuickJS's private `-DCONFIG_VERSION` / `-w` no
+   longer need duplicating. A single-command build cannot express that per-file
+   flag, which is what broke the first repair attempt.
+2. **gcc support.** The old target was clang-only
+   (`-fprofile-instr-generate` + `llvm-profdata merge`). It now detects the
+   compiler and uses `-fprofile-generate` / `-fprofile-use -fprofile-correction`
+   under gcc, where `.gcda` files are written beside the objects — so step 3
+   deletes only `*.o`, not the profile data. This matters because **CI builds
+   with gcc on Linux**.
+3. **Training set** (`PGO_TRAIN_*`): `bench` + `correctness` (MSP430, as before)
+   plus `arm-correctness` (ARM instruction mix), `arm-bench` (the five ARM hot
+   paths), and one real `nrf52840-dk-multinode zephyr-synchronization` firmware
+   run. The firmware run is what keeps the profile from overfitting to the
+   synthetic loops.
+4. `PROFDATA` is overridable (`make pgo PROFDATA=/path/to/llvm-profdata`) —
+   `xcrun` is not always usable, and it fails outright under a restricted
+   sandbox with `couldn't create cache file`.
 
-Note: `xcrun llvm-profdata` fails under a restricted sandbox
-(`couldn't create cache file`); use `llvm-profdata` directly, or document the
-requirement.
-
-Effort: **~1 day.** Confidence: high that it *builds*; **unknown** what it buys
-on ARM until measured — that is the point of the task.
+Cost: `make pgo` takes ~27 s (clang, Apple Silicon) / ~48 s (gcc -j2, x86-64).
 
 ---
 
@@ -343,7 +391,7 @@ Effort: **3–4 weeks.** Do not start it under release pressure.
 |---|---|---|---|
 | `arm-bench` | ½ day | — (enabler) | builds; numbers stable across 5 reps |
 | Tier 0 | ½ day | **measured ~8%** | arm-bench ≥5%; 153/153; determinism |
-| Tier 1 PGO | 1 day | build: high; gain: unknown | `make pgo` works; ARM delta measured |
+| ~~Tier 1 PGO~~ **DONE** | — | — | **1.55× clang / 1.18× gcc on an untrained workload**; suites green on both |
 | Tier 2 decode cache | ~1 week | high (in-tree precedent) | full gate + determinism byte-identical |
 | Tier 3 JIT | 3–4 weeks | medium | JIT_VERIFY clean over corpus + full gate |
 
@@ -355,8 +403,10 @@ Cooja suite (**93/93**), and `tools/check-determinism.sh`. Per
 forward**.
 
 **What this plan deliberately does not do:** chase the 311× idle-skip number as
-if it were engine speed, or quote `make pgo`'s "~40%" for ARM until someone has
-measured it. Both are currently in our docs and neither is supported for ARM.
+if it were engine speed — that measures event-queue policy, not the interpreter,
+and it stays labelled as such. (The companion offender, `make pgo`'s unmeasured
+"~40%", is now settled: §3.1 replaced it with per-toolchain numbers from an
+untrained holdout, and both `README.md` and `CLAUDE.md` were corrected.)
 
 ---
 
@@ -366,8 +416,11 @@ measured it. Both are currently in our docs and neither is supported for ARM.
 2. **x86-64 cross-check of the Renode comparison.** The 1.92× MIPS result is
    single-platform; Renode's arm64 .NET build may be less optimized than its
    primary target. jftest4 can settle it.
-3. **Is `make pgo` used by anyone?** If it is dead, deleting it is cheaper than
-   repairing it — but then the CLAUDE.md "~40% faster" claim must go too.
+3. ~~**Is `make pgo` used by anyone?**~~ **Resolved by repairing it.** It is
+   referenced only from `CLAUDE.md` and `README.md` (not from CI or any script),
+   but at 1.55× it is worth keeping and worth wiring into a release build. The
+   "~40% faster" claim has been replaced with the measured per-toolchain
+   numbers in both files.
 4. **Does any supported firmware actually write to flash at run time?** If not,
    Tier 2's invalidation can be a cheap assertion rather than a hot-path check —
    but it must still be *correct*, not merely absent.

@@ -63,7 +63,7 @@ make cooja-tests VERBOSE=1
 |---|---|
 | `make` | Default release build (`-O3 -flto`, native CPU tuning: `-march=native` on x86 / `-mcpu=native` on arm64), JIT auto-detected via pkg-config |
 | `make debug` | `-O0 -g -DDEBUG`, no LTO |
-| `make pgo` | Two-stage profile-guided optimization, ~40 % faster on hot loops |
+| `make pgo` | Two-stage profile-guided optimization — **~1.55× on clang / ~1.18× on gcc** (measured on an untrained workload; see [Performance](#performance)) |
 | `make clean` | Remove `build/` |
 
 Optional dependencies: **GNU Lightning** (MSP430 JIT, silent fallback if missing), **QuickJS / cJSON / cbor** (bundled under `lib/`), **Contiki-NG** (`csim.conf`, `CONTIKI_DIR` env, or `../contiki-ng`).  Runtime needs only libc/libm/libpthread, plus `iproute2` + `tunslip6` on Linux for the TUN tests.
