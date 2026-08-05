@@ -634,7 +634,13 @@ static inline void set_sub_flags(arm_cpu_t *cpu, uint32_t a, uint32_t b, uint64_
     if (((a ^ b) & (a ^ r32)) >> 31) cpu->xpsr |= APSR_V;
 }
 
-static inline int condition_passed(arm_cpu_t *cpu, int cond) {
+/* always_inline, not just inline: the compiler declines to inline this into
+ * arm_step (~3000 lines) at -O3, so it showed up as its own symbol at 10.5%
+ * of self time in a profile — every conditional instruction and every
+ * IT-block body paid a call.  Forcing it is worth ~8% on arm-bench.
+ * See docs/design/arm-performance-plan.md §0.1. */
+static inline __attribute__((always_inline))
+int condition_passed(arm_cpu_t *cpu, int cond) {
     uint32_t f = cpu->xpsr;
     int result;
     switch (cond >> 1) {

@@ -1,7 +1,8 @@
 # ARM Interpreter Performance Plan
 
-Status: **in progress** (2026-08-01). §1 `arm-bench` and §3 Tier 1 (PGO) are
-**done and measured**; Tier 0, 2 and 3 are open. Companion to
+Status: **in progress** (2026-08-05). §1 `arm-bench`, §2 Tier 0 and §3 Tier 1
+(PGO) are **done and measured**; Tier 2 (decode cache) and Tier 3 (JIT) are
+open. Companion to
 [`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0 here).
 
 **Why now.** ARM is the strategic platform — CC2538, nRF52840, nRF54L15,
@@ -50,16 +51,18 @@ Two of the top three are **accidents, not costs of emulation**:
 ### 0.2 Tier-0 fix — measured, not predicted
 
 `__attribute__((always_inline))` on `condition_passed` + dropping the two
-per-event clock reads. 5 reps, 60 s sim, same binary flags:
+per-event clock reads. First estimate, 5 reps, 60 s sim:
 
 | | median | min | max |
 |---|---|---|---|
 | baseline | 3.003 s | 2.831 s | 3.236 s |
-| Tier 0 | **2.737 s** | **2.651 s** | 2.769 s |
+| Tier 0 | 2.737 s | 2.651 s | 2.769 s |
 
-**~8% faster, and the distributions do not overlap** (baseline min 2.831 >
-Tier-0 max 2.769), so the effect is larger than the run-to-run noise.
-`arm-correctness` stayed 153/153. Two one-line changes.
+That read as **~8%** with non-overlapping distributions — but the two arms were
+measured **at different times**, hours apart, not back to back. Re-measured
+properly on one machine state (§2.3) it is **~5.9%**. The original figure is
+kept here as the estimate it was; **§2.3 is the number to cite.** The
+methodological point is in §1.3, and it applied to this very measurement.
 
 ### 0.3 External reference — Renode 1.16.1 (same host, same ELFs)
 
@@ -131,7 +134,7 @@ That is direct support for Tier 2 (§4): the 32-bit decode nest is measurably
 more expensive per instruction than the 16-bit dispatch, which is exactly what
 a decoded-instruction cache removes.
 
-### 1.2 The runner costs ~27% on top of the interpreter
+### 1.2 The runner is ~27% slower on the same ELF — but *not* from runner overhead
 
 `fw-zephyr-sync` runs the *same* Zephyr ELF as the hand-timed measurement in
 §0.3, but bare — no kernel, no event pump, no radio:
@@ -141,10 +144,26 @@ a decoded-instruction cache removes.
 | `arm-bench` (bare `arm_step`) | **~196** |
 | `nrf52840-dk-multinode` (full runner) | **~155** |
 
-So roughly **27% of wall time on a real single-node run is spent outside the
-interpreter**, in the kernel/event-pump path. That is consistent with the
-profile in §0.1 (`arm_step` 76.5% self) and it is what Tier 0 attacks — the two
-`mach_absolute_time` calls per event-pump iteration are in exactly this 27%.
+**Correction (measured 2026-08-05).** An earlier draft of this section read that
+"~27% of wall time on a real single-node run is spent outside the interpreter,
+in the kernel/event-pump path," and used that to size Tier 0. **That attribution
+was wrong.** With Tier 0's `CSIM_PHASE_TIMING=1` now reporting the split
+directly:
+
+| Workload | inside the event pump | outside it |
+|---|---|---|
+| `zephyr-synchronization`, 1 node, 60 s | **95.3%** | 4.7% |
+| `chain-3node-nrf52840-dk`, 240 s | **96.5%** | 3.5% |
+
+So only ~4–5% is runner scaffolding (service polls, progress, UI). The 27% MIPS
+gap is **real emulation work the bare benchmark doesn't do** — RTC/TIMER
+interrupts firing, radio events, event-queue dispatch — not overhead to be
+optimized away. Tier 0's clock-read removal targeted the small slice, which is
+consistent with it landing at ~6% rather than the ~8% first estimated.
+
+The lesson for the tiers below: a MIPS gap between two paths is not evidence of
+overhead until something attributes it. Tier 2/3 estimates should be sized
+against `arm_step` self time (§0.1), not against this gap.
 
 ### 1.3 Noise floor — read before gating on this
 
@@ -191,28 +210,56 @@ this benchmark's.
 
 ---
 
-## 2. Tier 0 — free, already measured (~8%)
+## 2. Tier 0 — **DONE** (~6% measured)
 
 **2.1 Force-inline `condition_passed`.**
 `static inline __attribute__((always_inline))`. The function is tiny and
 branch-only; the inliner is declining it purely because `arm_step` is enormous.
 *Risk: none. Verified 153/153.*
 
-**2.2 Remove the per-event wall-clock reads.**
-Two `get_time_ms()` calls per event-pump iteration exist only to populate
-`time_step`. Options, preferred first:
+**2.2 Phase Timing — four dead phases deleted, the live one gated.**
+The two `get_time_ms()` calls per event-pump iteration existed only to populate
+`time_step`. Resolved by evidence rather than preference:
 
-1. **Delete the Phase Timing report** together with its four always-zero phases
-   (`refactor-plan.md` §8 D5 already schedules this) and keep the single useful
-   number — total wall time — which is measured once at the ends.
-2. If the per-phase breakdown is wanted for debugging, gate the whole block
-   behind `CSIM_PHASE_TIMING=1` so the default path makes no syscall.
+- `time_distribute`, `time_deliver`, `time_flush`, `time_channel_sync` were
+  written **zero times** anywhere in the runner and always printed `0.0 ms`
+  (`refactor-plan.md` §8 D5). Deleted.
+- `time_step` is genuinely live and genuinely useful — it is what says whether a
+  workload is interpreter-bound — so it is kept behind `CSIM_PHASE_TIMING=1`.
+  The default path now makes no syscall; the diagnostic is one env var away and
+  works on any machine without a profiler. It earned its keep immediately: it is
+  what refuted the §1.2 overhead claim.
 
-*Risk: low, but it is user-visible output — it changes what a normal run prints.
-Decide (1) vs (2) before implementing.*
+`tools/check-config-equivalence.sh` filtered this block as noise, so removing it
+could not affect that guard (re-verified: **EQUIVALENT**, 1599 lines).
 
-**Acceptance:** `arm-bench` improves ≥5%; `arm-correctness` 153/153; determinism
-guard byte-identical (this touches the event pump, so that guard is mandatory).
+### 2.3 Measured result
+
+Back-to-back on one machine state, 5 reps each, `zephyr-synchronization` 1 node
+60 s through `nrf52840-dk-multinode` (the workload that exercises both the
+interpreter and the pump):
+
+| | median | min | max |
+|---|---|---|---|
+| baseline | 2.939 s | 2.838 | 3.208 |
+| Tier 0 | **2.767 s** | 2.614 | 2.873 |
+
+**~5.9%**, with **4 of 5** Tier-0 runs below the baseline *minimum*.
+
+Two honesty notes:
+
+- The first estimate was ~8%, from a **single** before/after pair. Re-measured
+  properly it is ~6%. This is precisely the §1.3 noise-floor warning applying to
+  its own author — a single A/B pair on this codebase is not a measurement.
+- **`arm-bench` cannot see most of this change** and should not be used to gate
+  it: the synthetic loops call `arm_step` directly with no kernel, so only the
+  `always_inline` half is visible there, and it lands inside the noise floor
+  (−4.4% to +7.3% across cases, all within run-to-run spread). The runner
+  workload is the correct instrument for Tier 0.
+
+**Gate (all green):** `correctness`, `arm-correctness` 153/153, `radio-medium`
+241/241, `cc1200-mock-host` 73/73, `arm-bench` exit 0, determinism run-twice
+byte-identical, config v1↔v2 equivalent, Cooja suite 93/93.
 
 ---
 
@@ -390,7 +437,7 @@ Effort: **3–4 weeks.** Do not start it under release pressure.
 | Step | Effort | Confidence | Gate |
 |---|---|---|---|
 | `arm-bench` | ½ day | — (enabler) | builds; numbers stable across 5 reps |
-| Tier 0 | ½ day | **measured ~8%** | arm-bench ≥5%; 153/153; determinism |
+| ~~Tier 0~~ **DONE** | — | — | **~5.9% measured** (4/5 runs below baseline min); full gate green |
 | ~~Tier 1 PGO~~ **DONE** | — | — | **1.55× clang / 1.18× gcc on an untrained workload**; suites green on both |
 | Tier 2 decode cache | ~1 week | high (in-tree precedent) | full gate + determinism byte-identical |
 | Tier 3 JIT | 3–4 weeks | medium | JIT_VERIFY clean over corpus + full gate |
@@ -412,7 +459,9 @@ untrained holdout, and both `README.md` and `CLAUDE.md` were corrected.)
 
 ## 7. Open questions
 
-1. **Phase Timing report — delete or gate?** (§2.2) Changes visible output.
+1. ~~**Phase Timing report — delete or gate?**~~ **Resolved:** the four
+   always-zero phases are deleted, the one live phase is gated behind
+   `CSIM_PHASE_TIMING=1`. See §2.2.
 2. **x86-64 cross-check of the Renode comparison.** The 1.92× MIPS result is
    single-platform; Renode's arm64 .NET build may be less optimized than its
    primary target. jftest4 can settle it.

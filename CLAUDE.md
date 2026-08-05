@@ -45,6 +45,10 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
                                          # synthetic loop is guarded by an iteration-count
                                          # invariant, so a wrong loop shape reports BROKEN
                                          # instead of timing garbage. Non-zero exit if any is.
+                                         # NB: calls arm_step directly with no kernel, so it
+                                         # measures the interpreter only — a change to the
+                                         # event pump won't show up here (see the Tier 0 note
+                                         # in docs/design/arm-performance-plan.md §2.3).
 ./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
@@ -78,6 +82,13 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
+
+`CSIM_PHASE_TIMING=1` adds a wall-time breakdown at the end of a run — how much
+went into the event pump (CPU step + event dispatch) versus the runner
+scaffolding around it. Off by default because the clock reads it needs profiled
+at 7% of self time on an ARM workload. Useful for answering "is this workload
+interpreter-bound?" without a profiler: single-node `zephyr-synchronization` is
+95.3% pump / 4.7% other, `chain-3node-nrf52840-dk` 96.5% / 3.5%.
 
 ```sh
 # Dynamic plugins (Phase 9) — dlopen a .so that registers a service or medium

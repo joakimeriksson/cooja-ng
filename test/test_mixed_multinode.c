@@ -447,6 +447,15 @@ static double get_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
+/* CSIM_PHASE_TIMING=1 enables the step-vs-kernel wall-time breakdown at the
+ * end of a run.  Off by default: it needs two clock reads per event-pump
+ * iteration, which profiled at 7.0% of self time on an ARM workload. */
+static int phase_timing_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CSIM_PHASE_TIMING"); v = (e && *e == '1'); }
+    return v;
+}
+
 /* ============================================================
  * Mote vtable adapters — Phase 2 milestone 11 (§3.16).
  *
@@ -2278,9 +2287,20 @@ sim_restart:
 
 
 
-    /* Phase timing accumulators (ms) */
-    double time_distribute = 0, time_deliver = 0, time_step = 0;
-    double time_flush = 0, time_channel_sync = 0, time_test_ui = 0;
+    /* Phase timing (ms), opt-in via CSIM_PHASE_TIMING=1.
+     *
+     * Off by default because the two clock reads it needs per event-pump
+     * iteration cost real time: `mach_absolute_time` was 7.0% of self time
+     * in an ARM interpreter profile, second only to arm_step itself
+     * (docs/design/arm-performance-plan.md §0.1).
+     *
+     * The four other phases this block used to report — distribute, deliver,
+     * flush/output, channel sync — were written zero times anywhere in the
+     * runner and always printed 0.0 ms; they are gone (refactor-plan.md §8
+     * D5).  What remains is the one live number: how much wall time is spent
+     * inside the CPU step versus the kernel/event-pump around it, which is
+     * what tells you whether an ARM workload is interpreter-bound. */
+    double time_step = 0;
 
     double t_start = get_time_ms();
 
@@ -2512,7 +2532,6 @@ sim_restart:
          * sync at tick boundaries is no longer needed. The dirty flag is
          * still cleared so the bookkeeping stays consistent for any
          * future readers. */
-        double t_phase;
         if (channels_dirty)
             channels_dirty = false;
 
@@ -2523,7 +2542,9 @@ sim_restart:
              * the same time (requestImmediateWakeup). Schedule the
              * ticked node's next wakeup based on timer state. */
 
-            t_phase = get_time_ms();
+            /* Clock reads only when phase timing is enabled — they are hot
+             * enough to show up in a profile (see the accumulator above). */
+            double t_phase = phase_timing_on() ? get_time_ms() : 0.0;
 
             /* Kernel event pump (milestone 10): pops events with
              * time <= sim_ns in (time, seq) order, advances now_ns to
@@ -2536,7 +2557,8 @@ sim_restart:
             if (sim_runtime_stop_requested(&sim_rt))
                 break;
 
-            time_step += get_time_ms() - t_phase;
+            if (phase_timing_on())
+                time_step += get_time_ms() - t_phase;
         }
 
         /* One-shot console injection for headless shell-driven tests:
@@ -2832,15 +2854,14 @@ sim_restart:
     /* Cleanup UI server */
     ui_service_destroy(&ui_svc);
 
-    printf("\n--- Phase Timing ---\n");
-    double time_accounted = time_distribute + time_deliver + time_step + time_flush + time_channel_sync;
-    double time_other = elapsed_ms - time_accounted;
-    printf("  distribute:    %7.1f ms (%4.1f%%)\n", time_distribute, 100.0 * time_distribute / elapsed_ms);
-    printf("  deliver:       %7.1f ms (%4.1f%%)\n", time_deliver, 100.0 * time_deliver / elapsed_ms);
-    printf("  step (CPU):    %7.1f ms (%4.1f%%)\n", time_step, 100.0 * time_step / elapsed_ms);
-    printf("  flush/output:  %7.1f ms (%4.1f%%)\n", time_flush, 100.0 * time_flush / elapsed_ms);
-    printf("  channel sync:  %7.1f ms (%4.1f%%)\n", time_channel_sync, 100.0 * time_channel_sync / elapsed_ms);
-    printf("  other/overhead:%7.1f ms (%4.1f%%)\n", time_other, 100.0 * time_other / elapsed_ms);
+    if (phase_timing_on()) {
+        printf("\n--- Phase Timing (CSIM_PHASE_TIMING=1) ---\n");
+        printf("  step (CPU):    %7.1f ms (%4.1f%%)\n",
+               time_step, 100.0 * time_step / elapsed_ms);
+        printf("  kernel/other:  %7.1f ms (%4.1f%%)\n",
+               elapsed_ms - time_step,
+               100.0 * (elapsed_ms - time_step) / elapsed_ms);
+    }
 
     printf("\n--- Performance ---\n");
     printf("  Wall-clock time:  %.1f ms (%.2f s)\n", elapsed_ms, elapsed_ms / 1000.0);
