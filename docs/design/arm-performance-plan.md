@@ -91,9 +91,10 @@ gate, it is not in CI, and it cannot detect a regression.
 
 ---
 
-## 1. Prerequisite — `arm-bench` (do this first)
+## 1. Prerequisite — `arm-bench` — **DONE**
 
-Nothing else in this plan is verifiable without it.
+Landed as `test/test_arm_benchmark.c`, mode `./build/test_runner arm-bench`.
+Nothing else in this plan was verifiable without it.
 
 - New mode in `test_main.c`, mirroring `run_benchmarks()`: fixed instruction
   budget per case, report wall ms + MIPS + instruction count, plus the CSV
@@ -108,7 +109,84 @@ Nothing else in this plan is verifiable without it.
   variance on shared runners would make it flaky. Revisit once we have a
   baseline distribution.
 
-Effort: **~half a day.** It also gives PGO a training workload (§3).
+It also gives PGO a training workload (§3).
+
+### 1.1 Measured baseline (Apple Silicon, `-O3 -flto -mcpu=native`)
+
+Median of 5 in-run iterations, 20 M instructions each:
+
+| Benchmark | What it isolates | MIPS |
+|---|---|---|
+| `it-block` | IT blocks / `condition_passed` | ~202 |
+| `alu-reg` | Thumb-16 computed-goto dispatch | ~200 |
+| `branch` | conditional branches | ~202 |
+| `mem-ldr-str` | `arm_read32`/`arm_write32` | ~176 |
+| **`thumb2-dp`** | **the `t32_decode` switch nest** | **~164** |
+| `fw-zephyr-sync` | real firmware (nRF52840) | ~196 |
+| `fw-cc2538-udp` | real firmware (CC2538) | ~153 |
+
+**`thumb2-dp` is the slowest synthetic case — ~18% below the Thumb-16 paths.**
+That is direct support for Tier 2 (§4): the 32-bit decode nest is measurably
+more expensive per instruction than the 16-bit dispatch, which is exactly what
+a decoded-instruction cache removes.
+
+### 1.2 The runner costs ~27% on top of the interpreter
+
+`fw-zephyr-sync` runs the *same* Zephyr ELF as the hand-timed measurement in
+§0.3, but bare — no kernel, no event pump, no radio:
+
+| Path | MIPS |
+|---|---|
+| `arm-bench` (bare `arm_step`) | **~196** |
+| `nrf52840-dk-multinode` (full runner) | **~155** |
+
+So roughly **27% of wall time on a real single-node run is spent outside the
+interpreter**, in the kernel/event-pump path. That is consistent with the
+profile in §0.1 (`arm_step` 76.5% self) and it is what Tier 0 attacks — the two
+`mach_absolute_time` calls per event-pump iteration are in exactly this 27%.
+
+### 1.3 Noise floor — read before gating on this
+
+Run-to-run spread of the per-run medians, 3 consecutive runs on a *loaded*
+laptop:
+
+| Benchmark | spread |
+|---|---|
+| `thumb2-dp` | 2.4% |
+| `it-block` | 2.6% |
+| `fw-zephyr-sync` | 6.7% |
+| `branch` | 7.1% |
+| `fw-cc2538-udp` | 7.4% |
+| `alu-reg` | 8.2% |
+| `mem-ldr-str` | **20.3%** |
+
+**Tier 0's ~8% gain is at or below this noise floor for a single A/B run.**
+Any tier must therefore be validated with repeated runs comparing medians, not
+one before/after pair — and CI should report the number, not hard-gate on it,
+until a quiet-machine baseline distribution exists. `mem-ldr-str` is too noisy
+to gate on at all in its current form.
+
+### 1.4 The guard, and what it does not cover
+
+Each synthetic loop increments `r7` once per pass and nothing else writes it,
+so `r7` must equal `INSTRUCTIONS / instructions-per-iteration`; a mismatch is
+reported as **BROKEN** and makes the suite exit non-zero, rather than timing
+garbage.
+
+Validated by injection, not assumed — and it earned its keep immediately:
+
+- Deleting one instruction from `alu-reg` (declared 10/iter, actual 9) trips
+  it: `iters=2222222` vs `expected=2000000`.
+- It caught a real error while the file was being written: `mem-ldr-str` was
+  declared at 6 instructions/iteration when it is 7.
+
+**Limit, stated so it is not over-trusted:** it detects changes to loop *length*
+or *control flow*, not a wrong instruction that is flow-neutral. Injecting
+`0xDEAD` is *not* caught — this emulator executes an undefined instruction as a
+silent no-op instead of faulting, so the loop keeps its shape. (That no-op
+behaviour is itself a small fidelity gap worth a separate look; a real M3 takes
+UsageFault.) Semantic correctness of encodings is `arm-correctness`'s job, not
+this benchmark's.
 
 ---
 

@@ -30,6 +30,13 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 
 # ARM Cortex-M3/M4 tests
 ./build/test_runner arm-correctness -v   # 153 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33)
+./build/test_runner arm-bench            # ARM interpreter benchmarks: 5 synthetic hot-path
+                                         # loops (dispatch, Thumb-2 decode, IT blocks, branches,
+                                         # load/store) + 2 firmware. Reports MIPS (primary) and
+                                         # xRealtime (secondary — idle-policy sensitive). Each
+                                         # synthetic loop is guarded by an iteration-count
+                                         # invariant, so a wrong loop shape reports BROKEN
+                                         # instead of timing garbage. Non-zero exit if any is.
 ./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
