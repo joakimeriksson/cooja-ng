@@ -25,8 +25,8 @@ void arm_pcw_init(void) {
 }
 /* Memory-change watch: ARM_MEM_WATCH="0xaddr" logs every change of the byte at
  * that address with the writing PC.  Diagnostic only. */
-uint32_t arm_memw_addr; int arm_memw_last = -1; int arm_memw_init_done;
-uint32_t arm_zt_kernel; int arm_zt_done, arm_zt_init;
+uint32_t arm_memw_addr; int arm_memw_last = -1;
+uint32_t arm_zt_kernel; int arm_zt_done;
 __attribute__((destructor,used)) static void arm_pcw_dump(void) {
     for (int i = 0; i < arm_pcw_count; i++)
         fprintf(stderr, "PC-WATCH 0x%08x: hits=%llu first=%lld last=%lld\n",
@@ -764,6 +764,34 @@ static inline void arm_sp_audit_push(arm_cpu_t *cpu, uint32_t return_pc,
     cpu->sp_audit[i].in_exception = (cpu->xpsr & 0x1FF) != 0 ? 1 : 0;
 }
 
+/* One-time probe for the per-instruction debug facilities, so arm_step's hot
+ * path pays a single predictable branch instead of one load+test per facility
+ * (plus a loop setup for the PC watchpoints) on every emulated instruction.
+ *
+ * Does all the getenv/init work on first call.  Facilities are latched at that
+ * point: setting ARM_MEM_WATCH etc. mid-run was never supported anyway, since
+ * each site already cached its own env lookup. */
+static int arm_dbg_any = -1;
+static int arm_debug_probe(void) {
+    extern int arm_pcw_count; extern void arm_pcw_init(void);
+    extern uint32_t arm_zt_kernel;
+    extern uint32_t arm_memw_addr;
+
+    if (arm_pcw_count < 0) arm_pcw_init();
+
+    const char *z = getenv("ZEPHYR_THREADS");
+    if (z) arm_zt_kernel = (uint32_t)strtoul(z, 0, 16);
+
+    const char *m = getenv("ARM_MEM_WATCH");
+    if (m) arm_memw_addr = (uint32_t)strtoul(m, 0, 16);
+
+    return (arm_pcw_count > 0) || (arm_zt_kernel != 0) || (arm_memw_addr != 0);
+}
+static inline int arm_debug_facilities_on(void) {
+    if (__builtin_expect(arm_dbg_any < 0, 0)) arm_dbg_any = arm_debug_probe();
+    return arm_dbg_any;
+}
+
 static inline void arm_sp_audit_check(arm_cpu_t *cpu) {
     if (__builtin_expect(arm_sp_audit_enabled <= 0, 1)) return;
     while (cpu->sp_audit_top > 0) {
@@ -1024,11 +1052,21 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         uint32_t pc = cpu->reg[ARM_PC];
 
-        {
-            extern int arm_pcw_count; extern void arm_pcw_init(void);
+        /* Per-instruction debug facilities (PC watchpoints, the one-shot
+         * Zephyr thread dump, the memory watch) behind ONE cached flag.
+         *
+         * Each used to cost its own load+test on every emulated instruction,
+         * and the PC-watchpoint one cost a loop setup as well — on a path
+         * that retires an instruction every ~20 host cycles.  All three are
+         * off in every normal run.  arm_debug_facilities_on() does the
+         * getenv work once and thereafter is a single predictable branch.
+         *
+         * This region has bitten us before: see the ARM_WILD_TRAP comment
+         * below, where an unlatched getenv() was once ~35% of wall time. */
+        if (__builtin_expect(arm_debug_facilities_on(), 0)) {
+            extern int arm_pcw_count;
             extern uint32_t arm_pcw_addr[]; extern uint64_t arm_pcw_n[];
             extern int64_t arm_pcw_first[], arm_pcw_last[];
-            if (arm_pcw_count < 0) arm_pcw_init();
             for (int i = 0; i < arm_pcw_count; i++)
                 if ((pc & ~1u) == (arm_pcw_addr[i] & ~1u)) {
                     if (arm_pcw_n[i] == 0) arm_pcw_first[i] = cpu->cycles;
@@ -1039,9 +1077,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
              * and the wait-queue each thread is pended on.  Offsets are for the
              * echo-s-nd build (z_kernel.threads +40, k_thread.next_thread +140,
              * .name +144, base.thread_state +16, base.pended_on +8). */
-            extern uint32_t arm_zt_kernel; extern int arm_zt_done, arm_zt_init;
-            if (!arm_zt_init) { arm_zt_init = 1;
-                char *z = getenv("ZEPHYR_THREADS"); if (z) arm_zt_kernel = (uint32_t)strtoul(z, 0, 16); }
+            extern uint32_t arm_zt_kernel; extern int arm_zt_done;
             if (arm_zt_kernel && !arm_zt_done && cpu->cycles > 20000000) {
                 arm_zt_done = 1;
                 uint32_t t = arm_read32(cpu, arm_zt_kernel + 40);
@@ -1058,9 +1094,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     t = arm_read32(cpu, t + 140);
                 }
             }
-            extern uint32_t arm_memw_addr; extern int arm_memw_last, arm_memw_init_done;
-            if (!arm_memw_init_done) { arm_memw_init_done = 1;
-                char *m = getenv("ARM_MEM_WATCH"); if (m) arm_memw_addr = (uint32_t)strtoul(m, 0, 16); }
+            extern uint32_t arm_memw_addr; extern int arm_memw_last;
             if (arm_memw_addr) {
                 int v = (int)arm_read8(cpu, arm_memw_addr);
                 if (v != arm_memw_last) {

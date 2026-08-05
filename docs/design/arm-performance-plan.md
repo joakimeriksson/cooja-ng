@@ -1,8 +1,9 @@
 # ARM Interpreter Performance Plan
 
-Status: **in progress** (2026-08-05). §1 `arm-bench`, §2 Tier 0 and §3 Tier 1
-(PGO) are **done and measured**; Tier 2 (decode cache) and Tier 3 (JIT) are
-open. Companion to
+Status: **in progress** (2026-08-05). §1 `arm-bench`, §2 Tier 0, §3 Tier 1 (PGO)
+and §4 (the debug-facility gate, which replaced the dropped decode cache) are
+**done and measured** — **21.1% cumulative** on an ARM runner workload. Tier 3
+(JIT) is open. Companion to
 [`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0 here).
 
 **Why now.** ARM is the strategic platform — CC2538, nRF52840, nRF54L15,
@@ -12,8 +13,15 @@ plus a GNU Lightning JIT; RISC-V got a memoized fetch/decode path (`da4c718`,
 ~28%). ARM has neither. The legacy platform is the fast one.
 
 Everything below is ordered by **measured evidence → confidence → cost**, not by
-how interesting the work is. Tiers 0–1 are near-free and already measured; Tier 2
-is a well-understood port of an in-tree technique; Tier 3 is a real project.
+how interesting the work is. Tiers 0–1 were near-free; Tier 2 was planned as a
+port of an in-tree technique and was **dropped when measurement refuted its
+premise** (§4.1), with the effort redirected to what the same measurement
+pointed at instead; Tier 3 is a real project.
+
+A note on how to read this document: several claims in it have been withdrawn or
+corrected by later measurement, and those corrections are left in place rather
+than edited out. That is deliberate — the failure mode this plan exists to avoid
+is spending a week on a refactor justified by a number nobody re-checked.
 
 ---
 
@@ -130,9 +138,11 @@ Median of 5 in-run iterations, 20 M instructions each:
 | `fw-cc2538-udp` | real firmware (CC2538) | ~153 |
 
 **`thumb2-dp` is the slowest synthetic case — ~18% below the Thumb-16 paths.**
-That is direct support for Tier 2 (§4): the 32-bit decode nest is measurably
-more expensive per instruction than the 16-bit dispatch, which is exactly what
-a decoded-instruction cache removes.
+That was read as direct support for Tier 2 (a decoded-instruction cache).
+**Withdrawn** — see §4.1: real firmware is 78–99.9% Thumb-16, so this synthetic
+loop does not represent the executed instruction mix, and the Amdahl ceiling for
+caching t32 decode is ~0.4–2%. The measurement is sound; the inference from it
+was not.
 
 ### 1.2 The runner is ~27% slower on the same ELF — but *not* from runner overhead
 
@@ -353,48 +363,96 @@ Cost: `make pgo` takes ~27 s (clang, Apple Silicon) / ~48 s (gcc -j2, x86-64).
 
 ---
 
-## 4. Tier 2 — ARM decoded-instruction cache
+## 4. Tier 2 — **DROPPED as scoped**, replaced by the debug-facility gate (14.6%)
 
-**The structural gap:** ARM decodes inline on *every* execution. MSP430 has a
-stateless decoder (`msp430_decode.c`) feeding a JIT; RISC-V memoizes. ARM does
-neither — `arm_step` fetches, computes `top5`, dispatches through
-`thumb_dispatch[32]`, and for Thumb-2 (`top5 >= 29`) falls into `t32_decode` and
-a nest of `switch (op1)/(op2)/(op_dp)` — all re-executed identically every time
-the same instruction runs.
+### 4.1 The decode-cache premise did not survive measurement
 
-**Correction to an easy assumption:** the RISC-V win is *not* directly portable.
-`da4c718` memoizes `rvc_expand()` in a **64 K table keyed on the 16-bit
-compressed word** — legal only because compressed expansion is a pure function of
-a 16-bit value. Thumb-2 is 32-bit; a value-keyed table is impossible.
+The plan called for a PC-keyed decoded-instruction cache, sized off one number:
+`thumb2-dp` running ~18% slower than the Thumb-16 loops (§1.1). Before spending
+a week on a refactor that fuses/unfuses ~1100 lines of decode-and-execute, the
+premise was checked directly by counting the executed instruction mix
+(temporary `CSIM_DECODE_STATS` instrumentation, since reverted):
 
-So ARM needs a **PC-keyed decoded-instruction cache**, i.e. the MSP430 model:
+| Workload | Thumb-2 share | mean t32 chain depth |
+|---|---|---|
+| `zephyr-synchronization` (nRF52840) | **0.1%** | 5.25 |
+| Contiki RPL-UDP (CC2538) | **4.5%** | 4.58 |
+| Zephyr `echo_server` 802.15.4 (nRF52840) | **14.7%** | 6.10 |
+| Contiki RPL-UDP (nRF52840) | **22.2%** | 7.14 |
 
-- `decoded_arm_insn_t` holding class/handler-index + pre-extracted operand
-  fields, cached at `pc >> 1`, sized to the flash window.
-- Hit → jump straight to the handler with fields already extracted, skipping the
-  entire decode nest. Miss → decode once, fill, execute.
-- Optionally extend to basic blocks later (MSP430's `basic_block` with
-  `MAX_BLOCK_SIZE 32` is the template) — but do the per-instruction cache first;
-  it is where the decode saving lives.
+**Real firmware is 78–99.9% Thumb-16.** Two consequences kill the idea:
 
-**Correctness hazard — do not skip.** `arm_write8/16/32` accept writes into
-`[flash_base, flash_end)`, so firmware (e.g. via NVMC) *can* self-modify. A
-PC-keyed cache must be invalidated on any write into that range, exactly as
-`msp430_cpu.c:73 cache_invalidate()` does — and note csim already shipped a bug
-here once (the MSP430 SMC invalidation only covered a fixed 6-byte window; fixed
-in the 0.1.0 hardening audit). Reuse that lesson: invalidate by **actual byte
-span**, not a fixed window.
+1. **A cache cannot help the majority case.** Thumb-16 "decode" is
+   `top5 = hw1 >> 11` plus a computed goto into `thumb_dispatch[32]` — about two
+   operations. A PC-keyed cache lookup (index, load, validity test, branch)
+   costs *the same or more*. csim's Thumb-16 dispatch is already at the floor;
+   there is nothing to memoize. This is the real disanalogy with MSP430, whose
+   decode genuinely is expensive (addressing modes, extension words) — not the
+   Thumb-2-is-32-bit point flagged earlier.
+2. **The addressable minority is small.** Even on the most Thumb-2-heavy
+   workload (22.2%), the *fixable* part is the chain walk, not the execute. With
+   `thumb2-dp` only 18% off the Thumb-16 pace, the Amdahl ceiling is
+   `0.222 × 18% ≈ 4%` for removing the entire gap, and roughly **0.4–2%** for
+   removing just the chain walk — against ~1 week of work and a real determinism
+   risk.
 
-**Expected gain:** RISC-V got 28% from a much cheaper decode. ARM's decode is
-heavier (Thumb-2 + IT-block state), so plausibly more — but this is an
-expectation, not a measurement, and Tier 0/1 land first precisely so the baseline
-is honest.
+Dropped. The `thumb2-dp` number was a true measurement of a *synthetic* loop
+that turned out not to represent real code; §1.1's "direct support for Tier 2"
+claim is withdrawn.
 
-Effort: **~1 week.** Self-contained in `src/arm/`, no ABI change, no kernel
-change. Determinism must be byte-identical (cycle counts are accumulated at 32
-sites in `arm_step`; the cached path must reproduce them exactly).
+### 4.2 What the measurement pointed at instead — **DONE, 14.6%**
 
----
+All the Thumb-16 benchmarks cluster at ~200 MIPS regardless of what the
+instruction actually does (ALU 199, branch 198, IT-block 205), which says the
+per-instruction **fixed overhead** dominates, not the operation. Reading
+`arm_step`'s 244-line preamble, five debug facilities were being checked on
+*every* emulated instruction:
+
+| Facility | Cost per instruction |
+|---|---|
+| `arm_trace_step()` | load + predicted branch (already guarded) |
+| **PC watchpoints** (`ARM_PC_WATCH`) | init test + **loop setup**, unguarded |
+| **Zephyr thread dump** (`ZEPHYR_THREADS`) | init test + 3-term condition, unguarded |
+| **Memory watch** (`ARM_MEM_WATCH`) | init test + address test, unguarded |
+| `arm_sp_audit_check()` | load + predicted branch (already guarded) |
+
+All are off in every normal run. The three unguarded ones now sit behind a
+single cached `arm_debug_facilities_on()`, which does the `getenv` work once and
+is thereafter one predictable branch.
+
+This region had bitten the project before: the `ARM_WILD_TRAP` site right below
+carries a comment recording that an *unlatched* `getenv()` there was once ~35%
+of simulation wall time. Same class of bug, three more instances.
+
+**Measured** back-to-back, 5 reps, `zephyr-synchronization` 1 node 60 s:
+
+| | median | min | max |
+|---|---|---|---|
+| Tier 0 | 2.716 s | 2.625 | 2.744 |
+| + debug gate | **2.319 s** | 2.264 | **2.433** |
+
+**14.6%, with completely non-overlapping distributions** (new max 2.433 < old
+min 2.625) — a far stronger signal than Tier 0's. Unlike Tier 0 this *is*
+visible to `arm-bench`, because it is in the interpreter core rather than the
+event pump: **+17.0% `alu-reg`, +18.2% `thumb2-dp`, +21.2% `fw-zephyr-sync`,
++13.5% `fw-cc2538-udp`** against the pre-Tier-0 baseline.
+
+Facilities re-verified working after the change: `ARM_MEM_WATCH` still logs
+byte changes, `ARM_PC_WATCH` still reports hit counts, `ZEPHYR_THREADS` still
+runs clean.
+
+**Cumulative Tier 0 + this: 21.1%** on the runner workload
+(2.939 s → 2.319 s).
+
+### 4.3 If a decode cache is ever revisited
+
+Only worth it for a workload profile that is genuinely Thumb-2-heavy, and only
+after `CSIM_DECODE_STATS`-style evidence that it is. Even then, scope it to the
+`t32_decode` chain alone — never to Thumb-16 — and note that a cheap
+intermediate exists: a `switch (op1)` pre-dispatch would cut the mean chain
+depth from ~7 to ~3 on Contiki workloads without any decode/execute refactor.
+Verify the 12 arms are genuinely mutually exclusive first; the trailing
+`(hw1 & 0xEC00) == 0xEC00` VFP arm looks like a catch-all and may overlap.
 
 ## 5. Tier 3 — ARM JIT (GNU Lightning)
 
@@ -439,7 +497,8 @@ Effort: **3–4 weeks.** Do not start it under release pressure.
 | `arm-bench` | ½ day | — (enabler) | builds; numbers stable across 5 reps |
 | ~~Tier 0~~ **DONE** | — | — | **~5.9% measured** (4/5 runs below baseline min); full gate green |
 | ~~Tier 1 PGO~~ **DONE** | — | — | **1.55× clang / 1.18× gcc on an untrained workload**; suites green on both |
-| Tier 2 decode cache | ~1 week | high (in-tree precedent) | full gate + determinism byte-identical |
+| ~~Tier 2 decode cache~~ **DROPPED** | — | premise refuted (§4.1) | — |
+| **Tier 2′ debug gate** **DONE** | ½ day | — | **14.6% measured**, non-overlapping; full gate green |
 | Tier 3 JIT | 3–4 weeks | medium | JIT_VERIFY clean over corpus + full gate |
 
 **Mandatory gate for anything touching `arm_step` or the event pump:**
