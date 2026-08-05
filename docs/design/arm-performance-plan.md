@@ -191,10 +191,32 @@ laptop:
 | `mem-ldr-str` | **20.3%** |
 
 **Tier 0's ~8% gain is at or below this noise floor for a single A/B run.**
-Any tier must therefore be validated with repeated runs comparing medians, not
-one before/after pair — and CI should report the number, not hard-gate on it,
-until a quiet-machine baseline distribution exists. `mem-ldr-str` is too noisy
-to gate on at all in its current form.
+CI should report the number, not hard-gate on it, until a quiet-machine
+baseline distribution exists. `mem-ldr-str` is too noisy to gate on at all in
+its current form.
+
+#### Measurement protocol — repeated runs are *not* enough
+
+This machine drifts on a timescale of minutes, which defeats the obvious
+method. Three separate times in this document a change was sized by running
+5 reps of A, then 5 reps of B:
+
+| Claim | by blocked A/B | by interleaved paired A/B | verdict |
+|---|---|---|---|
+| Tier 0 | ~8% | 5.9% | overstated |
+| debug-branch consolidation "ceiling" (§4.2) | ~6% | — | overstated |
+| debug-branch consolidation, actual (§4.4) | 1.6% | **3 wins / 9 pairs** | **not real** |
+
+**The protocol that works:** build both binaries, then alternate
+`A,B,A,B,…` for N pairs and count how often B beats A *within its own pair*.
+Drift then hits both arms equally. A change that is real wins nearly every
+pair (Tier 0: 4 of 5 runs below the baseline *minimum*; the §4.2 debug gate:
+zero distribution overlap). A change that wins 3 of 9 pairs is noise no matter
+what the medians say.
+
+Blocked A/B is still fine for large effects (the §4.2 gate at 14.6% was
+unambiguous either way). It is unreliable in the 0–6% band, which is exactly
+where most micro-optimizations land.
 
 ### 1.4 The guard, and what it does not cover
 
@@ -454,6 +476,37 @@ depth from ~7 to ~3 on Contiki workloads without any decode/execute refactor.
 Verify the 12 arms are genuinely mutually exclusive first; the trailing
 `(hw1 & 0xEC00) == 0xEC00` VFP arm looks like a catch-all and may overlap.
 
+### 4.4 Negative result — consolidating the *guarded* debug branches is worth ~0
+
+After §4.2 landed, four debug checks remained in the per-instruction path:
+`arm_trace_step()`, the new `arm_debug_facilities_on()` block,
+`arm_sp_audit_check()`, and the `ARM_WILD_TRAP` test. Folding the last two into
+the first looked like a free extra win — a cross-time "ceiling" experiment
+(delete them outright) suggested ~6%.
+
+It is not a win. Properly interleaved, 9 paired runs:
+
+| | median | min | max |
+|---|---|---|---|
+| §4.2 as committed | 2.353 s | 2.166 | 2.546 |
+| + consolidation | 2.316 s | 2.258 | 2.404 |
+
+1.6% by median, but **consolidated was faster in only 3 of 9 pairs** — i.e.
+slower more often than not. Reverted.
+
+**Why, and the generalisable lesson:** `arm_sp_audit_check`, `arm_trace_step`
+and the wild-trap test were *already* `__builtin_expect`-guarded single
+predictable branches. A perfectly-predicted not-taken branch is essentially
+free on an out-of-order core — it costs a slot that was idle anyway. The 14.6%
+in §4.2 did **not** come from "fewer branches"; it came specifically from the
+three *unguarded* facilities, above all the PC-watchpoint **loop setup**
+(`for (int i = 0; i < arm_pcw_count; i++)`), which the compiler cannot hoist
+and which is not a simple predicted branch.
+
+So the rule for anything further in this path: **look for unguarded work, loop
+setups, and unlatched `getenv`/syscalls — not for branch count.** Removing
+already-predicted branches from a hot loop is a non-optimization.
+
 ## 5. Tier 3 — ARM JIT (GNU Lightning)
 
 Biggest win, biggest risk. Only start after Tier 2 exists and `arm-bench` is a
@@ -499,6 +552,7 @@ Effort: **3–4 weeks.** Do not start it under release pressure.
 | ~~Tier 1 PGO~~ **DONE** | — | — | **1.55× clang / 1.18× gcc on an untrained workload**; suites green on both |
 | ~~Tier 2 decode cache~~ **DROPPED** | — | premise refuted (§4.1) | — |
 | **Tier 2′ debug gate** **DONE** | ½ day | — | **14.6% measured**, non-overlapping; full gate green |
+| ~~branch consolidation~~ **REVERTED** | — | 3 wins / 9 paired runs | not a real effect (§4.4) |
 | Tier 3 JIT | 3–4 weeks | medium | JIT_VERIFY clean over corpus + full gate |
 
 **Mandatory gate for anything touching `arm_step` or the event pump:**
