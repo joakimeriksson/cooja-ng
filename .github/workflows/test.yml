@@ -32,6 +32,14 @@ jobs:
       - name: ARM instruction tests
         run: ./build/test_runner arm-correctness
 
+      # Differential test of the JIT's decoder + reference model against the
+      # interpreter: all 65536 Thumb halfwords x 6 random register/flag states.
+      # Deterministic and fast (~1s), and it is the only thing that catches
+      # flag-only drift between the two implementations — the failure mode
+      # that is invisible until a conditional branch goes the wrong way.
+      - name: ARM decoder differential tests
+        run: ./build/test_runner arm-decode
+
       - name: Timeline unit tests
         run: ./build/test_runner timeline
 

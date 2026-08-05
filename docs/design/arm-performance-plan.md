@@ -1,9 +1,10 @@
 # ARM Interpreter Performance Plan
 
-Status: **in progress** (2026-08-05). §1 `arm-bench`, §2 Tier 0, §3 Tier 1 (PGO)
-and §4 (the debug-facility gate, which replaced the dropped decode cache) are
-**done and measured** — **21.1% cumulative** on an ARM runner workload. Tier 3
-(JIT) is open. Companion to
+Status: **in progress** (2026-08-06). §1 `arm-bench`, §2 Tier 0, §3 Tier 1
+(PGO) and §4 (the debug-facility gate, which replaced the dropped decode cache)
+are **done and measured**. §5 (Tier 3) has its decoder foundation landed and
+differentially verified; codegen is not started and carries an open decision
+(§5.4). Cumulative on the ARM runner workload: **2.939 s → 1.940 s, 34%**. Companion to
 [`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0 here).
 
 **Why now.** ARM is the strategic platform — CC2538, nRF52840, nRF54L15,
@@ -507,41 +508,98 @@ So the rule for anything further in this path: **look for unguarded work, loop
 setups, and unlatched `getenv`/syscalls — not for branch count.** Removing
 already-predicted branches from a hot loop is a non-optimization.
 
-## 5. Tier 3 — ARM JIT (GNU Lightning)
+## 5. Tier 3 — ARM JIT — **foundation landed, codegen not started**
 
-Biggest win, biggest risk. Only start after Tier 2 exists and `arm-bench` is a
-trusted number.
+### 5.0 What a JIT is actually worth here — measure before committing weeks
 
-Everything needed is already in the tree:
+GNU Lightning was not installed on either dev machine, so **nothing in this
+tree had ever been JIT-compiled**. Installing it (`brew install lightning` on
+the Mac; already present at /usr/local on jftest4) made the existing MSP430 JIT
+measurable — same binary, JIT on versus `MSPSIM_JIT_THRESHOLD` set impossibly
+high:
 
-- GNU Lightning is wired into the build (auto-detected via pkg-config; the JIT is
-  optional and the interpreter is the fallback).
-- `src/msp430/msp430_jit.c` is a complete working template: hot-block threshold
-  via `MSPSIM_JIT_THRESHOLD`, `block_exec_count[pc>>1]`, compiled-block cache,
-  invalidation on write, and — importantly — the discipline of compiling **only
-  blocks where every instruction is inlineable**, with a documented exclusion
-  list (`SUBC`, `DADD`, memory operands, SR/PC writes, PUSH/CALL/RETI, and
-  `ADDC`, excluded during the hardening audit because its carry-in left no
-  register free to compute the overflow flag).
+| Host | interpreter | + JIT | speedup |
+|---|---|---|---|
+| Apple Silicon, clang | 445 MIPS | 557 MIPS | **1.25×** (5/5 pairs, p=0.031) |
+| Linux x86-64, gcc | 266 MIPS | 490 MIPS | **1.84×** |
 
-That last point is the real lesson to carry over: **the MSP430 JIT shipped a
-warm-block-only divergence** — a bug that only appeared after a block went hot.
-An ARM JIT has strictly more state to get wrong (APSR flags including `GE`, IT
-blocks, banked SP under TrustZone). Mitigations, non-negotiable:
+**A JIT is strongly platform-dependent in this codebase.** The M-series core
+handles the indirect-branch-heavy interpreter loop so well that there is much
+less for generated code to beat; the x86-64/gcc interpreter is slower, so the
+JIT has more headroom. Anyone sizing this work from the 1.84× figure alone
+will be disappointed on Apple Silicon.
 
-- A `JIT_VERIFY` mode that runs interpreter and JIT in lockstep and diffs
-  architectural state per block, run over the whole firmware corpus.
-- Start with the narrowest possible profitable subset: flag-setting data
-  processing and unconditional branches on registers only. Explicitly exclude IT
-  blocks, all memory operands, `PC`/`SP` writes, and anything TrustZone-relevant
-  in v1.
-- Determinism is a **gated guarantee** in this project
-  (`tools/check-determinism.sh` is in CI). A JIT that perturbs cycle accounting
-  breaks it. Cycle counts must match the interpreter exactly, block for block.
+### 5.1 Why ARM is slower than MSP430 — decomposed
 
-Effort: **3–4 weeks.** Do not start it under release pressure.
+The obvious framing ("MSP430 is faster, build a JIT to catch up") was wrong
+twice over: MSP430 reaches its numbers *without* a JIT on the Mac, and part of
+its lead is inherent. Ceiling experiment, removing each per-instruction
+obligation ARM has that MSP430 does not:
 
----
+| variant | MIPS |
+|---|---|
+| ARM, as committed | 239 |
+| − GDB check, − ROM traps | 259 |
+| − IT-block machinery | 263 |
+| − all three | **321** |
+| MSP430 (interpreter) | **421** |
+
+The 1.76× gap ≈ **1.34× removable overhead × 1.31× inherent**. The removable
+part shipped (§5.2). The residual ~1.3× is the IT-block state machine and ISA
+complexity — not removable by tuning, which is the honest argument *for* a JIT
+rather than against one.
+
+### 5.2 Shipped from that analysis
+
+- **Flash window hoisted** out of the fetch path (`86d29b5`): `cpu->flash` is a
+  pointer, so any store in the loop may alias it and force a reload every
+  instruction. MSP430 has always cached `memory`/`max_mem` in locals.
+  **4.3%**, 15/20 pairs, p=0.021.
+- **GDB-stub and ROM-trap checks hoisted** (`8c3cb60`): both set once (at GDB
+  attach / ELF load) but re-tested every instruction. MSP430's interpreter has
+  neither obligation — 0 GDB checks vs ARM's 5. **15.9%**, 12/12 pairs,
+  p=0.0002. GDB behaviour verified unchanged by diffing the full RSP exchange.
+
+### 5.3 The real blocker was the decoder, and it is now built (`c40c994`)
+
+The MSP430 JIT is built on `msp430_decode.c` → `decoded_insn_t` →
+`msp430_jit_compile`. **ARM had no decoder at all** — decode is fused into
+execution, and `arm_decode.h` was a dead 21-line stub referenced from nowhere.
+Landed:
+
+- `arm_decode.c` — Thumb-16 decoder + `arm_decode_block()` with an
+  `all_supported` flag the compiler must honour.
+- `arm_execute_decoded()` — reference semantics the generated code must
+  reproduce, in `arm_cpu.c` so it shares the interpreter's flag helpers.
+- `test_runner arm-decode` — differential test, now in CI (0.29 s).
+
+**Subset: 18880 of 65536 encodings.** Small on purpose — anything unsupported
+is refused and interpreted, so it can never run *wrong*, only slowly. ADC/SBC
+are excluded by name: carry-in is exactly what broke the MSP430 JIT.
+
+**Verification is differential and exhaustive**, not by inspection: all 65536
+halfwords × 6 randomised register/flag states through both paths, comparing
+r0–r15, APSR and cycles. 113280 comparisons, 0 failures, identical on
+Linux/gcc. Validated by fault injection — a flag-only BIC bug (invisible to
+`arm-correctness`) is caught immediately.
+
+### 5.4 What remains, and the open decision
+
+Not started: Lightning codegen, the block cache + hot-block threshold,
+invalidation on writes into `[flash_base, flash_end)` **by actual byte span**
+(csim shipped that exact bug once on MSP430, where invalidation covered only a
+fixed 6-byte window), and `JIT_VERIFY` lockstep.
+
+`JIT_VERIFY` is non-negotiable and must exist *before* the first hot block
+runs, not after: the MSP430 ADDC bug was warm-block-only, so no ordinary test
+could reach it. Cycle counts must match block-for-block — determinism is a
+gated guarantee here.
+
+**Open decision (2026-08-06):** codegen is multi-week for ~1.25× on the
+primary dev machine (~1.8× on Linux/CI). The alternatives are to keep mining
+interpreter wins — which returned **34% in a day** (2.939 s → 1.940 s on the
+runner workload) — or to build the JIT primarily for the Linux/CI case. The
+foundation above is worth having either way.
 
 ## 6. Sequencing, risk, rollback
 
@@ -553,7 +611,10 @@ Effort: **3–4 weeks.** Do not start it under release pressure.
 | ~~Tier 2 decode cache~~ **DROPPED** | — | premise refuted (§4.1) | — |
 | **Tier 2′ debug gate** **DONE** | ½ day | — | **14.6% measured**, non-overlapping; full gate green |
 | ~~branch consolidation~~ **REVERTED** | — | 3 wins / 9 paired runs | not a real effect (§4.4) |
-| Tier 3 JIT | 3–4 weeks | medium | JIT_VERIFY clean over corpus + full gate |
+| **Tier 3 decoder** **DONE** | ½ day | — | **113280 differential comparisons, 0 failures**; in CI |
+| Tier 3 codegen | multi-week | **~1.25× on Apple Silicon, ~1.8× on x86-64** (§5.0) | JIT_VERIFY clean over corpus + full gate |
+| ~~flash-window hoist~~ **DONE** | — | 15/20 pairs, p=0.021 | **4.3%** |
+| ~~gdb/ROM-trap hoist~~ **DONE** | — | 12/12 pairs, p=0.0002 | **15.9%** |
 
 **Mandatory gate for anything touching `arm_step` or the event pump:**
 `arm-correctness` (153), `correctness`, `radio-medium` (241), `cc1200` (73),
