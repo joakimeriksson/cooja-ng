@@ -38,6 +38,16 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 
 # ARM Cortex-M3/M4 tests
 ./build/test_runner arm-correctness -v   # 153 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33)
+./build/test_runner arm-decode           # Decoder differential test: exhaustive over all
+                                         # 65536 Thumb halfwords x 6 random register/flag
+                                         # states, running decoder + arm_execute_decoded()
+                                         # against the interpreter and comparing r0-r15,
+                                         # APSR and cycles. 113280 comparisons. This is the
+                                         # foundation the ARM JIT is being built on — the
+                                         # decoder is a SECOND implementation of Thumb-16
+                                         # semantics, and flag-only drift between two
+                                         # implementations is invisible until a branch
+                                         # flips (exactly the MSP430 ADDC bug).
 ./build/test_runner arm-bench            # ARM interpreter benchmarks: 5 synthetic hot-path
                                          # loops (dispatch, Thumb-2 decode, IT blocks, branches,
                                          # load/store) + 2 firmware. Reports MIPS (primary) and

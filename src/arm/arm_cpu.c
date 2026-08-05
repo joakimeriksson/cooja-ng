@@ -2,6 +2,7 @@
  * ARM Cortex-M3 CPU emulator — instruction execution engine
  */
 #include "arm_cpu.h"
+#include "arm_decode.h"
 #include "arm_config.h"
 #include "arm_nvic.h"
 #include "gdb_stub.h"
@@ -681,6 +682,98 @@ static inline uint32_t asr_c(uint32_t val, int shift, int *carry) {
     }
     *carry = (val >> (shift - 1)) & 1;
     return (uint32_t)(sval >> shift);
+}
+
+/*
+ * arm_execute_decoded — the reference semantics for the JIT-compilable subset.
+ *
+ * This is the contract the JIT's generated code must reproduce *exactly*
+ * (registers, APSR flags and cycles).  It lives here rather than in
+ * arm_decode.c so it can reuse the interpreter's own flag helpers — the same
+ * arrangement MSP430 uses (execute_decoded is in msp430_cpu.c, not
+ * msp430_decode.c), and for the same reason: two hand-written copies of the
+ * flag rules would drift, and flag drift is invisible until a branch flips.
+ *
+ * Returns 1 if executed, 0 if the instruction is not in the subset.
+ * PC handling matches arm_step: the caller has already advanced PC past the
+ * instruction, so only B writes it.
+ */
+int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
+    uint32_t *reg = cpu->reg;
+
+    switch (di->klass) {
+    case ARM_DEC_SHIFT_IMM: {
+        int carry;
+        uint32_t v = reg[di->rm];
+        int sh = (int)di->imm;
+        switch (di->shift) {
+        case ARM_SH_LSL: reg[di->rd] = lsl_c(v, sh, &carry); break;
+        case ARM_SH_LSR: reg[di->rd] = lsr_c(v, sh, &carry); break;
+        default:         reg[di->rd] = asr_c(v, sh, &carry); break;
+        }
+        set_nzc(cpu, reg[di->rd], carry);
+        return 1;
+    }
+
+    case ARM_DEC_ALU_REG:
+    case ARM_DEC_ALU_IMM: {
+        int is_imm = (di->klass == ARM_DEC_ALU_IMM);
+        uint32_t n = reg[di->rn];
+        uint32_t m = is_imm ? di->imm : reg[di->rm];
+
+        switch (di->op) {
+        case ARM_ALU_ADD: {
+            uint64_t r = (uint64_t)n + m;
+            if (di->writes_result) reg[di->rd] = (uint32_t)r;
+            set_add_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_CMN: {
+            uint64_t r = (uint64_t)n + m;
+            set_add_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_SUB: {
+            uint64_t r = (uint64_t)n - m;
+            if (di->writes_result) reg[di->rd] = (uint32_t)r;
+            set_sub_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_CMP: {
+            uint64_t r = (uint64_t)n - m;
+            set_sub_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_RSB: {
+            /* NEG Rd, Rm — the interpreter computes 0 - Rm and takes flags
+             * against a == 0, so reproduce that exactly. */
+            uint32_t mv = reg[di->rn];
+            uint64_t r = (uint64_t)0 - mv;
+            reg[di->rd] = (uint32_t)r;
+            set_sub_flags(cpu, 0, mv, r);
+            return 1;
+        }
+        case ARM_ALU_AND: reg[di->rd] = n & m;  set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_EOR: reg[di->rd] = n ^ m;  set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_ORR: reg[di->rd] = n | m;  set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_BIC: reg[di->rd] = n & ~m; set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_TST: set_nz(cpu, n & m); return 1;
+        case ARM_ALU_MVN: reg[di->rd] = ~reg[di->rn]; set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_MOV:
+            reg[di->rd] = is_imm ? di->imm : reg[di->rn];
+            set_nz(cpu, reg[di->rd]);
+            return 1;
+        }
+        return 0;
+    }
+
+    case ARM_DEC_B_UNCOND:
+        reg[ARM_PC] = di->imm;
+        return 1;
+
+    default:
+        return 0;
+    }
 }
 
 static inline uint32_t ror_c(uint32_t val, int shift, int *carry) {

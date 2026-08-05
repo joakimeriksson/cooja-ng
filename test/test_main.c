@@ -34,6 +34,7 @@ extern int run_firmware_tests(int verbose);
 /* ARM test functions */
 extern int run_arm_correctness_tests(int verbose);
 extern int run_arm_benchmarks(void);
+extern int run_arm_decode_tests(int verbose);
 extern int run_arm_firmware_tests(int verbose);
 
 /* Mixed-platform test (handles MSP430, ARM, and native nodes) */
@@ -135,6 +136,10 @@ int main(int argc, char **argv) {
     }
 
     /* ARM modes */
+    if (strcmp(mode, "arm-decode") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_arm_decode_tests(verbose);
+    }
+
     if (strcmp(mode, "arm-bench") == 0) {
         failures += run_arm_benchmarks();
     }

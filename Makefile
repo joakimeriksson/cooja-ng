@@ -61,6 +61,7 @@ SOURCES = $(MSP430_SRC_DIR)/msp430_cpu.c \
           $(MSP430_SRC_DIR)/cc2420.c
 
 ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
+              $(ARM_SRC_DIR)/arm_decode.c \
               $(ARM_SRC_DIR)/arm_config.c \
               $(ARM_SRC_DIR)/arm_nvic.c \
               $(ARM_SRC_DIR)/arm_systick.c \
@@ -169,6 +170,7 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_firmware.c \
                $(TEST_DIR)/test_arm_correctness.c \
                $(TEST_DIR)/test_arm_benchmark.c \
+               $(TEST_DIR)/test_arm_decode.c \
                $(TEST_DIR)/test_arm_firmware.c \
                $(TEST_DIR)/test_mixed_multinode.c \
                $(TEST_DIR)/test_timeline.c \
