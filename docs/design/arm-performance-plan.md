@@ -28,30 +28,35 @@ is a gated guarantee and Lightning is an optional dependency.
 That works out to **4.2 host cycles per emulated instruction** where the JIT
 applies, against the MSP430 JIT's 7.8.
 
-**The one number that did not move is the important one, and §5.11 decomposes
-it.** Short version: the JIT's leverage is *amortising block entry*, Contiki-NG
-protocol code is branch-dense and call/return-shaped, and those workloads spend
-only a third to two thirds of their wall time interpreting in the first place.
-Coverage is real but secondary — proved by measurement, not argued (§5.11.3).
+**The one number that did not move is the important one, and §5.11–§5.12
+decompose it.** Short version: the JIT's leverage is *amortising block entry*;
+Contiki-NG protocol code has a branch every 2.4–3.6 instructions and no hot
+self-loop, so it pays that entry constantly. Measured, the compiled path there
+is only **~1.6x faster per instruction than the interpreter**. Coverage is not
+the lever — adding ~8% of the executed stream changed nothing (§5.12) — **block
+linking is** (§5.12.3).
 
 **Next steps, in the order the measurements justify** — reordered after §5.11,
 which refuted the previous ordering's premise:
 
-1. **Cheap Thumb-16 classes, measured one at a time (§5.11.3).** `NOP` alone
-   took cc2538 coverage 28.5% → 71.4% and bought 1.14x (7/7 paired). Remaining
-   candidates with their measured share of executed instructions:
-   hi-register `dp_reg`/`BX` (4.3% cc2538, 4.3% nRF52840), `SXTB`/`UXTB`/`SXTH`
-   /`UXTH` (3.8% nRF52840), `CBZ`/`CBNZ` (1.7% cc2538, 1.9% nRF52840),
-   `PUSH`/`POP` (1.3% / 1.4%). Days, not weeks, and each is independently
-   gateable. **Expect single-digit percentages, not multiples** — see 5 below.
-2. **Interpreter work, which is not subject to the block-length ceiling.**
-   Every workload spends 34–63% of its wall time interpreting instructions the
-   JIT will not compile soon. Tiers 0–2′ bought 34% this way and were far
-   cheaper than the JIT.
-3. **Thumb-2 codegen.** Still the largest single class on nRF52840 Contiki
-   (**23.3%** of executed instructions there — but only **6.3%** on cc2538, so
-   this is platform-specific, not a blanket "Contiki-NG is Thumb-2 dense"). ~2
-   weeks, and bounded by the same ceiling as everything else.
+~~Cheap Thumb-16 classes~~ **DONE and it bought nothing** (`d5ba3b3`, §5.12).
+~8% of the executed stream, correct and verified, zero measurable speedup.
+The list below is what §5.12 replaced it with.
+
+1. **Block linking (§5.12.3).** The compiled path is only **~1.6x faster per
+   instruction than interpreting**, derived from measurement, because block
+   entry dominates at a static block length of 3.3. Chaining blocks directly to
+   one another removes that cost and makes block length largely irrelevant —
+   which is the property these workloads need, and it helps every platform.
+   Needs a cycle-budget bound at chain entry and unlinking on flush.
+2. **Interpreter work, which is subject to none of the JIT's ceilings.**
+   Every workload spends 34–63% of wall time interpreting. Tiers 0–2′ bought
+   34% this way for far less effort than the JIT.
+3. **Thumb-2 codegen, and only after linking.** Worth 1.09 → 2.23 static block
+   on nRF52840 Contiki (of a 2.41 ceiling) and 3.04 → 3.45 on cc2538 — so it is
+   an nRF52840 change, not a Contiki-NG one. On its own, projected at **~1.15x
+   for ~2 weeks** (§5.12.2). After linking it is worth more, because then the
+   instructions matter and the entry cost does not.
 4. **`arm_step_until`'s convergence tail (§5.7b).** 79.8% of `arm_step` calls
    arrive with a budget of 1 instruction; the JIT now escapes that via the
    cycle target, but the interpreter still pays ~3M call frames per 3 s run to
@@ -61,11 +66,18 @@ which refuted the previous ordering's premise:
    register liveness across instructions, the loop back-edge, join patching —
    is covered only by `CSIM_ARM_JIT_VERIFY=1` over the firmware corpus.
 
-**What is NOT on this list, and why:** raising Contiki-NG ARM to Zephyr-like
-speedups. §5.11 shows the ceiling is structural — roughly **1.5x on cc2538 and
-2.5x on nRF52840 even with an infinitely fast JIT** — so no amount of codegen
-work gets there. Anyone planning against a 3x number for those platforms is
-planning against the wrong number.
+**What is NOT on this list, and why:** more instruction coverage as a way to
+speed up Contiki-NG ARM. §5.12 tested that directly — ~8% of the executed
+stream added, nothing measurable out — and the probe explains it: the blocks
+are short because of *branch density*, and every extra class buys a fraction of
+an instruction. **Coverage is a prerequisite for linking, not a substitute for
+it.**
+
+Also not on the list: raising these platforms to Zephyr-like numbers. Zephyr's
+3.5x comes from a **self-loop** entered once and run ~1000 iterations natively
+(§5.12.1); Contiki-NG protocol code has no such loop, and its static block
+ceiling (2.4–3.6) is no better than Zephyr's (2.1). Anyone planning against a
+3x number for these platforms is planning against the wrong number.
 
 Read §5.10 before touching `arm_jit.c` — it documents a GNU Lightning x86-64
 backend bug that made every N-reading condition silently take the wrong branch
@@ -975,6 +987,95 @@ Contiki-NG ARM look like the Zephyr number.** The honest targets are ~1.5x on
 cc2538 and ~2.5x on nRF52840, and interpreter work — which is subject to none
 of these ceilings — competes well against JIT work for the same effort.
 
+### 5.12 The cheap classes bought nothing, and the probe that explains why
+
+After `NOP`, the remaining cheap Thumb-16 classes were added together
+(`d5ba3b3`): high-register ADD/CMP/MOV, CBZ/CBNZ, SXTB/SXTH/UXTB/UXTH, ADR,
+`ADD Rd,SP,#imm`, `ADD/SUB SP,#imm`. That is **~8% of everything Contiki-NG
+executes** on both platforms, verified to 410400 generated-code comparisons.
+
+**Result: no measurable speedup.**
+
+| | coverage | mean block | wall clock (7 pairs) |
+|---|---|---|---|
+| cc2538 2-node RPL-UDP | 71.4% → 71.5% | 3.3 → 3.3 | 1.14x → 1.10x |
+| chain-3node-nRF52840 | 12.4% → 13.2% | 1.8 → 1.8 | 1.00x → 1.02x |
+
+Removing a block-stopper only lengthens a block if the *next* instruction is
+also supported, and it usually is not. CBZ/CBNZ is the clean illustration: it
+used to end a block by being unsupported and now ends it by being a
+terminator, so the block gains the CBZ itself and nothing else.
+
+**5.12.1 Probe: how long could blocks be, under any coverage?**
+
+Rather than guess at Thumb-2's value, walk forward from every executed PC and
+count how far a block *could* reach under three assumptions. (Static block
+length — one pass, not counting loop iterations.)
+
+| assumption | Contiki nRF52840 | Contiki cc2538 | Zephyr sync |
+|---|---|---|---|
+| today | 1.09 | 3.04 | 1.68 |
+| **+ Thumb-2 supported** | **2.23** | **3.45** | 1.96 |
+| + every non-branch instruction | 2.41 | 3.63 | 2.10 |
+| *(= branch-only ceiling)* | | | |
+
+Two things fall out, and the second one reframes this whole section.
+
+**Thumb-2 is most of the remaining headroom on nRF52840 (1.09 → 2.23 of a 2.41
+ceiling) and almost none on cc2538 (3.04 → 3.45).** The blanket "do Thumb-2"
+recommendation was wrong in the same way the blanket "Contiki is Thumb-2 dense"
+claim was.
+
+**And Zephyr's ceiling is 2.10 — lower than cc2538's.** Yet Zephyr runs 3.5x
+and cc2538 1.1x. So *static block length is not what distinguishes them*, and
+§5.11.2 was reaching for the wrong variable. What distinguishes them is that
+Zephyr's hot block is a **self-loop**: it is entered once and runs ~1000
+iterations inside compiled code, so the entry cost is amortised a thousandfold.
+The `avg_block=31.7` reported by `CSIM_ARM_JIT_STATS` counts iterations, not
+instructions decoded — it was measuring the loop, not the block.
+
+Contiki-NG protocol code has no such loop. It has a branch every 2.4–3.6
+instructions and returns to the dispatcher at each one.
+
+**5.12.2 How fast is the compiled path actually, per instruction?**
+
+This can be derived from measurements rather than modelled. cc2538 spends ~34%
+of wall time interpreting (§5.11.4), runs 71.5% of instructions through
+compiled code, and comes out 1.10x overall. Solving for the per-instruction
+speedup *f* of the compiled path:
+
+```
+1.10 = 1 / (0.66 + 0.34 × (0.285 + 0.715/f))   →   f ≈ 1.6
+```
+
+**At a static block length of 3.3, compiled code is only ~1.6x faster per
+instruction than interpreting it.** Block entry — the cache probe, the call,
+the prologue saving callee-saved registers, the xPSR load and its mirror on
+exit — is eating most of the 4–5x the generated code achieves inside a long
+block (§5.8: 3.6 host cycles/instruction on `alu-reg`, against ~15 interpreted).
+
+Applying the same arithmetic forward: Thumb-2 taking nRF52840 from 1.09 to 2.23
+would lift *f* to roughly 1.4, and with 63% of wall time interpreted that is
+**about 1.15x overall — two weeks for 15%.**
+
+**5.12.3 What this says to do instead: block linking, not more coverage.**
+
+If per-entry cost is the binding constraint, the fix is to stop paying it. The
+standard technique is **block chaining** — a compiled block ends by jumping
+*directly* into the next compiled block instead of returning to the dispatcher,
+so a chain of 2-instruction blocks runs without re-entering C at all. It makes
+block length largely irrelevant, which is exactly the property these workloads
+need, and it benefits every platform rather than one.
+
+It is not free: something must still bound how long a chain runs, because a
+block contains no event check. The natural shape is a cycle-budget test at each
+chain entry (the data for it — `cycles_total` per block and `next_event_cycle`
+— already exists, §5.7), plus unlinking on cache flush.
+
+**Recommended order, revised:** block linking first; Thumb-2 only afterwards,
+and then for nRF52840's sake specifically. Thumb-2 before linking would be
+buying instructions for blocks that cannot pay for themselves.
+
 ## 6. Sequencing, risk, rollback
 
 | Step | Effort | Confidence | Gate |
@@ -989,9 +1090,11 @@ of these ceilings — competes well against JIT work for the same effort.
 | **Tier 3 codegen** **DONE** | 1 day | — | 4.46x ALU, cycle-exact, JIT_VERIFY 0 mismatches |
 | **Tier 3b memory ops + dispatch** **DONE** | 1 day | — | **3.42x on real Zephyr firmware** (§5.8); 269952 decode comparisons |
 | **`arm-jit` generated-code suite** **DONE** | ½ day | — | **359936 comparisons over 44992 encodings, 0 failures**, both hosts; in CI |
-| **Tier 3c Thumb-2** | ~2 weeks | the whole remaining gap on Contiki-NG ARM (§5.8) | same lockstep + byte-identical gate |
+| **Tier 3c NOP** **DONE** | 1 h | — | **1.14x on cc2538**, 18% of its stream (§5.11.3) |
+| **Tier 3d cheap Thumb-16 classes** **DONE** | ½ day | — | **no measurable speedup** — kept as a linking prerequisite (§5.12) |
+| **Tier 3e block linking** | ~1 week | compiled path is only 1.6x/insn; entry dominates (§5.12.2) | lockstep + byte-identical + full gate |
+| Tier 3f Thumb-2 | ~2 weeks | nRF52840 only; ~1.15x alone, more after linking (§5.12.2) | same |
 | `arm_step_until` convergence tail | ~2 days | 79.8% of calls carry a budget of 1 (§5.7) | timing-sensitive — full gate, byte-identical |
-| remaining Thumb-16 classes | ~3 days | low — blocks are branch-bound at ~4 (§5.7) | `arm-decode` + `arm-jit` + full gate |
 | ~~flash-window hoist~~ **DONE** | — | 15/20 pairs, p=0.021 | **4.3%** |
 | ~~gdb/ROM-trap hoist~~ **DONE** | — | 12/12 pairs, p=0.0002 | **15.9%** |
 
