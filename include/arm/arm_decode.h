@@ -84,6 +84,8 @@ typedef enum {
     ARM_DEC_STORE,           /* mem[reg[rn] + (imm | reg[rm])] = Rt          */
     ARM_DEC_LOAD_LIT,        /* Rt = mem32[imm] — PC-relative, address const */
     ARM_DEC_NOP,             /* 0xBF00 — no architectural effect at all       */
+    ARM_DEC_EXTEND,          /* SXTB/SXTH/UXTB/UXTH: Rd = extend(Rm)          */
+    ARM_DEC_CBZ,             /* CBZ/CBNZ <label> — block terminator           */
 } arm_dec_class_t;
 
 /* `rm` value meaning "no register offset" — the offset is `imm` alone. */
@@ -127,11 +129,16 @@ typedef struct arm_decoded_insn {
     uint32_t imm;               /* immediate, shift amount, branch target, or
                                  * (LOAD_LIT) the absolute address           */
 
-    /* LOAD/STORE/LOAD_LIT only. */
-    uint8_t  msize;             /* access width in bytes: 1, 2 or 4          */
-    bool     sext;              /* LDRSB/LDRSH: sign-extend the loaded value */
+    /* LOAD/STORE/LOAD_LIT/EXTEND only. */
+    uint8_t  msize;             /* access/extend width in bytes: 1, 2 or 4   */
+    bool     sext;              /* LDRSB/LDRSH/SXTB/SXTH: sign-extend        */
 
     bool     writes_result;     /* false for CMP/CMN/TST                     */
+    /* False for the forms that compute a value but leave the flags alone:
+     * the high-register ADD/MOV, ADR, ADD Rd,SP,#imm and ADD/SUB SP,#imm.
+     * Getting this backwards is invisible until a later branch reads a flag
+     * that should not have moved — the MSP430 ADDC failure mode again. */
+    bool     set_flags;
     uint8_t  cycles;            /* cycles the interpreter charges            */
 } arm_decoded_insn_t;
 

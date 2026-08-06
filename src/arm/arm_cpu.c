@@ -804,6 +804,20 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
     case ARM_DEC_NOP:
         return 1;                      /* the caller already charged the cycle */
 
+    case ARM_DEC_EXTEND:
+        reg[di->rd] = (di->msize == 1)
+            ? (di->sext ? (uint32_t)(int32_t)(int8_t)(uint8_t)reg[di->rm]
+                        : (reg[di->rm] & 0xFFu))
+            : (di->sext ? (uint32_t)(int32_t)(int16_t)(uint16_t)reg[di->rm]
+                        : (reg[di->rm] & 0xFFFFu));
+        return 1;
+
+    case ARM_DEC_CBZ: {
+        int nonzero = (reg[di->rn] != 0);
+        if (nonzero == (int)di->cond) reg[ARM_PC] = di->imm;
+        return 1;
+    }
+
     case ARM_DEC_LOAD_LIT:
         reg[di->rd] = mem_read32_unaligned(cpu, di->imm);
         cpu->cycles += di->cycles - 1;
@@ -849,7 +863,7 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
         case ARM_ALU_ADD: {
             uint64_t r = (uint64_t)n + m;
             if (di->writes_result) reg[di->rd] = (uint32_t)r;
-            set_add_flags(cpu, n, m, r);
+            if (di->set_flags) set_add_flags(cpu, n, m, r);
             return 1;
         }
         case ARM_ALU_CMN: {
@@ -860,7 +874,7 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
         case ARM_ALU_SUB: {
             uint64_t r = (uint64_t)n - m;
             if (di->writes_result) reg[di->rd] = (uint32_t)r;
-            set_sub_flags(cpu, n, m, r);
+            if (di->set_flags) set_sub_flags(cpu, n, m, r);
             return 1;
         }
         case ARM_ALU_CMP: {
@@ -885,7 +899,7 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
         case ARM_ALU_MVN: reg[di->rd] = ~reg[di->rn]; set_nz(cpu, reg[di->rd]); return 1;
         case ARM_ALU_MOV:
             reg[di->rd] = is_imm ? di->imm : reg[di->rn];
-            set_nz(cpu, reg[di->rd]);
+            if (di->set_flags) set_nz(cpu, reg[di->rd]);
             return 1;
         }
         return 0;

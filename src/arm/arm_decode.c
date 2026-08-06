@@ -40,6 +40,7 @@ static void base(arm_decoded_insn_t *out, uint32_t pc, uint16_t hw,
     out->size          = 2;
     out->klass         = k;
     out->writes_result = true;
+    out->set_flags     = true;
     out->cycles        = 1;
     out->rm            = ARM_DEC_NO_RM;
 }
@@ -131,7 +132,36 @@ int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
 
     /* ---- data processing (register), Rd = Rd <op> Rm ---- */
     case 8: {
-        if ((hw >> 10) != 0x10) return reject(out, pc, hw); /* hi-reg / BX */
+        if ((hw >> 10) == 0x11) {
+            /* ---- high-register ADD / CMP / MOV ----
+             * ADD and MOV here do NOT set flags (unlike their low-register
+             * namesakes) and CMP does; that asymmetry is the whole reason
+             * `set_flags` exists.
+             *
+             * Any form naming r15 is refused, in either operand.  Reading PC
+             * yields InstructionAddr+4 and writing it is a branch, and the
+             * block design depends on PC being live only at block exit —
+             * "no instruction in this subset touches PC" is an invariant the
+             * code generator relies on, not a convenience.  BX/BLX (opcode 3)
+             * is refused for the same reason: its target is a register value,
+             * and it can be an exception return. */
+            int opcode = (hw >> 8) & 3;
+            int d = (int)(((hw >> 4) & 8) | (hw & 7));
+            int m = (int)((hw >> 3) & 0xF);
+            if (opcode == 3 || d == 15 || m == 15) return reject(out, pc, hw);
+            base(out, pc, hw, ARM_DEC_ALU_REG);
+            out->rd = (uint8_t)d;
+            out->rn = (uint8_t)d;
+            out->rm = (uint8_t)m;
+            switch (opcode) {
+            case 0: out->op = ARM_ALU_ADD; out->set_flags = false; break;
+            case 1: out->op = ARM_ALU_CMP; out->writes_result = false; break;
+            default: out->op = ARM_ALU_MOV; out->set_flags = false;
+                     out->rn = (uint8_t)m; break;
+            }
+            return 2;
+        }
+        if ((hw >> 10) != 0x10) return reject(out, pc, hw);
         int opcode = (hw >> 6) & 0xF;
         base(out, pc, hw, ARM_DEC_ALU_REG);
         out->rd = hw & 7;
@@ -183,6 +213,30 @@ int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
         return 2;
     }
 
+    /* ---- ADR: ADD Rd, PC, #imm8*4 ----
+     * PC is a compile-time constant for a given instruction, so this folds to
+     * a plain immediate move and never actually reads r15 at run time. */
+    case 20: {
+        base(out, pc, hw, ARM_DEC_ALU_IMM);
+        out->op        = ARM_ALU_MOV;
+        out->set_flags = false;
+        out->rd        = (uint8_t)((hw >> 8) & 7);
+        out->rn        = out->rd;
+        out->imm       = (((pc + 4) & ~3u) + (uint32_t)((hw & 0xFF) << 2));
+        return 2;
+    }
+
+    /* ---- ADD Rd, SP, #imm8*4 ---- */
+    case 21: {
+        base(out, pc, hw, ARM_DEC_ALU_IMM);
+        out->op        = ARM_ALU_ADD;
+        out->set_flags = false;
+        out->rd        = (uint8_t)((hw >> 8) & 7);
+        out->rn        = 13;                     /* ARM_SP */
+        out->imm       = (uint32_t)((hw & 0xFF) << 2);
+        return 2;
+    }
+
     /* ---- NOP ----
      * Only the bare 0xBF00 encoding.  The rest of the 0xBFxx space is IT (low
      * nibble non-zero) plus WFI/WFE/SEV, all of which have real effects — WFI
@@ -193,11 +247,49 @@ int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
      * executed by Contiki-NG on cc2538 are this encoding**, and because an
      * unsupported instruction ends a block, it was the single largest thing
      * cutting blocks short on that platform. */
-    case 23:
-        if (hw != 0xBF00) return reject(out, pc, hw);
-        base(out, pc, hw, ARM_DEC_NOP);
-        out->writes_result = false;
-        return 2;
+    case 22: case 23: {
+        int nib = (hw >> 8) & 0xF;
+
+        if (hw == 0xBF00) {                      /* NOP */
+            base(out, pc, hw, ARM_DEC_NOP);
+            out->writes_result = false;
+            return 2;
+        }
+        if (nib == 0x0) {                        /* ADD/SUB SP, #imm7*4 */
+            base(out, pc, hw, ARM_DEC_ALU_IMM);
+            out->op        = (hw & 0x80) ? ARM_ALU_SUB : ARM_ALU_ADD;
+            out->set_flags = false;
+            out->rd = out->rn = 13;              /* ARM_SP */
+            out->imm       = (uint32_t)((hw & 0x7F) << 2);
+            return 2;
+        }
+        if (nib == 0x2) {                        /* SXTH/SXTB/UXTH/UXTB */
+            static const struct { uint8_t msize, sext; } t[4] = {
+                { 2, 1 },  /* SXTH */  { 1, 1 },  /* SXTB */
+                { 2, 0 },  /* UXTH */  { 1, 0 },  /* UXTB */
+            };
+            int op2 = (hw >> 6) & 3;
+            base(out, pc, hw, ARM_DEC_EXTEND);
+            out->rd    = (uint8_t)(hw & 7);
+            out->rm    = (uint8_t)((hw >> 3) & 7);
+            out->msize = t[op2].msize;
+            out->sext  = t[op2].sext != 0;
+            return 2;
+        }
+        if (nib == 0x1 || nib == 0x3 || nib == 0x9 || nib == 0xB) {
+            /* CBZ / CBNZ — terminator with a compile-time-constant target.
+             * The offset is unsigned, so these only ever branch forward and
+             * can never form the self-loop shape arm_jit_compile looks for. */
+            base(out, pc, hw, ARM_DEC_CBZ);
+            out->writes_result = false;
+            out->rn   = (uint8_t)(hw & 7);
+            out->cond = (uint8_t)((nib >> 3) & 1);   /* 1 = CBNZ */
+            out->imm  = pc + 4 + (uint32_t)((((hw >> 9) & 1) << 6) |
+                                            (((hw >> 3) & 0x1F) << 1));
+            return 2;
+        }
+        return reject(out, pc, hw);
+    }
 
     /* ---- LDR Rt, [PC, #imm8*4] — literal pool ----
      * The address is a compile-time constant, which is what makes this worth
@@ -284,7 +376,8 @@ void arm_decode_block(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
         block->end_pc = pc;
 
         if (di->klass == ARM_DEC_B_UNCOND ||
-            di->klass == ARM_DEC_B_COND) return;   /* terminator */
+            di->klass == ARM_DEC_B_COND ||
+            di->klass == ARM_DEC_CBZ) return;      /* terminator */
     }
 
     /* A block that ran to the cap (or hit an unsupported instruction) has no

@@ -388,8 +388,24 @@ static int emit_insn(jit_state_t *_jit, emit_ctx_t *cx,
 
     case ARM_DEC_B_UNCOND:
     case ARM_DEC_B_COND:
+    case ARM_DEC_CBZ:
         /* Terminators are handled by the epilogue, which is the only place
          * that knows both the branch target and the fall-through address. */
+        return 1;
+
+    case ARM_DEC_EXTEND:
+        /* SXTB/SXTH/UXTB/UXTH — no flags.  Lightning's ext* forms carry no
+         * immediate, which is one fewer way to meet the backend bug in
+         * emit_n_bit()'s comment. */
+        LOADREG_U(JIT_R1, di->rm);
+        if (di->msize == 1) {
+            if (di->sext) jit_extr_c(JIT_R0, JIT_R1);
+            else          jit_extr_uc(JIT_R0, JIT_R1);
+        } else {
+            if (di->sext) jit_extr_s(JIT_R0, JIT_R1);
+            else          jit_extr_us(JIT_R0, JIT_R1);
+        }
+        STOREREG(JIT_R0, di->rd);
         return 1;
 
     case ARM_DEC_SHIFT_IMM: {
@@ -433,6 +449,26 @@ static int emit_insn(jit_state_t *_jit, emit_ctx_t *cx,
         LOADREG_U(JIT_R0, di->rn);
         if (is_imm) jit_movi(JIT_R1, (jit_word_t)di->imm);
         else        LOADREG_U(JIT_R1, di->rm);
+
+        /*
+         * The high-register ADD/MOV, ADR, ADD Rd,SP,#imm and ADD/SUB SP,#imm
+         * compute a value and leave the flags alone.  They are the only forms
+         * in the subset that do, and emitting the flag update anyway would be
+         * a divergence no register comparison could see — it only shows up
+         * when a later conditional branch reads a flag that should not have
+         * moved.
+         */
+        if (!di->set_flags) {
+            switch (di->op) {
+            case ARM_ALU_ADD: jit_addr(JIT_R2, JIT_R0, JIT_R1); break;
+            case ARM_ALU_SUB: jit_subr(JIT_R2, JIT_R0, JIT_R1); break;
+            case ARM_ALU_MOV: jit_movr(JIT_R2, is_imm ? JIT_R1 : JIT_R0); break;
+            default: return 0;
+            }
+            jit_andi(JIT_R2, JIT_R2, (jit_word_t)LOW32);
+            if (di->writes_result) STOREREG(JIT_R2, di->rd);
+            return 1;
+        }
 
         switch (di->op) {
         case ARM_ALU_ADD:
@@ -513,7 +549,8 @@ arm_compiled_block_t *arm_jit_compile(const arm_basic_block_t *block,
      * exits with PC = end_pc for the interpreter to continue from. */
     const arm_decoded_insn_t *last = &block->insns[block->length - 1];
     int term_is_branch = (last->klass == ARM_DEC_B_UNCOND ||
-                          last->klass == ARM_DEC_B_COND);
+                          last->klass == ARM_DEC_B_COND ||
+                          last->klass == ARM_DEC_CBZ);
 
     /*
      * A conditional branch back to the block's own first instruction is a
@@ -599,8 +636,16 @@ arm_compiled_block_t *arm_jit_compile(const arm_basic_block_t *block,
         jit_movi(JIT_R0, (jit_word_t)block->start_pc);
         STOREREG(JIT_R0, ARM_PC);
         if (cx.nstubs) joins[njoin++] = jit_jmpi();  /* jump over the stubs */
-    } else if (last->klass == ARM_DEC_B_COND) {
-        emit_cond(_jit, last->cond);
+    } else if (last->klass == ARM_DEC_B_COND || last->klass == ARM_DEC_CBZ) {
+        if (last->klass == ARM_DEC_CBZ) {
+            /* CBZ/CBNZ tests a register against zero and never reads a flag.
+             * `cond` carries 1 for CBNZ, 0 for CBZ. */
+            LOADREG_U(JIT_R1, last->rn);
+            if (last->cond) jit_nei(JIT_R0, JIT_R1, 0);
+            else            jit_eqi(JIT_R0, JIT_R1, 0);
+        } else {
+            emit_cond(_jit, last->cond);
+        }
         jit_node_t *not_taken = jit_beqi(JIT_R0, 0);
         jit_movi(JIT_R0, (jit_word_t)last->imm);
         STOREREG(JIT_R0, ARM_PC);
