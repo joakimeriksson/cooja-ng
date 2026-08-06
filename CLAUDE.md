@@ -48,6 +48,20 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
                                          # and flag-only drift between two implementations
                                          # is invisible until a branch flips (exactly the
                                          # MSP430 ADDC bug).
+./build/test_runner arm-jit              # JIT differential test: for every Thumb halfword
+                                         # the decoder accepts, compile a one-instruction
+                                         # block and run the GENERATED CODE against the
+                                         # interpreter over 8 register/flag states.
+                                         # 44992 encodings, 359936 comparisons. Distinct
+                                         # from arm-decode, which only validates the
+                                         # *description* of an instruction — the JIT ships a
+                                         # third implementation (the machine code Lightning
+                                         # emits) and only running it tests it, on the host
+                                         # it was emitted for. This suite exists because
+                                         # jit_andi(dst,src,0x80000000) returns 0 on x86-64
+                                         # Lightning 2.2.3, which made every N-reading
+                                         # condition (MI/PL/GE/LT/GT/LE) silently wrong
+                                         # there while every other test stayed green.
 ./build/test_runner arm-bench            # ARM interpreter benchmarks: 5 synthetic hot-path
                                          # loops (dispatch, Thumb-2 decode, IT blocks, branches,
                                          # load/store) + 2 firmware. Reports MIPS (primary) and

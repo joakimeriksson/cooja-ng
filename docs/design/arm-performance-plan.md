@@ -762,15 +762,59 @@ forms are left.
   `zephyr-synchronization` run the two agree to the cycle: 3813589583 cycles,
   453300376 instructions, same final PC.
 - **`arm-decode`**: 269952 differential comparisons, 0 failed, both hosts.
+- **`arm-jit`** (new, §5.10): 359936 generated-code comparisons over 44992
+  encodings, 0 failed, both hosts.
 - **TSCH passes on both** `cc2538dk` and `nrf52840-dk` — the timing-sensitive
   case, and the one that would break first if a block ran past an event.
 
-**Gap worth closing:** `emit_cond()` is the highest-risk function in the JIT —
-14 condition codes, and a wrong one silently takes the wrong branch — yet it is
-covered only by whatever conditions the corpus happens to execute.
-`CSIM_ARM_JIT_MIN_BLOCK=1` is now the default, so an `arm-jit` suite could
-compile one-instruction blocks and verify generated code exhaustively, the way
-`arm-decode` does for the reference model. That suite is not written yet.
+### 5.10 The bug that justified all of it, found on the second host
+
+The gap flagged here in the previous revision — "`emit_cond()` is the
+highest-risk function in the JIT and is covered only by whatever the corpus
+happens to execute" — turned out to be occupied.
+
+```
+jit_andi(dst, src, 0x80000000) returns 0 on x86-64 GNU Lightning 2.2.3.
+```
+
+`emit_cond()` extracted the N flag exactly that way, so **MI, PL, GE, LT, GT
+and LE all evaluated as though N were clear** on x86-64. Isolated in a
+standalone Lightning program with no csim involved: `ori`, `bmci`, `bmsi` and
+`andi` with `0xFFFFFFFF` are all correct on the same operand, and the ARM64
+backend is correct throughout. The fix is a logical right shift, which carries
+no immediate.
+
+**What it looked like from the outside is the part worth remembering.** On the
+host where it was wrong, every signal being watched stayed green: `arm-decode`
+269952/269952, `arm-correctness` 153/153, the full Cooja suite 93/93, and
+simulations producing entirely plausible output. They simply took the wrong
+branch sometimes. Two properties kept it hidden — it is **host-specific**, so
+the development machine could not find it, and it only bites where short
+conditional tails are compiled, so it was dormant at `MIN_BLOCK=4` and appeared
+the instant that became 1. It surfaced only because `CSIM_ARM_JIT_VERIFY=1` was
+run on the other architecture, where it reported 902007 mismatches in which
+**r15 was the only register that differed and the flags agreed** — the JIT
+computing N correctly and then reading it back as zero.
+
+**`arm-jit` now closes it.** For every one of the 65536 Thumb halfwords the
+decoder accepts, compile a one-instruction block and run the generated code
+against the interpreter over 8 register/flag states, comparing r0–r15, APSR and
+cycles: 44992 encodings, **359936 comparisons, 0 failed on both arm64 and
+x86-64**. The conditional-branch encodings supply all 14 condition codes
+against random flags; memory encodings are driven both at SRAM addresses (the
+inline path) and at wild ones, exercising 67583 guarded side exits and checking
+each leaves state untouched.
+
+`arm-decode` could never have caught this, and the distinction generalises:
+`arm-decode` validates the *description* of an instruction, while the JIT ships
+a **third** implementation — the machine code Lightning emits from that
+description. Only running that code tests it, and only on the host it was
+emitted for.
+
+**Remaining gap:** neither suite runs multi-instruction blocks, so a bug in how
+blocks are *composed* (register liveness across instructions, the loop
+back-edge, join patching) is still corpus-covered only. `CSIM_ARM_JIT_VERIFY=1`
+over the firmware corpus is what covers that today.
 
 ## 6. Sequencing, risk, rollback
 

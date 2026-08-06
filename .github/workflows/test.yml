@@ -40,6 +40,19 @@ jobs:
       - name: ARM decoder differential tests
         run: ./build/test_runner arm-decode
 
+      # Differential test of the GENERATED CODE against the interpreter, over
+      # the same exhaustive encoding sweep.  This is not redundant with
+      # arm-decode: that one validates the *description* of an instruction,
+      # while the JIT ships a third implementation — the machine code GNU
+      # Lightning emits — and only running it tests it, on the host it was
+      # emitted for.  It is here because jit_andi(dst, src, 0x80000000) returns
+      # 0 on x86-64 Lightning 2.2.3, which made every N-reading condition
+      # (MI/PL/GE/LT/GT/LE) silently take the wrong branch on that host while
+      # arm-decode, arm-correctness and the whole Cooja suite stayed green.
+      # Skips itself cleanly when Lightning is not installed.
+      - name: ARM JIT generated-code differential tests
+        run: ./build/test_runner arm-jit
+
       - name: Timeline unit tests
         run: ./build/test_runner timeline
 
