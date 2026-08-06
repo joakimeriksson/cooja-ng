@@ -780,8 +780,9 @@ forms are left.
   case, and the one that would break first if a block ran past an event.
 - **Full gate on Linux/x86-64** (the host the bug in §5.10 lived on): every
   suite above, all five configs cycle-exact, lockstep clean on three workloads,
-  MSP430 determinism check, both TSCH tests, and the **Cooja suite 85 passed /
-  0 failed** (8 `17-tun-rpl-br` tests skipped without `--with-tun`).
+  MSP430 determinism check, both TSCH tests, and the **Cooja suite 93/93,
+  0 failed, 0 skipped** — including all eight `17-tun-rpl-br` border-router
+  tests under `--with-tun`.
 
 ### 5.10 The bug that justified all of it, found on the second host
 
