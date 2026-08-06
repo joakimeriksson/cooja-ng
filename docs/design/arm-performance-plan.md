@@ -60,10 +60,13 @@ Thumb-2 all optimise that 5%.
 2. **`arm_step_until`'s convergence tail (§5.7b).** 79.8% of `arm_step` calls
    arrive with a budget of 1 instruction; ~3M call frames per 3 s run to execute
    one instruction each. Timing-sensitive, so it needs the full gate.
-3. **Consider disabling the JIT where coverage is low.** On Contiki-NG/nRF52840
-   `arm_step` + `arm_jit_run` are 7.5% of runtime for 13% coverage — the
-   dispatcher costs close to what it saves. A coverage-triggered bail-out would
-   need care to stay cycle-exact, but the measurement says it is worth checking.
+3. ~~**Disable the JIT where coverage is low.**~~ **Checked and refused.** The
+   profile made this look promising — on Contiki-NG/nRF52840 `arm_step` +
+   `arm_jit_run` are 7.5% of runtime for 13% coverage — but measuring it
+   directly after the ROM-trap hoist, the JIT is still a net positive
+   everywhere it was suspect (7 paired reps each): chain-3node-nRF52840 1.01x,
+   chain-4node 1.00x, cc2538 1.05x. The dispatcher costs close to what it
+   saves; it does not cost more. Leave it on.
 4. **Multi-instruction block verification (§5.10).** `arm-decode` and `arm-jit`
    are both exhaustive over *single* encodings; block **composition** —
    register liveness across instructions, the loop back-edge, join patching —
@@ -1139,7 +1142,10 @@ should have been measured before any of that work rather than after.
 
 On Contiki-NG/nRF52840 the same profile also shows **`arm_step` + `arm_jit_run`
 at 7.5% of runtime for 13% instruction coverage** — the JIT dispatcher there
-costs close to what it saves.
+costs close to what it saves. Close to, but not more than: measured after the
+ROM-trap hoist, `CSIM_ARM_JIT=1` still beats `=0` on every workload where this
+looked doubtful (chain-3node 1.01x, chain-4node 1.00x, cc2538 1.05x, 7 paired
+reps each), so it stays on.
 
 **5.13.4 The immediate payoff.** `handle_fw_trap` at ~10% was a per-instruction
 call the compiler declined to inline — the `condition_passed` defect from Tier
