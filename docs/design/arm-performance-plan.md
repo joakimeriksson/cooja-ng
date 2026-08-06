@@ -744,6 +744,18 @@ Whole-runner workloads, 5 paired reps:
 | cc2538 2-node RPL-UDP, 120 s sim | 0.24 s | 0.24 s | 1.00x |
 | `chain-3node-nrf54l15-dk` | 0.81 s | 0.82 s | 0.99x |
 
+Linux/x86-64 (jftest4, gcc) agrees and is larger, because its interpreter
+baseline is lower. **One interleaved pair, not a paired median** — the seven-rep
+protocol above was run on Apple Silicon only:
+
+| benchmark | JIT off | JIT on | |
+|---|---|---|---|
+| `fw-zephyr-sync` | 190.3 | **1170.5** MIPS | **6.15x** |
+| `alu-reg` | 188.5 | 882.6 MIPS | 4.68x |
+| `mem-ldr-str` | 187.5 | 669.7 MIPS | 3.57x |
+| `branch` | 197.5 | 369.8 MIPS | 1.87x |
+| `thumb2-dp`, `it-block`, `fw-cc2538-udp` | | | ~1.00x |
+
 **The flat cases are honest and the reason is the same one.** They are Thumb-2
 dense, so almost nothing compiles and they pay the probe: average block length
 is **1.7–2.4 instructions on Contiki-NG ARM firmware against 34.9 on Zephyr**.
@@ -766,6 +778,10 @@ forms are left.
   encodings, 0 failed, both hosts.
 - **TSCH passes on both** `cc2538dk` and `nrf52840-dk` — the timing-sensitive
   case, and the one that would break first if a block ran past an event.
+- **Full gate on Linux/x86-64** (the host the bug in §5.10 lived on): every
+  suite above, all five configs cycle-exact, lockstep clean on three workloads,
+  MSP430 determinism check, both TSCH tests, and the **Cooja suite 85 passed /
+  0 failed** (8 `17-tun-rpl-br` tests skipped without `--with-tun`).
 
 ### 5.10 The bug that justified all of it, found on the second host
 
