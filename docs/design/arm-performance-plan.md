@@ -1160,6 +1160,52 @@ trace formation put together.
 reachable on protocol firmware, where the instructions it can compile are not
 where the time is. Further coverage, linking or Thumb-2 all optimise the 5%.
 
+### 5.14 Two interpreter changes, one of each kind
+
+**5.14.1 MMIO page-hash lookup — DONE (`59673d7`): 1.07x on TSCH.**
+`find_io_region` was an unconditionally full linear scan (smallest-wins forbids
+early exit) at ~7% of cc2538 runtime. Replaced by an open-addressed hash on
+`addr >> 12` whose per-page chain is sorted by (size, registration index) — the
+first containing entry IS the linear scan's winner, including the NVIC⊃SysTick
+overlap. Three-layer proof: `ARM_IO_XCHECK=1` runs both lookups on every access
+and aborts on disagreement (clean over the whole corpus); a unit test covers
+every registration pattern plus a 200k-address fuzz and a forced fallback;
+byte-identical output. Same build, interleaved: **TSCH nrf52840 1.07x (7/7)**,
+chain-3node 1.03x (5/7), zephyr neutral at ms resolution (1.004x, 6/10).
+`ARM_IO_LINEAR=1` is the permanent A/B knob.
+
+**5.14.2 Cycle-target interpreter loop — built, measured, REVERTED.**
+The §5.7b hypothesis: 79.8% of `arm_step` calls carry a budget of 1
+instruction (~3M single-instruction call frames per 3 s run), so folding the
+`arm_step_until` batch convergence into the interpreter loop should be worth
+1.05–1.15x. The design replayed the old batch schedule exactly — same formula,
+same `sim_time_ns` sync points, and (after the first cut missed it) the same
+dispatcher preamble per virtual boundary, since an old `arm_step(1)` could
+retire 2+ instructions via the by_limit raise and every tail visit bumped the
+compile counter.
+
+Two results worth the record:
+
+- **The slice-trace protocol works.** `ARM_SLICE_TRACE=1` logs
+  `(cycles, insns, batch)` at every computed batch; diffing 22.4M checkpoints
+  between builds caught a real schedule divergence within 340 lines — extra
+  b=1 batches where the first cut interpreted what the old flow had run as an
+  overrunning compiled block — which surfaced in the actual gate as a
+  one-slot (10 ms) TSCH shift. Schedule made identical, all six configs
+  byte-identical, all suites green.
+- **The hypothesis is refuted.** With everything exact: cc2538 1.00x (0/7),
+  chain-3node 0.99x (2/7), TSCH 0.98x (3/7), zephyr 0.95x (1/7). The
+  single-instruction call frames were already cheap — the prologue hoists and
+  the fw-trap fix removed what made them expensive — and the exactness
+  machinery (per-iteration boundary compare + preamble replication) costs
+  slightly more than the frames did. Reverted per §1.3; patch preserved
+  off-tree, and §5.7b should no longer be cited as a pending win.
+
+Downstream consequence for Part 2 of the follow-up plan: the "budget
+starvation" prerequisite for reopening the JIT is moot — removing it is worth
+~nothing — which further weakens the case for trace-formation revival (§5.13),
+whose failure was attributed partly to that starvation.
+
 ## 6. Sequencing, risk, rollback
 
 | Step | Effort | Confidence | Gate |
@@ -1179,7 +1225,8 @@ where the time is. Further coverage, linking or Thumb-2 all optimise the 5%.
 | ~~Tier 3e block linking~~ **REVERTED** | 1 day | — | **0.91x on cc2538** — entries halved, coverage fell (§5.13.2) |
 | ~~Tier 3f Thumb-2~~ **DROPPED** | — | optimises the 5% the JIT already reaches (§5.13.3) | — |
 | **ROM-trap hoist** **DONE** | 1 h | — | **1.16x on chain-3node-nrf52840**, 7/7 paired; byte-identical (§5.13.4) |
-| MMIO region lookup | ~2 days | `arm_read32` ~7% + `find_io_region` (§5.13.3) | full gate, byte-identical |
+| **MMIO page-hash lookup** **DONE** | ½ day | — | **1.07x TSCH (7/7)**; XCHECK oracle clean; byte-identical (§5.14.1) |
+| ~~cycle-target interpreter loop~~ **REVERTED** | 1 day | hypothesis refuted | 0.95–1.00x; schedule replay proven by 22.4M-checkpoint trace diff (§5.14.2) |
 | `arm_step_until` convergence tail | ~2 days | 79.8% of calls carry a budget of 1 (§5.7) | timing-sensitive — full gate, byte-identical |
 | ~~flash-window hoist~~ **DONE** | — | 15/20 pairs, p=0.021 | **4.3%** |
 | ~~gdb/ROM-trap hoist~~ **DONE** | — | 12/12 pairs, p=0.0002 | **15.9%** |
