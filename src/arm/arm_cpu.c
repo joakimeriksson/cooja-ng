@@ -52,7 +52,16 @@ __attribute__((destructor,used)) static void arm_wfi_dump(void) {
 
 /* --- Memory access helpers --- */
 
-static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
+/*
+ * The reference lookup: full linear scan, smallest containing region wins,
+ * first-registered breaks size ties (strict `<`).  The overlap rule is
+ * load-bearing for exactly one pair in the tree — NVIC 0xE000E000/0x1000
+ * contains SysTick 0xE000E010/0x10 — but it is the semantic contract every
+ * peripheral was registered against, so the fast path below must reproduce
+ * it bit for bit.  Kept (a) as the fallback when the page table cannot
+ * represent a region set, and (b) as the oracle for ARM_IO_XCHECK.
+ */
+static arm_io_region_t *find_io_region_linear(arm_cpu_t *cpu, uint32_t addr) {
     arm_io_region_t *best = NULL;
     for (int i = 0; i < cpu->num_io_regions; i++) {
         arm_io_region_t *r = &cpu->io_regions[i];
@@ -62,6 +71,63 @@ static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
         }
     }
     return best;
+}
+
+/*
+ * Hot-path lookup: open-addressed hash on the 4 KB page number.
+ *
+ * The linear scan above was ~7% of runtime on Contiki-NG/cc2538 (profiled,
+ * arm-performance-plan.md §5.13.3): it has no early exit — smallest-wins
+ * forces a full walk of 17-27 regions on every MMIO access.  Nearly every
+ * region an SoC registers is one 0x1000 page on a 0x1000 boundary, so a
+ * page-keyed table resolves almost every access in one probe; the chain
+ * (sorted by (size, registration index) at build time) carries the one
+ * overlap and any sub-page windows, and its first containing entry is by
+ * construction the linear scan's winner.
+ *
+ * A page miss returning NULL is correct, not approximate: any region
+ * containing `addr` covers `addr`'s page and is therefore in that page's
+ * chain.  ARM_IO_XCHECK=1 runs both lookups and aborts on any disagreement.
+ */
+static inline arm_io_region_t *find_io_region_fast(arm_cpu_t *cpu, uint32_t addr) {
+    uint32_t page = addr >> 12;
+    uint32_t h = (page * 2654435761u) >> 25;    /* Knuth; top 7 bits -> 0..127 */
+    for (;;) {
+        arm_io_page_t *e = &cpu->io_page_map[h & (ARM_IO_PAGE_SLOTS - 1)];
+        if (e->n == 0) return NULL;             /* empty slot: page unmapped */
+        if (e->page == page) {
+            for (int i = 0; i < e->n; i++) {
+                arm_io_region_t *r = &cpu->io_regions[e->idx[i]];
+                if (addr - r->base < r->size)   /* unsigned: base<=addr<end */
+                    return r;
+            }
+            return NULL;                        /* sub-page hole */
+        }
+        h++;
+    }
+}
+
+static arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
+    static int xcheck = -1;
+    if (__builtin_expect(xcheck == -1, 0))
+        xcheck = getenv("ARM_IO_XCHECK") ? 1 : 0;
+
+    arm_io_region_t *r = cpu->io_page_map_fallback
+                       ? find_io_region_linear(cpu, addr)
+                       : find_io_region_fast(cpu, addr);
+
+    if (__builtin_expect(xcheck, 0)) {
+        arm_io_region_t *ref = find_io_region_linear(cpu, addr);
+        if (r != ref) {
+            fprintf(stderr,
+                    "ARM_IO_XCHECK: addr=0x%08x fast=%p (base=0x%08x) "
+                    "linear=%p (base=0x%08x)\n", addr,
+                    (void *)r,   r   ? r->base   : 0,
+                    (void *)ref, ref ? ref->base : 0);
+            abort();
+        }
+    }
+    return r;
 }
 
 /* Diagnostic (ARM_MMIO_TRACE=1): log the FIRST access to each unmapped
@@ -529,6 +595,84 @@ void arm_stop(arm_cpu_t *cpu) {
 
 /* --- IO registration --- */
 
+/*
+ * Rebuild the page-indexed lookup from the region list.  Cold: called once
+ * per arm_register_io, and registration only happens at platform init
+ * (regions are append-only; there is no unregister API in the tree).
+ * Rebuilding from scratch every time makes the table a pure function of the
+ * region list — no incremental state to get stale.
+ *
+ * Chains are kept sorted by (size, registration index) ascending, which is
+ * exactly the linear scan's winner order, so lookup takes the first hit.
+ * Anything the table cannot represent — a chain deeper than
+ * ARM_IO_PAGE_CHAIN, more pages than the table holds comfortably — sets
+ * io_page_map_fallback instead of trying harder: the linear scan is never
+ * wrong, only slower.
+ */
+static void arm_io_page_map_rebuild(arm_cpu_t *cpu) {
+    /* ARM_IO_LINEAR=1 pins the linear scan — the A/B and bisect knob, same
+     * pattern as CSIM_ARM_JIT=0.  Behaviour-identical by construction (the
+     * scan is the specification); only speed differs. */
+    static int force_linear = -1;
+    if (force_linear == -1) force_linear = getenv("ARM_IO_LINEAR") ? 1 : 0;
+    if (force_linear) { cpu->io_page_map_fallback = true; return; }
+
+    memset(cpu->io_page_map, 0, sizeof(cpu->io_page_map));
+    cpu->io_page_map_fallback = false;
+    int used_slots = 0;
+
+    for (int i = 0; i < cpu->num_io_regions; i++) {
+        arm_io_region_t *r = &cpu->io_regions[i];
+        if (r->size == 0) continue;             /* can never match: addr < base+0 */
+        uint32_t first = r->base >> 12;
+        uint32_t last  = (r->base + r->size - 1) >> 12;
+        for (uint32_t page = first; page <= last; page++) {
+            uint32_t h = (page * 2654435761u) >> 25;
+            arm_io_page_t *e;
+            for (;;) {
+                e = &cpu->io_page_map[h & (ARM_IO_PAGE_SLOTS - 1)];
+                if (e->n == 0 || e->page == page) break;
+                h++;
+            }
+            if (e->n == 0) {
+                e->page = page;
+                if (++used_slots > (ARM_IO_PAGE_SLOTS * 3) / 4) {
+                    cpu->io_page_map_fallback = true;   /* keep probes short */
+                    return;
+                }
+            }
+            if (e->n >= ARM_IO_PAGE_CHAIN) {
+                cpu->io_page_map_fallback = true;
+                return;
+            }
+            /* Insert i keeping (size, registration index) ascending.  i is
+             * the largest registration index so far, so it only moves past
+             * strictly larger sizes. */
+            int j = e->n++;
+            while (j > 0) {
+                arm_io_region_t *prev = &cpu->io_regions[e->idx[j - 1]];
+                if (prev->size <= r->size) break;
+                e->idx[j] = e->idx[j - 1];
+                j--;
+            }
+            e->idx[j] = (uint8_t)i;
+        }
+    }
+}
+
+/* Test hook (test_arm_correctness.c): run both lookups for `addr` and report
+ * whether they agree.  The linear scan is the specification; agreement over a
+ * sweep of region edges and random addresses is the unit-level equivalence
+ * proof, complementing ARM_IO_XCHECK which proves it over whole firmware
+ * runs. */
+int arm_io_lookup_check(arm_cpu_t *cpu, uint32_t addr);
+int arm_io_lookup_check(arm_cpu_t *cpu, uint32_t addr) {
+    arm_io_region_t *fast = cpu->io_page_map_fallback
+                          ? find_io_region_linear(cpu, addr)
+                          : find_io_region_fast(cpu, addr);
+    return fast == find_io_region_linear(cpu, addr);
+}
+
 void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
                      arm_io_read_fn read, arm_io_write_fn write, void *data) {
     if (cpu->num_io_regions >= ARM_MAX_IO_REGIONS) {
@@ -541,6 +685,7 @@ void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
     r->read = read;
     r->write = write;
     r->user_data = data;
+    arm_io_page_map_rebuild(cpu);
 }
 
 /* --- Event management (generated from shared template) --- */

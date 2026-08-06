@@ -78,6 +78,17 @@ typedef struct {
     void           *user_data;
 } arm_io_region_t;
 
+/* One hash slot of the page-indexed IO lookup.  n == 0 marks an empty slot
+ * (the whole table is memset to zero on rebuild), so a page whose peripheral
+ * really registered with n entries always has n >= 1. */
+#define ARM_IO_PAGE_SLOTS 128   /* power of two, > 2x the pages any SoC maps */
+#define ARM_IO_PAGE_CHAIN 4
+typedef struct {
+    uint32_t page;                       /* addr >> 12 */
+    uint8_t  n;                          /* entries used; 0 = empty slot */
+    uint8_t  idx[ARM_IO_PAGE_CHAIN];     /* indices into io_regions[] */
+} arm_io_page_t;
+
 /* --- Event callback ---
  * Unified per-CPU event type lives in include/common/cpu_event.h.
  * Aliases below keep existing ARM-typed call sites compiling. */
@@ -129,6 +140,17 @@ typedef struct arm_cpu {
     /* IO dispatch */
     arm_io_region_t io_regions[ARM_MAX_IO_REGIONS];
     int             num_io_regions;
+    /* Page-indexed lookup over io_regions (src/arm/arm_cpu.c find_io_region):
+     * open-addressed hash keyed on addr>>12, rebuilt from scratch on every
+     * arm_register_io call (cold path — regions are append-only and all
+     * registration happens at platform init).  A slot's idx[] chain is sorted
+     * by (size, registration index) ascending so the first containing entry
+     * reproduces the linear scan's smallest-region-wins rule exactly.
+     * io_page_map_fallback = the table could not represent the region set
+     * (chain overflow / table pressure) -> keep the linear scan: never wrong,
+     * only slower. */
+    arm_io_page_t   io_page_map[ARM_IO_PAGE_SLOTS];
+    bool            io_page_map_fallback;
 
     /* Event queue */
     arm_event_t *event_queue;
