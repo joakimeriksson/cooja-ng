@@ -28,40 +28,43 @@ is a gated guarantee and Lightning is an optional dependency.
 That works out to **4.2 host cycles per emulated instruction** where the JIT
 applies, against the MSP430 JIT's 7.8.
 
-**The one number that did not move is the important one, and §5.11–§5.12
-decompose it.** Short version: the JIT's leverage is *amortising block entry*;
-Contiki-NG protocol code has a branch every 2.4–3.6 instructions and no hot
-self-loop, so it pays that entry constantly. Measured, the compiled path there
-is only **~1.6x faster per instruction than the interpreter**. Coverage is not
-the lever — adding ~8% of the executed stream changed nothing (§5.12) — **block
-linking is** (§5.12.3).
+**The one number that did not move is the important one, and §5.11–§5.13
+decompose it — ending in a profile that should have been taken first.** The
+71.5% of instructions the JIT compiles on cc2538 account for **~5% of the
+runtime**; the 28.5% it cannot — MMIO, 64-bit division traps, Thumb-2 — hold
+~75%. Three successive attempts to give the JIT more to do (memory ops, the
+cheap Thumb-16 classes, trace formation) each returned nothing or less than
+nothing, and one profile explains all three. **The JIT is finished as a line of
+work here; the remaining wins are in the interpreter** (§5.13).
 
 **Next steps, in the order the measurements justify** — reordered after §5.11,
 which refuted the previous ordering's premise:
 
-~~Cheap Thumb-16 classes~~ **DONE and it bought nothing** (`d5ba3b3`, §5.12).
-~8% of the executed stream, correct and verified, zero measurable speedup.
-The list below is what §5.12 replaced it with.
+~~Cheap Thumb-16 classes~~ **DONE, bought nothing** (`d5ba3b3`, §5.12).
+~~Block linking~~ **BUILT AND REVERTED — a 9% regression** (§5.13).
 
-1. **Block linking (§5.12.3).** The compiled path is only **~1.6x faster per
-   instruction than interpreting**, derived from measurement, because block
-   entry dominates at a static block length of 3.3. Chaining blocks directly to
-   one another removes that cost and makes block length largely irrelevant —
-   which is the property these workloads need, and it helps every platform.
-   Needs a cycle-budget bound at chain entry and unlinking on flush.
-2. **Interpreter work, which is subject to none of the JIT's ceilings.**
-   Every workload spends 34–63% of wall time interpreting. Tiers 0–2′ bought
-   34% this way for far less effort than the JIT.
-3. **Thumb-2 codegen, and only after linking.** Worth 1.09 → 2.23 static block
-   on nRF52840 Contiki (of a 2.41 ceiling) and 3.04 → 3.45 on cc2538 — so it is
-   an nRF52840 change, not a Contiki-NG one. On its own, projected at **~1.15x
-   for ~2 weeks** (§5.12.2). After linking it is worth more, because then the
-   instructions matter and the entry cost does not.
-4. **`arm_step_until`'s convergence tail (§5.7b).** 79.8% of `arm_step` calls
-   arrive with a budget of 1 instruction; the JIT now escapes that via the
-   cycle target, but the interpreter still pays ~3M call frames per 3 s run to
-   execute one instruction each. Timing-sensitive, so it needs the full gate.
-5. **Multi-instruction block verification (§5.10).** `arm-decode` and `arm-jit`
+**The JIT is finished as a line of work.** A profile (§5.13.3) shows the 71.5%
+of instructions it compiles are ~5% of the runtime; the expensive ones — MMIO,
+64-bit division traps, Thumb-2 — are what is left. More coverage, linking or
+Thumb-2 all optimise that 5%.
+
+1. **Interpreter work, which is where the time actually is.** The first result
+   from taking the profile seriously was `handle_fw_trap`: a per-instruction
+   call the compiler declined to inline, **1.16x on chain-3node-nRF52840**
+   (`a8a8b70`, §5.13.4). Two more named in the same profile:
+   - **MMIO reads** (`arm_read32` ~7%, plus `find_io_region` inside
+     `arm_step_interpreter`). A linear region scan per access; a direct-mapped
+     lookup or a per-page table is the obvious replacement.
+   - **The Thumb-2 decode nest**, which is the slowest interpreted path
+     (`thumb2-dp` is the slowest `arm-bench` case) and 12–23% of these streams.
+2. **`arm_step_until`'s convergence tail (§5.7b).** 79.8% of `arm_step` calls
+   arrive with a budget of 1 instruction; ~3M call frames per 3 s run to execute
+   one instruction each. Timing-sensitive, so it needs the full gate.
+3. **Consider disabling the JIT where coverage is low.** On Contiki-NG/nRF52840
+   `arm_step` + `arm_jit_run` are 7.5% of runtime for 13% coverage — the
+   dispatcher costs close to what it saves. A coverage-triggered bail-out would
+   need care to stay cycle-exact, but the measurement says it is worth checking.
+4. **Multi-instruction block verification (§5.10).** `arm-decode` and `arm-jit`
    are both exhaustive over *single* encodings; block **composition** —
    register liveness across instructions, the loop back-edge, join patching —
    is covered only by `CSIM_ARM_JIT_VERIFY=1` over the firmware corpus.
@@ -1076,6 +1079,81 @@ chain entry (the data for it — `cycles_total` per block and `next_event_cycle`
 and then for nRF52840's sake specifically. Thumb-2 before linking would be
 buying instructions for blocks that cannot pay for themselves.
 
+### 5.13 Block linking: built, measured, **reverted** — and the profile that ended the JIT line of work
+
+§5.12.3 recommended block linking. It was built and it is a regression.
+
+**5.13.1 What was built, and why it is a trace and not a link.** GNU Lightning
+cannot express a jump from one compiled function into another: the target's
+prologue pushes a frame nothing pops, so a chain would leak stack per link. The
+equivalent that *is* expressible is to build the chain at compile time — keep
+decoding across the branch and emit the whole run as one function with one
+prologue. `B` is followed to its target and generates no code at all;
+`B<cond>`/`CBZ` continue down the fall-through with the taken path becoming a
+side exit, reusing the mechanism the guarded memory accesses already had. A
+branch to somewhere already in the trace ends it, which keeps traces
+straight-line and preserves the self-loop shape worth 3.5x on Zephyr.
+
+**5.13.2 It did what it was supposed to and lost anyway.**
+
+| cc2538 2-node | basic blocks | traces |
+|---|---|---|
+| instructions per block entry | 3.3 | **5.3** |
+| block entries | 1.96M | **999K** |
+| coverage | **71.5%** | 58.3% |
+
+Measured as a single variable in one build, interleaved, 7 pairs:
+
+| | blocks | traces | |
+|---|---|---|---|
+| cc2538 2-node RPL-UDP | 0.200 s | 0.220 s | **0.91x** — traces won 1/7 |
+| chain-3node-nRF52840 | 0.970 s | 0.980 s | 0.99x |
+| zephyr-sync | 0.560 s | 0.560 s | 1.00x |
+
+Entries halved and each covered 60% more instructions, exactly as the probe
+predicted — and coverage *fell*, because a longer trace needs more cycle
+headroom before the next scheduled event, and 79.8% of `arm_step` calls arrive
+with about ten cycles of it (§5.7b). Traces are entered less often than the
+blocks they replace. Recovering that needs an in-trace cycle check so a trace
+can be entered and stop early; the arithmetic in §5.12.2 puts the result at
+~1.14x against 1.10x today. Not worth the complexity in the highest-risk file
+in the tree. **Reverted** (patch kept out of tree).
+
+**5.13.3 The profile nobody had run.** Every estimate in §5.11–§5.12 rested on
+inferring the interpreter's share of wall time from MIPS ratios. Sampling the
+running processes instead:
+
+| Contiki-NG cc2538, JIT on | share |
+|---|---|
+| `arm_step_interpreter` | ~75% |
+| `handle_fw_trap` | ~11% |
+| `arm_read32` (MMIO) | ~7% |
+| **compiled JIT code** | **~5%** |
+
+**The 71.5% of instructions the JIT compiles account for about 5% of the
+runtime.** They are the cheap ones. The 28.5% it does not compile — MMIO
+accesses through `find_io_region` into a device callback, 64-bit division
+traps, Thumb-2 — are roughly 37x more expensive apiece and hold ~75%. That
+single number explains every null result in §5.12 and §5.13 at once, and it
+should have been measured before any of that work rather than after.
+
+On Contiki-NG/nRF52840 the same profile also shows **`arm_step` + `arm_jit_run`
+at 7.5% of runtime for 13% instruction coverage** — the JIT dispatcher there
+costs close to what it saves.
+
+**5.13.4 The immediate payoff.** `handle_fw_trap` at ~10% was a per-instruction
+call the compiler declined to inline — the `condition_passed` defect from Tier
+0 all over again, hidden because the *guard* had been hoisted while the call had
+not. Two register compares in place of the call: **1.16x on chain-3node-nRF52840
+(7/7 paired), 1.05x on cc2538** (`a8a8b70`). That is a larger win on those
+platforms than the memory ops, the NOP class, the cheap Thumb-16 classes and
+trace formation put together.
+
+**5.13.5 Conclusion: the ARM JIT is finished as a line of work.** It is worth
+3.4x on loop-shaped firmware and it has harvested essentially everything
+reachable on protocol firmware, where the instructions it can compile are not
+where the time is. Further coverage, linking or Thumb-2 all optimise the 5%.
+
 ## 6. Sequencing, risk, rollback
 
 | Step | Effort | Confidence | Gate |
@@ -1092,8 +1170,10 @@ buying instructions for blocks that cannot pay for themselves.
 | **`arm-jit` generated-code suite** **DONE** | ½ day | — | **359936 comparisons over 44992 encodings, 0 failures**, both hosts; in CI |
 | **Tier 3c NOP** **DONE** | 1 h | — | **1.14x on cc2538**, 18% of its stream (§5.11.3) |
 | **Tier 3d cheap Thumb-16 classes** **DONE** | ½ day | — | **no measurable speedup** — kept as a linking prerequisite (§5.12) |
-| **Tier 3e block linking** | ~1 week | compiled path is only 1.6x/insn; entry dominates (§5.12.2) | lockstep + byte-identical + full gate |
-| Tier 3f Thumb-2 | ~2 weeks | nRF52840 only; ~1.15x alone, more after linking (§5.12.2) | same |
+| ~~Tier 3e block linking~~ **REVERTED** | 1 day | — | **0.91x on cc2538** — entries halved, coverage fell (§5.13.2) |
+| ~~Tier 3f Thumb-2~~ **DROPPED** | — | optimises the 5% the JIT already reaches (§5.13.3) | — |
+| **ROM-trap hoist** **DONE** | 1 h | — | **1.16x on chain-3node-nrf52840**, 7/7 paired; byte-identical (§5.13.4) |
+| MMIO region lookup | ~2 days | `arm_read32` ~7% + `find_io_region` (§5.13.3) | full gate, byte-identical |
 | `arm_step_until` convergence tail | ~2 days | 79.8% of calls carry a budget of 1 (§5.7) | timing-sensitive — full gate, byte-identical |
 | ~~flash-window hoist~~ **DONE** | — | 15/20 pairs, p=0.021 | **4.3%** |
 | ~~gdb/ROM-trap hoist~~ **DONE** | — | 12/12 pairs, p=0.0002 | **15.9%** |
