@@ -172,6 +172,7 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_arm_correctness.c \
                $(TEST_DIR)/test_arm_benchmark.c \
                $(TEST_DIR)/test_arm_decode.c \
+               $(TEST_DIR)/test_arm_jit.c \
                $(TEST_DIR)/test_arm_firmware.c \
                $(TEST_DIR)/test_mixed_multinode.c \
                $(TEST_DIR)/test_timeline.c \

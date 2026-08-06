@@ -186,16 +186,40 @@ static void emit_sub_flags(jit_state_t *_jit) {
 }
 
 /*
+ * N as 0 or 1, from JIT_V2 bit 31.
+ *
+ * NEVER write this as `jit_andi(dst, JIT_V2, F_N)`.  **GNU Lightning 2.2.3 on
+ * x86-64 miscompiles `jit_andi` when the immediate is exactly 0x80000000: the
+ * result is always 0.**  Isolated in a standalone Lightning program, so it is
+ * the backend and not this file; `ori`, `bmci`, `bmsi` and `andi` with
+ * 0xFFFFFFFF are all correct, and the ARM64 backend is correct throughout.
+ *
+ * It cost a silent wrong-branch bug: emit_cond() extracted N this way, so MI,
+ * PL, GE, LT, GT and LE all behaved as though N were clear — on x86-64 only,
+ * while `arm-decode` passed 269952/269952 on both hosts and the simulations
+ * still produced plausible output.  A logical right shift has no immediate at
+ * all, and hands back the 0/1 the condition logic wants directly.
+ */
+static void emit_n_bit(jit_state_t *_jit, int dst) {
+    jit_rshi_u(dst, JIT_V2, 31);
+    jit_andi(dst, dst, 1);       /* belt and braces: keep it a clean 0/1 */
+}
+
+/*
  * Materialise an ARM condition code into JIT_R0 as 0/1, from the flags held in
  * JIT_V2.  Mirrors condition_passed() in arm_cpu.c case for case — the
  * highest-risk function in this file, since a wrong condition silently takes
  * the wrong branch.  Destroys R0/R1/R2, so it is only emitted as a terminator.
+ *
+ * `arm-jit` verifies all 14 condition codes against the interpreter on
+ * whatever host it is built for.  That suite exists because of the bug in
+ * emit_n_bit()'s comment.
  */
 static void emit_cond(jit_state_t *_jit, int cond) {
     switch (cond >> 1) {
     case 0: jit_andi(JIT_R0, JIT_V2, F_Z); jit_nei(JIT_R0, JIT_R0, 0); break;
     case 1: jit_andi(JIT_R0, JIT_V2, F_C); jit_nei(JIT_R0, JIT_R0, 0); break;
-    case 2: jit_andi(JIT_R0, JIT_V2, F_N); jit_nei(JIT_R0, JIT_R0, 0); break;
+    case 2: emit_n_bit(_jit, JIT_R0); break;
     case 3: jit_andi(JIT_R0, JIT_V2, F_V); jit_nei(JIT_R0, JIT_R0, 0); break;
     case 4:                                       /* HI/LS: C && !Z */
         jit_andi(JIT_R0, JIT_V2, F_C); jit_nei(JIT_R0, JIT_R0, 0);
@@ -203,12 +227,12 @@ static void emit_cond(jit_state_t *_jit, int cond) {
         jit_andr(JIT_R0, JIT_R0, JIT_R1);
         break;
     case 5:                                       /* GE/LT: N == V */
-        jit_andi(JIT_R0, JIT_V2, F_N); jit_nei(JIT_R0, JIT_R0, 0);
+        emit_n_bit(_jit, JIT_R0);
         jit_andi(JIT_R1, JIT_V2, F_V); jit_nei(JIT_R1, JIT_R1, 0);
         jit_eqr(JIT_R0, JIT_R0, JIT_R1);
         break;
     case 6:                                       /* GT/LE: !Z && N == V */
-        jit_andi(JIT_R0, JIT_V2, F_N); jit_nei(JIT_R0, JIT_R0, 0);
+        emit_n_bit(_jit, JIT_R0);
         jit_andi(JIT_R1, JIT_V2, F_V); jit_nei(JIT_R1, JIT_R1, 0);
         jit_eqr(JIT_R0, JIT_R0, JIT_R1);
         jit_andi(JIT_R2, JIT_V2, F_Z); jit_eqi(JIT_R2, JIT_R2, 0);
