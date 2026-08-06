@@ -183,6 +183,22 @@ int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
         return 2;
     }
 
+    /* ---- NOP ----
+     * Only the bare 0xBF00 encoding.  The rest of the 0xBFxx space is IT (low
+     * nibble non-zero) plus WFI/WFE/SEV, all of which have real effects — WFI
+     * and WFE stop the CPU, which a compiled block must never do — and the
+     * remaining hints are accepted by nobody here rather than reasoned about.
+     *
+     * It looks like a rounding error and is not: **17.98% of instructions
+     * executed by Contiki-NG on cc2538 are this encoding**, and because an
+     * unsupported instruction ends a block, it was the single largest thing
+     * cutting blocks short on that platform. */
+    case 23:
+        if (hw != 0xBF00) return reject(out, pc, hw);
+        base(out, pc, hw, ARM_DEC_NOP);
+        out->writes_result = false;
+        return 2;
+
     /* ---- LDR Rt, [PC, #imm8*4] — literal pool ----
      * The address is a compile-time constant, which is what makes this worth
      * a class of its own: flash is read-only in this model (arm_write32

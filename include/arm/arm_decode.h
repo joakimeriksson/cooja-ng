@@ -83,6 +83,7 @@ typedef enum {
     ARM_DEC_LOAD,            /* Rt = mem[reg[rn] + (imm | reg[rm])]          */
     ARM_DEC_STORE,           /* mem[reg[rn] + (imm | reg[rm])] = Rt          */
     ARM_DEC_LOAD_LIT,        /* Rt = mem32[imm] — PC-relative, address const */
+    ARM_DEC_NOP,             /* 0xBF00 — no architectural effect at all       */
 } arm_dec_class_t;
 
 /* `rm` value meaning "no register offset" — the offset is `imm` alone. */

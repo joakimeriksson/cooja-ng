@@ -801,6 +801,9 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
      * arm_step's central +1 and the interpreter's load/store handlers add a
      * second one of their own.
      */
+    case ARM_DEC_NOP:
+        return 1;                      /* the caller already charged the cycle */
+
     case ARM_DEC_LOAD_LIT:
         reg[di->rd] = mem_read32_unaligned(cpu, di->imm);
         cpu->cycles += di->cycles - 1;

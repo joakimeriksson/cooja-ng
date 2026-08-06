@@ -382,6 +382,10 @@ static int emit_insn(jit_state_t *_jit, emit_ctx_t *cx,
     case ARM_DEC_LOAD_LIT:
         return emit_load_lit(_jit, cx, di);
 
+    case ARM_DEC_NOP:
+        return 1;                      /* emit nothing; the cycle is counted
+                                        * by the block's cyc_prefix table */
+
     case ARM_DEC_B_UNCOND:
     case ARM_DEC_B_COND:
         /* Terminators are handled by the epilogue, which is the only place
