@@ -1,15 +1,60 @@
 # ARM Interpreter Performance Plan
 
-Status: **in progress** (2026-08-07). §1 `arm-bench`, §2 Tier 0, §3 Tier 1
-(PGO), §4 (the debug-facility gate that replaced the dropped decode cache) and
-§5 Tier 3 (**JIT codegen incl. memory ops — landed, cycle-exact**) are all done
-and measured. Interpreter work took the ARM runner workload **2.939 s → 1.940 s
-(34%)**; the JIT then takes a single-node 60 s `zephyr-synchronization` run
-from **2.05 s to 0.60 s — 3.42x — at 4.2 host cycles per emulated
-instruction**, with byte-identical output. Contiki-NG ARM firmware is flat
-because it is Thumb-2 dense (average block 1.7–2.4 instructions against 34.9 on
-Zephyr); **Thumb-2 is the entire remaining gap there** — see §5.7–§5.8. Companion to
-[`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0 here).
+Status: **every tier in this plan is done and measured** (2026-08-07).
+Companion to [`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0
+here).
+
+## Summary — what shipped, and what is left
+
+**Interpreter** (§2–§4): 2.939 s → 1.940 s on the ARM runner workload, **34%**,
+from four independent changes — force-inlining `condition_passed`, gating the
+per-instruction debug facilities, and hoisting the flash window and the
+GDB/ROM-trap checks out of the fetch path. A fifth (a decoded-instruction
+cache) was **dropped when measurement refuted its premise**, and a sixth
+(branch consolidation) was reverted as noise.
+
+**JIT** (§5): a Thumb-16 decoder, a GNU Lightning code generator, guarded SRAM
+memory operations, and two dispatcher fixes. Cycle-exact — `CSIM_ARM_JIT=0`
+and `=1` produce byte-identical output, which is required because determinism
+is a gated guarantee and Lightning is an optional dependency.
+
+| Workload | JIT off | JIT on | |
+|---|---|---|---|
+| `zephyr-synchronization`, 1 node, 60 s sim (arm64) | 2.05 s | **0.58 s** | **3.5x** |
+| `fw-zephyr-sync` MIPS (x86-64) | 190.3 | **1170.5** | **6.15x** |
+| `alu-reg` / `mem-ldr-str` / `branch` (arm64) | | | 4.46x / 4.11x / 2.06x |
+| Contiki-NG ARM firmware (chain-3/4node, cc2538 RPL-UDP) | | | **~1.00x** |
+
+That works out to **4.2 host cycles per emulated instruction** where the JIT
+applies, against the MSP430 JIT's 7.8.
+
+**The one number that did not move is the important one.** Contiki-NG ARM
+firmware is flat because it is Thumb-2 dense: average compiled block is
+**1.7–2.4 instructions against 34.9 on Zephyr**, so almost nothing compiles and
+the workload pays the cache probe for nothing. This is not a coverage gap in
+the Thumb-16 subset — 72% of executed instructions on cc2538 RPL-UDP already
+decode (§5.7).
+
+**Next steps, in the order the measurements justify:**
+
+1. **Thumb-2 codegen (§5.8).** The entire remaining gap on the Contiki-NG ARM
+   platforms — CC2538, nRF52840, nRF54L15, which is to say the strategic ones.
+   ~2 weeks. Nothing else on this list changes those workloads.
+2. **`arm_step_until`'s convergence tail (§5.7b).** 79.8% of `arm_step` calls
+   arrive with a budget of 1 instruction; the JIT now escapes that via the
+   cycle target, but the interpreter still pays ~3M call frames per 3 s run to
+   execute one instruction each. Timing-sensitive, so it needs the full gate.
+3. **Multi-instruction block verification (§5.10).** `arm-decode` and `arm-jit`
+   are both exhaustive over *single* encodings; block **composition** —
+   register liveness across instructions, the loop back-edge, join patching —
+   is covered only by `CSIM_ARM_JIT_VERIFY=1` over the firmware corpus.
+4. **Remaining Thumb-16 classes.** Only push/pop, the hi-register forms and
+   register-controlled shifts are left. Cheap, but worth little on its own:
+   blocks are already cut short by branches every ~4 instructions (§5.7).
+
+Read §5.10 before touching `arm_jit.c` — it documents a GNU Lightning x86-64
+backend bug that made every N-reading condition silently take the wrong branch
+while every test on that host stayed green.
 
 **Why now.** ARM is the strategic platform — CC2538, nRF52840, nRF54L15,
 TrustZone-M, and the FLPR host all run on it — but it is the *only* emulated ISA
@@ -512,7 +557,7 @@ So the rule for anything further in this path: **look for unguarded work, loop
 setups, and unlatched `getenv`/syscalls — not for branch count.** Removing
 already-predicted branches from a hot loop is a non-optimization.
 
-## 5. Tier 3 — ARM JIT — **foundation landed, codegen not started**
+## 5. Tier 3 — ARM JIT — **DONE**, incl. memory ops; Thumb-2 is what remains
 
 ### 5.0 What a JIT is actually worth here — measure before committing weeks
 
@@ -587,7 +632,10 @@ r0–r15, APSR and cycles. 269952 comparisons, 0 failures, identical on
 Linux/gcc. Validated by fault injection — a flag-only BIC bug (invisible to
 `arm-correctness`) is caught immediately.
 
-### 5.4 Codegen — **DONE** (`06f62b3`): 4.94x on ALU code, 1.23x on real firmware
+### 5.4 Codegen — **DONE** (`06f62b3`)
+
+*The figures in this section are the first-cut ones; §5.8 supersedes them after
+memory ops and the dispatcher fixes.*
 
 Measured interleaved (`CSIM_ARM_JIT=0` vs `1`), 7 pairs, Apple Silicon @ 4.39 GHz:
 
@@ -673,6 +721,9 @@ memory joined that state the moment stores were compiled. The snapshot is
 skipped for load-only blocks.
 
 ### 5.7 The two limits that actually mattered — and neither was instruction coverage
+
+*(a) is the min-block cliff; (b), referred to elsewhere as §5.7b, is the
+`arm_step` budget granularity.*
 
 With memory ops landed, coverage on `zephyr-synchronization` was still 26.3%.
 The instinct is "add more instruction classes". The measurement says otherwise:
@@ -843,17 +894,27 @@ over the firmware corpus is what covers that today.
 | ~~Tier 2 decode cache~~ **DROPPED** | — | premise refuted (§4.1) | — |
 | **Tier 2′ debug gate** **DONE** | ½ day | — | **14.6% measured**, non-overlapping; full gate green |
 | ~~branch consolidation~~ **REVERTED** | — | 3 wins / 9 paired runs | not a real effect (§4.4) |
-| **Tier 3 decoder** **DONE** | ½ day | — | **113280 differential comparisons, 0 failures**; in CI |
+| **Tier 3 decoder** **DONE** | ½ day | — | **269952 differential comparisons, 0 failures**; in CI |
 | **Tier 3 codegen** **DONE** | 1 day | — | 4.46x ALU, cycle-exact, JIT_VERIFY 0 mismatches |
 | **Tier 3b memory ops + dispatch** **DONE** | 1 day | — | **3.42x on real Zephyr firmware** (§5.8); 269952 decode comparisons |
-| Tier 3c Thumb-2 | ~2 weeks | the whole remaining gap on Contiki-NG ARM (§5.8) | same lockstep + byte-identical gate |
+| **`arm-jit` generated-code suite** **DONE** | ½ day | — | **359936 comparisons over 44992 encodings, 0 failures**, both hosts; in CI |
+| **Tier 3c Thumb-2** | ~2 weeks | the whole remaining gap on Contiki-NG ARM (§5.8) | same lockstep + byte-identical gate |
+| `arm_step_until` convergence tail | ~2 days | 79.8% of calls carry a budget of 1 (§5.7) | timing-sensitive — full gate, byte-identical |
+| remaining Thumb-16 classes | ~3 days | low — blocks are branch-bound at ~4 (§5.7) | `arm-decode` + `arm-jit` + full gate |
 | ~~flash-window hoist~~ **DONE** | — | 15/20 pairs, p=0.021 | **4.3%** |
 | ~~gdb/ROM-trap hoist~~ **DONE** | — | 12/12 pairs, p=0.0002 | **15.9%** |
 
 **Mandatory gate for anything touching `arm_step` or the event pump:**
-`arm-correctness` (153), `correctness`, `radio-medium` (241), `cc1200` (73),
-`arm-firmware`, the cc2538/nRF52840/nRF54L15 multinode configs, TSCH ×2, the
-Cooja suite (**93/93**), and `tools/check-determinism.sh`. Per
+`arm-correctness` (153), `arm-decode` (269952), `arm-jit` (359936),
+`correctness`, `radio-medium` (241), `cc1200` (73), `arm-firmware`, the
+cc2538/nRF52840/nRF54L15 multinode configs, TSCH ×2, the Cooja suite
+(**93/93**, `--with-tun`), and `tools/check-determinism.sh`.
+
+**And for anything touching the JIT specifically:** `CSIM_ARM_JIT=0` vs `=1`
+byte-identical on the five multinode configs, `CSIM_ARM_JIT_VERIFY=1` clean
+over the firmware corpus, **and both of those repeated on the other host
+architecture** — §5.10 is a bug that was correct on arm64 and silently wrong on
+x86-64, and no single-host gate could have caught it. Per
 `refactor-plan.md` §11.5, a tier that regresses the gate is **reverted, not fixed
 forward**.
 
@@ -881,3 +942,13 @@ untrained holdout, and both `README.md` and `CLAUDE.md` were corrected.)
 4. **Does any supported firmware actually write to flash at run time?** If not,
    Tier 2's invalidation can be a cheap assertion rather than a hot-path check —
    but it must still be *correct*, not merely absent.
+5. **Should the GNU Lightning `andi 0x80000000` bug (§5.10) go upstream?** It is
+   worked around here and the tree has no other use of that immediate (the
+   remaining `F_N` uses are `ori`/`bmci`, both verified correct on both
+   backends), so nothing is blocked either way — but it is a live defect in
+   2.2.3 that another project will hit.
+6. **Is `remaining >= cb->length` still needed at all?** The cycle-target
+   relaxation (§5.7b) made the instruction budget the looser of two bounds on
+   every path that sets `cycle_limit`. If no caller depends on the instruction
+   cap, the dispatcher could drop it and simplify — but that is a contract
+   change to `arm_step`, so it needs the byte-identical gate to say so.
