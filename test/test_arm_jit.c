@@ -37,6 +37,8 @@
  * above ship.  Memory encodings are driven both at SRAM addresses (exercising
  * the inline fast path) and at wild ones (exercising the guarded side exit,
  * where the block must leave state untouched for the interpreter to redo).
+ * SRAM contents are compared as well as registers, because a store writes no
+ * register — a wrong access width or byte order would otherwise pass.
  *
  * A failure here means the emulator is executing something other than the
  * program it was given, and is a hard stop.
@@ -137,6 +139,20 @@ static int compare(uint16_t hw, int trial, const arm_cpu_t *a,
     if (a->cycles != b->cycles) {
         printf("  FAIL: hw=0x%04x trial=%d  cycles: interp=%lld jit=%lld\n",
                hw, trial, (long long)a->cycles, (long long)b->cycles);
+        bad = 1;
+    }
+    /*
+     * Memory, without which a store is barely tested at all: STR/STRB/STRH
+     * write no register, so a wrong access width or a wrong byte order would
+     * pass every check above.  Both CPUs start from identical SRAM, so a
+     * straight compare is exact.
+     */
+    if (memcmp(a->sram, b->sram, ARM_SRAM_SIZE) != 0) {
+        uint32_t i = 0;
+        while (i < ARM_SRAM_SIZE && a->sram[i] == b->sram[i]) i++;
+        printf("  FAIL: hw=0x%04x trial=%d  sram[0x%08x]: interp=0x%02x "
+               "jit=0x%02x\n", hw, trial, ARM_SRAM_BASE + i,
+               a->sram[i], b->sram[i]);
         bad = 1;
     }
     if (bad && verbose) {
