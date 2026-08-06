@@ -2,11 +2,13 @@
 
 Status: **in progress** (2026-08-07). §1 `arm-bench`, §2 Tier 0, §3 Tier 1
 (PGO), §4 (the debug-facility gate that replaced the dropped decode cache) and
-§5 Tier 3 (**JIT codegen — landed, cycle-exact**) are all done and measured.
-Interpreter work took the ARM runner workload **2.939 s → 1.940 s (34%)**; the
-JIT then adds **4.94x on ALU-heavy code and 1.23x on real Zephyr firmware**,
-reaching **3.2 host cycles per emulated instruction** where it applies. What
-limits it now is coverage, not codegen — see §5.6. Companion to
+§5 Tier 3 (**JIT codegen incl. memory ops — landed, cycle-exact**) are all done
+and measured. Interpreter work took the ARM runner workload **2.939 s → 1.940 s
+(34%)**; the JIT then takes a single-node 60 s `zephyr-synchronization` run
+from **2.05 s to 0.60 s — 3.42x — at 4.2 host cycles per emulated
+instruction**, with byte-identical output. Contiki-NG ARM firmware is flat
+because it is Thumb-2 dense (average block 1.7–2.4 instructions against 34.9 on
+Zephyr); **Thumb-2 is the entire remaining gap there** — see §5.7–§5.8. Companion to
 [`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0 here).
 
 **Why now.** ARM is the strategic platform — CC2538, nRF52840, nRF54L15,
@@ -581,7 +583,7 @@ are excluded by name: carry-in is exactly what broke the MSP430 JIT.
 
 **Verification is differential and exhaustive**, not by inspection: all 65536
 halfwords × 6 randomised register/flag states through both paths, comparing
-r0–r15, APSR and cycles. 113280 comparisons, 0 failures, identical on
+r0–r15, APSR and cycles. 269952 comparisons, 0 failures, identical on
 Linux/gcc. Validated by fault injection — a flag-only BIC bug (invisible to
 `arm-correctness`) is caught immediately.
 
@@ -634,67 +636,140 @@ budget and probe once per `arm_step` call — ample, since a 3 s Zephyr run make
 disabled — is what separated "my batching" from "my code generation". Without
 it the natural conclusion would have been that the codegen was wrong.
 
-### 5.6 What limits coverage now — measured
+### 5.6 Memory operations — **DONE** (`d39ccf4`), and what they cost to get right
 
-Coverage is 99.0% of `alu-reg`, 21.1% of `fw-zephyr-sync`, ~0% elsewhere.
-Instrumenting which instruction class *stops* a block early (zephyr-sync):
+Loads and stores were 35% of what stopped a block early, and unlike everything
+else in the subset they can *fail*. A store into an IO window fires a
+peripheral callback that can raise an interrupt or reschedule an event, which
+breaks the property the whole block design rests on: nothing observable happens
+between block entry and block exit.
 
-| blocker | share |
+The shape that preserves it is a **guarded side exit**. Inline the SRAM case
+behind two tests — alignment, and `(uint32)(addr - sram_base) < sram_size`,
+which excludes flash, ROM, the bit-band alias and every peripheral window in
+one unsigned compare — and on a miss leave the block at that instruction with
+state exactly as if only the preceding ones had run. The interpreter redoes it
+through the full IO path. **Correctness therefore never depends on the guard
+being generous, only on it being sound**: a guard that rejects too much costs
+speed, not accuracy.
+
+Consequences worth knowing before repeating this:
+
+- A block's cost stopped being its length. Memory ops charge 2 cycles (the
+  central charge plus the handler's own), everything else 1, so blocks carry a
+  cycle prefix-sum table and the dispatcher reconstructs both counts from it.
+- `LDR Rt,[PC,#imm]` gets its own class: the address is a compile-time
+  constant, flash is read-only in this model, and the cache is flushed on
+  reset — so it resolves the region once and emits **no guard at all**.
+- Decoder support went 22528 -> 44992 encodings; `arm-decode` is now **269952**
+  differential comparisons, 0 failed.
+
+**The verifier had to learn to rewind memory.** Its first run against
+`ldr r3,[sp,#4] / adds r3,#1 / str r3,[sp,#4]` reported r3 off by exactly one,
+every time. Nothing was wrong with the generated code: the verifier replayed
+the block over the memory the *first* run had already updated. Re-running a
+block is only a valid comparison if the whole input state is restored, and
+memory joined that state the moment stores were compiled. The snapshot is
+skipped for load-only blocks.
+
+### 5.7 The two limits that actually mattered — and neither was instruction coverage
+
+With memory ops landed, coverage on `zephyr-synchronization` was still 26.3%.
+The instinct is "add more instruction classes". The measurement says otherwise:
+**72% of executed instructions on cc2538 RPL-UDP already decode**. Two
+structural limits were doing the damage.
+
+**(a) The fallback is all-or-nothing per `arm_step` call.** When the dispatcher
+finds no block at the current PC it hands the interpreter the caller's *entire*
+remaining budget — which it must, because chopping that budget changes
+simulation timing (§5.5). So one uncompilable PC costs every compilable block
+that would have followed it in that call. Refusing a 1-instruction block at the
+PC after a Thumb-2 instruction does not cost one instruction, it costs the rest
+of the slice. That makes the minimum-block-length knob a cliff, not a
+trade-off:
+
+| `CSIM_ARM_JIT_MIN_BLOCK` | insns via compiled code | wall clock |
+|---|---|---|
+| 4 | 26.3% | 1.55 s |
+| 2 | 26.3% | 1.59 s |
+| **1** | **98.3%** | **0.58 s** |
+
+Compiling everything keeps the dispatcher chaining block to block and it stops
+falling back at all. The cost was measured rather than assumed: **163 live
+compiled blocks, +4.8 MB peak RSS** — a firmware image's working set is nothing
+like the 65536-slot cache.
+
+**(b) A budget the JIT could never satisfy.** Histogramming `arm_step`'s
+`count` argument on cc2538 RPL-UDP:
+
+| `count` | share of 6.85M calls |
 |---|---|
-| memory ops (`ldr_imm`, `ldr_lit`, `str_imm`, `ldrb/strb`, `ldr_sp`/`str_sp`) | **~35%** |
-| Thumb-2 (32-bit) | 22% |
-| `dp_reg` hi-register forms + register-controlled shifts | 16% |
-| `misc` (push/pop, IT, CBZ) | 13% |
+| **1** | **79.8%** |
+| 5–8 | 20.1% |
+| everything else | 0.1% |
 
-And the executed mix on cc2538 RPL-UDP is 31.4% `ldr_sp`/`str_sp` alone.
-**Memory operations are the next step and are most of what is left.**
+`arm_step_until` single-steps once it is within 10 cycles of its target, and
+that tail is most of its calls. A 4-instruction block — the average on that
+firmware — can never run on a budget of 1, so roughly 61% of all executed
+instructions were unreachable by the JIT regardless of coverage.
 
-They are not a simple extension, which is why they are not in v1: a store can
-land in an IO region and fire a peripheral callback, which can raise an
-interrupt or reschedule events — breaking the "nothing observable happens
-inside a block" property the whole design rests on. The shape that preserves it
-is a **guarded side exit**: inline the SRAM fast path, and if the address falls
-outside SRAM, leave the block with PC set to the faulting instruction and
-return the count completed so far. That needs the compiled function to return a
-variable instruction count, which the loop-budget arithmetic currently assumes
-is fixed.
+The fix is to notice that **the instruction count was only ever a proxy for the
+cycle target**. A block is now admitted when its whole measured cost fits in
+`cpu->cycle_limit`, even if it exceeds the instruction budget. That is
+*stricter* than what the interpreter offers, not looser: `arm_step(cpu, 1)`
+overshoots by however many cycles one instruction happens to cost (2 for a
+load, 12 for exception entry, 20 for a divide), whereas a block is admitted
+only if it provably fits.
 
-### 5.7 A second, independent limiter: `arm_step` budget granularity
+### 5.8 Result
 
-Even with perfect coverage the JIT is throttled on the runner path.
-Histogramming the `count` argument over a 3 s single-node Zephyr run:
+`arm-bench`, 7 paired interleaved reps, Apple Silicon @ 4.39 GHz:
 
-| `count` | share of 4.18M calls |
-|---|---|
-| **<= 1** | **72.8%** |
-| 5-8 | 9.1% |
-| 9-32 | 18.1% |
-| > 32 | 0.0% |
+| benchmark | JIT off | JIT on | speedup | host cycles/insn | paired |
+|---|---|---|---|---|---|
+| `alu-reg` | 272.7 | **1216.4** MIPS | **4.46x** | 16.1 -> **3.6** | 7/7 |
+| `mem-ldr-str` | 262.0 | **1076.7** MIPS | **4.11x** | 16.8 -> **4.1** | 7/7 |
+| **`fw-zephyr-sync`** (real Zephyr) | 296.9 | **1033.3** MIPS | **3.48x** | 14.8 -> **4.2** | 7/7 |
+| `branch` | 275.5 | **568.6** MIPS | **2.06x** | 15.9 -> **7.7** | 7/7 |
+| `it-block` | 288.3 | 292.4 | 1.01x | | 3/7 |
+| `thumb2-dp` | 219.8 | 209.7 | 0.95x | | 2/7 |
+| `fw-cc2538-udp` | 171.0 | 168.4 | 0.98x | | 3/7 |
 
-`arm_step_until` single-steps whenever it is within 10 cycles of its target
-(`remaining <= 10 -> steps = 1`), and at ~7.3 cycles/instruction that is the
-tail of essentially every call. A block of length N cannot run on a budget of
-1, so 73% of calls can never reach the JIT — and separately, 3M call frames to
-execute one instruction each is interpreter overhead worth attacking on its
-own. Changing it is timing-sensitive (that single-step path exists to bound
-overshoot; the comment cites TSCH desync), so it needs the full gate.
+Whole-runner workloads, 5 paired reps:
 
-### 5.8 Verification
+| workload | JIT off | JIT on | speedup |
+|---|---|---|---|
+| `zephyr-synchronization`, 1 node, 60 s sim | 2.05 s | **0.60 s** | **3.42x** |
+| `chain-3node`/`chain-4node-nrf52840-dk` | 1.04 / 1.18 s | 1.04 / 1.17 s | 1.00x |
+| cc2538 2-node RPL-UDP, 120 s sim | 0.24 s | 0.24 s | 1.00x |
+| `chain-3node-nrf54l15-dk` | 0.81 s | 0.82 s | 0.99x |
 
-- **`CSIM_ARM_JIT_VERIFY=1`** runs each block, rewinds, re-runs it interpreted,
-  and compares r0-r15, APSR and cycles. **0 mismatches** over `arm-bench`,
-  `zephyr-synchronization`, cc2538 RPL-UDP and `chain-3node-nrf52840-dk`. This
-  is the check the MSP430 ADDC bug needed: warm-block-only, and a stale flag
-  stays invisible until a later branch reads it.
-- **`arm-decode`**: **134784** differential comparisons (B_COND added), 0
-  failed, on clang/arm64 and gcc/x86-64.
-- Full gate green, plus JIT-on/off byte-identical output on four configs.
+**The flat cases are honest and the reason is the same one.** They are Thumb-2
+dense, so almost nothing compiles and they pay the probe: average block length
+is **1.7–2.4 instructions on Contiki-NG ARM firmware against 34.9 on Zephyr**.
+Thumb-2 is the whole remaining gap on that firmware family, and it is the next
+lever — not more Thumb-16 classes, of which only push/pop and the hi-register
+forms are left.
+
+### 5.9 Verification
+
+- **`CSIM_ARM_JIT_VERIFY=1`** lockstep (registers, APSR, cycles, and now SRAM):
+  **0 mismatches** over `arm-bench`, `arm-correctness`, `zephyr-synchronization`,
+  cc2538 RPL-UDP, `chain-3node-nrf52840-dk` and `test-2node-nrf54l15-dk`.
+- **JIT on/off byte-identical** (wall-clock lines excluded) on
+  `test-2node-nrf54l15-dk`, `chain-3node`/`chain-4node-nrf52840-dk`,
+  `chain-3node-nrf54l15-dk`, `chain-4node-cc2538dk`. On the 60 s
+  `zephyr-synchronization` run the two agree to the cycle: 3813589583 cycles,
+  453300376 instructions, same final PC.
+- **`arm-decode`**: 269952 differential comparisons, 0 failed, both hosts.
+- **TSCH passes on both** `cc2538dk` and `nrf52840-dk` — the timing-sensitive
+  case, and the one that would break first if a block ran past an event.
 
 **Gap worth closing:** `emit_cond()` is the highest-risk function in the JIT —
 14 condition codes, and a wrong one silently takes the wrong branch — yet it is
 covered only by whatever conditions the corpus happens to execute.
-`CSIM_ARM_JIT_MIN_BLOCK=1` exists so an `arm-jit` suite could compile
-one-instruction blocks and verify generated code exhaustively, the way
+`CSIM_ARM_JIT_MIN_BLOCK=1` is now the default, so an `arm-jit` suite could
+compile one-instruction blocks and verify generated code exhaustively, the way
 `arm-decode` does for the reference model. That suite is not written yet.
 
 ## 6. Sequencing, risk, rollback
@@ -708,8 +783,9 @@ one-instruction blocks and verify generated code exhaustively, the way
 | **Tier 2′ debug gate** **DONE** | ½ day | — | **14.6% measured**, non-overlapping; full gate green |
 | ~~branch consolidation~~ **REVERTED** | — | 3 wins / 9 paired runs | not a real effect (§4.4) |
 | **Tier 3 decoder** **DONE** | ½ day | — | **113280 differential comparisons, 0 failures**; in CI |
-| **Tier 3 codegen** **DONE** | 1 day | — | **4.94x ALU / 1.23x real firmware**, cycle-exact, JIT_VERIFY 0 mismatches |
-| Tier 3b memory ops | ~1 week | high value (35% of blockers) | needs guarded side exits (§5.6) |
+| **Tier 3 codegen** **DONE** | 1 day | — | 4.46x ALU, cycle-exact, JIT_VERIFY 0 mismatches |
+| **Tier 3b memory ops + dispatch** **DONE** | 1 day | — | **3.42x on real Zephyr firmware** (§5.8); 269952 decode comparisons |
+| Tier 3c Thumb-2 | ~2 weeks | the whole remaining gap on Contiki-NG ARM (§5.8) | same lockstep + byte-identical gate |
 | ~~flash-window hoist~~ **DONE** | — | 15/20 pairs, p=0.021 | **4.3%** |
 | ~~gdb/ROM-trap hoist~~ **DONE** | — | 12/12 pairs, p=0.0002 | **15.9%** |
 

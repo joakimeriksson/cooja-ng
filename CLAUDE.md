@@ -42,12 +42,12 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
                                          # 65536 Thumb halfwords x 6 random register/flag
                                          # states, running decoder + arm_execute_decoded()
                                          # against the interpreter and comparing r0-r15,
-                                         # APSR and cycles. 113280 comparisons. This is the
-                                         # foundation the ARM JIT is being built on — the
-                                         # decoder is a SECOND implementation of Thumb-16
-                                         # semantics, and flag-only drift between two
-                                         # implementations is invisible until a branch
-                                         # flips (exactly the MSP430 ADDC bug).
+                                         # APSR and cycles. 269952 comparisons. This is the
+                                         # foundation the ARM JIT is built on — the decoder
+                                         # is a SECOND implementation of Thumb-16 semantics,
+                                         # and flag-only drift between two implementations
+                                         # is invisible until a branch flips (exactly the
+                                         # MSP430 ADDC bug).
 ./build/test_runner arm-bench            # ARM interpreter benchmarks: 5 synthetic hot-path
                                          # loops (dispatch, Thumb-2 decode, IT blocks, branches,
                                          # load/store) + 2 firmware. Reports MIPS (primary) and
@@ -223,7 +223,9 @@ scheduling policy is the one documented deferral. **The staged refactor
 
 | File | Purpose |
 |------|---------|
-| `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until |
+| `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until, JIT dispatcher + lockstep verifier |
+| `arm_decode.c` | Stateless Thumb-16 decoder for the JIT-compilable subset -> `arm_decoded_insn_t`, basic-block decoder. Deliberately a *second* implementation of the semantics, differential-tested by `arm-decode` |
+| `arm_jit.c` | GNU Lightning code generator: compiles hot basic blocks (ALU, shifts, branches, guarded SRAM loads/stores, native self-loops under an iteration budget) to ARM64/x86-64 |
 | `arm_config.c` | MCU configurations: CC2538 (512KB flash, 32KB SRAM, 32MHz) |
 | `arm_elf.c` | ELF loader: loads sections into flash/SRAM, symbol lookup |
 | `arm_nvic.c` | NVIC: interrupt priority, pending/enable registers, exception entry/return |
@@ -448,10 +450,36 @@ Same event-driven kernel as MSP430, with CC2538 RF Core for 802.15.4 radio:
 | 2-node nullnet (20s sim) | ~800x real-time |
 | 2-node RPL-UDP (60s sim) | ~2400x real-time |
 
-### ARM (interpreter only)
+### ARM
 
 | Benchmark | Speed |
 |-----------|-------|
 | CC2538 2-node RPL-UDP (60s sim) | ~300x real-time |
 | nRF52840 2-node RPL-UDP (60s sim) | ~360x real-time |
 | nRF52840 2-node TSCH (60s sim) | ~14x real-time |
+
+The ARM JIT (`src/arm/arm_jit.c`, GNU Lightning) compiles hot Thumb-16 basic
+blocks — ALU, shifts, branches and guarded SRAM loads/stores — and is **on by
+default when Lightning is present**. It is cycle-exact: `CSIM_ARM_JIT=0` and
+`=1` produce byte-identical output, which is required because determinism is a
+gated guarantee and Lightning is an optional dependency.
+
+| Workload | JIT off | JIT on | |
+|---|---|---|---|
+| `zephyr-synchronization`, 1 node, 60 s sim | 2.05 s | **0.60 s** | **3.42x** |
+| Contiki-NG ARM firmware (chain-3/4node, cc2538 RPL-UDP) | | | ~1.00x |
+
+The split is coverage, not codegen: Zephyr images are Thumb-16 dense (average
+compiled block 34.9 instructions), Contiki-NG ARM images are Thumb-2 dense
+(1.7–2.4), and Thumb-2 is not compiled yet. See
+[`docs/design/arm-performance-plan.md`](docs/design/arm-performance-plan.md) §5.
+
+```sh
+CSIM_ARM_JIT=0            # disable (for A/B or bisecting a suspected JIT bug)
+CSIM_ARM_JIT_STATS=1      # coverage: insns via compiled code, avg block, side exits, RSS
+CSIM_ARM_JIT_VERIFY=1     # lockstep: run each block, rewind (incl. SRAM), re-run
+                          # interpreted, compare r0-r15 + APSR + cycles + memory
+CSIM_ARM_JIT_MIN_BLOCK=n  # minimum block length to compile (default 1 — NOT a tuning
+                          # knob, see the comment in arm_jit.c: 4 costs 3x)
+CSIM_ARM_JIT_THRESHOLD=n  # executions before compiling (default 50)
+```
