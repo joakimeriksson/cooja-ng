@@ -28,29 +28,44 @@ is a gated guarantee and Lightning is an optional dependency.
 That works out to **4.2 host cycles per emulated instruction** where the JIT
 applies, against the MSP430 JIT's 7.8.
 
-**The one number that did not move is the important one.** Contiki-NG ARM
-firmware is flat because it is Thumb-2 dense: average compiled block is
-**1.7–2.4 instructions against 34.9 on Zephyr**, so almost nothing compiles and
-the workload pays the cache probe for nothing. This is not a coverage gap in
-the Thumb-16 subset — 72% of executed instructions on cc2538 RPL-UDP already
-decode (§5.7).
+**The one number that did not move is the important one, and §5.11 decomposes
+it.** Short version: the JIT's leverage is *amortising block entry*, Contiki-NG
+protocol code is branch-dense and call/return-shaped, and those workloads spend
+only a third to two thirds of their wall time interpreting in the first place.
+Coverage is real but secondary — proved by measurement, not argued (§5.11.3).
 
-**Next steps, in the order the measurements justify:**
+**Next steps, in the order the measurements justify** — reordered after §5.11,
+which refuted the previous ordering's premise:
 
-1. **Thumb-2 codegen (§5.8).** The entire remaining gap on the Contiki-NG ARM
-   platforms — CC2538, nRF52840, nRF54L15, which is to say the strategic ones.
-   ~2 weeks. Nothing else on this list changes those workloads.
-2. **`arm_step_until`'s convergence tail (§5.7b).** 79.8% of `arm_step` calls
+1. **Cheap Thumb-16 classes, measured one at a time (§5.11.3).** `NOP` alone
+   took cc2538 coverage 28.5% → 71.4% and bought 1.14x (7/7 paired). Remaining
+   candidates with their measured share of executed instructions:
+   hi-register `dp_reg`/`BX` (4.3% cc2538, 4.3% nRF52840), `SXTB`/`UXTB`/`SXTH`
+   /`UXTH` (3.8% nRF52840), `CBZ`/`CBNZ` (1.7% cc2538, 1.9% nRF52840),
+   `PUSH`/`POP` (1.3% / 1.4%). Days, not weeks, and each is independently
+   gateable. **Expect single-digit percentages, not multiples** — see 5 below.
+2. **Interpreter work, which is not subject to the block-length ceiling.**
+   Every workload spends 34–63% of its wall time interpreting instructions the
+   JIT will not compile soon. Tiers 0–2′ bought 34% this way and were far
+   cheaper than the JIT.
+3. **Thumb-2 codegen.** Still the largest single class on nRF52840 Contiki
+   (**23.3%** of executed instructions there — but only **6.3%** on cc2538, so
+   this is platform-specific, not a blanket "Contiki-NG is Thumb-2 dense"). ~2
+   weeks, and bounded by the same ceiling as everything else.
+4. **`arm_step_until`'s convergence tail (§5.7b).** 79.8% of `arm_step` calls
    arrive with a budget of 1 instruction; the JIT now escapes that via the
    cycle target, but the interpreter still pays ~3M call frames per 3 s run to
    execute one instruction each. Timing-sensitive, so it needs the full gate.
-3. **Multi-instruction block verification (§5.10).** `arm-decode` and `arm-jit`
+5. **Multi-instruction block verification (§5.10).** `arm-decode` and `arm-jit`
    are both exhaustive over *single* encodings; block **composition** —
    register liveness across instructions, the loop back-edge, join patching —
    is covered only by `CSIM_ARM_JIT_VERIFY=1` over the firmware corpus.
-4. **Remaining Thumb-16 classes.** Only push/pop, the hi-register forms and
-   register-controlled shifts are left. Cheap, but worth little on its own:
-   blocks are already cut short by branches every ~4 instructions (§5.7).
+
+**What is NOT on this list, and why:** raising Contiki-NG ARM to Zephyr-like
+speedups. §5.11 shows the ceiling is structural — roughly **1.5x on cc2538 and
+2.5x on nRF52840 even with an infinitely fast JIT** — so no amount of codegen
+work gets there. Anyone planning against a 3x number for those platforms is
+planning against the wrong number.
 
 Read §5.10 before touching `arm_jit.c` — it documents a GNU Lightning x86-64
 backend bug that made every N-reading condition silently take the wrong branch
@@ -883,6 +898,82 @@ emitted for.
 blocks are *composed* (register liveness across instructions, the loop
 back-edge, join patching) is still corpus-covered only. `CSIM_ARM_JIT_VERIFY=1`
 over the firmware corpus is what covers that today.
+
+### 5.11 Why Contiki-NG ARM firmware is hard — decomposed
+
+The summary above used to say these workloads are flat "because they are
+Thumb-2 dense". That is true of one of them and false of the other, and the
+real answer is structural. Executed-instruction mixes, measured by decoding
+every instruction as the interpreter retires it:
+
+| | Zephyr sync (nRF52840) | Contiki-NG cc2538 | Contiki-NG nRF52840 |
+|---|---|---|---|
+| speedup | **3.5x** | 1.14x | 1.00x |
+| JIT-decodable | 94.1% | 69.1% | 64.4% |
+| block-terminating branches | 9.1% | 10.5% | **25.8%** |
+| Thumb-2 | 3.4% | **6.3%** | **23.3%** |
+| single largest class | `SUBS #imm` **80.8%** | `LDR [SP,#imm]` 22.8%, `NOP` 18.0% | `B<cond>` 25.8% |
+| mean compiled block | **34.9** | 3.3 | 1.8 |
+
+**5.11.1 The Zephyr number is a spin loop, and should be read as one.**
+80.8% of that workload's executed instructions are a single `SUBS Rd,#imm`, and
+8.4% are the `B<cond>` closing the loop around it. The JIT compiles that pair
+into a *native* loop that runs under an iteration budget without re-entering —
+999.5 instructions per block entry on the pure delay loop. So 3.5x is a real
+measurement of a real Zephyr image, but the mechanism is "this firmware
+busy-waits", not "Zephyr code compiles well in general". It flatters the JIT
+and the comparison table should not be read as Zephyr-vs-Contiki.
+
+**5.11.2 The JIT's leverage is amortising block entry, and Contiki-NG's code
+shape denies it that.** Entering a compiled block costs a cache probe, a call,
+a prologue saving the callee-saved registers, an xPSR load, and the mirror
+image on exit — call it 15–25 host cycles against an interpreter costing ~15
+cycles *per instruction*. At Zephyr's 34.9 instructions per entry that is
+noise. At Contiki-NG's 1.8–3.3 it is most of the win.
+
+And block length there is not primarily a coverage problem. **25.8% of what
+Contiki-NG executes on nRF52840 is a conditional branch** — a block must end at
+one — so even with 100% instruction coverage the mean block would be under 4.
+The workload is protocol code: short functions, frequent calls and returns,
+data-dependent branching. That is the shape a basic-block JIT has least to
+offer. Zephyr's delay loop is the opposite extreme.
+
+**5.11.3 Coverage is real but secondary, and this was tested rather than
+argued.** `NOP` was 18.0% of cc2538's stream and unsupported, so adding it (a
+class that emits nothing) was a clean single-variable experiment:
+
+| | before | after |
+|---|---|---|
+| coverage | 28.5% | **71.4%** |
+| mean block | 2.4 | 3.3 |
+| wall clock | 0.240 s | 0.210 s (**1.14x**, 7/7 paired) |
+
+**A 2.5x jump in coverage bought 14%.** That is the ceiling asserting itself,
+and it is the number to remember before committing weeks to any further
+instruction class.
+
+**5.11.4 Some of these workloads are barely interpreter-bound at all.**
+`CSIM_PHASE_TIMING=1` reports ~95% "step (CPU)" for both Contiki-NG workloads,
+but that phase includes event dispatch and WFI fast-forward. Dividing
+instructions by step time and comparing against the interpreter-only rate from
+`arm-bench` separates them:
+
+| | instructions / step time | interpreter-only (`arm-bench`) | actually interpreting | ceiling for a perfect JIT |
+|---|---|---|---|---|
+| cc2538 2-node RPL-UDP | 58 MIPS | 170 MIPS | ~34% | **~1.5x** |
+| chain-3node-nRF52840 | 126 MIPS | ~200 MIPS | ~63% | **~2.5x** |
+
+The rest is radio bytes, the event queue, and idle time being skipped — none of
+which a faster interpreter or a JIT touches. `chain-4node-cc2538dk` is further
+along the same axis and does not move at all (1.01x).
+
+**5.11.5 What this means for planning.** The four effects compound: a third to
+two thirds of wall time is outside the interpreter; a quarter of what is left
+is branches that end blocks; short blocks do not repay entry; and the remaining
+uncovered classes are each a few percent. **No amount of codegen work makes
+Contiki-NG ARM look like the Zephyr number.** The honest targets are ~1.5x on
+cc2538 and ~2.5x on nRF52840, and interpreter work — which is subject to none
+of these ceilings — competes well against JIT work for the same effort.
 
 ## 6. Sequencing, risk, rollback
 
