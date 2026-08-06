@@ -1160,7 +1160,7 @@ trace formation put together.
 reachable on protocol firmware, where the instructions it can compile are not
 where the time is. Further coverage, linking or Thumb-2 all optimise the 5%.
 
-### 5.14 Two interpreter changes, one of each kind
+### 5.14 Two interpreter changes, one of each kind — and where the road ends
 
 **5.14.1 MMIO page-hash lookup — DONE (`59673d7`): 1.07x on TSCH.**
 `find_io_region` was an unconditionally full linear scan (smallest-wins forbids
@@ -1205,6 +1205,21 @@ Downstream consequence for Part 2 of the follow-up plan: the "budget
 starvation" prerequisite for reopening the JIT is moot — removing it is worth
 ~nothing — which further weakens the case for trace-formation revival (§5.13),
 whose failure was attributed partly to that starvation.
+
+**5.14.3 Where the measurements say to stop.** The post-§5.14 profile has no
+named symbol above ~3%: `arm_step_interpreter` holds ~70–85% flat, and the
+residue (`mem_read32_unaligned`, `arm_write32`, `find_io_region` post-hash,
+`arm_nvic_check_pending`, `arm_sp_audit_push`, `thumb_expand_imm_c`) is 1–3%
+apiece. One of those was tested to closure: force-inlining
+`thumb_expand_imm_c` (the `condition_passed` defect again) measured **1.036x
+on the isolated `thumb2-dp` bench (5/7) and nothing on any real workload**
+(cc2538 0/7, TSCH 2/7) — not kept. The remaining §1.3 candidates (T32
+second-level dispatch, read/write fallback dedup, per-instruction load
+hoists) all target slices of that flat 1–3% residue; expect fractions of a
+percent each, and demand the same full gate as anything else touching the
+loop. The ARM emulator is now, by measurement, uniformly limited by the
+per-instruction cost of faithful interpretation — the remaining order-of-
+magnitude levers are idle-skip policy and workload shape, not the engine.
 
 ## 6. Sequencing, risk, rollback
 
