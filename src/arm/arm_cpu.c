@@ -1242,8 +1242,23 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
      * per-instruction GDB check and no ROM-trap dispatch — which is part of
      * the measured ARM/MSP430 interpreter gap. */
     gdb_stub_t *const gdb_stub = (gdb_stub_t *)cpu->gdb_stub;
-    const int fw_traps_armed = (cpu->fw_udivmoddi4 != 0) ||
-                               (cpu->fw_aeabi_uldivmod != 0);
+    /*
+     * The two ROM-trap addresses, hoisted so the per-instruction test is two
+     * register compares rather than a call.
+     *
+     * `handle_fw_trap()` used to be called on *every* instruction, and the
+     * compiler will not inline a function that size into a loop this big — the
+     * same thing that happened to `condition_passed` and cost 5.9% until Tier 0
+     * forced it (§2). It showed up in a profile as its own symbol at **9.3% of
+     * runtime on Contiki-NG/nRF52840 and 11% on cc2538**, which is not the cost
+     * of emulating a 64-bit divide (those are rare) but the cost of asking
+     * "is this one?" three million times a second.
+     *
+     * A trap address of 0 means "not armed", and PC is never 0 here, so the
+     * comparison needs no separate armed test.
+     */
+    const uint32_t fw_trap_a = cpu->fw_udivmoddi4;
+    const uint32_t fw_trap_b = cpu->fw_aeabi_uldivmod;
 
     while (remaining > 0 && !cpu->stopping) {
         arm_trace_step(cpu);
@@ -1406,8 +1421,9 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
             }
         }
 
-        /* ROM utility traps */
-        if (__builtin_expect(fw_traps_armed, 0) && handle_fw_trap(cpu)) {
+        /* ROM utility traps — see the hoist above for why this is not a call. */
+        if (__builtin_expect(pc == fw_trap_a || pc == fw_trap_b, 0) &&
+            handle_fw_trap(cpu)) {
             cpu->instructions++;
             remaining--;
             continue;
