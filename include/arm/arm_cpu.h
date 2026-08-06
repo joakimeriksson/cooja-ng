@@ -236,6 +236,22 @@ typedef struct arm_cpu {
     } sp_audit[ARM_SP_AUDIT_DEPTH];
     int       sp_audit_top;
     int       sp_audit_overflow;
+
+    /* JIT block cache (src/arm/arm_jit.c).  Declared unconditionally — not
+     * under #ifdef HAVE_LIGHTNING — so the struct layout is identical whether
+     * or not Lightning was detected, and a stale object file can't disagree
+     * with a fresh one about field offsets.  All NULL/0 when the JIT is off.
+     *
+     * Indexed by (pc - flash_base) >> 1, i.e. one slot per possible Thumb
+     * instruction address in flash. */
+    void    **jit_cache;         /* arm_compiled_block_t* per slot        */
+    int32_t  *jit_exec_count;    /* hot-block detection; <0 = don't retry  */
+    uint32_t  jit_cache_size;    /* 0 = JIT disabled for this CPU          */
+    int       jit_threshold;     /* executions before compiling (env-set)  */
+    int       jit_verify;        /* CSIM_ARM_JIT_VERIFY=1 lockstep check   */
+    int32_t   jit_iter_budget;   /* loop blocks: iterations still allowed  */
+    uint64_t  jit_blocks_run;    /* diagnostics: compiled-block entries    */
+    uint64_t  jit_insns_run;     /* diagnostics: instructions via the JIT  */
 } arm_cpu_t;
 
 /* --- Public API --- */

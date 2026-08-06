@@ -291,7 +291,19 @@ static void bench_synth(const char *name, const char *desc, emit_fn emit) {
 
         int64_t c0 = cpu.cycles, i0 = cpu.instructions;
         double start = get_time_ms();
-        arm_step(&cpu, INSTRUCTIONS);
+        /* Step in chunks rather than one giant call.  The runner never hands
+         * arm_step a 20M-instruction budget — a 3 s single-node Zephyr run
+         * makes 4.18M arm_step calls, 73% of them with a budget of 1 — so a
+         * single call is the unrepresentative case, and it also starves the
+         * JIT's hot-block discovery, which probes once per call.  The extra
+         * 20k call frames over 20M instructions are not measurable. */
+        for (long left = INSTRUCTIONS; left > 0; ) {
+            int chunk = left > 1000 ? 1000 : (int)left;
+            int rem = arm_step(&cpu, chunk);
+            int did = chunk - rem;
+            if (did <= 0) break;
+            left -= did;
+        }
         double elapsed = get_time_ms() - start;
 
         /* Guards, strongest first.
@@ -350,7 +362,13 @@ static int bench_firmware(const char *name, const char *platform,
 
         int64_t c0 = plat.cpu.cycles;
         double start = get_time_ms();
-        arm_step(&plat.cpu, FW_INSTRUCTIONS);
+        for (long left = FW_INSTRUCTIONS; left > 0; ) {
+            int chunk = left > 1000 ? 1000 : (int)left;
+            int rem = arm_step(&plat.cpu, chunk);
+            int did = chunk - rem;
+            if (did <= 0) break;
+            left -= did;
+        }
         double elapsed = get_time_ms() - start;
 
         cycles = (long)(plat.cpu.cycles - c0);

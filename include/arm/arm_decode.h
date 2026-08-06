@@ -61,6 +61,7 @@ typedef enum {
     ARM_DEC_ALU_IMM,         /* Rd = Rn <op> #imm                            */
     ARM_DEC_SHIFT_IMM,       /* Rd = Rm <shift> #imm5                        */
     ARM_DEC_B_UNCOND,        /* B <label> — block terminator                 */
+    ARM_DEC_B_COND,          /* B<cond> <label> — block terminator           */
 } arm_dec_class_t;
 
 /* ALU operations in the v1 subset.  Excludes ADC/SBC (carry-in — the MSP430
@@ -95,6 +96,7 @@ typedef struct arm_decoded_insn {
     arm_shift_t     shift;      /* SHIFT_IMM only                            */
 
     uint8_t  rd, rn, rm;        /* register operands (low regs in v1)        */
+    uint8_t  cond;              /* B_COND only: ARM condition code 0..13     */
     uint32_t imm;               /* immediate, shift amount, or branch target */
 
     bool     writes_result;     /* false for CMP/CMN/TST                     */
@@ -127,8 +129,12 @@ int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
 /*
  * Decode a straight-line block starting at `pc`.  Stops after a terminator,
  * on the first unsupported instruction, or at ARM_MAX_BLOCK_SIZE.
- * `all_supported` says whether the whole block is compilable; the caller must
- * not compile a block where it is false.
+ * `all_supported` is false when the block stopped early at an unsupported
+ * instruction.  That does NOT make the block uncompilable: insns[0..length-1]
+ * are supported by construction, so the prefix can be compiled and exits with
+ * PC = end_pc, leaving the interpreter to handle the instruction that stopped
+ * it.  Refusing those outright would forfeit almost all coverage on real
+ * firmware, which is dominated by mixed ALU/memory sequences.
  */
 void arm_decode_block(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
                       uint32_t pc, arm_basic_block_t *block);

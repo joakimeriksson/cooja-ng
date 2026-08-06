@@ -62,6 +62,7 @@ SOURCES = $(MSP430_SRC_DIR)/msp430_cpu.c \
 
 ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/arm_decode.c \
+              $(ARM_SRC_DIR)/arm_jit.c \
               $(ARM_SRC_DIR)/arm_config.c \
               $(ARM_SRC_DIR)/arm_nvic.c \
               $(ARM_SRC_DIR)/arm_systick.c \

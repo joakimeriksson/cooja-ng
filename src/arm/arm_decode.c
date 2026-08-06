@@ -137,6 +137,21 @@ int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
         return 2;
     }
 
+    /* ---- conditional branch: terminates a block ----
+     * cond 0xE is UDF and 0xF is SVC; the interpreter treats both as NOPs,
+     * which is a fidelity gap of its own — not something to reproduce in
+     * generated code.  Both are refused. */
+    case 26: case 27: {
+        int cond = (hw >> 8) & 0xF;
+        if (cond >= 0xE) return reject(out, pc, hw);
+        int32_t imm8 = (int8_t)(hw & 0xFF);       /* sign-extended */
+        base(out, pc, hw, ARM_DEC_B_COND);
+        out->writes_result = false;
+        out->cond = (uint8_t)cond;
+        out->imm  = (uint32_t)(pc + 4 + imm8 * 2);
+        return 2;
+    }
+
     /* ---- unconditional branch: terminates a block ---- */
     case 28: {
         int32_t imm11 = hw & 0x7FF;
@@ -177,7 +192,8 @@ void arm_decode_block(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
         pc += (uint32_t)sz;
         block->end_pc = pc;
 
-        if (di->klass == ARM_DEC_B_UNCOND) return; /* terminator */
+        if (di->klass == ARM_DEC_B_UNCOND ||
+            di->klass == ARM_DEC_B_COND) return;   /* terminator */
     }
 
     /* A block that ran to the cap (or hit an unsupported instruction) has no

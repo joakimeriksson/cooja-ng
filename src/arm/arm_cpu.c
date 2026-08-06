@@ -5,6 +5,11 @@
 #include "arm_decode.h"
 #include "arm_config.h"
 #include "arm_nvic.h"
+#include "arm_jit.h"
+
+/* Defined below, next to the JIT dispatcher; declared here because
+ * arm_cpu_destroy/arm_cpu_reset appear earlier in the file. */
+void arm_jit_flush(arm_cpu_t *cpu);
 #include "gdb_stub.h"
 #include <stdlib.h>
 #include <string.h>
@@ -352,6 +357,33 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->vtor_default = config->vtor_default;
 
     cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
+
+    /* JIT block cache.  Fixed-size and direct-mapped with a start_pc tag —
+     * see include/arm/arm_jit.h for why it isn't a slot per flash address. */
+    cpu->jit_cache = NULL; cpu->jit_exec_count = NULL; cpu->jit_cache_size = 0;
+    cpu->jit_threshold = 50; cpu->jit_verify = 0;
+    cpu->jit_blocks_run = 0; cpu->jit_insns_run = 0;
+#ifdef HAVE_LIGHTNING
+    {
+        const char *e = getenv("CSIM_ARM_JIT");
+        if (!e || atoi(e) != 0) {
+            csim_lightning_init();
+            cpu->jit_cache = (void **)calloc(ARM_JIT_CACHE_SLOTS, sizeof(void *));
+            cpu->jit_exec_count =
+                (int32_t *)calloc(ARM_JIT_CACHE_SLOTS, sizeof(int32_t));
+            if (cpu->jit_cache && cpu->jit_exec_count) {
+                cpu->jit_cache_size = ARM_JIT_CACHE_SLOTS;
+            } else {
+                free(cpu->jit_cache); free(cpu->jit_exec_count);
+                cpu->jit_cache = NULL; cpu->jit_exec_count = NULL;
+            }
+        }
+        e = getenv("CSIM_ARM_JIT_THRESHOLD");
+        if (e) cpu->jit_threshold = atoi(e);
+        e = getenv("CSIM_ARM_JIT_VERIFY");
+        cpu->jit_verify = (e && atoi(e) != 0);
+    }
+#endif
     cpu->sram  = (uint8_t *)calloc(config->sram_size,  1);
     cpu->rom   = (config->rom_size > 0) ? (uint8_t *)calloc(config->rom_size, 1) : NULL;
 
@@ -398,6 +430,31 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
 }
 
 void arm_cpu_destroy(arm_cpu_t *cpu) {
+    /* CSIM_ARM_JIT_STATS=1: how much of the run actually went through
+     * compiled code.  Coverage is the number that matters — a JIT that is
+     * correct but only sees 3% of instructions cannot show up in wall time,
+     * and without this you cannot tell that case from "the codegen is slow". */
+    if (cpu->jit_insns_run || cpu->jit_blocks_run) {
+        const char *e = getenv("CSIM_ARM_JIT_STATS");
+        if (e && atoi(e) != 0) {
+            double pct = cpu->instructions
+                       ? 100.0 * (double)cpu->jit_insns_run / (double)cpu->instructions
+                       : 0.0;
+            fprintf(stderr,
+                    "  [arm-jit] blocks_run=%llu insns_via_jit=%llu / %lld (%.1f%%)"
+                    " avg_block=%.1f\n",
+                    (unsigned long long)cpu->jit_blocks_run,
+                    (unsigned long long)cpu->jit_insns_run,
+                    (long long)cpu->instructions, pct,
+                    cpu->jit_blocks_run
+                        ? (double)cpu->jit_insns_run / (double)cpu->jit_blocks_run
+                        : 0.0);
+        }
+    }
+    arm_jit_flush(cpu);
+    free(cpu->jit_cache);       cpu->jit_cache = NULL;
+    free(cpu->jit_exec_count);  cpu->jit_exec_count = NULL;
+    cpu->jit_cache_size = 0;
     free(cpu->rom);
     free(cpu->flash);
     free(cpu->sram);
@@ -405,6 +462,11 @@ void arm_cpu_destroy(arm_cpu_t *cpu) {
 }
 
 void arm_cpu_reset(arm_cpu_t *cpu) {
+    /* Drop compiled blocks: a reset may follow a fresh ELF load (tz-boot
+     * loads two images into one CPU), so cached code could describe
+     * bytes that are no longer there.  Flash is read-only at run time,
+     * so this is the only way the image can change under the cache. */
+    arm_jit_flush(cpu);
     memset(cpu->reg, 0, sizeof(cpu->reg));
     cpu->xpsr = 0;
     cpu->it_state = 0;
@@ -771,6 +833,11 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
         reg[ARM_PC] = di->imm;
         return 1;
 
+    case ARM_DEC_B_COND:
+        /* Not-taken leaves PC where the caller put it (pc + 2). */
+        if (condition_passed(cpu, di->cond)) reg[ARM_PC] = di->imm;
+        return 1;
+
     default:
         return 0;
     }
@@ -1063,7 +1130,7 @@ static inline void arm_trace_step(arm_cpu_t *cpu) {
             cpu->xpsr, (void*)cpu);
 }
 
-int arm_step(arm_cpu_t *cpu, int count) {
+static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
     int remaining = count;
 
     /* Hoist the flash window into locals for the whole slice.
@@ -3224,6 +3291,233 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
     return remaining;
 }
+
+
+/* ============================================================
+ * JIT dispatcher
+ *
+ * Deliberately an OUTER loop around the interpreter, mirroring msp430_step:
+ * the interpreter's own loop is left untouched.  Putting the cache probe
+ * inside arm_step_interpreter would have undone the two per-instruction
+ * hoists that bought 15.9% earlier (8c3cb60) — the whole point of that work
+ * was to get checks *out* of that loop.
+ *
+ * Conditions the compiled path does not model are simply handed back to the
+ * interpreter, which is the only thing that makes the subset argument work:
+ * the JIT never has to be right about anything it declined to compile.
+ * ============================================================ */
+#ifdef HAVE_LIGHTNING
+
+/*
+ * Interpreter run-length between JIT cache probes.  0 = hand the interpreter
+ * the caller's full budget, which is the default and is NOT a tuning choice:
+ *
+ * Chopping arm_step's budget into fixed batches changes simulation timing.
+ * Measured directly — dispatcher present but threshold set so high that
+ * nothing compiles, so the only variable is the batch size:
+ *
+ *   batch=32   vs no dispatcher  ->  DIFFERS  (a TX moves 4.240 s -> 3.078 s)
+ *   batch=full vs no dispatcher  ->  byte-identical
+ *
+ * arm_step's contract is "up to count instructions", and the interpreter's
+ * WFI/event handling is sensitive to that budget, so re-entering it with a
+ * different count is observable.  With batch=full the JIT is cycle-exact:
+ * CSIM_ARM_JIT=0 and CSIM_ARM_JIT=1 produce byte-identical output on
+ * test-2node-nrf54l15-dk (209 lines) and chain-3node-nrf52840-dk (1067).
+ * That property is required here — determinism is a gated guarantee, and a
+ * JIT that shifted timing would make results depend on whether GNU Lightning
+ * happened to be installed.
+ *
+ * Cost: one cache probe per arm_step call rather than one per 32
+ * instructions.  That is ample — a 3 s zephyr run makes 4.18M arm_step calls.
+ */
+#define ARM_JIT_BATCH 0
+int arm_jit_batch_size(void);
+int arm_jit_batch_size(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CSIM_ARM_JIT_BATCH"); v = e ? atoi(e) : ARM_JIT_BATCH; }
+    return v;
+}
+
+/*
+ * Lockstep verification (CSIM_ARM_JIT_VERIFY=1): run the compiled block, keep
+ * what it produced, rewind, re-run the same instructions through the
+ * interpreter, and compare architectural state exactly.
+ *
+ * This exists because of the single correctness bug the MSP430 JIT ever
+ * shipped — an inlined ADDC left the V flag stale.  It was warm-block-only,
+ * so no functional test could reach it, and a wrong *flag* stays invisible
+ * until some later conditional branch reads it.  Comparing state per block is
+ * the only thing that catches that class.
+ */
+/*
+ * Run one compiled block and do its bookkeeping.
+ *
+ * Cycle/instruction accounting lives here rather than in generated code
+ * because a loop block's iteration count is only known afterwards, and
+ * because the budget that bounds it has to come from the dispatcher's view of
+ * `remaining` and the next scheduled event.  Returns instructions executed, or
+ * 0 if the block could not be run (caller falls back to the interpreter).
+ */
+static int arm_jit_run(arm_cpu_t *cpu, arm_compiled_block_t *cb, int remaining) {
+    int iters_max = 1;
+    if (cb->is_loop) {
+        int by_insns = remaining / cb->length;
+        int64_t by_events =
+            (cpu->next_event_cycle - cpu->cycles - 1) / cb->length;
+        iters_max = by_insns;
+        if (by_events < (int64_t)iters_max) iters_max = (int)by_events;
+        if (iters_max < 1) return 0;
+    }
+    cpu->jit_iter_budget = iters_max;
+    cb->fn(cpu);
+    int iters = cb->is_loop ? (iters_max - cpu->jit_iter_budget) : 1;
+    int executed = iters * cb->length;
+    cpu->cycles       += executed;
+    cpu->instructions += executed;
+    return executed;
+}
+
+static int arm_jit_run_verified(arm_cpu_t *cpu, arm_compiled_block_t *cb,
+                                int remaining) {
+    uint32_t save_reg[16];
+    memcpy(save_reg, cpu->reg, sizeof(save_reg));
+    uint32_t save_xpsr   = cpu->xpsr;
+    int64_t  save_cycles = cpu->cycles;
+    int64_t  save_instr  = cpu->instructions;
+
+    int executed = arm_jit_run(cpu, cb, remaining);
+    if (executed == 0) return 0;
+
+    uint32_t jit_reg[16];
+    memcpy(jit_reg, cpu->reg, sizeof(jit_reg));
+    uint32_t jit_xpsr   = cpu->xpsr;
+    int64_t  jit_cycles = cpu->cycles;
+
+    /* Rewind and re-run the same instructions interpreted. */
+    memcpy(cpu->reg, save_reg, sizeof(save_reg));
+    cpu->xpsr         = save_xpsr;
+    cpu->cycles       = save_cycles;
+    cpu->instructions = save_instr;
+    arm_step_interpreter(cpu, executed);
+
+    int bad = 0;
+    for (int r = 0; r < 16; r++) {
+        if (jit_reg[r] != cpu->reg[r]) {
+            if (!bad)
+                fprintf(stderr, "ARM JIT MISMATCH pc=0x%08x len=%d:\n",
+                        cb->start_pc, cb->length);
+            fprintf(stderr, "  r%-2d  jit=0x%08x interp=0x%08x\n",
+                    r, jit_reg[r], cpu->reg[r]);
+            bad = 1;
+        }
+    }
+    if ((jit_xpsr & 0xF0000000u) != (cpu->xpsr & 0xF0000000u)) {
+        if (!bad)
+            fprintf(stderr, "ARM JIT MISMATCH pc=0x%08x len=%d:\n",
+                    cb->start_pc, cb->length);
+        fprintf(stderr, "  APSR jit=N%dZ%dC%dV%d interp=N%dZ%dC%dV%d\n",
+                !!(jit_xpsr & 0x80000000u), !!(jit_xpsr & 0x40000000u),
+                !!(jit_xpsr & 0x20000000u), !!(jit_xpsr & 0x10000000u),
+                !!(cpu->xpsr & 0x80000000u), !!(cpu->xpsr & 0x40000000u),
+                !!(cpu->xpsr & 0x20000000u), !!(cpu->xpsr & 0x10000000u));
+        bad = 1;
+    }
+    if (jit_cycles != cpu->cycles && !bad)
+        fprintf(stderr, "ARM JIT CYCLE MISMATCH pc=0x%08x: jit=%lld interp=%lld\n",
+                cb->start_pc, (long long)jit_cycles, (long long)cpu->cycles);
+    return executed;
+}
+
+void arm_jit_flush(arm_cpu_t *cpu);
+void arm_jit_flush(arm_cpu_t *cpu) {
+    if (!cpu->jit_cache) return;
+    for (uint32_t i = 0; i < cpu->jit_cache_size; i++) {
+        if (cpu->jit_cache[i]) {
+            arm_jit_free((arm_compiled_block_t *)cpu->jit_cache[i]);
+            cpu->jit_cache[i] = NULL;
+        }
+        cpu->jit_exec_count[i] = 0;
+    }
+}
+
+int arm_step(arm_cpu_t *cpu, int count) {
+    if (cpu->jit_cache_size == 0) return arm_step_interpreter(cpu, count);
+
+    int remaining = count;
+    while (remaining > 0 && !cpu->stopping) {
+        /* Anything the compiled path does not model -> interpreter.  A due
+         * event or a pending IRQ must be taken at an instruction boundary,
+         * and a block has no internal check; mid-IT-block execution needs the
+         * interpreter's flag suppression; WFI and GDB are its business too. */
+        int interp_only = cpu->cpu_off || cpu->gdb_stub != NULL ||
+                          (cpu->it_state & 0xF) != 0 ||
+                          cpu->cycles >= cpu->next_event_cycle;
+        if (!interp_only && cpu->nvic &&
+            ((arm_nvic_t *)cpu->nvic)->has_pending)
+            interp_only = 1;
+
+        if (!interp_only) {
+            uint32_t pc = cpu->reg[ARM_PC] & ~1u;
+            if (pc >= cpu->flash_base && pc < cpu->flash_end) {
+                uint32_t ci = (pc >> 1) & (ARM_JIT_CACHE_SLOTS - 1);
+                arm_compiled_block_t *cb =
+                    (arm_compiled_block_t *)cpu->jit_cache[ci];
+
+                if (cb && cb->start_pc == pc && remaining >= cb->length &&
+                    cpu->cycles + cb->length < cpu->next_event_cycle) {
+                    int executed = cpu->jit_verify
+                                 ? arm_jit_run_verified(cpu, cb, remaining)
+                                 : arm_jit_run(cpu, cb, remaining);
+                    if (executed > 0) {
+                        cpu->jit_blocks_run++;
+                        cpu->jit_insns_run += (uint64_t)executed;
+                        remaining -= executed;
+                        continue;
+                    }
+                }
+
+                if ((!cb || cb->start_pc != pc) && cpu->jit_exec_count[ci] >= 0 &&
+                    ++cpu->jit_exec_count[ci] >= cpu->jit_threshold) {
+                    arm_basic_block_t blk;
+                    arm_decode_block(cpu->flash, cpu->flash_base,
+                                     cpu->flash_end - cpu->flash_base,
+                                     pc, &blk);
+                    arm_compiled_block_t *ncb = arm_jit_compile(&blk, cpu);
+                    if (ncb) {
+                        if (cb) arm_jit_free(cb);   /* evict the collision */
+                        cpu->jit_cache[ci] = ncb;
+                        cpu->jit_exec_count[ci] = 0;
+                        continue;
+                    }
+                    /* Not compilable (too short / unsupported at this PC).
+                     * Mark so we don't re-decode it on every pass. */
+                    cpu->jit_exec_count[ci] = -1;
+                }
+            }
+        }
+
+        int arm_jit_batch_size(void);
+        int bsz = arm_jit_batch_size();
+        int batch = (bsz <= 0 || remaining < bsz) ? remaining : bsz;
+        int rem   = arm_step_interpreter(cpu, batch);
+        int done  = batch - rem;
+        if (done <= 0) break;          /* no progress -> stop, don't spin */
+        remaining -= done;
+    }
+    return remaining;
+}
+
+#else  /* !HAVE_LIGHTNING */
+
+void arm_jit_flush(arm_cpu_t *cpu);
+void arm_jit_flush(arm_cpu_t *cpu) { (void)cpu; }
+
+int arm_step(arm_cpu_t *cpu, int count) {
+    return arm_step_interpreter(cpu, count);
+}
+
+#endif /* HAVE_LIGHTNING */
 
 void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
     if (cpu->cycles >= target_cycle) return;
