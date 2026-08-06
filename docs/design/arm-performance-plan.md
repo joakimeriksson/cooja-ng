@@ -1,10 +1,12 @@
 # ARM Interpreter Performance Plan
 
-Status: **in progress** (2026-08-06). §1 `arm-bench`, §2 Tier 0, §3 Tier 1
-(PGO) and §4 (the debug-facility gate, which replaced the dropped decode cache)
-are **done and measured**. §5 (Tier 3) has its decoder foundation landed and
-differentially verified; codegen is not started and carries an open decision
-(§5.4). Cumulative on the ARM runner workload: **2.939 s → 1.940 s, 34%**. Companion to
+Status: **in progress** (2026-08-07). §1 `arm-bench`, §2 Tier 0, §3 Tier 1
+(PGO), §4 (the debug-facility gate that replaced the dropped decode cache) and
+§5 Tier 3 (**JIT codegen — landed, cycle-exact**) are all done and measured.
+Interpreter work took the ARM runner workload **2.939 s → 1.940 s (34%)**; the
+JIT then adds **4.94x on ALU-heavy code and 1.23x on real Zephyr firmware**,
+reaching **3.2 host cycles per emulated instruction** where it applies. What
+limits it now is coverage, not codegen — see §5.6. Companion to
 [`refactor-plan.md`](refactor-plan.md) (§8 D5 overlaps Tier 0 here).
 
 **Why now.** ARM is the strategic platform — CC2538, nRF52840, nRF54L15,
@@ -583,23 +585,117 @@ r0–r15, APSR and cycles. 113280 comparisons, 0 failures, identical on
 Linux/gcc. Validated by fault injection — a flag-only BIC bug (invisible to
 `arm-correctness`) is caught immediately.
 
-### 5.4 What remains, and the open decision
+### 5.4 Codegen — **DONE** (`06f62b3`): 4.94x on ALU code, 1.23x on real firmware
 
-Not started: Lightning codegen, the block cache + hot-block threshold,
-invalidation on writes into `[flash_base, flash_end)` **by actual byte span**
-(csim shipped that exact bug once on MSP430, where invalidation covered only a
-fixed 6-byte window), and `JIT_VERIFY` lockstep.
+Measured interleaved (`CSIM_ARM_JIT=0` vs `1`), 7 pairs, Apple Silicon @ 4.39 GHz:
 
-`JIT_VERIFY` is non-negotiable and must exist *before* the first hot block
-runs, not after: the MSP430 ADDC bug was warm-block-only, so no ordinary test
-could reach it. Cycle counts must match block-for-block — determinism is a
-gated guarantee here.
+| benchmark | JIT off | JIT on | speedup | cycles/insn | paired |
+|---|---|---|---|---|---|
+| `alu-reg` | 276.8 | **1367.1** MIPS | **4.94x** | 15.9 -> **3.2** | 7/7 |
+| `fw-zephyr-sync` (real Zephyr) | 300.9 | **371.5** MIPS | **1.23x** | 14.6 -> **11.8** | 7/7 |
+| `it-block`, `branch`, `mem-ldr-str`, `thumb2-dp`, `fw-cc2538-udp` | | | ~1.00x | | |
 
-**Open decision (2026-08-06):** codegen is multi-week for ~1.25× on the
-primary dev machine (~1.8× on Linux/CI). The alternatives are to keep mining
-interpreter wins — which returned **34% in a day** (2.939 s → 1.940 s on the
-runner workload) — or to build the JIT primarily for the Linux/CI case. The
-foundation above is worth having either way.
+Linux/x86-64 confirms it: `alu-reg` 184 -> 837 MIPS (4.5x).
+
+**3.2 host cycles per emulated instruction beats the MSP430 JIT's 7.8** — the
+generated code is not the limit; coverage is.
+
+**Native self-loops are where the win is.** A conditional branch back to the
+block head compiles to a native loop under an iteration budget, instead of one
+call per iteration. Measured `avg_block` = **999.5** instructions per entry on
+zephyr-synchronization, against 9.9 for straight-line blocks. That shape
+dominates firmware: a temporary top5 histogram showed `SUBS`+`BNE` is **99.8%**
+of executed instructions there.
+
+### 5.5 Cycle-exactness cost a design change — and caught a bug in my dispatcher
+
+`CSIM_ARM_JIT=0` and `=1` produce **byte-identical** output on
+`test-2node-nrf54l15-dk`, `chain-3node`/`chain-4node-nrf52840-dk` and
+`chain-3node-nrf54l15-dk`. Not optional: determinism is a gated guarantee, and
+a JIT that shifted timing would make results depend on whether GNU Lightning
+happened to be installed on the build machine.
+
+The first dispatcher ran the interpreter in fixed 32-instruction batches
+between cache probes. **That alone shifted simulation timing** — a TX moved
+4.240 s -> 3.078 s — with the compile threshold set so high that nothing
+compiled, so batching was the only variable:
+
+| dispatcher | vs no dispatcher |
+|---|---|
+| batch = 32 | **DIFFERS** |
+| batch = caller's full budget | byte-identical |
+
+`arm_step`'s contract is "up to `count` instructions", and the interpreter's
+WFI/event handling is sensitive to that budget. The fix: hand over the full
+budget and probe once per `arm_step` call — ample, since a 3 s Zephyr run makes
+4.18M such calls.
+
+*The lesson generalises.* The isolation run — dispatcher present, codegen
+disabled — is what separated "my batching" from "my code generation". Without
+it the natural conclusion would have been that the codegen was wrong.
+
+### 5.6 What limits coverage now — measured
+
+Coverage is 99.0% of `alu-reg`, 21.1% of `fw-zephyr-sync`, ~0% elsewhere.
+Instrumenting which instruction class *stops* a block early (zephyr-sync):
+
+| blocker | share |
+|---|---|
+| memory ops (`ldr_imm`, `ldr_lit`, `str_imm`, `ldrb/strb`, `ldr_sp`/`str_sp`) | **~35%** |
+| Thumb-2 (32-bit) | 22% |
+| `dp_reg` hi-register forms + register-controlled shifts | 16% |
+| `misc` (push/pop, IT, CBZ) | 13% |
+
+And the executed mix on cc2538 RPL-UDP is 31.4% `ldr_sp`/`str_sp` alone.
+**Memory operations are the next step and are most of what is left.**
+
+They are not a simple extension, which is why they are not in v1: a store can
+land in an IO region and fire a peripheral callback, which can raise an
+interrupt or reschedule events — breaking the "nothing observable happens
+inside a block" property the whole design rests on. The shape that preserves it
+is a **guarded side exit**: inline the SRAM fast path, and if the address falls
+outside SRAM, leave the block with PC set to the faulting instruction and
+return the count completed so far. That needs the compiled function to return a
+variable instruction count, which the loop-budget arithmetic currently assumes
+is fixed.
+
+### 5.7 A second, independent limiter: `arm_step` budget granularity
+
+Even with perfect coverage the JIT is throttled on the runner path.
+Histogramming the `count` argument over a 3 s single-node Zephyr run:
+
+| `count` | share of 4.18M calls |
+|---|---|
+| **<= 1** | **72.8%** |
+| 5-8 | 9.1% |
+| 9-32 | 18.1% |
+| > 32 | 0.0% |
+
+`arm_step_until` single-steps whenever it is within 10 cycles of its target
+(`remaining <= 10 -> steps = 1`), and at ~7.3 cycles/instruction that is the
+tail of essentially every call. A block of length N cannot run on a budget of
+1, so 73% of calls can never reach the JIT — and separately, 3M call frames to
+execute one instruction each is interpreter overhead worth attacking on its
+own. Changing it is timing-sensitive (that single-step path exists to bound
+overshoot; the comment cites TSCH desync), so it needs the full gate.
+
+### 5.8 Verification
+
+- **`CSIM_ARM_JIT_VERIFY=1`** runs each block, rewinds, re-runs it interpreted,
+  and compares r0-r15, APSR and cycles. **0 mismatches** over `arm-bench`,
+  `zephyr-synchronization`, cc2538 RPL-UDP and `chain-3node-nrf52840-dk`. This
+  is the check the MSP430 ADDC bug needed: warm-block-only, and a stale flag
+  stays invisible until a later branch reads it.
+- **`arm-decode`**: **134784** differential comparisons (B_COND added), 0
+  failed, on clang/arm64 and gcc/x86-64.
+- Full gate green, plus JIT-on/off byte-identical output on four configs.
+
+**Gap worth closing:** `emit_cond()` is the highest-risk function in the JIT —
+14 condition codes, and a wrong one silently takes the wrong branch — yet it is
+covered only by whatever conditions the corpus happens to execute.
+`CSIM_ARM_JIT_MIN_BLOCK=1` exists so an `arm-jit` suite could compile
+one-instruction blocks and verify generated code exhaustively, the way
+`arm-decode` does for the reference model. That suite is not written yet.
 
 ## 6. Sequencing, risk, rollback
 
@@ -612,7 +708,8 @@ foundation above is worth having either way.
 | **Tier 2′ debug gate** **DONE** | ½ day | — | **14.6% measured**, non-overlapping; full gate green |
 | ~~branch consolidation~~ **REVERTED** | — | 3 wins / 9 paired runs | not a real effect (§4.4) |
 | **Tier 3 decoder** **DONE** | ½ day | — | **113280 differential comparisons, 0 failures**; in CI |
-| Tier 3 codegen | multi-week | **~1.25× on Apple Silicon, ~1.8× on x86-64** (§5.0) | JIT_VERIFY clean over corpus + full gate |
+| **Tier 3 codegen** **DONE** | 1 day | — | **4.94x ALU / 1.23x real firmware**, cycle-exact, JIT_VERIFY 0 mismatches |
+| Tier 3b memory ops | ~1 week | high value (35% of blockers) | needs guarded side exits (§5.6) |
 | ~~flash-window hoist~~ **DONE** | — | 15/20 pairs, p=0.021 | **4.3%** |
 | ~~gdb/ROM-trap hoist~~ **DONE** | — | 12/12 pairs, p=0.0002 | **15.9%** |
 
