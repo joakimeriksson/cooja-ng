@@ -250,7 +250,12 @@ typedef struct arm_cpu {
     int       jit_threshold;     /* executions before compiling (env-set)  */
     int       jit_verify;        /* CSIM_ARM_JIT_VERIFY=1 lockstep check   */
     int32_t   jit_iter_budget;   /* loop blocks: iterations still allowed  */
+    /* Side-exit report: -1 = the block ran to a normal exit; >= 0 = it
+     * stopped at that instruction index (a guarded memory access missed),
+     * having executed only the ones before it.  See arm_jit.h. */
+    int32_t   jit_partial;
     uint64_t  jit_blocks_run;    /* diagnostics: compiled-block entries    */
+    uint64_t  jit_side_exits;    /* diagnostics: guard misses              */
     uint64_t  jit_insns_run;     /* diagnostics: instructions via the JIT  */
 } arm_cpu_t;
 

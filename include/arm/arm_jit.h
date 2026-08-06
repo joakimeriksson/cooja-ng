@@ -31,9 +31,26 @@
 #include <lightning.h>
 
 /*
- * A compiled block runs to completion and returns the number of ARM
- * instructions it executed (always its full length — v1 blocks are
- * straight-line with no early exit).
+ * THE SIDE-EXIT CONTRACT
+ *
+ * A compiled block normally runs to its end and leaves `cpu->jit_partial` at
+ * the -1 the dispatcher set before the call.  A guarded memory access that
+ * misses (address outside SRAM, or misaligned) instead takes a **side exit**:
+ * it leaves architectural state exactly as if only insns[0..i-1] had executed,
+ * sets `cpu->reg[ARM_PC]` to insns[i].pc, writes `i` to `cpu->jit_partial`,
+ * and — inside a loop block — hands its iteration-budget decrement back, so
+ * `iter_budget` still counts only *completed* iterations.
+ *
+ * The interpreter then re-executes insns[i] through the full memory path,
+ * including IO callbacks, bit-band aliases and unaligned splits.  Nothing the
+ * JIT declined to model can be reached from generated code, which is what
+ * keeps "a store might fire a peripheral callback" from being a correctness
+ * problem: such a store is never the one that ran inline.
+ *
+ * The generated code's return value is unused; the dispatcher reconstructs the
+ * instruction and cycle counts from `jit_partial`, `jit_iter_budget` and
+ * `cyc_prefix`, because a loop block's iteration count is only known after it
+ * has run.
  */
 /*
  * The block cache is direct-mapped with a tag check (`start_pc`), not a slot
@@ -52,7 +69,20 @@ typedef struct arm_compiled_block {
     uint32_t        start_pc;
     uint32_t        end_pc;     /* first byte past the block               */
     int             is_loop;    /* self-loop: runs natively under a budget */
+    int             has_store;  /* block writes SRAM — see the verify note   */
     jit_state_t    *jit_state;  /* owns the code memory; freed on release  */
+
+    /*
+     * Cycle cost is a sum, not a count.  Register-only instructions cost 1
+     * cycle but every load/store costs 2 (arm_step's central charge plus the
+     * handler's own), so a block's cost stopped being its length the moment
+     * memory ops were admitted.  `cyc_prefix[i]` is the cost of insns[0..i-1],
+     * which is exactly what a side exit at instruction `i` has to charge;
+     * `cyc_prefix[length]` is the whole block.  Both are computed once at
+     * compile time so the dispatcher does a table lookup, not a loop.
+     */
+    uint16_t        cyc_prefix[ARM_MAX_BLOCK_SIZE + 1];
+    int             cycles_total;
 } arm_compiled_block_t;
 
 /* Lightning's init_jit()/finish_jit() are process-global, and a mixed

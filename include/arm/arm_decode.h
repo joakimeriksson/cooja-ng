@@ -18,6 +18,24 @@
  *
  * SCOPE — v1 is intentionally tiny, and that is the safety property
  *
+ * MEMORY OPERATIONS ARE DIFFERENT, AND THE DIFFERENCE IS THE INTERESTING PART
+ *
+ * Everything else in this subset is a pure register-to-register function: it
+ * cannot fail, so a compiled block that contains it either runs to the end or
+ * was never entered.  A load or store can land anywhere — SRAM, flash, a
+ * peripheral register, an unmapped hole — and a store into a peripheral can
+ * fire a callback that raises an interrupt or reschedules an event.  That
+ * would break the property the whole block design rests on: that nothing
+ * observable happens between block entry and block exit.
+ *
+ * So the decoder describes the *access*, not its destination, and the JIT
+ * compiles only the SRAM case inline behind an address guard.  Anything else
+ * takes a **side exit**: the block stops at that instruction with architectural
+ * state exactly as if only the preceding instructions had run, and the
+ * interpreter re-executes it through the full IO path.  Correctness therefore
+ * never depends on the guard being *generous*, only on it being *sound* —
+ * a guard that rejects too much costs speed, not accuracy.
+ *
  * This decodes only the subset the JIT is allowed to compile and reports
  * everything else as ARM_DEC_UNSUPPORTED.  The block compiler must refuse any
  * block containing an unsupported instruction, so an instruction not modelled
@@ -62,10 +80,16 @@ typedef enum {
     ARM_DEC_SHIFT_IMM,       /* Rd = Rm <shift> #imm5                        */
     ARM_DEC_B_UNCOND,        /* B <label> — block terminator                 */
     ARM_DEC_B_COND,          /* B<cond> <label> — block terminator           */
+    ARM_DEC_LOAD,            /* Rt = mem[reg[rn] + (imm | reg[rm])]          */
+    ARM_DEC_STORE,           /* mem[reg[rn] + (imm | reg[rm])] = Rt          */
+    ARM_DEC_LOAD_LIT,        /* Rt = mem32[imm] — PC-relative, address const */
 } arm_dec_class_t;
 
+/* `rm` value meaning "no register offset" — the offset is `imm` alone. */
+#define ARM_DEC_NO_RM 0xFFu
+
 /* ALU operations in the v1 subset.  Excludes ADC/SBC (carry-in — the MSP430
- * ADDC lesson) and everything with a memory or PC side effect. */
+ * ADDC lesson) and everything with a PC side effect. */
 typedef enum {
     ARM_ALU_AND = 0,
     ARM_ALU_EOR,
@@ -95,9 +119,16 @@ typedef struct arm_decoded_insn {
     arm_alu_op_t    op;
     arm_shift_t     shift;      /* SHIFT_IMM only                            */
 
-    uint8_t  rd, rn, rm;        /* register operands (low regs in v1)        */
+    uint8_t  rd, rn, rm;        /* register operands; rd is Rt for LOAD/STORE,
+                                 * rn the base (may be SP), rm the offset reg
+                                 * or ARM_DEC_NO_RM                          */
     uint8_t  cond;              /* B_COND only: ARM condition code 0..13     */
-    uint32_t imm;               /* immediate, shift amount, or branch target */
+    uint32_t imm;               /* immediate, shift amount, branch target, or
+                                 * (LOAD_LIT) the absolute address           */
+
+    /* LOAD/STORE/LOAD_LIT only. */
+    uint8_t  msize;             /* access width in bytes: 1, 2 or 4          */
+    bool     sext;              /* LDRSB/LDRSH: sign-extend the loaded value */
 
     bool     writes_result;     /* false for CMP/CMN/TST                     */
     uint8_t  cycles;            /* cycles the interpreter charges            */

@@ -37,14 +37,39 @@
 #include <stddef.h>
 #include <stdlib.h>
 
-/* Blocks shorter than this don't repay the call into native code.  Runtime
- * settable so `arm-jit` can compile one-instruction blocks and verify the
- * generated code for every supported encoding. */
+/*
+ * Minimum block length worth compiling.
+ *
+ * The obvious reasoning — "a block has to be long enough to repay the call
+ * into native code, so require 4" — is wrong, and measurably so.  Raising this
+ * from 1 to 4 does not trade a little coverage for a little call overhead; it
+ * falls off a cliff:
+ *
+ *   zephyr-synchronization, 60 s sim      min=4        min=1
+ *     instructions through compiled code   26.3%       98.3%
+ *     wall clock                           1.55 s      0.58 s
+ *
+ * The cause is that the fallback is all-or-nothing *per arm_step call*.  When
+ * the dispatcher finds no block at the current PC it hands the interpreter the
+ * caller's entire remaining budget (which it must — see ARM_JIT_BATCH), so one
+ * uncompilable PC costs every compilable block that would have followed it in
+ * that call.  Refusing a 1-instruction block at the PC right after a Thumb-2
+ * instruction therefore does not cost one instruction, it costs the rest of
+ * the slice.  Compiling everything keeps the dispatcher chaining block to
+ * block and it never falls back at all.
+ *
+ * The cost of doing that is small and was measured rather than assumed: 163
+ * live compiled blocks and +4.8 MB peak RSS on the run above.  The working set
+ * of a firmware image is nothing like the 65536-slot cache.
+ *
+ * Still runtime-settable, both because it is how the cliff above was found and
+ * so `arm-jit` can pin it while verifying generated code encoding by encoding.
+ */
 static int arm_jit_min_block(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("CSIM_ARM_JIT_MIN_BLOCK");
-        v = e ? atoi(e) : 4;
+        v = e ? atoi(e) : 1;
         if (v < 1) v = 1;
     }
     return v;
@@ -55,6 +80,23 @@ static int arm_jit_min_block(void) {
 #define OFF_CYCLES offsetof(arm_cpu_t, cycles)
 #define OFF_INSTR  offsetof(arm_cpu_t, instructions)
 #define OFF_ITER   offsetof(arm_cpu_t, jit_iter_budget)
+#define OFF_PART   offsetof(arm_cpu_t, jit_partial)
+#define OFF_SRAM   offsetof(arm_cpu_t, sram)
+#define OFF_FLASH  offsetof(arm_cpu_t, flash)
+
+/*
+ * The inline memory path reads and writes the emulated SRAM byte array with
+ * native host loads and stores, which is only equivalent to the interpreter's
+ * byte-at-a-time assembly on a little-endian host.  Rather than emit
+ * byte-shuffling code nobody would ever exercise, memory ops are simply not
+ * compiled on a big-endian host — they side-exit to the interpreter, which is
+ * already correct there.
+ */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#  define ARM_JIT_INLINE_MEM 0
+#else
+#  define ARM_JIT_INLINE_MEM 1
+#endif
 
 /* APSR bits, and the masks that clear the ones a given form writes. */
 #define F_N        0x80000000u
@@ -177,10 +219,144 @@ static void emit_cond(jit_state_t *_jit, int cond) {
     if (cond & 1) jit_eqi(JIT_R0, JIT_R0, 0);     /* invert the odd codes */
 }
 
+/*
+ * A guard miss jumps here.  One stub per memory instruction, emitted after the
+ * block body so the fast path is a straight fall-through with two
+ * never-taken forward branches rather than two jumps over inline cold code.
+ */
+typedef struct {
+    jit_node_t *from[2];    /* the guard branches that land here */
+    int         nfrom;
+    int         index;      /* instruction index within the block */
+    uint32_t    pc;
+} side_stub_t;
+
+typedef struct {
+    side_stub_t stubs[ARM_MAX_BLOCK_SIZE];
+    int         nstubs;
+    uint32_t    sram_base, sram_size;
+    uint32_t    flash_base, flash_size;
+} emit_ctx_t;
+
+/* Register a guard branch as landing in instruction `idx`'s side-exit stub. */
+static void stub_add(emit_ctx_t *cx, int idx, uint32_t pc, jit_node_t *from) {
+    side_stub_t *st = cx->nstubs ? &cx->stubs[cx->nstubs - 1] : NULL;
+    if (!st || st->index != idx) {
+        st = &cx->stubs[cx->nstubs++];
+        st->nfrom = 0; st->index = idx; st->pc = pc;
+    }
+    st->from[st->nfrom++] = from;
+}
+
+/*
+ * Emit `R0 = reg[rn] + reg[rm] + imm`, truncated to 32 bits.
+ * The truncation is not cosmetic: operands are loaded zero-extended into
+ * 64-bit host registers, and ARM address arithmetic wraps at 2^32, so a base
+ * near the top of the address space must wrap rather than run off into the
+ * host's high half — where it would sail past the SRAM range check.
+ */
+static void emit_addr(jit_state_t *_jit, const arm_decoded_insn_t *di) {
+    LOADREG_U(JIT_R0, di->rn);
+    if (di->rm != ARM_DEC_NO_RM) {
+        LOADREG_U(JIT_R1, di->rm);
+        jit_addr(JIT_R0, JIT_R0, JIT_R1);
+    }
+    if (di->imm) jit_addi(JIT_R0, JIT_R0, (jit_word_t)di->imm);
+    jit_andi(JIT_R0, JIT_R0, (jit_word_t)LOW32);
+}
+
+/*
+ * LOAD / STORE.  Leaves R1 = byte offset into the SRAM array on the fast path.
+ *
+ * Two guards, both of which side-exit rather than fault:
+ *   - alignment.  The interpreter splits an unaligned access into bytes via a
+ *     different code path; reproducing that inline would be a second
+ *     implementation of it, so unaligned accesses go back to the interpreter.
+ *   - range.  `(uint32)(addr - sram_base) < sram_size` is the whole test, one
+ *     subtract and one unsigned compare, and it excludes flash, ROM, the
+ *     bit-band alias and every peripheral window in one go.  Everything it
+ *     excludes is exactly what must not run inside a block.
+ */
+static int emit_mem(jit_state_t *_jit, emit_ctx_t *cx,
+                    const arm_decoded_insn_t *di, int idx) {
+    if (!ARM_JIT_INLINE_MEM) return 0;
+
+    emit_addr(_jit, di);
+
+    if (di->msize > 1) {
+        jit_andi(JIT_R1, JIT_R0, (jit_word_t)(di->msize - 1));
+        stub_add(cx, idx, di->pc, jit_bnei(JIT_R1, 0));
+    }
+    jit_subi(JIT_R1, JIT_R0, (jit_word_t)cx->sram_base);
+    jit_andi(JIT_R1, JIT_R1, (jit_word_t)LOW32);
+    stub_add(cx, idx, di->pc,
+             jit_bgei_u(JIT_R1, (jit_word_t)(cx->sram_size - (di->msize - 1))));
+
+    jit_ldxi(JIT_R2, JIT_V0, OFF_SRAM);           /* host SRAM base */
+
+    if (di->klass == ARM_DEC_LOAD) {
+        switch (di->msize) {
+        case 1: if (di->sext) jit_ldxr_c (JIT_R0, JIT_R2, JIT_R1);
+                else          jit_ldxr_uc(JIT_R0, JIT_R2, JIT_R1);
+                break;
+        case 2: if (di->sext) jit_ldxr_s (JIT_R0, JIT_R2, JIT_R1);
+                else          jit_ldxr_us(JIT_R0, JIT_R2, JIT_R1);
+                break;
+        default: jit_ldxr_ui(JIT_R0, JIT_R2, JIT_R1); break;
+        }
+        STOREREG(JIT_R0, di->rd);
+    } else {
+        LOADREG_U(JIT_R0, di->rd);                /* the value to store */
+        switch (di->msize) {
+        case 1:  jit_stxr_c(JIT_R1, JIT_R2, JIT_R0); break;
+        case 2:  jit_stxr_s(JIT_R1, JIT_R2, JIT_R0); break;
+        default: jit_stxr_i(JIT_R1, JIT_R2, JIT_R0); break;
+        }
+    }
+    return 1;
+}
+
+/*
+ * LDR Rt, [PC, #imm] — the address is a compile-time constant, so the region
+ * is resolved here and the load needs no guard at all.  Flash is read-only in
+ * this model and the cache is flushed on reset (the only way the image can
+ * change), so the resolution stays valid for the life of the block.
+ *
+ * The SRAM-before-flash order mirrors mem_read32(); the regions are disjoint
+ * in every SoC csim models, but matching the interpreter's precedence costs
+ * nothing and removes the question.
+ */
+static int emit_load_lit(jit_state_t *_jit, emit_ctx_t *cx,
+                         const arm_decoded_insn_t *di) {
+    uint32_t a = di->imm;
+    jit_word_t region;
+    uint32_t off;
+
+    if (a >= cx->sram_base && a + 4 <= cx->sram_base + cx->sram_size) {
+        region = OFF_SRAM;  off = a - cx->sram_base;
+    } else if (a >= cx->flash_base && a + 4 <= cx->flash_base + cx->flash_size) {
+        region = OFF_FLASH; off = a - cx->flash_base;
+    } else {
+        return 0;           /* literal outside RAM and flash — refuse */
+    }
+    jit_ldxi(JIT_R2, JIT_V0, region);
+    jit_ldxi_ui(JIT_R0, JIT_R2, (jit_word_t)off);
+    STOREREG(JIT_R0, di->rd);
+    return 1;
+}
+
 /* Emit one decoded instruction.  Returns 0 if it cannot be emitted (which
  * makes the whole block be refused — never silently skipped). */
-static int emit_insn(jit_state_t *_jit, const arm_decoded_insn_t *di) {
+static int emit_insn(jit_state_t *_jit, emit_ctx_t *cx,
+                     const arm_decoded_insn_t *di, int idx) {
     switch (di->klass) {
+
+    case ARM_DEC_LOAD:
+    case ARM_DEC_STORE:
+        return emit_mem(_jit, cx, di, idx);
+
+    case ARM_DEC_LOAD_LIT:
+        return emit_load_lit(_jit, cx, di);
 
     case ARM_DEC_B_UNCOND:
     case ARM_DEC_B_COND:
@@ -338,6 +514,20 @@ arm_compiled_block_t *arm_jit_compile(const arm_basic_block_t *block,
     int min_len = is_loop ? 2 : arm_jit_min_block();
     if (block->length < min_len) return NULL;
 
+    /*
+     * Memory ops address the SRAM array as `sram[addr - sram_base]`, so a base
+     * that is not word-aligned would make an aligned guest access land on an
+     * unaligned host one.  Every SoC csim models puts SRAM at 0x20000000 or
+     * similar; assert it rather than emit code that only works by luck.
+     */
+    emit_ctx_t cx;
+    cx.nstubs     = 0;
+    cx.sram_base  = cpu->sram_base;
+    cx.sram_size  = cpu->sram_end - cpu->sram_base;
+    cx.flash_base = cpu->flash_base;
+    cx.flash_size = cpu->flash_end - cpu->flash_base;
+    int mem_ok = ((cx.sram_base & 3u) == 0) && cx.sram_size >= 4;
+
     jit_state_t *_jit = jit_new_state();
     if (!_jit) return NULL;
 
@@ -358,14 +548,16 @@ arm_compiled_block_t *arm_jit_compile(const arm_basic_block_t *block,
 
     int body = term_is_branch ? block->length - 1 : block->length;
     for (int i = 0; i < body; i++) {
-        if (!emit_insn(_jit, &block->insns[i])) {
+        const arm_decoded_insn_t *di = &block->insns[i];
+        int is_mem = (di->klass == ARM_DEC_LOAD || di->klass == ARM_DEC_STORE);
+        if ((is_mem && !mem_ok) || !emit_insn(_jit, &cx, di, i)) {
             jit_destroy_state();
             return NULL;
         }
     }
 
     /* --- terminator + final PC --- */
-    jit_node_t *joins[2]; int njoin = 0;
+    jit_node_t *joins[ARM_MAX_BLOCK_SIZE + 2]; int njoin = 0;
 
     if (is_loop) {
         emit_cond(_jit, last->cond);
@@ -378,6 +570,7 @@ arm_compiled_block_t *arm_jit_compile(const arm_basic_block_t *block,
         jit_patch(exhausted);                        /* budget spent */
         jit_movi(JIT_R0, (jit_word_t)block->start_pc);
         STOREREG(JIT_R0, ARM_PC);
+        if (cx.nstubs) joins[njoin++] = jit_jmpi();  /* jump over the stubs */
     } else if (last->klass == ARM_DEC_B_COND) {
         emit_cond(_jit, last->cond);
         jit_node_t *not_taken = jit_beqi(JIT_R0, 0);
@@ -393,13 +586,39 @@ arm_compiled_block_t *arm_jit_compile(const arm_basic_block_t *block,
         jit_movi(JIT_R0, (jit_word_t)final_pc);
         STOREREG(JIT_R0, ARM_PC);
     }
+    if (!is_loop && cx.nstubs) joins[njoin++] = jit_jmpi();
+
+    /*
+     * Side-exit stubs, all cold.  Each reports where the block stopped and how
+     * much of it ran, then falls into the shared exit so the flag store
+     * happens exactly once no matter which path got here.  A loop block hands
+     * its iteration-budget decrement back, because the iteration it was in the
+     * middle of did not complete — that keeps `iters_max - jit_iter_budget` a
+     * count of *finished* iterations, which is what the cycle arithmetic
+     * assumes.
+     */
+    for (int i = 0; i < cx.nstubs; i++) {
+        side_stub_t *st = &cx.stubs[i];
+        for (int j = 0; j < st->nfrom; j++) jit_patch(st->from[j]);
+        jit_movi(JIT_R0, (jit_word_t)st->pc);
+        STOREREG(JIT_R0, ARM_PC);
+        jit_movi(JIT_R0, (jit_word_t)st->index);
+        jit_stxi_i(OFF_PART, JIT_V0, JIT_R0);
+        if (is_loop) {
+            jit_ldxi_i(JIT_R0, JIT_V0, OFF_ITER);
+            jit_addi(JIT_R0, JIT_R0, 1);
+            jit_stxi_i(OFF_ITER, JIT_V0, JIT_R0);
+        }
+        if (i != cx.nstubs - 1) joins[njoin++] = jit_jmpi();
+    }
+
     for (int i = 0; i < njoin; i++) jit_patch(joins[i]);
 
     /* Flags back to memory.  Cycle and instruction accounting is the
      * dispatcher's job — it is the only side that knows how many iterations a
      * loop block actually ran. */
     jit_stxi_i(OFF_XPSR, JIT_V0, JIT_V2);
-    jit_reti(block->length);
+    jit_reti(block->length);   /* unused — see the side-exit contract in the header */
     jit_epilog();
 
     arm_compiled_fn fn = (arm_compiled_fn)jit_emit();
@@ -415,6 +634,14 @@ arm_compiled_block_t *arm_jit_compile(const arm_basic_block_t *block,
     cb->end_pc    = block->end_pc;
     cb->is_loop   = is_loop;
     cb->jit_state = _jit;
+    cb->has_store = 0;
+    for (int i = 0; i < block->length; i++)
+        if (block->insns[i].klass == ARM_DEC_STORE) { cb->has_store = 1; break; }
+    cb->cyc_prefix[0] = 0;
+    for (int i = 0; i < block->length; i++)
+        cb->cyc_prefix[i + 1] =
+            (uint16_t)(cb->cyc_prefix[i] + block->insns[i].cycles);
+    cb->cycles_total = cb->cyc_prefix[block->length];
     return cb;
 }
 

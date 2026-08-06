@@ -10,11 +10,13 @@
  * this by differential execution against the interpreter rather than by
  * inspection.
  *
- * Cycle model: arm_step charges exactly 1 cycle per Thumb-16 instruction,
- * centrally, before dispatch:
+ * Cycle model: arm_step charges 1 cycle per Thumb-16 instruction centrally,
+ * before dispatch:
  *      if (top5 < 29) { cpu->reg[ARM_PC] = pc + 2; cpu->cycles += 1; }
- * so every instruction in this subset has cycles = 1.  If that ever becomes
- * per-instruction, this decoder must follow it.
+ * and the load/store handlers then charge a second one themselves, so `cycles`
+ * is 1 for the register-only forms and 2 for every memory access.  That is why
+ * a block's cost is a sum over `cycles` and not simply its length — see
+ * `cycles_total` / `cyc_prefix` in arm_jit.h.
  */
 #include "arm_decode.h"
 
@@ -39,6 +41,24 @@ static void base(arm_decoded_insn_t *out, uint32_t pc, uint16_t hw,
     out->klass         = k;
     out->writes_result = true;
     out->cycles        = 1;
+    out->rm            = ARM_DEC_NO_RM;
+}
+
+/*
+ * Common tail for the memory forms.  `rn == ARM_SP` is allowed here even
+ * though every other class is restricted to r0-r7: the [SP, #imm] encodings
+ * are 31.4% of executed instructions on cc2538 RPL-UDP, so excluding them
+ * would leave most of the win on the table for no safety gain — SP is an
+ * ordinary base register to a load, not a PC-like special case.
+ */
+static void memop(arm_decoded_insn_t *out, uint32_t pc, uint16_t hw,
+                arm_dec_class_t k, int rt, int rn, int msize) {
+    base(out, pc, hw, k);
+    out->rd            = (uint8_t)rt;
+    out->rn            = (uint8_t)rn;
+    out->msize         = (uint8_t)msize;
+    out->writes_result = (k != ARM_DEC_STORE);
+    out->cycles        = 2;        /* central 1 + the handler's own +1 */
 }
 
 int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
@@ -160,6 +180,61 @@ int arm_decode_insn(const uint8_t *mem, uint32_t mem_base, uint32_t mem_len,
         out->writes_result = false;
         /* arm_step: cpu->reg[ARM_PC] = pc + 4 + imm11 * 2 */
         out->imm = (uint32_t)(pc + 4 + imm11 * 2);
+        return 2;
+    }
+
+    /* ---- LDR Rt, [PC, #imm8*4] — literal pool ----
+     * The address is a compile-time constant, which is what makes this worth
+     * a class of its own: flash is read-only in this model (arm_write32
+     * refuses flash writes) and the cache is flushed on reset, so the JIT can
+     * resolve the region once and emit an unguarded load. */
+    case 9: {
+        memop(out, pc, hw, ARM_DEC_LOAD_LIT, (hw >> 8) & 7, 15, 4);
+        out->imm = (((pc + 4) & ~3u) + (uint32_t)((hw & 0xFF) << 2));
+        return 2;
+    }
+
+    /* ---- load/store register offset ---- */
+    case 10: case 11: {
+        int opcode = (hw >> 9) & 7;
+        static const struct { uint8_t klass, msize, sext; } t[8] = {
+            { ARM_DEC_STORE, 4, 0 },   /* STR   */
+            { ARM_DEC_STORE, 2, 0 },   /* STRH  */
+            { ARM_DEC_STORE, 1, 0 },   /* STRB  */
+            { ARM_DEC_LOAD,  1, 1 },   /* LDRSB */
+            { ARM_DEC_LOAD,  4, 0 },   /* LDR   */
+            { ARM_DEC_LOAD,  2, 0 },   /* LDRH  */
+            { ARM_DEC_LOAD,  1, 0 },   /* LDRB  */
+            { ARM_DEC_LOAD,  2, 1 },   /* LDRSH */
+        };
+        memop(out, pc, hw, (arm_dec_class_t)t[opcode].klass,
+            hw & 7, (hw >> 3) & 7, t[opcode].msize);
+        out->sext = t[opcode].sext != 0;
+        out->rm   = (uint8_t)((hw >> 6) & 7);
+        return 2;
+    }
+
+    /* ---- load/store immediate offset, base = Rn ----
+     * The scale is the access width, so imm5 addresses imm5 elements. */
+    case 12: case 13: case 14: case 15: case 16: case 17: {
+        static const struct { uint8_t klass, msize; } t[6] = {
+            { ARM_DEC_STORE, 4 }, { ARM_DEC_LOAD, 4 },   /* 12, 13 */
+            { ARM_DEC_STORE, 1 }, { ARM_DEC_LOAD, 1 },   /* 14, 15 */
+            { ARM_DEC_STORE, 2 }, { ARM_DEC_LOAD, 2 },   /* 16, 17 */
+        };
+        int k = top5 - 12;
+        memop(out, pc, hw, (arm_dec_class_t)t[k].klass,
+            hw & 7, (hw >> 3) & 7, t[k].msize);
+        out->imm = (uint32_t)(((hw >> 6) & 0x1F) * t[k].msize);
+        return 2;
+    }
+
+    /* ---- LDR/STR Rt, [SP, #imm8*4] ---- */
+    case 18: case 19: {
+        memop(out, pc, hw,
+            (top5 == 18) ? ARM_DEC_STORE : ARM_DEC_LOAD,
+            (hw >> 8) & 7, 13 /* ARM_SP */, 4);
+        out->imm = (uint32_t)((hw & 0xFF) << 2);
         return 2;
     }
 

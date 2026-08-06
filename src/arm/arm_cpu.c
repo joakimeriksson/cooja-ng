@@ -14,6 +14,7 @@ void arm_jit_flush(arm_cpu_t *cpu);
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/resource.h>
 
 uint64_t arm_wfi_total, arm_wfi_pending, arm_wfi_skipped, arm_wfi_blocked, arm_wfi_noirq;
 
@@ -442,13 +443,25 @@ void arm_cpu_destroy(arm_cpu_t *cpu) {
                        : 0.0;
             fprintf(stderr,
                     "  [arm-jit] blocks_run=%llu insns_via_jit=%llu / %lld (%.1f%%)"
-                    " avg_block=%.1f\n",
+                    " avg_block=%.1f side_exits=%llu\n",
                     (unsigned long long)cpu->jit_blocks_run,
                     (unsigned long long)cpu->jit_insns_run,
                     (long long)cpu->instructions, pct,
                     cpu->jit_blocks_run
                         ? (double)cpu->jit_insns_run / (double)cpu->jit_blocks_run
-                        : 0.0);
+                        : 0.0,
+                    (unsigned long long)cpu->jit_side_exits);
+            /* Compiled-block population and process peak RSS.  A low
+             * min-block threshold fills the cache with short blocks, and
+             * "how much memory did that cost" is not a question to answer by
+             * reasoning about Lightning's allocator. */
+            uint32_t live = 0;
+            for (uint32_t i = 0; i < cpu->jit_cache_size; i++)
+                if (cpu->jit_cache[i]) live++;
+            struct rusage ru;
+            getrusage(RUSAGE_SELF, &ru);
+            fprintf(stderr, "  [arm-jit] blocks_live=%u  peak_rss=%.1f MB\n",
+                    live, (double)ru.ru_maxrss / (1024.0 * 1024.0));
         }
     }
     arm_jit_flush(cpu);
@@ -774,6 +787,52 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
         default:         reg[di->rd] = asr_c(v, sh, &carry); break;
         }
         set_nzc(cpu, reg[di->rd], carry);
+        return 1;
+    }
+
+    /*
+     * Memory forms.  These call the same mem_*_unaligned() helpers the
+     * interpreter's handlers do, deliberately: the point of this reference
+     * model is that arm-decode can prove the *decode* is right, so it must not
+     * introduce a second implementation of the *access* as well.  The JIT's
+     * inline SRAM path is then checked against this by CSIM_ARM_JIT_VERIFY.
+     *
+     * The extra cycle is charged here because the caller has already applied
+     * arm_step's central +1 and the interpreter's load/store handlers add a
+     * second one of their own.
+     */
+    case ARM_DEC_LOAD_LIT:
+        reg[di->rd] = mem_read32_unaligned(cpu, di->imm);
+        cpu->cycles += di->cycles - 1;
+        return 1;
+
+    case ARM_DEC_LOAD: {
+        uint32_t addr = reg[di->rn] + di->imm +
+                        (di->rm == ARM_DEC_NO_RM ? 0 : reg[di->rm]);
+        switch (di->msize) {
+        case 1: reg[di->rd] = di->sext
+                    ? (uint32_t)(int32_t)(int8_t)mem_read8(cpu, addr)
+                    : (uint32_t)mem_read8(cpu, addr);
+                break;
+        case 2: reg[di->rd] = di->sext
+                    ? (uint32_t)(int32_t)(int16_t)mem_read16_unaligned(cpu, addr)
+                    : (uint32_t)mem_read16_unaligned(cpu, addr);
+                break;
+        default: reg[di->rd] = mem_read32_unaligned(cpu, addr); break;
+        }
+        cpu->cycles += di->cycles - 1;
+        return 1;
+    }
+
+    case ARM_DEC_STORE: {
+        uint32_t addr = reg[di->rn] + di->imm +
+                        (di->rm == ARM_DEC_NO_RM ? 0 : reg[di->rm]);
+        switch (di->msize) {
+        case 1:  mem_write8(cpu, addr, (uint8_t)reg[di->rd]); break;
+        case 2:  mem_write16_unaligned(cpu, addr, (uint16_t)reg[di->rd]); break;
+        default: mem_write32_unaligned(cpu, addr, reg[di->rd]); break;
+        }
+        cpu->cycles += di->cycles - 1;
         return 1;
     }
 
@@ -3359,32 +3418,107 @@ int arm_jit_batch_size(void) {
  * `remaining` and the next scheduled event.  Returns instructions executed, or
  * 0 if the block could not be run (caller falls back to the interpreter).
  */
-static int arm_jit_run(arm_cpu_t *cpu, arm_compiled_block_t *cb, int remaining) {
-    int iters_max = 1;
-    if (cb->is_loop) {
-        int by_insns = remaining / cb->length;
-        int64_t by_events =
-            (cpu->next_event_cycle - cpu->cycles - 1) / cb->length;
-        iters_max = by_insns;
-        if (by_events < (int64_t)iters_max) iters_max = (int)by_events;
-        if (iters_max < 1) return 0;
+/*
+ * How many times this block may run before control has to come back.
+ * Returns 0 when it cannot run at all (caller falls back to the interpreter).
+ *
+ * Three bounds, and which one binds is the whole story of this function:
+ *
+ *  - the caller's instruction budget (`remaining`).
+ *  - the caller's *cycle* target (`cpu->cycle_limit`), when it set one.
+ *  - the next scheduled event.  A block has no internal event check, so
+ *    running past `next_event_cycle` would deliver a peripheral event late —
+ *    the one way a JIT could silently change simulation results.  This one
+ *    only ever tightens.
+ *
+ * The second bound is why this is not simply `remaining / length`.  Measured
+ * on cc2538 RPL-UDP, **79.8% of arm_step calls arrive with a budget of exactly
+ * 1 instruction** — they are the tail of arm_step_until's convergence loop,
+ * which single-steps once it is within 10 cycles of its target.  A 4-
+ * instruction block (the average on that firmware) can never run on a budget
+ * of 1, so before this the JIT was locked out of about 61% of all executed
+ * instructions no matter how good its instruction coverage got.
+ *
+ * Relaxing the instruction cap to the cycle target is sound because the cycle
+ * target is what arm_step_until is actually converging to; the instruction
+ * count was only ever a proxy for it.  And it is *stricter* than what the
+ * interpreter offers: `arm_step(cpu, 1)` can overshoot the target by however
+ * many cycles one instruction happens to cost (2 for a load, 12 for an
+ * exception entry, 20 for a divide), whereas a block is admitted only if its
+ * whole measured cost fits.  Nothing may exceed the target that would not
+ * already have exceeded it.
+ */
+static int arm_jit_iters(arm_cpu_t *cpu, arm_compiled_block_t *cb,
+                         int remaining) {
+    int64_t lim = remaining / cb->length;
+    if (cpu->cycle_limit != INT64_MAX) {
+        int64_t by_limit =
+            (cpu->cycle_limit - cpu->cycles) / cb->cycles_total;
+        if (by_limit > lim) lim = by_limit;
     }
+    int64_t by_events =
+        (cpu->next_event_cycle - cpu->cycles - 1) / cb->cycles_total;
+    if (by_events < lim) lim = by_events;
+    if (!cb->is_loop && lim > 1) lim = 1;
+    if (lim < 1) return 0;
+    return (int)(lim > INT32_MAX ? INT32_MAX : lim);
+}
+
+static int arm_jit_run(arm_cpu_t *cpu, arm_compiled_block_t *cb, int remaining) {
+    int iters_max = arm_jit_iters(cpu, cb, remaining);
+    if (iters_max < 1) return 0;
     cpu->jit_iter_budget = iters_max;
+    cpu->jit_partial     = -1;
     cb->fn(cpu);
-    int iters = cb->is_loop ? (iters_max - cpu->jit_iter_budget) : 1;
-    int executed = iters * cb->length;
-    cpu->cycles       += executed;
+
+    /* `partial >= 0` means a guarded memory access missed and the block
+     * stopped there, having run only insns[0..partial-1] of its final pass. */
+    int partial = cpu->jit_partial;
+    int iters   = cb->is_loop ? (iters_max - cpu->jit_iter_budget)
+                              : (partial < 0 ? 1 : 0);
+    int tail    = partial < 0 ? 0 : partial;
+    int executed = iters * cb->length + tail;
+    cpu->cycles       += (int64_t)iters * cb->cycles_total + cb->cyc_prefix[tail];
     cpu->instructions += executed;
+    if (partial >= 0) cpu->jit_side_exits++;
     return executed;
+}
+
+/*
+ * Memory has to be rewound too, and finding that out cost a false alarm worth
+ * recording: the first run of this verifier against a block containing
+ * `ldr r3,[sp,#4] / adds r3,#1 / str r3,[sp,#4]` reported r3 off by exactly
+ * one, every time.  Nothing was wrong with the generated code — the verifier
+ * replayed the block over the memory the *first* run had already updated, so
+ * the interpreter incremented a value that had been incremented once already.
+ * Re-running a block is only a valid comparison if the whole input state is
+ * restored, and memory became part of that state the moment stores were
+ * compiled.
+ *
+ * The snapshot is skipped for blocks that only load, which is most of them,
+ * and the buffers are allocated once per CPU rather than per block.  This is a
+ * debug mode; a memcpy of SRAM per storing block is an acceptable price for
+ * comparing the two implementations exactly rather than approximately.
+ */
+static int arm_jit_verify_mem(arm_cpu_t *cpu, uint8_t **pre, uint8_t **post) {
+    uint32_t sz = cpu->sram_end - cpu->sram_base;
+    if (!*pre)  *pre  = (uint8_t *)malloc(sz);
+    if (!*post) *post = (uint8_t *)malloc(sz);
+    return (*pre && *post);
 }
 
 static int arm_jit_run_verified(arm_cpu_t *cpu, arm_compiled_block_t *cb,
                                 int remaining) {
+    static uint8_t *mem_pre, *mem_post;
+    uint32_t sram_sz = cpu->sram_end - cpu->sram_base;
+    int check_mem = cb->has_store && arm_jit_verify_mem(cpu, &mem_pre, &mem_post);
+
     uint32_t save_reg[16];
     memcpy(save_reg, cpu->reg, sizeof(save_reg));
     uint32_t save_xpsr   = cpu->xpsr;
     int64_t  save_cycles = cpu->cycles;
     int64_t  save_instr  = cpu->instructions;
+    if (check_mem) memcpy(mem_pre, cpu->sram, sram_sz);
 
     int executed = arm_jit_run(cpu, cb, remaining);
     if (executed == 0) return 0;
@@ -3393,15 +3527,28 @@ static int arm_jit_run_verified(arm_cpu_t *cpu, arm_compiled_block_t *cb,
     memcpy(jit_reg, cpu->reg, sizeof(jit_reg));
     uint32_t jit_xpsr   = cpu->xpsr;
     int64_t  jit_cycles = cpu->cycles;
+    if (check_mem) {
+        memcpy(mem_post, cpu->sram, sram_sz);   /* what the JIT produced */
+        memcpy(cpu->sram, mem_pre, sram_sz);    /* rewind for the replay */
+    }
 
     /* Rewind and re-run the same instructions interpreted. */
     memcpy(cpu->reg, save_reg, sizeof(save_reg));
     cpu->xpsr         = save_xpsr;
     cpu->cycles       = save_cycles;
     cpu->instructions = save_instr;
-    arm_step_interpreter(cpu, executed);
+    if (executed > 0) arm_step_interpreter(cpu, executed);
 
     int bad = 0;
+    if (check_mem && memcmp(mem_post, cpu->sram, sram_sz) != 0) {
+        uint32_t i = 0;
+        while (i < sram_sz && mem_post[i] == cpu->sram[i]) i++;
+        fprintf(stderr, "ARM JIT MEM MISMATCH pc=0x%08x len=%d: "
+                        "sram[0x%08x] jit=0x%02x interp=0x%02x\n",
+                cb->start_pc, cb->length, cpu->sram_base + i,
+                mem_post[i], cpu->sram[i]);
+        bad = 1;
+    }
     for (int r = 0; r < 16; r++) {
         if (jit_reg[r] != cpu->reg[r]) {
             if (!bad)
@@ -3464,15 +3611,18 @@ int arm_step(arm_cpu_t *cpu, int count) {
                 arm_compiled_block_t *cb =
                     (arm_compiled_block_t *)cpu->jit_cache[ci];
 
-                if (cb && cb->start_pc == pc && remaining >= cb->length &&
-                    cpu->cycles + cb->length < cpu->next_event_cycle) {
+                if (cb && cb->start_pc == pc) {
                     int executed = cpu->jit_verify
                                  ? arm_jit_run_verified(cpu, cb, remaining)
                                  : arm_jit_run(cpu, cb, remaining);
                     if (executed > 0) {
                         cpu->jit_blocks_run++;
                         cpu->jit_insns_run += (uint64_t)executed;
-                        remaining -= executed;
+                        /* A block admitted on the cycle bound can run past the
+                         * instruction budget; that is the point.  Clamp rather
+                         * than let `remaining` go negative. */
+                        remaining = (executed >= remaining) ? 0
+                                                            : remaining - executed;
                         continue;
                     }
                 }
