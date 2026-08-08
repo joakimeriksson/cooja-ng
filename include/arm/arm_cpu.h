@@ -78,6 +78,17 @@ typedef struct {
     void           *user_data;
 } arm_io_region_t;
 
+/* One hash slot of the page-indexed IO lookup.  n == 0 marks an empty slot
+ * (the whole table is memset to zero on rebuild), so a page whose peripheral
+ * really registered with n entries always has n >= 1. */
+#define ARM_IO_PAGE_SLOTS 128   /* power of two, > 2x the pages any SoC maps */
+#define ARM_IO_PAGE_CHAIN 4
+typedef struct {
+    uint32_t page;                       /* addr >> 12 */
+    uint8_t  n;                          /* entries used; 0 = empty slot */
+    uint8_t  idx[ARM_IO_PAGE_CHAIN];     /* indices into io_regions[] */
+} arm_io_page_t;
+
 /* --- Event callback ---
  * Unified per-CPU event type lives in include/common/cpu_event.h.
  * Aliases below keep existing ARM-typed call sites compiling. */
@@ -129,6 +140,17 @@ typedef struct arm_cpu {
     /* IO dispatch */
     arm_io_region_t io_regions[ARM_MAX_IO_REGIONS];
     int             num_io_regions;
+    /* Page-indexed lookup over io_regions (src/arm/arm_cpu.c find_io_region):
+     * open-addressed hash keyed on addr>>12, rebuilt from scratch on every
+     * arm_register_io call (cold path — regions are append-only and all
+     * registration happens at platform init).  A slot's idx[] chain is sorted
+     * by (size, registration index) ascending so the first containing entry
+     * reproduces the linear scan's smallest-region-wins rule exactly.
+     * io_page_map_fallback = the table could not represent the region set
+     * (chain overflow / table pressure) -> keep the linear scan: never wrong,
+     * only slower. */
+    arm_io_page_t   io_page_map[ARM_IO_PAGE_SLOTS];
+    bool            io_page_map_fallback;
 
     /* Event queue */
     arm_event_t *event_queue;
@@ -236,6 +258,27 @@ typedef struct arm_cpu {
     } sp_audit[ARM_SP_AUDIT_DEPTH];
     int       sp_audit_top;
     int       sp_audit_overflow;
+
+    /* JIT block cache (src/arm/arm_jit.c).  Declared unconditionally — not
+     * under #ifdef HAVE_LIGHTNING — so the struct layout is identical whether
+     * or not Lightning was detected, and a stale object file can't disagree
+     * with a fresh one about field offsets.  All NULL/0 when the JIT is off.
+     *
+     * Indexed by (pc - flash_base) >> 1, i.e. one slot per possible Thumb
+     * instruction address in flash. */
+    void    **jit_cache;         /* arm_compiled_block_t* per slot        */
+    int32_t  *jit_exec_count;    /* hot-block detection; <0 = don't retry  */
+    uint32_t  jit_cache_size;    /* 0 = JIT disabled for this CPU          */
+    int       jit_threshold;     /* executions before compiling (env-set)  */
+    int       jit_verify;        /* CSIM_ARM_JIT_VERIFY=1 lockstep check   */
+    int32_t   jit_iter_budget;   /* loop blocks: iterations still allowed  */
+    /* Side-exit report: -1 = the block ran to a normal exit; >= 0 = it
+     * stopped at that instruction index (a guarded memory access missed),
+     * having executed only the ones before it.  See arm_jit.h. */
+    int32_t   jit_partial;
+    uint64_t  jit_blocks_run;    /* diagnostics: compiled-block entries    */
+    uint64_t  jit_side_exits;    /* diagnostics: guard misses              */
+    uint64_t  jit_insns_run;     /* diagnostics: instructions via the JIT  */
 } arm_cpu_t;
 
 /* --- Public API --- */

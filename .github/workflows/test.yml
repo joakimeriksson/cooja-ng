@@ -23,6 +23,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GNU Lightning enables the MSP430 and ARM JITs.  It is installed
+      # explicitly and ASSERTED below because the build auto-detects it:
+      # without it, `make` silently compiles the JITs out and the arm-jit
+      # suite self-skips — which is how 410400 generated-code comparisons can
+      # "pass" in 40 seconds without executing a single generated instruction.
+      # That failure mode is exactly the one this suite exists for: the
+      # x86-64-only `jit_andi 0x80000000` miscompile stayed green on every
+      # other signal.  Pinned to 2.2.3 — the version both dev machines run,
+      # and whose backend bug arm_jit.c (emit_n_bit) works around; a silent
+      # version drift here should be a deliberate choice, not runner luck.
+      # No usable Ubuntu package exists, so Linux builds it from source.
+      - name: Install GNU Lightning (Linux, source build)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sL https://ftp.gnu.org/gnu/lightning/lightning-2.2.3.tar.gz | tar xz
+          cd lightning-2.2.3
+          ./configure --prefix=/usr/local > /dev/null
+          make -j"$(nproc)" > /dev/null
+          sudo make install > /dev/null
+          sudo ldconfig
+
+      - name: Install GNU Lightning (macOS)
+        if: runner.os == 'macOS'
+        run: brew install lightning
+
+      - name: Assert Lightning is visible to the build
+        run: pkg-config --exists lightning && pkg-config --modversion lightning
+
       - name: Build
         run: make
 
@@ -31,6 +59,33 @@ jobs:
 
       - name: ARM instruction tests
         run: ./build/test_runner arm-correctness
+
+      # Differential test of the JIT's decoder + reference model against the
+      # interpreter: all 65536 Thumb halfwords x 6 random register/flag states.
+      # Deterministic and fast (~1s), and it is the only thing that catches
+      # flag-only drift between the two implementations — the failure mode
+      # that is invisible until a conditional branch goes the wrong way.
+      - name: ARM decoder differential tests
+        run: ./build/test_runner arm-decode
+
+      # Differential test of the GENERATED CODE against the interpreter, over
+      # the same exhaustive encoding sweep.  This is not redundant with
+      # arm-decode: that one validates the *description* of an instruction,
+      # while the JIT ships a third implementation — the machine code GNU
+      # Lightning emits — and only running it tests it, on the host it was
+      # emitted for.  It is here because jit_andi(dst, src, 0x80000000) returns
+      # 0 on x86-64 Lightning 2.2.3, which made every N-reading condition
+      # (MI/PL/GE/LT/GT/LE) silently take the wrong branch on that host while
+      # arm-decode, arm-correctness and the whole Cooja suite stayed green.
+      # Skips itself cleanly when Lightning is not installed.
+      - name: ARM JIT generated-code differential tests
+        run: |
+          set -o pipefail
+          ./build/test_runner arm-jit | tee armjit.out
+          if grep -q "SKIP" armjit.out; then
+            echo "::error::arm-jit skipped — Lightning missing despite the install step"
+            exit 1
+          fi
 
       - name: Timeline unit tests
         run: ./build/test_runner timeline
@@ -106,10 +161,55 @@ jobs:
       - name: Determinism guard (sky RPL-UDP run twice → byte-identical)
         run: tools/check-determinism.sh multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 20000
 
+      # The JIT's core contract: CSIM_ARM_JIT=0 and =1 must produce
+      # byte-identical simulation output (wall-clock lines excluded), because
+      # determinism is a gated guarantee and Lightning is an optional
+      # dependency — results must not depend on whether it happens to be
+      # installed.
+      - name: "JIT cycle-exactness: CSIM_ARM_JIT=0 vs 1 → byte-identical"
+        run: |
+          filter='Wall-clock|Speed ratio|Throughput|MIPS'
+          CSIM_ARM_JIT=0 ./build/test_runner test configs/chain-3node-nrf52840-dk.json | grep -vE "$filter" > jit-off.txt
+          ./build/test_runner test configs/chain-3node-nrf52840-dk.json | grep -vE "$filter" > jit-on.txt
+          grep -q "TEST PASSED" jit-on.txt
+          cmp jit-off.txt jit-on.txt
+
+      # Lockstep verification on real firmware: every compiled block is run,
+      # rewound (registers + APSR + cycles + SRAM), re-executed interpreted,
+      # and compared exactly.  Complements arm-jit, which is exhaustive over
+      # single encodings but never runs multi-instruction blocks — this is
+      # the only automated coverage of block composition.
+      - name: JIT lockstep verify (cc2538 RPL-UDP, 10 s sim)
+        run: |
+          CSIM_ARM_JIT_VERIFY=1 ./build/test_runner arm-multinode \
+            firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk \
+            -t 10000 -q > verify.txt 2>&1
+          n=$(grep -c "MISMATCH" verify.txt || true)
+          echo "lockstep mismatches: $n"
+          [ "$n" -eq 0 ]
+
+      # TSCH is the timing-sensitive canary: association + sustained sync
+      # depend on per-byte RX delivery landing on exact cycles, so it is the
+      # first thing to break if anything shifts an event.  The nRF52840
+      # config simulates ~25 s and runs in seconds; the ~240 s cc2538 variant
+      # stays out of PR CI on runtime grounds.
+      - name: TSCH association + sync (nRF52840-DK)
+        run: |
+          ./build/test_runner test configs/test-tsch-nrf52840-dk.json > tsch.txt 2>&1
+          tail -5 tsch.txt
+          grep -aq "TEST PASSED" tsch.txt
+
       - name: Config v1 <-> v2 equivalence (chain-4node-sky)
         run: tools/check-config-equivalence.sh configs/chain-4node-sky.json configs/chain-4node-sky-v2.json
 
-# TODO: add a third job that builds with GNU Lightning enabled to cover
-# the JIT path in src/msp430/msp430_jit.c. Verify the Ubuntu apt package
-# name first (`apt-cache search lightning` on the runner) — Debian/Ubuntu
-# has historically shipped GNU Lightning under different names.
+      # Lightning is optional by design; now that CI installs it, this is the
+      # only coverage the no-Lightning build path has.  Rebuild with the
+      # detection overridden, prove the interpreter suites still pass and that
+      # arm-jit skips itself cleanly instead of failing.
+      - name: Build without Lightning still works (JIT compiled out)
+        if: runner.os == 'Linux'
+        run: |
+          make clean > /dev/null
+          make LIGHTNING_CFLAGS= LIGHTNING_LIBS= -j"$(nproc)" > /dev/null
+          ./build/test_runner arm-correctness
+          ./build/test_runner arm-jit | grep -q "SKIP"

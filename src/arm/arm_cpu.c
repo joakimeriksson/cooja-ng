@@ -2,12 +2,19 @@
  * ARM Cortex-M3 CPU emulator — instruction execution engine
  */
 #include "arm_cpu.h"
+#include "arm_decode.h"
 #include "arm_config.h"
 #include "arm_nvic.h"
+#include "arm_jit.h"
+
+/* Defined below, next to the JIT dispatcher; declared here because
+ * arm_cpu_destroy/arm_cpu_reset appear earlier in the file. */
+void arm_jit_flush(arm_cpu_t *cpu);
 #include "gdb_stub.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/resource.h>
 
 uint64_t arm_wfi_total, arm_wfi_pending, arm_wfi_skipped, arm_wfi_blocked, arm_wfi_noirq;
 
@@ -25,8 +32,8 @@ void arm_pcw_init(void) {
 }
 /* Memory-change watch: ARM_MEM_WATCH="0xaddr" logs every change of the byte at
  * that address with the writing PC.  Diagnostic only. */
-uint32_t arm_memw_addr; int arm_memw_last = -1; int arm_memw_init_done;
-uint32_t arm_zt_kernel; int arm_zt_done, arm_zt_init;
+uint32_t arm_memw_addr; int arm_memw_last = -1;
+uint32_t arm_zt_kernel; int arm_zt_done;
 __attribute__((destructor,used)) static void arm_pcw_dump(void) {
     for (int i = 0; i < arm_pcw_count; i++)
         fprintf(stderr, "PC-WATCH 0x%08x: hits=%llu first=%lld last=%lld\n",
@@ -45,7 +52,16 @@ __attribute__((destructor,used)) static void arm_wfi_dump(void) {
 
 /* --- Memory access helpers --- */
 
-static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
+/*
+ * The reference lookup: full linear scan, smallest containing region wins,
+ * first-registered breaks size ties (strict `<`).  The overlap rule is
+ * load-bearing for exactly one pair in the tree — NVIC 0xE000E000/0x1000
+ * contains SysTick 0xE000E010/0x10 — but it is the semantic contract every
+ * peripheral was registered against, so the fast path below must reproduce
+ * it bit for bit.  Kept (a) as the fallback when the page table cannot
+ * represent a region set, and (b) as the oracle for ARM_IO_XCHECK.
+ */
+static arm_io_region_t *find_io_region_linear(arm_cpu_t *cpu, uint32_t addr) {
     arm_io_region_t *best = NULL;
     for (int i = 0; i < cpu->num_io_regions; i++) {
         arm_io_region_t *r = &cpu->io_regions[i];
@@ -55,6 +71,63 @@ static inline arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
         }
     }
     return best;
+}
+
+/*
+ * Hot-path lookup: open-addressed hash on the 4 KB page number.
+ *
+ * The linear scan above was ~7% of runtime on Contiki-NG/cc2538 (profiled,
+ * arm-performance-plan.md §5.13.3): it has no early exit — smallest-wins
+ * forces a full walk of 17-27 regions on every MMIO access.  Nearly every
+ * region an SoC registers is one 0x1000 page on a 0x1000 boundary, so a
+ * page-keyed table resolves almost every access in one probe; the chain
+ * (sorted by (size, registration index) at build time) carries the one
+ * overlap and any sub-page windows, and its first containing entry is by
+ * construction the linear scan's winner.
+ *
+ * A page miss returning NULL is correct, not approximate: any region
+ * containing `addr` covers `addr`'s page and is therefore in that page's
+ * chain.  ARM_IO_XCHECK=1 runs both lookups and aborts on any disagreement.
+ */
+static inline arm_io_region_t *find_io_region_fast(arm_cpu_t *cpu, uint32_t addr) {
+    uint32_t page = addr >> 12;
+    uint32_t h = (page * 2654435761u) >> 25;    /* Knuth; top 7 bits -> 0..127 */
+    for (;;) {
+        arm_io_page_t *e = &cpu->io_page_map[h & (ARM_IO_PAGE_SLOTS - 1)];
+        if (e->n == 0) return NULL;             /* empty slot: page unmapped */
+        if (e->page == page) {
+            for (int i = 0; i < e->n; i++) {
+                arm_io_region_t *r = &cpu->io_regions[e->idx[i]];
+                if (addr - r->base < r->size)   /* unsigned: base<=addr<end */
+                    return r;
+            }
+            return NULL;                        /* sub-page hole */
+        }
+        h++;
+    }
+}
+
+static arm_io_region_t *find_io_region(arm_cpu_t *cpu, uint32_t addr) {
+    static int xcheck = -1;
+    if (__builtin_expect(xcheck == -1, 0))
+        xcheck = getenv("ARM_IO_XCHECK") ? 1 : 0;
+
+    arm_io_region_t *r = cpu->io_page_map_fallback
+                       ? find_io_region_linear(cpu, addr)
+                       : find_io_region_fast(cpu, addr);
+
+    if (__builtin_expect(xcheck, 0)) {
+        arm_io_region_t *ref = find_io_region_linear(cpu, addr);
+        if (r != ref) {
+            fprintf(stderr,
+                    "ARM_IO_XCHECK: addr=0x%08x fast=%p (base=0x%08x) "
+                    "linear=%p (base=0x%08x)\n", addr,
+                    (void *)r,   r   ? r->base   : 0,
+                    (void *)ref, ref ? ref->base : 0);
+            abort();
+        }
+    }
+    return r;
 }
 
 /* Diagnostic (ARM_MMIO_TRACE=1): log the FIRST access to each unmapped
@@ -351,6 +424,33 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->vtor_default = config->vtor_default;
 
     cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
+
+    /* JIT block cache.  Fixed-size and direct-mapped with a start_pc tag —
+     * see include/arm/arm_jit.h for why it isn't a slot per flash address. */
+    cpu->jit_cache = NULL; cpu->jit_exec_count = NULL; cpu->jit_cache_size = 0;
+    cpu->jit_threshold = 50; cpu->jit_verify = 0;
+    cpu->jit_blocks_run = 0; cpu->jit_insns_run = 0;
+#ifdef HAVE_LIGHTNING
+    {
+        const char *e = getenv("CSIM_ARM_JIT");
+        if (!e || atoi(e) != 0) {
+            csim_lightning_init();
+            cpu->jit_cache = (void **)calloc(ARM_JIT_CACHE_SLOTS, sizeof(void *));
+            cpu->jit_exec_count =
+                (int32_t *)calloc(ARM_JIT_CACHE_SLOTS, sizeof(int32_t));
+            if (cpu->jit_cache && cpu->jit_exec_count) {
+                cpu->jit_cache_size = ARM_JIT_CACHE_SLOTS;
+            } else {
+                free(cpu->jit_cache); free(cpu->jit_exec_count);
+                cpu->jit_cache = NULL; cpu->jit_exec_count = NULL;
+            }
+        }
+        e = getenv("CSIM_ARM_JIT_THRESHOLD");
+        if (e) cpu->jit_threshold = atoi(e);
+        e = getenv("CSIM_ARM_JIT_VERIFY");
+        cpu->jit_verify = (e && atoi(e) != 0);
+    }
+#endif
     cpu->sram  = (uint8_t *)calloc(config->sram_size,  1);
     cpu->rom   = (config->rom_size > 0) ? (uint8_t *)calloc(config->rom_size, 1) : NULL;
 
@@ -397,6 +497,43 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
 }
 
 void arm_cpu_destroy(arm_cpu_t *cpu) {
+    /* CSIM_ARM_JIT_STATS=1: how much of the run actually went through
+     * compiled code.  Coverage is the number that matters — a JIT that is
+     * correct but only sees 3% of instructions cannot show up in wall time,
+     * and without this you cannot tell that case from "the codegen is slow". */
+    if (cpu->jit_insns_run || cpu->jit_blocks_run) {
+        const char *e = getenv("CSIM_ARM_JIT_STATS");
+        if (e && atoi(e) != 0) {
+            double pct = cpu->instructions
+                       ? 100.0 * (double)cpu->jit_insns_run / (double)cpu->instructions
+                       : 0.0;
+            fprintf(stderr,
+                    "  [arm-jit] blocks_run=%llu insns_via_jit=%llu / %lld (%.1f%%)"
+                    " avg_block=%.1f side_exits=%llu\n",
+                    (unsigned long long)cpu->jit_blocks_run,
+                    (unsigned long long)cpu->jit_insns_run,
+                    (long long)cpu->instructions, pct,
+                    cpu->jit_blocks_run
+                        ? (double)cpu->jit_insns_run / (double)cpu->jit_blocks_run
+                        : 0.0,
+                    (unsigned long long)cpu->jit_side_exits);
+            /* Compiled-block population and process peak RSS.  A low
+             * min-block threshold fills the cache with short blocks, and
+             * "how much memory did that cost" is not a question to answer by
+             * reasoning about Lightning's allocator. */
+            uint32_t live = 0;
+            for (uint32_t i = 0; i < cpu->jit_cache_size; i++)
+                if (cpu->jit_cache[i]) live++;
+            struct rusage ru;
+            getrusage(RUSAGE_SELF, &ru);
+            fprintf(stderr, "  [arm-jit] blocks_live=%u  peak_rss=%.1f MB\n",
+                    live, (double)ru.ru_maxrss / (1024.0 * 1024.0));
+        }
+    }
+    arm_jit_flush(cpu);
+    free(cpu->jit_cache);       cpu->jit_cache = NULL;
+    free(cpu->jit_exec_count);  cpu->jit_exec_count = NULL;
+    cpu->jit_cache_size = 0;
     free(cpu->rom);
     free(cpu->flash);
     free(cpu->sram);
@@ -404,6 +541,11 @@ void arm_cpu_destroy(arm_cpu_t *cpu) {
 }
 
 void arm_cpu_reset(arm_cpu_t *cpu) {
+    /* Drop compiled blocks: a reset may follow a fresh ELF load (tz-boot
+     * loads two images into one CPU), so cached code could describe
+     * bytes that are no longer there.  Flash is read-only at run time,
+     * so this is the only way the image can change under the cache. */
+    arm_jit_flush(cpu);
     memset(cpu->reg, 0, sizeof(cpu->reg));
     cpu->xpsr = 0;
     cpu->it_state = 0;
@@ -453,6 +595,84 @@ void arm_stop(arm_cpu_t *cpu) {
 
 /* --- IO registration --- */
 
+/*
+ * Rebuild the page-indexed lookup from the region list.  Cold: called once
+ * per arm_register_io, and registration only happens at platform init
+ * (regions are append-only; there is no unregister API in the tree).
+ * Rebuilding from scratch every time makes the table a pure function of the
+ * region list — no incremental state to get stale.
+ *
+ * Chains are kept sorted by (size, registration index) ascending, which is
+ * exactly the linear scan's winner order, so lookup takes the first hit.
+ * Anything the table cannot represent — a chain deeper than
+ * ARM_IO_PAGE_CHAIN, more pages than the table holds comfortably — sets
+ * io_page_map_fallback instead of trying harder: the linear scan is never
+ * wrong, only slower.
+ */
+static void arm_io_page_map_rebuild(arm_cpu_t *cpu) {
+    /* ARM_IO_LINEAR=1 pins the linear scan — the A/B and bisect knob, same
+     * pattern as CSIM_ARM_JIT=0.  Behaviour-identical by construction (the
+     * scan is the specification); only speed differs. */
+    static int force_linear = -1;
+    if (force_linear == -1) force_linear = getenv("ARM_IO_LINEAR") ? 1 : 0;
+    if (force_linear) { cpu->io_page_map_fallback = true; return; }
+
+    memset(cpu->io_page_map, 0, sizeof(cpu->io_page_map));
+    cpu->io_page_map_fallback = false;
+    int used_slots = 0;
+
+    for (int i = 0; i < cpu->num_io_regions; i++) {
+        arm_io_region_t *r = &cpu->io_regions[i];
+        if (r->size == 0) continue;             /* can never match: addr < base+0 */
+        uint32_t first = r->base >> 12;
+        uint32_t last  = (r->base + r->size - 1) >> 12;
+        for (uint32_t page = first; page <= last; page++) {
+            uint32_t h = (page * 2654435761u) >> 25;
+            arm_io_page_t *e;
+            for (;;) {
+                e = &cpu->io_page_map[h & (ARM_IO_PAGE_SLOTS - 1)];
+                if (e->n == 0 || e->page == page) break;
+                h++;
+            }
+            if (e->n == 0) {
+                e->page = page;
+                if (++used_slots > (ARM_IO_PAGE_SLOTS * 3) / 4) {
+                    cpu->io_page_map_fallback = true;   /* keep probes short */
+                    return;
+                }
+            }
+            if (e->n >= ARM_IO_PAGE_CHAIN) {
+                cpu->io_page_map_fallback = true;
+                return;
+            }
+            /* Insert i keeping (size, registration index) ascending.  i is
+             * the largest registration index so far, so it only moves past
+             * strictly larger sizes. */
+            int j = e->n++;
+            while (j > 0) {
+                arm_io_region_t *prev = &cpu->io_regions[e->idx[j - 1]];
+                if (prev->size <= r->size) break;
+                e->idx[j] = e->idx[j - 1];
+                j--;
+            }
+            e->idx[j] = (uint8_t)i;
+        }
+    }
+}
+
+/* Test hook (test_arm_correctness.c): run both lookups for `addr` and report
+ * whether they agree.  The linear scan is the specification; agreement over a
+ * sweep of region edges and random addresses is the unit-level equivalence
+ * proof, complementing ARM_IO_XCHECK which proves it over whole firmware
+ * runs. */
+int arm_io_lookup_check(arm_cpu_t *cpu, uint32_t addr);
+int arm_io_lookup_check(arm_cpu_t *cpu, uint32_t addr) {
+    arm_io_region_t *fast = cpu->io_page_map_fallback
+                          ? find_io_region_linear(cpu, addr)
+                          : find_io_region_fast(cpu, addr);
+    return fast == find_io_region_linear(cpu, addr);
+}
+
 void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
                      arm_io_read_fn read, arm_io_write_fn write, void *data) {
     if (cpu->num_io_regions >= ARM_MAX_IO_REGIONS) {
@@ -465,6 +685,7 @@ void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
     r->read = read;
     r->write = write;
     r->user_data = data;
+    arm_io_page_map_rebuild(cpu);
 }
 
 /* --- Event management (generated from shared template) --- */
@@ -634,7 +855,13 @@ static inline void set_sub_flags(arm_cpu_t *cpu, uint32_t a, uint32_t b, uint64_
     if (((a ^ b) & (a ^ r32)) >> 31) cpu->xpsr |= APSR_V;
 }
 
-static inline int condition_passed(arm_cpu_t *cpu, int cond) {
+/* always_inline, not just inline: the compiler declines to inline this into
+ * arm_step (~3000 lines) at -O3, so it showed up as its own symbol at 10.5%
+ * of self time in a profile — every conditional instruction and every
+ * IT-block body paid a call.  Forcing it is worth ~8% on arm-bench.
+ * See docs/design/arm-performance-plan.md §0.1. */
+static inline __attribute__((always_inline))
+int condition_passed(arm_cpu_t *cpu, int cond) {
     uint32_t f = cpu->xpsr;
     int result;
     switch (cond >> 1) {
@@ -675,6 +902,166 @@ static inline uint32_t asr_c(uint32_t val, int shift, int *carry) {
     }
     *carry = (val >> (shift - 1)) & 1;
     return (uint32_t)(sval >> shift);
+}
+
+/*
+ * arm_execute_decoded — the reference semantics for the JIT-compilable subset.
+ *
+ * This is the contract the JIT's generated code must reproduce *exactly*
+ * (registers, APSR flags and cycles).  It lives here rather than in
+ * arm_decode.c so it can reuse the interpreter's own flag helpers — the same
+ * arrangement MSP430 uses (execute_decoded is in msp430_cpu.c, not
+ * msp430_decode.c), and for the same reason: two hand-written copies of the
+ * flag rules would drift, and flag drift is invisible until a branch flips.
+ *
+ * Returns 1 if executed, 0 if the instruction is not in the subset.
+ * PC handling matches arm_step: the caller has already advanced PC past the
+ * instruction, so only B writes it.
+ */
+int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
+    uint32_t *reg = cpu->reg;
+
+    switch (di->klass) {
+    case ARM_DEC_SHIFT_IMM: {
+        int carry;
+        uint32_t v = reg[di->rm];
+        int sh = (int)di->imm;
+        switch (di->shift) {
+        case ARM_SH_LSL: reg[di->rd] = lsl_c(v, sh, &carry); break;
+        case ARM_SH_LSR: reg[di->rd] = lsr_c(v, sh, &carry); break;
+        default:         reg[di->rd] = asr_c(v, sh, &carry); break;
+        }
+        set_nzc(cpu, reg[di->rd], carry);
+        return 1;
+    }
+
+    /*
+     * Memory forms.  These call the same mem_*_unaligned() helpers the
+     * interpreter's handlers do, deliberately: the point of this reference
+     * model is that arm-decode can prove the *decode* is right, so it must not
+     * introduce a second implementation of the *access* as well.  The JIT's
+     * inline SRAM path is then checked against this by CSIM_ARM_JIT_VERIFY.
+     *
+     * The extra cycle is charged here because the caller has already applied
+     * arm_step's central +1 and the interpreter's load/store handlers add a
+     * second one of their own.
+     */
+    case ARM_DEC_NOP:
+        return 1;                      /* the caller already charged the cycle */
+
+    case ARM_DEC_EXTEND:
+        reg[di->rd] = (di->msize == 1)
+            ? (di->sext ? (uint32_t)(int32_t)(int8_t)(uint8_t)reg[di->rm]
+                        : (reg[di->rm] & 0xFFu))
+            : (di->sext ? (uint32_t)(int32_t)(int16_t)(uint16_t)reg[di->rm]
+                        : (reg[di->rm] & 0xFFFFu));
+        return 1;
+
+    case ARM_DEC_CBZ: {
+        int nonzero = (reg[di->rn] != 0);
+        if (nonzero == (int)di->cond) reg[ARM_PC] = di->imm;
+        return 1;
+    }
+
+    case ARM_DEC_LOAD_LIT:
+        reg[di->rd] = mem_read32_unaligned(cpu, di->imm);
+        cpu->cycles += di->cycles - 1;
+        return 1;
+
+    case ARM_DEC_LOAD: {
+        uint32_t addr = reg[di->rn] + di->imm +
+                        (di->rm == ARM_DEC_NO_RM ? 0 : reg[di->rm]);
+        switch (di->msize) {
+        case 1: reg[di->rd] = di->sext
+                    ? (uint32_t)(int32_t)(int8_t)mem_read8(cpu, addr)
+                    : (uint32_t)mem_read8(cpu, addr);
+                break;
+        case 2: reg[di->rd] = di->sext
+                    ? (uint32_t)(int32_t)(int16_t)mem_read16_unaligned(cpu, addr)
+                    : (uint32_t)mem_read16_unaligned(cpu, addr);
+                break;
+        default: reg[di->rd] = mem_read32_unaligned(cpu, addr); break;
+        }
+        cpu->cycles += di->cycles - 1;
+        return 1;
+    }
+
+    case ARM_DEC_STORE: {
+        uint32_t addr = reg[di->rn] + di->imm +
+                        (di->rm == ARM_DEC_NO_RM ? 0 : reg[di->rm]);
+        switch (di->msize) {
+        case 1:  mem_write8(cpu, addr, (uint8_t)reg[di->rd]); break;
+        case 2:  mem_write16_unaligned(cpu, addr, (uint16_t)reg[di->rd]); break;
+        default: mem_write32_unaligned(cpu, addr, reg[di->rd]); break;
+        }
+        cpu->cycles += di->cycles - 1;
+        return 1;
+    }
+
+    case ARM_DEC_ALU_REG:
+    case ARM_DEC_ALU_IMM: {
+        int is_imm = (di->klass == ARM_DEC_ALU_IMM);
+        uint32_t n = reg[di->rn];
+        uint32_t m = is_imm ? di->imm : reg[di->rm];
+
+        switch (di->op) {
+        case ARM_ALU_ADD: {
+            uint64_t r = (uint64_t)n + m;
+            if (di->writes_result) reg[di->rd] = (uint32_t)r;
+            if (di->set_flags) set_add_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_CMN: {
+            uint64_t r = (uint64_t)n + m;
+            set_add_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_SUB: {
+            uint64_t r = (uint64_t)n - m;
+            if (di->writes_result) reg[di->rd] = (uint32_t)r;
+            if (di->set_flags) set_sub_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_CMP: {
+            uint64_t r = (uint64_t)n - m;
+            set_sub_flags(cpu, n, m, r);
+            return 1;
+        }
+        case ARM_ALU_RSB: {
+            /* NEG Rd, Rm — the interpreter computes 0 - Rm and takes flags
+             * against a == 0, so reproduce that exactly. */
+            uint32_t mv = reg[di->rn];
+            uint64_t r = (uint64_t)0 - mv;
+            reg[di->rd] = (uint32_t)r;
+            set_sub_flags(cpu, 0, mv, r);
+            return 1;
+        }
+        case ARM_ALU_AND: reg[di->rd] = n & m;  set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_EOR: reg[di->rd] = n ^ m;  set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_ORR: reg[di->rd] = n | m;  set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_BIC: reg[di->rd] = n & ~m; set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_TST: set_nz(cpu, n & m); return 1;
+        case ARM_ALU_MVN: reg[di->rd] = ~reg[di->rn]; set_nz(cpu, reg[di->rd]); return 1;
+        case ARM_ALU_MOV:
+            reg[di->rd] = is_imm ? di->imm : reg[di->rn];
+            if (di->set_flags) set_nz(cpu, reg[di->rd]);
+            return 1;
+        }
+        return 0;
+    }
+
+    case ARM_DEC_B_UNCOND:
+        reg[ARM_PC] = di->imm;
+        return 1;
+
+    case ARM_DEC_B_COND:
+        /* Not-taken leaves PC where the caller put it (pc + 2). */
+        if (condition_passed(cpu, di->cond)) reg[ARM_PC] = di->imm;
+        return 1;
+
+    default:
+        return 0;
+    }
 }
 
 static inline uint32_t ror_c(uint32_t val, int shift, int *carry) {
@@ -756,6 +1143,34 @@ static inline void arm_sp_audit_push(arm_cpu_t *cpu, uint32_t return_pc,
     cpu->sp_audit[i].saved_sp     = cpu->reg[ARM_SP];
     cpu->sp_audit[i].callee_pc    = callee_pc & ~1u;
     cpu->sp_audit[i].in_exception = (cpu->xpsr & 0x1FF) != 0 ? 1 : 0;
+}
+
+/* One-time probe for the per-instruction debug facilities, so arm_step's hot
+ * path pays a single predictable branch instead of one load+test per facility
+ * (plus a loop setup for the PC watchpoints) on every emulated instruction.
+ *
+ * Does all the getenv/init work on first call.  Facilities are latched at that
+ * point: setting ARM_MEM_WATCH etc. mid-run was never supported anyway, since
+ * each site already cached its own env lookup. */
+static int arm_dbg_any = -1;
+static int arm_debug_probe(void) {
+    extern int arm_pcw_count; extern void arm_pcw_init(void);
+    extern uint32_t arm_zt_kernel;
+    extern uint32_t arm_memw_addr;
+
+    if (arm_pcw_count < 0) arm_pcw_init();
+
+    const char *z = getenv("ZEPHYR_THREADS");
+    if (z) arm_zt_kernel = (uint32_t)strtoul(z, 0, 16);
+
+    const char *m = getenv("ARM_MEM_WATCH");
+    if (m) arm_memw_addr = (uint32_t)strtoul(m, 0, 16);
+
+    return (arm_pcw_count > 0) || (arm_zt_kernel != 0) || (arm_memw_addr != 0);
+}
+static inline int arm_debug_facilities_on(void) {
+    if (__builtin_expect(arm_dbg_any < 0, 0)) arm_dbg_any = arm_debug_probe();
+    return arm_dbg_any;
 }
 
 static inline void arm_sp_audit_check(arm_cpu_t *cpu) {
@@ -936,16 +1351,67 @@ static inline void arm_trace_step(arm_cpu_t *cpu) {
             cpu->xpsr, (void*)cpu);
 }
 
-int arm_step(arm_cpu_t *cpu, int count) {
+static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
     int remaining = count;
+
+    /* Hoist the flash window into locals for the whole slice.
+     *
+     * `flash`, `flash_base` and `flash_end` are set once in arm_cpu_init and
+     * never change afterwards, but the compiler cannot prove that: `flash` is
+     * a *pointer* member, so any store in the loop (mem_write, a peripheral
+     * callback, …) might alias it, forcing a reload of the pointer and both
+     * bounds on every single fetch.
+     *
+     * MSP430's interpreter has always done this — msp430_step_interpreter
+     * opens by caching `memory`/`max_mem` in locals — which is part of why it
+     * out-runs the ARM interpreter on the same host.
+     *
+     * FETCH16 keeps the flash fast path inline off these locals and falls back
+     * to the full fetch16() (ROM, SRAM, IO) for anything outside the window,
+     * so behaviour is unchanged: fetch16 checks flash first as well. */
+    const uint8_t *const fl_mem  = cpu->flash;
+    const uint32_t       fl_base = cpu->flash_base;
+    const uint32_t       fl_end  = cpu->flash_end;
+#define FETCH16(a)                                                          \
+    (__builtin_expect((a) >= fl_base && (a) < fl_end, 1)                     \
+        ? (uint16_t)(fl_mem[(a) - fl_base] | (fl_mem[(a) - fl_base + 1] << 8))\
+        : fetch16(cpu, (a)))
+
+    /* Two more per-instruction obligations hoisted out of the loop, for the
+     * same reason as the flash window above: both are set once (gdb_stub by
+     * the GDB service at attach, the fw_* trap addresses by the ELF loader)
+     * and never change while a slice runs, but they live behind `cpu->` so
+     * the compiler must reload and re-test them on every instruction.
+     *
+     * MSP430's interpreter has neither obligation at all — it has no
+     * per-instruction GDB check and no ROM-trap dispatch — which is part of
+     * the measured ARM/MSP430 interpreter gap. */
+    gdb_stub_t *const gdb_stub = (gdb_stub_t *)cpu->gdb_stub;
+    /*
+     * The two ROM-trap addresses, hoisted so the per-instruction test is two
+     * register compares rather than a call.
+     *
+     * `handle_fw_trap()` used to be called on *every* instruction, and the
+     * compiler will not inline a function that size into a loop this big — the
+     * same thing that happened to `condition_passed` and cost 5.9% until Tier 0
+     * forced it (§2). It showed up in a profile as its own symbol at **9.3% of
+     * runtime on Contiki-NG/nRF52840 and 11% on cc2538**, which is not the cost
+     * of emulating a 64-bit divide (those are rare) but the cost of asking
+     * "is this one?" three million times a second.
+     *
+     * A trap address of 0 means "not armed", and PC is never 0 here, so the
+     * comparison needs no separate armed test.
+     */
+    const uint32_t fw_trap_a = cpu->fw_udivmoddi4;
+    const uint32_t fw_trap_b = cpu->fw_aeabi_uldivmod;
 
     while (remaining > 0 && !cpu->stopping) {
         arm_trace_step(cpu);
         /* GDB stub: check breakpoint at current PC, then poll for halt
          * commands. If halted, stop the inner loop so the multinode
          * driver can pump the stub's command processor. */
-        if (cpu->gdb_stub) {
-            gdb_stub_t *g = (gdb_stub_t *)cpu->gdb_stub;
+        if (__builtin_expect(gdb_stub != NULL, 0)) {
+            gdb_stub_t *g = gdb_stub;
             uint32_t pc_check = cpu->reg[ARM_PC] & ~1u;
             if (gdb_stub_check_breakpoint(g, pc_check)) {
                 cpu->stopping = true;
@@ -1018,11 +1484,21 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         uint32_t pc = cpu->reg[ARM_PC];
 
-        {
-            extern int arm_pcw_count; extern void arm_pcw_init(void);
+        /* Per-instruction debug facilities (PC watchpoints, the one-shot
+         * Zephyr thread dump, the memory watch) behind ONE cached flag.
+         *
+         * Each used to cost its own load+test on every emulated instruction,
+         * and the PC-watchpoint one cost a loop setup as well — on a path
+         * that retires an instruction every ~20 host cycles.  All three are
+         * off in every normal run.  arm_debug_facilities_on() does the
+         * getenv work once and thereafter is a single predictable branch.
+         *
+         * This region has bitten us before: see the ARM_WILD_TRAP comment
+         * below, where an unlatched getenv() was once ~35% of wall time. */
+        if (__builtin_expect(arm_debug_facilities_on(), 0)) {
+            extern int arm_pcw_count;
             extern uint32_t arm_pcw_addr[]; extern uint64_t arm_pcw_n[];
             extern int64_t arm_pcw_first[], arm_pcw_last[];
-            if (arm_pcw_count < 0) arm_pcw_init();
             for (int i = 0; i < arm_pcw_count; i++)
                 if ((pc & ~1u) == (arm_pcw_addr[i] & ~1u)) {
                     if (arm_pcw_n[i] == 0) arm_pcw_first[i] = cpu->cycles;
@@ -1033,9 +1509,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
              * and the wait-queue each thread is pended on.  Offsets are for the
              * echo-s-nd build (z_kernel.threads +40, k_thread.next_thread +140,
              * .name +144, base.thread_state +16, base.pended_on +8). */
-            extern uint32_t arm_zt_kernel; extern int arm_zt_done, arm_zt_init;
-            if (!arm_zt_init) { arm_zt_init = 1;
-                char *z = getenv("ZEPHYR_THREADS"); if (z) arm_zt_kernel = (uint32_t)strtoul(z, 0, 16); }
+            extern uint32_t arm_zt_kernel; extern int arm_zt_done;
             if (arm_zt_kernel && !arm_zt_done && cpu->cycles > 20000000) {
                 arm_zt_done = 1;
                 uint32_t t = arm_read32(cpu, arm_zt_kernel + 40);
@@ -1052,9 +1526,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
                     t = arm_read32(cpu, t + 140);
                 }
             }
-            extern uint32_t arm_memw_addr; extern int arm_memw_last, arm_memw_init_done;
-            if (!arm_memw_init_done) { arm_memw_init_done = 1;
-                char *m = getenv("ARM_MEM_WATCH"); if (m) arm_memw_addr = (uint32_t)strtoul(m, 0, 16); }
+            extern uint32_t arm_memw_addr; extern int arm_memw_last;
             if (arm_memw_addr) {
                 int v = (int)arm_read8(cpu, arm_memw_addr);
                 if (v != arm_memw_last) {
@@ -1094,8 +1566,9 @@ int arm_step(arm_cpu_t *cpu, int count) {
             }
         }
 
-        /* ROM utility traps */
-        if (handle_fw_trap(cpu)) {
+        /* ROM utility traps — see the hoist above for why this is not a call. */
+        if (__builtin_expect(pc == fw_trap_a || pc == fw_trap_b, 0) &&
+            handle_fw_trap(cpu)) {
             cpu->instructions++;
             remaining--;
             continue;
@@ -1107,7 +1580,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
         }
 
         /* Fetch first halfword */
-        uint16_t hw1 = fetch16(cpu, pc);
+        uint16_t hw1 = FETCH16(pc);
         uint16_t top5 = hw1 >> 11;
 
         /* Periodic PC trace for debugging */
@@ -1891,7 +2364,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
         t32_decode: {
             /* 32-bit Thumb-2 instruction */
-            uint16_t hw2 = fetch16(cpu, pc + 2);
+            uint16_t hw2 = FETCH16(pc + 2);
             cpu->reg[ARM_PC] = pc + 4;
             cpu->cycles += 1;
 
@@ -3055,6 +3528,324 @@ int arm_step(arm_cpu_t *cpu, int count) {
 
     return remaining;
 }
+
+
+/* ============================================================
+ * JIT dispatcher
+ *
+ * Deliberately an OUTER loop around the interpreter, mirroring msp430_step:
+ * the interpreter's own loop is left untouched.  Putting the cache probe
+ * inside arm_step_interpreter would have undone the two per-instruction
+ * hoists that bought 15.9% earlier (8c3cb60) — the whole point of that work
+ * was to get checks *out* of that loop.
+ *
+ * Conditions the compiled path does not model are simply handed back to the
+ * interpreter, which is the only thing that makes the subset argument work:
+ * the JIT never has to be right about anything it declined to compile.
+ * ============================================================ */
+#ifdef HAVE_LIGHTNING
+
+/*
+ * Interpreter run-length between JIT cache probes.  0 = hand the interpreter
+ * the caller's full budget, which is the default and is NOT a tuning choice:
+ *
+ * Chopping arm_step's budget into fixed batches changes simulation timing.
+ * Measured directly — dispatcher present but threshold set so high that
+ * nothing compiles, so the only variable is the batch size:
+ *
+ *   batch=32   vs no dispatcher  ->  DIFFERS  (a TX moves 4.240 s -> 3.078 s)
+ *   batch=full vs no dispatcher  ->  byte-identical
+ *
+ * arm_step's contract is "up to count instructions", and the interpreter's
+ * WFI/event handling is sensitive to that budget, so re-entering it with a
+ * different count is observable.  With batch=full the JIT is cycle-exact:
+ * CSIM_ARM_JIT=0 and CSIM_ARM_JIT=1 produce byte-identical output on
+ * test-2node-nrf54l15-dk (209 lines) and chain-3node-nrf52840-dk (1067).
+ * That property is required here — determinism is a gated guarantee, and a
+ * JIT that shifted timing would make results depend on whether GNU Lightning
+ * happened to be installed.
+ *
+ * Cost: one cache probe per arm_step call rather than one per 32
+ * instructions.  That is ample — a 3 s zephyr run makes 4.18M arm_step calls.
+ */
+#define ARM_JIT_BATCH 0
+int arm_jit_batch_size(void);
+int arm_jit_batch_size(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CSIM_ARM_JIT_BATCH"); v = e ? atoi(e) : ARM_JIT_BATCH; }
+    return v;
+}
+
+/*
+ * Lockstep verification (CSIM_ARM_JIT_VERIFY=1): run the compiled block, keep
+ * what it produced, rewind, re-run the same instructions through the
+ * interpreter, and compare architectural state exactly.
+ *
+ * This exists because of the single correctness bug the MSP430 JIT ever
+ * shipped — an inlined ADDC left the V flag stale.  It was warm-block-only,
+ * so no functional test could reach it, and a wrong *flag* stays invisible
+ * until some later conditional branch reads it.  Comparing state per block is
+ * the only thing that catches that class.
+ */
+/*
+ * Run one compiled block and do its bookkeeping.
+ *
+ * Cycle/instruction accounting lives here rather than in generated code
+ * because a loop block's iteration count is only known afterwards, and
+ * because the budget that bounds it has to come from the dispatcher's view of
+ * `remaining` and the next scheduled event.  Returns instructions executed, or
+ * 0 if the block could not be run (caller falls back to the interpreter).
+ */
+/*
+ * How many times this block may run before control has to come back.
+ * Returns 0 when it cannot run at all (caller falls back to the interpreter).
+ *
+ * Three bounds, and which one binds is the whole story of this function:
+ *
+ *  - the caller's instruction budget (`remaining`).
+ *  - the caller's *cycle* target (`cpu->cycle_limit`), when it set one.
+ *  - the next scheduled event.  A block has no internal event check, so
+ *    running past `next_event_cycle` would deliver a peripheral event late —
+ *    the one way a JIT could silently change simulation results.  This one
+ *    only ever tightens.
+ *
+ * The second bound is why this is not simply `remaining / length`.  Measured
+ * on cc2538 RPL-UDP, **79.8% of arm_step calls arrive with a budget of exactly
+ * 1 instruction** — they are the tail of arm_step_until's convergence loop,
+ * which single-steps once it is within 10 cycles of its target.  A 4-
+ * instruction block (the average on that firmware) can never run on a budget
+ * of 1, so before this the JIT was locked out of about 61% of all executed
+ * instructions no matter how good its instruction coverage got.
+ *
+ * Relaxing the instruction cap to the cycle target is sound because the cycle
+ * target is what arm_step_until is actually converging to; the instruction
+ * count was only ever a proxy for it.  And it is *stricter* than what the
+ * interpreter offers: `arm_step(cpu, 1)` can overshoot the target by however
+ * many cycles one instruction happens to cost (2 for a load, 12 for an
+ * exception entry, 20 for a divide), whereas a block is admitted only if its
+ * whole measured cost fits.  Nothing may exceed the target that would not
+ * already have exceeded it.
+ */
+static int arm_jit_iters(arm_cpu_t *cpu, arm_compiled_block_t *cb,
+                         int remaining) {
+    int64_t lim = remaining / cb->length;
+    if (cpu->cycle_limit != INT64_MAX) {
+        int64_t by_limit =
+            (cpu->cycle_limit - cpu->cycles) / cb->cycles_total;
+        if (by_limit > lim) lim = by_limit;
+    }
+    int64_t by_events =
+        (cpu->next_event_cycle - cpu->cycles - 1) / cb->cycles_total;
+    if (by_events < lim) lim = by_events;
+    if (!cb->is_loop && lim > 1) lim = 1;
+    if (lim < 1) return 0;
+    return (int)(lim > INT32_MAX ? INT32_MAX : lim);
+}
+
+static int arm_jit_run(arm_cpu_t *cpu, arm_compiled_block_t *cb, int remaining) {
+    int iters_max = arm_jit_iters(cpu, cb, remaining);
+    if (iters_max < 1) return 0;
+    cpu->jit_iter_budget = iters_max;
+    cpu->jit_partial     = -1;
+    cb->fn(cpu);
+
+    /* `partial >= 0` means a guarded memory access missed and the block
+     * stopped there, having run only insns[0..partial-1] of its final pass. */
+    int partial = cpu->jit_partial;
+    int iters   = cb->is_loop ? (iters_max - cpu->jit_iter_budget)
+                              : (partial < 0 ? 1 : 0);
+    int tail    = partial < 0 ? 0 : partial;
+    int executed = iters * cb->length + tail;
+    cpu->cycles       += (int64_t)iters * cb->cycles_total + cb->cyc_prefix[tail];
+    cpu->instructions += executed;
+    if (partial >= 0) cpu->jit_side_exits++;
+    return executed;
+}
+
+/*
+ * Memory has to be rewound too, and finding that out cost a false alarm worth
+ * recording: the first run of this verifier against a block containing
+ * `ldr r3,[sp,#4] / adds r3,#1 / str r3,[sp,#4]` reported r3 off by exactly
+ * one, every time.  Nothing was wrong with the generated code — the verifier
+ * replayed the block over the memory the *first* run had already updated, so
+ * the interpreter incremented a value that had been incremented once already.
+ * Re-running a block is only a valid comparison if the whole input state is
+ * restored, and memory became part of that state the moment stores were
+ * compiled.
+ *
+ * The snapshot is skipped for blocks that only load, which is most of them,
+ * and the buffers are allocated once per CPU rather than per block.  This is a
+ * debug mode; a memcpy of SRAM per storing block is an acceptable price for
+ * comparing the two implementations exactly rather than approximately.
+ */
+static int arm_jit_verify_mem(arm_cpu_t *cpu, uint8_t **pre, uint8_t **post) {
+    uint32_t sz = cpu->sram_end - cpu->sram_base;
+    if (!*pre)  *pre  = (uint8_t *)malloc(sz);
+    if (!*post) *post = (uint8_t *)malloc(sz);
+    return (*pre && *post);
+}
+
+static int arm_jit_run_verified(arm_cpu_t *cpu, arm_compiled_block_t *cb,
+                                int remaining) {
+    static uint8_t *mem_pre, *mem_post;
+    uint32_t sram_sz = cpu->sram_end - cpu->sram_base;
+    int check_mem = cb->has_store && arm_jit_verify_mem(cpu, &mem_pre, &mem_post);
+
+    uint32_t save_reg[16];
+    memcpy(save_reg, cpu->reg, sizeof(save_reg));
+    uint32_t save_xpsr   = cpu->xpsr;
+    int64_t  save_cycles = cpu->cycles;
+    int64_t  save_instr  = cpu->instructions;
+    if (check_mem) memcpy(mem_pre, cpu->sram, sram_sz);
+
+    int executed = arm_jit_run(cpu, cb, remaining);
+    if (executed == 0) return 0;
+
+    uint32_t jit_reg[16];
+    memcpy(jit_reg, cpu->reg, sizeof(jit_reg));
+    uint32_t jit_xpsr   = cpu->xpsr;
+    int64_t  jit_cycles = cpu->cycles;
+    if (check_mem) {
+        memcpy(mem_post, cpu->sram, sram_sz);   /* what the JIT produced */
+        memcpy(cpu->sram, mem_pre, sram_sz);    /* rewind for the replay */
+    }
+
+    /* Rewind and re-run the same instructions interpreted. */
+    memcpy(cpu->reg, save_reg, sizeof(save_reg));
+    cpu->xpsr         = save_xpsr;
+    cpu->cycles       = save_cycles;
+    cpu->instructions = save_instr;
+    if (executed > 0) arm_step_interpreter(cpu, executed);
+
+    int bad = 0;
+    if (check_mem && memcmp(mem_post, cpu->sram, sram_sz) != 0) {
+        uint32_t i = 0;
+        while (i < sram_sz && mem_post[i] == cpu->sram[i]) i++;
+        fprintf(stderr, "ARM JIT MEM MISMATCH pc=0x%08x len=%d: "
+                        "sram[0x%08x] jit=0x%02x interp=0x%02x\n",
+                cb->start_pc, cb->length, cpu->sram_base + i,
+                mem_post[i], cpu->sram[i]);
+        bad = 1;
+    }
+    for (int r = 0; r < 16; r++) {
+        if (jit_reg[r] != cpu->reg[r]) {
+            if (!bad)
+                fprintf(stderr, "ARM JIT MISMATCH pc=0x%08x len=%d:\n",
+                        cb->start_pc, cb->length);
+            fprintf(stderr, "  r%-2d  jit=0x%08x interp=0x%08x\n",
+                    r, jit_reg[r], cpu->reg[r]);
+            bad = 1;
+        }
+    }
+    if ((jit_xpsr & 0xF0000000u) != (cpu->xpsr & 0xF0000000u)) {
+        if (!bad)
+            fprintf(stderr, "ARM JIT MISMATCH pc=0x%08x len=%d:\n",
+                    cb->start_pc, cb->length);
+        fprintf(stderr, "  APSR jit=N%dZ%dC%dV%d interp=N%dZ%dC%dV%d\n",
+                !!(jit_xpsr & 0x80000000u), !!(jit_xpsr & 0x40000000u),
+                !!(jit_xpsr & 0x20000000u), !!(jit_xpsr & 0x10000000u),
+                !!(cpu->xpsr & 0x80000000u), !!(cpu->xpsr & 0x40000000u),
+                !!(cpu->xpsr & 0x20000000u), !!(cpu->xpsr & 0x10000000u));
+        bad = 1;
+    }
+    if (jit_cycles != cpu->cycles && !bad)
+        fprintf(stderr, "ARM JIT CYCLE MISMATCH pc=0x%08x: jit=%lld interp=%lld\n",
+                cb->start_pc, (long long)jit_cycles, (long long)cpu->cycles);
+    return executed;
+}
+
+void arm_jit_flush(arm_cpu_t *cpu);
+void arm_jit_flush(arm_cpu_t *cpu) {
+    if (!cpu->jit_cache) return;
+    for (uint32_t i = 0; i < cpu->jit_cache_size; i++) {
+        if (cpu->jit_cache[i]) {
+            arm_jit_free((arm_compiled_block_t *)cpu->jit_cache[i]);
+            cpu->jit_cache[i] = NULL;
+        }
+        cpu->jit_exec_count[i] = 0;
+    }
+}
+
+int arm_step(arm_cpu_t *cpu, int count) {
+    if (cpu->jit_cache_size == 0) return arm_step_interpreter(cpu, count);
+
+    int remaining = count;
+    while (remaining > 0 && !cpu->stopping) {
+        /* Anything the compiled path does not model -> interpreter.  A due
+         * event or a pending IRQ must be taken at an instruction boundary,
+         * and a block has no internal check; mid-IT-block execution needs the
+         * interpreter's flag suppression; WFI and GDB are its business too. */
+        int interp_only = cpu->cpu_off || cpu->gdb_stub != NULL ||
+                          (cpu->it_state & 0xF) != 0 ||
+                          cpu->cycles >= cpu->next_event_cycle;
+        if (!interp_only && cpu->nvic &&
+            ((arm_nvic_t *)cpu->nvic)->has_pending)
+            interp_only = 1;
+
+        if (!interp_only) {
+            uint32_t pc = cpu->reg[ARM_PC] & ~1u;
+            if (pc >= cpu->flash_base && pc < cpu->flash_end) {
+                uint32_t ci = (pc >> 1) & (ARM_JIT_CACHE_SLOTS - 1);
+                arm_compiled_block_t *cb =
+                    (arm_compiled_block_t *)cpu->jit_cache[ci];
+
+                if (cb && cb->start_pc == pc) {
+                    int executed = cpu->jit_verify
+                                 ? arm_jit_run_verified(cpu, cb, remaining)
+                                 : arm_jit_run(cpu, cb, remaining);
+                    if (executed > 0) {
+                        cpu->jit_blocks_run++;
+                        cpu->jit_insns_run += (uint64_t)executed;
+                        /* A block admitted on the cycle bound can run past the
+                         * instruction budget; that is the point.  Clamp rather
+                         * than let `remaining` go negative. */
+                        remaining = (executed >= remaining) ? 0
+                                                            : remaining - executed;
+                        continue;
+                    }
+                }
+
+                if ((!cb || cb->start_pc != pc) && cpu->jit_exec_count[ci] >= 0 &&
+                    ++cpu->jit_exec_count[ci] >= cpu->jit_threshold) {
+                    arm_basic_block_t blk;
+                    arm_decode_block(cpu->flash, cpu->flash_base,
+                                     cpu->flash_end - cpu->flash_base,
+                                     pc, &blk);
+                    arm_compiled_block_t *ncb = arm_jit_compile(&blk, cpu);
+                    if (ncb) {
+                        if (cb) arm_jit_free(cb);   /* evict the collision */
+                        cpu->jit_cache[ci] = ncb;
+                        cpu->jit_exec_count[ci] = 0;
+                        continue;
+                    }
+                    /* Not compilable (too short / unsupported at this PC).
+                     * Mark so we don't re-decode it on every pass. */
+                    cpu->jit_exec_count[ci] = -1;
+                }
+            }
+        }
+
+        int arm_jit_batch_size(void);
+        int bsz = arm_jit_batch_size();
+        int batch = (bsz <= 0 || remaining < bsz) ? remaining : bsz;
+        int rem   = arm_step_interpreter(cpu, batch);
+        int done  = batch - rem;
+        if (done <= 0) break;          /* no progress -> stop, don't spin */
+        remaining -= done;
+    }
+    return remaining;
+}
+
+#else  /* !HAVE_LIGHTNING */
+
+void arm_jit_flush(arm_cpu_t *cpu);
+void arm_jit_flush(arm_cpu_t *cpu) { (void)cpu; }
+
+int arm_step(arm_cpu_t *cpu, int count) {
+    return arm_step_interpreter(cpu, count);
+}
+
+#endif /* HAVE_LIGHTNING */
 
 void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
     if (cpu->cycles >= target_cycle) return;
