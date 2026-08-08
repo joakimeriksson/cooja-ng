@@ -3,6 +3,8 @@
  */
 #include "arm_cpu.h"
 #include "arm_config.h"
+#include "arm_trustzone.h"
+#include "arm_nvic.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -1814,6 +1816,528 @@ static void test_ldrd_strd(void) {
     }
 }
 
+/* ===================================================================
+ * ARMv8-M TrustZone-M: SAU + IDAU security attribution (Phase 1)
+ * =================================================================== */
+static void tz_add_region(arm_cpu_t *cpu, unsigned r, uint32_t base,
+                          uint32_t limit, bool nsc) {
+    cpu->sau_rbar[r] = base & ~0x1fu;
+    cpu->sau_rlar[r] = (limit & ~0x1fu) | ARM_SAU_RLAR_ENABLE
+                       | (nsc ? ARM_SAU_RLAR_NSC : 0);
+}
+
+static void test_trustzone_sau(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SAU/IDAU attribution tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);           /* cc2538: tz_enabled == false */
+
+    /* Non-TZ SoC: attribution is always Non-secure regardless of SAU state. */
+    assert_eq("no-TZ SoC => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20000000));
+
+    /* Enable the extension for the engine tests. */
+    cpu.tz_enabled = true;
+    cpu.sau_sregions = 8;
+
+    /* SAU disabled, ALLNS=0 => entire space Secure. */
+    cpu.sau_ctrl = 0;
+    assert_eq("SAU off, ALLNS=0 => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x00000000));
+    assert_eq("SAU off, ALLNS=0 => SECURE (high)", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0xE000ED00));
+
+    /* SAU disabled, ALLNS=1 => entire space Non-secure. */
+    cpu.sau_ctrl = ARM_SAU_CTRL_ALLNS;
+    assert_eq("SAU off, ALLNS=1 => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20000000));
+
+    /* SAU enabled with one Non-secure region [0x20000000, 0x2000FFFF]. */
+    memset(cpu.sau_rbar, 0, sizeof(cpu.sau_rbar));
+    memset(cpu.sau_rlar, 0, sizeof(cpu.sau_rlar));
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    tz_add_region(&cpu, 0, 0x20000000, 0x2000FFFF, false);
+    assert_eq("in NS region => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20008000));
+    assert_eq("region base is inclusive", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20000000));
+    assert_eq("region limit low bits set (inclusive)", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x2000FFFF));
+    assert_eq("just below region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x1FFFFFFF));
+    assert_eq("just above region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x20010000));
+
+    /* NSC region => Secure, callable. */
+    tz_add_region(&cpu, 1, 0x00040000, 0x00040FFF, true);
+    assert_eq("in NSC region => NSC", ARM_SEC_NSC,
+              arm_security_attr(&cpu, 0x00040100));
+    assert_eq("outside all regions => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x00080000));
+
+    /* Overlapping regions => Secure (invalid), even if both are NS. */
+    tz_add_region(&cpu, 2, 0x30000000, 0x3000FFFF, false);
+    tz_add_region(&cpu, 3, 0x30008000, 0x3001FFFF, false);
+    assert_eq("overlapping NS regions => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x3000C000));
+    assert_eq("non-overlapping part of region 2 => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x30001000));
+
+    /* Disabled region is ignored. */
+    cpu.sau_rlar[0] &= ~ARM_SAU_RLAR_ENABLE;
+    assert_eq("disabled region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x20008000));
+}
+
+/* Program the SAU through the memory-mapped SCS registers (as firmware does)
+ * and confirm read-back, attribution, and Secure-only RAZ/WI. */
+static void test_trustzone_sau_mmio(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SAU memory-mapped register tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    arm_nvic_t nvic;
+    arm_nvic_init(&nvic, &cpu);      /* registers the SCS IO region */
+
+    /* Emulate a TZ part in Secure state. */
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+
+    /* SAU_TYPE reports the implemented region count. */
+    assert_eq("SAU_TYPE reads region count", 8, arm_read32(&cpu, 0xE000EDD4));
+
+    /* Program region 0 = [0x20000000, 0x2000FFFF], Non-secure. */
+    arm_write32(&cpu, 0xE000EDD8, 0);            /* SAU_RNR = 0 */
+    arm_write32(&cpu, 0xE000EDDC, 0x20000000);   /* SAU_RBAR */
+    arm_write32(&cpu, 0xE000EDE0, 0x2000FFE1);   /* SAU_RLAR: limit|ENABLE */
+    arm_write32(&cpu, 0xE000EDD0, 1);            /* SAU_CTRL: ENABLE */
+
+    assert_eq("SAU_RBAR read-back", 0x20000000, arm_read32(&cpu, 0xE000EDDC));
+    assert_eq("SAU_RLAR read-back", 0x2000FFE1, arm_read32(&cpu, 0xE000EDE0));
+    assert_eq("SAU_CTRL read-back", 1, arm_read32(&cpu, 0xE000EDD0));
+
+    /* Attribution reflects the memory-programmed region. */
+    assert_eq("mmio-programmed region => NONSECURE", ARM_SEC_NONSECURE,
+              arm_security_attr(&cpu, 0x20008000));
+    assert_eq("outside mmio region => SECURE", ARM_SEC_SECURE,
+              arm_security_attr(&cpu, 0x10000000));
+
+    /* Program region 1 as NSC via the indexed RNR/RLAR interface. */
+    arm_write32(&cpu, 0xE000EDD8, 1);            /* SAU_RNR = 1 */
+    arm_write32(&cpu, 0xE000EDDC, 0x00040000);
+    arm_write32(&cpu, 0xE000EDE0, 0x00040FE3);   /* limit|NSC|ENABLE */
+    assert_eq("mmio NSC region => NSC", ARM_SEC_NSC,
+              arm_security_attr(&cpu, 0x00040100));
+
+    /* Secure-only: Non-secure accesses RAZ/WI. */
+    cpu.secure = false;
+    assert_eq("SAU_CTRL RAZ from Non-secure", 0, arm_read32(&cpu, 0xE000EDD0));
+    arm_write32(&cpu, 0xE000EDD0, 0);            /* WI: must not clear ENABLE */
+    cpu.secure = true;
+    assert_eq("SAU_CTRL unchanged after NS write (WI)", 1,
+              arm_read32(&cpu, 0xE000EDD0));
+}
+
+/* Step 2: data-access enforcement decision + SecureFault recording. */
+static void test_trustzone_enforcement(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone data-access enforcement tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.sau_sregions = 8;
+    /* Region 0 = [0x20000000,0x2000FFFF] Non-secure; everything else Secure. */
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    cpu.sau_rbar[0] = 0x20000000;
+    cpu.sau_rlar[0] = (0x2000FFFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+
+    /* Secure state may reach any address. */
+    cpu.secure = true;
+    assert_true("Secure may access Secure mem",
+                arm_mem_access_permitted(&cpu, 0x00000000));
+    assert_true("Secure may access NS mem",
+                arm_mem_access_permitted(&cpu, 0x20008000));
+
+    /* Non-secure state may reach only Non-secure memory. */
+    cpu.secure = false;
+    assert_true("NS may access NS mem",
+                arm_mem_access_permitted(&cpu, 0x20008000));
+    assert_true("NS may NOT access Secure mem",
+                !arm_mem_access_permitted(&cpu, 0x00000000));
+
+    /* Recording a fault latches SFSR.AUVIOL|SFARVALID, SFAR, and pending. */
+    cpu.sfsr = 0; cpu.sfar = 0; cpu.secure_fault_pending = false;
+    arm_record_secure_fault(&cpu, 0x00001234);
+    assert_true("SFSR.AUVIOL set", (cpu.sfsr & ARM_SFSR_AUVIOL) != 0);
+    assert_true("SFSR.SFARVALID set", (cpu.sfsr & ARM_SFSR_SFARVALID) != 0);
+    assert_eq("SFAR holds faulting address", 0x00001234, cpu.sfar);
+    assert_true("SecureFault pending", cpu.secure_fault_pending);
+
+    /* Enforcement is disabled entirely when the SoC has no extension. */
+    cpu.tz_enabled = false;
+    assert_true("no-TZ SoC: all accesses permitted",
+                arm_mem_access_permitted(&cpu, 0x00000000));
+}
+
+/* Step 3a: TT (test target) executes and reports the address attribution. */
+static void test_trustzone_tt(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone TT instruction tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+    /* Region 0 = [0x20000000,0x2000FFFF] Non-secure. */
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    cpu.sau_rbar[0] = 0x20000000;
+    cpu.sau_rlar[0] = (0x2000FFFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+
+    /* TT r0, r1  => hw1=0xE841 (Rn=1), hw2=0xF000 (Rd=0, A=0, T=0). */
+    write_thumb32(&cpu, CODE_BASE, 0xE841, 0xF000);
+
+    /* Point r1 at Non-secure memory: S bit (22) must be clear. */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[1] = 0x20008000;
+    arm_step(&cpu, 1);
+    assert_true("TT on NS addr: S bit clear", !(cpu.reg[0] & (1u << 22)));
+    assert_true("TT on NS addr: SRVALID set", (cpu.reg[0] & (1u << 17)) != 0);
+
+    /* Point r1 at Secure memory: S bit (22) must be set. */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[1] = 0x00001000;
+    arm_step(&cpu, 1);
+    assert_true("TT on Secure addr: S bit set", (cpu.reg[0] & (1u << 22)) != 0);
+
+    /* A normal LDRD (same hw1 range) must NOT be caught by the TT decode:
+     * hw2 top nibble is a real register, not 0xF. Sanity: TT gate is inert
+     * for the whole suite (test_ldrd_strd already exercises LDRD). */
+}
+
+/* Step 3b: SG (NS->S) and BXNS (S->NS) state transitions + SP banking. */
+static void test_trustzone_transitions(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SG/BXNS transition tests ---\n");
+
+    /* --- BXNS: Secure -> Non-secure --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = true;
+        cpu.use_psp = false;
+        cpu.sau_sregions = 8;
+        cpu.reg[ARM_SP] = 0x30010000;   /* active Secure MSP */
+        cpu.msp_ns = 0x20010000;        /* banked Non-secure MSP */
+
+        /* BXNS r0 = 0x4704. Target bit0 == 0 => switch to Non-secure. */
+        write_thumb16(&cpu, CODE_BASE, 0x4704);
+        cpu.reg[ARM_PC] = CODE_BASE;
+        cpu.reg[0] = 0x20008000;        /* NS target, bit0 clear */
+        arm_step(&cpu, 1);
+
+        assert_true("BXNS: now Non-secure", !cpu.secure);
+        assert_eq("BXNS: PC = target", 0x20008000, cpu.reg[ARM_PC]);
+        assert_eq("BXNS: active SP swapped to NS bank", 0x20010000,
+                  cpu.reg[ARM_SP]);
+        assert_eq("BXNS: Secure MSP preserved in bank", 0x30010000, cpu.msp_s);
+    }
+
+    /* --- SG: Non-secure -> Secure, from an NSC region --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = false;             /* start Non-secure */
+        cpu.use_psp = false;
+        cpu.sau_sregions = 8;
+        cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+        /* Mark the code/flash region Non-secure-callable so SG is legal. */
+        cpu.sau_rbar[0] = ARM_FLASH_BASE & ~0x1fu;
+        cpu.sau_rlar[0] = ((ARM_FLASH_BASE + 0x1FFFF) & ~0x1fu)
+                          | ARM_SAU_RLAR_ENABLE | ARM_SAU_RLAR_NSC;
+        cpu.reg[ARM_SP] = 0x20010000;   /* active NS MSP */
+        cpu.msp_s = 0x30010000;         /* banked Secure MSP */
+
+        /* SG = 0xE97FE97F. */
+        write_thumb32(&cpu, CODE_BASE, 0xE97F, 0xE97F);
+        cpu.reg[ARM_PC] = CODE_BASE;
+        cpu.reg[ARM_LR] = 0x00000201;   /* bit0 set; SG must clear it */
+        arm_step(&cpu, 1);
+
+        assert_true("SG: now Secure", cpu.secure);
+        assert_eq("SG: LR bit0 cleared", 0x00000200, cpu.reg[ARM_LR]);
+        assert_eq("SG: PC advanced past 32-bit insn", CODE_BASE + 4,
+                  cpu.reg[ARM_PC]);
+        assert_eq("SG: active SP swapped to Secure bank", 0x30010000,
+                  cpu.reg[ARM_SP]);
+        assert_eq("SG: NS MSP preserved in bank", 0x20010000, cpu.msp_ns);
+
+        /* SG from Non-secure but NOT an NSC region is a NOP (no switch). */
+        arm_cpu_t cpu2;
+        setup_arm(&cpu2);
+        cpu2.tz_enabled = true;
+        cpu2.secure = false;
+        cpu2.sau_sregions = 8;          /* SAU disabled => flash is Secure, not NSC */
+        write_thumb32(&cpu2, CODE_BASE, 0xE97F, 0xE97F);
+        cpu2.reg[ARM_PC] = CODE_BASE;
+        arm_step(&cpu2, 1);
+        assert_eq("SG from non-NSC: no NS->S transition", 0,
+                  (int)cpu2.tz_sg_count);
+        assert_true("SG from non-NSC: SFSR.INVEP recorded",
+                    (cpu2.sfsr & ARM_SFSR_INVEP) != 0);
+    }
+}
+
+/* Step 7: world-transition instrumentation counts SG/BXNS/secure-exception. */
+static void test_trustzone_instrumentation(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone transition-counter tests ---\n");
+
+    /* One BXNS => one counted Non-secure return. */
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+    cpu.reg[ARM_SP] = 0x30010000;
+    cpu.msp_ns = 0x20010000;
+    write_thumb16(&cpu, CODE_BASE, 0x4704);   /* BXNS r0 */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[0] = 0x20008000;
+    arm_step(&cpu, 1);
+    assert_eq("BXNS counted", 1, (int)cpu.tz_bxns_count);
+    assert_eq("no SG counted", 0, (int)cpu.tz_sg_count);
+
+    /* One SG => one counted NS->S entry. */
+    arm_cpu_t cpu2;
+    setup_arm(&cpu2);
+    cpu2.tz_enabled = true;
+    cpu2.secure = false;
+    cpu2.sau_sregions = 8;
+    cpu2.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    cpu2.sau_rbar[0] = ARM_FLASH_BASE & ~0x1fu;
+    cpu2.sau_rlar[0] = ((ARM_FLASH_BASE + 0x1FFFF) & ~0x1fu)
+                       | ARM_SAU_RLAR_ENABLE | ARM_SAU_RLAR_NSC;
+    cpu2.reg[ARM_SP] = 0x20010000;
+    cpu2.msp_s = 0x30010000;
+    write_thumb32(&cpu2, CODE_BASE, 0xE97F, 0xE97F);
+    cpu2.reg[ARM_PC] = CODE_BASE;
+    cpu2.reg[ARM_LR] = 0x00000201;
+    arm_step(&cpu2, 1);
+    assert_eq("SG counted", 1, (int)cpu2.tz_sg_count);
+}
+
+/* Step 4: a Non-secure illegal access faults, the SecureFault is taken into
+ * the Secure handler (via VTOR_S), and exception-return restores Non-secure. */
+static void test_trustzone_secure_exception(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone SecureFault exception tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = false;               /* Non-secure background */
+    cpu.use_psp = false;
+    cpu.sau_sregions = 8;
+    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    /* Mark all of SRAM Non-secure; flash stays Secure. */
+    cpu.sau_rbar[0] = 0x20000000;
+    cpu.sau_rlar[0] = (0x20007FFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+
+    /* Secure vector table at flash base; SecureFault (exc 7) handler. */
+    cpu.vtor_s = ARM_FLASH_BASE;
+    write_flash32(&cpu, ARM_FLASH_BASE + 7 * 4, (CODE_BASE + 0x40) | 1);
+    write_thumb16(&cpu, CODE_BASE + 0x40, 0x4770);   /* BX LR at handler */
+
+    /* Non-secure code: LDR r0, [r1] where r1 points at Secure memory. */
+    write_thumb16(&cpu, CODE_BASE, 0x6808);          /* LDR r0, [r1, #0] */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[1] = 0x00001000;          /* Secure address */
+    cpu.reg[ARM_SP] = 0x20007F00;     /* NS stack (in SRAM) */
+    cpu.msp_s = 0x20007000;           /* Secure stack */
+
+    arm_step(&cpu, 1);   /* executes LDR, records + takes SecureFault */
+    assert_true("SecureFault taken: now Secure", cpu.secure);
+    assert_eq("SecureFault: PC = secure handler", CODE_BASE + 0x40,
+              cpu.reg[ARM_PC]);
+    assert_true("SecureFault: SFSR.AUVIOL set", (cpu.sfsr & ARM_SFSR_AUVIOL) != 0);
+    assert_eq("SecureFault: SFAR = faulting address", 0x00001000, cpu.sfar);
+
+    arm_step(&cpu, 1);   /* BX LR — exception return */
+    assert_true("SecureFault return: back to Non-secure", !cpu.secure);
+    assert_eq("SecureFault return: PC = instr after LDR", CODE_BASE + 2,
+              cpu.reg[ARM_PC]);
+}
+
+/* Step 5: NVIC target-security (NVIC_ITNS) decides an IRQ's security state. */
+static void test_trustzone_nvic_itns(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone NVIC target-security tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    arm_nvic_t nvic;
+    arm_nvic_init(&nvic, &cpu);
+    cpu.tz_enabled = true;
+    cpu.secure = true;
+    cpu.sau_sregions = 8;
+
+    /* Default: IRQ targets Secure. */
+    assert_true("default IRQ -> Secure", arm_nvic_targets_secure(&nvic, 16 + 5));
+
+    /* Program IRQ 5 as Non-secure via memory-mapped NVIC_ITNS[0]. */
+    arm_write32(&cpu, 0xE000E380, (1u << 5));
+    assert_eq("ITNS[0] read-back", (1u << 5), arm_read32(&cpu, 0xE000E380));
+    assert_true("IRQ5 now -> Non-secure", !arm_nvic_targets_secure(&nvic, 16 + 5));
+    assert_true("IRQ6 still -> Secure", arm_nvic_targets_secure(&nvic, 16 + 6));
+
+    /* ITNS is Secure-only: Non-secure read RAZ, write WI. */
+    cpu.secure = false;
+    assert_eq("ITNS RAZ from Non-secure", 0, arm_read32(&cpu, 0xE000E380));
+    arm_write32(&cpu, 0xE000E380, 0xFFFFFFFF);   /* WI */
+    cpu.secure = true;
+    assert_eq("ITNS unchanged after NS write (WI)", (1u << 5),
+              arm_read32(&cpu, 0xE000E380));
+}
+
+/* Step 8: BLXNS (Secure->NS call) and FNC_RETURN (NS->Secure return), the
+ * friendly veneer round-trip, plus the tampered-signature violation. */
+static void test_trustzone_blxns(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone BLXNS/FNC_RETURN tests ---\n");
+
+    /* --- Successful round-trip: BLXNS out, BX FNC_RETURN back --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = true;
+        cpu.use_psp = false;
+        cpu.sau_sregions = 8;
+        cpu.reg[ARM_SP] = 0x20007F00;    /* Secure stack (SRAM) */
+        cpu.msp_ns = 0x20006F00;         /* Non-secure stack */
+
+        /* BLXNS r0 = 0x4784; the NS callee is a lone BX LR. */
+        write_thumb16(&cpu, CODE_BASE, 0x4784);
+        write_thumb16(&cpu, CODE_BASE + 0x40, 0x4770);   /* BX LR */
+        cpu.reg[0] = (CODE_BASE + 0x40) | 1;
+        cpu.reg[ARM_PC] = CODE_BASE;
+
+        arm_step(&cpu, 1);   /* BLXNS */
+        assert_true("BLXNS: now Non-secure", !cpu.secure);
+        assert_eq("BLXNS: LR = FNC_RETURN", 0xFEFFFFFFu, cpu.reg[ARM_LR]);
+        assert_eq("BLXNS: PC = NS callee", CODE_BASE + 0x40, cpu.reg[ARM_PC]);
+        assert_eq("BLXNS: S->NS counted", 1, (int)cpu.tz_bxns_count);
+
+        arm_step(&cpu, 1);   /* BX LR (= FNC_RETURN) */
+        assert_true("FNC_RETURN: back to Secure", cpu.secure);
+        assert_eq("FNC_RETURN: PC = secure return", CODE_BASE + 2,
+                  cpu.reg[ARM_PC]);
+        assert_eq("FNC_RETURN: secure MSP restored", 0x20007F00,
+                  cpu.reg[ARM_SP]);
+        assert_true("FNC_RETURN: no integrity fault", !cpu.secure_fault_pending);
+    }
+
+    /* --- Violation: a Non-secure callee that corrupts the saved integrity
+     * signature must raise a SecureFault (INVIS) on return. --- */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        cpu.tz_enabled = true;
+        cpu.secure = true;
+        cpu.sau_sregions = 8;
+        cpu.reg[ARM_SP] = 0x20007F00;
+        cpu.msp_ns = 0x20006F00;
+        write_thumb16(&cpu, CODE_BASE, 0x4784);          /* BLXNS r0 */
+        write_thumb16(&cpu, CODE_BASE + 0x40, 0x4770);   /* BX LR */
+        cpu.reg[0] = (CODE_BASE + 0x40) | 1;
+        cpu.reg[ARM_PC] = CODE_BASE;
+        arm_step(&cpu, 1);   /* BLXNS pushes frame at 0x20007EF8 */
+
+        /* Tamper with the integrity signature on the secure stack. */
+        arm_write32(&cpu, 0x20007F00 - 8 + 4, 0xDEADBEEF);
+        arm_step(&cpu, 1);   /* BX LR -> FNC_RETURN (fault detected + taken) */
+        /* SFSR.INVIS is the durable evidence; the pending flag is consumed the
+         * same step when the SecureFault is taken into the handler. */
+        assert_true("tampered signature: SFSR.INVIS recorded",
+                    (cpu.sfsr & ARM_SFSR_INVIS) != 0);
+        assert_true("tampered signature: returned to Secure to fault",
+                    cpu.secure);
+    }
+}
+
+/* ===================================================================
+ * IO region lookup: page-hash fast path vs the linear-scan specification
+ * =================================================================== */
+extern int arm_io_lookup_check(arm_cpu_t *cpu, uint32_t addr);
+
+static int io_dummy_read(void *u, uint32_t a) { (void)u; (void)a; return 0; }
+static void io_dummy_write(void *u, uint32_t a, uint32_t v) { (void)u; (void)a; (void)v; }
+
+static void test_io_lookup(void) {
+    if (verbose) printf("IO region lookup (page hash vs linear scan):\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+
+    /* Synthetic set reproducing every registration pattern in the tree:
+     * the NVIC/SysTick containment (the one load-bearing overlap), plain
+     * page regions, adjacent pages, a multi-page region, a sub-page window
+     * in the middle of an otherwise-unmapped page, a same-size overlap
+     * (first registered must win), and a far-away page (FICR-like). */
+    static const struct { uint32_t base, size; } regs[] = {
+        { 0xE000E000, 0x1000 },   /* NVIC-like, registered first          */
+        { 0xE000E010, 0x0010 },   /* SysTick-like, contained              */
+        { 0x40000000, 0x1000 },
+        { 0x40001000, 0x1000 },   /* adjacent page                        */
+        { 0x4001F000, 0x2000 },   /* spans two pages                      */
+        { 0x50000800, 0x0100 },   /* sub-page window mid-page             */
+        { 0x50000800, 0x0100 },   /* identical twin: tie -> first wins    */
+        { 0x10000000, 0x1000 },   /* FICR-like, far page                  */
+    };
+    for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++)
+        arm_register_io(&cpu, regs[i].base, regs[i].size,
+                        io_dummy_read, io_dummy_write, NULL);
+
+    assert_true("io: page map active (not fallback)", !cpu.io_page_map_fallback);
+
+    /* Region edges: base-1, base, base+size-1, base+size. */
+    int edge_ok = 1;
+    for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
+        uint32_t probes[4] = { regs[i].base - 1, regs[i].base,
+                               regs[i].base + regs[i].size - 1,
+                               regs[i].base + regs[i].size };
+        for (int k = 0; k < 4; k++)
+            if (!arm_io_lookup_check(&cpu, probes[k])) {
+                printf("  FAIL: io edge 0x%08x disagrees\n", probes[k]);
+                edge_ok = 0;
+            }
+    }
+    assert_true("io: all region edges agree", edge_ok);
+
+    /* The overlap page, exhaustively — every byte of 0xE000Exxx. */
+    int ov_ok = 1;
+    for (uint32_t a = 0xE000E000u; a < 0xE000F000u; a++)
+        if (!arm_io_lookup_check(&cpu, a)) { ov_ok = 0; break; }
+    assert_true("io: NVIC/SysTick page exhaustive", ov_ok);
+
+    /* Deterministic fuzz over the peripheral span. */
+    uint32_t rng = 0x12345678u;
+    int fuzz_ok = 1;
+    for (int n = 0; n < 200000; n++) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        uint32_t a = 0x10000000u + (rng % 0xD0100000u);
+        if (!arm_io_lookup_check(&cpu, a)) {
+            printf("  FAIL: io fuzz 0x%08x disagrees\n", a);
+            fuzz_ok = 0;
+            break;
+        }
+    }
+    assert_true("io: 200k random addresses agree", fuzz_ok);
+
+    /* Overflow a chain (5 regions on one page) -> must fall back, and the
+     * fallback must still answer correctly (trivially: it IS the scan). */
+    for (int i = 0; i < 5; i++)
+        arm_register_io(&cpu, 0x60000000u + (uint32_t)i * 4, 8,
+                        io_dummy_read, io_dummy_write, NULL);
+    assert_true("io: chain overflow sets fallback", cpu.io_page_map_fallback);
+    assert_true("io: fallback still agrees",
+                arm_io_lookup_check(&cpu, 0x60000004u) &&
+                arm_io_lookup_check(&cpu, 0xE000E010u));
+
+    arm_cpu_destroy(&cpu);
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -1838,6 +2362,16 @@ int run_arm_correctness_tests(int v) {
     test_m4_dsp_halfword_multiply();
     test_m4_vfp();
     test_anti_replay_ops();
+    test_trustzone_sau();
+    test_trustzone_sau_mmio();
+    test_trustzone_enforcement();
+    test_trustzone_tt();
+    test_trustzone_transitions();
+    test_trustzone_secure_exception();
+    test_trustzone_nvic_itns();
+    test_trustzone_instrumentation();
+    test_trustzone_blxns();
+    test_io_lookup();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;

@@ -1,0 +1,22 @@
+{
+    "version": 2,
+    "title": "Gilbert-Elliott burst-loss radio-medium plugin demo (Sky, 2-node UDP)",
+    "timeout_ms": 60000,
+    "seed": 42,
+    "plugins": [
+        "build/plugins/gilbert_elliott_medium.so"
+    ],
+    "medium": {
+        "type": "gilbert-elliott",
+        "tx_range": 55.0,
+        "interference_range": 110.0
+    },
+    "mote_types": [
+        { "name": "sky-server", "kind": "emulated-elf", "cpu": "msp430", "soc": "msp430f1611", "board": "sky", "firmware": "firmware/sky/udp-server.sky" },
+        { "name": "sky-client", "kind": "emulated-elf", "cpu": "msp430", "soc": "msp430f1611", "board": "sky", "firmware": "firmware/sky/udp-client.sky" }
+    ],
+    "nodes": [
+        { "type": "sky-server", "id": 1, "x":  0.0, "y": 0.0 },
+        { "type": "sky-client", "id": 2, "x": 30.0, "y": 0.0 }
+    ]
+}

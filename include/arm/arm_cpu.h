@@ -43,6 +43,7 @@
 #define EXC_MEMMANAGE   4
 #define EXC_BUSFAULT    5
 #define EXC_USAGEFAULT  6
+#define EXC_SECUREFAULT 7   /* ARMv8-M security extension */
 #define EXC_SVCALL     11
 #define EXC_PENDSV     14
 #define EXC_SYSTICK    15
@@ -77,6 +78,17 @@ typedef struct {
     arm_io_write_fn write;
     void           *user_data;
 } arm_io_region_t;
+
+/* One hash slot of the page-indexed IO lookup.  n == 0 marks an empty slot
+ * (the whole table is memset to zero on rebuild), so a page whose peripheral
+ * really registered with n entries always has n >= 1. */
+#define ARM_IO_PAGE_SLOTS 128   /* power of two, > 2x the pages any SoC maps */
+#define ARM_IO_PAGE_CHAIN 4
+typedef struct {
+    uint32_t page;                       /* addr >> 12 */
+    uint8_t  n;                          /* entries used; 0 = empty slot */
+    uint8_t  idx[ARM_IO_PAGE_CHAIN];     /* indices into io_regions[] */
+} arm_io_page_t;
 
 /* --- Event callback ---
  * Unified per-CPU event type lives in include/common/cpu_event.h.
@@ -129,6 +141,17 @@ typedef struct arm_cpu {
     /* IO dispatch */
     arm_io_region_t io_regions[ARM_MAX_IO_REGIONS];
     int             num_io_regions;
+    /* Page-indexed lookup over io_regions (src/arm/arm_cpu.c find_io_region):
+     * open-addressed hash keyed on addr>>12, rebuilt from scratch on every
+     * arm_register_io call (cold path — regions are append-only and all
+     * registration happens at platform init).  A slot's idx[] chain is sorted
+     * by (size, registration index) ascending so the first containing entry
+     * reproduces the linear scan's smallest-region-wins rule exactly.
+     * io_page_map_fallback = the table could not represent the region set
+     * (chain overflow / table pressure) -> keep the linear scan: never wrong,
+     * only slower. */
+    arm_io_page_t   io_page_map[ARM_IO_PAGE_SLOTS];
+    bool            io_page_map_fallback;
 
     /* Event queue */
     arm_event_t *event_queue;
@@ -185,6 +208,56 @@ typedef struct arm_cpu {
     /* Vector table offset register */
     uint32_t  vtor;
 
+    /* --- ARMv8-M Security Extension (TrustZone-M) — see
+     * docs/design/trustzone-m-plan.md.
+     *
+     * `tz_enabled` is a per-SoC capability (config->has_trustzone). When it
+     * is false — every non-M33 target, and M33 SoCs without TZ configured —
+     * the whole block is inert: `secure` stays false and nothing below is
+     * read, so behaviour is byte-identical to the non-secure-only model.
+     *
+     * The ACTIVE stack pointers remain cpu->msp / cpu->psp (handler/thread
+     * banking unchanged). The fields here hold the *other* security state's
+     * banked SP / stack-limit / CONTROL, swapped on a secure<->non-secure
+     * transition (Phase 3). Stored but not yet wired in Phase 0. */
+    bool      tz_enabled;            /* SoC implements the security extension */
+    bool      secure;                /* current security state (Secure = true) */
+    uint32_t  msp_s,   msp_ns;       /* banked Main Stack Pointer */
+    uint32_t  psp_s,   psp_ns;       /* banked Process Stack Pointer */
+    uint32_t  msplim_s, msplim_ns;   /* banked MSP limit (MSPLIM) */
+    uint32_t  psplim_s, psplim_ns;   /* banked PSP limit (PSPLIM) */
+    uint32_t  control_s, control_ns; /* banked CONTROL (nPRIV/SPSEL/FPCA/SFPA) */
+    uint32_t  vtor_s;                /* secure vector table offset (VTOR_S) */
+
+    /* Security Attribution Unit (SAU) — Phase 1. Programmable regions that,
+     * together with the SoC IDAU (the Nordic SPU on nRF54L15), decide the
+     * security attribute of each address. Registers at 0xE000EDD0.. See
+     * arm_trustzone.c / arm_security_attr(). */
+    uint32_t  sau_ctrl;              /* SAU_CTRL: bit0 ENABLE, bit1 ALLNS */
+    uint32_t  sau_rnr;               /* SAU_RNR: region number register */
+    uint32_t  sau_rbar[8];           /* SAU_RBAR[]: region base (bits 31:5) */
+    uint32_t  sau_rlar[8];           /* SAU_RLAR[]: limit(31:5)|NSC(1)|ENABLE(0) */
+    uint8_t   sau_sregions;          /* number of implemented SAU regions (0/4/8) */
+
+    /* SecureFault state (Phase 1/Step 2). Set when a Non-secure access is
+     * refused by the attribution unit; the exception is *taken* by the
+     * secure exception model (Step 4). */
+    uint32_t  sfsr;                  /* SecureFault Status Register */
+    uint32_t  sfar;                  /* SecureFault Address Register */
+    bool      secure_fault_pending;  /* a SecureFault has been recorded */
+
+    /* Secure exception model (Step 4). When a secure exception is taken from
+     * Non-secure background, the background security state is stashed here and
+     * restored on exception return. (Single-level; nesting is a refinement.) */
+    bool      exc_crossed_domain;    /* current exception switched security */
+    bool      exc_bg_secure;         /* background security state to restore */
+
+    /* World-transition instrumentation (Step 7). Counted per node; the thing
+     * silicon cannot expose without intrusive probes. */
+    uint64_t  tz_sg_count;           /* SG entries (NS->S) */
+    uint64_t  tz_bxns_count;         /* BXNS returns to Non-secure */
+    uint64_t  tz_secexc_count;       /* secure exceptions taken from NS */
+
     /* ROM utility traps */
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
     uint32_t  rom_util_memset;    /* Address of rom_util_memset entry */
@@ -236,6 +309,27 @@ typedef struct arm_cpu {
     } sp_audit[ARM_SP_AUDIT_DEPTH];
     int       sp_audit_top;
     int       sp_audit_overflow;
+
+    /* JIT block cache (src/arm/arm_jit.c).  Declared unconditionally — not
+     * under #ifdef HAVE_LIGHTNING — so the struct layout is identical whether
+     * or not Lightning was detected, and a stale object file can't disagree
+     * with a fresh one about field offsets.  All NULL/0 when the JIT is off.
+     *
+     * Indexed by (pc - flash_base) >> 1, i.e. one slot per possible Thumb
+     * instruction address in flash. */
+    void    **jit_cache;         /* arm_compiled_block_t* per slot        */
+    int32_t  *jit_exec_count;    /* hot-block detection; <0 = don't retry  */
+    uint32_t  jit_cache_size;    /* 0 = JIT disabled for this CPU          */
+    int       jit_threshold;     /* executions before compiling (env-set)  */
+    int       jit_verify;        /* CSIM_ARM_JIT_VERIFY=1 lockstep check   */
+    int32_t   jit_iter_budget;   /* loop blocks: iterations still allowed  */
+    /* Side-exit report: -1 = the block ran to a normal exit; >= 0 = it
+     * stopped at that instruction index (a guarded memory access missed),
+     * having executed only the ones before it.  See arm_jit.h. */
+    int32_t   jit_partial;
+    uint64_t  jit_blocks_run;    /* diagnostics: compiled-block entries    */
+    uint64_t  jit_side_exits;    /* diagnostics: guard misses              */
+    uint64_t  jit_insns_run;     /* diagnostics: instructions via the JIT  */
 } arm_cpu_t;
 
 /* --- Public API --- */
@@ -265,6 +359,15 @@ static inline void arm_set_wfi_skip_guard(arm_cpu_t *cpu,
                                            void *user) {
     cpu->wfi_skip_guard = guard;
     cpu->wfi_skip_user  = user;
+}
+
+/* --- TrustZone-M state accessors (see docs/design/trustzone-m-plan.md) ---
+ * On non-TZ SoCs tz_enabled is false and the core is always non-secure. */
+static inline bool arm_cpu_has_trustzone(const arm_cpu_t *cpu) {
+    return cpu->tz_enabled;
+}
+static inline bool arm_cpu_is_secure(const arm_cpu_t *cpu) {
+    return cpu->tz_enabled && cpu->secure;
 }
 
 /* Memory access (for external use / tests / peripherals) */

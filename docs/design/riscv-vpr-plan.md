@@ -68,20 +68,20 @@ just need to be reachable from the RV32E core's bus):
 - **GPIO** `P2_S` (gpio2, LED0 = pin 9, FLPR) and `P1_S` (gpio1, LED1 = pin 10,
   M33). DIRSET/OUTSET/OUTCLR — already modeled.
 
-## RV32E instruction surface
+## RV32EMC instruction surface
 
 **Confirmed** from `arch/cpu/nrf-vpr/Makefile.nrf-vpr`:
-`VPR_MARCH = rv32e_zicsr_zifencei`, `VPR_MABI = ilp32e`.
+`VPR_MARCH = rv32emc_zicsr`, `VPR_MABI = ilp32e`.
 
 - **Base:** RV32E — RV32I with 16 GP registers (x0–x15), `ilp32e` ABI.
-- **Extensions:** **Zicsr** (CSR instructions) + **Zifencei** (`fence.i`) only.
-  **No M** (no hardware mul/div) and **no C** (no compressed) — every
-  instruction is a 4-byte base RV32I/Zicsr/Zifencei encoding. This is about the
-  smallest realistic decoder: ~40 base opcodes + a few CSR ops + `fence.i`.
-- **Soft mul/div:** Contiki's `clock_time()` division etc. compile to **libgcc
-  soft-routines** (`__mulsi3`, `__udivdi3`, …) — the `.ld` pulls in `-lgcc`.
-  These are *base* RV32I instructions in the blob, so the interpreter needs no
-  M-extension to run them.
+- **Extensions:** **M** (hardware mul/div/rem) + **C** (compressed, 2-byte
+  encodings) + **Zicsr** (CSR instructions); csim additionally implements
+  **Zifencei** (`fence.i`). No F/D. Instructions are therefore a mix of 4-byte
+  base and 2-byte compressed encodings — the decoder must handle both.
+- **Hardware mul/div:** with **M** in `VPR_MARCH`, Contiki's `clock_time()`
+  division etc. compile to native `mul`/`div`/`rem` rather than the libgcc
+  soft-routines (`__mulsi3`, `__udivdi3`, …), so the interpreter must implement
+  the M extension. Wider 64-bit helpers may still come from `-lgcc`.
 - **CSR/trap:** `csrw mtvec`, `csrr mcause`, `csrr mepc`. On any exception:
   vector to `mtvec`, set `mcause`/`mepc`. `startup-stubs.c` reroutes `mtvec` to
   a handler that stamps `0x2003F000`, so a faithful trap path makes RV32E
@@ -170,8 +170,8 @@ predates the newest `hello-vpr.bin`.)
 
 ## Open questions / risks
 
-1. ~~**Exact `-march`**~~ — **resolved:** `rv32e_zicsr_zifencei`, `ilp32e`
-   (no M, no C). See *RV32E instruction surface*.
+1. ~~**Exact `-march`**~~ — **resolved:** `rv32emc_zicsr`, `ilp32e` (M + C, to
+   match contiki-main's FLPR build). See *RV32EMC instruction surface*.
 2. **SPU/SECATTR depth** — model only enough to gate the VPR launch; not a full
    TrustZone/SPU implementation.
 3. **FLPR clock rate** — approximate; timing correctness comes from GRTC.

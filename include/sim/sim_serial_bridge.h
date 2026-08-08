@@ -68,6 +68,12 @@ typedef struct sim_serial_bridge {
     int     tx_head, tx_count;
     uint8_t rx_buf[SIM_SERIAL_BRIDGE_RX_BUF];
     int     rx_head, rx_count;
+
+    /* Host-link latency gate (see sim_serial_bridge.c "HOST-LINK LATENCY").
+     * Wall-clock ms after which the currently-buffered TX burst may be
+     * written to the socket; 0 = nothing pending.  REMOVE together with
+     * the gate once the serial link models real flow control. */
+    double  tx_release_ms;
 } sim_serial_bridge_t;
 
 /* Zero/fd-init only; no sockets opened.  Safe to call before start. */

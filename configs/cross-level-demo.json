@@ -1,0 +1,9 @@
+{
+  "title": "Cross-level demo: MSP430 + ARM + JS in one simulation",
+  "timeout_ms": 30000,
+  "nodes": [
+    { "firmware": "firmware/sky/udp-server.sky",        "id": 1, "x":   0.0, "y":   0.0 },
+    { "firmware": "firmware/cc2538dk/udp-client.cc2538dk", "id": 2, "x":  20.0, "y":   0.0 },
+    { "firmware": "firmware/js/broadcast.js",            "id": 3, "x": -20.0, "y":   0.0 }
+  ]
+}

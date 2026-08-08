@@ -35,3 +35,10 @@ cooja-bench-results/
 
 # OS files
 .DS_Store
+
+# Obsidian vault settings (per-developer editor state)
+.obsidian/
+
+# Stale Zephyr bring-up spike output — the shipped Zephyr images live in
+# firmware/nrf52840-dk/zephyr-*.nrf52840-dk
+firmware/zephyr/

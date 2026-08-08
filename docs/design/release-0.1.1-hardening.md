@@ -1,21 +1,32 @@
 # Release Hardening Plan — 0.1.1 Stabilization
 
-Status: in progress (2026-07-07). Companion to [`refactor-plan.md`](refactor-plan.md).
-Source: full subsystem audit (kernel / ARM / MSP430+common / motes-native-riscv /
-services-ui-runner), plus the radio-CRC fix already landed as `6bc0402`.
+Status: **complete (2026-07-25)** — shipped in the `v0.1.0` release, not as a
+separate 0.1.1 (see the amended §0 note below). Companion to
+[`refactor-plan.md`](refactor-plan.md). Source: full subsystem audit (kernel /
+ARM / MSP430+common / motes-native-riscv / services-ui-runner), plus the
+radio-CRC fix already landed as `6bc0402`.
 
-**Progress:** Tranche A (A1–A6), Tranche B (B1–B7), Tranche C, and the §5 config
-triage (T4) are **done** and gated green on branch `fix/release-0.1.1-wave1`
-(6 commits). T3 (nRF54L15/nRF52840 multinode radio RX) is **root-caused**, left
-as a documented Known Issue (deep radio-timing work, not a release blocker).
-Remaining: the §4 stand-alone unit tests (ws-frame, elf-malformed, FLPR-WFI,
-NVIC-dual-pending, periodic-GPTimer — the fixes are integration-gated and DADD
-has its regression test), and §6 tag/PR. CHANGELOG `[0.1.1]` section written.
+**Progress:** Tranche A (A1–A6), Tranche B (B1–B7), Tranche C, and the §5
+config triage (T4) are **done** and merged to `main`. **T3 is fixed**, not
+deferred: the nRF54L15 TX-completion event is now scheduled in cycles
+(`71a85d7`), and the follow-on multi-hop failure on *both* nRF radios — an
+aborted RX leaving `psdu_being_received` set — is fixed in `8b7d84c`. Two-node
+and 3/4-node chains route end-to-end on nRF52840 and nRF54L15, each with a
+regression config.
+
+**Still open:** the §4 stand-alone unit tests (ws-frame, elf-malformed,
+FLPR-WFI, NVIC-dual-pending, periodic-GPTimer). Those fixes are covered only
+by integration gates today; DADD is the one with its own regression test. This
+is the plan's stated bar that the release does **not** yet meet.
 
 ## 0. Framing and key decisions
 
-- **`v0.1.0` is already tagged (2026-06-22).** Do **not** move or re-cut it. This
-  work ships as **`v0.1.1`**, a bugfix/stabilization release. No CLI, config, or
+- ~~**`v0.1.0` is already tagged (2026-06-22).** Do **not** move or re-cut it.
+  This work ships as **`v0.1.1`**.~~ **Superseded (2026-07-25):** the earlier
+  `v0.1.0` tag was never published, so rather than ship a 0.1.1 on top of an
+  unreleased 0.1.0, the tag is re-cut on the current `main` and this audit
+  ships *inside* `v0.1.0` as the first public release. The document keeps its
+  0.1.1 filename and item numbering for traceability. No CLI, config, or
   plugin-ABI changes are in scope — every item below is a correctness, memory-
   safety, robustness, or internal-refactor fix. (§0.x SemVer note in the
   CHANGELOG permits behaviour adjustments in a minor bump if we later decide to
