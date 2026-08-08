@@ -28,6 +28,12 @@ typedef struct arm_config {
      * has the Open Bootloader at 0x0..0xfff and the application
      * vector table at 0x1000). */
     uint32_t vtor_default;
+
+    /* ARMv8-M Security Extension (TrustZone-M) present on this SoC.
+     * Defaults to false via designated-initializer omission; only the
+     * nRF54L15 (Cortex-M33 + Nordic SPU) sets it once the extension is
+     * implemented. See docs/design/trustzone-m-plan.md. */
+    bool has_trustzone;
 } arm_config_t;
 
 /* Pre-defined configurations */

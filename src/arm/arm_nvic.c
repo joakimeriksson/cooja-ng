@@ -2,6 +2,7 @@
  * ARM Cortex-M3 Nested Vectored Interrupt Controller
  */
 #include "arm_nvic.h"
+#include "arm_trustzone.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -37,6 +38,11 @@ static int nvic_read(void *user_data, uint32_t addr) {
     if (offset >= NVIC_IABR_BASE && offset < NVIC_IABR_BASE + 32) {
         int idx = (offset - NVIC_IABR_BASE) / 4;
         return (int)nvic->iabr[idx];
+    }
+    /* NVIC_ITNS (ARMv8-M) — Secure-only; RAZ from Non-secure. */
+    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 32) {
+        if (!arm_cpu_is_secure(nvic->cpu)) return 0;
+        return (int)nvic->itns[(offset - NVIC_ITNS_BASE) / 4];
     }
     /* NVIC_IPR — assemble up to 4 bytes, clamped at the array end so an
      * unaligned word read near the top of the range can't read past ipr[]. */
@@ -84,6 +90,26 @@ static int nvic_read(void *user_data, uint32_t addr) {
             return nvic->shpr[8] | (nvic->shpr[9] << 8) |
                    (nvic->shpr[10] << 16) | (nvic->shpr[11] << 24);
         case SCB_SHCSR: return (int)nvic->shcsr;
+
+        /* SAU — Secure-only; reads as zero (RAZ) from Non-secure. */
+        case SAU_CTRL:
+        case SAU_TYPE:
+        case SAU_RNR:
+        case SAU_RBAR:
+        case SAU_RLAR: {
+            arm_cpu_t *cpu = nvic->cpu;
+            if (!arm_cpu_is_secure(cpu))
+                return 0;
+            uint32_t r = cpu->sau_rnr;
+            switch (offset) {
+                case SAU_CTRL: return (int)cpu->sau_ctrl;
+                case SAU_TYPE: return (int)cpu->sau_sregions;   /* SREGION count */
+                case SAU_RNR:  return (int)cpu->sau_rnr;
+                case SAU_RBAR: return (r < cpu->sau_sregions) ? (int)cpu->sau_rbar[r] : 0;
+                case SAU_RLAR: return (r < cpu->sau_sregions) ? (int)cpu->sau_rlar[r] : 0;
+            }
+            return 0;
+        }
     }
 
     return 0;
@@ -107,6 +133,12 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         int idx = (offset - NVIC_ICER_BASE) / 4;
         nvic->iser[idx] &= ~value;
         nvic->scan_valid = false;
+        return;
+    }
+    /* NVIC_ITNS (ARMv8-M target-security) — Secure-only; WI from Non-secure. */
+    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 32) {
+        if (arm_cpu_is_secure(nvic->cpu))
+            nvic->itns[(offset - NVIC_ITNS_BASE) / 4] = value;
         return;
     }
     /* NVIC_ISPR (set-pending) */
@@ -224,7 +256,49 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         case SCB_SHCSR:
             nvic->shcsr = value;
             break;
+
+        /* SAU — Secure-only; writes are ignored (WI) from Non-secure. */
+        case SAU_CTRL:
+        case SAU_TYPE:
+        case SAU_RNR:
+        case SAU_RBAR:
+        case SAU_RLAR: {
+            arm_cpu_t *cpu = nvic->cpu;
+            if (!arm_cpu_is_secure(cpu))
+                break;
+            uint32_t r = cpu->sau_rnr;
+            switch (offset) {
+                case SAU_CTRL:
+                    cpu->sau_ctrl = value & (ARM_SAU_CTRL_ENABLE | ARM_SAU_CTRL_ALLNS);
+                    break;
+                case SAU_TYPE:
+                    break;  /* read-only */
+                case SAU_RNR:
+                    /* Region number; out-of-range values are held but select no region. */
+                    cpu->sau_rnr = value & 0xFFu;
+                    break;
+                case SAU_RBAR:
+                    if (r < cpu->sau_sregions)
+                        cpu->sau_rbar[r] = value & 0xFFFFFFE0u;  /* base[31:5] */
+                    break;
+                case SAU_RLAR:
+                    if (r < cpu->sau_sregions)
+                        cpu->sau_rlar[r] = value & 0xFFFFFFE3u;  /* limit[31:5]|NSC|ENABLE */
+                    break;
+            }
+            break;
+        }
     }
+}
+
+bool arm_nvic_targets_secure(const arm_nvic_t *nvic, int exception_num) {
+    if (exception_num < 16)
+        return true;   /* system exceptions: Secure (refined later) */
+    int irq = exception_num - 16;
+    if (irq >= 256)
+        return true;
+    /* ITNS bit set => Non-secure target. */
+    return !(nvic->itns[irq >> 5] & (1u << (irq & 31)));
 }
 
 void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu) {

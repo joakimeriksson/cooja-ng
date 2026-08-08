@@ -71,6 +71,7 @@ const arm_config_t nrf54l15_config = {
     .default_cpu_freq = 128000000,    /* 128 MHz */
     .num_irqs         = 64,           /* upper bound; tighten once PS is in hand */
     .vtor_default     = 0,            /* vector table at flash base */
+    .has_trustzone    = true,         /* ARMv8-M security extension (M33 + SPU) */
 };
 
 const arm_config_t nrf52840_config = {

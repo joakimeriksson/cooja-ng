@@ -5,6 +5,49 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/); this project
 uses [Semantic Versioning](https://semver.org/) once it reaches 1.0 — until
 then, 0.x minor releases may adjust the CLI, config, and plugin ABI.
 
+## [Unreleased]
+
+### Added — ARMv8-M TrustZone-M (nRF54L15 Cortex-M33)
+- **The M33 runs secure/non-secure partitioned firmware**, not just non-secure.
+  New `src/arm/arm_trustzone.c` implements the security-attribution engine —
+  SAU regions plus SPU-as-IDAU, `arm_security_attr()`, the memory-mapped SAU
+  registers at `0xE000EDD0` (Secure-only; RAZ/WI from Non-secure), and
+  `arm_tz_blocks()` hot-path access enforcement feeding `SecureFault`/SFSR.
+  Enabled per MCU by `has_trustzone` — nRF54L15 only, so every other platform
+  is untouched.
+- **Security state and transitions** in `arm_cpu.c`: banked SP/CONTROL, the
+  transition instruction surface (`SG`, `BXNS`, `BLXNS` + `FNC_RETURN`,
+  `TT`/`TTT`/`TTA`/`TTAT`), and secure exception entry/return with the
+  integrity signature (a tampered signature is recorded as `SFSR.INVIS`). `SG`
+  from outside an NSC region raises SecureFault (`INVEP`).
+- **NVIC target-security banking** (`NVIC_ITNS`) in `arm_nvic.c`, wired into
+  exception entry so the secure world can route individual IRQs to Non-secure.
+- **Per-node world-transition instrumentation** — SG, BXNS and secure-exception
+  counters per mote, which is the point of the work: TEE transition cost becomes
+  measurable network-wide rather than per-image.
+- **`tz-boot` harness** (`test_runner tz-boot <secure.elf> <normal.elf>`): loads
+  a split image into one nRF54L15 node, runs the handoff, and reports the
+  counters. csim boots the **real** Contiki-NG `trustzone/` split image — the
+  secure world initializes TrustZone, configures SAU/IDAU and the non-secure
+  environment, validates the NS image permissions and reset vector, routes IRQs,
+  and jumps to the non-secure reset handler. Verified on two different split
+  apps (`{secure,normal}-world` → 389 SG + 390 BXNS; `trustzone/rpl-udp` → 16 SG
+  + 17 BXNS), both ending in Non-secure state with 0 secure exceptions, so the
+  pass is app-independent. The split images live in the `contiki-ng-nrf54l15`
+  checkout, not this tree, so `tz-boot` is a manual harness and not part of the
+  default gate.
+- **71 new TrustZone tests** in `arm-correctness`, which goes 153 → **224**:
+  SAU/IDAU attribution (14), SAU MMIO (9), access enforcement (9), TT (3),
+  SG/BXNS (11), SecureFault (6), `NVIC_ITNS` (6), transition counters (3),
+  BLXNS/FNC_RETURN (10).
+- No regression on the non-TZ path with `has_trustzone` live on the same SoC the
+  release gates: `correctness` PASS, `radio-medium` 241/241, `cc1200-mock-host`
+  73/73, and `configs/test-2node-nrf54l15-dk.json` PASSED at an identical
+  60013 ms simulated.
+
+Plan, scope boundaries and the deferred (spec-completeness) list:
+[`docs/design/trustzone-m-plan.md`](docs/design/trustzone-m-plan.md).
+
 ## [0.1.0] — 2026-07-25
 
 First public release. A fast, multi-architecture C re-implementation of the

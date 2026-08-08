@@ -16,6 +16,7 @@
 #define NVIC_ICPR_BASE  0x280   /* Interrupt Clear-Pending Registers */
 #define NVIC_IABR_BASE  0x300   /* Interrupt Active Bit Registers */
 #define NVIC_IPR_BASE   0x400   /* Interrupt Priority Registers */
+#define NVIC_ITNS_BASE  0x380   /* Interrupt Target Non-secure (ARMv8-M) */
 
 /* System Control Block offsets */
 #define SCB_ICSR    0xD04  /* Interrupt Control and State Register */
@@ -29,6 +30,14 @@
 #define SCB_SHCSR   0xD24  /* System Handler Control and State Register */
 #define SCB_CPUID   0xD00  /* CPUID Base Register */
 
+/* ARMv8-M Security Attribution Unit (SAU) register offsets within the SCS.
+ * Secure-only (RAZ/WI from Non-secure). See arm_trustzone.c. */
+#define SAU_CTRL    0xDD0  /* SAU Control Register */
+#define SAU_TYPE    0xDD4  /* SAU Type Register (SREGION count, read-only) */
+#define SAU_RNR     0xDD8  /* SAU Region Number Register */
+#define SAU_RBAR    0xDDC  /* SAU Region Base Address Register */
+#define SAU_RLAR    0xDE0  /* SAU Region Limit Address Register */
+
 typedef struct arm_nvic {
     arm_cpu_t *cpu;
 
@@ -40,6 +49,10 @@ typedef struct arm_nvic {
 
     /* Active bits: 1 = IRQ currently being serviced */
     uint32_t  iabr[8];
+
+    /* ARMv8-M target-security: bit set => IRQ targets Non-secure. Reset 0
+     * (all interrupts Secure). Secure-only registers. */
+    uint32_t  itns[8];
 
     /* Priority: 8-bit priority per IRQ (only upper bits used) */
     uint8_t   ipr[NVIC_MAX_IRQ];
@@ -95,5 +108,9 @@ uint32_t arm_nvic_get_vector(arm_nvic_t *nvic, int exception_num);
 
 /* Get priority for an exception number */
 int arm_nvic_get_priority(arm_nvic_t *nvic, int exception_num);
+
+/* ARMv8-M: does `exception_num` target the Secure state? External IRQs use
+ * NVIC_ITNS; SecureFault and (for now) other system exceptions are Secure. */
+bool arm_nvic_targets_secure(const arm_nvic_t *nvic, int exception_num);
 
 #endif /* ARM_NVIC_H */

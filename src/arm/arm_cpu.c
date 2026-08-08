@@ -5,6 +5,7 @@
 #include "arm_decode.h"
 #include "arm_config.h"
 #include "arm_nvic.h"
+#include "arm_trustzone.h"
 #include "arm_jit.h"
 
 /* Defined below, next to the JIT dispatcher; declared here because
@@ -187,8 +188,25 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * These check SRAM first (most common data target), then flash,
  * then fall back to the public functions for IO/ROM/bitband. */
 
+/* TrustZone-M data-access enforcement gate. The common case — no security
+ * extension, or executing Secure — is a single predicted-true branch with no
+ * added cost. When a Non-secure access is refused by the attribution unit it
+ * records a SecureFault and returns true; the caller then suppresses the
+ * access (read yields 0, write is dropped) until the secure exception model
+ * (Step 4) takes the pending fault. Dormant until Non-secure execution exists
+ * (Step 3), so it changes no current behaviour. */
+static inline bool arm_tz_blocks(arm_cpu_t *cpu, uint32_t addr) {
+    if (__builtin_expect(!cpu->tz_enabled || cpu->secure, 1))
+        return false;
+    if (arm_mem_access_permitted(cpu, addr))
+        return false;
+    arm_record_secure_fault(cpu, addr);
+    return true;
+}
+
 static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
+    if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8) |
@@ -204,6 +222,7 @@ static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline uint16_t mem_read16(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~1u;
+    if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
@@ -216,6 +235,7 @@ static inline uint16_t mem_read16(arm_cpu_t *cpu, uint32_t addr) {
 }
 
 static inline uint8_t mem_read8(arm_cpu_t *cpu, uint32_t addr) {
+    if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1))
         return cpu->sram[addr - cpu->sram_base];
     if (addr >= cpu->flash_base && addr < cpu->flash_end)
@@ -225,6 +245,7 @@ static inline uint8_t mem_read8(arm_cpu_t *cpu, uint32_t addr) {
 
 static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
     addr &= ~3u;
+    if (arm_tz_blocks(cpu, addr)) return;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
@@ -238,6 +259,7 @@ static inline void mem_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
 
 static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
     addr &= ~1u;
+    if (arm_tz_blocks(cpu, addr)) return;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
         cpu->sram[off]   = val & 0xFF;
@@ -248,6 +270,7 @@ static inline void mem_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
 }
 
 static inline void mem_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
+    if (arm_tz_blocks(cpu, addr)) return;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         cpu->sram[addr - cpu->sram_base] = val;
         return;
@@ -422,6 +445,7 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->sram_end     = config->sram_base + config->sram_size;
     cpu->rom_size     = config->rom_size;
     cpu->vtor_default = config->vtor_default;
+    cpu->tz_enabled   = config->has_trustzone;  /* ARMv8-M security extension */
 
     cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
 
@@ -587,6 +611,42 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->msp = sp;
     cpu->reg[ARM_PC] = pc & ~1u; /* Clear thumb bit */
     cpu->xpsr = (1u << 24); /* Thumb bit in EPSR must be set */
+
+    /* TrustZone-M reset state. On a part that implements the security
+     * extension the core comes out of reset in Secure state, with the reset
+     * SP and PC taken from the *secure* vector table (which is what `vtor`
+     * already points at here). When tz_enabled is false this is all inert:
+     * `secure` stays false and the banked fields below are never read. */
+    cpu->secure    = cpu->tz_enabled;
+    cpu->msp_s     = cpu->tz_enabled ? sp : 0;
+    cpu->msp_ns    = 0;
+    cpu->psp_s     = 0;
+    cpu->psp_ns    = 0;
+    cpu->msplim_s  = 0;
+    cpu->msplim_ns = 0;
+    cpu->psplim_s  = 0;
+    cpu->psplim_ns = 0;
+    cpu->control_s = 0;
+    cpu->control_ns = 0;
+    cpu->vtor_s    = cpu->tz_enabled ? cpu->vtor : 0;
+
+    /* SAU: the Cortex-M33 implements 8 regions. Zero when there is no
+     * security extension (the registers then RAZ/WI). */
+    cpu->sau_ctrl = 0;
+    cpu->sau_rnr  = 0;
+    cpu->sau_sregions = cpu->tz_enabled ? 8 : 0;
+    for (int i = 0; i < 8; i++) {
+        cpu->sau_rbar[i] = 0;
+        cpu->sau_rlar[i] = 0;
+    }
+    cpu->sfsr = 0;
+    cpu->sfar = 0;
+    cpu->secure_fault_pending = false;
+    cpu->exc_crossed_domain = false;
+    cpu->exc_bg_secure = false;
+    cpu->tz_sg_count = 0;
+    cpu->tz_bxns_count = 0;
+    cpu->tz_secexc_count = 0;
 }
 
 void arm_stop(arm_cpu_t *cpu) {
@@ -702,6 +762,61 @@ static inline bool arm_sp_is_psp(const arm_cpu_t *cpu) {
     return ((cpu->xpsr & 0x1FFu) == 0) && cpu->use_psp;
 }
 
+/* --- TrustZone-M security-state SP banking (Step 3b) ---
+ * On a secure<->non-secure transition the whole {MSP,PSP,CONTROL} set is
+ * banked. csim keeps the active SP in reg[ARM_SP] and the inactive one in
+ * cpu->msp/psp; these helpers translate between that representation and the
+ * per-security-state banks (msp_s/ns, psp_s/ns, control_s/ns). */
+static void arm_tz_save_sp_bank(arm_cpu_t *cpu, bool secure) {
+    uint32_t lmsp, lpsp;
+    if (arm_sp_is_psp(cpu)) { lpsp = cpu->reg[ARM_SP]; lmsp = cpu->msp; }
+    else                    { lmsp = cpu->reg[ARM_SP]; lpsp = cpu->psp; }
+    if (secure) {
+        cpu->msp_s = lmsp; cpu->psp_s = lpsp; cpu->control_s = cpu->use_psp ? 2 : 0;
+    } else {
+        cpu->msp_ns = lmsp; cpu->psp_ns = lpsp; cpu->control_ns = cpu->use_psp ? 2 : 0;
+    }
+}
+
+static void arm_tz_load_sp_bank(arm_cpu_t *cpu, bool secure) {
+    uint32_t lmsp, lpsp, ctrl;
+    if (secure) { lmsp = cpu->msp_s; lpsp = cpu->psp_s; ctrl = cpu->control_s; }
+    else        { lmsp = cpu->msp_ns; lpsp = cpu->psp_ns; ctrl = cpu->control_ns; }
+    cpu->use_psp = (ctrl & 2) != 0;
+    if (arm_sp_is_psp(cpu)) { cpu->reg[ARM_SP] = lpsp; cpu->msp = lmsp; }
+    else                    { cpu->reg[ARM_SP] = lmsp; cpu->psp = lpsp; }
+}
+
+/* Switch security state, banking the stack pointers. No-op without the
+ * extension or when already in the target state. Thread-mode transitions
+ * (SG/BXNS); exception-driven banking is handled by the secure exception
+ * model (Step 4). */
+static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
+    if (!cpu->tz_enabled || cpu->secure == to_secure)
+        return;
+    arm_tz_save_sp_bank(cpu, cpu->secure);
+    cpu->secure = to_secure;
+    arm_tz_load_sp_bank(cpu, to_secure);
+}
+
+/* ARMv8-M FNC_RETURN (0xFExxxxxx): return from a Non-secure callee to the
+ * Secure caller that invoked it via BLXNS. Restore Secure state (and its
+ * stack), then pop the return address + integrity signature BLXNS pushed. A
+ * corrupted signature raises a SecureFault (INVIS). */
+static void arm_fnc_return(arm_cpu_t *cpu, uint32_t magic) {
+    (void)magic;
+    arm_switch_security_state(cpu, true);
+    uint32_t sp = cpu->reg[ARM_SP];
+    uint32_t ret = arm_read32(cpu, sp + 0);
+    uint32_t sig = arm_read32(cpu, sp + 4);
+    if (sig != 0xFEFA125Au) {
+        cpu->sfsr |= ARM_SFSR_INVIS;
+        cpu->secure_fault_pending = true;
+    }
+    cpu->reg[ARM_SP] = sp + 8;
+    cpu->reg[ARM_PC] = ret & ~1u;
+}
+
 /* Exception entry/return tracer (ARM_EXC_TRACE=1).  Behaviour-neutral; the
  * key scope for context-switch (PendSV) and ISR-dispatch bring-up. */
 static void arm_exc_trace(const char *what, uint32_t a, uint32_t b, uint32_t c) {
@@ -712,6 +827,23 @@ static void arm_exc_trace(const char *what, uint32_t a, uint32_t b, uint32_t c) 
 }
 
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
+    /* ARMv8-M: an exception may target Secure or Non-secure. The background
+     * frame is stacked on the CURRENT (background) stack; then, if the handler
+     * runs in the other security state, we bank across. SecureFault always
+     * targets Secure; other exceptions keep the current domain until NVIC
+     * target-security banking (Step 5). Entirely gated on tz_enabled. */
+    bool tz_bg_secure = cpu->secure;
+    bool target_secure = false;
+    if (cpu->tz_enabled) {
+        if (exception_num == EXC_SECUREFAULT)
+            target_secure = true;
+        else if (exception_num >= 16 && cpu->nvic)
+            target_secure = arm_nvic_targets_secure(
+                (arm_nvic_t *)cpu->nvic, exception_num);
+        else
+            target_secure = cpu->secure;   /* system exceptions: current domain */
+    }
+
     /* Push exception frame on the ACTIVE stack (PSP or MSP). */
     bool from_psp = arm_sp_is_psp(cpu);
     uint32_t sp = cpu->reg[ARM_SP];
@@ -757,11 +889,27 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
         cpu->reg[ARM_LR] = 0xFFFFFFF9; /* Return to Thread using MSP */
     }
 
-    /* Load vector */
-    uint32_t vector = arm_read32(cpu, cpu->vtor + exception_num * 4);
-    cpu->reg[ARM_PC] = vector & ~1u;
+    /* Enter Handler mode (set IPSR) before any security banking, so SP
+     * selection correctly resolves to MSP. */
     cpu->xpsr = (cpu->xpsr & ~0x1FFu) | (exception_num & 0x1FF);
     cpu->xpsr |= (1u << 24); /* Thumb bit */
+
+    /* ARMv8-M: if the handler runs in the other security state, bank across
+     * (the frame was stacked on the background stack above) and fetch from
+     * that state's vector table. Record the background state for return. */
+    cpu->exc_crossed_domain = false;
+    cpu->exc_bg_secure = tz_bg_secure;
+    if (cpu->tz_enabled && target_secure != tz_bg_secure) {
+        arm_switch_security_state(cpu, target_secure);
+        cpu->exc_crossed_domain = true;
+        if (target_secure)
+            cpu->tz_secexc_count++;
+    }
+    uint32_t vtor = (cpu->tz_enabled && target_secure) ? cpu->vtor_s : cpu->vtor;
+
+    /* Load vector */
+    uint32_t vector = arm_read32(cpu, vtor + exception_num * 4);
+    cpu->reg[ARM_PC] = vector & ~1u;
 
     cpu->cpu_off = false; /* Wake from WFI */
     cpu->cycles += 12; /* Exception entry latency */
@@ -774,6 +922,14 @@ void arm_check_pending_exceptions(arm_cpu_t *cpu) {
 }
 
 static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
+    /* ARMv8-M: return to the background security state first, as the frame
+     * lives on that state's stack. Must precede the MSP sync below so the
+     * active SP is the background frame's, not the handler's. */
+    if (cpu->tz_enabled && cpu->exc_crossed_domain) {
+        arm_switch_security_state(cpu, cpu->exc_bg_secure);
+        cpu->exc_crossed_domain = false;
+    }
+
     /* The handler ran on MSP — sync the bank before re-banking. */
     cpu->msp = cpu->reg[ARM_SP];
 
@@ -1965,23 +2121,62 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         cpu->reg[d] = m_val;
                         if (d == ARM_PC) cpu->reg[ARM_PC] &= ~1u;
                         break;
-                    case 3: /* BX / BLX */
-                        if (hw1 & (1 << 7)) {
+                    case 3: { /* BX / BLX / BXNS / BLXNS */
+                        bool link = (hw1 & (1 << 7)) != 0;
+                        /* The Non-secure variant (bit[2]) is only meaningful
+                         * when executing Secure; in Non-secure it decodes as
+                         * plain BX/BLX. */
+                        bool ns_variant = (hw1 & (1 << 2)) && cpu->tz_enabled
+                                          && cpu->secure;
+                        uint32_t target = m_val;
+                        if (ns_variant && link) {
+                            /* BLXNS Rm: Secure -> Non-secure call. Save the
+                             * secure return address + integrity signature on
+                             * the Secure stack, set LR = FNC_RETURN, switch to
+                             * Non-secure, and branch. */
+                            uint32_t ret = cpu->reg[ARM_PC] | 1u;
+                            uint32_t sp = cpu->reg[ARM_SP] - 8;
+                            arm_write32(cpu, sp + 0, ret);
+                            arm_write32(cpu, sp + 4, 0xFEFA125Au);
+                            cpu->reg[ARM_SP] = sp;
+                            cpu->reg[ARM_LR] = 0xFEFFFFFFu;   /* FNC_RETURN */
+                            arm_switch_security_state(cpu, false);
+                            cpu->tz_bxns_count++;
+                            cpu->reg[ARM_PC] = target & ~1u;
+                        } else if (ns_variant && !link) {
+                            /* BXNS Rm: FNC_RETURN / EXC_RETURN, else branch
+                             * switching to Non-secure iff target bit[0] == 0. */
+                            if ((target & 0xFF000000u) == 0xFE000000u) {
+                                arm_fnc_return(cpu, target);
+                            } else if ((target & 0xFF000000u) == 0xFF000000u) {
+                                exception_return(cpu, target);
+                            } else {
+                                if ((target & 1) == 0) {
+                                    arm_switch_security_state(cpu, false);
+                                    cpu->tz_bxns_count++;
+                                }
+                                cpu->reg[ARM_PC] = target & ~1u;
+                            }
+                        } else if (link) {
                             /* BLX Rm */
                             cpu->reg[ARM_LR] = (cpu->reg[ARM_PC]) | 1;
-                            arm_sp_audit_push(cpu, cpu->reg[ARM_PC], m_val);
-                            cpu->reg[ARM_PC] = m_val & ~1u;
+                            arm_sp_audit_push(cpu, cpu->reg[ARM_PC], target);
+                            cpu->reg[ARM_PC] = target & ~1u;
                         } else {
-                            /* BX Rm */
-                            uint32_t target = m_val;
-                            /* Check for exception return */
-                            if ((target & 0xF0000000) == 0xF0000000) {
+                            /* BX Rm: a Non-secure FNC_RETURN returns to the
+                             * Secure caller (BLXNS partner); otherwise it is a
+                             * normal branch or an exception return. */
+                            if (cpu->tz_enabled && !cpu->secure &&
+                                (target & 0xFF000000u) == 0xFE000000u) {
+                                arm_fnc_return(cpu, target);
+                            } else if ((target & 0xF0000000) == 0xF0000000) {
                                 exception_return(cpu, target);
                             } else {
                                 cpu->reg[ARM_PC] = target & ~1u;
                             }
                         }
                         break;
+                    }
                 }
             }
             goto insn_done;
@@ -2372,6 +2567,43 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
             int op1 = (hw1 >> 11) & 3;
             int op2_5 = (hw1 >> 4) & 0x7F;
             int op_hw2 = (hw2 >> 15) & 1;
+
+            /* ARMv8-M SG — Secure Gateway (0xE97FE97F). From Non-secure state:
+             * if fetched from a Non-secure-callable region it switches to
+             * Secure and clears LR[0] so the paired BXNS returns to NS; if
+             * fetched from a non-NSC region it is an invalid entry point and
+             * raises a SecureFault (INVEP). In Secure state it is a NOP. */
+            if (cpu->tz_enabled && insn32 == 0xE97FE97Fu) {
+                if (!cpu->secure) {
+                    if (arm_security_attr(cpu, pc) == ARM_SEC_NSC) {
+                        arm_switch_security_state(cpu, true);
+                        cpu->reg[ARM_LR] &= ~1u;
+                        cpu->tz_sg_count++;
+                    } else {
+                        cpu->sfsr |= ARM_SFSR_INVEP;
+                        cpu->secure_fault_pending = true;
+                    }
+                }
+                goto insn_done;
+            }
+
+            /* ARMv8-M TT / TTT / TTA / TTAT — test target attributes.
+             * hw1 = 0xE84|Rn, hw2 = 0xF|Rd|A|T|000000. Distinguished from
+             * LDRD/STRD (same hw1 range) by hw2[15:12]==0xF, which those
+             * never have (Rt=PC is invalid there). Gated on tz_enabled, so
+             * non-TZ decode is entirely unaffected. */
+            if (cpu->tz_enabled &&
+                (hw1 & 0xFFF0) == 0xE840 && (hw2 & 0xF03F) == 0xF000) {
+                int rn = hw1 & 0xF;
+                int rd = (hw2 >> 8) & 0xF;
+                bool alt = (hw2 >> 7) & 1;          /* A: alternate domain */
+                if (rn != 15 && rd != 15 && rd != 13) {
+                    /* TTA/TTAT (alt) are only valid from Secure state. */
+                    bool ok = !alt || cpu->secure;
+                    cpu->reg[rd] = ok ? arm_tt_response(cpu, cpu->reg[rn], alt) : 0;
+                }
+                goto insn_done;
+            }
 
             if (op1 == 1 && (op2_5 & 0x64) == 0x00) {
                 /* Load/Store multiple, SRS, RFE */
@@ -3470,6 +3702,14 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         cpu->instructions++;
         remaining--;
 
+        /* ARMv8-M: take a recorded SecureFault (Step 2/4). It is the
+         * highest-priority configurable fault; escalation to secure HardFault
+         * when masked is not modelled. Gated on tz_enabled. */
+        if (cpu->tz_enabled && cpu->secure_fault_pending) {
+            cpu->secure_fault_pending = false;
+            arm_exception_entry(cpu, EXC_SECUREFAULT);
+        }
+
         /* Service any IRQ that became pending mid-instruction.  Peripherals
          * (radio, timer, etc.) call arm_nvic_set_pending → check_pending,
          * which would normally take the exception immediately — but if
@@ -3775,8 +4015,17 @@ int arm_step(arm_cpu_t *cpu, int count) {
          * event or a pending IRQ must be taken at an instruction boundary,
          * and a block has no internal check; mid-IT-block execution needs the
          * interpreter's flag suppression; WFI and GDB are its business too. */
+        /* TrustZone: arm_tz_blocks() sits at the top of every mem_* helper,
+         * and the JIT's inline SRAM path bypasses it by design.  That is
+         * sound only because blocks never run Non-secure: arm_tz_blocks is
+         * inert while Secure (or with TZ absent), and no instruction in the
+         * compilable subset can change security state (SG/BXNS/BLXNS and
+         * exception entry/return are all interpreter-only), so gating entry
+         * here is exact.  Non-secure execution takes the interpreter, whose
+         * attribution checks and SecureFault recording are the reference. */
         int interp_only = cpu->cpu_off || cpu->gdb_stub != NULL ||
                           (cpu->it_state & 0xF) != 0 ||
+                          (cpu->tz_enabled && !cpu->secure) ||
                           cpu->cycles >= cpu->next_event_cycle;
         if (!interp_only && cpu->nvic &&
             ((arm_nvic_t *)cpu->nvic)->has_pending)

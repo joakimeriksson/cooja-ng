@@ -43,6 +43,7 @@
 #define EXC_MEMMANAGE   4
 #define EXC_BUSFAULT    5
 #define EXC_USAGEFAULT  6
+#define EXC_SECUREFAULT 7   /* ARMv8-M security extension */
 #define EXC_SVCALL     11
 #define EXC_PENDSV     14
 #define EXC_SYSTICK    15
@@ -207,6 +208,56 @@ typedef struct arm_cpu {
     /* Vector table offset register */
     uint32_t  vtor;
 
+    /* --- ARMv8-M Security Extension (TrustZone-M) — see
+     * docs/design/trustzone-m-plan.md.
+     *
+     * `tz_enabled` is a per-SoC capability (config->has_trustzone). When it
+     * is false — every non-M33 target, and M33 SoCs without TZ configured —
+     * the whole block is inert: `secure` stays false and nothing below is
+     * read, so behaviour is byte-identical to the non-secure-only model.
+     *
+     * The ACTIVE stack pointers remain cpu->msp / cpu->psp (handler/thread
+     * banking unchanged). The fields here hold the *other* security state's
+     * banked SP / stack-limit / CONTROL, swapped on a secure<->non-secure
+     * transition (Phase 3). Stored but not yet wired in Phase 0. */
+    bool      tz_enabled;            /* SoC implements the security extension */
+    bool      secure;                /* current security state (Secure = true) */
+    uint32_t  msp_s,   msp_ns;       /* banked Main Stack Pointer */
+    uint32_t  psp_s,   psp_ns;       /* banked Process Stack Pointer */
+    uint32_t  msplim_s, msplim_ns;   /* banked MSP limit (MSPLIM) */
+    uint32_t  psplim_s, psplim_ns;   /* banked PSP limit (PSPLIM) */
+    uint32_t  control_s, control_ns; /* banked CONTROL (nPRIV/SPSEL/FPCA/SFPA) */
+    uint32_t  vtor_s;                /* secure vector table offset (VTOR_S) */
+
+    /* Security Attribution Unit (SAU) — Phase 1. Programmable regions that,
+     * together with the SoC IDAU (the Nordic SPU on nRF54L15), decide the
+     * security attribute of each address. Registers at 0xE000EDD0.. See
+     * arm_trustzone.c / arm_security_attr(). */
+    uint32_t  sau_ctrl;              /* SAU_CTRL: bit0 ENABLE, bit1 ALLNS */
+    uint32_t  sau_rnr;               /* SAU_RNR: region number register */
+    uint32_t  sau_rbar[8];           /* SAU_RBAR[]: region base (bits 31:5) */
+    uint32_t  sau_rlar[8];           /* SAU_RLAR[]: limit(31:5)|NSC(1)|ENABLE(0) */
+    uint8_t   sau_sregions;          /* number of implemented SAU regions (0/4/8) */
+
+    /* SecureFault state (Phase 1/Step 2). Set when a Non-secure access is
+     * refused by the attribution unit; the exception is *taken* by the
+     * secure exception model (Step 4). */
+    uint32_t  sfsr;                  /* SecureFault Status Register */
+    uint32_t  sfar;                  /* SecureFault Address Register */
+    bool      secure_fault_pending;  /* a SecureFault has been recorded */
+
+    /* Secure exception model (Step 4). When a secure exception is taken from
+     * Non-secure background, the background security state is stashed here and
+     * restored on exception return. (Single-level; nesting is a refinement.) */
+    bool      exc_crossed_domain;    /* current exception switched security */
+    bool      exc_bg_secure;         /* background security state to restore */
+
+    /* World-transition instrumentation (Step 7). Counted per node; the thing
+     * silicon cannot expose without intrusive probes. */
+    uint64_t  tz_sg_count;           /* SG entries (NS->S) */
+    uint64_t  tz_bxns_count;         /* BXNS returns to Non-secure */
+    uint64_t  tz_secexc_count;       /* secure exceptions taken from NS */
+
     /* ROM utility traps */
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
     uint32_t  rom_util_memset;    /* Address of rom_util_memset entry */
@@ -308,6 +359,15 @@ static inline void arm_set_wfi_skip_guard(arm_cpu_t *cpu,
                                            void *user) {
     cpu->wfi_skip_guard = guard;
     cpu->wfi_skip_user  = user;
+}
+
+/* --- TrustZone-M state accessors (see docs/design/trustzone-m-plan.md) ---
+ * On non-TZ SoCs tz_enabled is false and the core is always non-secure. */
+static inline bool arm_cpu_has_trustzone(const arm_cpu_t *cpu) {
+    return cpu->tz_enabled;
+}
+static inline bool arm_cpu_is_secure(const arm_cpu_t *cpu) {
+    return cpu->tz_enabled && cpu->secure;
 }
 
 /* Memory access (for external use / tests / peripherals) */
