@@ -15,10 +15,22 @@ static int sys_ctrl_read(void *user_data, uint32_t addr) {
         case SYS_CTRL_CLOCK_CTRL: return (int)sc->clock_ctrl;
         case SYS_CTRL_CLOCK_STA: {
             uint32_t sta = sc->clock_sta;
-            if (sc->osc32k_pending > 0) {
-                sc->osc32k_pending--;
-                if (sc->osc32k_pending == 0)
-                    sc->clock_sta |= (1u << 26); /* OSC32K now stable */
+            /* SYNC_32K (CLOCK_STA bit 26, 0x04000000 — NOT OSC32K, which is bit
+             * 24) self-stabilizes on read. Contiki's cc2538 clock setup polls it
+             * with a clear-then-set sequence (sys-ctrl.c:
+             *   while(REG(CLOCK_STA) & SYNC_32K);
+             *   while(!(REG(CLOCK_STA) & SYNC_32K)); )
+             * waiting for the 32-kHz domain to re-sync after a CLOCK_CTRL write
+             * (e.g. PM1/2 entry). A CLOCK_CTRL write clears the bit; a couple of
+             * subsequent reads bring it back set. Without this the poll spins
+             * forever (inside the rtimer ISR on PM1/2 wake), wedging the node.
+             * The read returns the pre-update value so the firmware first
+             * observes it clear (clear-wait passes) then set (set-wait ends). */
+            if (!(sc->clock_sta & (1u << 26))) {
+                if (++sc->sync32k_pending >= 2) {
+                    sc->clock_sta |= (1u << 26);
+                    sc->sync32k_pending = 0;
+                }
             }
             return (int)sta;
         }
@@ -50,21 +62,28 @@ static void sys_ctrl_write(void *user_data, uint32_t addr, uint32_t value) {
         case SYS_CTRL_CLOCK_CTRL:
             sc->clock_ctrl = value;
             /* Update clock status to reflect new config.
-             * CC2538 CLOCK_STA register layout:
+             * CC2538 CLOCK_STA register layout (see Contiki sys-ctrl.h):
              *   [2:0]  SYS_DIV, [10:8] IO_DIV — mirror CLOCK_CTRL
-             *   [16]   SOURCE_CHANGE = 0 (switch complete)
-             *   [19]   XOSC_STB   = 1 when XOSC selected (OSC bit=0)
-             *   [18]   HSOSC_STB  = 1 when RCOSC selected (OSC bit=1)
-             *   [26]   OSC32K     = set after transition delay */
+             *   [16]   OSC          = selected source (0=XOSC, 1=RCOSC)
+             *   [18]   HSOSC_STB     = 1 when RCOSC selected (OSC bit=1)
+             *   [19]   XOSC_STB      = 1 when XOSC selected (OSC bit=0)
+             *   [20]   SOURCE_CHANGE = 0 (switch complete)
+             *   [26]   SYNC_32K      = set after 32-kHz sync (0x04000000) */
             {
-                int osc = (value >> 6) & 1;
-                sc->clock_sta = (value & 0x707) |           /* SYS_DIV, IO_DIV, OSC */
-                                (osc ? (1u << 18) : (1u << 19)); /* stable bit */
-                /* OSC32K transition: firmware expects bit 26 to be 0 first, then 1 */
-                if ((value >> 17) & 1)
-                    sc->osc32k_pending = 2; /* will set after 2 reads */
-                else
-                    sc->osc32k_pending = 0;
+                /* CLOCK_CTRL.OSC = bit 16 (SYS_CTRL_CLOCK_CTRL_OSC=0x10000):
+                 * 0=32MHz XOSC, 1=16MHz RCOSC. CLOCK_STA.OSC (also bit 16) must
+                 * mirror it so the firmware's select_16_mhz_rcosc()/
+                 * select_32_mhz_xosc() "wait for the switch" poll
+                 * (while(CLOCK_STA.OSC != selected)) terminates — otherwise a
+                 * cc2538 dropping to PM1/2 spins forever. The OSC switch is
+                 * modelled as instantaneous, so SOURCE_CHANGE (bit 20) stays 0. */
+                int osc = (value >> 16) & 1;
+                sc->clock_sta = (value & 0x707) |           /* SYS_DIV, IO_DIV */
+                                (osc ? ((1u << 18) | (1u << 16)) /* HSOSC_STB + OSC */
+                                     : (1u << 19));              /* XOSC_STB, OSC=0 */
+                /* clock_sta recompute above cleared SYNC_32K (bit 26); restart the
+                 * read-stabilization counter so it re-settles (see CLOCK_STA read). */
+                sc->sync32k_pending = 0;
             }
             /* Update CPU frequency */
             arm_cpu_set_frequency(sc->cpu, cc2538_sys_ctrl_get_sys_clock(sc));
@@ -102,11 +121,26 @@ void cc2538_sys_ctrl_init(cc2538_sys_ctrl_t *sc, arm_cpu_t *cpu) {
 }
 
 uint32_t cc2538_sys_ctrl_get_sys_clock(cc2538_sys_ctrl_t *sc) {
-    /* CC2538 system clock:
-     * CLOCK_CTRL.SYS_DIV[2:0] = divisor (0=32MHz, 1=16MHz, 2=8MHz, etc.)
-     * OSC bit: 0=32MHz XOSC, 1=16MHz RCOSC */
+    /* Derive the CPU execution frequency the way the firmware itself does.
+     * Contiki's sys_ctrl_get_sys_clock() is
+     *     return SYS_CTRL_32MHZ >> (CLOCK_STA & SYS_DIV);
+     * (arch/cpu/cc2538/dev/sys-ctrl.c): a fixed 32 MHz XOSC base shifted by
+     * SYS_DIV, ignoring the CLOCK_CTRL.OSC (bit 16) source-select entirely.
+     * Pinning the emulated core to that same 32 MHz base keeps the emulator's
+     * clock model in agreement with the firmware's, so the rtimer/SysTick math
+     * lines up. CLOCK_STA mirrors CLOCK_CTRL's SYS_DIV, so reading either gives
+     * the same divisor.
+     *
+     * (Honoring OSC=1 here was actively wrong. On silicon OSC=1 selects the
+     * 16 MHz HF-RCOSC only transiently around PM1/2 entry, where the core is
+     * HALTED — it never runs a real workload at the RCOSC rate. This emulator
+     * does not halt the core in PM1/2 (it keeps stepping instructions), so the
+     * RCOSC downshift made a node that dipped into lpm keep running its TSCH
+     * slot code at 8 MHz (16 MHz >> SYS_DIV(1)) instead of 16 MHz — burning 2x
+     * the sim-time and overshooting the frequency-independent rtimer slot
+     * deadline every slot: the cc2538 TSCH "!dl-miss" storm that desynced the
+     * leaf.) The OSC bit is still mirrored into CLOCK_STA on a CLOCK_CTRL write
+     * so the firmware's switch-poll terminates (see sys_ctrl_write). */
     int sys_div = sc->clock_ctrl & 7;
-    int osc = (sc->clock_ctrl >> 6) & 1;
-    uint32_t base_freq = osc ? 16000000 : 32000000;
-    return base_freq >> sys_div;
+    return 32000000u >> sys_div;
 }

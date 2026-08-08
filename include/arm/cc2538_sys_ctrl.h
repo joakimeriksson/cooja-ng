@@ -57,8 +57,10 @@ typedef struct cc2538_sys_ctrl {
     uint32_t    i_map;
     uint32_t    emuovr;
 
-    /* Pending OSC32K transition: reads remaining before OSC32K status bit sets */
-    int         osc32k_pending;
+    /* Pending SYNC_32K (CLOCK_STA bit 26) transition: reads remaining before the
+     * 32-kHz sync-status bit re-settles after a CLOCK_CTRL write. (Note: bit 26
+     * is SYNC_32K, 0x04000000; OSC32K is bit 24, 0x01000000 — a different field.) */
+    int         sync32k_pending;
 
     /* Generic storage for other registers */
     uint32_t    regs[64];
