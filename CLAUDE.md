@@ -12,7 +12,15 @@ runtime extraction plan.
 ```sh
 make              # O3, LTO, auto-detects GNU Lightning for JIT
 make debug        # O0, -g, DEBUG flag
-make pgo          # Profile-guided optimization (~40% faster)
+make pgo          # Profile-guided optimization. Recursive make, so it reuses the
+                  # normal per-object rules (it can't drift out of sync with CFLAGS
+                  # again). Trains on MSP430 *and* ARM workloads — it was MSP430-only
+                  # before, so every ARM hot path was laid out blind. Works with
+                  # clang (llvm-profdata) and gcc (-fprofile-generate/use); override
+                  # the merge tool with `make pgo PROFDATA=/path/to/llvm-profdata`.
+                  # Measured on an *untrained* workload (chain-3node-nrf52840-dk):
+                  # ~1.55x on clang/arm64, ~1.18x on gcc/x86-64. arm-bench itself is
+                  # in the training set, so its 1.6-2.0x is an optimistic read.
 make clean        # Remove build/
 ```
 
@@ -29,8 +37,43 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 60000
 
 # ARM Cortex-M3/M4 tests
-./build/test_runner arm-correctness -v   # 224 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33),
+./build/test_runner arm-correctness -v   # 230 instruction-level tests (Thumb-2 + M4 DSP/VFP + M33),
                                          # of which 71 are ARMv8-M TrustZone-M
+./build/test_runner arm-decode           # Decoder differential test: exhaustive over all
+                                         # 65536 Thumb halfwords x 6 random register/flag
+                                         # states, running decoder + arm_execute_decoded()
+                                         # against the interpreter and comparing r0-r15,
+                                         # APSR and cycles. 269952 comparisons. This is the
+                                         # foundation the ARM JIT is built on — the decoder
+                                         # is a SECOND implementation of Thumb-16 semantics,
+                                         # and flag-only drift between two implementations
+                                         # is invisible until a branch flips (exactly the
+                                         # MSP430 ADDC bug).
+./build/test_runner arm-jit              # JIT differential test: for every Thumb halfword
+                                         # the decoder accepts, compile a one-instruction
+                                         # block and run the GENERATED CODE against the
+                                         # interpreter over 8 register/flag states.
+                                         # 44992 encodings, 359936 comparisons. Distinct
+                                         # from arm-decode, which only validates the
+                                         # *description* of an instruction — the JIT ships a
+                                         # third implementation (the machine code Lightning
+                                         # emits) and only running it tests it, on the host
+                                         # it was emitted for. This suite exists because
+                                         # jit_andi(dst,src,0x80000000) returns 0 on x86-64
+                                         # Lightning 2.2.3, which made every N-reading
+                                         # condition (MI/PL/GE/LT/GT/LE) silently wrong
+                                         # there while every other test stayed green.
+./build/test_runner arm-bench            # ARM interpreter benchmarks: 5 synthetic hot-path
+                                         # loops (dispatch, Thumb-2 decode, IT blocks, branches,
+                                         # load/store) + 2 firmware. Reports MIPS (primary) and
+                                         # xRealtime (secondary — idle-policy sensitive). Each
+                                         # synthetic loop is guarded by an iteration-count
+                                         # invariant, so a wrong loop shape reports BROKEN
+                                         # instead of timing garbage. Non-zero exit if any is.
+                                         # NB: calls arm_step directly with no kernel, so it
+                                         # measures the interpreter only — a change to the
+                                         # event pump won't show up here (see the Tier 0 note
+                                         # in docs/design/arm-performance-plan.md §2.3).
 ./build/test_runner arm-firmware -v      # Firmware boot test (hello-world.cc2538dk)
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
@@ -75,6 +118,13 @@ TZ=~/work/contiki-ng-nrf54l15/examples/platform-specific/nrf/trustzone
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
+
+`CSIM_PHASE_TIMING=1` adds a wall-time breakdown at the end of a run — how much
+went into the event pump (CPU step + event dispatch) versus the runner
+scaffolding around it. Off by default because the clock reads it needs profiled
+at 7% of self time on an ARM workload. Useful for answering "is this workload
+interpreter-bound?" without a profiler: single-node `zephyr-synchronization` is
+95.3% pump / 4.7% other, `chain-3node-nrf52840-dk` 96.5% / 3.5%.
 
 ```sh
 # Dynamic plugins (Phase 9) — dlopen a .so that registers a service or medium
@@ -199,8 +249,10 @@ scheduling policy is the one documented deferral. **The staged refactor
 
 | File | Purpose |
 |------|---------|
-| `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until. On ARMv8-M also the **TrustZone-M** security state: banked SP/CONTROL, SG/BXNS/BLXNS/FNC_RETURN, TT/TTT/TTA/TTAT, secure exception entry/return with the integrity signature, and per-node transition counters |
+| `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until, JIT dispatcher + lockstep verifier. On ARMv8-M also the **TrustZone-M** security state: banked SP/CONTROL, SG/BXNS/BLXNS/FNC_RETURN, TT/TTT/TTA/TTAT, secure exception entry/return with the integrity signature, and per-node transition counters. The JIT never runs Non-secure code — `arm_tz_blocks()` lives in the interpreter's memory path, so the dispatcher hands NS execution back |
 | `arm_trustzone.c` | **TrustZone-M attribution engine** (ARMv8-M security extension): SAU regions + SPU-as-IDAU, `arm_security_attr()`, memory-mapped SAU registers at `0xE000EDD0` (Secure-only, RAZ/WI from Non-secure), and `arm_tz_blocks()` hot-path access enforcement feeding SecureFault/SFSR. Gated per MCU by `has_trustzone` (nRF54L15 only) |
+| `arm_decode.c` | Stateless Thumb-16 decoder for the JIT-compilable subset -> `arm_decoded_insn_t`, basic-block decoder. Deliberately a *second* implementation of the semantics, differential-tested by `arm-decode` |
+| `arm_jit.c` | GNU Lightning code generator: compiles hot basic blocks (ALU, shifts, branches, guarded SRAM loads/stores, native self-loops under an iteration budget) to ARM64/x86-64 |
 | `arm_config.c` | MCU configurations: CC2538 (512KB flash, 32KB SRAM, 32MHz) |
 | `arm_elf.c` | ELF loader: loads sections into flash/SRAM, symbol lookup |
 | `arm_nvic.c` | NVIC: interrupt priority, pending/enable registers, exception entry/return, ARMv8-M target-security banking (`NVIC_ITNS`) |
@@ -425,10 +477,36 @@ Same event-driven kernel as MSP430, with CC2538 RF Core for 802.15.4 radio:
 | 2-node nullnet (20s sim) | ~800x real-time |
 | 2-node RPL-UDP (60s sim) | ~2400x real-time |
 
-### ARM (interpreter only)
+### ARM
 
 | Benchmark | Speed |
 |-----------|-------|
 | CC2538 2-node RPL-UDP (60s sim) | ~300x real-time |
 | nRF52840 2-node RPL-UDP (60s sim) | ~360x real-time |
 | nRF52840 2-node TSCH (60s sim) | ~14x real-time |
+
+The ARM JIT (`src/arm/arm_jit.c`, GNU Lightning) compiles hot Thumb-16 basic
+blocks — ALU, shifts, branches and guarded SRAM loads/stores — and is **on by
+default when Lightning is present**. It is cycle-exact: `CSIM_ARM_JIT=0` and
+`=1` produce byte-identical output, which is required because determinism is a
+gated guarantee and Lightning is an optional dependency.
+
+| Workload | JIT off | JIT on | |
+|---|---|---|---|
+| `zephyr-synchronization`, 1 node, 60 s sim | 2.05 s | **0.60 s** | **3.42x** |
+| Contiki-NG ARM firmware (chain-3/4node, cc2538 RPL-UDP) | | | ~1.00x |
+
+The split is coverage, not codegen: Zephyr images are Thumb-16 dense (average
+compiled block 34.9 instructions), Contiki-NG ARM images are Thumb-2 dense
+(1.7–2.4), and Thumb-2 is not compiled yet. See
+[`docs/design/arm-performance-plan.md`](docs/design/arm-performance-plan.md) §5.
+
+```sh
+CSIM_ARM_JIT=0            # disable (for A/B or bisecting a suspected JIT bug)
+CSIM_ARM_JIT_STATS=1      # coverage: insns via compiled code, avg block, side exits, RSS
+CSIM_ARM_JIT_VERIFY=1     # lockstep: run each block, rewind (incl. SRAM), re-run
+                          # interpreted, compare r0-r15 + APSR + cycles + memory
+CSIM_ARM_JIT_MIN_BLOCK=n  # minimum block length to compile (default 1 — NOT a tuning
+                          # knob, see the comment in arm_jit.c: 4 costs 3x)
+CSIM_ARM_JIT_THRESHOLD=n  # executions before compiling (default 50)
+```

@@ -2257,6 +2257,87 @@ static void test_trustzone_blxns(void) {
     }
 }
 
+/* ===================================================================
+ * IO region lookup: page-hash fast path vs the linear-scan specification
+ * =================================================================== */
+extern int arm_io_lookup_check(arm_cpu_t *cpu, uint32_t addr);
+
+static int io_dummy_read(void *u, uint32_t a) { (void)u; (void)a; return 0; }
+static void io_dummy_write(void *u, uint32_t a, uint32_t v) { (void)u; (void)a; (void)v; }
+
+static void test_io_lookup(void) {
+    if (verbose) printf("IO region lookup (page hash vs linear scan):\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+
+    /* Synthetic set reproducing every registration pattern in the tree:
+     * the NVIC/SysTick containment (the one load-bearing overlap), plain
+     * page regions, adjacent pages, a multi-page region, a sub-page window
+     * in the middle of an otherwise-unmapped page, a same-size overlap
+     * (first registered must win), and a far-away page (FICR-like). */
+    static const struct { uint32_t base, size; } regs[] = {
+        { 0xE000E000, 0x1000 },   /* NVIC-like, registered first          */
+        { 0xE000E010, 0x0010 },   /* SysTick-like, contained              */
+        { 0x40000000, 0x1000 },
+        { 0x40001000, 0x1000 },   /* adjacent page                        */
+        { 0x4001F000, 0x2000 },   /* spans two pages                      */
+        { 0x50000800, 0x0100 },   /* sub-page window mid-page             */
+        { 0x50000800, 0x0100 },   /* identical twin: tie -> first wins    */
+        { 0x10000000, 0x1000 },   /* FICR-like, far page                  */
+    };
+    for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++)
+        arm_register_io(&cpu, regs[i].base, regs[i].size,
+                        io_dummy_read, io_dummy_write, NULL);
+
+    assert_true("io: page map active (not fallback)", !cpu.io_page_map_fallback);
+
+    /* Region edges: base-1, base, base+size-1, base+size. */
+    int edge_ok = 1;
+    for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
+        uint32_t probes[4] = { regs[i].base - 1, regs[i].base,
+                               regs[i].base + regs[i].size - 1,
+                               regs[i].base + regs[i].size };
+        for (int k = 0; k < 4; k++)
+            if (!arm_io_lookup_check(&cpu, probes[k])) {
+                printf("  FAIL: io edge 0x%08x disagrees\n", probes[k]);
+                edge_ok = 0;
+            }
+    }
+    assert_true("io: all region edges agree", edge_ok);
+
+    /* The overlap page, exhaustively — every byte of 0xE000Exxx. */
+    int ov_ok = 1;
+    for (uint32_t a = 0xE000E000u; a < 0xE000F000u; a++)
+        if (!arm_io_lookup_check(&cpu, a)) { ov_ok = 0; break; }
+    assert_true("io: NVIC/SysTick page exhaustive", ov_ok);
+
+    /* Deterministic fuzz over the peripheral span. */
+    uint32_t rng = 0x12345678u;
+    int fuzz_ok = 1;
+    for (int n = 0; n < 200000; n++) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        uint32_t a = 0x10000000u + (rng % 0xD0100000u);
+        if (!arm_io_lookup_check(&cpu, a)) {
+            printf("  FAIL: io fuzz 0x%08x disagrees\n", a);
+            fuzz_ok = 0;
+            break;
+        }
+    }
+    assert_true("io: 200k random addresses agree", fuzz_ok);
+
+    /* Overflow a chain (5 regions on one page) -> must fall back, and the
+     * fallback must still answer correctly (trivially: it IS the scan). */
+    for (int i = 0; i < 5; i++)
+        arm_register_io(&cpu, 0x60000000u + (uint32_t)i * 4, 8,
+                        io_dummy_read, io_dummy_write, NULL);
+    assert_true("io: chain overflow sets fallback", cpu.io_page_map_fallback);
+    assert_true("io: fallback still agrees",
+                arm_io_lookup_check(&cpu, 0x60000004u) &&
+                arm_io_lookup_check(&cpu, 0xE000E010u));
+
+    arm_cpu_destroy(&cpu);
+}
+
 int run_arm_correctness_tests(int v) {
     printf("=== ARM Cortex-M3/M4 Correctness Tests ===\n\n");
     passed = 0;
@@ -2290,6 +2371,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_nvic_itns();
     test_trustzone_instrumentation();
     test_trustzone_blxns();
+    test_io_lookup();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);
     return failed;
