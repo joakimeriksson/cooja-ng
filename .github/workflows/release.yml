@@ -1,0 +1,160 @@
+# Binary releases — the artifact Contiki-NG CI downloads instead of compiling us.
+#
+# Pushing a tag `v*` builds a per-platform tarball of test_runner + the three
+# runner scripts, smoke-tests THE UNPACKED TARBALL (not the build tree), and
+# attaches everything plus SHA256SUMS to a GitHub release.
+#
+# Design decisions, from docs/design/contiki-ng-testing-plan.md Phase 0:
+#
+#  - GNU Lightning is built from source with --disable-shared and linked
+#    STATICALLY.  A dylib/so dependency would make the binary unusable outside
+#    the build machine, and Homebrew's liblightning.a is not linkable on macOS
+#    (GNU ar format).  Shipping the JIT costs nothing in reproducibility: it
+#    is cycle-exact by gate, so a Lightning-enabled binary and an
+#    interpreter-only one produce byte-identical simulation output.
+#    An assert step fails the release if a dynamic lightning dep sneaks in.
+#
+#  - NATIVE_FLAG= overrides the default -march=native/-mcpu=native: a release
+#    binary must run on CPUs other than the runner's.  linux-x86_64 builds on
+#    ubuntu-22.04 deliberately — the oldest supported runner image, so the
+#    glibc baseline (2.35) stays low enough for the containers contiki-ng CI
+#    uses.  Remaining dynamic deps are libc/libm/libpthread only (QuickJS and
+#    cJSON are vendored; dlopen is used only by the optional plugin system,
+#    which the Cooja suite never touches).
+#
+#  - The tarball keeps the repo layout (build/test_runner, tools/*.sh) because
+#    the scripts are the interface: run-cooja-tests.sh locates the runner via
+#    its own path, so the unpacked tree works with zero configuration beyond
+#    CONTIKI_DIR.  Firmware compilation deliberately stays on the contiki-ng
+#    side — that is their code under test.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: linux-x86_64 }
+          - { os: macos-13,     target: macos-x64 }     # Intel runner
+          - { os: macos-latest, target: macos-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      # The vendored patch is upstream lightning commit bfd695a9 ("Correct
+      # wrong ifdef causing missing mprotect call") — without it, jit_emit
+      # never mprotects the code page to PROT_READ|PROT_EXEC and every
+      # generated block SIGBUSes on Apple Silicon (Linux only survives by
+      # accident of its mmap defaults).  Homebrew ships the same patch; the
+      # vanilla 2.2.3 tarball does not.  Vendored so a release cannot depend
+      # on savannah's cgit being up.
+      - name: Build static GNU Lightning 2.2.3 (+ mprotect fix)
+        run: |
+          curl -sL https://ftp.gnu.org/gnu/lightning/lightning-2.2.3.tar.gz | tar xz
+          cd lightning-2.2.3
+          patch -p1 < ../.github/patches/lightning-2.2.3-mprotect.patch
+          ./configure --prefix="$GITHUB_WORKSPACE/.lightning" --disable-shared > /dev/null
+          make -j"$(getconf _NPROCESSORS_ONLN)" > /dev/null
+          make install > /dev/null
+
+      - name: Build test_runner (generic arch, static Lightning)
+        run: |
+          make -j"$(getconf _NPROCESSORS_ONLN)" \
+            NATIVE_FLAG= \
+            LIGHTNING_CFLAGS="-I$GITHUB_WORKSPACE/.lightning/include" \
+            LIGHTNING_LIBS="$GITHUB_WORKSPACE/.lightning/lib/liblightning.a"
+
+      - name: Assert no dynamic Lightning dependency
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then deps=$(ldd build/test_runner); else deps=$(otool -L build/test_runner); fi
+          echo "$deps"
+          if echo "$deps" | grep -qi lightning; then
+            echo "::error::release binary dynamically links GNU Lightning — not portable"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          PKG="cooja-ng-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$PKG/build" "dist/$PKG/tools"
+          cp build/test_runner                "dist/$PKG/build/"
+          cp tools/run-cooja-tests.sh         "dist/$PKG/tools/"
+          cp tools/csc2json.py                "dist/$PKG/tools/"
+          cp tools/build-test-firmware.sh     "dist/$PKG/tools/"
+          cat > "dist/$PKG/README.md" <<EOF
+          # Cooja-NG ${VERSION} (${{ matrix.target }})
+
+          Standalone Cooja-compatible simulator binary + Contiki-NG test-suite
+          runner. No build step, no JVM. GNU Lightning JIT statically linked
+          (cycle-exact: results are byte-identical with the JIT on or off).
+
+          Run the Contiki-NG Cooja simulation suite:
+
+              CONTIKI_DIR=/path/to/contiki-ng tools/run-cooja-tests.sh
+              CONTIKI_DIR=/path/to/contiki-ng tools/run-cooja-tests.sh --with-tun   # + border-router tests (needs sudo/TUN)
+
+          Firmware is compiled from the Contiki-NG tree by the runner
+          (tools/build-test-firmware.sh); this package contains no firmware.
+
+          Requires: python3 (csc conversion), a Contiki-NG checkout, and the
+          usual embedded toolchains for the firmware builds.
+
+          Self-check without a Contiki-NG tree:
+
+              build/test_runner correctness && build/test_runner arm-correctness
+          EOF
+          tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
+
+      - name: Smoke-test the unpacked tarball
+        run: |
+          mkdir -p /tmp/pkgtest && tar -C /tmp/pkgtest -xzf dist/cooja-ng-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz
+          cd /tmp/pkgtest/cooja-ng-${GITHUB_REF_NAME}-${{ matrix.target }}
+          # The tag and the compiled-in version string must agree — a v0.2.0
+          # release whose binary reports 0.1.0 is a support headache.  Bump
+          # CSIM_VERSION in include/sim/csim_version.h before tagging.
+          ./build/test_runner --version | grep -F "${GITHUB_REF_NAME#v}"
+          ./build/test_runner correctness | grep "RESULT: PASS"
+          ./build/test_runner arm-correctness | grep -E "Results: [0-9]+ passed, 0 failed"
+          ./build/test_runner arm-decode | grep -E "Results: [0-9]+ passed, 0 failed"
+          # arm-jit exercises the statically linked JIT's GENERATED CODE on
+          # this host; a SKIP here means Lightning fell out of the build.
+          ./build/test_runner arm-jit | tee jit.out | grep -E "Results: [0-9]+ passed, 0 failed"
+          if grep -q SKIP jit.out; then echo "::error::arm-jit skipped in release binary"; exit 1; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Cooja-NG $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS
