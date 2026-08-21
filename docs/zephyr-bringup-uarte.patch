@@ -1,0 +1,139 @@
+diff --git a/include/arm/nrf52840_soc.h b/include/arm/nrf52840_soc.h
+index 72b3ae7..a6ac8aa 100644
+--- a/include/arm/nrf52840_soc.h
++++ b/include/arm/nrf52840_soc.h
+@@ -22,14 +22,28 @@ typedef struct nrf_clock_state {
+     uint32_t lfclkstarted;   /* offset 0x104 — set when LFCLK is up */
+ } nrf_clock_state_t;
+ 
+-/* Legacy UART0 register window of the UARTE0 peripheral at 0x40002000.
+- * Contiki's nrf52840 platform uses the legacy API when NRF52840_NATIVE_USB=0:
+- *   write byte to TXD (0x51C)
+- *   spin on EVENTS_TXDRDY (0x11C) until set
+- *   clear EVENTS_TXDRDY (write 0). */
++/* UARTE0 register window at 0x40002000 — both the legacy byte-at-a-time
++ * UART path and the EasyDMA UARTE path share this base.
++ *
++ * Legacy path (Contiki-NG, NRF52840_NATIVE_USB=0):
++ *   write byte to TXD (0x51C); spin on EVENTS_TXDRDY (0x11C); clear it.
++ *
++ * EasyDMA path (Zephyr's nrfx UARTE driver, CONFIG_UART_NRFX_UARTE=y):
++ *   set TXD.PTR (0x544) + TXD.MAXCNT (0x548); trigger TASKS_STARTTX
++ *   (0x008); poll EVENTS_ENDTX (0x120). The driver streams the whole
++ *   buffer via DMA rather than one byte through TXD, so the legacy TXD
++ *   handler never sees its output. */
+ typedef struct nrf_uart_state {
++    arm_platform_t      *plat;     /* back-pointer for EasyDMA arm_read8 */
+     uint32_t enable;          /* offset 0x500 */
+     uint32_t txdrdy;          /* offset 0x11C */
++    /* EasyDMA TX */
++    uint32_t tx_ptr;          /* offset 0x544 — TXD.PTR */
++    uint32_t tx_maxcnt;       /* offset 0x548 — TXD.MAXCNT */
++    uint32_t tx_amount;       /* offset 0x54C — TXD.AMOUNT (bytes sent) */
++    uint32_t evt_endtx;       /* offset 0x120 — EVENTS_ENDTX */
++    uint32_t evt_txstarted;   /* offset 0x150 — EVENTS_TXSTARTED */
++    uint32_t evt_txstopped;   /* offset 0x158 — EVENTS_TXSTOPPED */
+     arm_uart_tx_callback tx_cb;
+     void                *tx_user;
+ } nrf_uart_state_t;
+diff --git a/src/arm/nrf52840_soc.c b/src/arm/nrf52840_soc.c
+index 3650419..ea2f54c 100644
+--- a/src/arm/nrf52840_soc.c
++++ b/src/arm/nrf52840_soc.c
+@@ -101,21 +101,37 @@ static void nrf_clock_write(void *user_data, uint32_t addr, uint32_t value) {
+  * (PSEL.TXD/RXD/CTS/RTS, BAUDRATE, CONFIG: writes accepted, no
+  * behaviour. Reads return 0.)
+  *
+- * UARTE EasyDMA path (TXD.PTR / TXD.MAXCNT / TASKS_STARTTX) is NOT
+- * modelled — Contiki uses the legacy API with NRF52840_NATIVE_USB=0.
++ * The EasyDMA UARTE path (TXD.PTR / TXD.MAXCNT / TASKS_STARTTX) shares
++ * this window and is modelled too: Zephyr's nrfx UARTE driver streams
++ * its console output that way rather than through the legacy TXD byte
++ * register, so without it a Zephyr build boots but prints nothing.
+  * ============================================================ */
+ #define NRF_UART0_BASE             0x40002000u
+ #define NRF_UART0_SIZE             0x1000u
++#define NRF_UART_TASKS_STARTTX     0x008
++#define NRF_UART_TASKS_STOPTX      0x00C
+ #define NRF_UART_EVENTS_TXDRDY     0x11C
++#define NRF_UART_EVENTS_ENDTX      0x120
++#define NRF_UART_EVENTS_TXSTARTED  0x150
++#define NRF_UART_EVENTS_TXSTOPPED  0x158
+ #define NRF_UART_ENABLE            0x500
+ #define NRF_UART_TXD               0x51C
++#define NRF_UART_TXD_PTR           0x544
++#define NRF_UART_TXD_MAXCNT        0x548
++#define NRF_UART_TXD_AMOUNT        0x54C
+ 
+ static int nrf_uart_read(void *user_data, uint32_t addr) {
+     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
+     uint32_t off = addr - NRF_UART0_BASE;
+     switch (off) {
+-        case NRF_UART_EVENTS_TXDRDY: return (int)uart->txdrdy;
+-        case NRF_UART_ENABLE:        return (int)uart->enable;
++        case NRF_UART_EVENTS_TXDRDY:    return (int)uart->txdrdy;
++        case NRF_UART_EVENTS_ENDTX:     return (int)uart->evt_endtx;
++        case NRF_UART_EVENTS_TXSTARTED: return (int)uart->evt_txstarted;
++        case NRF_UART_EVENTS_TXSTOPPED: return (int)uart->evt_txstopped;
++        case NRF_UART_ENABLE:           return (int)uart->enable;
++        case NRF_UART_TXD_PTR:          return (int)uart->tx_ptr;
++        case NRF_UART_TXD_MAXCNT:       return (int)uart->tx_maxcnt;
++        case NRF_UART_TXD_AMOUNT:       return (int)uart->tx_amount;
+         default: return 0;
+     }
+ }
+@@ -123,18 +139,44 @@ static int nrf_uart_read(void *user_data, uint32_t addr) {
+ static void nrf_uart_write(void *user_data, uint32_t addr, uint32_t value) {
+     nrf_uart_state_t *uart = (nrf_uart_state_t *)user_data;
+     uint32_t off = addr - NRF_UART0_BASE;
++    if (getenv("NRF_UART_TRACE"))
++        fprintf(stderr, "[nrf-uart-w] off=0x%03x val=0x%x\n", off, value);
+     switch (off) {
+         case NRF_UART_TXD:
+-            /* Forward to console callback if installed. Set TXDRDY so
+-             * the firmware's spin-loop exits on the next read. */
++            /* Legacy byte-at-a-time TX. Forward to console callback if
++             * installed. Set TXDRDY so the firmware's spin-loop exits on
++             * the next read. */
+             if (uart->tx_cb)
+                 uart->tx_cb(uart->tx_user, (uint8_t)(value & 0xFF));
+             uart->txdrdy = 1;
+             break;
++        case NRF_UART_TASKS_STARTTX:
++            /* EasyDMA TX kick: stream MAXCNT bytes from SRAM at TXD.PTR
++             * through the console callback, then latch ENDTX/TXSTARTED so
++             * the nrfx driver's poll loop completes. */
++            if ((value & 1) && uart->plat) {
++                for (uint32_t i = 0; i < uart->tx_maxcnt; i++) {
++                    uint8_t b = arm_read8(&uart->plat->cpu, uart->tx_ptr + i);
++                    if (uart->tx_cb) uart->tx_cb(uart->tx_user, b);
++                }
++                uart->tx_amount     = uart->tx_maxcnt;
++                uart->evt_txstarted = 1;
++                uart->evt_endtx     = 1;
++            }
++            break;
++        case NRF_UART_TASKS_STOPTX:
++            if (value & 1) uart->evt_txstopped = 1;
++            break;
++        case NRF_UART_TXD_PTR:    uart->tx_ptr    = value; break;
++        case NRF_UART_TXD_MAXCNT: uart->tx_maxcnt = value; break;
++        case NRF_UART_TXD_AMOUNT: uart->tx_amount = value; break;
+         case NRF_UART_EVENTS_TXDRDY:
+             /* Firmware writes 0 to ack the event after consuming it. */
+             uart->txdrdy = value & 1;
+             break;
++        case NRF_UART_EVENTS_ENDTX:     uart->evt_endtx     = value & 1; break;
++        case NRF_UART_EVENTS_TXSTARTED: uart->evt_txstarted = value & 1; break;
++        case NRF_UART_EVENTS_TXSTOPPED: uart->evt_txstopped = value & 1; break;
+         case NRF_UART_ENABLE:
+             uart->enable = value;
+             break;
+@@ -1079,6 +1121,7 @@ static void nrf52840_soc_init(arm_platform_t *plat) {
+     /* CLOCK and UART register windows. */
+     arm_register_io(&plat->cpu, NRF_CLOCK_BASE, NRF_CLOCK_SIZE,
+                     nrf_clock_read, nrf_clock_write, &soc->clock);
++    soc->uart0.plat = plat;
+     arm_register_io(&plat->cpu, NRF_UART0_BASE, NRF_UART0_SIZE,
+                     nrf_uart_read, nrf_uart_write, &soc->uart0);
+ 
