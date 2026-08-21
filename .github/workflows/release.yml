@@ -59,9 +59,8 @@ jobs:
       # on savannah's cgit being up.
       - name: Build static GNU Lightning 2.2.3 (+ mprotect fix)
         run: |
-          curl -sL https://ftp.gnu.org/gnu/lightning/lightning-2.2.3.tar.gz | tar xz
+          .github/scripts/fetch-lightning.sh
           cd lightning-2.2.3
-          patch -p1 < ../.github/patches/lightning-2.2.3-mprotect.patch
           ./configure --prefix="$GITHUB_WORKSPACE/.lightning" --disable-shared > /dev/null
           make -j"$(getconf _NPROCESSORS_ONLN)" > /dev/null
           make install > /dev/null

@@ -37,12 +37,8 @@ jobs:
       - name: Install GNU Lightning (Linux, source build)
         if: runner.os == 'Linux'
         run: |
-          curl -sL https://ftp.gnu.org/gnu/lightning/lightning-2.2.3.tar.gz | tar xz
+          .github/scripts/fetch-lightning.sh   # fetch + sha256 + mprotect patch, shared with release.yml
           cd lightning-2.2.3
-          # Same vendored mprotect fix the release workflow applies — see
-          # .github/patches/.  Linux happens to run without it, but the two
-          # recipes must not drift.
-          patch -p1 < ../.github/patches/lightning-2.2.3-mprotect.patch
           ./configure --prefix=/usr/local > /dev/null
           make -j"$(nproc)" > /dev/null
           sudo make install > /dev/null
