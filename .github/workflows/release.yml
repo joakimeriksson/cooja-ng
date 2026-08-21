@@ -45,7 +45,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-22.04, target: linux-x86_64 }
-          - { os: macos-13,     target: macos-x64 }     # Intel runner
+          - { os: macos-15-intel, target: macos-x64 }   # GitHub's current Intel runner — same one Contiki-NG CI uses; macos-13 is retired and queues forever
           - { os: macos-latest, target: macos-arm64 }
     steps:
       - uses: actions/checkout@v4
