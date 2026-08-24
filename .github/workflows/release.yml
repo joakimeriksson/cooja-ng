@@ -90,6 +90,10 @@ jobs:
           cp tools/run-cooja-tests.sh         "dist/$PKG/tools/"
           cp tools/csc2json.py                "dist/$PKG/tools/"
           cp tools/build-test-firmware.sh     "dist/$PKG/tools/"
+          # csc2json.py rewrites the Cooja serial-socket host command to this
+          # wrapper; without it 6 of the 8 17-tun-rpl-br tests fail at host
+          # start (/bin/sh: test-border-router.sh: not found).
+          cp tools/test-border-router.sh      "dist/$PKG/tools/"
           cat > "dist/$PKG/README.md" <<EOF
           # Cooja-NG ${VERSION} (${{ matrix.target }})
 
