@@ -766,8 +766,17 @@ static void *js_thread_func(void *arg) {
             if (str) JS_FreeCString(ctx, str);
             JS_FreeValue(ctx, exc);
         } else {
-            /* Script ended without testOK/testFailed — treated as success
-             * if it ran to completion (e.g., all steps done). */
+            /* Script ran off the end without ever calling testOK() or
+             * testFailed().  This used to count as success, which is a
+             * silent-green hole: a truncated or mis-converted script — or an
+             * upstream script whose assertion path was simply never reached —
+             * would pass by doing nothing.  It is not Cooja's semantics
+             * either: there, an ended script leaves the verdict to TIMEOUT,
+             * whose default is failure.  FAIL-LOUDLY: no verdict is a
+             * failure. */
+            e->finished = -1;
+            snprintf(e->fail_reason, sizeof(e->fail_reason),
+                     "script ended without a testOK()/testFailed() verdict");
         }
     }
     e->js_waiting = true;
