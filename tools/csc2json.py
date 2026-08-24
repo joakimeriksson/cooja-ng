@@ -20,6 +20,164 @@ import xml.etree.ElementTree as ET
 from html import unescape
 
 
+class ConversionError(Exception):
+    """One or more .csc features this converter does not understand.
+
+    FAIL-LOUDLY CONTRACT: this converter is the bridge between Cooja's .csc
+    format and csim's native JSON config, and it runs inside CI gates.  A
+    feature it does not recognize must therefore be a hard conversion error,
+    never a silently dropped element — a dropped radio medium, plugin, or
+    interface config can change what the simulation *is* while the test still
+    prints green.  Everything on the allowlists below is there because it was
+    inventoried from the Contiki-NG 5.2 suite (93 .csc files) and either
+    handled or shown to have no effect on simulation semantics; anything
+    upstream adds later lands here as an error the same day it appears.
+    """
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__("; ".join(errors))
+
+
+# Every class/tag below was inventoried from the Contiki-NG 5.2 test suite.
+# "handled" means the converter consumes it; "ignored" means it provably does
+# not affect headless simulation semantics (GUI/observation only) and is
+# listed so the reader can see the decision was made, not missed.
+
+KNOWN_ROOT_TAGS = {"simulation", "plugin", "project"}
+
+KNOWN_SIM_TAGS = {
+    "title", "randomseed", "motedelay_us", "radiomedium", "motetype",
+    "events",       # ignored: Cooja log-output buffer size, GUI only
+    "speedlimit",   # ignored: wall-clock pacing for interactive runs; csim
+                    # runs headless at full speed (TUN tests get speed=1.0
+                    # from the SerialSocketServer path instead)
+}
+
+KNOWN_RADIO_MEDIUM_TAGS = {
+    "transmitting_range", "interference_range",
+    "success_ratio_tx", "success_ratio_rx",
+}
+
+KNOWN_MOTE_TYPE_CLASSES = {
+    "org.contikios.cooja.contikimote.ContikiMoteType",
+    "org.contikios.cooja.mspmote.SkyMoteType",
+    "org.contikios.cooja.mspmote.Z1MoteType",
+}
+
+# interface_config class -> handled here, or known-cosmetic.
+KNOWN_INTERFACE_CONFIGS = {
+    "org.contikios.cooja.interfaces.Position",             # handled
+    "org.contikios.cooja.contikimote.interfaces.ContikiMoteID",  # handled
+    "org.contikios.cooja.mspmote.interfaces.MspMoteID",    # handled
+    "org.contikios.cooja.mspmote.interfaces.MspClock",     # handled
+    "org.contikios.cooja.contikimote.interfaces.ContikiRS232",   # ignored:
+        # carries the GUI serial-console command history, nothing else
+}
+
+# Declared mote hardware (<moteinterface> lists).  These say what the mote
+# HAS, so a new one is a semantic change (a second radio, a new sensor) even
+# when it carries no <interface_config> — it must flag, not vanish.  The set
+# below is the complete inventory of the Contiki-NG 5.2 suite; csim provides
+# the equivalent function through its platform models (or the interface is
+# GUI/sensor scaffolding with no bearing on the network tests).
+KNOWN_MOTE_INTERFACES = {
+    "org.contikios.cooja.interfaces.Position",
+    "org.contikios.cooja.interfaces.Mote2MoteRelations",
+    "org.contikios.cooja.interfaces.IPAddress",
+    "org.contikios.cooja.interfaces.MoteAttributes",
+    "org.contikios.cooja.interfaces.Battery",
+    "org.contikios.cooja.interfaces.RimeAddress",
+    "org.contikios.cooja.contikimote.interfaces.ContikiVib",
+    "org.contikios.cooja.contikimote.interfaces.ContikiRadio",
+    "org.contikios.cooja.contikimote.interfaces.ContikiRS232",
+    "org.contikios.cooja.contikimote.interfaces.ContikiPIR",
+    "org.contikios.cooja.contikimote.interfaces.ContikiMoteID",
+    "org.contikios.cooja.contikimote.interfaces.ContikiLED",
+    "org.contikios.cooja.contikimote.interfaces.ContikiClock",
+    "org.contikios.cooja.contikimote.interfaces.ContikiCFS",
+    "org.contikios.cooja.contikimote.interfaces.ContikiButton",
+    "org.contikios.cooja.contikimote.interfaces.ContikiBeeper",
+    "org.contikios.cooja.contikimote.interfaces.ContikiEEPROM",
+    "org.contikios.cooja.mspmote.interfaces.MspMoteID",
+    "org.contikios.cooja.mspmote.interfaces.MspClock",
+    "org.contikios.cooja.mspmote.interfaces.Msp802154Radio",
+    "org.contikios.cooja.mspmote.interfaces.MspDebugOutput",
+    "org.contikios.cooja.mspmote.interfaces.MspSerial",
+    "org.contikios.cooja.mspmote.interfaces.MspDefaultSerial",
+    "org.contikios.cooja.mspmote.interfaces.MspLED",
+    "org.contikios.cooja.mspmote.interfaces.SkyLED",
+    "org.contikios.cooja.mspmote.interfaces.SkyFlash",
+    "org.contikios.cooja.mspmote.interfaces.SkyButton",
+    "org.contikios.cooja.mspmote.interfaces.SkyTemperature",
+    "org.contikios.cooja.mspmote.interfaces.SkyCoffeeFilesystem",
+}
+
+KNOWN_PLUGINS_HANDLED = {
+    "org.contikios.cooja.plugins.ScriptRunner",
+    "org.contikios.cooja.plugins.Mobility",
+    "org.contikios.cooja.serialsocket.SerialSocketServer",
+}
+KNOWN_PLUGINS_IGNORED = {
+    # Pure observation/GUI plugins: they render state, they never change it.
+    # PowerTracker is deliberately NOT here — a script can read its stats,
+    # so dropping it could turn a real assertion into a no-op.
+    "org.contikios.cooja.plugins.SimControl",
+    "org.contikios.cooja.plugins.LogListener",
+    "org.contikios.cooja.plugins.Visualizer",
+    "org.contikios.cooja.plugins.Notes",
+    "org.contikios.cooja.plugins.TimeLine",
+    "org.contikios.cooja.plugins.RadioLogger",
+    "org.contikios.cooja.plugins.BufferListener",
+    "org.contikios.cooja.plugins.MoteInterfaceViewer",
+}
+
+
+def check_unknown_features(root, sim):
+    """Return a list of errors for any .csc feature outside the allowlists."""
+    errors = []
+
+    for child in root:
+        if child.tag not in KNOWN_ROOT_TAGS:
+            errors.append(f"unknown top-level element <{child.tag}>")
+
+    for child in sim:
+        if child.tag not in KNOWN_SIM_TAGS:
+            errors.append(f"unknown <simulation> element <{child.tag}>")
+
+    rm = sim.find("radiomedium")
+    if rm is None:
+        errors.append("no <radiomedium> element")
+    else:
+        rm_class = (rm.text or "").strip()
+        if "radiomediums.UDGM" not in rm_class:
+            errors.append(f"unsupported radio medium class '{rm_class}' "
+                          f"(only UDGM is implemented)")
+        for child in rm:
+            if child.tag not in KNOWN_RADIO_MEDIUM_TAGS:
+                errors.append(f"unknown <radiomedium> element <{child.tag}>")
+
+    for mt in sim.findall("motetype"):
+        mt_class = (mt.text or "").strip()
+        if mt_class and mt_class not in KNOWN_MOTE_TYPE_CLASSES:
+            errors.append(f"unsupported mote type class '{mt_class}'")
+        for mi in mt.iter("moteinterface"):
+            mi_class = (mi.text or "").strip()
+            if mi_class and mi_class not in KNOWN_MOTE_INTERFACES:
+                errors.append(f"unknown moteinterface '{mi_class}'")
+        for ic in mt.iter("interface_config"):
+            ic_class = (ic.text or "").strip()
+            if ic_class and ic_class not in KNOWN_INTERFACE_CONFIGS:
+                errors.append(f"unknown interface_config '{ic_class}'")
+
+    for plugin in root.findall("plugin"):
+        p_class = (plugin.text or "").strip()
+        if (p_class and p_class not in KNOWN_PLUGINS_HANDLED
+                and p_class not in KNOWN_PLUGINS_IGNORED):
+            errors.append(f"unknown plugin '{p_class}'")
+
+    return errors
+
+
 def parse_csc(csc_path):
     """Parse a .csc XML file, return the ElementTree root."""
     tree = ET.parse(csc_path)
@@ -1118,16 +1276,22 @@ def list_firmware_files(root, csc_dir):
     return sorted(firmware)
 
 
-def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False):
+def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False,
+                lax=False):
     """Convert a .csc file to csim JSON config dict.
-    Returns (config_dict, warnings_list)."""
+    Returns (config_dict, warnings_list).
+
+    Strict by default: any element/class outside the inventoried allowlists
+    raises ConversionError (see its docstring for why).  lax=True downgrades
+    those to warnings — for exploration only, never for CI."""
     csc_dir = os.path.dirname(os.path.abspath(csc_path))
     root = parse_csc(csc_path)
     sim = root.find("simulation")
     if sim is None:
-        raise ValueError("No <simulation> element found in .csc file")
+        raise ConversionError(["no <simulation> element found in .csc file"])
 
     warnings = []
+    errors = check_unknown_features(root, sim)
     config = {}
 
     # Title
@@ -1177,13 +1341,22 @@ def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False):
     script = extract_script(root, csc_dir)
     if script:
         if js_native:
-            # Embed raw JS for native execution via QuickJS
+            # Embed raw JS for native execution via QuickJS.  The
+            # detect_unsupported_features() list does NOT apply here: the JS
+            # engine implements java.util.Random (algorithm-exact polyfill)
+            # and generateMote/addMote/removeMote natively, and anything it
+            # does not implement raises a JS exception at run time, which the
+            # engine reports as a test FAILURE — loud, not silent.
             cleaned = clean_script(script)
             timeout_ms, _, _, _ = parse_timeout(cleaned)
             if timeout_ms:
                 config["timeout_ms"] = timeout_ms
             config["test"] = {"js_script_inline": cleaned}
         else:
+            for feat in detect_unsupported_features(script):
+                errors.append(f"test script uses feature the JSON translation "
+                              f"cannot express: {feat} (js-native mode "
+                              f"supports it)")
             test_config, script_warnings = translate_script(script, nodes)
             warnings.extend(script_warnings)
 
@@ -1238,6 +1411,12 @@ def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False):
         # Replace the infinite JS loop with a simple timeout_is_success
         config["test"] = {"timeout_is_success": True}
 
+    if errors:
+        if lax:
+            warnings.extend(f"(lax) {e}" for e in errors)
+        else:
+            raise ConversionError(errors)
+
     return config, warnings
 
 
@@ -1256,6 +1435,11 @@ def main():
     parser.add_argument("--js-native", action="store_true",
                         help="Embed raw JS script for native QuickJS execution "
                              "instead of converting to JSON steps")
+    parser.add_argument("--lax", action="store_true",
+                        help="Downgrade unknown-feature errors to warnings. "
+                             "For exploration only — CI must never pass this: "
+                             "a silently dropped feature can change what the "
+                             "simulation is while the test stays green.")
 
     args = parser.parse_args()
 
@@ -1273,8 +1457,17 @@ def main():
             print(fw)
         return
 
-    config, warnings = convert_csc(csc_path, args.contiki, args.firmware_dir,
-                                    js_native=args.js_native)
+    try:
+        config, warnings = convert_csc(csc_path, args.contiki, args.firmware_dir,
+                                       js_native=args.js_native, lax=args.lax)
+    except ConversionError as e:
+        print(f"CONVERSION FAILED: {csc_path}", file=sys.stderr)
+        for err in e.errors:
+            print(f"  ERROR: {err}", file=sys.stderr)
+        print("  (unknown .csc features are fatal by design — see "
+              "ConversionError in this file; --lax downgrades for exploration)",
+              file=sys.stderr)
+        sys.exit(2)
 
     if warnings and args.warn:
         for w in warnings:

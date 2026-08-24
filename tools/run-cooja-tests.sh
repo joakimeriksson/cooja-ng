@@ -133,6 +133,7 @@ total=0
 
 FAILED_TESTS=""
 SKIPPED_TESTS=""
+ERRORED_TESTS=""
 failed_count=0
 skipped_count=0
 
@@ -207,8 +208,12 @@ for csc_file in $csc_files; do
 
     # Convert .csc to JSON with native JS execution
     json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
-    if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
+    conv_log="$TMP_DIR/$(echo "$test_name" | tr '/' '_').convert.log"
+    if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>"$conv_log"; then
         echo "  ERROR $test_name (conversion failed)"
+        sed 's/^/        /' "$conv_log"
+        ERRORED_TESTS="$ERRORED_TESTS
+  - $test_name (conversion failed)"
         errors=$((errors + 1))
         continue
     fi
@@ -226,14 +231,15 @@ has_js = 'js_script_inline' in t
 has_ss = 'serial_socket' in d
 if has_steps or has_fail_on or has_tis or has_js or has_ss:
     print('yes')
-" 2>/dev/null || true)
+" 2>/dev/null || echo inspect-failed)
 
     if [ "$has_test" != "yes" ]; then
-        echo "  SKIP  $test_name (no test criteria)"
-        SKIPPED_TESTS="$SKIPPED_TESTS
+        # A test with no assertions must not pass by simply existing, and a
+        # crash in the inspection itself must not demote to SKIP.
+        echo "  ERROR $test_name (no test criteria)"
+        ERRORED_TESTS="$ERRORED_TESTS
   - $test_name (no test criteria)"
-        skipped=$((skipped + 1))
-        skipped_count=$((skipped_count + 1))
+        errors=$((errors + 1))
         continue
     fi
 
@@ -301,8 +307,12 @@ if [ "$need_rebuild_count" -gt 0 ]; then
         [ -f "$csc_file" ] || continue
 
         json_file="$TMP_DIR/$(echo "$test_name" | tr '/' '_').json"
-        if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>/dev/null; then
+        conv_log="$TMP_DIR/$(echo "$test_name" | tr '/' '_').convert.log"
+        if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>"$conv_log"; then
             echo "  ERROR $test_name (conversion failed)"
+            sed 's/^/        /' "$conv_log"
+            ERRORED_TESTS="$ERRORED_TESTS
+  - $test_name (conversion failed)"
             errors=$((errors + 1))
             continue
         fi
@@ -328,11 +338,13 @@ for n in d.get('nodes', []):
         done
 
         if [ -n "$missing_fw" ]; then
-            echo "  SKIP  $test_name (still missing: $(basename "$missing_fw"))"
-            SKIPPED_TESTS="$SKIPPED_TESTS
-  - $test_name (missing firmware)"
-            skipped=$((skipped + 1))
-            skipped_count=$((skipped_count + 1))
+            # The rebuild ran and the firmware is STILL missing: the build
+            # failed. That is an error, not a skip — a broken firmware build
+            # must never turn into a green suite.
+            echo "  ERROR $test_name (firmware build failed: $(basename "$missing_fw"))"
+            ERRORED_TESTS="$ERRORED_TESTS
+  - $test_name (firmware build failed)"
+            errors=$((errors + 1))
             continue
         fi
 
@@ -358,8 +370,17 @@ if [ $skipped_count -gt 0 ] && [ -n "$VERBOSE" ]; then
     echo "Skipped tests:$SKIPPED_TESTS"
 fi
 
-# Exit with failure if any test failed
-if [ $failed -gt 0 ]; then
+if [ $errors -gt 0 ]; then
+    echo ""
+    echo "Errored tests:$ERRORED_TESTS"
+fi
+
+# FAIL-LOUDLY: failures AND errors fail the suite.  An error means a test
+# could not even be attempted (conversion, firmware build, or a test with
+# nothing to assert) — none of which may produce a green result.  The only
+# accepted skips are the explicit opt-outs: TUN tests without --with-tun,
+# and missing firmware under --no-build.
+if [ $failed -gt 0 ] || [ $errors -gt 0 ]; then
     exit 1
 fi
 exit 0
