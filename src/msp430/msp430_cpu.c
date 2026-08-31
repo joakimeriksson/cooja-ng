@@ -752,6 +752,11 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
 #ifdef HAVE_LIGHTNING
     if (cpu->compiled_cache) {
         while (count > 0) {
+            /* Slice budget (MSPSim: no instruction starts once
+             * cycles >= maxCycles).  cycle_limit is INT64_MAX outside
+             * msp430_step_until, so this only binds inside a timed slice. */
+            if (cpu->cycles >= cpu->cycle_limit)
+                return count;
             /* Event processing */
             if (cpu->cycles >= cpu->next_event_cycle) {
                 execute_events(cpu);
@@ -787,7 +792,8 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
                     (compiled_block_t *)cpu->compiled_cache[ci];
                 if (cb && count >= cb->length &&
                     cpu->cycles + cb->length * 6 <
-                        cpu->next_event_cycle) {
+                        cpu->next_event_cycle &&
+                    cpu->cycles + cb->length * 6 < cpu->cycle_limit) {
 #ifdef JIT_VERIFY
                     /* Save state before JIT execution */
                     uint32_t save_reg[16];
@@ -842,6 +848,7 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
                            Check events and interrupts between blocks. */
                         while (count > 0 &&
                                cpu->cycles < cpu->next_event_cycle &&
+                               cpu->cycles < cpu->cycle_limit &&
                                cpu->interrupt_max < 0) {
                             pc = cpu->reg[MSP430_PC];
                             ci = pc >> 1;
@@ -849,6 +856,8 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
                             cb = (compiled_block_t *)
                                 cpu->compiled_cache[ci];
                             if (!cb || count < cb->length) break;
+                            if (cpu->cycles + cb->length * 6 >= cpu->cycle_limit)
+                                break;  /* finish the slice in the interpreter */
                             executed = cb->fn(cpu);
                             if (executed <= 0) break;
                             cpu->instructions += executed;
@@ -998,6 +1007,13 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
 #endif
 
     while (count > 0) {
+        /* Slice budget: MSPSim's emulateOP loop stops before the first
+         * instruction that would start at or past maxCycles.  Without this
+         * per-instruction check an active CPU (e.g. a TSCH busy-wait) ran
+         * up to several ms past the scheduler's time, and frames it then
+         * transmitted were anchored at the (earlier) scheduler time. */
+        if (cpu->cycles >= cpu->cycle_limit)
+            return count;
         /* Match MSPSim execution order: INTERRUPTS → LPM → INSTRUCTION → EVENTS.
          * MSPSim fires events AFTER instruction execution (emulateOP line 2080),
          * while interrupts are checked BEFORE (line 913). This ensures that
