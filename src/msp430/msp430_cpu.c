@@ -752,6 +752,11 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
 #ifdef HAVE_LIGHTNING
     if (cpu->compiled_cache) {
         while (count > 0) {
+            /* Slice budget (MSPSim: no instruction starts once
+             * cycles >= maxCycles).  cycle_limit is INT64_MAX outside
+             * msp430_step_until, so this only binds inside a timed slice. */
+            if (cpu->cycles >= cpu->cycle_limit)
+                return count;
             /* Event processing */
             if (cpu->cycles >= cpu->next_event_cycle) {
                 execute_events(cpu);
@@ -787,7 +792,8 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
                     (compiled_block_t *)cpu->compiled_cache[ci];
                 if (cb && count >= cb->length &&
                     cpu->cycles + cb->length * 6 <
-                        cpu->next_event_cycle) {
+                        cpu->next_event_cycle &&
+                    cpu->cycles + cb->length * 6 < cpu->cycle_limit) {
 #ifdef JIT_VERIFY
                     /* Save state before JIT execution */
                     uint32_t save_reg[16];
@@ -842,6 +848,7 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
                            Check events and interrupts between blocks. */
                         while (count > 0 &&
                                cpu->cycles < cpu->next_event_cycle &&
+                               cpu->cycles < cpu->cycle_limit &&
                                cpu->interrupt_max < 0) {
                             pc = cpu->reg[MSP430_PC];
                             ci = pc >> 1;
@@ -849,6 +856,8 @@ int msp430_step(msp430_cpu_t *cpu, int count) {
                             cb = (compiled_block_t *)
                                 cpu->compiled_cache[ci];
                             if (!cb || count < cb->length) break;
+                            if (cpu->cycles + cb->length * 6 >= cpu->cycle_limit)
+                                break;  /* finish the slice in the interpreter */
                             executed = cb->fn(cpu);
                             if (executed <= 0) break;
                             cpu->instructions += executed;
@@ -998,6 +1007,13 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
 #endif
 
     while (count > 0) {
+        /* Slice budget: MSPSim's emulateOP loop stops before the first
+         * instruction that would start at or past maxCycles.  Without this
+         * per-instruction check an active CPU (e.g. a TSCH busy-wait) ran
+         * up to several ms past the scheduler's time, and frames it then
+         * transmitted were anchored at the (earlier) scheduler time. */
+        if (cpu->cycles >= cpu->cycle_limit)
+            return count;
         /* Match MSPSim execution order: INTERRUPTS → LPM → INSTRUCTION → EVENTS.
          * MSPSim fires events AFTER instruction execution (emulateOP line 2080),
          * while interrupts are checked BEFORE (line 913). This ensures that
@@ -1613,6 +1629,51 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             uint32_t sr = reg[MSP430_SR];
             uint32_t nxt_carry;
 
+            /* MSP430X repeat prefix (RPT #n / RPT Rn) on register-mode
+             * single-operand instructions: RRAX/RRCX/SWPBX/SXTX execute
+             * 1 + n times (n from ext[3:0] or Rn[3:0]); ZC (ext bit 5)
+             * clears the carry-in of every RRCX repetition.  Same layout
+             * as the two-operand repeat code.  Only the final repetition
+             * falls through to the common flag/write-back path below; the
+             * earlier ones are applied here.  Previously the count was
+             * ignored, so `RPT R14; RRA R15` (mspgcc's `x >> n` idiom)
+             * shifted exactly once. */
+            if (sext && dst_reg_mode &&
+                (single_op == OP_RRC || single_op == OP_RRA ||
+                 single_op == OP_SWPB || single_op == OP_SXT)) {
+                bool rep_in_reg = (sext >> 7) & 1;
+                int n = sext & 0xf;
+                int repeats = 1 + (rep_in_reg ? (int)(reg[n] & 0xf) : n);
+                bool zero_carry = (sext & 0x20) != 0;
+                for (int rep = 1; rep < repeats; rep++) {
+                    switch (single_op) {
+                    case OP_RRC: {
+                        uint32_t c_in = zero_carry ? 0 : (sr & SR_C);
+                        uint32_t c_out = (dst & 1) ? SR_C : 0;
+                        dst = (dst >> 1) | (c_in ? msb : 0);
+                        sr = (sr & ~(SR_C | SR_V)) | c_out;
+                        break;
+                    }
+                    case OP_RRA: {
+                        uint32_t c_out = (dst & 1) ? SR_C : 0;
+                        dst = (dst & msb) | (dst >> 1);
+                        sr = (sr & ~(SR_C | SR_V)) | c_out;
+                        break;
+                    }
+                    case OP_SWPB:
+                        dst = ((dst & 0xff) << 8) | ((dst >> 8) & 0xff);
+                        break;
+                    case OP_SXT:
+                        dst = (dst & 0x80) ? (dst | 0xfff00) : (dst & 0x7f);
+                        break;
+                    default: break;
+                    }
+                    dst &= mask;
+                    cpu->cycles += 1;
+                }
+                if (zero_carry && single_op == OP_RRC)
+                    sr &= ~SR_C;   /* carry-in of the final repetition */
+            }
             switch (single_op) {
             case OP_RRC:
                 nxt_carry = (dst & 1) ? SR_C : 0;

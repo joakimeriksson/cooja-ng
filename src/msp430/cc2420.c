@@ -730,8 +730,13 @@ void cc2420_receive_byte(cc2420_t *radio, uint8_t data) {
                 r->stat_rx_ack_completed++;
             }
 
-            /* Replace last 2 bytes with RSSI + (corrval | crc_ok<<7) */
-            uint8_t rssi_val = (uint8_t)(int8_t)r->rx_rssi;
+            /* Replace last 2 bytes with RSSI + (corrval | crc_ok<<7).
+             * The CC2420 footer carries the RSSI *register* value, i.e.
+             * dBm - RSSI_OFFSET (offset -45 dBm), exactly what MSPSim writes
+             * (registers[REG_RSSI] & 0xff).  Contiki's driver then computes
+             * footer[0] + RSSI_OFFSET to recover dBm.  Writing raw dBm here
+             * made every frame look 45 dB weaker to the firmware. */
+            uint8_t rssi_val = (uint8_t)(int8_t)(r->rx_rssi + 45);
             /* Derive correlation from RSSI: map [-10..-90] -> [110..50]
              * dist_ratio = -(rssi + 10) / 80; corr = 110 - dist_ratio * 60 */
             int corr = 110 + ((int)r->rx_rssi + 10) * 60 / 80;
