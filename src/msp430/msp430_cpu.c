@@ -1629,6 +1629,51 @@ static int msp430_step_interpreter(msp430_cpu_t *cpu, int count) {
             uint32_t sr = reg[MSP430_SR];
             uint32_t nxt_carry;
 
+            /* MSP430X repeat prefix (RPT #n / RPT Rn) on register-mode
+             * single-operand instructions: RRAX/RRCX/SWPBX/SXTX execute
+             * 1 + n times (n from ext[3:0] or Rn[3:0]); ZC (ext bit 5)
+             * clears the carry-in of every RRCX repetition.  Same layout
+             * as the two-operand repeat code.  Only the final repetition
+             * falls through to the common flag/write-back path below; the
+             * earlier ones are applied here.  Previously the count was
+             * ignored, so `RPT R14; RRA R15` (mspgcc's `x >> n` idiom)
+             * shifted exactly once. */
+            if (sext && dst_reg_mode &&
+                (single_op == OP_RRC || single_op == OP_RRA ||
+                 single_op == OP_SWPB || single_op == OP_SXT)) {
+                bool rep_in_reg = (sext >> 7) & 1;
+                int n = sext & 0xf;
+                int repeats = 1 + (rep_in_reg ? (int)(reg[n] & 0xf) : n);
+                bool zero_carry = (sext & 0x20) != 0;
+                for (int rep = 1; rep < repeats; rep++) {
+                    switch (single_op) {
+                    case OP_RRC: {
+                        uint32_t c_in = zero_carry ? 0 : (sr & SR_C);
+                        uint32_t c_out = (dst & 1) ? SR_C : 0;
+                        dst = (dst >> 1) | (c_in ? msb : 0);
+                        sr = (sr & ~(SR_C | SR_V)) | c_out;
+                        break;
+                    }
+                    case OP_RRA: {
+                        uint32_t c_out = (dst & 1) ? SR_C : 0;
+                        dst = (dst & msb) | (dst >> 1);
+                        sr = (sr & ~(SR_C | SR_V)) | c_out;
+                        break;
+                    }
+                    case OP_SWPB:
+                        dst = ((dst & 0xff) << 8) | ((dst >> 8) & 0xff);
+                        break;
+                    case OP_SXT:
+                        dst = (dst & 0x80) ? (dst | 0xfff00) : (dst & 0x7f);
+                        break;
+                    default: break;
+                    }
+                    dst &= mask;
+                    cpu->cycles += 1;
+                }
+                if (zero_carry && single_op == OP_RRC)
+                    sr &= ~SR_C;   /* carry-in of the final repetition */
+            }
             switch (single_op) {
             case OP_RRC:
                 nxt_carry = (dst & 1) ? SR_C : 0;

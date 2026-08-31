@@ -563,6 +563,62 @@ static void test_single_operand(void) {
         cleanup_cpu(&cpu);
     }
 
+    /* MSP430X RPT prefix on single-operand register instructions.
+     * Register count: RPT R5 executes 1 + (R5 & 0xF) times. mspgcc emits
+     * `add.b #-1,Rn ; .rpt Rn ; rra Rd` for `x >> n`, so an ignored count
+     * silently shifts by one (seen in Contiki-NG's nbr_get_bit). */
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f5437_config, 0x5c00);
+        int pc = 0x5c00;
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x0080); pc += 2;  /* MOV #0x80, R4 */
+        WW(pc, 0x4035); pc += 2; WW(pc, 0x0003); pc += 2;  /* MOV #3, R5   */
+        WW(pc, 0x18c5); pc += 2;                            /* RPT R5 (A/L=1) */
+        WW(pc, 0x1104); pc += 2;                            /* RRA R4 -> 4 shifts */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("RPT R5(=3) RRA R4: 0x80 >> 4 = 0x08", 0x0008, cpu.reg[4] & 0xFFFF);
+        cleanup_cpu(&cpu);
+    }
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f5437_config, 0x5c00);
+        int pc = 0x5c00;
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x0002); pc += 2;  /* MOV #2, R4 */
+        WW(pc, 0x4035); pc += 2; WW(pc, 0x0001); pc += 2;  /* MOV #1, R5 */
+        WW(pc, 0x18c5); pc += 2;                            /* RPT R5 */
+        WW(pc, 0x1104); pc += 2;                            /* RRA R4 -> 2 shifts */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("RPT R5(=1) RRA R4: 0x02 >> 2 = 0", 0x0000, cpu.reg[4] & 0xFFFF);
+        cleanup_cpu(&cpu);
+    }
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f5437_config, 0x5c00);
+        int pc = 0x5c00;
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x0100); pc += 2;  /* MOV #0x100, R4 */
+        WW(pc, 0x1843); pc += 2;                            /* RPT #3 (immediate, A/L=1) */
+        WW(pc, 0x1104); pc += 2;                            /* RRA R4 -> 4 shifts */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 2);
+        assert_eq("RPT #3 RRA R4: 0x100 >> 4 = 0x10", 0x0010, cpu.reg[4] & 0xFFFF);
+        cleanup_cpu(&cpu);
+    }
+    {
+        msp430_cpu_t cpu;
+        setup_cpu(&cpu, &msp430f5437_config, 0x5c00);
+        int pc = 0x5c00;
+        WW(pc, 0x4034); pc += 2; WW(pc, 0x8001); pc += 2;  /* MOV #0x8001, R4 */
+        WW(pc, 0xd312); pc += 2;                            /* SETC */
+        WW(pc, 0x1861); pc += 2;                            /* RPT #1, ZC (bit5), A/L=1 */
+        WW(pc, 0x1004); pc += 2;                            /* RRC R4 -> 2 shifts, carry-in 0 */
+        WW(pc, 0x3fff);
+        msp430_step(&cpu, 3);
+        assert_eq("RPT #1 ZC RRC R4: 0x8001 >> 2 (no carry in) = 0x2000", 0x2000, cpu.reg[4] & 0xFFFF);
+        cleanup_cpu(&cpu);
+    }
+
     /* PUSH/POP */
     {
         msp430_cpu_t cpu;
