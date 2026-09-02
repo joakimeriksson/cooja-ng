@@ -60,7 +60,13 @@ int native_cooja_mote_boot(mixed_node_t *node, int slot,
 static void native_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
     (void)rssi;
     mixed_node_t *node = (mixed_node_t *)m;
-    native_rx_assembler_feed(&node->plat.native, byte);
+    native_node_t *nat = &node->plat.native;
+    /* Radio off: COOJA's medium never delivers to it (UDGM addInterfered). */
+    if (nat->simRadioHWOn && !*nat->simRadioHWOn) {
+        native_rx_assembler_reset(&nat->rx_asm);
+        return;
+    }
+    native_rx_assembler_feed(nat, byte);
 }
 static int native_radio_rxfifo_available(void *m) { (void)m; return 0; }
 static bool native_radio_rx_busy(void *m) { (void)m; return false; }
@@ -126,22 +132,26 @@ static void tick_one_native(mixed_node_t *mnode, int64_t sim_ns) {
         nat->radio_tx_finished = false;
     }
 
-    /* Deliver queued RX frame BEFORE tick.
-     * Force simReceiving=0 so pending_packet() returns true.
-     * Only dequeue when the radio is on — TSCH turns radio off between
-     * slots, and doInterfaceActionsBeforeTick drops frames when off.
-     * Keeping the frame in the queue lets it be delivered on a later
-     * tick when the radio is in an active RX slot. */
-    if (*nat->simReceiving)
-        *nat->simReceiving = 0;
+    /* Radio model before the tick, as COOJA's ContikiRadio sees it:
+     * with the radio off nothing is in the air and nothing is buffered
+     * (doActionsAfterTick clears simReceiving/simInSize at HW_OFF);
+     * with it on, every frame whose on-air time has ended is completed
+     * now (signalReceptionEnd) and frames still in flight keep
+     * simReceiving=1.  Frames are never held back for a later slot. */
     bool radio_on = !nat->simRadioHWOn || *nat->simRadioHWOn;
-    if (*nat->simInSize == 0 && nat->rx_queue.count > 0 && radio_on)
+    if (!radio_on)
+        native_radio_flush_rx(nat);
+    else
         native_dequeue_rx_frame(nat);
     int pre_insize = *nat->simInSize;
     nat->cooja_tick();
     mnode->native_had_tx = (*nat->simOutSize > 0);
     native_check_radio_tx(nat);
     native_check_log_output(nat);
+    /* Radio switched off during the tick: drop what was in the air and
+     * in the buffer (ContikiRadio.doActionsAfterTick, HW_OFF). */
+    if (nat->simRadioHWOn && !*nat->simRadioHWOn)
+        native_radio_flush_rx(nat);
     /* Reset signal strength when frame is consumed (signalReceptionEnd) */
     if (pre_insize > 0 && *nat->simInSize == 0) {
         if (nat->simSignalStrength)
@@ -204,9 +214,15 @@ static int64_t native_next_wakeup_after_tick(mixed_node_t *mnode) {
         if (et < next) next = et;
     }
 
-    /* If rx_queue has frames, schedule +1ms to ensure TSCH slot
-     * operation gets a chance to find the frame via pending_packet(). */
-    if (nat->rx_queue.count > 0 || *nat->simInSize > 0) {
+    /* Frames in the air complete at their exact end time (COOJA wakes the
+     * mote from signalReceptionEnd); an unconsumed buffered frame keeps
+     * the +1 ms poll so the radio process picks it up. */
+    {
+        int64_t rx_end = native_rx_next_end_ns(nat);
+        if (rx_end < now) rx_end = now;
+        if (rx_end < next) next = rx_end;
+    }
+    if (*nat->simInSize > 0) {
         int64_t rx_next = now + 1000000LL;
         if (rx_next < next) next = rx_next;
     }
@@ -309,6 +325,7 @@ static void native_mote_destroy(sim_mote_t *m) {
 static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
     native_node_t *nat = &MOTE_IMPL(m)->plat.native;
     nat->sim_time_ns = now_ns;
+    native_radio_flush_rx(nat);
     /* Reboot at runtime: like a mote added to a running COOJA simulation
      * (Clock.added(): setDrift(-simulationTime)), its clock restarts at 0. */
     native_node_set_clock_drift(nat, -now_ns);
@@ -333,24 +350,36 @@ static void *native_mote_get_interface(sim_mote_t *m, int iface) {
     return NULL;
 }
 
+/* Reception start for a frame from another frame-level (native/JS) sender,
+ * mirroring UDGM.createConnections + ContikiRadio.signalReceptionStart:
+ *   radio off                       -> the frame is never seen;
+ *   transmitting or already receiving -> both frames are interfered
+ *                                      (the in-flight one completes empty);
+ *   otherwise                       -> receiving, timestamp = start of
+ *                                      frame, data lands at end of frame.
+ * The mote is woken at the frame's end so the completion happens on time. */
 static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
                                      int len, int64_t now_ns,
                                      int sender_idx) {
-    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
-    /* M28: the direct-to-simInDataBuffer fast path (ex the runner's
-     * mixed_rf_frame_handler inline native branch) — deliver immediately
-     * when the RX buffer is free, force-setting the packet timestamp TSCH
-     * keys on; otherwise fall back to the deferred RX queue. */
-    if (*nat->simInSize == 0) {
-        len = native_clamp_frame_len(len);   /* buffer is COOJA_RADIO_FRAME_MAX */
-        memcpy(nat->simInDataBuffer, frame, (size_t)len);
-        *nat->simInSize = len;
-        if (nat->simLastPacketTimestamp)
-            *nat->simLastPacketTimestamp = (uint64_t)(now_ns / 1000LL);
+    mixed_node_t *mnode = MOTE_IMPL(m);
+    native_node_t *nat = &mnode->plat.native;
+    if (nat->simRadioHWOn && !*nat->simRadioHWOn)
         return 0;
-    }
+    bool busy = nat->radio_is_transmitting || *nat->simOutSize > 0 ||
+                nat->rx_queue.count > 0;
     int rc = (nat->rx_queue.count >= NATIVE_RX_QUEUE_SIZE) ? -1 : 0;
     native_deliver_frame(nat, frame, len, now_ns, sender_idx);
+    if (busy) {
+        /* interfereAnyReception(): everything in the air is lost */
+        for (int f = 0; f < nat->rx_queue.count; f++)
+            nat->rx_queue.frames[(nat->rx_queue.head + f) % NATIVE_RX_QUEUE_SIZE].collided = true;
+    } else if (nat->simLastPacketTimestamp) {
+        *nat->simLastPacketTimestamp = (uint64_t)(now_ns / 1000LL);
+    }
+    if (nat->simReceiving) *nat->simReceiving = 1;
+    if (mnode->env && mnode->env->sim)
+        sim_schedule_mote_wakeup_if_earlier(mnode->env->sim, mnode->slot,
+                                            native_rx_next_end_ns(nat));
     return rc;  /* <0 = queue was full; caller owns the stats */
 }
 

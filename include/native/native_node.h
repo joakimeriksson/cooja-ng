@@ -173,6 +173,8 @@ void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
 
 /* Dequeue one non-collided frame into simInDataBuffer. Returns true if delivered. */
 bool native_dequeue_rx_frame(native_node_t *node);
+void native_radio_flush_rx(native_node_t *node);
+int64_t native_rx_next_end_ns(const native_node_t *node);
 
 /* Return the next time the node needs to wake up (ns), INT64_MAX if idle */
 int64_t native_next_wakeup_ns(const native_node_t *node);

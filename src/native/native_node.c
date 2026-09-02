@@ -252,26 +252,59 @@ int64_t native_node_etimer_expiry_ns(const native_node_t *node) {
 }
 
 /*
- * Dequeue one frame from the RX queue for delivery.
- * Skips collided frames. Returns true if a good frame was delivered.
+ * Complete every in-flight frame whose on-air time has ended at
+ * node->sim_time_ns, exactly like COOJA's ContikiRadio.signalReceptionEnd():
+ * a frame that was not interfered lands in simInDataBuffer (the newest one
+ * wins, as in COOJA), an interfered one is dropped, and simReceiving stays
+ * 1 only while a frame is still in the air.  Frames still in flight are
+ * kept.  Returns true if a good frame was delivered.
  */
 bool native_dequeue_rx_frame(native_node_t *node) {
-    while (node->rx_queue.count > 0) {
-        native_pending_frame_t *head =
-            &node->rx_queue.frames[node->rx_queue.head];
-        node->rx_queue.head =
-            (node->rx_queue.head + 1) % NATIVE_RX_QUEUE_SIZE;
-        node->rx_queue.count--;
-
-        if (!head->collided) {
-            /* Good frame — deliver to simInDataBuffer */
-            memcpy(node->simInDataBuffer, head->data, (size_t)head->len);
-            *node->simInSize = head->len;
-            return true;
+    bool delivered = false;
+    native_rx_queue_t *q = &node->rx_queue;
+    int kept = 0;
+    /* Frames may end out of arrival order (a short frame that started
+     * after a long one ends first), so scan the whole queue, complete
+     * every ended frame and compact the rest in place. */
+    for (int f = 0; f < q->count; f++) {
+        int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
+        native_pending_frame_t *fr = &q->frames[idx];
+        if (fr->end_ns > node->sim_time_ns) {
+            int dst = (q->head + kept) % NATIVE_RX_QUEUE_SIZE;
+            if (dst != idx) q->frames[dst] = *fr;
+            kept++;
+            continue;
         }
-        /* Collided frame — skip it and try next */
+        if (!fr->collided) {
+            memcpy(node->simInDataBuffer, fr->data, (size_t)fr->len);
+            *node->simInSize = fr->len;
+            delivered = true;
+        }
     }
-    return false;
+    q->count = kept;
+    if (node->simReceiving)
+        *node->simReceiving = q->count > 0 ? 1 : 0;
+    return delivered;
+}
+
+/* Drop everything in the air and in the buffer (ContikiRadio.doActionsAfterTick
+ * when simRadioHWOn goes to 0). */
+void native_radio_flush_rx(native_node_t *node) {
+    node->rx_queue.head = 0;
+    node->rx_queue.count = 0;
+    if (node->simReceiving) *node->simReceiving = 0;
+    *node->simInSize = 0;
+}
+
+/* Earliest end-of-frame time among frames in flight, or INT64_MAX. */
+int64_t native_rx_next_end_ns(const native_node_t *node) {
+    int64_t next = INT64_MAX;
+    for (int f = 0; f < node->rx_queue.count; f++) {
+        int idx = (node->rx_queue.head + f) % NATIVE_RX_QUEUE_SIZE;
+        if (node->rx_queue.frames[idx].end_ns < next)
+            next = node->rx_queue.frames[idx].end_ns;
+    }
+    return next;
 }
 
 void native_step_until_ns(native_node_t *node, int64_t target_ns) {
@@ -398,9 +431,10 @@ void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
     memcpy(slot->data, frame, (size_t)len);
     slot->len = len;
     slot->arrival_ns = arrival_ns;
-    /* Frame duration: (len + 6) bytes at 32us/byte = (len+6)*32000 ns
-     * The +6 accounts for preamble(4) + SFD(1) + length(1) */
-    slot->end_ns = arrival_ns + (int64_t)(len + 6) * 32000LL;
+    /* On-air time as COOJA computes it for ContikiRadio: 8*len bits at
+     * 250 kbit/s = 32 µs per payload byte, ending exactly when the
+     * sender's simOutSize is cleared (radio_tx_end_ns uses the same rule). */
+    slot->end_ns = arrival_ns + (int64_t)len * 32000LL;
     slot->sender_idx = sender_idx;
     slot->collided = false;
 
