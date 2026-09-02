@@ -133,6 +133,7 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
     *node->simRandomSeed = node_id * 12345 + 67890;
     *node->simCurrentTime = 0;
     *node->simRtimerCurrentTicks = 0;
+    node->clock_drift_ns = 0;
     *node->simInSize = 0;
     *node->simOutSize = 0;
     *node->simLoggedFlag = 0;
@@ -144,18 +145,17 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
         fprintf(stderr, "native_node: cooja_init() returned %d\n", ret);
     }
 
-    /* Initial ticks to complete boot.
-     * Tick 1: contiki_init() runs, reads simMoteID.
-     * Tick 2: process simMoteIDChanged (node_id_init re-reads if changed).
-     * Note: don't call native_check_log_output here — the caller sets up
-     * the log callback after init, then does additional boot ticks. */
+    /* Do NOT tick here.  cooja_init() only creates the Contiki coroutines;
+     * the first cooja_tick() runs the boot-up yield and the second runs
+     * Contiki's main() (platform init, netstack, autostart).  COOJA performs
+     * both on the mote's first scheduled wakeups, i.e. at its randomized
+     * start time, so everything the boot anchors on RTIMER_NOW() (TSCH's
+     * slot schedule in particular) is anchored to the mote's real start.
+     * Ticking at load time anchored it at t=0 instead and left the mote
+     * a full startup delay behind its own schedule (the "!dl-miss
+     * TxBeforeTx <start delay>" at the coordinator's first slot).
+     * simProcessRunValue=1 marks the pending boot for the wakeup logic. */
     *node->simProcessRunValue = 1;
-    node->cooja_tick();
-
-    /* Ensure node_id is applied — set changed flag and tick again */
-    *node->simMoteIDChanged = 1;
-    *node->simProcessRunValue = 1;
-    node->cooja_tick();
 
     node->sim_time_ns = 0;
     printf("  Native node %d: initialized successfully\n", node_id);
@@ -192,9 +192,9 @@ static int64_t compute_next_wakeup(const native_node_t *node) {
         return node->sim_time_ns;
     }
 
-    /* Etimer: expiration time is in ms */
+    /* Etimer: expiration time is in mote-local ms */
     if (*node->simEtimerPending) {
-        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
+        int64_t et_ns = native_node_etimer_expiry_ns(node);
         if (et_ns < next_ns) next_ns = et_ns;
     }
 
@@ -223,7 +223,7 @@ int64_t native_next_wakeup_ns(const native_node_t *node) {
      * processRunValue and rx_queue are handled by idle-skip in the outer loop. */
     int64_t next_ns = INT64_MAX;
     if (*node->simEtimerPending) {
-        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
+        int64_t et_ns = native_node_etimer_expiry_ns(node);
         if (et_ns < next_ns) next_ns = et_ns;
     }
     if (*node->simRtimerPending) {
@@ -231,6 +231,24 @@ int64_t native_next_wakeup_ns(const native_node_t *node) {
         if (rt_ns < next_ns) next_ns = rt_ns;
     }
     return next_ns;
+}
+
+void native_node_set_clocks(native_node_t *node, int64_t sim_ns) {
+    int64_t mote_ns = sim_ns + node->clock_drift_ns;
+    *node->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
+    if (mote_ns > 0)
+        *node->simCurrentTime = (uint64_t)(mote_ns / 1000000LL);
+}
+
+void native_node_set_clock_drift(native_node_t *node, int64_t drift_ns) {
+    int64_t drift_us = drift_ns / 1000LL;
+    drift_us -= drift_us % 1000LL;   /* ContikiClock.setDrift: round to ms */
+    node->clock_drift_ns = drift_us * 1000LL;
+}
+
+int64_t native_node_etimer_expiry_ns(const native_node_t *node) {
+    return (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL
+           - node->clock_drift_ns;
 }
 
 /*
@@ -284,8 +302,7 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
         last_tick_ns = node->sim_time_ns;
 
         /* Update simulation time variables */
-        *node->simCurrentTime        = (uint64_t)(node->sim_time_ns / 1000000LL);
-        *node->simRtimerCurrentTicks = (uint64_t)(node->sim_time_ns / 1000LL);
+        native_node_set_clocks(node, node->sim_time_ns);
 
         /* Process ticks. After TX, call yield callback for ACK delivery.
          * For non-TX ticks with processRunValue=1, continue ticking

@@ -113,8 +113,7 @@ void native_cooja_mote_register_radio(mixed_node_t *node, int slot,
 static void tick_one_native(mixed_node_t *mnode, int64_t sim_ns) {
     native_node_t *nat = &mnode->plat.native;
     nat->sim_time_ns = sim_ns;
-    *nat->simCurrentTime = (uint64_t)(sim_ns / 1000000LL);
-    *nat->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
+    native_node_set_clocks(nat, sim_ns);
 
     if (nat->radio_is_transmitting && sim_ns >= nat->radio_tx_end_ns) {
         nat->radio_is_transmitting = false;
@@ -198,9 +197,9 @@ static int64_t native_next_wakeup_after_tick(mixed_node_t *mnode) {
         if (prv < next) next = prv;
     }
 
-    /* etimer */
+    /* etimer (mote-local ms → global ns, ContikiClock.doActionsAfterTick) */
     if (*nat->simEtimerPending) {
-        int64_t et = (int64_t)(*nat->simEtimerNextExpirationTime) * 1000000LL;
+        int64_t et = native_node_etimer_expiry_ns(nat);
         if (et <= now) et = now + 1000000LL;  /* stale → +1ms */
         if (et < next) next = et;
     }
@@ -308,25 +307,24 @@ static void native_mote_destroy(sim_mote_t *m) {
 }
 
 static void native_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
-    MOTE_IMPL(m)->plat.native.sim_time_ns = now_ns;
+    native_node_t *nat = &MOTE_IMPL(m)->plat.native;
+    nat->sim_time_ns = now_ns;
+    /* Reboot at runtime: like a mote added to a running COOJA simulation
+     * (Clock.added(): setDrift(-simulationTime)), its clock restarts at 0. */
+    native_node_set_clock_drift(nat, -now_ns);
 }
 
-/* M54: native/cooja motes init at t=0 before the randomized startup spread.
- * Shift any absolute pending timer deadlines by the same delay so the first
- * wakeup is anchored to the delayed start, not the boot-time zero.  Returns
- * false — sim_time itself is NOT advanced, so the runner adds delay_ns to
+/* Startup-delay spread.  A native mote is not ticked before its start time
+ * and (since the load-time boot ticks were removed, see native_node_init)
+ * boots on its first wakeup there, exactly like COOJA.  What remains is
+ * COOJA's clock semantics: Clock.added() sets drift = -(startTime), so the
+ * mote-local clock_time() counts from the mote's own start while rtimer
+ * time stays global.  No timer deadline exists yet to shift.  Returns
+ * false — sim_time is NOT advanced, the runner adds delay_ns to
  * node_start_ns. */
 static bool native_mote_apply_startup_delay(sim_mote_t *m, int64_t delay_ns) {
     native_node_t *nat = &MOTE_IMPL(m)->plat.native;
-    int64_t delay_ms = delay_ns / 1000000LL;
-    if (nat->simEtimerPending && *nat->simEtimerPending &&
-        nat->simEtimerNextExpirationTime) {
-        *nat->simEtimerNextExpirationTime += (uint64_t)delay_ms;
-    }
-    if (nat->simRtimerPending && *nat->simRtimerPending &&
-        nat->simRtimerNextExpirationTime) {
-        *nat->simRtimerNextExpirationTime += (uint64_t)(delay_ns / 1000LL);
-    }
+    native_node_set_clock_drift(nat, nat->clock_drift_ns - delay_ns);
     return false;
 }
 
