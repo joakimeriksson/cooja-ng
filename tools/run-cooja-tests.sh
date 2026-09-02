@@ -76,18 +76,17 @@ fi
 
 CONTIKI_DIR="$(cd "$CONTIKI_DIR" && pwd)"
 
-# Auto-detect firmware target: prefer cooja, fall back to cc2538dk.
-# With --clean we force cooja (the suite's default) so the wipe and the
-# subsequent auto-build target match, regardless of leftover artifacts.
-if [ "$CLEAN" -eq 1 ]; then
-    FIRMWARE_TARGET="cooja"
-elif [ -d "$CSIM_DIR/firmware/cooja" ] && ls "$CSIM_DIR/firmware/cooja"/*.cooja >/dev/null 2>&1; then
-    FIRMWARE_TARGET="cooja"
-elif [ -d "$CSIM_DIR/firmware/cc2538dk" ] && ls "$CSIM_DIR/firmware/cc2538dk"/*.cc2538dk >/dev/null 2>&1; then
-    FIRMWARE_TARGET="cc2538dk"
-else
-    FIRMWARE_TARGET="cooja"
-fi
+# Firmware target for the Cooja suite: cooja motes, always, unless the caller
+# asks for cc2538dk explicitly (FIRMWARE_TARGET=cc2538dk).  The old auto-detect
+# ("cooja if any .cooja exists, else cc2538dk if any .cc2538dk exists") picked
+# cc2538dk on every fresh checkout — firmware/cooja is untracked and empty while
+# firmware/cc2538dk ships tracked ARM-suite binaries — and then tried to
+# cross-build every scenario for cc2538dk, turning 12 tests into ERRORs.
+FIRMWARE_TARGET="${FIRMWARE_TARGET:-cooja}"
+case "$FIRMWARE_TARGET" in
+    cooja|cc2538dk) ;;
+    *) echo "Error: FIRMWARE_TARGET must be cooja or cc2538dk (got '$FIRMWARE_TARGET')"; exit 1 ;;
+esac
 FIRMWARE_DIR="$CSIM_DIR/firmware/$FIRMWARE_TARGET"
 
 if [ "$CLEAN" -eq 1 ]; then
