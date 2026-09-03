@@ -1,6 +1,7 @@
 # External data-driven nodes for Cooja-NG — plan (Phase 13)
 
-Status: **proposal, for team review.** No code written. Approved internally on 2026-09-03;
+Status: **proposal, for team review.** No code written except the worked
+example `examples/ext/jammer.py` (§5.5). Approved internally 2026-09-03;
 awaiting team OK on the §10 decisions before implementation starts.
 
 ## 0. Short answer: how small, how long, how much to maintain
@@ -153,7 +154,8 @@ Inputs inside `step.in`:
 | `serial` | `t, data (hex)` |
 | `move` | `t, x, y` (test action `move`, UI drag) |
 
-**peer → csim**, exactly one reply per `step`:
+**peer → csim**, exactly one `done` reply per `hello` and per `step` (the
+reply to `hello` is what carries the peer's first `wake`; `out` may be empty):
 
 ```
 {"type":"done","t":T,"wake":T_next_or_null,"out":[ …events… ]}
@@ -295,6 +297,14 @@ in `sim_board.c`), nothing else changes.
   `send(frame, ch, t=None)`, `log(line)`, `led(...)`, `radio(...)`,
   `wake_at(t)`; `run_stdio()` / `run_tcp()`. Includes a tiny 802.15.4 header
   builder (the peer builds MAC headers itself, exactly like JS motes do).
+- `examples/ext/jammer.py` — **written, in this branch**: a disturber node
+  in ~30 lines of logic and no library, which puts a burst of junk on the air
+  every `JAM_PERIOD_MS` of sim time and so collides with anything in flight.
+  It is the smallest useful external node (it never listens) and doubles as
+  the protocol's worked example. Knobs are environment variables
+  (`JAM_PERIOD_MS`, `JAM_LEN`, `JAM_CHANNEL`), so it needs no config-schema
+  change. Verified against a hand-written mock of csim's side of the
+  conversation; it cannot be run for real until M1 exists.
 - `examples/ext/broadcast.py` (twin of `firmware/js/broadcast.js`),
   `examples/ext/sniffer.py` (logs every frame heard: shows RSSI/channel
   plumbing), `examples/ext/csv_sensor.py` (reads a CSV of timestamped
@@ -395,13 +405,13 @@ mergeable PR; M2–M4 can be dropped or reordered without touching M1.
 
 ## 11. Relationship to the open co-simulation PR (#1)
 
-PR #1 "Add co-simulation support" (Nicolas Tsiftes, opened 2026-04-23, last
-updated 2026-06-14, no reviews yet) solves the **inverse** problem: an
-external *coordinator* drives csim's clock (`time_advance` / `step_to` /
-`run_until` + `continue`) and routes **all** radio traffic through an external
-channel model (csim emits `tx`, the coordinator injects `rx`). csim is a
-component inside someone else's simulation. This plan keeps csim as the
-master clock and makes external processes *nodes* inside csim's medium.
+PR #1 "Add co-simulation support" (opened 2026-04-23, last updated
+2026-06-14, no reviews yet) solves the **inverse** problem: an external
+*coordinator* drives csim's clock (`time_advance` / `step_to` / `run_until` +
+`continue`) and routes **all** radio traffic through an external channel model
+(csim emits `tx`, the coordinator injects `rx`). csim is a component inside
+someone else's simulation. This plan keeps csim as the master clock and makes
+external processes *nodes* inside csim's medium.
 
 Overlap worth exploiting:
 
