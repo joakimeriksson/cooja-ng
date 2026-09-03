@@ -9,8 +9,9 @@
  * relationship to the kernel (frame-level radio, pseudo-cycle clock, no
  * emulated-CPU entanglements), so they should read the same.
  *
- * This cut transmits and logs; RX delivery into the peer is M1 work, so a
- * node built on it is deaf (see external_mote_receive_frame).
+ * Transmits, logs, and receives: a delivered frame reaches the peer as an
+ * `rx` input on its next step, carrying the sender's node id and channel and
+ * the per-receiver RSSI the medium computed.
  */
 #include "mote_impl.h"
 
@@ -67,7 +68,8 @@ static const mote_radio_ops_t ext_radio_ops = {
 void external_mote_register_radio(mixed_node_t *node, int slot,
                                   sim_radio_bus_t *bus) {
     sim_radio_bus_register(bus, slot, &ext_radio_ops, node,
-                           SIM_RADIO_DELIVERY_BATCH, /*caps=*/0);
+                           SIM_RADIO_DELIVERY_BATCH,
+                           SIM_RADIO_CAP_FRAME_CONSUMER);
 }
 
 /* ============================================================
@@ -127,15 +129,33 @@ static void *ext_mote_get_interface(sim_mote_t *m, int iface) {
     return NULL;
 }
 
-/* Deaf by design in this cut: the node is registered as a BATCH receiver so
- * the medium's bookkeeping (neighbour lists, collision marking) treats it
- * like any other node, but frames are dropped instead of being forwarded to
- * the peer as `rx` inputs.  That is enough for a transmit-only node such as
- * examples/ext/jammer.py; M1 turns this into the queue + `rx` path. */
+/* A frame cleared the medium's filter for this receiver.  Queue it with the
+ * context the peer cannot work out for itself -- who sent it, on what
+ * channel, and how strong it was *here* -- then make sure the mote runs at
+ * the arrival time so the peer sees it promptly.
+ *
+ * RSSI is per-receiver, so it has to be asked of the medium rather than
+ * carried on the frame: two nodes at different distances hear the same
+ * transmission at different strengths. */
 static int ext_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
                                   int len, int64_t now_ns, int sender_idx) {
-    (void)m; (void)frame; (void)len; (void)now_ns; (void)sender_idx;
-    return 0;
+    mixed_node_t *node = MOTE_IMPL(m);
+    radio_medium_t *rm = &node->env->sim->radio_medium;
+
+    int from_id = -1;
+    sim_mote_t *sender = sim_runtime_mote(node->env->sim, sender_idx);
+    if (sender) from_id = MOTE_IMPL(sender)->id;
+
+    int channel = -1;
+    if (sender_idx >= 0 && sender_idx < RADIO_MEDIUM_MAX_NODES)
+        channel = rm->nodes[sender_idx].radios[0].channel;
+
+    int8_t rssi = radio_medium_get_rssi(rm, sender_idx, node->slot);
+
+    int rc = ext_node_deliver_frame(&node->plat.ext, frame, len, now_ns,
+                                    from_id, channel, rssi);
+    sim_schedule_mote_wakeup_if_earlier(node->env->sim, node->slot, now_ns);
+    return rc;
 }
 
 const sim_mote_ops_t external_mote_ops = {

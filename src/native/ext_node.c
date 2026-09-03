@@ -144,6 +144,45 @@ static int hex_decode(const char *hex, uint8_t *out, int out_max) {
     return n;
 }
 
+static void hex_encode(const uint8_t *in, int len, char *out) {
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < len; i++) {
+        out[2 * i]     = digits[in[i] >> 4];
+        out[2 * i + 1] = digits[in[i] & 0x0f];
+    }
+    out[2 * len] = '\0';
+}
+
+/* ============================================================
+ * RX queue
+ * ============================================================ */
+
+int ext_node_deliver_frame(ext_node_t *node, const uint8_t *frame, int len,
+                           int64_t arrival_ns, int from_id, int channel,
+                           int8_t rssi) {
+    if (node->failed) return 0;
+    if (len < 0 || len > EXT_NODE_MAX_FRAME) {
+        /* Longer than we can carry; the peer would see a truncated frame,
+         * which is worse than a reported drop. */
+        node->rx_dropped++;
+        return -1;
+    }
+    if (node->rx_count >= EXT_NODE_RX_QUEUE) {
+        node->rx_dropped++;
+        return -1;
+    }
+    int tail = (node->rx_head + node->rx_count) % EXT_NODE_RX_QUEUE;
+    ext_node_rx_t *slot = &node->rx_queue[tail];
+    slot->arrival_ns = arrival_ns;
+    slot->from_id    = from_id;
+    slot->channel    = channel;
+    slot->rssi       = rssi;
+    slot->len        = len;
+    memcpy(slot->frame, frame, (size_t)len);
+    node->rx_count++;
+    return 0;
+}
+
 /* ============================================================
  * Applying the peer's output events
  * ============================================================ */
@@ -321,28 +360,76 @@ int ext_node_start(ext_node_t *node, double x, double y, uint32_t seed) {
     return consume_done(node, 0);
 }
 
+/* One step exchange, carrying every RX that has arrived by `when`. */
 static void do_step(ext_node_t *node, int64_t when) {
-    char line[128];
+    char line[EXT_NODE_LINE_MAX];
     int n = snprintf(line, sizeof(line),
-                     "{\"type\":\"step\",\"t\":%lld,\"in\":[]}\n",
+                     "{\"type\":\"step\",\"t\":%lld,\"in\":[",
                      (long long)when);
+
+    int emitted = 0;
+    while (node->rx_count > 0) {
+        const ext_node_rx_t *rx = &node->rx_queue[node->rx_head];
+        if (rx->arrival_ns > when) break;
+
+        char hex[2 * EXT_NODE_MAX_FRAME + 1];
+        hex_encode(rx->frame, rx->len, hex);
+
+        int m = snprintf(line + n, sizeof(line) - (size_t)n,
+                         "%s{\"type\":\"rx\",\"t\":%lld,\"from\":%d,"
+                         "\"ch\":%d,\"rssi\":%d,\"frame\":\"%s\"}",
+                         emitted ? "," : "", (long long)rx->arrival_ns,
+                         rx->from_id, rx->channel, (int)rx->rssi, hex);
+        if (m < 0 || n + m >= (int)sizeof(line)) {
+            /* Leave the rest queued for the next step rather than sending a
+             * truncated line the peer cannot parse. */
+            break;
+        }
+        n += m;
+        emitted++;
+        node->rx_head = (node->rx_head + 1) % EXT_NODE_RX_QUEUE;
+        node->rx_count--;
+    }
+
+    int m = snprintf(line + n, sizeof(line) - (size_t)n, "]}\n");
+    if (m < 0 || n + m >= (int)sizeof(line)) {
+        ext_fail(node, "step line does not fit in %zu bytes", sizeof(line));
+        return;
+    }
+    n += m;
+
     if (write_all(node, line, (size_t)n) != 0) return;
     consume_done(node, when);
 }
 
 void ext_node_step_until_ns(ext_node_t *node, int64_t target_ns) {
     /* Mirror js_node_step_until_ns: dispatch every event due at or before
-     * target_ns, advancing sim_time_ns to each event's exact time. */
-    while (!node->failed && node->next_wakeup_ns <= target_ns) {
-        int64_t when = node->next_wakeup_ns;
-        if (when > node->sim_time_ns) node->sim_time_ns = when;
+     * target_ns -- a requested wakeup or an arriving frame, whichever is
+     * next -- advancing sim_time_ns to each event's exact time. */
+    while (!node->failed) {
+        int64_t next_rx_ns = (node->rx_count > 0)
+                           ? node->rx_queue[node->rx_head].arrival_ns
+                           : INT64_MAX;
+        int64_t next_ev = node->next_wakeup_ns;
+        if (next_rx_ns < next_ev) next_ev = next_rx_ns;
+        if (next_ev > target_ns) break;
+
+        if (next_ev > node->sim_time_ns) node->sim_time_ns = next_ev;
+        /* do_step drains every RX due at next_ev, so one exchange covers a
+         * wakeup and any simultaneous arrivals. */
         node->next_wakeup_ns = INT64_MAX;
-        do_step(node, when);
+        do_step(node, next_ev);
     }
 }
 
 int64_t ext_node_next_wakeup_ns(const ext_node_t *node) {
-    return node->failed ? INT64_MAX : node->next_wakeup_ns;
+    if (node->failed) return INT64_MAX;
+    int64_t next = node->next_wakeup_ns;
+    if (node->rx_count > 0) {
+        int64_t rx = node->rx_queue[node->rx_head].arrival_ns;
+        if (rx < next) next = rx;
+    }
+    return next;
 }
 
 bool ext_node_failed(const ext_node_t *node) {
@@ -351,6 +438,10 @@ bool ext_node_failed(const ext_node_t *node) {
 
 void ext_node_destroy(ext_node_t *node) {
     if (node->child_pid <= 0) return;
+
+    if (node->rx_dropped)
+        fprintf(stderr, "ext_node[%d]: %d RX frame(s) dropped (queue full)\n",
+                node->node_id, node->rx_dropped);
 
     if (!node->failed && node->to_child >= 0) {
         char line[128];

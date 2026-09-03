@@ -10,9 +10,10 @@
  *   peer -> csim   {"type":"done","t":<ns>,"wake":<ns|null>,"out":[...]}
  *   csim -> peer   {"type":"stop","t":<ns>,"reason":"..."}
  *
- * Output events handled in this cut: `tx` (whole 802.15.4 frame, hex),
- * `log` (console line) and `wake`.  RX delivery into the peer (`rx` inputs)
- * is M1 work — a node built on this engine today transmits but is deaf.
+ * Output events handled: `tx` (whole 802.15.4 frame, hex), `log` (console
+ * line) and `wake`.  Inputs carried in `step.in`: `rx` (a received frame with
+ * its sender, channel and per-receiver RSSI).  `serial` input is still to
+ * come.
  *
  * This is the js_node.c shape without a script engine: the "interpreter" is
  * one line written and one line read per execute slice.
@@ -36,6 +37,20 @@ extern "C" {
 
 #define EXT_NODE_LINE_MAX  8192
 
+/* Frames waiting to be handed to the peer on its next step.  Same depth as
+ * the JS mote's queue; a full queue drops the frame and says so, which is
+ * what a real radio does when its FIFO overruns. */
+#define EXT_NODE_RX_QUEUE  16
+
+typedef struct ext_node_rx {
+    int64_t arrival_ns;
+    int     from_id;      /* sender's node id, -1 if unknown */
+    int     channel;      /* sender's channel, -1 if unknown */
+    int8_t  rssi;         /* per-receiver, from the medium */
+    int     len;
+    uint8_t frame[EXT_NODE_MAX_FRAME];
+} ext_node_rx_t;
+
 typedef struct ext_node {
     int      node_id;
     int64_t  sim_time_ns;      /* last dispatched event time (js_node rule) */
@@ -47,6 +62,12 @@ typedef struct ext_node {
     bool     failed;           /* sticky: peer died / protocol violation    */
 
     int      timeout_ms;       /* CSIM_EXT_TIMEOUT_MS, default 5000         */
+
+    /* Pending RX, oldest first (ring). */
+    ext_node_rx_t rx_queue[EXT_NODE_RX_QUEUE];
+    int      rx_head;
+    int      rx_count;
+    int      rx_dropped;       /* queue-full drops, reported at teardown */
 
     /* Partial-line accumulator for the reader. */
     char     rbuf[EXT_NODE_LINE_MAX];
@@ -74,6 +95,12 @@ int  ext_node_start(ext_node_t *node, double x, double y, uint32_t seed);
 
 /* Run the peer up to target_ns: one step exchange per due wakeup. */
 void ext_node_step_until_ns(ext_node_t *node, int64_t target_ns);
+
+/* Queue a received frame for delivery to the peer as an `rx` input.
+ * Returns 0, or -1 if the queue was full (frame dropped). */
+int  ext_node_deliver_frame(ext_node_t *node, const uint8_t *frame, int len,
+                            int64_t arrival_ns, int from_id, int channel,
+                            int8_t rssi);
 
 int64_t ext_node_next_wakeup_ns(const ext_node_t *node);
 
