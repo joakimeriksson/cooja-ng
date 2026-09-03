@@ -21,6 +21,7 @@
 #include "arm_platform.h"
 #include "native_node.h"
 #include "js_node.h"
+#include "ext_node.h"
 #include "sim_board.h"
 #include "sim_mote.h"
 #include "sim_runtime.h"
@@ -30,7 +31,7 @@
 extern "C" {
 #endif
 
-typedef enum { NODE_MSP430, NODE_ARM, NODE_NATIVE, NODE_JS } node_type_t;
+typedef enum { NODE_MSP430, NODE_ARM, NODE_NATIVE, NODE_JS, NODE_EXT } node_type_t;
 
 /*
  * Per-chip TX listener context.
@@ -82,6 +83,7 @@ typedef struct mixed_node {
         arm_platform_t arm;
         native_node_t native;
         js_node_t js;
+        ext_node_t ext;
     } plat;
 } mixed_node_t;
 
@@ -156,6 +158,12 @@ int  js_app_mote_boot(mixed_node_t *node, int slot, const char *script_path,
                       int node_id, const sim_mote_env_t *env);
 void js_app_mote_register_radio(mixed_node_t *node, int slot,
                                 sim_radio_bus_t *bus);
+
+extern const sim_mote_ops_t external_mote_ops;
+int  external_mote_boot(mixed_node_t *node, int slot, const char *path,
+                        int node_id, const sim_mote_env_t *env);
+void external_mote_register_radio(mixed_node_t *node, int slot,
+                                  sim_radio_bus_t *bus);
 
 /* M20: native Cooja motes (dlopen'd Contiki shared library). */
 extern const sim_mote_ops_t native_cooja_mote_ops;

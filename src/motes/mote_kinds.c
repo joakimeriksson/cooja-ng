@@ -47,6 +47,14 @@ static sim_mote_kind_t kinds[] = {
         .register_radio = js_app_mote_register_radio,
         .ops            = &js_app_mote_ops,
     },
+    [SIM_BOARD_KIND_EXTERNAL] = {
+        .name           = "external",
+        .banner_label   = "EXT",
+        .node_type      = NODE_EXT,
+        .boot           = external_mote_boot,
+        .register_radio = external_mote_register_radio,
+        .ops            = &external_mote_ops,
+    },
 };
 
 const sim_mote_kind_t *sim_mote_kind_for(sim_board_kind_t kind) {

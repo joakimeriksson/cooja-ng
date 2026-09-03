@@ -155,6 +155,15 @@ typedef enum sim_radio_delivery_mode {
 #define SIM_RADIO_CAP_RX_TICKING_STEP    (1u << 0)
 #define SIM_RADIO_CAP_DRAIN_MINI_STEP    (1u << 1)
 #define SIM_RADIO_CAP_WAKE_SENDER_POST_TX (1u << 2)
+/*   FRAME_CONSUMER   — the receiver has no emulated radio to take bytes: at
+ *                    frame-complete, hand it the whole MAC frame through its
+ *                    receive_frame mote op instead of the byte path.  Without
+ *                    this a BATCH receiver that is not an emulated chip gets
+ *                    nothing from an emulated sender: deliver_bytes and
+ *                    queue_frame both end in rx_byte_sync, which such a mote
+ *                    does not have.  Opt-in, so no existing receiver's
+ *                    delivery changes. */
+#define SIM_RADIO_CAP_FRAME_CONSUMER     (1u << 3)
 
 /* Host (runner) hooks the TX path calls out to (M9.4).  These cover the
  * pieces that stay runner-side until Phase 2: node lifecycle, native
