@@ -15,6 +15,7 @@
  * single biggest map-level difference from nRF52.
  */
 #include "nrf54l15_soc.h"
+#include "arm_trustzone.h"
 #include "arm_cpu.h"
 #include "arm_nvic.h"
 #include "ieee_802154.h"
@@ -2471,18 +2472,6 @@ static void nrf54l_vpr_write(void *user, uint32_t addr, uint32_t value) {
     }
 }
 
-static int nrf54l_spu_read(void *user, uint32_t addr) {
-    nrf54l_vpr_state_t *vpr = user;
-    if ((addr - NRF54L_SPU00_BASE) == NRF54L_SPU_PERIPH12)
-        return (int)vpr->spu_periph12;
-    return 0;
-}
-
-static void nrf54l_spu_write(void *user, uint32_t addr, uint32_t value) {
-    nrf54l_vpr_state_t *vpr = user;
-    if ((addr - NRF54L_SPU00_BASE) == NRF54L_SPU_PERIPH12)
-        vpr->spu_periph12 = value;
-}
 
 /* ============================================================
  * GPIO P0/P1/P2 — minimal OUT/DIR model (drives + observes LEDs)
@@ -2709,6 +2698,276 @@ static int nrf54l_icache_read(void *user_data, uint32_t addr) {
 static void nrf54l_icache_write(void *user_data, uint32_t addr, uint32_t value) {
     uint32_t *enable = (uint32_t *)user_data;
     if (addr - NRF54L_ICACHE_BASE == NRF54L_ICACHE_ENABLE) *enable = value & 1u;
+}
+
+
+/* ============================================================
+ * SPU (security unit) + MPC00 (memory protection)
+ *
+ * The SPU is both the peripheral permission gate and the CPU's attribution
+ * unit. Two separate mechanisms, deliberately kept apart here:
+ *
+ *   Attribution (nrf54l_idau_check) answers "is this address Secure?" for
+ *   the core. On this SoC every peripheral answers at two addresses, and the
+ *   alias picks the security: 0x5xxx_xxxx is the Secure view, 0x4xxx_xxxx the
+ *   Non-secure one. So Non-secure code touching a Secure alias raises a
+ *   SecureFault before the transaction ever reaches the bus. Everything
+ *   outside the peripheral window is left to the SAU, which the secure world
+ *   programs with the same flash and RAM split it gives the MPC.
+ *
+ *   Permission (nrf54l_spu_bus_check) answers "may this transaction reach
+ *   this peripheral?". Non-secure code using the Non-secure alias of a
+ *   peripheral the secure world has claimed is refused here, and reported
+ *   through EVENTS_PERIPHACCERR and the owning instance's interrupt rather
+ *   than as a CPU fault — which is exactly how the secure world's handler
+ *   records the violation and reboots.
+ *
+ * Register map (NRF_SPU_Type): EVENTS_PERIPHACCERR 0x100, INTEN 0x300,
+ * INTENSET 0x304, INTENCLR 0x308, INTPEND 0x30C, PERIPHACCERR.ADDRESS 0x404,
+ * PERIPH[64].PERM 0x500 + 4n, FEATURE 0x600 (FEATURE.GRTC at 0xD00).
+ * ============================================================ */
+#define NRF54L_SPU_SIZE            0x1000u
+#define NRF54L_SPU_DOMAIN_MASK     0x00FC0000u   /* selects the owning instance */
+#define S_EVENTS_PERIPHACCERR      0x100
+#define S_INTEN                    0x300
+#define S_INTENSET                 0x304
+#define S_INTENCLR                 0x308
+#define S_INTPEND                  0x30C
+#define S_PERIPHACCERR_ADDRESS     0x404
+#define S_PERIPH_BASE              0x500
+#define S_FEATURE_GRTC_CC          0xD00        /* FEATURE(0x600) + GRTC(0x700) */
+#define S_FEATURE_GRTC_PWMCONFIG   0xD74
+#define S_FEATURE_GRTC_CLK         0xD78
+#define S_FEATURE_GRTC_SYSCOUNTER  0xD7C
+#define S_FEATURE_GRTC_INTERRUPT   0xD80
+
+static const uint32_t nrf54l_spu_bases[NRF54L_SPU_COUNT] = {
+    0x50040000u,  /* SPU00 — 0x5004_xxxx .. 0x5007_xxxx */
+    0x50080000u,  /* SPU10 — RADIO, TIMER10, EGU10      */
+    0x500C0000u,  /* SPU20 — UARTE20, GRTC              */
+    0x50100000u,  /* SPU30 — CLOCK, WDT30/31, GPIOTE30  */
+};
+static const int nrf54l_spu_irqs[NRF54L_SPU_COUNT] = { 64, 128, 192, 256 };
+
+static int trc54_spu = -1;   /* NRF54L_SPU_TRACE: permission violations */
+
+/* Peripheral slot within its instance: both are 4 KB-indexed, so the slot is
+ * just the distance between them in pages. */
+static inline int nrf54l_spu_slot(uint32_t spu_base, uint32_t periph_addr) {
+    int slot = (int)((periph_addr >> 12) & 0x1FFu) - (int)((spu_base >> 12) & 0x1FFu);
+    return (slot >= 0 && slot < NRF54L_SPU_NUM_PERIPH) ? slot : -1;
+}
+
+/* The instance governing a peripheral address, or NULL if it lies outside
+ * the four windows this model covers (those peripherals are unguarded, which
+ * matches their Non-secure reset default). */
+static nrf54l_spu_state_t *nrf54l_spu_for(nrf54l15_soc_t *soc, uint32_t secure_addr) {
+    uint32_t base = 0x50000000u | (secure_addr & NRF54L_SPU_DOMAIN_MASK);
+    for (int i = 0; i < NRF54L_SPU_COUNT; i++)
+        if (soc->spu[i].base == base) return &soc->spu[i];
+    return NULL;
+}
+
+/* Bus-side permission check — see the block comment above. */
+static bool nrf54l_spu_bus_check(void *user, uint32_t addr, bool is_write) {
+    nrf54l15_soc_t *soc = (nrf54l15_soc_t *)user;
+    if (addr < 0x40000000u || addr >= 0x60000000u) return true;
+    if (addr & 0x10000000u) return true;      /* Secure transaction: unrestricted */
+
+    uint32_t secure_addr = addr | 0x10000000u;
+    nrf54l_spu_state_t *spu = nrf54l_spu_for(soc, secure_addr);
+    if (!spu) return true;
+    int slot = nrf54l_spu_slot(spu->base, secure_addr);
+    if (slot < 0) return true;
+    if (!(spu->perm[slot] & NRF54L_SPU_PERM_SECATTR)) return true;  /* Non-secure */
+
+    spu->events_periphaccerr = 1;
+    spu->periphaccerr_addr   = addr;
+    if (nrf54l_trace_flag(&trc54_spu, "NRF54L_SPU_TRACE"))
+        fprintf(stderr, "[spu cpu=0x%04x] PERIPHACCERR: non-secure %s of 0x%08x "
+                        "(instance 0x%08x slot %d)\n",
+                (unsigned)((uintptr_t)&spu->plat->cpu & 0xFFFF),
+                is_write ? "write" : "read", addr, spu->base, slot);
+    if (spu->inten & 1u)
+        arm_nvic_set_pending(&spu->plat->nvic, spu->irq_num);
+    return false;
+}
+
+#define M_OVERRIDE_CONFIG_ENABLE  (1u << 9)
+#define M_OVERRIDE_PERM_SECATTR   (1u << 3)
+
+/* Attribution unit — see the block comment above.
+ *
+ * Peripherals are decided by the alias: the Secure view is Secure, the
+ * Non-secure view is Non-secure. Everything else is left to the SAU, which
+ * the secure world programs with the flash and RAM split and, importantly,
+ * with the non-secure-callable window holding the veneers. The memory
+ * protection controller is deliberately not consulted here: it gates bus
+ * masters, including DMA, rather than the core's own attribution, and
+ * feeding its override regions into this decision vetoes the SAU's
+ * callable window and breaks every secure-gateway entry.
+ *
+ * Nothing is reported exempt: the system control space is reached through
+ * the banked views the interrupt controller registers, not through an
+ * attribution exemption, and reporting it exempt here would deny Non-secure
+ * code its own view. */
+static struct arm_idau_result nrf54l_idau_check(void *user, uint32_t addr) {
+    (void)user;
+    struct arm_idau_result r = { .ns = true, .nsc = false, .exempt = false };
+    if (addr >= 0x40000000u && addr < 0x60000000u)
+        r.ns = (addr & 0x10000000u) == 0;
+    return r;
+}
+
+static int nrf54l_spu_read(void *user, uint32_t addr) {
+    nrf54l_spu_state_t *spu = (nrf54l_spu_state_t *)user;
+    uint32_t off = addr - spu->base;
+    if (off >= S_PERIPH_BASE && off < S_PERIPH_BASE + 4 * NRF54L_SPU_NUM_PERIPH)
+        return (int)spu->perm[(off - S_PERIPH_BASE) / 4];
+    if (off >= S_FEATURE_GRTC_CC && off < S_FEATURE_GRTC_CC + 4 * NRF54L_SPU_NUM_GRTC_CC)
+        return (int)spu->feat_grtc_cc[(off - S_FEATURE_GRTC_CC) / 4];
+    if (off >= S_FEATURE_GRTC_INTERRUPT &&
+        off < S_FEATURE_GRTC_INTERRUPT + 4 * NRF54L_SPU_NUM_GRTC_INT)
+        return (int)spu->feat_grtc_interrupt[(off - S_FEATURE_GRTC_INTERRUPT) / 4];
+    switch (off) {
+        case S_EVENTS_PERIPHACCERR:     return (int)spu->events_periphaccerr;
+        case S_INTEN:
+        case S_INTENSET:
+        case S_INTENCLR:                return (int)spu->inten;
+        case S_INTPEND:                 return (int)(spu->events_periphaccerr & spu->inten);
+        case S_PERIPHACCERR_ADDRESS:    return (int)spu->periphaccerr_addr;
+        case S_FEATURE_GRTC_PWMCONFIG:  return (int)spu->feat_grtc_pwmconfig;
+        case S_FEATURE_GRTC_CLK:        return (int)spu->feat_grtc_clk;
+        case S_FEATURE_GRTC_SYSCOUNTER: return (int)spu->feat_grtc_syscounter;
+        default:                        return 0;
+    }
+}
+
+static void nrf54l_spu_write(void *user, uint32_t addr, uint32_t value) {
+    nrf54l_spu_state_t *spu = (nrf54l_spu_state_t *)user;
+    uint32_t off = addr - spu->base;
+    if (off >= S_PERIPH_BASE && off < S_PERIPH_BASE + 4 * NRF54L_SPU_NUM_PERIPH) {
+        int slot = (int)(off - S_PERIPH_BASE) / 4;
+        if (spu->perm[slot] & NRF54L_SPU_PERM_LOCK) return;  /* locked until reset */
+        spu->perm[slot] = value;
+        /* The FLPR launch gate is this same register on SPU00 slot 12; keep
+         * the coprocessor's copy in step (see nrf54l_vpr_state_t). */
+        nrf54l15_soc_t *soc = (nrf54l15_soc_t *)spu->plat->soc;
+        if (spu->base == nrf54l_spu_bases[0] && slot == 12)
+            soc->vpr.spu_periph12 = value;
+        return;
+    }
+    if (off >= S_FEATURE_GRTC_CC && off < S_FEATURE_GRTC_CC + 4 * NRF54L_SPU_NUM_GRTC_CC) {
+        spu->feat_grtc_cc[(off - S_FEATURE_GRTC_CC) / 4] = value;
+        return;
+    }
+    if (off >= S_FEATURE_GRTC_INTERRUPT &&
+        off < S_FEATURE_GRTC_INTERRUPT + 4 * NRF54L_SPU_NUM_GRTC_INT) {
+        spu->feat_grtc_interrupt[(off - S_FEATURE_GRTC_INTERRUPT) / 4] = value;
+        return;
+    }
+    switch (off) {
+        case S_EVENTS_PERIPHACCERR:     spu->events_periphaccerr = value & 1; break;
+        case S_INTEN:                   spu->inten  = value;  break;
+        case S_INTENSET:                spu->inten |= value;  break;
+        case S_INTENCLR:                spu->inten &= ~value; break;
+        case S_FEATURE_GRTC_PWMCONFIG:  spu->feat_grtc_pwmconfig  = value; break;
+        case S_FEATURE_GRTC_CLK:        spu->feat_grtc_clk        = value; break;
+        case S_FEATURE_GRTC_SYSCOUNTER: spu->feat_grtc_syscounter = value; break;
+        default: break;
+    }
+}
+
+/* MPC00 — register state only; see nrf54l_mpc_state_t. */
+#define NRF54L_MPC00_BASE      0x50041000u
+#define NRF54L_MPC00_SIZE      0x1000u
+#define NRF54L_MPC00_IRQ       65
+#define M_EVENTS_MEMACCERR     0x100
+#define M_INTEN                0x300
+#define M_INTENSET             0x304
+#define M_INTENCLR             0x308
+#define M_MEMACCERR_BASE       0x400
+#define M_OVERRIDE_BASE        0x800
+#define M_OVERRIDE_STRIDE      0x20
+
+static int nrf54l_mpc_read(void *user, uint32_t addr) {
+    nrf54l_mpc_state_t *m = (nrf54l_mpc_state_t *)user;
+    uint32_t off = addr - NRF54L_MPC00_BASE;
+    if (off >= M_OVERRIDE_BASE &&
+        off < M_OVERRIDE_BASE + M_OVERRIDE_STRIDE * NRF54L_MPC_NUM_OVERRIDE) {
+        nrf54l_mpc_override_t *o = &m->override[(off - M_OVERRIDE_BASE) / M_OVERRIDE_STRIDE];
+        switch ((off - M_OVERRIDE_BASE) % M_OVERRIDE_STRIDE) {
+            case 0x00: return (int)o->config;
+            case 0x04: return (int)o->startaddr;
+            case 0x08: return (int)o->endaddr;
+            case 0x10: return (int)o->perm;
+            case 0x14: return (int)o->permmask;
+            case 0x18: return (int)o->ownerid;
+            default:   return 0;
+        }
+    }
+    if (off >= M_MEMACCERR_BASE && off < M_MEMACCERR_BASE + 32)
+        return (int)m->memaccerr[(off - M_MEMACCERR_BASE) / 4];
+    switch (off) {
+        case M_EVENTS_MEMACCERR: return (int)m->events_memaccerr;
+        case M_INTEN:
+        case M_INTENSET:
+        case M_INTENCLR:         return (int)m->inten;
+        default:                 return 0;
+    }
+}
+
+static void nrf54l_mpc_write(void *user, uint32_t addr, uint32_t value) {
+    nrf54l_mpc_state_t *m = (nrf54l_mpc_state_t *)user;
+    uint32_t off = addr - NRF54L_MPC00_BASE;
+    if (off >= M_OVERRIDE_BASE &&
+        off < M_OVERRIDE_BASE + M_OVERRIDE_STRIDE * NRF54L_MPC_NUM_OVERRIDE) {
+        nrf54l_mpc_override_t *o = &m->override[(off - M_OVERRIDE_BASE) / M_OVERRIDE_STRIDE];
+        if (o->config & (1u << 8)) return;   /* CONFIG.LOCK */
+        switch ((off - M_OVERRIDE_BASE) % M_OVERRIDE_STRIDE) {
+            case 0x00: o->config    = value; break;
+            case 0x04: o->startaddr = value; break;
+            case 0x08: o->endaddr   = value; break;
+            case 0x10: o->perm      = value; break;
+            case 0x14: o->permmask  = value; break;
+            case 0x18: o->ownerid   = value; break;
+            default: break;
+        }
+        return;
+    }
+    switch (off) {
+        case M_EVENTS_MEMACCERR: m->events_memaccerr = value & 1; break;
+        case M_INTEN:            m->inten  = value;  break;
+        case M_INTENSET:         m->inten |= value;  break;
+        case M_INTENCLR:         m->inten &= ~value; break;
+        default: break;
+    }
+}
+
+static void nrf54l_spu_mpc_reset(nrf54l15_soc_t *soc, arm_platform_t *plat) {
+    for (int i = 0; i < NRF54L_SPU_COUNT; i++) {
+        nrf54l_spu_state_t *spu = &soc->spu[i];
+        memset(spu, 0, sizeof(*spu));
+        spu->plat    = plat;
+        spu->base    = nrf54l_spu_bases[i];
+        spu->irq_num = nrf54l_spu_irqs[i];
+        for (int n = 0; n < NRF54L_SPU_NUM_PERIPH; n++)
+            spu->perm[n] = NRF54L_SPU_PERM_RESET;
+        for (int n = 0; n < NRF54L_SPU_NUM_GRTC_CC; n++)
+            spu->feat_grtc_cc[n] = 0x00100010u;      /* reset: Secure */
+        for (int n = 0; n < NRF54L_SPU_NUM_GRTC_INT; n++)
+            spu->feat_grtc_interrupt[n] = 0x00100010u;
+        spu->feat_grtc_syscounter = 0x00100010u;
+        spu->feat_grtc_clk        = 0x00100010u;
+    }
+    /* The VPR slot's reset value differs from the generic one; keep it exact
+     * so the FLPR host's "PERIPH[12] before/after" log is unchanged. */
+    soc->spu[0].perm[12] = 0x8001000au;
+    soc->vpr.spu_periph12 = 0x8001000au;
+
+    memset(&soc->mpc00, 0, sizeof(soc->mpc00));
+    soc->mpc00.plat    = plat;
+    soc->mpc00.irq_num = NRF54L_MPC00_IRQ;
 }
 
 /* ============================================================
@@ -2968,8 +3227,18 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
     soc->vpr.flpr         = NULL;
     arm_register_io(&plat->cpu, NRF54L_VPR00_BASE, NRF54L_VPR00_SIZE,
                     nrf54l_vpr_read, nrf54l_vpr_write, &soc->vpr);
-    arm_register_io(&plat->cpu, NRF54L_SPU00_BASE, NRF54L_SPU00_SIZE,
-                    nrf54l_spu_read, nrf54l_spu_write, &soc->vpr);
+    /* SPU00-30 + MPC00, and the attribution / bus-permission hooks they
+     * back. Registered after the VPR so the FLPR gate keeps its own view. */
+    nrf54l_spu_mpc_reset(soc, plat);
+    for (int i = 0; i < NRF54L_SPU_COUNT; i++)
+        arm_register_io(&plat->cpu, soc->spu[i].base, NRF54L_SPU_SIZE,
+                        nrf54l_spu_read, nrf54l_spu_write, &soc->spu[i]);
+    arm_register_io(&plat->cpu, NRF54L_MPC00_BASE, NRF54L_MPC00_SIZE,
+                    nrf54l_mpc_read, nrf54l_mpc_write, &soc->mpc00);
+    plat->cpu.idau_check     = nrf54l_idau_check;
+    plat->cpu.idau_user      = soc;
+    plat->cpu.io_access_check = nrf54l_spu_bus_check;
+    plat->cpu.io_access_user  = soc;
 
     /* GRTC — Contiki tick source + MPSL timeslot timer. */
     soc->grtc.plat    = plat;
@@ -3186,7 +3455,10 @@ static void nrf54l15_soc_reset(arm_platform_t *plat) {
      * running (the core reset does not reach the coprocessor here). */
     soc->vpr.initpc = 0;
     soc->vpr.cpurun = 0;
-    soc->vpr.spu_periph12 = 0x8001000au;
+
+    /* Security unit and memory protection return to their reset defaults:
+     * every peripheral Non-secure again, every override region cleared. */
+    nrf54l_spu_mpc_reset(soc, plat);
 
     /* WDT30 is in the always-on domain: it keeps running across a warm
      * reset, and its pending timeout event was cancelled above only if it

@@ -574,6 +574,60 @@ typedef struct nrf54l_spi_chip {
  * instantiated. */
 #define NRF54L_NUM_SPIM 3
 
+/* SPU — the security unit, which is also the CPU's attribution unit (IDAU).
+ *
+ * Four instances, one per peripheral domain, each governing the 64 peripheral
+ * slots in its 256 KB window. PERIPH[n].PERM.SECATTR says whether slot n is
+ * Secure; peripherals reset Non-secure (PERM reset value 0x8000002A), and the
+ * TrustZone secure world explicitly secures the handful it keeps for itself.
+ * A Non-secure transaction that reaches a Secure peripheral is refused and
+ * reported through EVENTS_PERIPHACCERR and the instance's interrupt, which is
+ * how the secure world detects and reboots on a violation.
+ *
+ * FEATURE.GRTC sub-divides the clock's compare channels, counter views and
+ * interrupt groups between the worlds. Those registers are stored so firmware
+ * reads back what it wrote, but the sub-division is not enforced: the clock
+ * as a whole is Non-secure, so a Non-secure access to it is permitted. */
+#define NRF54L_SPU_COUNT          4
+#define NRF54L_SPU_NUM_PERIPH     64
+#define NRF54L_SPU_NUM_GRTC_CC    24
+#define NRF54L_SPU_NUM_GRTC_INT   16
+#define NRF54L_SPU_PERM_RESET     0x8000002Au   /* PRESENT, SECATTR = Non-secure */
+#define NRF54L_SPU_PERM_SECATTR   (1u << 4)
+#define NRF54L_SPU_PERM_LOCK      (1u << 8)
+
+typedef struct nrf54l_spu_state {
+    arm_platform_t *plat;
+    uint32_t        base;
+    int             irq_num;
+    uint32_t        perm[NRF54L_SPU_NUM_PERIPH];
+    uint32_t        inten;
+    uint32_t        events_periphaccerr;
+    uint32_t        periphaccerr_addr;
+    uint32_t        feat_grtc_cc[NRF54L_SPU_NUM_GRTC_CC];
+    uint32_t        feat_grtc_pwmconfig, feat_grtc_clk, feat_grtc_syscounter;
+    uint32_t        feat_grtc_interrupt[NRF54L_SPU_NUM_GRTC_INT];
+} nrf54l_spu_state_t;
+
+/* MPC00 — memory protection. The secure world programs override regions to
+ * carve the Non-secure world's flash and RAM out of an otherwise Secure
+ * memory map. Modelled as register state so the firmware's configuration
+ * reads back; memory attribution itself comes from the SAU, which the same
+ * firmware programs with the identical ranges. */
+#define NRF54L_MPC_NUM_OVERRIDE 7
+typedef struct nrf54l_mpc_override {
+    uint32_t config, startaddr, endaddr, perm, permmask, ownerid;
+} nrf54l_mpc_override_t;
+
+typedef struct nrf54l_mpc_state {
+    arm_platform_t       *plat;
+    int                   irq_num;
+    uint32_t              inten;
+    uint32_t              events_memaccerr;
+    uint32_t              memaccerr[8];
+    nrf54l_mpc_override_t override[NRF54L_MPC_NUM_OVERRIDE];
+} nrf54l_mpc_state_t;
+
 /* WDT30 (0x5010_8000) — the TrustZone secure world's watchdog. The nRF54L15
  * watchdogs have no interrupt: a timeout resets the SoC directly. Contiki's
  * secure world configures CRV for a 2 s timeout with reload channel 0 and
@@ -606,6 +660,8 @@ typedef struct nrf54l15_soc {
     nrf54l_vpr_state_t          vpr;
     nrf54l_gpio_state_t         gpio[3];   /* P0, P1, P2 */
     nrf54l_wdt_state_t          wdt30;
+    nrf54l_spu_state_t          spu[NRF54L_SPU_COUNT];
+    nrf54l_mpc_state_t          mpc00;
     uint32_t                    icache_enable;
     /* Three EGU instances at 0x5001_5000 (EGU00), 0x5008_7000 (EGU10),
      * 0x500C_7000 (EGU20).  Channel allocation across instances is
