@@ -1,6 +1,7 @@
 # External data-driven nodes for Cooja-NG — plan (Phase 13)
 
-Status: **proposal, for team review.** No code written. Approved internally on 2026-09-03;
+Status: **proposal, for team review.** No code written except the worked
+example `examples/ext/jammer.py` (§5.5). Approved internally 2026-09-03;
 awaiting team OK on the §10 decisions before implementation starts.
 
 ## 0. Short answer: how small, how long, how much to maintain
@@ -153,7 +154,8 @@ Inputs inside `step.in`:
 | `serial` | `t, data (hex)` |
 | `move` | `t, x, y` (test action `move`, UI drag) |
 
-**peer → csim**, exactly one reply per `step`:
+**peer → csim**, exactly one `done` reply per `hello` and per `step` (the
+reply to `hello` is what carries the peer's first `wake`; `out` may be empty):
 
 ```
 {"type":"done","t":T,"wake":T_next_or_null,"out":[ …events… ]}
@@ -179,9 +181,20 @@ swapped (an external coordinator stepping csim, §9):
 
 Rules: `wake` is the *earliest* time csim will call `step` again; csim also
 calls `step` whenever an input arrives (an `rx` or `serial`). A peer that
-sets `wake:null` and gets no input is never stepped again (idle). Maximum
-frame 2047 bytes (802.15.4g); frames > 127 are only meaningful for sub-GHz
-receivers, same as the JS path today.
+sets `wake:null` and gets no input is never stepped again (idle).
+
+**Frame size: 152 bytes, not 2047** (corrected against the implementation).
+The reused TX hook PHY-wraps into the runner's `uint8_t bytes[160]`
+(4 preamble + SFD + length + frame + 2 CRC), and `native_frame_to_bytes`
+returns 0 — *silently dropping the whole frame* — for anything larger. The
+engine therefore rejects an oversize `tx` loudly rather than inheriting that
+silent drop. Raising the cap means a second TX path, not a constant.
+
+**The PHY wrap appends a valid CRC.** A `tx` frame is delivered to receivers
+as a well-formed frame whose *contents* are whatever the peer sent, so a
+jammer disturbs by occupying air time and colliding, not by putting corrupt
+bits on the air. That is the realistic model for an interferer on-channel;
+a peer cannot currently emit a CRC-invalid frame through this path.
 
 **Replay file** = the sequence of peer output events only, sorted by `t`:
 
@@ -295,6 +308,14 @@ in `sim_board.c`), nothing else changes.
   `send(frame, ch, t=None)`, `log(line)`, `led(...)`, `radio(...)`,
   `wake_at(t)`; `run_stdio()` / `run_tcp()`. Includes a tiny 802.15.4 header
   builder (the peer builds MAC headers itself, exactly like JS motes do).
+- `examples/ext/jammer.py` — **written, and now runnable** (see §12): a disturber node
+  in ~30 lines of logic and no library, which puts a burst of junk on the air
+  every `JAM_PERIOD_MS` of sim time and so collides with anything in flight.
+  It is the smallest useful external node (it never listens) and doubles as
+  the protocol's worked example. Knobs are environment variables
+  (`JAM_PERIOD_MS`, `JAM_LEN`, `JAM_CHANNEL`), so it needs no config-schema
+  change. Verified against a hand-written mock of csim's side of the
+  conversation; it cannot be run for real until M1 exists.
 - `examples/ext/broadcast.py` (twin of `firmware/js/broadcast.js`),
   `examples/ext/sniffer.py` (logs every frame heard: shows RSSI/channel
   plumbing), `examples/ext/csv_sensor.py` (reads a CSV of timestamped
@@ -395,13 +416,13 @@ mergeable PR; M2–M4 can be dropped or reordered without touching M1.
 
 ## 11. Relationship to the open co-simulation PR (#1)
 
-PR #1 "Add co-simulation support" (Nicolas Tsiftes, opened 2026-04-23, last
-updated 2026-06-14, no reviews yet) solves the **inverse** problem: an
-external *coordinator* drives csim's clock (`time_advance` / `step_to` /
-`run_until` + `continue`) and routes **all** radio traffic through an external
-channel model (csim emits `tx`, the coordinator injects `rx`). csim is a
-component inside someone else's simulation. This plan keeps csim as the
-master clock and makes external processes *nodes* inside csim's medium.
+PR #1 "Add co-simulation support" (opened 2026-04-23, last updated
+2026-06-14, no reviews yet) solves the **inverse** problem: an external
+*coordinator* drives csim's clock (`time_advance` / `step_to` / `run_until` +
+`continue`) and routes **all** radio traffic through an external channel model
+(csim emits `tx`, the coordinator injects `rx`). csim is a component inside
+someone else's simulation. This plan keeps csim as the master clock and makes
+external processes *nodes* inside csim's medium.
 
 Overlap worth exploiting:
 
@@ -427,3 +448,50 @@ Recommendation: treat the two as one "external interfaces" theme with a
 shared message vocabulary, land this plan's minimal cut first (it needs no
 runner changes), then revive PR #1's coordinator mode as a scheduler policy
 on the post-refactor kernel. Neither blocks the other.
+
+## 12. Status: what is built
+
+The M1 minimal cut's transmit half is **implemented and merged-ready** (PR
+#23), sized at ~530 lines against the ~380 estimated:
+
+| File | Lines | |
+|---|---|---|
+| `src/native/ext_node.c` + `include/native/ext_node.h` | ~390 | Engine: fork/exec + pipes, bounded line reader, NDJSON via the in-tree cJSON, `tx`/`log`/`wake` |
+| `src/motes/external_mote.c` | ~150 | Mote ops, deliberately the `js_app_mote.c` shape |
+| Registration + build | 13 | One enum value, one `.py` extension row, one `mote_kinds.c` row, one union arm, two Makefile lines |
+
+**No runner change, no kernel change, no config-schema change**, as predicted.
+
+Measured, on `configs/test-ext-jammer-sky.json` (two Sky nullnet nodes 5 m
+apart, `examples/ext/jammer.py` between them at 2 m):
+
+| | sends | app-level receives | CC2420 |
+|---|---|---|---|
+| Baseline, no jammer | 4 | 4 | `crc_ok=4 crc_fail=0` |
+| `JAM_PERIOD_MS=2` (64% duty) | 4 | **0** | `crc_ok=20137 crc_fail=4 dropped=2492 overflow=10` |
+
+The link goes to 100% loss. The large `crc_ok` is the jam frames themselves
+arriving as valid-CRC garbage (§4); `crc_fail=4` is the four real packets,
+destroyed by collision.
+
+Verified: byte-identical across two runs (108 lines compared, host-timing
+lines excluded); `correctness` 87/87, `arm-correctness` 230/230,
+`radio-medium` 241/241, `cc1200-mock-host` 73/73 unchanged; the JS mote
+unaffected (`cross-level-demo.json`).
+
+Failure paths, each with a specific message: peer exits before replying,
+peer replies with non-JSON, `tx` frame malformed or over 152 bytes, reply
+timeout (`CSIM_EXT_TIMEOUT_MS`, default 5000), output stamped before the
+step time.
+
+**Not built (M1's other half):** RX into the peer — a node on this engine
+transmits but is deaf, so `rx` inputs, the RX queue and per-receiver
+RSSI/channel lookup are still to come, along with `serial` input, the
+replay-file source, `tools/csim_ext.py` and the config-v2 block.
+
+**Known rough edge:** a peer that dies *mid-run* logs to stderr and stops the
+run immediately via `sim_runtime_request_stop()`, but the process still exits
+0 — refactor-plan §3.14.2 explicitly forbids a mote failure from aborting the
+sim, and a non-zero exit needs a runner change. Boot-time failures already
+exit 1. Until that is resolved, a CI job using an external node should assert
+liveness through a test validator rather than trusting the exit code.
