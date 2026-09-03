@@ -3,10 +3,22 @@
 # Run Contiki-NG Cooja test suite using csim
 #
 # Usage: ./tools/run-cooja-tests.sh [test-dir-pattern] [-v] [--no-build]
+#                                   [--seed N] [--logdir DIR] [--with-tun] [--clean]
 #
 # Converts each .csc → JSON, runs csim mixed-multinode, reports PASS/FAIL/SKIP.
 # Auto-builds missing firmware unless --no-build is passed.
-# Exit code 0 if all non-skipped tests pass.
+#
+# --seed N     run every test with random seed N instead of the .csc's own.
+#              This is Cooja's --random-seed: Contiki-NG's
+#              tests/Makefile.simulation-test loops BASESEED..BASESEED+RUNCOUNT
+#              and passes one seed per run.  Same seed => byte-identical run.
+# --logdir DIR write each test's full log to DIR/<category>/<csc-name>.testlog
+#              — Contiki-NG's tests/ layout, so `--logdir contiki-ng/tests`
+#              puts every log beside its .csc (their .gitignore covers
+#              *.testlog).  Errored tests (conversion / firmware build) get a
+#              log too, so a red test never leaves nothing behind.
+#
+# Exit code 0 only if every non-skipped test passed AND nothing errored.
 #
 # CONTIKI_DIR resolution: env variable → csim.conf → ../contiki-ng
 #
@@ -24,6 +36,8 @@ VERBOSE=""
 AUTO_BUILD=1
 WITH_TUN=0
 CLEAN=0
+SEED=""
+LOGDIR=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,6 +53,18 @@ while [ $# -gt 0 ]; do
         --clean)
             CLEAN=1
             ;;
+        --seed)
+            SEED="$2"; shift
+            ;;
+        --seed=*)
+            SEED="${1#--seed=}"
+            ;;
+        --logdir)
+            LOGDIR="$2"; shift
+            ;;
+        --logdir=*)
+            LOGDIR="${1#--logdir=}"
+            ;;
         -h|--help)
             echo "Usage: $0 [test-dir-pattern] [-v] [--no-build] [--with-tun] [--clean]"
             echo "  test-dir-pattern: glob to filter test dirs (e.g. '07-*' or '14-rpl-lite')"
@@ -46,6 +72,8 @@ while [ $# -gt 0 ]; do
             echo "  --no-build: skip auto-building missing firmware"
             echo "  --with-tun: include border-router tests (requires sudo for TUN)"
             echo "  --clean: wipe firmware/<target>/* before running (forces full rebuild)"
+            echo "  --seed N: run with random seed N instead of each .csc's own (Cooja --random-seed)"
+            echo "  --logdir DIR: write DIR/<category>/<csc-name>.testlog per test (Contiki-NG tests/ layout)"
             echo ""
             echo "CONTIKI_DIR resolution: env variable -> csim.conf -> ../contiki-ng"
             exit 0
@@ -56,6 +84,29 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Fail loudly on bad option values rather than running something else.
+if [ -n "$SEED" ]; then
+    case "$SEED" in
+        ''|*[!0-9]*) echo "Error: --seed expects a positive integer, got '$SEED'"; exit 2 ;;
+    esac
+    if [ "$SEED" -eq 0 ]; then echo "Error: --seed 0 is not a valid seed"; exit 2; fi
+fi
+if [ -n "$LOGDIR" ]; then
+    mkdir -p "$LOGDIR" || { echo "Error: cannot create --logdir '$LOGDIR'"; exit 2; }
+    LOGDIR="$(cd "$LOGDIR" && pwd)"
+fi
+SEED_ARGS=""
+[ -n "$SEED" ] && SEED_ARGS="--seed $SEED"
+
+# Run from the Cooja-NG tree regardless of the caller's cwd.  The generated
+# JSON refers to firmware as firmware/<target>/<name> relative to this tree,
+# and test_runner opens it relative to ITS cwd — so invoked from elsewhere
+# (make -C contiki-ng/tests/<category> SIMULATOR=cooja-ng, a CI step, the
+# unpacked release tarball) every test failed with "Cannot open ELF file".
+# Every user-supplied path is already absolute by this point (CONTIKI_DIR,
+# LOGDIR); TEST_PATTERN is relative to $CONTIKI_DIR/tests, not to the cwd.
+cd "$CSIM_DIR" || exit 2
 
 # Resolve CONTIKI_DIR: env -> csim.conf -> default
 if [ -z "$CONTIKI_DIR" ]; then
@@ -110,6 +161,8 @@ fi
 echo "=== Cooja Test Suite (csim) ==="
 echo "  Contiki-NG: $CONTIKI_DIR"
 echo "  Test pattern: $TEST_PATTERN"
+[ -n "$SEED" ]   && echo "  Seed: $SEED (overrides each .csc's randomseed)"
+[ -n "$LOGDIR" ] && echo "  Log dir: $LOGDIR (<category>/<csc-name>.testlog per test)"
 echo "  Firmware target: $FIRMWARE_TARGET"
 echo "  Firmware dir: $FIRMWARE_DIR"
 echo ""
@@ -140,6 +193,20 @@ skipped_count=0
 NEED_REBUILD_FILE="$TMP_DIR/need_rebuild.txt"
 touch "$NEED_REBUILD_FILE"
 
+# Persist a test's log under --logdir as <category>/<csc-name>.testlog — the
+# same layout as Contiki-NG's tests/ tree, so `--logdir contiki-ng/tests` puts
+# every log beside its .csc.  Mirroring the category is not cosmetic: the same
+# .csc basename exists in several categories (07-rpl-random-rearrangement in
+# both 14-rpl-lite and 15-rpl-classic), and a flat directory silently lost 13
+# of 85 logs on a full run.  No-op without --logdir.
+save_testlog() {
+    local test_name="$1" src="$2"
+    [ -n "$LOGDIR" ] || return 0
+    local cat="$(dirname "$test_name")"
+    mkdir -p "$LOGDIR/$cat"
+    cp "$src" "$LOGDIR/$cat/$(basename "$test_name").testlog"
+}
+
 run_test() {
     local test_name="$1"
     local json_file="$2"
@@ -158,13 +225,14 @@ run_test() {
     fi
 
     start_time=$(date +%s)
-    if timeout "$wall_timeout" "$TEST_RUNNER" mixed-multinode "$json_file" $VERBOSE > "$log_file" 2>&1; then
+    if timeout "$wall_timeout" "$TEST_RUNNER" mixed-multinode "$json_file" $VERBOSE $SEED_ARGS > "$log_file" 2>&1; then
         exit_code=0
     else
         exit_code=$?
     fi
     end_time=$(date +%s)
     elapsed=$((end_time - start_time))
+    save_testlog "$test_name" "$log_file"
 
     if [ $exit_code -eq 0 ]; then
         echo "PASS (${elapsed}s)"
@@ -211,6 +279,7 @@ for csc_file in $csc_files; do
     if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>"$conv_log"; then
         echo "  ERROR $test_name (conversion failed)"
         sed 's/^/        /' "$conv_log"
+        save_testlog "$test_name" "$conv_log"
         ERRORED_TESTS="$ERRORED_TESTS
   - $test_name (conversion failed)"
         errors=$((errors + 1))
@@ -310,6 +379,7 @@ if [ "$need_rebuild_count" -gt 0 ]; then
         if ! python3 "$CSC2JSON" "$csc_file" --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$FIRMWARE_TARGET" --js-native -o "$json_file" 2>"$conv_log"; then
             echo "  ERROR $test_name (conversion failed)"
             sed 's/^/        /' "$conv_log"
+        save_testlog "$test_name" "$conv_log"
             ERRORED_TESTS="$ERRORED_TESTS
   - $test_name (conversion failed)"
             errors=$((errors + 1))
@@ -349,6 +419,14 @@ for n in d.get('nodes', []):
 
         run_test "$test_name" "$json_file"
     done < "$NEED_REBUILD_FILE"
+fi
+
+# FAIL-LOUDLY: a pattern that matched no .csc at all is a mistake (typo,
+# wrong CONTIKI_DIR, renamed test) — not a passing run of zero tests.
+if [ "$total" -eq 0 ]; then
+    echo ""
+    echo "Error: no .csc files matched '$TEST_PATTERN' under $CONTIKI_DIR/tests"
+    exit 2
 fi
 
 echo ""
