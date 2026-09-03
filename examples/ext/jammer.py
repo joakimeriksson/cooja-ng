@@ -41,6 +41,7 @@ def done(t, wake, out=()):
 
 def main():
     next_jam = 0
+    bursts = 0
     for line in sys.stdin:
         msg = json.loads(line)
         kind = msg.get("type")
@@ -57,8 +58,15 @@ def main():
             out = []
             if t >= next_jam:
                 out.append({"type": "tx", "t": t, "ch": CHANNEL, "frame": JUNK})
-                out.append({"type": "log", "t": t,
-                            "line": "jam %d B" % JAM_LEN})
+                bursts += 1
+                # One line per burst would be 10k lines at a 2 ms period, which
+                # drowns the console the jamming is meant to be judged by.
+                # First burst, then a periodic heartbeat: enough for a test to
+                # assert the jammer is alive without narrating every packet.
+                if bursts == 1 or bursts % 100 == 0:
+                    out.append({"type": "log", "t": t,
+                                "line": "jam #%d (%d B on ch %d)"
+                                        % (bursts, JAM_LEN, CHANNEL)})
                 next_jam = t + PERIOD_NS
             done(t, next_jam, out)            # `wake` = when we want the next step
 

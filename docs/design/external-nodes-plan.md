@@ -517,8 +517,39 @@ despite two neighbours in range. Giving the JS kind the same capability
 would fix it, but it would also change existing JS console output, so it is
 left as a separate decision rather than a silent side effect.
 
+**Both examples are gated in CI**, not just shipped as demos
+(`.github/workflows/test.yml`, ubuntu + macOS):
+
+- **sniffer** — validators assert the decoded *source addresses*, so it fails
+  if the peer dies, if the bus stops delivering, or if the MAC decode drifts.
+  Verified by mutation: removing `SIM_RADIO_CAP_FRAME_CONSUMER` turns it red
+  (`"rx #" matched 0/4`).
+- **jammer** — a negative test: `fail_on` trips if any application message
+  gets through, and validators require that the Sky pair actually sent and
+  that the jammer actually transmitted, so a jammer that does nothing cannot
+  pass vacuously. Verified by mutation: at the 100 ms default period the link
+  survives and the test fails, naming the packet that got through.
+
+These validators are also what makes the exit-code gap above harmless in
+practice: a dead peer produces no log lines, so the validator fails even
+though the mote failure itself cannot set the exit code.
+
+Measured dose-response, which is the evidence the interference model behaves
+sensibly rather than just "on/off":
+
+| `JAM_PERIOD_MS` | duty | app messages delivered (of 4) |
+|---|---|---|
+| none (baseline) | 0% | 4 |
+| 100 | ~1% | 4 |
+| 20 | ~7% | 3 |
+| 5 | ~26% | 1 |
+| 2 | ~64% | 0 |
+
 **Still not built:** `serial` input into the peer, the replay-file source,
 `tools/csim_ext.py`, the config-v2 block, and `led`/`radio`/`move` events.
+The config-v2 block has a concrete motivation now: `JAM_PERIOD_MS=2` has to be
+passed as an environment variable in the CI step because a config cannot yet
+carry per-node arguments.
 
 **Known rough edge:** a peer that dies *mid-run* logs to stderr and stops the
 run immediately via `sim_runtime_request_stop()`, but the process still exits

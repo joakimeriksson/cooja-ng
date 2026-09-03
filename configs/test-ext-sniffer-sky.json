@@ -1,9 +1,18 @@
 {
-  "title": "External node: Python sniffer decodes 802.15.4 from a Sky pair",
+  "title": "External node: Python sniffer receives and decodes 802.15.4 from a Sky pair",
   "timeout_ms": 20000,
   "nodes": [
     { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 1, "x": 0.0, "y": 0.0 },
     { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 2, "x": 5.0, "y": 0.0 },
     { "firmware": "examples/ext/sniffer.py",            "id": 3, "x": 2.0, "y": 0.0 }
-  ]
+  ],
+  "test": {
+    "timeout_is_success": true,
+    "validators": [
+      { "pattern": "rx #",                            "node": 3, "min_count": 4 },
+      { "pattern": "DATA seq=",                       "node": 3, "min_count": 4 },
+      { "pattern": "src=(same)/0101.0100.0174.1200",  "node": 3, "min_count": 2 },
+      { "pattern": "src=(same)/0202.0200.0274.1200",  "node": 3, "min_count": 2 }
+    ]
+  }
 }
