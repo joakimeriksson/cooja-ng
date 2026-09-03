@@ -95,9 +95,13 @@ void native_rx_assembler_feed(native_node_t *node, uint8_t byte) {
         if (byte == 0x00) {
             a->zero_count++;
         } else if (byte == 0x7A && a->zero_count >= 4) {
-            /* Got SFD after preamble */
+            /* Got SFD after preamble: reception start (ContikiRadio.
+             * signalReceptionStart) — mark receiving and stamp the frame. */
             a->state = RX_ASM_LENGTH;
             a->count = 0;
+            if (node->simReceiving) *node->simReceiving = 1;
+            if (node->simLastPacketTimestamp)
+                *node->simLastPacketTimestamp = (uint64_t)(node->sim_time_ns / 1000LL);
         } else {
             /* Reset on unexpected byte */
             a->zero_count = 0;
@@ -128,9 +132,11 @@ void native_rx_assembler_feed(native_node_t *node, uint8_t byte) {
             /* Frame complete: strip FCS (last 2 bytes), deliver to native node */
             int frame_len = a->expected_len - 2;
             if (frame_len > 0 && frame_len <= 128) {
-                /* Byte-stream reassembly: use node's current time, sender unknown */
+                /* Byte-stream reassembly: the frame has fully arrived, so
+                 * queue it as already-ended (arrival = now - on-air time);
+                 * it is completed on the node's next tick. */
                 native_deliver_frame(node, a->buf, frame_len,
-                                     node->sim_time_ns, -1);
+                                     node->sim_time_ns - (int64_t)frame_len * 32000LL, -1);
             }
             native_rx_assembler_reset(a);
         }

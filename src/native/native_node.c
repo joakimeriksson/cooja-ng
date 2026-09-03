@@ -133,6 +133,7 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
     *node->simRandomSeed = node_id * 12345 + 67890;
     *node->simCurrentTime = 0;
     *node->simRtimerCurrentTicks = 0;
+    node->clock_drift_ns = 0;
     *node->simInSize = 0;
     *node->simOutSize = 0;
     *node->simLoggedFlag = 0;
@@ -144,18 +145,17 @@ int native_node_init(native_node_t *node, const char *firmware_path, int node_id
         fprintf(stderr, "native_node: cooja_init() returned %d\n", ret);
     }
 
-    /* Initial ticks to complete boot.
-     * Tick 1: contiki_init() runs, reads simMoteID.
-     * Tick 2: process simMoteIDChanged (node_id_init re-reads if changed).
-     * Note: don't call native_check_log_output here — the caller sets up
-     * the log callback after init, then does additional boot ticks. */
+    /* Do NOT tick here.  cooja_init() only creates the Contiki coroutines;
+     * the first cooja_tick() runs the boot-up yield and the second runs
+     * Contiki's main() (platform init, netstack, autostart).  COOJA performs
+     * both on the mote's first scheduled wakeups, i.e. at its randomized
+     * start time, so everything the boot anchors on RTIMER_NOW() (TSCH's
+     * slot schedule in particular) is anchored to the mote's real start.
+     * Ticking at load time anchored it at t=0 instead and left the mote
+     * a full startup delay behind its own schedule (the "!dl-miss
+     * TxBeforeTx <start delay>" at the coordinator's first slot).
+     * simProcessRunValue=1 marks the pending boot for the wakeup logic. */
     *node->simProcessRunValue = 1;
-    node->cooja_tick();
-
-    /* Ensure node_id is applied — set changed flag and tick again */
-    *node->simMoteIDChanged = 1;
-    *node->simProcessRunValue = 1;
-    node->cooja_tick();
 
     node->sim_time_ns = 0;
     printf("  Native node %d: initialized successfully\n", node_id);
@@ -192,9 +192,9 @@ static int64_t compute_next_wakeup(const native_node_t *node) {
         return node->sim_time_ns;
     }
 
-    /* Etimer: expiration time is in ms */
+    /* Etimer: expiration time is in mote-local ms */
     if (*node->simEtimerPending) {
-        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
+        int64_t et_ns = native_node_etimer_expiry_ns(node);
         if (et_ns < next_ns) next_ns = et_ns;
     }
 
@@ -223,7 +223,7 @@ int64_t native_next_wakeup_ns(const native_node_t *node) {
      * processRunValue and rx_queue are handled by idle-skip in the outer loop. */
     int64_t next_ns = INT64_MAX;
     if (*node->simEtimerPending) {
-        int64_t et_ns = (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL;
+        int64_t et_ns = native_node_etimer_expiry_ns(node);
         if (et_ns < next_ns) next_ns = et_ns;
     }
     if (*node->simRtimerPending) {
@@ -233,27 +233,78 @@ int64_t native_next_wakeup_ns(const native_node_t *node) {
     return next_ns;
 }
 
+void native_node_set_clocks(native_node_t *node, int64_t sim_ns) {
+    int64_t mote_ns = sim_ns + node->clock_drift_ns;
+    *node->simRtimerCurrentTicks = (uint64_t)(sim_ns / 1000LL);
+    if (mote_ns > 0)
+        *node->simCurrentTime = (uint64_t)(mote_ns / 1000000LL);
+}
+
+void native_node_set_clock_drift(native_node_t *node, int64_t drift_ns) {
+    int64_t drift_us = drift_ns / 1000LL;
+    drift_us -= drift_us % 1000LL;   /* ContikiClock.setDrift: round to ms */
+    node->clock_drift_ns = drift_us * 1000LL;
+}
+
+int64_t native_node_etimer_expiry_ns(const native_node_t *node) {
+    return (int64_t)(*node->simEtimerNextExpirationTime) * 1000000LL
+           - node->clock_drift_ns;
+}
+
 /*
- * Dequeue one frame from the RX queue for delivery.
- * Skips collided frames. Returns true if a good frame was delivered.
+ * Complete every in-flight frame whose on-air time has ended at
+ * node->sim_time_ns, exactly like COOJA's ContikiRadio.signalReceptionEnd():
+ * a frame that was not interfered lands in simInDataBuffer (the newest one
+ * wins, as in COOJA), an interfered one is dropped, and simReceiving stays
+ * 1 only while a frame is still in the air.  Frames still in flight are
+ * kept.  Returns true if a good frame was delivered.
  */
 bool native_dequeue_rx_frame(native_node_t *node) {
-    while (node->rx_queue.count > 0) {
-        native_pending_frame_t *head =
-            &node->rx_queue.frames[node->rx_queue.head];
-        node->rx_queue.head =
-            (node->rx_queue.head + 1) % NATIVE_RX_QUEUE_SIZE;
-        node->rx_queue.count--;
-
-        if (!head->collided) {
-            /* Good frame — deliver to simInDataBuffer */
-            memcpy(node->simInDataBuffer, head->data, (size_t)head->len);
-            *node->simInSize = head->len;
-            return true;
+    bool delivered = false;
+    native_rx_queue_t *q = &node->rx_queue;
+    int kept = 0;
+    /* Frames may end out of arrival order (a short frame that started
+     * after a long one ends first), so scan the whole queue, complete
+     * every ended frame and compact the rest in place. */
+    for (int f = 0; f < q->count; f++) {
+        int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
+        native_pending_frame_t *fr = &q->frames[idx];
+        if (fr->end_ns > node->sim_time_ns) {
+            int dst = (q->head + kept) % NATIVE_RX_QUEUE_SIZE;
+            if (dst != idx) q->frames[dst] = *fr;
+            kept++;
+            continue;
         }
-        /* Collided frame — skip it and try next */
+        if (!fr->collided) {
+            memcpy(node->simInDataBuffer, fr->data, (size_t)fr->len);
+            *node->simInSize = fr->len;
+            delivered = true;
+        }
     }
-    return false;
+    q->count = kept;
+    if (node->simReceiving)
+        *node->simReceiving = q->count > 0 ? 1 : 0;
+    return delivered;
+}
+
+/* Drop everything in the air and in the buffer (ContikiRadio.doActionsAfterTick
+ * when simRadioHWOn goes to 0). */
+void native_radio_flush_rx(native_node_t *node) {
+    node->rx_queue.head = 0;
+    node->rx_queue.count = 0;
+    if (node->simReceiving) *node->simReceiving = 0;
+    *node->simInSize = 0;
+}
+
+/* Earliest end-of-frame time among frames in flight, or INT64_MAX. */
+int64_t native_rx_next_end_ns(const native_node_t *node) {
+    int64_t next = INT64_MAX;
+    for (int f = 0; f < node->rx_queue.count; f++) {
+        int idx = (node->rx_queue.head + f) % NATIVE_RX_QUEUE_SIZE;
+        if (node->rx_queue.frames[idx].end_ns < next)
+            next = node->rx_queue.frames[idx].end_ns;
+    }
+    return next;
 }
 
 void native_step_until_ns(native_node_t *node, int64_t target_ns) {
@@ -284,8 +335,7 @@ void native_step_until_ns(native_node_t *node, int64_t target_ns) {
         last_tick_ns = node->sim_time_ns;
 
         /* Update simulation time variables */
-        *node->simCurrentTime        = (uint64_t)(node->sim_time_ns / 1000000LL);
-        *node->simRtimerCurrentTicks = (uint64_t)(node->sim_time_ns / 1000LL);
+        native_node_set_clocks(node, node->sim_time_ns);
 
         /* Process ticks. After TX, call yield callback for ACK delivery.
          * For non-TX ticks with processRunValue=1, continue ticking
@@ -381,9 +431,10 @@ void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
     memcpy(slot->data, frame, (size_t)len);
     slot->len = len;
     slot->arrival_ns = arrival_ns;
-    /* Frame duration: (len + 6) bytes at 32us/byte = (len+6)*32000 ns
-     * The +6 accounts for preamble(4) + SFD(1) + length(1) */
-    slot->end_ns = arrival_ns + (int64_t)(len + 6) * 32000LL;
+    /* On-air time as COOJA computes it for ContikiRadio: 8*len bits at
+     * 250 kbit/s = 32 µs per payload byte, ending exactly when the
+     * sender's simOutSize is cleared (radio_tx_end_ns uses the same rule). */
+    slot->end_ns = arrival_ns + (int64_t)len * 32000LL;
     slot->sender_idx = sender_idx;
     slot->collided = false;
 

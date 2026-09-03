@@ -106,6 +106,12 @@ typedef struct native_node {
 
     /* Simulation state */
     int64_t  sim_time_ns;
+    /* Mote-local clock offset in ns (whole ms, normally <= 0), COOJA's
+     * ContikiClock drift: simCurrentTime = (sim_time_ns + clock_drift_ns)
+     * so clock_time() counts from the mote's own start while the rtimer
+     * stays on global simulation time.  Set by the startup-delay spread
+     * and by reboot-at-runtime (setDrift(-startTime) in Clock.added()). */
+    int64_t  clock_drift_ns;
     int      node_id;
 
     /* Radio state */
@@ -139,6 +145,16 @@ typedef struct native_node {
 /* Initialize a native node: copy firmware, dlopen, resolve symbols, cooja_init */
 int native_node_init(native_node_t *node, const char *firmware_path, int node_id);
 
+/* Write the clocks Contiki reads on its next tick: simRtimerCurrentTicks is
+ * global µs; simCurrentTime is the mote-local ms clock and is only written
+ * once the mote-local time is positive (ContikiClock.setTime). */
+void native_node_set_clocks(native_node_t *node, int64_t sim_ns);
+/* ContikiClock.setDrift(): store the offset rounded to whole ms. */
+void native_node_set_clock_drift(native_node_t *node, int64_t drift_ns);
+/* Global simulation time (ns) at which the pending etimer expires
+ * (ContikiClock.doActionsAfterTick: expiration*1ms - moteTime + simTime). */
+int64_t native_node_etimer_expiry_ns(const native_node_t *node);
+
 /* Destroy a native node: dlclose, remove temp file */
 void native_node_destroy(native_node_t *node);
 
@@ -157,6 +173,8 @@ void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
 
 /* Dequeue one non-collided frame into simInDataBuffer. Returns true if delivered. */
 bool native_dequeue_rx_frame(native_node_t *node);
+void native_radio_flush_rx(native_node_t *node);
+int64_t native_rx_next_end_ns(const native_node_t *node);
 
 /* Return the next time the node needs to wake up (ns), INT64_MAX if idle */
 int64_t native_next_wakeup_ns(const native_node_t *node);
