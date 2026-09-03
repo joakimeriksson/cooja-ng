@@ -123,6 +123,7 @@ SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
 # Per-kind mote modules (boot policy + adapters) + the mote-kind
 # registry — Phase 4, §3.17.
 MOTES_SOURCES = $(MOTES_SRC_DIR)/js_app_mote.c \
+                $(MOTES_SRC_DIR)/external_mote.c \
                 $(MOTES_SRC_DIR)/native_cooja_mote.c \
                 $(MOTES_SRC_DIR)/msp430_elf_mote.c \
                 $(MOTES_SRC_DIR)/arm_elf_mote.c \
@@ -130,7 +131,8 @@ MOTES_SOURCES = $(MOTES_SRC_DIR)/js_app_mote.c \
 
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
-                 $(NATIVE_SRC_DIR)/js_node.c
+                 $(NATIVE_SRC_DIR)/js_node.c \
+                 $(NATIVE_SRC_DIR)/ext_node.c
 
 UI_SOURCES = $(UI_SRC_DIR)/ws_server.c \
              $(UI_SRC_DIR)/sim_state.c

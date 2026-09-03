@@ -27,6 +27,7 @@ typedef enum sim_board_kind {
     SIM_BOARD_KIND_ARM,
     SIM_BOARD_KIND_NATIVE,
     SIM_BOARD_KIND_JS,
+    SIM_BOARD_KIND_EXTERNAL,
 } sim_board_kind_t;
 
 typedef struct sim_board_desc {

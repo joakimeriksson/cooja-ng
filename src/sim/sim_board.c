@@ -34,6 +34,7 @@ static const sim_board_desc_t boards[] = {
     /* Host-process motes */
     { ".cooja", NULL, SIM_BOARD_KIND_NATIVE, "Native/Cooja" },
     { ".js",    NULL, SIM_BOARD_KIND_JS,     "JS/QuickJS"   },
+    { ".py",    NULL, SIM_BOARD_KIND_EXTERNAL, "External/process" },
 };
 
 #define BOARD_COUNT ((int)(sizeof(boards) / sizeof(boards[0])))

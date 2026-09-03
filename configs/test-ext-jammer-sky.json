@@ -1,0 +1,9 @@
+{
+  "title": "External node: Python jammer disturbs a Sky nullnet pair",
+  "timeout_ms": 20000,
+  "nodes": [
+    { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 1, "x": 0.0, "y": 0.0 },
+    { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 2, "x": 5.0, "y": 0.0 },
+    { "firmware": "examples/ext/jammer.py",             "id": 3, "x": 2.0, "y": 0.0 }
+  ]
+}
