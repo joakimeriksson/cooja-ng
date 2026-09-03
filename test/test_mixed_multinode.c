@@ -1715,8 +1715,18 @@ int run_mixed_multinode_test(int argc, char **argv) {
     /* Optional plugin .so paths (--plugin PATH, repeatable) — Phase 9 M65 */
     const char *plugin_paths[16];
     int plugin_path_count = 0;
+    /* Zero-initialised: `-d` and `--seed` write into it before (or without)
+     * a JSON config being loaded, and several consumers below read
+     * config.seed / config.startup_delay_ms on the no-config path too. */
     sim_normalized_config_t config;
+    memset(&config, 0, sizeof(config));
     int config_loaded = 0;
+    /* --seed N: overrides the config's (or .csc's) seed.  Cooja's
+     * --random-seed semantics — Contiki-NG's tests/Makefile.simulation-test
+     * runs each test RUNCOUNT times with seeds BASESEED.. and expects each to
+     * take effect.  0 is rejected: it is the struct's "not set" value, so a
+     * silent no-op is exactly the kind of green-by-accident we do not ship. */
+    int seed_override = 0;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--ui") == 0) {
@@ -1759,6 +1769,20 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (plugin_path_count < (int)(sizeof(plugin_paths)/sizeof(plugin_paths[0])))
                 plugin_paths[plugin_path_count++] = argv[++i];
             else { fprintf(stderr, "--plugin: too many plugins\n"); i++; }
+        }
+        else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed_override = atoi(argv[++i]);
+            if (seed_override == 0) {
+                fprintf(stderr, "--seed: expected a non-zero integer, got '%s'\n", argv[i]);
+                return 1;
+            }
+        }
+        else if (strncmp(argv[i], "--seed=", 7) == 0) {
+            seed_override = atoi(argv[i] + 7);
+            if (seed_override == 0) {
+                fprintf(stderr, "--seed: expected a non-zero integer, got '%s'\n", argv[i] + 7);
+                return 1;
+            }
         }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-q") == 0) verbose = 0;
@@ -1810,9 +1834,15 @@ int run_mixed_multinode_test(int argc, char **argv) {
     if (node_count == 0)
         node_count = firmware_count;
 
+    if (seed_override) {
+        printf("  seed: %d (--seed, overrides %s)\n", seed_override,
+               config.seed ? "the config's seed" : "no config seed");
+        config.seed = seed_override;
+    }
+
     if (firmware_count < 1) {
-        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [-v] [-q] [--threads N] [--ui [port]]\n");
-        printf("       test_runner mixed-multinode <config.json> [-t ms] [-v] [-q] [--threads N] [--ui [port]]\n");
+        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [--seed N] [-v] [-q] [--ui [port]]\n");
+        printf("       test_runner mixed-multinode <config.json> [-t ms] [--seed N] [-v] [-q] [--ui [port]]\n");
         printf("  Firmware types detected by extension:\n");
         printf("    .sky      -> MSP430 (Tmote Sky)\n");
         printf("    .cc2538dk -> ARM (CC2538DK)\n");
@@ -1924,6 +1954,12 @@ sim_restart:
         radio_medium_configure_udgm(&radio_medium,
             default_range, default_range * 2.0, 1.0, 1.0);
         radio_medium_compute_neighbors(&radio_medium);
+        /* Seed here too, so --seed (or a config seed without a "medium"
+         * block) is never silently ignored on the default path.  With the
+         * default 1.0 ratios the medium RNG is never consulted, so this
+         * changes nothing observable for existing runs. */
+        if (config.seed)
+            radio_medium_set_seed(&radio_medium, (uint32_t)config.seed);
     }
     if (radio_medium.type == RADIO_MEDIUM_UDGM && !custom_medium) {
         printf("Radio medium: UDGM (tx_range=%.1f m, interference=%.1f m, "

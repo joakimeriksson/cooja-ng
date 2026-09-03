@@ -130,10 +130,13 @@ be a zero-risk ask.
   `develop` HEAD** (jftest4 or a scheduled GitHub workflow), so we see
   upstream drift before their CI does. Track the delta between "tests in
   their tree" and "tests we pass" as a number that must stay 0.
-- Seed semantics: upstream runs `BASESEED=1 RUNCOUNT=1`. Document what csim
-  does with the csc random seed today and, if it ignores it, wire it through
-  — multi-seed runs (`RUNCOUNT>1`) become nearly free at csim speeds and are
-  a Phase-4 selling point.
+- ~~Seed semantics~~ **DONE**: `--seed N` on `test_runner test` /
+  `mixed-multinode` and on `run-cooja-tests.sh` overrides the `.csc`'s
+  `randomseed` (Cooja's `--random-seed`), applied on every medium path;
+  `--logdir DIR` writes `DIR/<category>/<csc-name>.testlog` per test. Together they make
+  `make -C tests/<cat> SIMULATOR=cooja-ng BASESEED=.. RUNCOUNT=..` faithful —
+  the Makefile switch is documented in `docs/contiki-ng-testing.md` and is the
+  fork-side change for Phase 1.
 
 ### Phase 3 — flip to gating + replace the Renode category (~1 week incl. review)
 

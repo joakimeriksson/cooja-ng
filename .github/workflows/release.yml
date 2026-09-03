@@ -105,6 +105,16 @@ jobs:
 
               CONTIKI_DIR=/path/to/contiki-ng tools/run-cooja-tests.sh
               CONTIKI_DIR=/path/to/contiki-ng tools/run-cooja-tests.sh --with-tun   # + border-router tests (needs sudo/TUN)
+              CONTIKI_DIR=/path/to/contiki-ng tools/run-cooja-tests.sh 07-simulation-base/01-cooja-hello-world \
+                  --seed 3 --logdir /path/to/contiki-ng/tests     # one test, one seed, .testlog beside the .csc
+
+          --seed N is Cooja's --random-seed (same seed = byte-identical run);
+          --logdir DIR writes DIR/<category>/<csc-name>.testlog per test. The suite fails
+          loudly: an unknown .csc feature, a failed firmware build, a test with
+          no assertions or a script without a verdict fails the run - never a
+          silent skip. To run it from inside a Contiki-NG tree
+          (make -C tests/<category> SIMULATOR=cooja-ng) and from CI, see
+          https://github.com/joakimeriksson/cooja-ng/blob/main/docs/contiki-ng-testing.md
 
           Firmware is compiled from the Contiki-NG tree by the runner
           (tools/build-test-firmware.sh); this package contains no firmware.

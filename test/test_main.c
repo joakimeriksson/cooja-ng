@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
         printf("Chip drivers: cc1200-mock-host\n");
         printf("Radio medium: radio-medium\n");
         printf("Radio bus:    radio-bus\n");
-        printf("Test:         test <config.json> [-v] [-t ms]\n");
+        printf("Test:         test <config.json> [-v] [-t ms] [--seed N]\n");
         printf("Combined:     all\n");
         return 1;
     }

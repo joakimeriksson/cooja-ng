@@ -171,11 +171,17 @@ make cooja-tests PATTERN='14-rpl-lite*'            # subset
 sudo setcap cap_net_admin+eip ../contiki-ng/tools/serial-io/tunslip6
 ./tools/run-cooja-tests.sh --with-tun -v 2>&1 | tee cooja-tests-tun.log
 
+# One test, one seed, log beside the .csc (--logdir mirrors the tests/ layout)
+./tools/run-cooja-tests.sh 07-simulation-base/01-cooja-hello-world \
+    --seed 3 --logdir ../contiki-ng/tests
+
 # Rebuild test firmware (only if Contiki sources changed)
 make build-firmware
 ```
 
-`run-cooja-tests.sh` globs `tests/*/*.csc` in your Contiki checkout, converts each to JSON via `csc2json.py`, builds any missing firmware (`--no-build` to skip), runs `test_runner mixed-multinode` with the JS test script attached, and reports compatible PASS / FAIL / SKIP totals.
+`run-cooja-tests.sh` globs `tests/*/*.csc` in your Contiki checkout, converts each to JSON via `csc2json.py`, builds any missing firmware (`--no-build` to skip), runs `test_runner mixed-multinode` with the JS test script attached, and reports compatible PASS / FAIL / SKIP totals. `--seed N` is Cooja's `--random-seed` (one seed per run, same seed ⇒ byte-identical run); `--logdir DIR` writes `DIR/<category>/<csc-name>.testlog` per test.
+
+The suite **fails loudly**: an unknown `.csc` feature, a firmware build that fails, a test with no assertions, or a script that ends without a verdict is an error that fails the run — never a silent skip. To run the suite from *inside* a Contiki-NG tree with `make -C tests/<category> SIMULATOR=cooja-ng` (same `summary` / exit semantics as Java Cooja), and to wire it into CI, see [`docs/contiki-ng-testing.md`](docs/contiki-ng-testing.md).
 
 ## JSON simulation configs
 
