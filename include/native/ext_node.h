@@ -43,7 +43,8 @@ extern "C" {
 #define EXT_NODE_RX_QUEUE  16
 
 typedef struct ext_node_rx {
-    int64_t arrival_ns;
+    int64_t arrival_ns;   /* when the peer is stepped for it */
+    int64_t start_ns;     /* the frame's start on the air: `rx.t` (<= arrival) */
     int     from_id;      /* sender's node id, -1 if unknown */
     int     channel;      /* sender's channel, -1 if unknown */
     int8_t  rssi;         /* per-receiver, from the medium */
@@ -81,7 +82,11 @@ typedef struct ext_node {
     void    *log_callback_data;
 
     /* Whole-frame TX (user_data = the mote). */
-    void   (*rf_frame_callback)(void *user_data, const uint8_t *frame, int len);
+    /* Whole-frame TX (user_data = the mote).  at_ns is the time the peer
+     * stamped the frame with -- inside the slice just executed, since a peer
+     * that emulates a CPU lags the kernel -- or 0 for "now". */
+    void   (*rf_frame_callback)(void *user_data, const uint8_t *frame, int len,
+                                int64_t at_ns);
     void    *rf_frame_callback_data;
 } ext_node_t;
 
@@ -100,8 +105,8 @@ void ext_node_step_until_ns(ext_node_t *node, int64_t target_ns);
 /* Queue a received frame for delivery to the peer as an `rx` input.
  * Returns 0, or -1 if the queue was full (frame dropped). */
 int  ext_node_deliver_frame(ext_node_t *node, const uint8_t *frame, int len,
-                            int64_t arrival_ns, int from_id, int channel,
-                            int8_t rssi);
+                            int64_t start_ns, int64_t arrival_ns, int from_id,
+                            int channel, int8_t rssi);
 
 int64_t ext_node_next_wakeup_ns(const ext_node_t *node);
 

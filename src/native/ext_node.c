@@ -158,8 +158,8 @@ static void hex_encode(const uint8_t *in, int len, char *out) {
  * ============================================================ */
 
 int ext_node_deliver_frame(ext_node_t *node, const uint8_t *frame, int len,
-                           int64_t arrival_ns, int from_id, int channel,
-                           int8_t rssi) {
+                           int64_t start_ns, int64_t arrival_ns, int from_id,
+                           int channel, int8_t rssi) {
     if (node->failed) return 0;
     if (len < 0 || len > EXT_NODE_MAX_FRAME) {
         /* Longer than we can carry; the peer would see a truncated frame,
@@ -174,6 +174,7 @@ int ext_node_deliver_frame(ext_node_t *node, const uint8_t *frame, int len,
     int tail = (node->rx_head + node->rx_count) % EXT_NODE_RX_QUEUE;
     ext_node_rx_t *slot = &node->rx_queue[tail];
     slot->arrival_ns = arrival_ns;
+    slot->start_ns   = start_ns <= arrival_ns ? start_ns : arrival_ns;
     slot->from_id    = from_id;
     slot->channel    = channel;
     slot->rssi       = rssi;
@@ -233,8 +234,14 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
                      EXT_NODE_MAX_FRAME);
             return;
         }
+        /* The stamp is what makes an acknowledgement land in the sender's
+         * CSMA window: the peer computed it from the frame's true end on
+         * the air, and the bus puts it on the air there rather than at the
+         * end of this catch-up slice. */
+        int64_t at_ns = cJSON_IsNumber(t) ? (int64_t)t->valuedouble : 0;
         if (node->rf_frame_callback)
-            node->rf_frame_callback(node->rf_frame_callback_data, buf, len);
+            node->rf_frame_callback(node->rf_frame_callback_data, buf, len,
+                                    at_ns);
 
     } else if (strcmp(type->valuestring, "log") == 0) {
         const cJSON *line = cJSON_GetObjectItemCaseSensitive(ev, "line");
@@ -409,7 +416,7 @@ static void do_step(ext_node_t *node, int64_t slice_start, int64_t when) {
         int m = snprintf(line + n, sizeof(line) - (size_t)n,
                          "%s{\"type\":\"rx\",\"t\":%lld,\"from\":%d,"
                          "\"ch\":%d,\"rssi\":%d,\"frame\":\"%s\"}",
-                         emitted ? "," : "", (long long)rx->arrival_ns,
+                         emitted ? "," : "", (long long)rx->start_ns,
                          rx->from_id, rx->channel, (int)rx->rssi, hex);
         if (m < 0 || n + m >= (int)sizeof(line)) {
             /* Leave the rest queued for the next step rather than sending a

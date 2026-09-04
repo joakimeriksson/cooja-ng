@@ -34,7 +34,7 @@ int external_mote_boot(mixed_node_t *node, int slot, const char *path,
     /* The runner's frame hook is not JS-specific: it takes (node, frame,
      * len), casts to mixed_node_t and never reads ->type.  Reusing it is
      * what keeps this kind free of runner changes. */
-    en->rf_frame_callback      = env->js_rf_frame;
+    en->rf_frame_callback      = env->ext_rf_frame_at;
     en->rf_frame_callback_data = node;
 
     /* Only now is it safe to hand the peer `hello` — its reply may already
@@ -152,8 +152,12 @@ static int ext_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
 
     int8_t rssi = radio_medium_get_rssi(rm, sender_idx, node->slot);
 
-    int rc = ext_node_deliver_frame(&node->plat.ext, frame, len, now_ns,
-                                    from_id, channel, rssi);
+    /* `rx.t` is the frame's start on the air (the bus's accurate first-byte
+     * time for an emulated sender that lags the kernel), so the peer can
+     * time RX_DONE and its acknowledgement from the frame's true end. */
+    int64_t start_ns = node->env->radio_bus ? node->env->radio_bus->frame_start_ns : now_ns;
+    int rc = ext_node_deliver_frame(&node->plat.ext, frame, len, start_ns,
+                                    now_ns, from_id, channel, rssi);
     sim_schedule_mote_wakeup_if_earlier(node->env->sim, node->slot, now_ns);
     return rc;
 }

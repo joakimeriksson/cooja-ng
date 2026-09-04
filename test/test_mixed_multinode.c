@@ -1344,6 +1344,45 @@ static void mixed_js_rf_handler(void *user_data, const uint8_t *frame, int len) 
         mixed_rf_tx_handler(sender, bytes[i]);
 }
 
+/* External motes: as above, but the frame goes on the air at the peer's own
+ * stamp.  A peer that emulates a CPU lags the kernel, so an acknowledgement
+ * it computed from the frame's true end is stamped inside the slice just
+ * executed; putting it on the air at the end of that slice instead is what
+ * made the Sky root's CSMA retransmit every unicast. */
+static void mixed_ext_rf_handler(void *user_data, const uint8_t *frame, int len,
+                                 int64_t at_ns) {
+    mixed_node_t *sender = (mixed_node_t *)user_data;
+    int sender_idx = (int)(sender - nodes);
+
+    /* Per-exchange ACK timing: the peer's frame start against the accurate
+     * on-air end of the last frame handed to it.  For an acknowledgement
+     * this is the 802.15.4 turnaround, and the number the Sky's CSMA window
+     * is judged against. */
+    if (verbose && at_ns > 0) {
+        int64_t frame_end = sim_radio_bus_consumer_frame_end_ns(&radio_bus,
+                                                                sender_idx);
+        if (frame_end > 0)
+            printf("  [ACK-dt] node %d: frame end %.6f s, peer TX %.6f s, "
+                   "delta %+.1f us (%d B)\n",
+                   sender->id, (double)frame_end / 1e9, (double)at_ns / 1e9,
+                   (double)(at_ns - frame_end) / 1000.0, len);
+    }
+
+    stat_rf_frames++;
+    channels_dirty = true;
+    node_last_tx_ns[sender_idx] = sim_runtime_now_ns(&sim_rt);
+    sim_radio_bus_tx_frame_at(&radio_bus, &sim_rt, sender_idx, frame, len,
+                              at_ns);
+
+    /* Arm the byte clock at the stamp too, so the emulated receivers'
+     * per-byte schedule runs from there and not from the slice end. */
+    sim_radio_bus_set_tx_at(&radio_bus, sender_idx, at_ns);
+    uint8_t bytes[160];
+    int n = native_frame_to_bytes(frame, len, bytes, (int)sizeof(bytes));
+    for (int i = 0; i < n; i++)
+        mixed_rf_tx_handler(sender, bytes[i]);
+}
+
 /* (JS boot policy lives in src/motes/js_app_mote.c — M19.) */
 
 /* --- Top-level node init (dispatches by type) --- */
@@ -1376,6 +1415,7 @@ static const sim_mote_env_t mixed_mote_env = {
     .rf_frame              = mixed_rf_frame_handler,
     .native_yield          = native_yield_callback,
     .js_rf_frame           = mixed_js_rf_handler,
+    .ext_rf_frame_at       = mixed_ext_rf_handler,
     .native_channel_sync   = mixed_native_channel_sync,
 };
 
