@@ -34,7 +34,7 @@ int external_mote_boot(mixed_node_t *node, int slot, const char *path,
     /* The runner's frame hook is not JS-specific: it takes (node, frame,
      * len), casts to mixed_node_t and never reads ->type.  Reusing it is
      * what keeps this kind free of runner changes. */
-    en->rf_frame_callback      = env->js_rf_frame;
+    en->rf_frame_callback      = env->ext_rf_frame_at;
     en->rf_frame_callback_data = node;
 
     /* Only now is it safe to hand the peer `hello` — its reply may already

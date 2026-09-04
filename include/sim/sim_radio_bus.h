@@ -58,6 +58,14 @@ typedef struct {
     bool subghz;           /* true once sync word matched (sub-GHz frame) */
     int subghz_phr_len;    /* CC1200 PHR width: 1 or 2 bytes */
     int64_t first_byte_ns; /* sim time of first preamble byte */
+    /* Frame-level sender only: the time this frame went on the air, when
+     * that is not the kernel's `now`.  A peer emulator lags the kernel and
+     * stamps its output inside the slice just executed; arming this before
+     * the PHY bytes are fed makes the byte clock run from the stamp, so an
+     * acknowledgement lands in the sender's window instead of at the end of
+     * the receiving peer's catch-up.  0 = unarmed (use now).  Cleared as
+     * the preamble arms the clock, so it can never leak into a later frame. */
+    int64_t at_override_ns;
 } tx_frame_asm_t;
 
 typedef struct {
@@ -275,6 +283,10 @@ typedef struct sim_radio_bus {
      * acknowledgement -- at the frame's true end rather than at the end of
      * the sender's catch-up slice. */
     int64_t frame_start_ns;
+    /* Per frame consumer: the accurate on-air end of the last frame handed
+     * to it.  The reference point for the peer-ACK delta (-v) and what a
+     * peer's acknowledgement is timed against. */
+    int64_t consumer_frame_end_ns[SIM_RADIO_BUS_MAX_NODES];
     /* M27: per-sender medium-busy deadline (ex node_tx_busy_until_ns) —
      * a frame occupies the sender's channel until this sim time; CCA
      * queries (cc1200) read it. */
@@ -291,6 +303,18 @@ typedef struct sim_radio_bus {
 void sim_radio_bus_register(sim_radio_bus_t *bus, int idx,
                             const mote_radio_ops_t *ops, void *mote,
                             sim_radio_delivery_mode_t mode, uint32_t caps);
+
+/* 802.15.4 ACK turnaround: 12 symbols after the frame leaves the air. */
+#define SIM_RADIO_ACK_TURNAROUND_NS 192000LL
+
+/* Arm the on-air time of sender idx's next frame-level frame, for a sender
+ * whose output is stamped inside the slice just executed (see
+ * tx_frame_asm_t::at_override_ns).  Consumed by the next preamble byte. */
+void sim_radio_bus_set_tx_at(sim_radio_bus_t *bus, int idx, int64_t at_ns);
+
+/* The accurate on-air end of the last frame delivered to frame consumer
+ * idx, or 0 if it has had none. */
+int64_t sim_radio_bus_consumer_frame_end_ns(const sim_radio_bus_t *bus, int idx);
 
 /* Install the runner's host hooks (copied by value). */
 void sim_radio_bus_set_host(sim_radio_bus_t *bus,
@@ -389,6 +413,15 @@ void sim_radio_bus_wake_mote(sim_radio_bus_t *bus, struct sim_runtime *sim,
  * TX-side bookkeeping (stat_rf_frames, channels_dirty, last_tx_ns). */
 void sim_radio_bus_tx_frame(sim_radio_bus_t *bus, struct sim_runtime *sim,
                             int sender_idx, const uint8_t *frame, int len);
+
+/* As sim_radio_bus_tx_frame, but the frame goes on the air at at_ns rather
+ * than now (0 = now).  A stamp inside the slice just executed takes effect
+ * at the stamp: receivers are handed the frame at that time and collision
+ * windows run from it, the way a CC2420's re-entrant auto-ACK is timed from
+ * the frame's accurate end rather than from the kernel's clock. */
+void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, struct sim_runtime *sim,
+                               int sender_idx, const uint8_t *frame, int len,
+                               int64_t at_ns);
 
 /* M28: push a (radio_idx, channel) change for node idx into the medium —
  * auto-registers the slot's spectrum on first push (slot 0 = 2.4 GHz,

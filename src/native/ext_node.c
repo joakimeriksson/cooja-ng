@@ -234,8 +234,14 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
                      EXT_NODE_MAX_FRAME);
             return;
         }
+        /* The stamp is what makes an acknowledgement land in the sender's
+         * CSMA window: the peer computed it from the frame's true end on
+         * the air, and the bus puts it on the air there rather than at the
+         * end of this catch-up slice. */
+        int64_t at_ns = cJSON_IsNumber(t) ? (int64_t)t->valuedouble : 0;
         if (node->rf_frame_callback)
-            node->rf_frame_callback(node->rf_frame_callback_data, buf, len);
+            node->rf_frame_callback(node->rf_frame_callback_data, buf, len,
+                                    at_ns);
 
     } else if (strcmp(type->valuestring, "log") == 0) {
         const cJSON *line = cJSON_GetObjectItemCaseSensitive(ev, "line");

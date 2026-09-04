@@ -82,7 +82,11 @@ typedef struct ext_node {
     void    *log_callback_data;
 
     /* Whole-frame TX (user_data = the mote). */
-    void   (*rf_frame_callback)(void *user_data, const uint8_t *frame, int len);
+    /* Whole-frame TX (user_data = the mote).  at_ns is the time the peer
+     * stamped the frame with -- inside the slice just executed, since a peer
+     * that emulates a CPU lags the kernel -- or 0 for "now". */
+    void   (*rf_frame_callback)(void *user_data, const uint8_t *frame, int len,
+                                int64_t at_ns);
     void    *rf_frame_callback_data;
 } ext_node_t;
 

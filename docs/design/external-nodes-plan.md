@@ -170,8 +170,32 @@ effect at the kernel's clock, the end of the slice, late by at most one
 slice — the same bound an emulated mote's radio output has. The reply's own
 `t` is where the peer stopped: a peer that yields at a transmission answers
 with `t` = that time and `wake` just after it, and the next slice starts
-there (the transmission itself still reaches the medium at the kernel's
-clock; shortening the busy-slice `wake` is what bounds the lateness):
+there:
+
+**A `tx` stamped inside the slice takes effect at its stamp, not at the end
+of the slice.** The frame goes on the air at the stamp: the per-byte clock
+for emulated receivers starts there, frame consumers are handed it at that
+time, and collision windows run from it. The precedent is the CC2420's own
+auto-ACK, which is generated re-entrantly inside the sender's
+`frame_complete` and timed from the frame's *accurate* end rather than from
+the kernel's clock — without that, an acknowledgement computed by the peer
+from the frame's true end would reach the medium half a slice late and miss
+the sender's CSMA window entirely. A stamp is never allowed to run ahead of
+the kernel; `t ≥ now` keeps the old behaviour.
+
+**`rx.t` is the frame's start on the air, not the moment csim handed it
+over.** An emulated sender pushes its bytes as its CPU reaches them, so the
+bus only completes the frame when the sender's *last* byte is pushed — at
+the end of that sender's catch-up slice, 0.6–2 ms after the frame actually
+started. The peer is given `accurate_tx_start` (sub-GHz: `now`), so it can
+place RX_DONE, and anything it times from RX_DONE, on the frame's true
+timeline. The `step` that carries the `rx` still happens at the arrival.
+
+Note that the peer must model the air time of the *PHY* frame, not of the
+MAC bytes it was handed: `rx.t` is the first preamble byte, and the on-air
+frame is 6 bytes longer than the MAC payload (4 preamble + SFD + length).
+A peer that computes its turnaround from `rx.t + len × 32 µs` answers a
+whole PHY header — 192 µs — early:
 
 | `type` | fields | csim action |
 |---|---|---|
@@ -567,3 +591,61 @@ run immediately via `sim_runtime_request_stop()`, but the process still exits
 sim, and a non-zero exit needs a runner change. Boot-time failures already
 exit 1. Until that is resolved, a CI job using an external node should assert
 liveness through a test validator rather than trusting the exit code.
+
+## 13. E6 stage 2: an external mote's ACK and the sender's CSMA window
+
+**Goal:** a peer's acknowledgement reaches an emulated sender inside its CSMA
+ACK wait, so the Sky root sends each unicast once instead of retransmitting
+it eight times.
+
+**Built** (`feat/ext-ack-timing`): `rx.t` = the frame's accurate start (§4);
+a peer's `tx` put on the air at its stamp (`sim_radio_bus_tx_frame_at` plus a
+first-byte-clock override, `sim_radio_bus_set_tx_at`); and a per-exchange
+delta print under `-v`:
+
+```
+[ACK-dt] node 2: frame end 16.708600 s, peer TX 16.708632 s, delta +32.0 us (3 B)
+```
+
+**Not achieved:** the Sky still retransmits every unicast to the C6 eight
+times. Two independent gaps, both measured:
+
+1. **The peer answers 160 µs early.** 83 of the 88 ACKs in a 120 s probe are
+   stamped +32 µs after the frame's true end, not the 802.15.4 +192 µs.
+   The two sides read `rx.t` differently: csim means the first preamble byte,
+   while the peer times RX_DONE as if it were the SFD — five byte times, 160
+   µs, later. `esp32c6/src/radio.rs:382` uses `air_cycles(1 + len + 2)` (the
+   length byte, the PSDU and the FCS), while the peer's own TX path two
+   hundred lines further down uses `air_cycles(PHY_OVERHEAD_BYTES + len + 2)`,
+   so the file disagrees with itself. Strictly this was a hole in §4, which
+   never said which point on the air `rx.t` names; §4 now does. The
+   correction is on the peer's RX path, and is the same term its TX path
+   already uses.
+
+2. **The sender's ACK wait expires inside its own execute slice**, so nothing
+   delivered after `frame_complete` returns can be seen. Stepping the peer
+   synchronously inside `frame_complete` (the prompt's item 3) does produce
+   the ACK in the right scope, but neither way of handing it back works:
+
+   | Route | Result |
+   |---|---|
+   | Byte path at the stamp (`dispatch_tx_byte`) | every byte dropped — the sender's radio has not left TX (CC2420 `dropped` 595 → 953, `crc_ok` unchanged at 118) |
+   | Sender's RX queue at the turnaround, as the chip's own auto-ACK uses (`queue_frame` at `now + 192 µs`) | delivered (`8 queued, 8 drained`) but still refused: it arrives after the firmware's wait has already run out inside that slice |
+
+   The chip's auto-ACK escapes this only because it is generated *by the
+   receiving chip's own model* during `deliver_bytes`, before the sender's
+   CPU resumes. Closing it for an external peer needs the sender's slice to
+   yield at `accurate_tx_end + 192 µs` so the ACK can be delivered between
+   sub-slices — a change to the mote slice model, beyond this plan's scope.
+
+   That machinery is therefore **not** in the branch: it changes emulated
+   delivery without fixing the symptom. The measurement above is the
+   deliverable for item 3.
+
+Regression state: `test-ext-sniffer-sky`, `test-ext-jammer-sky`
+(`JAM_PERIOD_MS=2`), `chain-4node-sky` pass; `correctness` 87/87,
+`radio-bus` 120/120, `radio-medium` 241/241, `arm-correctness` 230/230.
+Three probe runs byte-identical once the peer's own wall-clock line is
+excluded. `configs/test-ext-esp32c6-nullnet.json` fails, identically before
+and after this branch — its validators predate the peer's stage-2 radio
+logging.

@@ -351,7 +351,15 @@ void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
         /* Match Cooja's radio callbacks: outgoing bytes are observed at the
          * current scheduler time, not from a mote-local sim_time that may
          * have advanced within the current execute slice. */
-        a->first_byte_ns = sim_runtime_now_ns(sim);
+        /* A frame-level sender may have armed the time this frame went on
+         * the air (sim_radio_bus_set_tx_at): a peer emulator lags the
+         * kernel, so its output is stamped inside the slice just executed
+         * and must run on a byte clock starting there, not at the slice's
+         * end.  Bytes whose air time has already passed are clamped to now
+         * by dispatch_tx_byte, exactly as a re-entrant auto-ACK's are. */
+        a->first_byte_ns = a->at_override_ns > 0 ? a->at_override_ns
+                                                 : sim_runtime_now_ns(sim);
+        a->at_override_ns = 0;
         cap->len = 0;
     }
     /* Per-sender byte period — sub-GHz CC1200 frames take 5x longer per
@@ -694,6 +702,7 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
             int mac_len = frame_snap_len[i] - phy_hdr - fcs;
             if (mac_len > 0) {
                 bus->frame_start_ns = a->subghz ? now : accurate_tx_start;
+                bus->consumer_frame_end_ns[i] = accurate_tx_end;
                 if (mi->ops->receive_frame(mi, frame_snap[i] + phy_hdr,
                                            mac_len, now, sender_idx) < 0)
                     bus->stats.frame_queue_full++;
@@ -743,8 +752,8 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
          * instantaneous here, so its firmware ACK-wait timer starts at
          * now, and accurate_tx_end + 192 µs would land past the
          * RTIMER_BUSYWAIT_UNTIL timeout → perpetual CSMA retransmits. */
-        int64_t ack_start = accurate_tx_end + 192000LL;
-        int64_t sender_ack_start = now + 192000LL;
+        int64_t ack_start = accurate_tx_end + SIM_RADIO_ACK_TURNAROUND_NS;
+        int64_t sender_ack_start = now + SIM_RADIO_ACK_TURNAROUND_NS;
         int ack_tx_emitted = 0;
         for (int j = 0; j < bus->node_count; j++) {
             /* SYNC ⇔ native: natives never stage ACK bytes (M25). */
@@ -818,10 +827,31 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
  * and marks interference-range collisions (native via its
  * mark_collisions op, emulated queues bus-side).
  * ============================================================ */
+void sim_radio_bus_set_tx_at(sim_radio_bus_t *bus, int idx, int64_t at_ns) {
+    if (idx < 0 || idx >= SIM_RADIO_BUS_MAX_NODES) return;
+    bus->tx_asm[idx].at_override_ns = at_ns;
+}
+
+int64_t sim_radio_bus_consumer_frame_end_ns(const sim_radio_bus_t *bus, int idx) {
+    if (idx < 0 || idx >= SIM_RADIO_BUS_MAX_NODES) return 0;
+    return bus->consumer_frame_end_ns[idx];
+}
+
 void sim_radio_bus_tx_frame(sim_radio_bus_t *bus, sim_runtime_t *sim,
                             int sender_idx, const uint8_t *frame, int len) {
+    sim_radio_bus_tx_frame_at(bus, sim, sender_idx, frame, len, 0);
+}
+
+void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                               int sender_idx, const uint8_t *frame, int len,
+                               int64_t at_ns) {
     radio_medium_t *medium = &sim->radio_medium;
+    /* The frame goes on the air at its stamp when it carries one -- a peer
+     * emulator's output is stamped inside the slice just executed -- else
+     * now.  A stamp is never allowed to run ahead of the kernel: the medium
+     * must not be told about a frame that has not happened yet. */
     int64_t now = sim_runtime_now_ns(sim);
+    if (at_ns > 0 && at_ns < now) now = at_ns;
 
     /* Native sender: pull its channel into the medium before filtering. */
     bus_sync_channel(bus, sim, sender_idx);

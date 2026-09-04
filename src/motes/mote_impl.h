@@ -134,6 +134,12 @@ struct sim_mote_env {
     /* JS-mote frame TX (user_data = node). */
     void (*js_rf_frame)(void *node, const uint8_t *frame, int len);
 
+    /* External-mote frame TX (user_data = node).  Separate from js_rf_frame
+     * because it carries the peer's stamp; JS motes have no clock of their
+     * own to stamp with and keep the plain hook. */
+    void (*ext_rf_frame_at)(void *node, const uint8_t *frame, int len,
+                            int64_t at_ns);
+
     /* TSCH channel sync for native motes (M20): push a channel change
      * into the radio medium for slot `slot`. */
     void (*native_channel_sync)(int slot, int channel);
