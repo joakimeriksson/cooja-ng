@@ -194,20 +194,27 @@ static void emit_log_line(ext_node_t *node, const char *line) {
     node->log_callback(node->log_callback_data, (uint8_t)'\n');
 }
 
-static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t step_t) {
+static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
+                            int64_t step_t) {
     const cJSON *type = cJSON_GetObjectItemCaseSensitive(ev, "type");
     if (!cJSON_IsString(type)) {
         ext_fail(node, "output event with no `type`");
         return;
     }
 
-    /* Events are stamped in sim time; a peer may not schedule into the past.
-     * Times at or before `now` fire immediately in this cut — deferring a
-     * future-stamped event needs the pending queue that arrives with M1. */
+    /* Events are stamped in sim time.  A peer that emulates a CPU lags the
+     * kernel the way the MSP430/ARM motes do -- a step catches it up from
+     * where it stopped to `step.t` -- so its events carry times inside the
+     * slice just executed.  Anything at or after the slice's start is
+     * accepted; it takes effect now, at the kernel's clock (the end of the
+     * slice), late by at most one slice, exactly like an emulated mote's
+     * radio output.  Only a stamp before the slice is a protocol error.
+     * Deferring a future-stamped event needs the pending queue that
+     * arrives with M1. */
     const cJSON *t = cJSON_GetObjectItemCaseSensitive(ev, "t");
-    if (cJSON_IsNumber(t) && (int64_t)t->valuedouble < step_t) {
-        ext_fail(node, "output event stamped t=%lld before step t=%lld",
-                 (long long)t->valuedouble, (long long)step_t);
+    if (cJSON_IsNumber(t) && (int64_t)t->valuedouble < slice_start) {
+        ext_fail(node, "output event stamped t=%lld before the slice start t=%lld",
+                 (long long)t->valuedouble, (long long)slice_start);
         return;
     }
 
@@ -231,6 +238,14 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t step_t) {
 
     } else if (strcmp(type->valuestring, "log") == 0) {
         const cJSON *line = cJSON_GetObjectItemCaseSensitive(ev, "line");
+        /* The console line carries the node's clock (timeline, log
+         * timestamps): stamp it with the event's own time inside the
+         * slice, as an emulated mote's line would be, not the slice end. */
+        if (cJSON_IsNumber(t)) {
+            int64_t at = (int64_t)t->valuedouble;
+            if (at > step_t) at = step_t;
+            node->sim_time_ns = at;
+        }
         if (cJSON_IsString(line))
             emit_log_line(node, line->valuestring);
 
@@ -246,8 +261,12 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t step_t) {
     }
 }
 
-/* Read one `done` reply and apply it. */
-static int consume_done(ext_node_t *node, int64_t step_t) {
+/* Read one `done` reply and apply it.  `slice_start` is where the peer
+ * stood before this step, `step_t` the time it was asked to reach.  The
+ * reply's own `t` -- where the peer actually stopped, which is earlier
+ * than `step_t` when it yielded at a transmission -- becomes the node's
+ * clock, so the next slice's lower bound is where the peer really is. */
+static int consume_done(ext_node_t *node, int64_t slice_start, int64_t step_t) {
     char line[EXT_NODE_LINE_MAX];
     if (read_line(node, line, sizeof(line)) != 0) return -1;
 
@@ -273,10 +292,21 @@ static int consume_done(ext_node_t *node, int64_t step_t) {
     if (cJSON_IsArray(out)) {
         cJSON *ev = NULL;
         cJSON_ArrayForEach(ev, out) {
-            apply_out_event(node, ev, step_t);
+            apply_out_event(node, ev, slice_start, step_t);
             if (node->failed) break;
         }
     }
+
+    /* Where the peer stopped: inside the slice when it yielded early, at
+     * `step_t` otherwise.  A reply that claims a time outside the slice is
+     * taken as `step_t` -- the old peers stamp their reply with it anyway. */
+    const cJSON *done_t = cJSON_GetObjectItemCaseSensitive(msg, "t");
+    int64_t reached = step_t;
+    if (cJSON_IsNumber(done_t)) {
+        int64_t claimed = (int64_t)done_t->valuedouble;
+        if (claimed >= slice_start && claimed <= step_t) reached = claimed;
+    }
+    node->sim_time_ns = reached;
 
     cJSON_Delete(msg);
     return node->failed ? -1 : 0;
@@ -357,11 +387,12 @@ int ext_node_start(ext_node_t *node, double x, double y, uint32_t seed) {
     if (write_all(node, line, (size_t)n) != 0) return -1;
 
     /* The reply to hello is what carries the peer's first wakeup. */
-    return consume_done(node, 0);
+    return consume_done(node, 0, 0);
 }
 
-/* One step exchange, carrying every RX that has arrived by `when`. */
-static void do_step(ext_node_t *node, int64_t when) {
+/* One step exchange, carrying every RX that has arrived by `when`.
+ * `slice_start` is where the peer stood before it. */
+static void do_step(ext_node_t *node, int64_t slice_start, int64_t when) {
     char line[EXT_NODE_LINE_MAX];
     int n = snprintf(line, sizeof(line),
                      "{\"type\":\"step\",\"t\":%lld,\"in\":[",
@@ -399,7 +430,7 @@ static void do_step(ext_node_t *node, int64_t when) {
     n += m;
 
     if (write_all(node, line, (size_t)n) != 0) return;
-    consume_done(node, when);
+    consume_done(node, slice_start, when);
 }
 
 void ext_node_step_until_ns(ext_node_t *node, int64_t target_ns) {
@@ -414,11 +445,14 @@ void ext_node_step_until_ns(ext_node_t *node, int64_t target_ns) {
         if (next_rx_ns < next_ev) next_ev = next_rx_ns;
         if (next_ev > target_ns) break;
 
-        if (next_ev > node->sim_time_ns) node->sim_time_ns = next_ev;
         /* do_step drains every RX due at next_ev, so one exchange covers a
-         * wakeup and any simultaneous arrivals. */
+         * wakeup and any simultaneous arrivals.  The clock moves to next_ev
+         * for the exchange (log lines default to it) and ends up where the
+         * peer says it stopped (consume_done), never past next_ev. */
+        int64_t slice_start = node->sim_time_ns;
+        if (next_ev > node->sim_time_ns) node->sim_time_ns = next_ev;
         node->next_wakeup_ns = INT64_MAX;
-        do_step(node, next_ev);
+        do_step(node, slice_start, next_ev);
     }
 }
 

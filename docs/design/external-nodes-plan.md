@@ -161,7 +161,17 @@ reply to `hello` is what carries the peer's first `wake`; `out` may be empty):
 {"type":"done","t":T,"wake":T_next_or_null,"out":[ …events… ]}
 ```
 
-Output events (all stamped `t ≥ step.t`; csim rejects earlier stamps):
+Output events, each stamped with the simulation time it happened at. A peer
+that emulates a CPU lags the kernel the way the MSP430/ARM motes do — a `step`
+catches it up from where it stopped to `step.t` — so its events carry times
+*inside the slice just executed*; csim accepts any stamp at or after the
+slice's start (the previous `done.t`) and rejects earlier ones. An event takes
+effect at the kernel's clock, the end of the slice, late by at most one
+slice — the same bound an emulated mote's radio output has. The reply's own
+`t` is where the peer stopped: a peer that yields at a transmission answers
+with `t` = that time and `wake` just after it, and the next slice starts
+there (the transmission itself still reaches the medium at the kernel's
+clock; shortening the busy-slice `wake` is what bounds the lateness):
 
 | `type` | fields | csim action |
 |---|---|---|

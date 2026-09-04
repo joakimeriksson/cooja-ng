@@ -53,7 +53,8 @@ typedef struct ext_node_rx {
 
 typedef struct ext_node {
     int      node_id;
-    int64_t  sim_time_ns;      /* last dispatched event time (js_node rule) */
+    int64_t  sim_time_ns;      /* where the peer stopped: `done.t`, or the
+                                * step time when it did not say (js_node rule) */
     int64_t  next_wakeup_ns;   /* INT64_MAX = never wake again              */
 
     pid_t    child_pid;

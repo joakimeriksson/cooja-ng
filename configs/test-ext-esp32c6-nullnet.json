@@ -1,0 +1,20 @@
+{
+  "title": "External node: an ESP32-C6 (esp32sim, Contiki-NG on ESP-IDF) exchanges nullnet broadcasts with a Sky node",
+  "timeout_ms": 25000,
+  "nodes": [
+    { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 1, "x": 0.0, "y": 0.0 },
+    { "firmware": "examples/ext/esp32c6.py",            "id": 2, "x": 2.0, "y": 0.0 },
+    { "firmware": "examples/ext/sniffer.py",            "id": 3, "x": 1.0, "y": 0.0 }
+  ],
+  "test": {
+    "timeout_is_success": true,
+    "validators": [
+      { "pattern": "Starting Contiki-NG-ESP32C6",           "node": 2, "min_count": 1 },
+      { "pattern": "ESP RADIO: TX: 19 bytes",               "node": 2, "min_count": 4 },
+      { "pattern": "ESP RADIO: RX SFD received",            "node": 2, "min_count": 3 },
+      { "pattern": "rx len 2 count 0 from 0101010001741200", "node": 2, "min_count": 2 },
+      { "pattern": "src=(same)/0200.00ff.fe00.0002",        "node": 3, "min_count": 4 },
+      { "pattern": "src=(same)/0101.0100.0174.1200",        "node": 3, "min_count": 3 }
+    ]
+  }
+}

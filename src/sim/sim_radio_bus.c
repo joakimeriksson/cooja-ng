@@ -678,9 +678,18 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
          * RXFIFO and no rx_byte_sync, so hand it the MAC frame directly.
          * Strip the PHY wrap (4 preamble + SFD + length) and the trailing
          * FCS so the payload matches what a sender hands to
-         * sim_radio_bus_tx_frame -- a peer can echo back what it received. */
+         * sim_radio_bus_tx_frame -- a peer can echo back what it received.
+         * Only for an emulated (per-byte) sender: a native/JS/external
+         * sender's frame already reached every frame consumer through
+         * sim_radio_bus_tx_frame, and its PHY-wrapped bytes here are for
+         * the emulated receivers -- delivering them again handed a sniffer
+         * every external frame twice. */
         if ((bus->caps[i] & SIM_RADIO_CAP_FRAME_CONSUMER) &&
             mi && mi->ops->receive_frame) {
+            if (bus->delivery[sender_idx] != SIM_RADIO_DELIVERY_PER_BYTE) {
+                bus->emu_rx_end_ns[i] = coll_end;
+                continue;
+            }
             const int phy_hdr = 6, fcs = 2;
             int mac_len = frame_snap_len[i] - phy_hdr - fcs;
             if (mac_len > 0) {
