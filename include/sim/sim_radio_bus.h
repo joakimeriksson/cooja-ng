@@ -268,6 +268,13 @@ typedef struct sim_radio_bus {
      * sync for this node to avoid a re-entrant step.  -1 = none. */
     int                executing_node;
     sim_radio_bus_stats_t stats;
+    /* The on-air start of the frame being handed to a frame consumer
+     * (receive_frame): the sender's accurate first-byte time for an
+     * emulated sender, which lags the kernel, else now.  What an external
+     * mote stamps its `rx` with, so a peer can place RX_DONE -- and its
+     * acknowledgement -- at the frame's true end rather than at the end of
+     * the sender's catch-up slice. */
+    int64_t frame_start_ns;
     /* M27: per-sender medium-busy deadline (ex node_tx_busy_until_ns) —
      * a frame occupies the sender's channel until this sim time; CCA
      * queries (cc1200) read it. */

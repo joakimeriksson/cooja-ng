@@ -693,6 +693,7 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
             const int phy_hdr = 6, fcs = 2;
             int mac_len = frame_snap_len[i] - phy_hdr - fcs;
             if (mac_len > 0) {
+                bus->frame_start_ns = a->subghz ? now : accurate_tx_start;
                 if (mi->ops->receive_frame(mi, frame_snap[i] + phy_hdr,
                                            mac_len, now, sender_idx) < 0)
                     bus->stats.frame_queue_full++;
@@ -824,6 +825,7 @@ void sim_radio_bus_tx_frame(sim_radio_bus_t *bus, sim_runtime_t *sim,
 
     /* Native sender: pull its channel into the medium before filtering. */
     bus_sync_channel(bus, sim, sender_idx);
+    bus->frame_start_ns = now;   /* a frame-level sender's frame starts now */
 
     if (medium->type != RADIO_MEDIUM_NONE) {
         neighbor_list_t *nl = &medium->neighbors[sender_idx];
