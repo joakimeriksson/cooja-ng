@@ -610,8 +610,10 @@ delta print under `-v`:
 **Not achieved:** the Sky still retransmits every unicast to the C6 eight
 times. Two independent gaps, both measured:
 
-1. **The peer answers 160 µs early.** 83 of the 88 ACKs in a 120 s probe are
-   stamped +32 µs after the frame's true end, not the 802.15.4 +192 µs.
+1. **The peer answered 160 µs early — now fixed on the peer side.** 83 of the
+   88 ACKs in a 120 s probe were stamped +32 µs after the frame's true end,
+   not the 802.15.4 +192 µs. With the peer corrected, 87 of 88 are now at
+   exactly **+192.0 µs** (the odd one at +194.6 µs, inside one byte time).
    The two sides read `rx.t` differently: csim means the first preamble byte,
    while the peer times RX_DONE as if it were the SFD — five byte times, 160
    µs, later. `esp32c6/src/radio.rs:382` uses `air_cycles(1 + len + 2)` (the
@@ -620,27 +622,67 @@ times. Two independent gaps, both measured:
    so the file disagrees with itself. Strictly this was a hole in §4, which
    never said which point on the air `rx.t` names; §4 now does. The
    correction is on the peer's RX path, and is the same term its TX path
-   already uses.
+   already uses: `air_cycles(PHY_OVERHEAD_BYTES + frame.len() + 2)`. Applying
+   it moved seven test call sites in esp32sim that encoded the old assumption,
+   and shifts two golden files by exactly +160,000 ns.
 
-2. **The sender's ACK wait expires inside its own execute slice**, so nothing
-   delivered after `frame_complete` returns can be seen. Stepping the peer
-   synchronously inside `frame_complete` (the prompt's item 3) does produce
-   the ACK in the right scope, but neither way of handing it back works:
+2. **The Sky's radio never accepts the ACK, and the cause is *not* timing.**
+   Measured after the peer-side correction landed; it refutes what an earlier
+   draft of this section claimed.
 
-   | Route | Result |
+   | Question | Measured |
    |---|---|
-   | Byte path at the stamp (`dispatch_tx_byte`) | every byte dropped — the sender's radio has not left TX (CC2420 `dropped` 595 → 953, `crc_ok` unchanged at 118) |
-   | Sender's RX queue at the turnaround, as the chip's own auto-ACK uses (`queue_frame` at `now + 192 µs`) | delivered (`8 queued, 8 drained`) but still refused: it arrives after the firmware's wait has already run out inside that slice |
+   | Is the peer's ACK late? | No. Stamped +192.0 µs after the frame's air end, and emitted at kernel time **+0.0 µs** relative to that stamp. |
+   | Do the sender's TX-end and the frame's air-end disagree? | No — 0–3 µs apart (µs-resolution `CSIM_TRACE_RADIO`). An earlier reading of ~0.5 ms was an artefact of the 3-decimal `[RF]` print. |
+   | Does the Sky's CC2420 start receiving them? | No. `started/completed/crc_ok` = 119/118/118 before and after; `ack_rx` stays 81. |
+   | Did the correction change anything? | Yes — dropped bytes fell **595 → 176**. |
 
-   The chip's auto-ACK escapes this only because it is generated *by the
-   receiving chip's own model* during `deliver_bytes`, before the sender's
-   CPU resumes. Closing it for an external peer needs the sender's slice to
-   yield at `accurate_tx_end + 192 µs` so the ACK can be delivered between
-   sub-slices — a change to the mote slice model, beyond this plan's scope.
+   `cc2420_receive_byte` ignores bytes outside `RX_SFD_SEARCH`/`RX_FRAME`,
+   deliberately matching MSPSim. The ACK arrives at the right instant, passes
+   the medium filter, reaches the chip, and is discarded because the chip's
+   *modelled radio state* lags the kernel: its state machine only advances
+   when its CPU runs, so between slices it can still be in TX or mid
+   turnaround.
 
-   That machinery is therefore **not** in the branch: it changes emulated
-   delivery without fixing the symptom. The measurement above is the
-   deliverable for item 3.
+   **Two candidate fixes were tried and both refuted**, so neither is in the
+   branch:
+
+   - *Step the peer inside `frame_complete`*, so it answers in the same scope
+     a chip's auto-ACK would, handing the reply back either through the byte
+     path (every byte dropped — radio still in TX; `dropped` 595 → 953) or
+     through the sender's RX queue at the turnaround (delivered, still
+     refused).
+   - *Defer a frame-level sender's bytes to the receiver's RX queue* whenever
+     the receiver could not take them byte-by-byte — the same route the chip's
+     own auto-ACK to a data sender already uses (`sim_radio_bus.c:770`).
+     Mechanically this works (33 frames queued and drained) but the ACKs are
+     **still** refused, and it perturbs unrelated traffic (`started`
+     119 → 117) because it defers the C6's data frames too.
+
+   The remaining cause is therefore inside the CC2420 receive path or its
+   post-TX turnaround — not in the scheduler, the slice model or the ACK wait.
+
+   **Constraint on any future attempt:** the CC2420 model is deliberately
+   faithful to MSPSim, and the drop is that faithfulness working as intended —
+   `cc2420_receive_byte`'s own comment cites `CC2420.receivedByte()` for
+   ignoring bytes outside RX. Nothing here should diverge from MSPSim/Cooja to
+   make an external peer's ACK land; that would trade a real fidelity
+   guarantee for one workload. Both refuted attempts above would have done
+   exactly that, which is the main reason neither was kept.
+
+   Two things are worth establishing before anyone tries again. First, what
+   **Cooja itself** does when a non-emulated mote acknowledges an emulated one
+   — that is the reference behaviour to match, and it may well be that Cooja
+   has no equivalent path, in which case the honest answer is that an external
+   peer cannot ACK an emulated sender and the E6 topology needs rethinking
+   rather than the model. Second, csim's own docs and code disagree about the
+   post-TX path: `CLAUDE.md` describes an `rx_incoming` buffer that holds
+   bytes arriving during `RX_CALIBRATE`/`RX_WAIT` and replays them on entry to
+   `RX_SFD_SEARCH`, while `cc2420_receive_byte` drops such bytes outright and
+   cites MSPSim for doing so. The counters (`incoming=0 replayed=0`) say the
+   buffering never engages. Reconciling those two — against MSPSim, not
+   against this workload — is the actual open question.
+
 
 Regression state: `test-ext-sniffer-sky`, `test-ext-jammer-sky`
 (`JAM_PERIOD_MS=2`), `chain-4node-sky` pass; `correctness` 87/87,
