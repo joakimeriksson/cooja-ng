@@ -161,7 +161,17 @@ reply to `hello` is what carries the peer's first `wake`; `out` may be empty):
 {"type":"done","t":T,"wake":T_next_or_null,"out":[ …events… ]}
 ```
 
-Output events (all stamped `t ≥ step.t`; csim rejects earlier stamps):
+Output events, each stamped with the simulation time it happened at. A peer
+that emulates a CPU lags the kernel the way the MSP430/ARM motes do — a `step`
+catches it up from where it stopped to `step.t` — so its events carry times
+*inside the slice just executed*; csim accepts any stamp at or after the
+slice's start (the previous `done.t`) and rejects earlier ones. An event takes
+effect at the kernel's clock, the end of the slice, late by at most one
+slice — the same bound an emulated mote's radio output has. The reply's own
+`t` is where the peer stopped: a peer that yields at a transmission answers
+with `t` = that time and `wake` just after it, and the next slice starts
+there (the transmission itself still reaches the medium at the kernel's
+clock; shortening the busy-slice `wake` is what bounds the lateness):
 
 | `type` | fields | csim action |
 |---|---|---|
@@ -484,10 +494,72 @@ peer replies with non-JSON, `tx` frame malformed or over 152 bytes, reply
 timeout (`CSIM_EXT_TIMEOUT_MS`, default 5000), output stamped before the
 step time.
 
-**Not built (M1's other half):** RX into the peer — a node on this engine
-transmits but is deaf, so `rx` inputs, the RX queue and per-receiver
-RSSI/channel lookup are still to come, along with `serial` input, the
-replay-file source, `tools/csim_ext.py` and the config-v2 block.
+**RX is now built too.** A delivered frame reaches the peer as an `rx`
+input on its next step, carrying the sender's node id, the sender's channel
+and the per-receiver RSSI the medium computed (asked of the medium rather
+than carried on the frame: two nodes at different distances hear the same
+transmission at different strengths). `examples/ext/sniffer.py` decodes the
+802.15.4 header from it — see `configs/test-ext-sniffer-sky.json`:
+
+```
+rx #2  from=1  rssi=-65 dBm  ch=26  len=17
+    DATA seq=86  ver=1  dst=abcd/ffff  src=(same)/0101.0100.0174.1200
+    hdr  41d8 56cd abff ff00 1274 0100 0101 01
+    data 0000
+```
+
+The decoded source address matches what Contiki prints on the sending
+node's own console, and the PAN matches its boot banner.
+
+**This needed one bus change, contradicting the "no kernel change"
+prediction.** A BATCH receiver's frame goes to `deliver_bytes` or
+`queue_frame`, and both end in `rx_byte_sync`, which a non-emulated mote does
+not have — so `receive_frame` was only ever called for native/JS senders, and
+nothing from an emulated chip could reach a frame-consuming mote. The fix is
+one opt-in capability, `SIM_RADIO_CAP_FRAME_CONSUMER`: at frame-complete the
+bus hands such a receiver the MAC frame directly, PHY wrap and FCS stripped.
+Opt-in means no existing receiver's delivery changes.
+
+**Discovered while doing it:** JS app motes have the same gap. Their
+`receivedPacket` handler in `firmware/js/broadcast.js` never fires from an
+emulated sender — verified: 0 receives in `configs/cross-level-demo.json`
+despite two neighbours in range. Giving the JS kind the same capability
+would fix it, but it would also change existing JS console output, so it is
+left as a separate decision rather than a silent side effect.
+
+**Both examples are gated in CI**, not just shipped as demos
+(`.github/workflows/test.yml`, ubuntu + macOS):
+
+- **sniffer** — validators assert the decoded *source addresses*, so it fails
+  if the peer dies, if the bus stops delivering, or if the MAC decode drifts.
+  Verified by mutation: removing `SIM_RADIO_CAP_FRAME_CONSUMER` turns it red
+  (`"rx #" matched 0/4`).
+- **jammer** — a negative test: `fail_on` trips if any application message
+  gets through, and validators require that the Sky pair actually sent and
+  that the jammer actually transmitted, so a jammer that does nothing cannot
+  pass vacuously. Verified by mutation: at the 100 ms default period the link
+  survives and the test fails, naming the packet that got through.
+
+These validators are also what makes the exit-code gap above harmless in
+practice: a dead peer produces no log lines, so the validator fails even
+though the mote failure itself cannot set the exit code.
+
+Measured dose-response, which is the evidence the interference model behaves
+sensibly rather than just "on/off":
+
+| `JAM_PERIOD_MS` | duty | app messages delivered (of 4) |
+|---|---|---|
+| none (baseline) | 0% | 4 |
+| 100 | ~1% | 4 |
+| 20 | ~7% | 3 |
+| 5 | ~26% | 1 |
+| 2 | ~64% | 0 |
+
+**Still not built:** `serial` input into the peer, the replay-file source,
+`tools/csim_ext.py`, the config-v2 block, and `led`/`radio`/`move` events.
+The config-v2 block has a concrete motivation now: `JAM_PERIOD_MS=2` has to be
+passed as an environment variable in the CI step because a config cannot yet
+carry per-node arguments.
 
 **Known rough edge:** a peer that dies *mid-run* logs to stderr and stops the
 run immediately via `sim_runtime_request_stop()`, but the process still exits

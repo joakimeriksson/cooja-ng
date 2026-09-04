@@ -672,9 +672,41 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
             continue;
         }
 
+        sim_mote_t *mi = sim_runtime_mote(sim, i);
+
+        /* Frame-consuming receiver (external/app-level mote): it has no
+         * RXFIFO and no rx_byte_sync, so hand it the MAC frame directly.
+         * Strip the PHY wrap (4 preamble + SFD + length) and the trailing
+         * FCS so the payload matches what a sender hands to
+         * sim_radio_bus_tx_frame -- a peer can echo back what it received.
+         * Only for an emulated (per-byte) sender: a native/JS/external
+         * sender's frame already reached every frame consumer through
+         * sim_radio_bus_tx_frame, and its PHY-wrapped bytes here are for
+         * the emulated receivers -- delivering them again handed a sniffer
+         * every external frame twice. */
+        if ((bus->caps[i] & SIM_RADIO_CAP_FRAME_CONSUMER) &&
+            mi && mi->ops->receive_frame) {
+            if (bus->delivery[sender_idx] != SIM_RADIO_DELIVERY_PER_BYTE) {
+                bus->emu_rx_end_ns[i] = coll_end;
+                continue;
+            }
+            const int phy_hdr = 6, fcs = 2;
+            int mac_len = frame_snap_len[i] - phy_hdr - fcs;
+            if (mac_len > 0) {
+                if (mi->ops->receive_frame(mi, frame_snap[i] + phy_hdr,
+                                           mac_len, now, sender_idx) < 0)
+                    bus->stats.frame_queue_full++;
+                bus->stats.frame_queued++;
+            }
+            bus->emu_rx_end_ns[i] = coll_end;
+            if (h->on_rx_frame)
+                h->on_rx_frame(h->user, &fi, i, SIM_RADIO_RX_DIRECT,
+                               frame_snap[i], frame_snap_len[i], 0, 0);
+            continue;
+        }
+
         int fifo_needed = frame_fifo_bytes(frame_snap[i], frame_snap_len[i],
                                            a->subghz);
-        sim_mote_t *mi = sim_runtime_mote(sim, i);
         if (bus->ops[i]->rxfifo_available(bus->mote[i]) < fifo_needed) {
             /* RXFIFO full — mini-step the receiver to read the previous
              * frame; keep it short to avoid cascade TX. */

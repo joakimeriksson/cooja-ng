@@ -1,0 +1,17 @@
+{
+  "title": "External node: Python jammer breaks a Sky nullnet link (needs JAM_PERIOD_MS=2)",
+  "timeout_ms": 20000,
+  "nodes": [
+    { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 1, "x": 0.0, "y": 0.0 },
+    { "firmware": "firmware/sky/nullnet-broadcast.sky", "id": 2, "x": 5.0, "y": 0.0 },
+    { "firmware": "examples/ext/jammer.py",             "id": 3, "x": 2.0, "y": 0.0 }
+  ],
+  "test": {
+    "timeout_is_success": true,
+    "fail_on": ["] Received "],
+    "validators": [
+      { "pattern": "] Sending ", "min_count": 4 },
+      { "pattern": "jam #", "node": 3, "min_count": 5 }
+    ]
+  }
+}

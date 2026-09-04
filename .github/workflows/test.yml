@@ -111,6 +111,24 @@ jobs:
       - name: Radio bus unit tests
         run: ./build/test_runner radio-bus
 
+      - name: External mote — Python sniffer receives + decodes 802.15.4
+        # Gates the whole RX path for external motes: the peer must actually
+        # receive frames from the emulated Sky pair and decode their MAC
+        # header.  The validators assert the decoded source addresses, so a
+        # peer that dies or a bus that stops delivering fails here rather
+        # than passing silently (a mote failure cannot set the exit code —
+        # see docs/design/external-nodes-plan.md §12).
+        run: ./build/test_runner test configs/test-ext-sniffer-sky.json -q
+
+      - name: External mote — Python jammer breaks a Sky link
+        # Gates the TX path, and is a negative test: fail_on trips if any
+        # application message gets through.  The validators keep it honest —
+        # without them a jammer that never transmits would also "pass".
+        # JAM_PERIOD_MS=2 is needed for a blackout; at the 100 ms default the
+        # duty cycle is ~1% and all 4 messages arrive.  Passing it in the
+        # config needs the config-v2 `external.args` block (M3).
+        run: JAM_PERIOD_MS=2 ./build/test_runner test configs/test-ext-jammer-sky.json -q
+
       - name: Version smoke
         run: ./build/test_runner --version
 
