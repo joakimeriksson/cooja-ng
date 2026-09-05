@@ -72,6 +72,8 @@ const arm_config_t nrf54l15_config = {
     .num_irqs         = 64,           /* upper bound; tighten once PS is in hand */
     .vtor_default     = 0,            /* vector table at flash base */
     .has_trustzone    = true,         /* ARMv8-M security extension (M33 + SPU) */
+    .periph_ns_alias  = true,         /* 0x4xxx_xxxx = Non-secure alias of 0x5xxx_xxxx */
+    .cpuid            = 0x410FD214,   /* Cortex-M33 r0p4 */
 };
 
 const arm_config_t nrf52840_config = {

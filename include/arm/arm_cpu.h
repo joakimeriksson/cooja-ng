@@ -221,6 +221,16 @@ typedef struct arm_cpu {
      * banked SP / stack-limit / CONTROL, swapped on a secure<->non-secure
      * transition (Phase 3). Stored but not yet wired in Phase 0. */
     bool      tz_enabled;            /* SoC implements the security extension */
+    bool      io_ns_alias;           /* config->periph_ns_alias: fold 0x4 onto 0x5 in IO dispatch */
+    bool      io_txn_ns;             /* last IO access came through the Non-secure alias */
+    uint32_t  cpuid;                 /* config->cpuid (0 = Cortex-M3 default) */
+    /* DWT cycle counter (0xE0001000). CYCCNT counts core clocks while
+     * CTRL.CYCCNTENA is set and DEMCR.TRCENA has clocked the trace block;
+     * Contiki's cycles API and its `cycles` / `call-perf` shell commands
+     * read it. Modelled as an offset from cpu->cycles so it is exact. */
+    uint32_t  demcr;
+    uint32_t  dwt_ctrl;
+    uint64_t  dwt_cyccnt_base;       /* cpu->cycles when CYCCNT last read 0 */
     bool      secure;                /* current security state (Secure = true) */
     uint32_t  msp_s,   msp_ns;       /* banked Main Stack Pointer */
     uint32_t  psp_s,   psp_ns;       /* banked Process Stack Pointer */
@@ -228,6 +238,12 @@ typedef struct arm_cpu {
     uint32_t  psplim_s, psplim_ns;   /* banked PSP limit (PSPLIM) */
     uint32_t  control_s, control_ns; /* banked CONTROL (nPRIV/SPSEL/FPCA/SFPA) */
     uint32_t  vtor_s;                /* secure vector table offset (VTOR_S) */
+    /* Banked exception masks. The ACTIVE state's values stay in
+     * cpu->primask / basepri / faultmask (hot-path reads unchanged); the
+     * inactive state's live here and are swapped on a security transition. */
+    uint32_t  primask_s,   primask_ns;
+    uint32_t  basepri_s,   basepri_ns;
+    uint32_t  faultmask_s, faultmask_ns;
 
     /* Security Attribution Unit (SAU) — Phase 1. Programmable regions that,
      * together with the SoC IDAU (the Nordic SPU on nRF54L15), decide the
@@ -280,6 +296,17 @@ typedef struct arm_cpu {
      * returning non-zero whenever such state is in flight; the WFI
      * handler then runs at full speed instead of skipping ahead. */
     int     (*wfi_skip_guard)(void *user);
+
+    /* System reset (AIRCR.SYSRESETREQ, or a peripheral such as the
+     * watchdog). Requested asynchronously and taken at the next
+     * instruction boundary: a reset raised from inside a store would
+     * otherwise tear down state the faulting instruction is still using.
+     * The hook lets the platform reset the NVIC, SysTick and the SoC's
+     * peripherals; SRAM, RESETREAS and the cycle counter survive, as they
+     * do across a warm reset on silicon. */
+    bool      reset_pending;
+    void    (*reset_hook)(void *user);
+    void     *reset_hook_user;
     void     *wfi_skip_user;
 
     /* Debug: non-zero enables debug tracing */
@@ -352,6 +379,21 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2);
 
 void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
                      arm_io_read_fn read, arm_io_write_fn write, void *data);
+
+/* Register the DWT cycle-counter block at 0xE0001000. */
+void arm_register_dwt(arm_cpu_t *cpu);
+
+/* Request a system reset, taken at the next instruction boundary. */
+static inline void arm_request_reset(arm_cpu_t *cpu) { cpu->reset_pending = true; }
+
+/* Install the platform reset hook (see reset_hook in arm_cpu_t). */
+static inline void arm_set_reset_hook(arm_cpu_t *cpu, void (*hook)(void *), void *user) {
+    cpu->reset_hook = hook;
+    cpu->reset_hook_user = user;
+}
+
+/* ARM_TZ_TRACE=1 world-transition tracer (arm_cpu.c). */
+void arm_tz_trace(const arm_cpu_t *cpu, const char *what, uint32_t a, uint32_t b);
 
 /* Install the WFI fast-forward guard. See wfi_skip_guard in arm_cpu_t. */
 static inline void arm_set_wfi_skip_guard(arm_cpu_t *cpu,

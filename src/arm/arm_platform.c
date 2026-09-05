@@ -167,9 +167,26 @@ void arm_platform_init(arm_platform_t *plat, const arm_platform_config_t *config
     arm_cpu_init(&plat->cpu, config->soc);
     arm_nvic_init(&plat->nvic, &plat->cpu);
     arm_systick_init(&plat->systick, &plat->cpu, &plat->nvic);
+    arm_register_dwt(&plat->cpu);
 
     /* SoC-specific peripherals + host vtable population */
     config->soc_ops->init(plat);
+
+    /* System-reset hook: NVIC + SysTick + the SoC's own peripherals. */
+    arm_set_reset_hook(&plat->cpu, arm_platform_reset_peripherals, plat);
+}
+
+/* Reset every peripheral in place, keeping IO registrations and the host
+ * wiring (console callback, radio listener, FICR seed) that the harness
+ * installed. Called from arm_cpu_reset via the reset hook, so it also runs
+ * on the initial boot reset and must therefore be a pure re-initialisation. */
+void arm_platform_reset_peripherals(void *user) {
+    arm_platform_t *plat = (arm_platform_t *)user;
+    if (!plat || !plat->config) return;
+    arm_nvic_reset(&plat->nvic);
+    arm_systick_reset(&plat->systick);
+    if (plat->config->soc_ops->reset)
+        plat->config->soc_ops->reset(plat);
 }
 
 void arm_platform_destroy(arm_platform_t *plat) {

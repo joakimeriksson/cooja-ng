@@ -152,6 +152,26 @@ static void trace_unmapped_mmio(uint32_t addr, int is_write, uint32_t val) {
         fprintf(stderr, "[mmio] UNMAPPED R 0x%08x (page 0x%08x)\n", addr, page);
 }
 
+/* IO dispatch entry: resolve the peripheral region for an address.
+ *
+ * On SoCs with a Non-secure peripheral alias (nRF54L15: 0x4xxx_xxxx is the
+ * NS view of 0x5xxx_xxxx) every peripheral is registered once at its Secure
+ * base, and a 0x4 access is folded onto it here. The handler then sees the
+ * canonical 0x5 address, so `addr - BASE` offset arithmetic is unchanged.
+ * `io_txn_ns` records which alias was used: that is the *transaction*
+ * security the SPU sees on the bus (independent of the core's state), which
+ * the GRTC's per-CC/SYSCOUNTER-view FEATURE checks consult. One
+ * predicted-false branch for every other SoC; SRAM/flash never come here. */
+static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr) {
+    uint32_t a = *addr;
+    if (__builtin_expect(cpu->io_ns_alias, 0)) {
+        bool ns = (a >> 28) == 4;
+        cpu->io_txn_ns = ns;
+        if (ns) { a |= 0x10000000u; *addr = a; }
+    }
+    return find_io_region(cpu, a);
+}
+
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
     if (cpu->rom && addr < cpu->rom_size) {
@@ -176,7 +196,7 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
         uint32_t val = arm_read32(cpu, base_addr);
         return (val >> bit) & 1;
     }
-    arm_io_region_t *r = find_io_region(cpu, addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr);
     if (r) return r->read(r->user_data, addr);
     trace_unmapped_mmio(addr, 0, 0);
     return 0;
@@ -324,7 +344,7 @@ uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
         uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
     }
-    arm_io_region_t *r = find_io_region(cpu, addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr);
     if (r) return (uint16_t)r->read(r->user_data, addr);
     return 0;
 }
@@ -335,7 +355,7 @@ uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
         return cpu->flash[addr - cpu->flash_base];
     if (addr >= cpu->sram_base && addr < cpu->sram_end)
         return cpu->sram[addr - cpu->sram_base];
-    arm_io_region_t *r = find_io_region(cpu, addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr);
     if (r) return (uint8_t)r->read(r->user_data, addr);
     return 0;
 }
@@ -384,7 +404,7 @@ void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
             arm_write32(cpu, base_addr, old & ~(1u << bit));
         return;
     }
-    arm_io_region_t *r = find_io_region(cpu, addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr);
     if (r) r->write(r->user_data, addr, val);
     else trace_unmapped_mmio(addr, 1, val);
 }
@@ -398,7 +418,7 @@ void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
         return;
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
-    arm_io_region_t *r = find_io_region(cpu, addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr);
     if (r) r->write(r->user_data, addr, val);
     else trace_unmapped_mmio(addr, 1, val);
 }
@@ -410,7 +430,7 @@ void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
         return;
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
-    arm_io_region_t *r = find_io_region(cpu, addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr);
     if (r) r->write(r->user_data, addr, val);
     else trace_unmapped_mmio(addr, 1, val);
 }
@@ -446,6 +466,8 @@ void arm_cpu_init(arm_cpu_t *cpu, const arm_config_t *config) {
     cpu->rom_size     = config->rom_size;
     cpu->vtor_default = config->vtor_default;
     cpu->tz_enabled   = config->has_trustzone;  /* ARMv8-M security extension */
+    cpu->io_ns_alias  = config->periph_ns_alias;
+    cpu->cpuid        = config->cpuid;
 
     cpu->flash = (uint8_t *)calloc(config->flash_size, 1);
 
@@ -564,7 +586,55 @@ void arm_cpu_destroy(arm_cpu_t *cpu) {
     cpu->event_queue = NULL;
 }
 
+
+/* --- DWT (0xE0001000): the cycle counter Contiki's cycles API reads. --- */
+#define ARM_DWT_BASE   0xE0001000u
+#define ARM_DWT_SIZE   0x1000u
+#define ARM_DWT_CTRL   0x000
+#define ARM_DWT_CYCCNT 0x004
+
+static int arm_dwt_read(void *user_data, uint32_t addr) {
+    arm_cpu_t *cpu = (arm_cpu_t *)user_data;
+    switch (addr - ARM_DWT_BASE) {
+        case ARM_DWT_CTRL:   return (int)cpu->dwt_ctrl;
+        case ARM_DWT_CYCCNT:
+            if (!(cpu->dwt_ctrl & 1u)) return 0;
+            return (int)(uint32_t)(cpu->cycles - cpu->dwt_cyccnt_base);
+        default: return 0;
+    }
+}
+
+static void arm_dwt_write(void *user_data, uint32_t addr, uint32_t value) {
+    arm_cpu_t *cpu = (arm_cpu_t *)user_data;
+    switch (addr - ARM_DWT_BASE) {
+        case ARM_DWT_CTRL:
+            /* Enabling the counter does not reset it (Contiki relies on
+             * cycles_start() being idempotent and non-destructive). */
+            if ((value & 1u) && !(cpu->dwt_ctrl & 1u))
+                cpu->dwt_cyccnt_base = cpu->cycles - (uint32_t)0;
+            cpu->dwt_ctrl = value;
+            break;
+        case ARM_DWT_CYCCNT:
+            cpu->dwt_cyccnt_base = cpu->cycles - value;
+            break;
+        default: break;
+    }
+}
+
+void arm_register_dwt(arm_cpu_t *cpu) {
+    arm_register_io(cpu, ARM_DWT_BASE, ARM_DWT_SIZE,
+                    arm_dwt_read, arm_dwt_write, cpu);
+}
+
 void arm_cpu_reset(arm_cpu_t *cpu) {
+    cpu->reset_pending = false;
+    cpu->demcr = 0;
+    cpu->dwt_ctrl = 0;
+    cpu->dwt_cyccnt_base = cpu->cycles;
+    /* Peripherals first: they own scheduled events that must be cancelled
+     * before the queue head is dropped below, and the NVIC/SysTick state
+     * the firmware will re-program on the way back up. */
+    if (cpu->reset_hook) cpu->reset_hook(cpu->reset_hook_user);
     /* Drop compiled blocks: a reset may follow a fresh ELF load (tz-boot
      * loads two images into one CPU), so cached code could describe
      * bytes that are no longer there.  Flash is read-only at run time,
@@ -644,6 +714,9 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->secure_fault_pending = false;
     cpu->exc_crossed_domain = false;
     cpu->exc_bg_secure = false;
+    cpu->primask_s = cpu->primask_ns = 0;
+    cpu->basepri_s = cpu->basepri_ns = 0;
+    cpu->faultmask_s = cpu->faultmask_ns = 0;
     cpu->tz_sg_count = 0;
     cpu->tz_bxns_count = 0;
     cpu->tz_secexc_count = 0;
@@ -771,17 +844,31 @@ static void arm_tz_save_sp_bank(arm_cpu_t *cpu, bool secure) {
     uint32_t lmsp, lpsp;
     if (arm_sp_is_psp(cpu)) { lpsp = cpu->reg[ARM_SP]; lmsp = cpu->msp; }
     else                    { lmsp = cpu->reg[ARM_SP]; lpsp = cpu->psp; }
+    uint32_t spsel = cpu->use_psp ? 2u : 0u;
     if (secure) {
-        cpu->msp_s = lmsp; cpu->psp_s = lpsp; cpu->control_s = cpu->use_psp ? 2 : 0;
+        cpu->msp_s = lmsp; cpu->psp_s = lpsp;
+        cpu->control_s = (cpu->control_s & ~2u) | spsel;
+        cpu->primask_s = cpu->primask; cpu->basepri_s = cpu->basepri;
+        cpu->faultmask_s = cpu->faultmask;
     } else {
-        cpu->msp_ns = lmsp; cpu->psp_ns = lpsp; cpu->control_ns = cpu->use_psp ? 2 : 0;
+        cpu->msp_ns = lmsp; cpu->psp_ns = lpsp;
+        cpu->control_ns = (cpu->control_ns & ~2u) | spsel;
+        cpu->primask_ns = cpu->primask; cpu->basepri_ns = cpu->basepri;
+        cpu->faultmask_ns = cpu->faultmask;
     }
 }
 
 static void arm_tz_load_sp_bank(arm_cpu_t *cpu, bool secure) {
     uint32_t lmsp, lpsp, ctrl;
-    if (secure) { lmsp = cpu->msp_s; lpsp = cpu->psp_s; ctrl = cpu->control_s; }
-    else        { lmsp = cpu->msp_ns; lpsp = cpu->psp_ns; ctrl = cpu->control_ns; }
+    if (secure) {
+        lmsp = cpu->msp_s; lpsp = cpu->psp_s; ctrl = cpu->control_s;
+        cpu->primask = cpu->primask_s; cpu->basepri = cpu->basepri_s;
+        cpu->faultmask = cpu->faultmask_s;
+    } else {
+        lmsp = cpu->msp_ns; lpsp = cpu->psp_ns; ctrl = cpu->control_ns;
+        cpu->primask = cpu->primask_ns; cpu->basepri = cpu->basepri_ns;
+        cpu->faultmask = cpu->faultmask_ns;
+    }
     cpu->use_psp = (ctrl & 2) != 0;
     if (arm_sp_is_psp(cpu)) { cpu->reg[ARM_SP] = lpsp; cpu->msp = lmsp; }
     else                    { cpu->reg[ARM_SP] = lmsp; cpu->psp = lpsp; }
@@ -809,6 +896,7 @@ static void arm_fnc_return(arm_cpu_t *cpu, uint32_t magic) {
     uint32_t sp = cpu->reg[ARM_SP];
     uint32_t ret = arm_read32(cpu, sp + 0);
     uint32_t sig = arm_read32(cpu, sp + 4);
+    arm_tz_trace(cpu, "fnc-return", ret, sig);
     if (sig != 0xFEFA125Au) {
         cpu->sfsr |= ARM_SFSR_INVIS;
         cpu->secure_fault_pending = true;
@@ -824,6 +912,19 @@ static void arm_exc_trace(const char *what, uint32_t a, uint32_t b, uint32_t c) 
     if (en < 0) en = getenv("ARM_EXC_TRACE") ? 1 : 0;
     if (en) fprintf(stderr, "[exc] %-6s exc/lr=0x%08x sp=0x%08x pc=0x%08x\n",
                     what, a, b, c);
+}
+
+/* World-transition tracer (ARM_TZ_TRACE=1): one line per SG / BLXNS / BXNS /
+ * FNC_RETURN and per cross-domain exception entry/return, tagged with the
+ * CPU (so multi-node runs stay readable) and the cycle-derived time. */
+void arm_tz_trace(const arm_cpu_t *cpu, const char *what, uint32_t a, uint32_t b) {
+    static int en = -1;
+    if (en < 0) en = getenv("ARM_TZ_TRACE") ? 1 : 0;
+    if (!en) return;
+    fprintf(stderr, "[tz] cpu=%p %10.6f %-10s %s pc=0x%08x a=0x%08x b=0x%08x sp=0x%08x\n",
+            (const void *)cpu,
+            (double)arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz) / 1e9,
+            what, cpu->secure ? "S " : "NS", cpu->reg[ARM_PC], a, b, cpu->reg[ARM_SP]);
 }
 
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
@@ -881,12 +982,22 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
      * 0xFFFFFFF1 = Return to Handler mode (nested interrupt), MSP
      * 0xFFFFFFF9 = Return to Thread mode, MSP
      * 0xFFFFFFFD = Return to Thread mode, PSP */
-    if ((cpu->xpsr & 0x1FF) != 0) {
-        cpu->reg[ARM_LR] = 0xFFFFFFF1; /* Nested: return to Handler, MSP */
-    } else if (cpu->use_psp) {
-        cpu->reg[ARM_LR] = 0xFFFFFFFD; /* Return to Thread using PSP */
-    } else {
-        cpu->reg[ARM_LR] = 0xFFFFFFF9; /* Return to Thread using MSP */
+    {
+        /* ARMv8-M layout: bit6 S (background security), bit5 DCRS=1 (no
+         * additional state context stacked — csim uses the plain 8-word
+         * frame), bit4 FType=1 (no FP frame), bit3 Mode, bit2 SPSEL, bit0 ES
+         * (exception security). Without the security extension S=ES=1 and
+         * the values are the classic 0xFFFFFFF1 / F9 / FD. */
+        uint32_t er = 0xFFFFFFB0u;
+        bool s  = cpu->tz_enabled ? tz_bg_secure : true;
+        bool es = cpu->tz_enabled ? target_secure : true;
+        if (s)  er |= 0x40u;
+        if (es) er |= 0x01u;
+        if ((cpu->xpsr & 0x1FF) == 0) {
+            er |= 0x08u;                      /* return to Thread */
+            if (cpu->use_psp) er |= 0x04u;    /* ... using PSP */
+        }
+        cpu->reg[ARM_LR] = er;
     }
 
     /* Enter Handler mode (set IPSR) before any security banking, so SP
@@ -897,13 +1008,14 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     /* ARMv8-M: if the handler runs in the other security state, bank across
      * (the frame was stacked on the background stack above) and fetch from
      * that state's vector table. Record the background state for return. */
-    cpu->exc_crossed_domain = false;
-    cpu->exc_bg_secure = tz_bg_secure;
+    /* The background security state travels in EXC_RETURN.S, so nested
+     * cross-domain exceptions (S thread -> NS handler -> S handler) unwind
+     * correctly; the old single-level flag lost the outer crossing. */
     if (cpu->tz_enabled && target_secure != tz_bg_secure) {
         arm_switch_security_state(cpu, target_secure);
-        cpu->exc_crossed_domain = true;
         if (target_secure)
             cpu->tz_secexc_count++;
+        arm_tz_trace(cpu, "exc-cross", (uint32_t)exception_num, cpu->reg[ARM_LR]);
     }
     uint32_t vtor = (cpu->tz_enabled && target_secure) ? cpu->vtor_s : cpu->vtor;
 
@@ -925,9 +1037,12 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     /* ARMv8-M: return to the background security state first, as the frame
      * lives on that state's stack. Must precede the MSP sync below so the
      * active SP is the background frame's, not the handler's. */
-    if (cpu->tz_enabled && cpu->exc_crossed_domain) {
-        arm_switch_security_state(cpu, cpu->exc_bg_secure);
-        cpu->exc_crossed_domain = false;
+    if (cpu->tz_enabled) {
+        bool bg_secure = (exc_return & 0x40u) != 0;   /* EXC_RETURN.S */
+        if (bg_secure != cpu->secure) {
+            arm_switch_security_state(cpu, bg_secure);
+            arm_tz_trace(cpu, "exc-return", exc_return, cpu->xpsr & 0x1FFu);
+        }
     }
 
     /* The handler ran on MSP — sync the bank before re-banking. */
@@ -956,8 +1071,9 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     uint32_t newsp = sp + 32 + ((cpu->xpsr & (1u << 9)) ? 4 : 0);
 
     /* Restore execution mode + re-bank the active SP from EXC_RETURN. */
-    if ((exc_return & 0xF) == 0x1) {
-        /* Return to (outer) Handler mode, MSP — IPSR kept from popped xPSR. */
+    if ((exc_return & 0x8u) == 0) {
+        /* Return to (outer) Handler mode, MSP — IPSR kept from popped xPSR.
+         * (Mode bit 3 clear; matches 0xFFFFFFF1 and the NS 0xFFFFFFB0/B1.) */
         cpu->msp = newsp;
         cpu->reg[ARM_SP] = newsp;
     } else {
@@ -976,6 +1092,22 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
 
     cpu->cycles += 12;
     arm_exc_trace("return", exc_return, cpu->reg[ARM_SP], cpu->reg[ARM_PC]);
+}
+
+/* Interworking branch through a loaded PC value (POP/LDM/LDR with Rt=PC):
+ * an EXC_RETURN (0xFxxxxxxx) unstacks an exception frame; on ARMv8-M a
+ * FNC_RETURN (0xFExxxxxx) seen in Non-secure state returns to the Secure
+ * caller of BLXNS — the Non-secure callee's `pop {.., pc}` is the usual way
+ * that value reaches PC, so it must be recognised here, not only on BX. */
+static inline void arm_load_pc(arm_cpu_t *cpu, uint32_t v) {
+    if ((v & 0xF0000000u) == 0xF0000000u) {
+        if (cpu->tz_enabled && !cpu->secure && (v & 0xFF000000u) == 0xFE000000u)
+            arm_fnc_return(cpu, v);
+        else
+            exception_return(cpu, v);
+        return;
+    }
+    cpu->reg[ARM_PC] = v & ~1u;
 }
 
 /* --- APSR flag helpers --- */
@@ -2143,6 +2275,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                             cpu->reg[ARM_LR] = 0xFEFFFFFFu;   /* FNC_RETURN */
                             arm_switch_security_state(cpu, false);
                             cpu->tz_bxns_count++;
+                            arm_tz_trace(cpu, "blxns", target, cpu->reg[ARM_SP]);
                             cpu->reg[ARM_PC] = target & ~1u;
                         } else if (ns_variant && !link) {
                             /* BXNS Rm: FNC_RETURN / EXC_RETURN, else branch
@@ -2155,6 +2288,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                                 if ((target & 1) == 0) {
                                     arm_switch_security_state(cpu, false);
                                     cpu->tz_bxns_count++;
+                                    arm_tz_trace(cpu, "bxns", target, cpu->reg[ARM_LR]);
                                 }
                                 cpu->reg[ARM_PC] = target & ~1u;
                             }
@@ -2452,11 +2586,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         /* Update SP BEFORE exception_return so it reads
                            the exception frame from the correct address */
                         cpu->reg[ARM_SP] = addr;
-                        if ((target & 0xF0000000) == 0xF0000000) {
-                            exception_return(cpu, target);
-                        } else {
-                            cpu->reg[ARM_PC] = target & ~1u;
-                        }
+                        arm_load_pc(cpu, target);
                     } else {
                         cpu->reg[ARM_SP] = addr;
                     }
@@ -2580,7 +2710,9 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         arm_switch_security_state(cpu, true);
                         cpu->reg[ARM_LR] &= ~1u;
                         cpu->tz_sg_count++;
+                        arm_tz_trace(cpu, "sg", pc, cpu->reg[ARM_LR]);
                     } else {
+                        arm_tz_trace(cpu, "sg-invep", pc, cpu->reg[ARM_LR]);
                         cpu->sfsr |= ARM_SFSR_INVEP;
                         cpu->secure_fault_pending = true;
                     }
@@ -2637,7 +2769,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     if (W && !(reglist & (1 << rn)))
                         cpu->reg[rn] = addr;
                     if (do_exc_ret)
-                        exception_return(cpu, exc_ret);
+                        arm_load_pc(cpu, exc_ret);
                 } else {
                     /* STM.W */
                     /* Check if decrement before (STMDB) */
@@ -3218,7 +3350,33 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                             case 16: cpu->reg[rd] = cpu->primask; break;
                             case 17: cpu->reg[rd] = cpu->basepri; break;
                             case 19: cpu->reg[rd] = cpu->faultmask; break;
-                            case 20: cpu->reg[rd] = cpu->use_psp ? 2 : 0; break; /* CONTROL */
+                            case 20: /* CONTROL: SPSEL live; other bits from the bank */
+                                cpu->reg[rd] = cpu->tz_enabled
+                                    ? (((cpu->secure ? cpu->control_s : cpu->control_ns) & ~2u)
+                                       | (cpu->use_psp ? 2u : 0u))
+                                    : (cpu->use_psp ? 2u : 0u);
+                                break;
+                            case 0x0A: cpu->reg[rd] = cpu->tz_enabled && cpu->secure
+                                       ? cpu->msplim_s : cpu->msplim_ns; break; /* MSPLIM */
+                            case 0x0B: cpu->reg[rd] = cpu->tz_enabled && cpu->secure
+                                       ? cpu->psplim_s : cpu->psplim_ns; break; /* PSPLIM */
+                            /* ARMv8-M Non-secure banks, Secure-only (RAZ otherwise). */
+                            case 0x88: case 0x89: case 0x8A: case 0x8B:
+                            case 0x90: case 0x91: case 0x93: case 0x94: case 0x98:
+                                if (!(cpu->tz_enabled && cpu->secure)) { cpu->reg[rd] = 0; break; }
+                                switch (sysm) {
+                                    case 0x88: cpu->reg[rd] = cpu->msp_ns; break;
+                                    case 0x89: cpu->reg[rd] = cpu->psp_ns; break;
+                                    case 0x8A: cpu->reg[rd] = cpu->msplim_ns; break;
+                                    case 0x8B: cpu->reg[rd] = cpu->psplim_ns; break;
+                                    case 0x90: cpu->reg[rd] = cpu->primask_ns; break;
+                                    case 0x91: cpu->reg[rd] = cpu->basepri_ns; break;
+                                    case 0x93: cpu->reg[rd] = cpu->faultmask_ns; break;
+                                    case 0x94: cpu->reg[rd] = cpu->control_ns; break;
+                                    case 0x98: cpu->reg[rd] = (cpu->control_ns & 2u)
+                                               ? cpu->psp_ns : cpu->msp_ns; break;
+                                }
+                                break;
                             default: cpu->reg[rd] = 0; break;
                         }
                     } else if ((op_br & 0x7E) == 0x38 && (op_misc & 0xF0) != 0xF0) {
@@ -3274,8 +3432,35 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                                                    cpu->reg[ARM_SP] = cpu->msp; }
                                 }
                                 cpu->use_psp = new_psp;
+                                if (cpu->tz_enabled) {
+                                    uint32_t *c = cpu->secure ? &cpu->control_s : &cpu->control_ns;
+                                    *c = val & 0x7u;   /* nPRIV | SPSEL | FPCA */
+                                }
                                 break;
                             }
+                            case 0x0A: if (cpu->tz_enabled && cpu->secure) cpu->msplim_s = val & ~7u;
+                                       else cpu->msplim_ns = val & ~7u; break;   /* MSPLIM */
+                            case 0x0B: if (cpu->tz_enabled && cpu->secure) cpu->psplim_s = val & ~7u;
+                                       else cpu->psplim_ns = val & ~7u; break;   /* PSPLIM */
+                            /* ARMv8-M Non-secure banks — the secure world's
+                             * TZ_NonSecure_SetMSP/CONTROL idiom before BLXNS to
+                             * the NS reset handler. Secure-only (WI otherwise). */
+                            case 0x88: case 0x89: case 0x8A: case 0x8B:
+                            case 0x90: case 0x91: case 0x93: case 0x94: case 0x98:
+                                if (!(cpu->tz_enabled && cpu->secure)) break;
+                                switch (sysm) {
+                                    case 0x88: cpu->msp_ns = val & ~3u; break;
+                                    case 0x89: cpu->psp_ns = val & ~3u; break;
+                                    case 0x8A: cpu->msplim_ns = val & ~7u; break;
+                                    case 0x8B: cpu->psplim_ns = val & ~7u; break;
+                                    case 0x90: cpu->primask_ns = val & 1u; break;
+                                    case 0x91: cpu->basepri_ns = val & 0xFFu; break;
+                                    case 0x93: cpu->faultmask_ns = val & 1u; break;
+                                    case 0x94: cpu->control_ns = val & 0x7u; break;
+                                    case 0x98: if (cpu->control_ns & 2u) cpu->psp_ns = val & ~3u;
+                                               else cpu->msp_ns = val & ~3u; break;
+                                }
+                                break;
                             default: break;
                         }
                     }
@@ -3397,10 +3582,9 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                          * a PLD/PLI/PLDW preload hint (NOP on Cortex-M, which has
                          * no cache).  libc strlen/memcpy/memchr emit these; doing
                          * the load wrote a byte into PC and crashed.  Skip it. */
-                    } else if ((val & 0xF0000000) == 0xF0000000)
-                        exception_return(cpu, val);
-                    else
-                        cpu->reg[ARM_PC] = val & ~1u;
+                    } else {
+                        arm_load_pc(cpu, val);
+                    }
                 } else {
                     cpu->reg[rt] = val;
                 }
@@ -3428,10 +3612,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                 }
                 uint32_t val = mem_read32(cpu, addr);
                 if (rt == ARM_PC) {
-                    if ((val & 0xF0000000) == 0xF0000000)
-                        exception_return(cpu, val);
-                    else
-                        cpu->reg[ARM_PC] = val & ~1u;
+                    arm_load_pc(cpu, val);
                 } else {
                     cpu->reg[rt] = val;
                 }
@@ -3721,6 +3902,23 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         cpu->reg[rd] = (uint32_t)(acc >> 32);  /* RdHi */
                     }
                 }
+            } else if ((hw1 & 0xFFE0) == 0xEC20 && hw2 == 0x0A00 && cpu->tz_enabled) {
+                /* ARMv8-M VLSTM (EC2n 0A00) / VLLDM (EC3n 0A00) — the CMSE
+                 * secure-gateway / non-secure-call prologue+epilogue that
+                 * preserves the FP context across a world switch. Modelled
+                 * eagerly (no lazy state preservation): VLSTM stores
+                 * S0-S15 + FPSCR at [Rn], VLLDM restores them. The 0x48-byte
+                 * slot is reserved by the caller; nothing else touches it. */
+                int rn = hw1 & 0xF;
+                uint32_t base = cpu->reg[rn];
+                bool store = (hw1 & 0x0010) == 0;
+                for (int i = 0; i < 16; i++) {
+                    if (store) arm_write32(cpu, base + 4 * i, cpu->vfp_s[i]);
+                    else       cpu->vfp_s[i] = arm_read32(cpu, base + 4 * i);
+                }
+                if (store) arm_write32(cpu, base + 0x40, cpu->fpscr);
+                else       cpu->fpscr = arm_read32(cpu, base + 0x40);
+                (void)insn32;
             } else if ((hw1 & 0xEC00) == 0xEC00) {
                 /* Cortex-M4F single-precision VFP. Real implementations
                  * live in arm_vfp.c — `arm_vfp_step` returns true if it
@@ -3762,6 +3960,13 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         if (cpu->tz_enabled && cpu->secure_fault_pending) {
             cpu->secure_fault_pending = false;
             arm_exception_entry(cpu, EXC_SECUREFAULT);
+        }
+
+        /* System reset requested during this instruction (SYSRESETREQ or a
+         * watchdog timeout): take it here, between instructions. */
+        if (__builtin_expect(cpu->reset_pending, 0)) {
+            arm_cpu_reset(cpu);
+            break;
         }
 
         /* Service any IRQ that became pending mid-instruction.  Peripherals
