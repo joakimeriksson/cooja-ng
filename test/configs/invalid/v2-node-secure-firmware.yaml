@@ -1,0 +1,7 @@
+version: 2
+title: secure_firmware belongs on the mote type, not the node
+timeout_ms: 1000
+mote_types:
+  - { name: a, firmware: firmware/nrf54l15-xiao/normal-world-example.nrf54l15-xiao }
+nodes:
+  - { type: a, secure_firmware: firmware/nrf54l15-xiao/secure-world-example.nrf54l15-xiao, id: 1 }

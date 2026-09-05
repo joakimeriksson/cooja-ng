@@ -8,6 +8,8 @@
  *   mote_types:
  *     - { name: server, firmware: firmware/cooja/udp-server.cooja }
  *     - { name: client, firmware: firmware/cooja/udp-client.cooja }
+ *     # TrustZone-M split image: the Secure-world ELF is loaded first
+ *     - { name: tz, firmware: ns.nrf54l15-xiao, secure_firmware: s.nrf54l15-xiao }
  *   nodes:
  *     - { type: server, id: 1, x: 0.0, y: 0.0 }
  *     - { type: client, id: 2, x: 30.0, y: 0.0 }
@@ -95,6 +97,9 @@ typedef struct {
 
 typedef struct {
     char firmware[256];
+    /* TrustZone-M split image: the Secure-world ELF loaded into the same
+     * node before `firmware` (the Non-secure world). "" = single image. */
+    char secure_firmware[256];
     int  id;         /* 0 = auto-assign */
     double x, y;     /* position in meters */
     int  has_position; /* true if x,y specified in JSON */
@@ -117,6 +122,7 @@ typedef struct {
     char soc[32];       /* "msp430f1611" | "cc2538" | ...             */
     char board[32];     /* "sky" | "zoul-firefly" | "cc2538dk" | ...  */
     char firmware[256];
+    char secure_firmware[256];  /* TrustZone-M Secure-world ELF, or "" */
 } sim_mote_type_t;
 
 typedef struct {
@@ -158,6 +164,7 @@ typedef struct {
      * v2 parser writes both it and the richer mote_types[] table below. */
     int mote_type_count;
     char mote_type_firmware[8][256]; /* firmware path per type index */
+    char mote_type_secure_firmware[8][256]; /* TZ Secure-world ELF per type index ("" = none) */
     sim_mote_type_t mote_types[8];   /* v2 named mote types (M42)       */
 
     /* v2 plugin/service names (captured for Phase 8 register-by-name;

@@ -327,7 +327,8 @@ static const field_t peripheral_fields[] = {   /* off-SoC SPI chip on a node */
     {"chip", 's', 0}, {"spim", 'n', 0}, {"cs", 's', 0}, {0, 0, 0}
 };
 static const field_t node_v1_fields[] = {
-    {"firmware", 's', 0}, {"id", 'n', 0}, {"x", 'n', 0}, {"y", 'n', 0},
+    {"firmware", 's', 0}, {"secure_firmware", 's', 0},
+    {"id", 'n', 0}, {"x", 'n', 0}, {"y", 'n', 0},
     {"clock_deviation", 'n', 0}, {"peripherals", 'a', &peripheral_schema},
     {"build", 'o', &build_schema}, {"_mote_type_desc", 's', 0}, {0, 0, 0}
 };
@@ -338,7 +339,8 @@ static const field_t node_v2_fields[] = {
 };
 static const field_t mote_type_fields[] = {
     {"name", 's', 0}, {"kind", 's', 0}, {"cpu", 's', 0}, {"soc", 's', 0},
-    {"board", 's', 0}, {"firmware", 's', 0}, {"description", 's', 0}, {0, 0, 0}
+    {"board", 's', 0}, {"firmware", 's', 0}, {"secure_firmware", 's', 0},
+    {"description", 's', 0}, {0, 0, 0}
 };
 static const field_t step_fields[] = {
     {"wait", 's', 0}, {"node", 'n', 0}, {"count", 'n', 0}, {"timeout_ms", 'n', 0}, {0, 0, 0}
@@ -606,7 +608,18 @@ static void put_block(FILE *f, const char *key, const char *text, int indent) {
 /* Mote-type naming for the writer.  Existing mote_types keep their order
  * (getMoteTypes()[i] in JS scripts depends on it); firmware paths not
  * covered by one get a synthesized type named after the file stem. */
-typedef struct { char name[64]; char firmware[256]; const sim_mote_type_t *src; } wtype_t;
+/* A type is identified by its firmware pair: two nodes with the same
+ * Non-secure image but different Secure-world images are different types. */
+typedef struct {
+    char name[64];
+    char firmware[256];
+    char secure_firmware[256];   /* TrustZone-M Secure-world ELF, or "" */
+    const sim_mote_type_t *src;
+} wtype_t;
+
+static int same_images(const wtype_t *t, const char *fw, const char *sfw) {
+    return strcmp(t->firmware, fw) == 0 && strcmp(t->secure_firmware, sfw) == 0;
+}
 
 static void stem_of(const char *fw, char *out, size_t sz) {
     const char *base = strrchr(fw, '/');
@@ -622,32 +635,43 @@ static int build_types(const sim_normalized_config_t *cfg, wtype_t *types, int m
         wtype_t *t = &types[n++];
         const sim_mote_type_t *mt = &cfg->mote_types[i];
         const char *fw = mt->firmware[0] ? mt->firmware : cfg->mote_type_firmware[i];
+        const char *sfw = mt->secure_firmware[0] ? mt->secure_firmware
+                                                 : cfg->mote_type_secure_firmware[i];
         snprintf(t->firmware, sizeof(t->firmware), "%s", fw);
+        snprintf(t->secure_firmware, sizeof(t->secure_firmware), "%s", sfw);
         t->src = mt->name[0] ? mt : NULL;
         if (mt->name[0]) snprintf(t->name, sizeof(t->name), "%s", mt->name);
         else stem_of(fw, t->name, sizeof(t->name));
     }
     for (int i = 0; i < cfg->node_count && n < max; i++) {
         const char *fw = cfg->nodes[i].firmware;
+        const char *sfw = cfg->nodes[i].secure_firmware;
         int found = 0;
-        for (int k = 0; k < n; k++) if (strcmp(types[k].firmware, fw) == 0) { found = 1; break; }
+        for (int k = 0; k < n; k++) if (same_images(&types[k], fw, sfw)) { found = 1; break; }
         if (found) continue;
         wtype_t *t = &types[n];
         snprintf(t->firmware, sizeof(t->firmware), "%s", fw);
+        snprintf(t->secure_firmware, sizeof(t->secure_firmware), "%s", sfw);
         t->src = NULL;
         stem_of(fw, t->name, sizeof(t->name));
         n++;
     }
-    /* de-duplicate names (same stem, different extension): append the ext */
+    /* de-duplicate names: same stem, different extension -> append the ext;
+     * same firmware, different Secure-world image -> append that stem */
     for (int i = 0; i < n; i++)
         for (int k = i + 1; k < n; k++)
             if (strcmp(types[i].name, types[k].name) == 0) {
-                const char *ext = strrchr(types[k].firmware, '.');
-                if (ext) {
-                    char tmp[64];
-                    snprintf(tmp, sizeof(tmp), "%s-%s", types[k].name, ext + 1);
-                    snprintf(types[k].name, sizeof(types[k].name), "%s", tmp);
+                char tmp[64], suffix[64];
+                if (strcmp(types[i].firmware, types[k].firmware) == 0 &&
+                    types[k].secure_firmware[0]) {
+                    stem_of(types[k].secure_firmware, suffix, sizeof(suffix));
+                } else {
+                    const char *ext = strrchr(types[k].firmware, '.');
+                    if (!ext) continue;
+                    snprintf(suffix, sizeof(suffix), "%s", ext + 1);
                 }
+                snprintf(tmp, sizeof(tmp), "%s-%s", types[k].name, suffix);
+                snprintf(types[k].name, sizeof(types[k].name), "%s", tmp);
             }
     return n;
 }
@@ -696,6 +720,9 @@ int sim_config_write_yaml(const sim_normalized_config_t *cfg, FILE *f,
             if (t->src->board[0]) { fputs(", board: ", f); put_str(f, t->src->board); }
         }
         fputs(", firmware: ", f); put_str(f, t->firmware);
+        if (t->secure_firmware[0]) {
+            fputs(", secure_firmware: ", f); put_str(f, t->secure_firmware);
+        }
         fputs(" }\n", f);
     }
 
@@ -704,7 +731,7 @@ int sim_config_write_yaml(const sim_normalized_config_t *cfg, FILE *f,
         const sim_node_config_t *n = &cfg->nodes[i];
         const char *tname = "?";
         for (int k = 0; k < ntypes; k++)
-            if (strcmp(types[k].firmware, n->firmware) == 0) { tname = types[k].name; break; }
+            if (same_images(&types[k], n->firmware, n->secure_firmware)) { tname = types[k].name; break; }
         fputs("  - { type: ", f); put_str(f, tname);
         fprintf(f, ", id: %d", n->id);
         if (n->has_position) {

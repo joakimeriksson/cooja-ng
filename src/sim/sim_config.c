@@ -222,6 +222,13 @@ static int parse_v1(cJSON *root, sim_normalized_config_t *cfg) {
                  sizeof(cfg->nodes[count].firmware),
                  "%s", fw->valuestring);
 
+        /* Optional TrustZone-M Secure-world image (loaded first) */
+        cJSON *sfw = cJSON_GetObjectItemCaseSensitive(node_item, "secure_firmware");
+        if (cJSON_IsString(sfw) && sfw->valuestring)
+            snprintf(cfg->nodes[count].secure_firmware,
+                     sizeof(cfg->nodes[count].secure_firmware),
+                     "%s", sfw->valuestring);
+
         cJSON *id = cJSON_GetObjectItemCaseSensitive(node_item, "id");
         if (cJSON_IsNumber(id)) {
             cfg->nodes[count].id = id->valueint;
@@ -264,6 +271,9 @@ static int parse_v1(cJSON *root, sim_normalized_config_t *cfg) {
             cJSON *fw = cJSON_GetObjectItem(mt_item, "firmware");
             if (cJSON_IsString(fw) && fw->valuestring)
                 strncpy(cfg->mote_type_firmware[ti], fw->valuestring, 255);
+            cJSON *sfw = cJSON_GetObjectItem(mt_item, "secure_firmware");
+            if (cJSON_IsString(sfw) && sfw->valuestring)
+                strncpy(cfg->mote_type_secure_firmware[ti], sfw->valuestring, 255);
             ti++;
         }
         cfg->mote_type_count = ti;
@@ -507,13 +517,13 @@ static int parse_test(cJSON *test, sim_normalized_config_t *cfg) {
     return 0;
 }
 
-/* Resolve a v2 node's named mote-type to its firmware path; returns NULL if
- * the name is not in cfg->mote_types[]. */
-static const char *resolve_mote_type_firmware(const sim_normalized_config_t *cfg,
-                                              const char *name) {
+/* Resolve a v2 node's named mote-type; returns NULL if the name is not in
+ * cfg->mote_types[]. */
+static const sim_mote_type_t *resolve_mote_type(const sim_normalized_config_t *cfg,
+                                                const char *name) {
     for (int i = 0; i < cfg->mote_type_count; i++)
         if (strcmp(cfg->mote_types[i].name, name) == 0)
-            return cfg->mote_types[i].firmware;
+            return &cfg->mote_types[i];
     return NULL;
 }
 
@@ -558,6 +568,7 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
                 {"soc",  mt->soc,  sizeof(mt->soc)},
                 {"board", mt->board, sizeof(mt->board)},
                 {"firmware", mt->firmware, sizeof(mt->firmware)},
+                {"secure_firmware", mt->secure_firmware, sizeof(mt->secure_firmware)},
             };
             for (size_t fi = 0; fi < sizeof(fields)/sizeof(fields[0]); fi++) {
                 cJSON *v = cJSON_GetObjectItemCaseSensitive(mt_item, fields[fi].key);
@@ -567,6 +578,8 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
             /* mirror into the legacy index-keyed table (TEST_ACTION_ADD) */
             snprintf(cfg->mote_type_firmware[ti], sizeof(cfg->mote_type_firmware[ti]),
                      "%s", mt->firmware);
+            snprintf(cfg->mote_type_secure_firmware[ti],
+                     sizeof(cfg->mote_type_secure_firmware[ti]), "%s", mt->secure_firmware);
             ti++;
         }
         cfg->mote_type_count = ti;
@@ -617,14 +630,15 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
             fprintf(stderr, "sim_config: node %d missing 'type'\n", count);
             return -1;
         }
-        const char *fw = resolve_mote_type_firmware(cfg, type->valuestring);
-        if (!fw) {
+        const sim_mote_type_t *mt = resolve_mote_type(cfg, type->valuestring);
+        if (!mt) {
             fprintf(stderr, "sim_config: node %d references unknown mote type '%s'\n",
                     count, type->valuestring);
             return -1;
         }
         snprintf(n->type_name, sizeof(n->type_name), "%s", type->valuestring);
-        snprintf(n->firmware, sizeof(n->firmware), "%s", fw);
+        snprintf(n->firmware, sizeof(n->firmware), "%s", mt->firmware);
+        snprintf(n->secure_firmware, sizeof(n->secure_firmware), "%s", mt->secure_firmware);
 
         cJSON *id = cJSON_GetObjectItemCaseSensitive(node_item, "id");
         n->id = cJSON_IsNumber(id) ? id->valueint : 0;  /* auto-assign */
