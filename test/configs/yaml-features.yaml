@@ -1,0 +1,70 @@
+# Exercises every YAML feature Cooja-NG accepts beyond plain JSON:
+# comments, block scalars, flow-style mappings, quoted scalars that must
+# stay strings, and integers/floats in plain style.
+version: 2
+title: "YAML features: comments, block scalar, flow style"
+description: Loaded by the config-roundtrip test; not a runnable simulation.
+timeout_ms: 5000
+seed: 7
+startup_delay_ms: 100
+speed: 2.5
+
+medium:
+  type: udgm
+  tx_range: 50          # metres
+  interference_range: 1.0e2
+  success_ratio_tx: 1.0
+  success_ratio_rx: 0.9
+
+plugins:
+  - energest
+  - "builtin:timeline"
+
+mote_types:
+  - { name: server, kind: native-cooja, firmware: firmware/cooja/udp-server.cooja }
+  - name: client
+    firmware: firmware/cooja/udp-client.cooja
+
+nodes:
+  - { type: server, id: 1, x: 0, y: 0 }
+  - { type: client, id: 2, x: 30.5, y: -12.25, clock_deviation: 0.9999 }
+  - type: client
+    id: 3
+    x: 60
+    y: 0
+
+serial_socket:
+  port: 60001
+  node: 1
+  command: "tools/test-border-router.sh --prefix fd00::/64"
+
+test:
+  description: "Strings that look like other types must stay strings: '007', 'true', 'NO'"
+  timeout_is_success: true
+  steps:
+    - { wait: "007", node: 1 }
+    - { wait: "true", count: 2, timeout_ms: 1000 }
+    - { wait: "NO" }
+  fail_on:
+    - "FAILED"
+    - "assertion"
+  validators:
+    - { pattern: "Received request", node: 1, min_count: 1 }
+    - pattern: "Received response"
+      min_count: 2
+  actions:
+    - { at_ms: 1000, type: move, node: 2, x: 10, y: 10 }
+    - { at_ms: 2000, type: send, node: 1, data: "hello world" }
+    - { at_ms: 2500, type: send_all, data: ping }
+    - { at_ms: 3000, type: add, node: 4, mote_type: 1, x: 5, y: 5 }
+    - { at_ms: 4000, type: remove, node: 3 }
+  js_script_inline: |
+    // A literal block keeps the script verbatim: indentation, quotes, colons.
+    TIMEOUT(5000, log.testFailed());
+    while (true) {
+      YIELD();
+      if (msg.contains("Hello, world")) {
+        log.log("saw it at " + time + "\n");
+        log.testOK();
+      }
+    }

@@ -1,0 +1,37 @@
+# 4-node RPL-UDP chain on Tmote Sky (MSP430 + CC2420).
+#
+# The YAML twin of configs/chain-4node-sky-v2.json — same simulation, byte-
+# identical output (tools/check-config-equivalence.sh proves it in CI).
+# Run it:   ./build/test_runner test configs/chain-4node-sky.yaml
+# Save the live setup after a run:  ... --save-config my-setup.yaml
+version: 2
+title: "4-node chain RPL-UDP: Sky (MSP430 + CC2420 2.4 GHz)"
+timeout_ms: 180000
+seed: 42          # same seed => byte-identical run
+startup_delay_ms: 1000
+
+# UDGM: unit-disk graph medium, ranges in metres. 55 m range with nodes
+# 50 m apart makes every hop single-neighbour, so this is a true chain.
+medium:
+  type: udgm
+  tx_range: 55.0           # metres
+  interference_range: 1.1e+02
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+# Mote types are named once and referenced by the nodes below.
+mote_types:
+  - { name: sky-server, kind: emulated-elf, cpu: msp430, soc: msp430f1611, board: sky, firmware: firmware/sky/udp-server.sky }
+  - { name: sky-client, kind: emulated-elf, cpu: msp430, soc: msp430f1611, board: sky, firmware: firmware/sky/udp-client.sky }
+
+nodes:
+  - { type: sky-server, id: 1, x: 0.0, y: 0.0 }
+  - { type: sky-client, id: 2, x: 5e+01, y: 0.0 }
+  - { type: sky-client, id: 3, x: 1e+02, y: 0.0 }
+  - { type: sky-client, id: 4, x: 1.5e+02, y: 0.0 }
+
+# End-of-run validators: the console lines each node must have printed.
+test:
+  validators:
+    - { pattern: "Received request", node: 1, min_count: 1 }
+    - { pattern: "Received response", node: 4, min_count: 1 }

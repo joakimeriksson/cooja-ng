@@ -1,23 +1,29 @@
 /*
- * JSON simulation configuration loader
+ * Simulation configuration loader — YAML (primary) or JSON.
  *
- * Loads simulation scenarios from JSON config files:
- *   {
- *     "title": "RPL-UDP test",
- *     "timeout_ms": 60000,
- *     "seed": 123456,
- *     "nodes": [
- *       { "firmware": "firmware/cooja/udp-server.cooja", "id": 1 },
- *       { "firmware": "firmware/cooja/udp-client.cooja", "id": 2 }
- *     ]
- *   }
+ *   version: 2
+ *   title: RPL-UDP test
+ *   timeout_ms: 60000
+ *   seed: 123456
+ *   mote_types:
+ *     - { name: server, firmware: firmware/cooja/udp-server.cooja }
+ *     - { name: client, firmware: firmware/cooja/udp-client.cooja }
+ *   nodes:
+ *     - { type: server, id: 1, x: 0.0, y: 0.0 }
+ *     - { type: client, id: 2, x: 30.0, y: 0.0 }
  *
- * Node type auto-detected from firmware extension (.sky / .cc2538dk / .cooja).
+ * The file extension selects the parser (.yaml/.yml → libyaml, .json →
+ * cJSON); both produce the same tree, which one schema validator checks
+ * (unknown/duplicate keys and wrong types are errors — never silently
+ * ignored) and one per-version parser (v1/v2) turns into
+ * sim_normalized_config_t.  The runtime consumes only that struct.
+ * Node platform is auto-detected from the firmware extension.
  */
 #ifndef SIM_CONFIG_H
 #define SIM_CONFIG_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 #define MAX_SIM_NODES 128
 #define MAX_TEST_STEPS 32
@@ -56,6 +62,8 @@ typedef struct {
 } sim_test_action_t;
 
 typedef struct {
+    char description[256];   /* free text, round-tripped by the writer */
+
     int step_count;
     sim_test_step_t steps[MAX_TEST_STEPS];
 
@@ -99,6 +107,7 @@ typedef struct {
 typedef struct {
     int  version;      /* config schema version: 1 (legacy) or 2 (M41+) */
     char title[128];
+    char description[512];  /* free text ("description" or legacy "note") */
     int  timeout_ms;   /* default 20000 */
     int  seed;         /* 0 = not set */
     int  node_count;
@@ -152,9 +161,29 @@ typedef struct {
  * populate; the runtime consumes only this, never the raw JSON layout
  * (§8.3).  Phase 7 renamed it from sim_config_t. */
 
-/* Load a JSON config file (v1 or v2, dispatched on the top-level "version"
- * key).  Returns 0 on success, -1 on error. */
-int  sim_config_load(sim_normalized_config_t *cfg, const char *json_path);
+/* Load a config file — .yaml/.yml or .json, v1 or v2 (dispatched on the
+ * top-level "version" key).  Returns 0 on success, -1 on error (diagnostic
+ * already printed).  Any unknown key, duplicate key, wrong-typed value or
+ * unsupported YAML feature is an error: a config that loads is one whose
+ * every field was understood. */
+int  sim_config_load(sim_normalized_config_t *cfg, const char *path);
+
+/* Release what a loaded config owns (the inline JS script). */
+void sim_config_free(sim_normalized_config_t *cfg);
+
+/* True if `path` has a config extension (.yaml / .yml / .json) — how the
+ * runner tells a config argument from a firmware argument. */
+int  sim_config_is_file(const char *path);
+
+/* Write the config as canonical v2 YAML: stable key order, comments where
+ * they help, the JS script as a literal block.  `header` (may be NULL) is
+ * emitted as leading comment lines — the writer is used to save a running
+ * simulation's setup, so it says where the file came from.  A v1 config is
+ * lifted to v2 (mote types synthesized from the distinct firmware paths,
+ * preserving the order of any existing mote_types so getMoteTypes()[i]
+ * indices survive).  Returns 0 on success. */
+int  sim_config_write_yaml(const sim_normalized_config_t *cfg, FILE *out,
+                           const char *header);
 
 /* Print config summary to stdout. */
 void sim_config_print(const sim_normalized_config_t *cfg);

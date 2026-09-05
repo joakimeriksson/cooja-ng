@@ -1,0 +1,7 @@
+version: 2
+title: v2 nodes use type
+timeout_ms: 1000
+mote_types:
+  - { name: a, firmware: firmware/cooja/udp-server.cooja }
+nodes:
+  - { firmware: firmware/cooja/udp-server.cooja, id: 1 }

@@ -183,41 +183,67 @@ make build-firmware
 
 The suite **fails loudly**: an unknown `.csc` feature, a firmware build that fails, a test with no assertions, or a script that ends without a verdict is an error that fails the run — never a silent skip. To run the suite from *inside* a Contiki-NG tree with `make -C tests/<category> SIMULATOR=cooja-ng` (same `summary` / exit semantics as Java Cooja), and to wire it into CI, see [`docs/contiki-ng-testing.md`](docs/contiki-ng-testing.md).
 
-## JSON simulation configs
+## Simulation configs (YAML or JSON)
 
-Full schema in [`docs/test-format.md`](docs/test-format.md).  Short version:
+Full schema in [`docs/test-format.md`](docs/test-format.md).  YAML is the
+primary format; JSON is a subset of it and stays fully supported (every
+`.json` in `configs/` still works).  The loader is strict: an unknown key, a
+duplicate key, a wrong type or an unsupported YAML feature is an error with a
+`file:line:column` — nothing is ignored silently.  Short version:
 
-```jsonc
-{
-    "title": "RPL-UDP 3-node linear chain",
-    "timeout_ms": 60000,
-    "seed": 42,
-    "startup_delay_ms": 1000,
-    "radiomedium": {
-        "type": "udgm",
-        "tx_range": 50.0,
-        "interference_range": 100.0,
-        "success_ratio_tx": 1.0,
-        "success_ratio_rx": 1.0
-    },
-    "nodes": [
-        { "firmware": "firmware/sky/udp-server.sky", "id": 1, "x":  0.0, "y": 0.0 },
-        { "firmware": "firmware/sky/udp-client.sky", "id": 2, "x": 30.0, "y": 0.0 },
-        { "firmware": "firmware/sky/udp-client.sky", "id": 3, "x": 60.0, "y": 0.0 }
-    ],
-    "test": {
-        "timeout_is_success": true,
-        "fail_on": ["packet loss", "parent switch: -> (NULL"],
-        "validators": [ { "pattern": "Received response", "min_count": 6 } ],
-        "actions": [
-            { "at_ms": 30000, "type": "move", "node": 3, "x": 200.0, "y": 0.0 },
-            { "at_ms": 45000, "type": "move", "node": 3, "x":  60.0, "y": 0.0 }
-        ]
-    }
-}
+```yaml
+version: 2
+title: RPL-UDP 3-node linear chain
+timeout_ms: 60000
+seed: 42                     # same seed => byte-identical run
+startup_delay_ms: 1000
+
+medium:
+  type: udgm
+  tx_range: 50.0             # metres
+  interference_range: 100.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+mote_types:
+  - { name: server, firmware: firmware/sky/udp-server.sky }
+  - { name: client, firmware: firmware/sky/udp-client.sky }
+
+nodes:
+  - { type: server, id: 1, x:  0.0, y: 0.0 }
+  - { type: client, id: 2, x: 30.0, y: 0.0 }
+  - { type: client, id: 3, x: 60.0, y: 0.0 }
+
+test:
+  timeout_is_success: true
+  fail_on: ["packet loss", "parent switch: -> (NULL"]
+  validators:
+    - { pattern: "Received response", min_count: 6 }
+  actions:
+    - { at_ms: 30000, type: move, node: 3, x: 200.0, y: 0.0 }
+    - { at_ms: 45000, type: move, node: 3, x:  60.0, y: 0.0 }
+  js_script_inline: |        # or a Cooja-style script, verbatim
+    TIMEOUT(60000);
+    while (true) { YIELD(); if (msg.contains("Received response")) log.testOK(); }
 ```
 
-Working examples in [`configs/`](configs/): `rpl-udp-{sky,cc2538dk,native}.json`, `mixed-sky-native.json`, `udgm-{3node,in-range,out-of-range,100node-grid}.json`, `test-4node-chain.json`, `test-js-rpl-udp.json`, `ui-rpl-udp-grid.json`.  Run any with `./build/test_runner mixed-multinode configs/<file>.json [-v]`.
+Working examples in [`configs/`](configs/): `chain-4node-sky.yaml`,
+`test-js-hello.yaml`, `test-rpl-udp-sky.yaml`,
+`medium-plugin-gilbert-elliott.yaml` (each with a `.json` twin that CI proves
+simulates byte-identically), plus `rpl-udp-{sky,cc2538dk,native}.json`,
+`udgm-{3node,in-range,out-of-range,100node-grid}.json`, `test-js-rpl-udp.json`,
+`ui-rpl-udp-grid.json`.  Run any with `./build/test_runner test configs/<file> [-v]`.
+
+```sh
+# Save the LIVE setup at the end of a run — positions, added/removed nodes,
+# effective seed and duration — as canonical YAML.  Works from a config or
+# from plain firmware arguments.
+./build/test_runner test configs/chain-4node-sky.yaml --save-config my-setup.yaml
+./build/test_runner mixed-multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky --save-config my-setup.yaml
+
+./build/test_runner config-convert   old.json new.yaml          # canonical v2 YAML
+./build/test_runner config-roundtrip configs/*.json configs/*.yaml   # writer is lossless + idempotent
+```
 
 ## Performance
 

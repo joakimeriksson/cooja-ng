@@ -1,0 +1,7 @@
+version: 2
+title: string where number expected
+timeout_ms: "60000"
+mote_types:
+  - { name: a, firmware: firmware/cooja/udp-server.cooja }
+nodes:
+  - { type: a, id: 1 }

@@ -58,6 +58,9 @@ extern int run_arm_correctness_tests(int verbose);
 extern int run_arm_benchmarks(void);
 extern int run_arm_decode_tests(int verbose);
 extern int run_arm_jit_tests(int verbose);
+extern int run_config_convert(int argc, char **argv);
+extern int run_config_roundtrip(int argc, char **argv);
+extern int run_config_reject(int argc, char **argv);
 extern int run_arm_firmware_tests(int verbose);
 
 /* Mixed-platform test (handles MSP430, ARM, and native nodes) */
@@ -107,7 +110,8 @@ int main(int argc, char **argv) {
         printf("Chip drivers: cc1200-mock-host\n");
         printf("Radio medium: radio-medium\n");
         printf("Radio bus:    radio-bus\n");
-        printf("Test:         test <config.json> [-v] [-t ms] [--seed N]\n");
+        printf("Test:         test <config.yaml|json> [-v] [-t ms] [--seed N] [--save-config out.yaml]\n");
+        printf("Config:       config-convert <in> <out.yaml> | config-roundtrip <config...> | config-reject <config...>\n");
         printf("Combined:     all\n");
         return 1;
     }
@@ -383,6 +387,13 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "test") == 0) {
         failures += run_mixed_multinode_test(argc - 2, argv + 2);
     }
+
+    if (strcmp(mode, "config-convert") == 0)
+        return run_config_convert(argc - 2, argv + 2);
+    if (strcmp(mode, "config-roundtrip") == 0)
+        return run_config_roundtrip(argc - 2, argv + 2) ? 1 : 0;
+    if (strcmp(mode, "config-reject") == 0)
+        return run_config_reject(argc - 2, argv + 2) ? 1 : 0;
 
     /* Timeline unit tests */
     if (strcmp(mode, "mock-host") == 0 || strcmp(mode, "all") == 0) {

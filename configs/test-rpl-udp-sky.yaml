@@ -1,0 +1,20 @@
+# 2-node RPL-UDP on Sky with step-based assertions: each step waits for a
+# console line (optionally on a given node, N times, within a timeout).
+# Twin of configs/test-rpl-udp-sky.json.
+version: 2
+title: "RPL-UDP Sky convergence test"
+timeout_ms: 120000
+
+mote_types:
+  - { name: udp-server, firmware: firmware/sky/udp-server.sky }
+  - { name: udp-client, firmware: firmware/sky/udp-client.sky }
+
+nodes:
+  - { type: udp-server, id: 1 }
+  - { type: udp-client, id: 2 }
+
+test:
+  steps:
+    - { wait: "Sending request", node: 2, timeout_ms: 60000 }
+    - { wait: "Received request", node: 1, timeout_ms: 30000 }
+    - { wait: "Received response", node: 2, count: 3 }

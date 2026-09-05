@@ -1,0 +1,5 @@
+title: v1 spells it radiomedium
+timeout_ms: 1000
+medium: { type: udgm }
+nodes:
+  - { firmware: firmware/cooja/udp-server.cooja, id: 1 }

@@ -228,6 +228,27 @@ jobs:
       - name: Config v1 <-> v2 equivalence (chain-4node-sky)
         run: tools/check-config-equivalence.sh configs/chain-4node-sky.json configs/chain-4node-sky-v2.json
 
+      # YAML is the primary config format; JSON stays accepted.  Three checks:
+      # every config in the tree survives load -> YAML -> load with the
+      # writer idempotent (a field the writer forgets fails here, not as a
+      # quietly different simulation); every invalid fixture — typo'd key,
+      # anchor, "Norway" boolean, hex, second document, ... — is refused;
+      # and a YAML twin simulates byte-identically to its JSON original.
+      - name: Config round-trip (every config, JSON and YAML, through the writer)
+        run: ./build/test_runner config-roundtrip configs/*.json configs/*.yaml test/configs/yaml-features.yaml
+      - name: Config rejection (every invalid fixture must fail to load)
+        run: ./build/test_runner config-reject test/configs/invalid/*
+      - name: Config JSON <-> YAML equivalence (chain-4node-sky, JS hello)
+        run: |
+          tools/check-config-equivalence.sh configs/chain-4node-sky-v2.json configs/chain-4node-sky.yaml
+          tools/check-config-equivalence.sh configs/test-js-hello.json configs/test-js-hello.yaml
+      # --save-config writes the LIVE setup; the saved file must reproduce
+      # the run it was saved from.
+      - name: Config save (--save-config reproduces the run)
+        run: |
+          ./build/test_runner test configs/test-rpl-udp-sky.yaml --save-config saved.yaml | grep "Saved config"
+          tools/check-config-equivalence.sh configs/test-rpl-udp-sky.yaml saved.yaml
+
       # Lightning is optional by design; now that CI installs it, this is the
       # only coverage the no-Lightning build path has.  Rebuild with the
       # detection overridden, prove the interpreter suites still pass and that
