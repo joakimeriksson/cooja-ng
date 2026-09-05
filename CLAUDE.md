@@ -530,4 +530,7 @@ CSIM_ARM_JIT_MIN_BLOCK=n  # minimum block length to compile (default 1 — NOT a
                           # knob, see the comment in arm_jit.c: 4 costs 3x)
 CSIM_ARM_JIT_THRESHOLD=n  # executions before compiling (default 50)
 NRF54L_UART_RX_TRACE=1    # nRF54L15 console bytes delivered into the firmware's receive buffer
+NRF54L_DPPI_TRACE=1       # nRF54L15 interconnect publishes, channel-group tasks, CHEN writes
+NRF54L_DISABLED_DEFER_NS  # nRF54L15 radio DISABLE->DISABLED latency, ns (default 3000; the
+                          # working window is 2500-4000 — docs/design/nrf54l15-ack-gap.md)
 ```

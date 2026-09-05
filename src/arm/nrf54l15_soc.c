@@ -1421,8 +1421,38 @@ static void nrf54l_radio_set_state(nrf54l_radio_state_t *r, uint32_t new_state) 
                 r->disabled_event_defer.callback  = nrf54l_radio_disabled_event_fire_cb;
                 r->disabled_event_defer.user_data = r;
                 r->disabled_event_defer_scheduled = 1;
+                /* Silicon ramps down into DISABLED in ~0.5 µs, but this
+                 * delay also stands in for an ordering the model cannot
+                 * otherwise express. On hardware the CRC result precedes
+                 * END by a few cycles, so the driver's receive ISR is
+                 * already running when DISABLED arrives; here CRCOK, END
+                 * and the disable land in one instant and the ISR can only
+                 * start afterwards. The value has to satisfy both sides of
+                 * that ISR:
+                 *
+                 *   - not before ~2.5 µs: the ISR must reach the point where
+                 *     it tears down the ramp-up chain before DISABLED fires,
+                 *     or the chain re-arms the receiver under it;
+                 *   - not after ~4 µs: DISABLED starts TIMER10, and the
+                 *     driver samples that timer ~6.6 µs after CRCOK to decide
+                 *     whether it can still transmit an acknowledgement. It
+                 *     needs to read a few ticks, and a late start reads too
+                 *     few and the acknowledgement is abandoned.
+                 *
+                 * The window was measured with the 2-node RPL-UDP tests: 2 µs
+                 * fails on the first side, 5 µs on the second, 2.5-4 µs pass.
+                 * The value the model shipped with, 8 µs, broke every
+                 * acknowledgement the driver itself transmits, which went
+                 * unnoticed only while the firmware also acknowledged from
+                 * its CSMA layer. NRF54L_DISABLED_DEFER_NS overrides it;
+                 * see docs/design/nrf54l15-ack-gap.md. */
+                static int64_t defer_ns = -1;
+                if (defer_ns < 0) {
+                    const char *e = getenv("NRF54L_DISABLED_DEFER_NS");
+                    defer_ns = e ? strtoll(e, NULL, 0) : 3000LL;
+                }
                 int64_t fire = cpu->cycles +
-                    cpu_ns_to_cycles(8000LL, cpu->cpu_freq_hz);
+                    cpu_ns_to_cycles(defer_ns, cpu->cpu_freq_hz);
                 arm_schedule_event(cpu, &r->disabled_event_defer, fire);
             }
             break;
@@ -1830,13 +1860,13 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
                 else
                     nrf54l_radio_fire_event(r, &r->evt_crcerror, INT_CRCERROR, PUB_CRCERROR);
 
-                /* No hardware-style auto-ACK: the Nordic 802.15.4 driver
-                 * schedules its own ACK via TIMER+PPI in response to
-                 * CRCOK with AR bit set, and now that emit_tx defers
-                 * PHYEND to actual air-time end the driver has time to
-                 * exit its critical section and arm the ACK on time.
-                 * Emitting one from the chip too produces a duplicate
-                 * ACK frame at the sender. */
+                /* No chip-fabricated auto-ACK: the Nordic 802.15.4 driver
+                 * builds and transmits the acknowledgement itself, timed off
+                 * TIMER10 and the DPPI fabric, so emitting one here would
+                 * duplicate it. Firmware built with CSMA_CONF_SEND_SOFT_ACK=0
+                 * (hardware-acknowledge only) depends on that driver path
+                 * completing; see the receive-completion ordering note on
+                 * disabled_event_defer. */
                 r->state    = NRF54L_RADIO_STATE_RXIDLE;
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
                 nrf54l_radio_apply_shorts(r, R_SHORT_END_START);
