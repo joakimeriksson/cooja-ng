@@ -133,6 +133,25 @@ static const arm_platform_config_t platform_nrf54l15_dk = {
     .vtor_override = 0,
 };
 
+/* Seeed Studio XIAO nRF54L15 (TARGET=nrf BOARD=nrf54l15/xiao). Same SoC
+ * as the DK; only the board wiring differs. VTOR = 0.
+ *   LED      = P2.0 (single user LED, active-low)
+ *   BUTTON   = P0.0 (user button, active-low pull-up)
+ *   Console  = UARTE20 (P1.9 TX / P1.8 RX) via the onboard CMSIS-DAP VCP
+ * Pin mux is not enforced by the SoC model, so the UART pin difference
+ * against the DK is irrelevant to emulation. */
+static const arm_platform_config_t platform_nrf54l15_xiao = {
+    .name          = "nrf54l15-xiao",
+    .soc           = &nrf54l15_config,
+    .soc_ops       = &nrf54l15_soc_ops,
+    .console_uart  = 0,
+    .leds = {
+        { .port = 2, .pin = 0,  .active_low = true },   /* user LED P2.0 */
+    },
+    .button        = { .port = 0, .pin = 0, .active_low = true },   /* user button P0.0 */
+    .vtor_override = 0,
+};
+
 static const arm_platform_config_t *all_arm_platforms[] = {
     &platform_cc2538dk,
     &platform_openmote,
@@ -140,6 +159,7 @@ static const arm_platform_config_t *all_arm_platforms[] = {
     &platform_nrf52840_dongle,
     &platform_nrf52840_dk,
     &platform_nrf54l15_dk,
+    &platform_nrf54l15_xiao,
     NULL
 };
 
