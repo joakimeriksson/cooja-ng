@@ -40,6 +40,11 @@ struct sim_radio_bus;  /* see sim_radio_bus.h — owned storage lives with the r
 typedef struct sim_runtime {
     /* The five Phase 1 milestone 1 fields, in the order the plan lists them. */
     int64_t            now_ns;        /* current simulation time (ns)        */
+    /* Wakeups requested for a time already passed are clamped to now_ns
+     * (Cooja throws on scheduling in the past; we clamp, count, and warn
+     * once) — see sim_schedule_mote_wakeup*().  A nonzero count after a
+     * run is a bug in the caller, not a property of the scenario. */
+    int64_t            past_wakeups_clamped;
     int64_t            end_ns;        /* run-until horizon (ns), 0 = unset   */
     sim_run_state_t    run_state;     /* lifecycle state, see enum above     */
     sim_event_queue_t  event_queue;   /* unified event queue                 */

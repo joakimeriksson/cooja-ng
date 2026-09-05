@@ -3,6 +3,8 @@
 # Run Contiki-NG Cooja test suite using csim
 #
 # Usage: ./tools/run-cooja-tests.sh [test-dir-pattern] [-v] [--no-build]
+#   CSIM_KEEP_LOGS=<dir> keeps the per-test log of every failed test there
+#   (CSIM_KEEP_LOGS_ALL=1: every test); otherwise logs vanish with the temp dir.
 #                                   [--seed N] [--logdir DIR] [--with-tun] [--clean]
 #
 # Converts each .csc → JSON, runs csim mixed-multinode, reports PASS/FAIL/SKIP.
@@ -247,6 +249,14 @@ run_test() {
             echo "    --- Last 5 lines ---"
             tail -5 "$log_file" | sed 's/^/    /'
         fi
+    fi
+    # Per-test logs live in $TMP_DIR, which is removed at exit.  With
+    # CSIM_KEEP_LOGS=<dir> every log is copied there (failed ones always,
+    # passing ones too when CSIM_KEEP_LOGS_ALL=1), so a failure under sudo
+    # or in CI can be read afterwards instead of rerun by hand.
+    if [ -n "${CSIM_KEEP_LOGS:-}" ] && { [ $exit_code -ne 0 ] || [ "${CSIM_KEEP_LOGS_ALL:-0}" = 1 ]; }; then
+        mkdir -p "$CSIM_KEEP_LOGS" && cp "$log_file" "$CSIM_KEEP_LOGS/" && \
+            echo "    log kept: $CSIM_KEEP_LOGS/$(basename "$log_file")"
     fi
 }
 
