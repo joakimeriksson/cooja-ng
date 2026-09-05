@@ -39,6 +39,34 @@ static void nrf54l_host_cancel(void *cpu, cpu_event_t *ev) {
     arm_cancel_event((arm_cpu_t *)cpu, ev);
 }
 
+/* Schedule an event at an absolute time in the CYCLE clock's ns base,
+ * arm_cycles_to_ns(cpu->cycles), which is the base the GRTC and TIMER
+ * models measure "now" in. arm_schedule_event_ns converts against
+ * cpu->sim_time_ns instead: a mirror the mote layer pins to kernel time
+ * at slice boundaries, which trails the cycle clock by the boot pre-run
+ * and by how far the current slice has advanced. A deadline computed from
+ * the cycle clock and converted against that mirror lands late by the
+ * gap; an absolute GRTC compare re-armed from inside its own ISR was late
+ * on every tick. Converting against the clock the deadline came from
+ * puts it on the cycle it names.
+ *
+ * The delta is rounded up: the event lands on the first cycle at or after
+ * the deadline, never the one before. A 62 ns TIMER tick is 7.9 cycles at
+ * 128 MHz; floored to 7 the compare fired at 54 ns, with the modelled
+ * counter still one tick short of CC. */
+static void nrf54l_schedule_at_cycle_ns(arm_cpu_t *cpu, arm_event_t *ev, int64_t fire_ns) {
+    int64_t now_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+    int64_t delta  = fire_ns > now_ns ? fire_ns - now_ns : 0;
+    arm_schedule_event(cpu, ev, cpu->cycles + cpu_ns_to_cycles_ceil(delta, cpu->cpu_freq_hz));
+}
+
+/* schedule_ns for the `live_host` vtable: its now_ns is cycle-derived
+ * (nrf54l_host_now_ns_live), so a deadline computed from it must be
+ * converted the same way or the SPIM completion lands late by the gap. */
+static void nrf54l_host_schedule_ns_live(void *cpu, cpu_event_t *ev, int64_t fire_ns) {
+    nrf54l_schedule_at_cycle_ns((arm_cpu_t *)cpu, ev, fire_ns);
+}
+
 /* ============================================================
  * GLOBAL_CLOCK (0x5010_E000)
  *
@@ -554,8 +582,7 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
     int64_t  fire_ns;
     if (cc->absolute_mode) {
         /* Absolute mode: CCL/CCH form a 52-bit syscounter target.
-         * Convert to ns from the GRTC start anchor and let
-         * arm_schedule_event_ns figure out the fire cycle. If the
+         * Convert to ns from the GRTC start anchor. If the
          * target is already in the past relative to now, the firmware
          * scheduled it past-due; fire on the next event check, which
          * is what real-HW comparator-already-matched semantics
@@ -566,7 +593,7 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
                   (int64_t)(target * (uint64_t)NRF54L_GRTC_TICK_NS);
         if (fire_ns < now_ns) fire_ns = now_ns;
         cc->scheduled_ns = fire_ns;
-        arm_schedule_event_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
+        nrf54l_schedule_at_cycle_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
         return;
     }
     uint32_t delay_ticks = cc->ccadd & 0x7FFFFFFFu;
@@ -585,14 +612,14 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
          * at 56% of sim time and the udp-client etimer never reaching
          * its 10 s SEND_INTERVAL.
          *
-         * arm_schedule_event_ns will fire the event on the next event
-         * check after the CPU's cycle passes `fire_ns`, so handing it a
+         * The event fires on the next event check after the CPU's
+         * cycle passes `fire_ns`, so handing it a
          * past timestamp just means "fire ASAP" — which is what real
          * comparator-already-matched semantics produce. */
         fire_ns = cc->scheduled_ns + delay_ns;
     }
     cc->scheduled_ns = fire_ns;
-    arm_schedule_event_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
+    nrf54l_schedule_at_cycle_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
 }
 
 static void nrf54l_grtc_compare_fire(void *user_data, cpu_event_t *event) {
@@ -2003,7 +2030,7 @@ static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
     if (delta == 0) delta = nrf54l_timer_mask(t) + 1u;  /* full wrap */
     uint64_t tn = nrf54l_timer_tick_ns(t);
     int64_t fire_ns = nrf54l_timer_now_ns(t) + (int64_t)(delta * tn);
-    arm_schedule_event_ns(&t->plat->cpu, &t->ev_compare[n], fire_ns);
+    nrf54l_schedule_at_cycle_ns(&t->plat->cpu, &t->ev_compare[n], fire_ns);
 }
 
 static void nrf54l_timer_capture(nrf54l_timer_state_t *t, int n) {
@@ -2578,8 +2605,9 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
      * chips: same as plat->host but now_ns comes from CPU cycles, so an
      * event armed mid-step lands bytes*8/bit-rate ahead of *now*, not of
      * the step's start. */
-    soc->live_host        = plat->host;
-    soc->live_host.now_ns = nrf54l_host_now_ns_live;
+    soc->live_host             = plat->host;
+    soc->live_host.now_ns      = nrf54l_host_now_ns_live;
+    soc->live_host.schedule_ns = nrf54l_host_schedule_ns_live;
 
     /* SPIM00 / SPIM22 / SPIM30 — SPI masters with EasyDMA. */
     for (int i = 0; i < NRF54L_NUM_SPIM; i++) {

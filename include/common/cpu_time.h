@@ -24,6 +24,17 @@ static inline int64_t cpu_ns_to_cycles(int64_t ns, uint32_t freq_hz) {
     return q * (int64_t)freq_hz + (r * (int64_t)freq_hz) / 1000000000LL;
 }
 
+/* Ceiling variant: the first cycle whose ns value is >= ns. Use it for
+ * deadlines — the floor above fires an event up to one cycle before the
+ * time it names, and a counter read from the callback then sits one tick
+ * short of the compare value. */
+static inline int64_t cpu_ns_to_cycles_ceil(int64_t ns, uint32_t freq_hz) {
+    int64_t q = ns / 1000000000LL;
+    int64_t r = ns % 1000000000LL;
+    return q * (int64_t)freq_hz
+         + (r * (int64_t)freq_hz + 999999999LL) / 1000000000LL;
+}
+
 static inline int64_t cpu_cycles_to_ns(int64_t cycles, uint32_t freq_hz) {
     if (freq_hz == 0) return 0;
     int64_t q = cycles / (int64_t)freq_hz;
