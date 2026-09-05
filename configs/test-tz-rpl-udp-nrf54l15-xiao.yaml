@@ -1,0 +1,35 @@
+# Two-node RPL-UDP over TrustZone-M.  Each node's Non-secure world drives the
+# radio through SG veneers into the Secure world's driver, which acknowledges
+# in hardware only.  Also the test that the driver's own acknowledgement path
+# works at all (docs/design/nrf54l15-ack-gap.md).
+
+version: 2
+title: "2-node nRF54L15 TrustZone-M RPL-UDP (XIAO, TRUSTZONE=1 normal worlds)"
+timeout_ms: 60000
+seed: 42          # same seed => byte-identical run
+
+medium:
+  type: udgm
+  tx_range: 50.0           # metres
+  interference_range: 100.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+mote_types:
+  - { name: udp-server-ns, firmware: firmware/nrf54l15-xiao/udp-server-ns.nrf54l15-xiao, secure_firmware: firmware/nrf54l15-xiao/secure-world-example.nrf54l15-xiao }
+  - { name: udp-client-ns, firmware: firmware/nrf54l15-xiao/udp-client-ns.nrf54l15-xiao, secure_firmware: firmware/nrf54l15-xiao/secure-world-example.nrf54l15-xiao }
+
+nodes:
+  - { type: udp-server-ns, id: 1, x: 0.0, y: 0.0 }
+  - { type: udp-client-ns, id: 2, x: 20.0, y: 0.0 }
+
+test:
+  description: >
+    rpl-udp built with TRUSTZONE=1: each node runs the bundled Secure world
+    plus a Non-secure udp-server/udp-client whose radio driver is the tz_radio
+    SG-veneer proxy onto the Secure world's nrf_ieee driver. Link addresses
+    come from the FICR through tz_radio_get_device_id. Passes when the
+    client's request reaches the server and the response comes back.
+  validators:
+    - { pattern: "Received request",  node: 1, min_count: 1 }
+    - { pattern: "Received response", node: 2, min_count: 1 }

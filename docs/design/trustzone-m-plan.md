@@ -1,7 +1,9 @@
 # TrustZone-M on csim: ARMv8-M security extension for the Cortex-M33 (nRF54L15)
 
-**Status: COMPLETE (emulator track).** Plan written 2026-07-18, implemented
-through 2026-07-26, re-verified 2026-07-30 on branch `trustzone`. Per-step
+**Status: COMPLETE (emulator track), extended 2026-09-03 — see *Step 9*.**
+Plan written 2026-07-18, implemented through 2026-07-26, re-verified
+2026-07-30 on branch `trustzone`; Step 9 runs the split image under the
+simulation kernel and validates it against hardware. Per-step
 record under *Confirmed execution steps*; current measured numbers under
 *Verified result*. The remaining work is the hardware track (DK golden-vector
 capture) and deeper firmware exercise — both outside the core emulator.
@@ -202,6 +204,52 @@ built `BOARD=nrf54l15/dk` so one binary runs on csim and the DK.
 boots in csim. Remaining is the HW track (DK golden-vector capture — the
 authoritative oracle) and deeper firmware exercise (radio/timer-driven rpl-udp,
 secure services), both outside the core emulator.
+
+## Step 9 (2026-09-03) — running the split image under the kernel
+
+Steps 1–8 were verified with `tz-boot`, which drives one CPU with no
+simulation kernel, no radio and no timers. Running the same images under the
+kernel, as a config-driven test, exposed a set of gaps that a single-CPU
+instruction budget cannot reach. All are now fixed:
+
+- **Non-secure peripheral alias.** The Normal world addresses peripherals
+  through the `0x4xxx_xxxx` window; the SoC registers them once at
+  `0x5xxx_xxxx`. IO dispatch now folds the alias and records the transaction's
+  security for the attribution work. Without it the Normal world's clock spun
+  forever on an unmapped GRTC.
+- **Non-secure view of the system registers.** `VTOR_NS` and the Non-secure
+  NVIC alias at `0xE002E000` were unmapped, so the Secure world's hand-off
+  configuration and its `SWI01` doorbell into the Normal world were silently
+  dropped. The vector table base is now banked, the Non-secure view is
+  filtered through `NVIC_ITNS`, and `SFSR`/`SFAR` are memory-mapped.
+- **Banked special registers.** `MSR`/`MRS` of `MSP_NS`, `PSP_NS`,
+  `PRIMASK_NS` and `CONTROL_NS` were ignored, so the Secure world's stack and
+  control setup before `BLXNS` did nothing. The exception masks now bank on a
+  world switch, with the active copy still in the hot-path field.
+- **Interrupt capacity.** The NVIC held 240 lines; this SoC uses up to 265
+  (`WDT30`), and lines at or above 256 were clamped to Secure and dropped.
+- **Cross-domain exception nesting.** The background security state lived in a
+  single flag, which a nested exception destroyed: an inner return restored
+  the wrong state and the outer return then unstacked a Secure frame from the
+  Non-secure stack. It now travels in `EXC_RETURN` as the architecture
+  specifies, including the mode and exception-security bits.
+- **Function return through a loaded PC.** A Non-secure callee returning to
+  its Secure caller with `pop {…, pc}` was treated as an exception return.
+  This crashed a node minutes into a run.
+- **`VLSTM`/`VLLDM`** (the floating-point context save around a world switch)
+  were undecoded.
+- **Timer deadlines** were converted against a stale time mirror, running the
+  Normal world's clock at roughly a third of real speed.
+
+Also added, because the firmware now depends on them: **WDT30** with the
+reset-reason register and a **system reset** that resets the NVIC, SysTick and
+the SoC's peripherals in place while SRAM, the reset reason and the always-on
+watchdog survive; the **DWT cycle counter** behind `DEMCR.TRCENA`; and an
+**instruction-cache** stub.
+
+**Verified against silicon.** A Seeed XIAO nRF54L15 runs the same two ELFs;
+boot sequence, clock tick rate and the watchdog timeout and reset reason match
+line for line. See `devices/nrf54l15-xiao/HARDWARE-COMPARISON.md`.
 
 ## Verified result (re-measured 2026-07-30, branch `trustzone` @ `87c92b3`)
 

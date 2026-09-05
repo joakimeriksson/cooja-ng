@@ -129,16 +129,33 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # CSIM_GPIO_TRACE=1 dumps timestamped GPIO OUT changes.
 ./build/test_runner mixed-multinode firmware/nrf54l15-dk/flpr-host.nrf54l15-dk -t 4000
 
-# nRF54L15 TrustZone-M (ARMv8-M security extension). Loads a secure + a
-# normal-world ELF into ONE node, runs the secure world's SAU/IDAU + NS setup,
-# and watches for the handoff banner ("Non-secure world") plus the SG-veneer
-# round-trip; prints per-node SG / BXNS / secure-exception counters at the end.
-# The split images are NOT in this tree — build them from the contiki-ng-nrf54l15
-# checkout (branch trustzone-port-v2), so this is a manual harness, not a gate.
-TZ=~/work/contiki-ng-nrf54l15/examples/platform-specific/nrf/trustzone
+# nRF54L15 TrustZone-M (ARMv8-M security extension). A node can carry a
+# second, Secure-world ELF: the config's "secure_firmware" key loads it before
+# the (Non-secure) "firmware", boot starts in the Secure world, and the
+# end-of-run per-node report adds the SG / BXNS / secure-exception counters.
+# Images are checked in under firmware/nrf54l15-xiao/, built from the
+# contiki-ng-nrf54l15 checkout (branch nrf54l15-trustzone). "secure_firmware"
+# is a schema key on v1 nodes and v2 mote types (two nodes sharing a Non-secure
+# image but not a Secure one are two mote types), and the YAML writer emits it,
+# so these configs round-trip through config-roundtrip like every other.
+./build/test_runner test configs/test-tz-boot-nrf54l15-xiao.yaml      # ~20s sim
+# Watchdog: the Secure world owns WDT30 and the Normal world feeds it through
+# an SG veneer. This normal world stops feeding after its second iteration;
+# the watchdog resets the SoC 2 s later and the Secure world's next boot
+# reports "Reset reason: watchdog0". Verified line-for-line against a Seeed
+# XIAO nRF54L15 — see devices/nrf54l15-xiao/HARDWARE-COMPARISON.md.
+./build/test_runner test configs/test-tz-watchdog-nrf54l15-xiao.yaml  # ~32s sim
+# Two-node RPL-UDP over TrustZone: each node's Non-secure world drives the
+# radio through SG veneers into the Secure world's driver, which acknowledges
+# in hardware only (CSMA_CONF_SEND_SOFT_ACK 0). The client joins the server's
+# DAG and they exchange request/response — docs/design/nrf54l15-ack-gap.md.
+./build/test_runner test configs/test-tz-rpl-udp-nrf54l15-xiao.yaml  # ~60s sim
+# tz-boot remains as a kernel-free bisect tool (no radio, no timeouts, an
+# instruction budget rather than a sim duration):
+TZ=../contiki-ng-nrf54l15/examples/platform-specific/nrf/trustzone
 ./build/test_runner tz-boot \
-    $TZ/secure-world/build/nrf/nrf54l15/dk/secure-world-example.nrf \
-    $TZ/normal-world/build/nrf/nrf54l15/dk/normal-world-example.nrf
+    $TZ/secure-world/build/nrf/nrf54l15/xiao/secure-world-example.nrf \
+    $TZ/normal-world/build/nrf/nrf54l15/xiao/normal-world-example.nrf
 ```
 
 Multinode options: `-t ms` (sim duration), `-n nodes` (node count), `-q` (quiet), `-v` (verbose).
@@ -431,6 +448,7 @@ ACLK is fixed at 32,768 Hz (crystal). SMCLK = DCO / divider.
 | **nrf52840-dongle** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10059 USB Dongle, M4F + FPv4-SP-D16, VTOR=0x1000 (Open Bootloader region at 0x0..0xfff) |
 | **nrf52840-dk** | nRF52840 (ARM Cortex-M4F) | Yes (on-chip 2.4 GHz) | UART0 (legacy window) | Nordic PCA10056 Development Kit, same SoC as Dongle, VTOR=0x0, SEGGER VCP console |
 | **nrf54l15-dk** | nRF54L15 (ARM Cortex-M33, ARMv8-M) | Yes (on-chip 2.4 GHz) | UARTE20 | Nordic nRF54L15-DK, 256 KB RAM, GRTC/DPPI fabric, VTOR=0x0. **The only platform with the ARMv8-M security extension (TrustZone-M) enabled** (`has_trustzone`) — see [`docs/design/trustzone-m-plan.md`](docs/design/trustzone-m-plan.md) |
+| **nrf54l15-xiao** | nRF54L15 (ARM Cortex-M33, ARMv8-M) | Yes (on-chip 2.4 GHz) | UARTE20 | Seeed Studio XIAO nRF54L15. Same SoC as the DK; one user LED on P2.0, user button on P0.0. The board the TrustZone tests and the hardware comparison use |
 | **nrf54l15-dk + FLPR** | nRF54L15 **FLPR (RV32EMC, RISC-V)** coprocessor | — (uses the M33's radio) | shared SRAM | **Dual-core / cross-ISA**: the M33 (`flpr-host`) loads the FLPR blob into shared SRAM and releases it via the VPR `CPURUN` register; the RV32EMC core (`hello-vpr`) then runs **unmodified Contiki-NG** alongside the M33. ISA `rv32emc_zicsr_zifencei` (M + C). See [`docs/design/riscv-vpr-plan.md`](docs/design/riscv-vpr-plan.md) |
 
 ## MCU Configurations
@@ -535,6 +553,9 @@ CSIM_ARM_JIT_MIN_BLOCK=n  # minimum block length to compile (default 1 — NOT a
                           # knob, see the comment in arm_jit.c: 4 costs 3x)
 CSIM_ARM_JIT_THRESHOLD=n  # executions before compiling (default 50)
 NRF54L_UART_RX_TRACE=1    # nRF54L15 console bytes delivered into the firmware's receive buffer
+ARM_TZ_TRACE=1            # log every world transition (SG / BLXNS / BXNS /
+                          # FNC_RETURN / cross-domain exception) with ns time
+NRF54L_WDT_TRACE=1        # nRF54L15 watchdog timeout -> SoC reset
 NRF54L_DPPI_TRACE=1       # nRF54L15 interconnect publishes, channel-group tasks, CHEN writes
 NRF54L_DISABLED_DEFER_NS  # nRF54L15 radio DISABLE->DISABLED latency, ns (default 3000; the
                           # working window is 2500-4000 — docs/design/nrf54l15-ack-gap.md)

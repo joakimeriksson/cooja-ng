@@ -8,8 +8,10 @@ software acknowledgement off (`CSMA_CONF_SEND_SOFT_ACK 0`). Such firmware
 relies entirely on the driver to build and transmit link-layer
 acknowledgements. That path never completed in the emulator: a receiver never
 acknowledged a unicast frame, the sender retried until it gave up, and
-two-node RPL-UDP never formed a DAG. It now works, and
-`configs/test-2node-nrf54l15-dk.json` gates it.
+two-node RPL-UDP never formed a DAG. It now works;
+`configs/test-2node-nrf54l15-dk.json` gates it, and
+`configs/test-tz-rpl-udp-nrf54l15-xiao.yaml` gates the same path driven from a
+TrustZone Non-secure world through SG veneers.
 
 Three model defects were found on the way. The first two were unambiguous
 bugs against the vendor's register descriptions; the third is a timing
