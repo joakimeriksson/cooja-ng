@@ -5,7 +5,7 @@
 #ifndef CSIM_VERSION_H
 #define CSIM_VERSION_H
 
-#define CSIM_VERSION "0.2.2"
+#define CSIM_VERSION "0.2.3"
 #define CSIM_NAME    "Cooja-NG (csim)"
 
 #endif /* CSIM_VERSION_H */
