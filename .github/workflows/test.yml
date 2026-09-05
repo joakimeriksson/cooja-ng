@@ -225,6 +225,12 @@ jobs:
           tail -5 tsch.txt
           grep -aq "TEST PASSED" tsch.txt
 
+      - name: nRF54L15-DK shell over the UARTE console (console input)
+        run: |
+          ./build/test_runner test configs/test-shell-nrf54l15-dk.yaml > shell54.txt 2>&1
+          tail -5 shell54.txt
+          grep -aq "TEST PASSED" shell54.txt
+
       - name: Config v1 <-> v2 equivalence (chain-4node-sky)
         run: tools/check-config-equivalence.sh configs/chain-4node-sky.json configs/chain-4node-sky-v2.json
 

@@ -1,0 +1,30 @@
+# nRF54L15-DK console input: the Contiki-NG shell example, driven through the
+# UARTE20 receive path. Two commands are typed at the node; each is one line
+# delivered byte by byte at the console's baud rate, and the shell answers.
+
+version: 2
+title: "nRF54L15-DK shell over the UARTE console"
+timeout_ms: 10000
+seed: 42
+
+mote_types:
+  - { name: shell, firmware: firmware/nrf54l15-dk/shell.nrf54l15-dk }
+
+nodes:
+  - { type: shell, id: 1, x: 0.0, y: 0.0 }
+
+test:
+  description: >
+    Types 'help' and then 'ip-addr' at node 1 once it has booted, and waits
+    for the shell's reply to each. Proves the UARTE receive registers, the
+    receive interrupt and the per-character pacing: a line delivered faster
+    than the firmware re-arms its single-byte transfer is overwritten in
+    place and matches no command.
+  actions:
+    - { at_ms: 2000, type: send, node: 1, data: "help\n" }
+    - { at_ms: 3000, type: send, node: 1, data: "ip-addr\n" }
+  steps:
+    - { wait: "Shows this help", node: 1, timeout_ms: 4000 }
+    - { wait: "Node IPv6 addresses", node: 1, timeout_ms: 4000 }
+  fail_on:
+    - "Command not found"

@@ -39,3 +39,13 @@
 - **Build command**: `tools/build-device-firmware.sh --target nrf --board nrf54l15/dk --example examples/rpl-udp --source-file udp-server --output firmware/nrf54l15-dk/udp-server-instr.nrf54l15-dk --no-provenance --local`
 - **Modification**: a `tick_test_process` is autostarted alongside `udp_server_process`. At boot it prints `[CFG] RTIMER_SECOND=… CLOCK_SECOND=… boot_rt=…`, then once per `etimer_set(CLOCK_SECOND)` prints `[T] uptime=Ns clock_time=N rtimer_now=N rt_delta=N`. Used as a ground-truth probe for GRTC tick rate — on real PCA10156 each `[T]` line emerges every 1 wall-clock second and `rt_delta` advances by ~1,000,000 (= 1 MHz GRTC SYSCOUNTER). The csim emulator's GRTC must reproduce both timings.
 
+## shell.nrf54l15-dk
+
+- **Source**: contiki-ng commit `14a3f574a37228cae84f50b7891acf1488604473`
+- **Source path**: `examples/libs/shell` (file: `example.c`)
+- **TARGET**: `nrf`
+- **BOARD**: `nrf54l15/dk`
+- **Toolchain**: host
+- **Built**: 2026-09-05T22:33:17Z by Niclas Finne
+- **Build command**: `tools/build-device-firmware.sh --target nrf --board nrf54l15/dk --example examples/libs/shell --output firmware/nrf54l15-dk/shell.nrf54l15-dk`
+

@@ -181,6 +181,97 @@ static void nrf54l_ficr_write(void *user_data, uint32_t addr, uint32_t value) {
 #define NRF54L_UARTE_DMA_TX_MAXCNT       0x740
 #define NRF54L_UARTE_DMA_TX_AMOUNT       0x744
 
+/* Receive-side register offsets (NRF_UARTE_Type on this SoC). */
+#define NRF54L_UARTE_TASKS_DMA_RX_START   0x028
+#define NRF54L_UARTE_TASKS_DMA_RX_STOP    0x02C
+#define NRF54L_UARTE_EVENTS_RXDRDY        0x110
+#define NRF54L_UARTE_EVENTS_DMA_RX_END    0x14C
+#define NRF54L_UARTE_EVENTS_DMA_RX_READY  0x150
+#define NRF54L_UARTE_INTEN                0x300
+#define NRF54L_UARTE_INTENSET             0x304
+#define NRF54L_UARTE_INTENCLR             0x308
+#define NRF54L_UARTE_DMA_RX_PTR           0x704
+#define NRF54L_UARTE_DMA_RX_MAXCNT        0x708
+#define NRF54L_UARTE_DMA_RX_AMOUNT        0x70C
+#define NRF54L_UARTE_INTEN_RXDRDY         (1u << 4)
+#define NRF54L_UARTE_INTEN_DMARXEND       (1u << 19)
+#define NRF54L_UARTE_INTEN_DMARXREADY     (1u << 20)
+#define NRF54L_UARTE20_IRQ     198   /* SERIAL20_IRQn */
+
+/* One character time at the console's 115200 baud, 8N1: ten bit periods.
+ * The model does not decode the BAUDRATE register — every board here runs the
+ * console at 115200 — but the pacing itself matters, which is why this is a
+ * real interval and not zero. Delivering an injected line as fast as the
+ * firmware can re-arm its single-byte transfer overwrites the buffer under
+ * the driver, and the shell reads back a line that matches no command. */
+#define NRF54L_UARTE_CHAR_NS   86800LL
+
+static int nrf54l_trace_flag(int *cache, const char *name);
+static int trc54_uartrx = -1;   /* NRF54L_UART_RX_TRACE */
+static void nrf54l_uarte_rx_pace_cb(void *user, arm_event_t *ev);
+static void nrf54l_uarte_rx_schedule(nrf54l_uarte_state_t *u);
+
+/* Arrange for the next queued byte to arrive one character time from now.
+ * Delivery happens only from the paced callback: bytes arrive on a wire at
+ * the baud rate, and the firmware re-arms its single-byte transfer from the
+ * completion handler. Handing it the next byte the instant it re-arms
+ * overwrites the buffer under the driver, which then reads the line back as
+ * garbage — the whole line lands before the shell has consumed a character. */
+static void nrf54l_uarte_rx_schedule(nrf54l_uarte_state_t *u) {
+    if (!u->plat || u->rx_pace_scheduled) return;
+    if (u->rx_head == u->rx_tail) return;
+    arm_cpu_t *cpu = &u->plat->cpu;
+    u->rx_pace_event.callback  = nrf54l_uarte_rx_pace_cb;
+    u->rx_pace_event.user_data = u;
+    u->rx_pace_scheduled = 1;
+    arm_schedule_event(cpu, &u->rx_pace_event,
+                       cpu->cycles + cpu_ns_to_cycles(NRF54L_UARTE_CHAR_NS,
+                                                      cpu->cpu_freq_hz));
+}
+
+static void nrf54l_uarte_rx_drain(nrf54l_uarte_state_t *u) {
+    if (!u->plat) return;
+    arm_cpu_t *cpu = &u->plat->cpu;
+    if (u->rx_active && u->rx_head != u->rx_tail && u->rx_amount < u->rx_maxcnt) {
+        uint8_t byte = u->rx_fifo[u->rx_tail];
+        u->rx_tail = (u->rx_tail + 1) % (int)sizeof(u->rx_fifo);
+        arm_write8(cpu, u->rx_ptr + u->rx_amount, byte);
+        if (nrf54l_trace_flag(&trc54_uartrx, "NRF54L_UART_RX_TRACE"))
+            fprintf(stderr, "[uart-rx] deliver 0x%02x '%c' -> 0x%08x amount=%u/%u\n",
+                    byte, (byte >= 32 && byte < 127) ? byte : '.',
+                    u->rx_ptr + u->rx_amount, u->rx_amount + 1, u->rx_maxcnt);
+        u->rx_amount++;
+        u->evt_rxdrdy = 1;
+        if (u->inten & NRF54L_UARTE_INTEN_RXDRDY)
+            arm_nvic_set_pending(&u->plat->nvic, u->irq_num);
+        if (u->rx_amount >= u->rx_maxcnt) {
+            u->rx_active = false;
+            u->evt_dma_rx_end = 1;
+            if (u->inten & NRF54L_UARTE_INTEN_DMARXEND)
+                arm_nvic_set_pending(&u->plat->nvic, u->irq_num);
+        }
+    }
+    nrf54l_uarte_rx_schedule(u);
+}
+
+static void nrf54l_uarte_rx_pace_cb(void *user, arm_event_t *ev) {
+    (void)ev;
+    nrf54l_uarte_state_t *u = (nrf54l_uarte_state_t *)user;
+    u->rx_pace_scheduled = 0;
+    nrf54l_uarte_rx_drain(u);
+}
+
+void nrf54l_uarte_feed_rx(struct nrf54l15_soc *soc, const uint8_t *buf, int len) {
+    nrf54l_uarte_state_t *u = &((nrf54l15_soc_t *)soc)->uarte20;
+    for (int i = 0; i < len; i++) {
+        int next = (u->rx_head + 1) % (int)sizeof(u->rx_fifo);
+        if (next == u->rx_tail) break;      /* ring full: drop, as hardware would */
+        u->rx_fifo[u->rx_head] = buf[i];
+        u->rx_head = next;
+    }
+    nrf54l_uarte_rx_schedule(u);
+}
+
 static int nrf54l_uarte_read(void *user_data, uint32_t addr) {
     nrf54l_uarte_state_t *u = (nrf54l_uarte_state_t *)user_data;
     uint32_t off = addr - NRF54L_UARTE20_BASE;
@@ -191,6 +282,15 @@ static int nrf54l_uarte_read(void *user_data, uint32_t addr) {
         case NRF54L_UARTE_DMA_TX_PTR:         return (int)u->tx_ptr;
         case NRF54L_UARTE_DMA_TX_MAXCNT:      return (int)u->tx_maxcnt;
         case NRF54L_UARTE_DMA_TX_AMOUNT:      return (int)u->tx_amount;
+        case NRF54L_UARTE_EVENTS_RXDRDY:        return (int)u->evt_rxdrdy;
+        case NRF54L_UARTE_EVENTS_DMA_RX_END:    return (int)u->evt_dma_rx_end;
+        case NRF54L_UARTE_EVENTS_DMA_RX_READY:  return (int)u->evt_dma_rx_ready;
+        case NRF54L_UARTE_DMA_RX_PTR:           return (int)u->rx_ptr;
+        case NRF54L_UARTE_DMA_RX_MAXCNT:        return (int)u->rx_maxcnt;
+        case NRF54L_UARTE_DMA_RX_AMOUNT:        return (int)u->rx_amount;
+        case NRF54L_UARTE_INTEN:
+        case NRF54L_UARTE_INTENSET:
+        case NRF54L_UARTE_INTENCLR:             return (int)u->inten;
         default:                              return 0;
     }
 }
@@ -225,12 +325,30 @@ static void nrf54l_uarte_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF54L_UARTE_DMA_TX_PTR:         u->tx_ptr         = value;     break;
         case NRF54L_UARTE_DMA_TX_MAXCNT:      u->tx_maxcnt      = value;     break;
         case NRF54L_UARTE_DMA_TX_AMOUNT:      u->tx_amount      = value;     break;
+        case NRF54L_UARTE_TASKS_DMA_RX_START:
+            if (value & 1) {
+                u->rx_amount = 0;
+                u->rx_active = true;
+                nrf54l_uarte_rx_schedule(u);
+            }
+            break;
+        case NRF54L_UARTE_TASKS_DMA_RX_STOP:
+            if (value & 1) u->rx_active = false;
+            break;
+        case NRF54L_UARTE_EVENTS_RXDRDY:        u->evt_rxdrdy     = value & 1; break;
+        case NRF54L_UARTE_EVENTS_DMA_RX_END:    u->evt_dma_rx_end = value & 1; break;
+        case NRF54L_UARTE_EVENTS_DMA_RX_READY:  u->evt_dma_rx_ready = value & 1; break;
+        case NRF54L_UARTE_DMA_RX_PTR:           u->rx_ptr         = value;     break;
+        case NRF54L_UARTE_DMA_RX_MAXCNT:        u->rx_maxcnt      = value;     break;
+        case NRF54L_UARTE_DMA_RX_AMOUNT:        u->rx_amount      = value;     break;
+        case NRF54L_UARTE_INTEN:                u->inten  = value;  break;
+        case NRF54L_UARTE_INTENSET:             u->inten |= value;  break;
+        case NRF54L_UARTE_INTENCLR:             u->inten &= ~value; break;
         default:
             /* Accept every other register write as a no-op: SHORTS,
-             * BAUDRATE, CONFIG, FRAMETIMEOUT, PSEL.*, INTEN*,
-             * PUBLISH_*, SUBSCRIBE_*, the RX-DMA cluster, etc.  None of
-             * these have observed read-back semantics that would gate
-             * boot progress in this firmware. */
+             * BAUDRATE, CONFIG, FRAMETIMEOUT, PSEL.*, PUBLISH_*,
+             * SUBSCRIBE_*, etc.  None of these have observed read-back
+             * semantics that would gate boot progress in this firmware. */
             break;
     }
 }
@@ -2247,7 +2365,8 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
                     nrf54l_ficr_read, nrf54l_ficr_write, &soc->ficr);
 
     /* UARTE20 — pure EasyDMA console. */
-    soc->uarte20.plat = plat;
+    soc->uarte20.plat    = plat;
+    soc->uarte20.irq_num = NRF54L_UARTE20_IRQ;
     arm_register_io(&plat->cpu,
                     NRF54L_UARTE20_BASE, NRF54L_UARTE20_SIZE,
                     nrf54l_uarte_read, nrf54l_uarte_write, &soc->uarte20);
