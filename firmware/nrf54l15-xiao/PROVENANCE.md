@@ -86,3 +86,15 @@
 - **Built**: 2026-09-05T22:35:19Z by Niclas Finne
 - **Build command**: `tools/build-device-firmware.sh --target nrf --board nrf54l15/xiao --example examples/rpl-udp --output firmware/nrf54l15-xiao/udp-client-ns.nrf54l15-xiao --source-file udp-client --make-args "TRUSTZONE=1" --local`
 
+## normal-world-fullplat.nrf54l15-xiao
+
+- **Source**: contiki-ng commit `ec4aafd64df1b2da81483ac9c6ddd665410fda41`
+- **Branch**: contiki-ng `nrf54l15-trustzone` (TrustZone-M support is not in upstream Contiki-NG yet)
+- **Source path**: `examples/platform-specific/nrf/trustzone/normal-world` (file: `normal-world-example.c`)
+- **TARGET**: `nrf`
+- **BOARD**: `nrf54l15/xiao`
+- **Make args**: `TZ_MINIMAL_NONSECURE_PLATFORM=0`
+- **Toolchain**: host
+- **Built**: 2026-09-05T22:35:39Z by Niclas Finne
+- **Build command**: `tools/build-device-firmware.sh --target nrf --board nrf54l15/xiao --example examples/platform-specific/nrf/trustzone/normal-world --output firmware/nrf54l15-xiao/normal-world-fullplat.nrf54l15-xiao --make-args "TZ_MINIMAL_NONSECURE_PLATFORM=0" --local`
+
