@@ -44,6 +44,26 @@ int arm_elf_mote_boot(mixed_node_t *node, int slot,
     if (!pcfg) { fprintf(stderr, "Platform '%s' not found\n", plat_name); return -1; }
 
     arm_platform_init(plat, pcfg);
+    /* TrustZone-M split image: the Secure world is loaded first, then the
+     * Non-secure world on top (disjoint flash/RAM partitions). The last
+     * load wins the libgcc trap symbols, so the NS image — which carries
+     * the network stack — gets the fast paths. Boot is from the Secure
+     * image's vector table (VTOR = 0). */
+    bool tz_split = node->secure_firmware_path[0] != '\0';
+    if (tz_split) {
+        if (!plat->cpu.tz_enabled) {
+            fprintf(stderr, "secure_firmware given but platform '%s' has no "
+                    "TrustZone-M\n", plat_name);
+            arm_platform_destroy(plat);
+            return -1;
+        }
+        if (arm_load_elf(&plat->cpu, node->secure_firmware_path) != 0) {
+            fprintf(stderr, "Cannot load secure firmware: %s\n",
+                    node->secure_firmware_path);
+            arm_platform_destroy(plat);
+            return -1;
+        }
+    }
     if (arm_load_elf(&plat->cpu, firmware_path) != 0) {
         fprintf(stderr, "Cannot load firmware: %s\n", firmware_path);
         arm_platform_destroy(plat);
@@ -179,6 +199,25 @@ int arm_elf_mote_boot(mixed_node_t *node, int slot,
     }
 
     arm_cpu_reset(&plat->cpu);
+
+    /* Split image: run the Secure world's boot (SAU/SPU/ITNS setup, its own
+     * Contiki init) up to the BLXNS hand-off, so the run-to-main below finds
+     * the Non-secure image's main() and patches the right world. Bounded so
+     * a Secure world that never hands off cannot hang node init. */
+    if (tz_split) {
+        int64_t limit = plat->cpu.cycles + 200000000;   /* ~1.5 s @128 MHz */
+        while (plat->cpu.secure && (int64_t)plat->cpu.cycles < limit)
+            arm_step(&plat->cpu, 256);
+        if (plat->cpu.secure)
+            fprintf(stderr, "  Node %d [ARM]: WARNING: secure world did not hand "
+                    "off to the normal world within the boot budget\n", node_id);
+        else
+            printf("  Node %d [ARM]: secure world handed off to the normal world "
+                   "at %lld cycles (sg=%llu bxns=%llu)\n", node_id,
+                   (long long)plat->cpu.cycles,
+                   (unsigned long long)plat->cpu.tz_sg_count,
+                   (unsigned long long)plat->cpu.tz_bxns_count);
+    }
 
     uint32_t main_addr = arm_elf_find_symbol(firmware_path, "main") & ~1u;
     if (main_addr) {
@@ -620,11 +659,33 @@ static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
     }
     nrf54l15_soc_t *nl = arm_platform_nrf54l15(plat);
     if (nl) {
-        /* nRF54L15-DK demo wiring: LED0 = P2.9 (FLPR), LED1 = P1.10 (M33). */
-        leds[0] = (nl->gpio[2].out >> 9)  & 1;
-        leds[1] = (nl->gpio[1].out >> 10) & 1;
-        leds[2] = 0;
+        /* Board wiring comes from the platform config (DK: LED1 = P2.9
+         * driven by the FLPR demo, LED2 = P1.10 by the M33; XIAO: the
+         * single user LED on P2.0). Raw GPIO OUT level, no polarity
+         * inversion, matching the historical DK readout. */
+        const arm_platform_config_t *cfg = plat->config;
+        for (int i = 0; i < 3; i++) {
+            const arm_gpio_pin_t *led = &cfg->leds[i];
+            bool present = led->port || led->pin || led->active_low;
+            leds[i] = 0;
+            if (present && led->port < 3 && led->pin < 32)
+                leds[i] = (nl->gpio[led->port].out >> led->pin) & 1;
+        }
     }
+}
+
+/* End-of-run per-node diagnostics. Only the TrustZone-M section exists for
+ * ARM motes: the world-transition counters silicon cannot expose. Silent
+ * on SoCs without the security extension so non-TZ output is unchanged. */
+static void arm_mote_dump_diagnostics(const sim_mote_t *m, int section) {
+    if (section != SIM_MOTE_DIAG_TRUSTZONE) return;
+    const arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    if (!cpu->tz_enabled) return;
+    printf("    TrustZone: sg=%llu bxns=%llu secure-exceptions=%llu state=%s\n",
+           (unsigned long long)cpu->tz_sg_count,
+           (unsigned long long)cpu->tz_bxns_count,
+           (unsigned long long)cpu->tz_secexc_count,
+           cpu->secure ? "Secure" : "Non-secure");
 }
 
 static void *arm_mote_get_interface(sim_mote_t *m, int iface) {
@@ -648,6 +709,7 @@ const sim_mote_ops_t arm_elf_mote_ops = {
     .reset_time      = arm_mote_reset_time,
     .ui_radio_state  = NULL, /* CC2538 pushes state via async callback */
     .ui_leds         = arm_mote_ui_leds,
+    .dump_diagnostics = arm_mote_dump_diagnostics,
     .get_interface   = arm_mote_get_interface,
     .receive_frame   = NULL, /* per-byte / staged delivery */
     .rx_byte_sync    = arm_mote_rx_byte_sync,
