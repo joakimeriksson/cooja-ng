@@ -1969,6 +1969,16 @@ sim_restart:
         double default_range = (node_count > 1) ? 50.0 : 10.0;
         radio_medium_configure_udgm(&radio_medium,
             default_range, default_range * 2.0, 1.0, 1.0);
+        /* Positions the config gives are honoured on this path too.  They
+         * used to be silently ignored when no medium block was present
+         * (--save-config exposed it: a node configured at (0,0) was saved
+         * at the default circular layout's (20,0)).  Every config in the
+         * tree that hits this path keeps all nodes within the default
+         * range, so this changes no existing simulation output. */
+        for (int i = 0; i < node_count; i++)
+            if (config_loaded && i < config.node_count && config.nodes[i].has_position)
+                radio_medium_set_position(&radio_medium, i,
+                                          config.nodes[i].x, config.nodes[i].y);
         radio_medium_compute_neighbors(&radio_medium);
         /* Seed here too, so --seed (or a config seed without a "medium"
          * block) is never silently ignored on the default path.  With the
