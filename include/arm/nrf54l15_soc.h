@@ -28,6 +28,14 @@
  * domain).  Offsets discovered empirically — see the trace comment in
  * `nrf54l15_soc.c`.  We only model the single event the boot path
  * polls; other registers accept writes as no-ops and read 0. */
+/* RESET.RESETREAS bits (0x5010_E600). Latched across a reset so the secure
+ * world can report why it rebooted; write-1-to-clear. */
+#define NRF54L_RESETREAS_RESETPIN   (1u << 0)
+#define NRF54L_RESETREAS_DOG0       (1u << 1)
+#define NRF54L_RESETREAS_DOG1       (1u << 2)
+#define NRF54L_RESETREAS_SREQ       (1u << 6)
+#define NRF54L_RESETREAS_LOCKUP     (1u << 7)
+
 typedef struct nrf54l_global_clock_state {
     /* Latched events.  Each is set to 1 when the corresponding TASKS_*
      * register is written with value 1, and cleared by an explicit
@@ -46,6 +54,10 @@ typedef struct nrf54l_global_clock_state {
     uint32_t lfclkstarted;      /* 0x104 */
     uint32_t hfxostarted;       /* 0x108 */
     uint32_t domain_enable_440; /* 0x440 — clock-domain enable */
+    /* RESET.RESETREAS lives in this same 4 KB page (0x5010_E600); the CLOCK,
+     * POWER and RESET peripherals share the base address on this SoC. It
+     * survives a warm reset, which is the whole point of it. */
+    uint32_t resetreas;
 } nrf54l_global_clock_state_t;
 
 /* UARTE20 at 0x500C_6000.  Pure EasyDMA — no legacy register window
@@ -208,6 +220,7 @@ typedef struct nrf54l_grtc_state {
     uint32_t             publish_compare[NRF54L_GRTC_NUM_CC];  /* PUBLISH_COMPARE[n] */
     uint32_t             inten;          /* INTEN2 (app-core, GRTC_2) — bit n = COMPARE[n] */
     uint32_t             inten_flpr;     /* INTEN0 (FLPR, GRTC_0) — routes to the RV32E core */
+    uint32_t             inten1;         /* INTEN1 (GRTC_1) — the TrustZone normal world's group */
     uint32_t             captured_lo;    /* SYSCOUNTERL latched value */
     uint32_t             captured_hi;    /* SYSCOUNTERH latched value */
     int                  irq_num;        /* GRTC_2_IRQn = 228 */
@@ -561,6 +574,28 @@ typedef struct nrf54l_spi_chip {
  * instantiated. */
 #define NRF54L_NUM_SPIM 3
 
+/* WDT30 (0x5010_8000) — the TrustZone secure world's watchdog. The nRF54L15
+ * watchdogs have no interrupt: a timeout resets the SoC directly. Contiki's
+ * secure world configures CRV for a 2 s timeout with reload channel 0 and
+ * feeds RR[0] from both worlds (the normal world through an SG veneer).
+ * WDT30 has no Non-secure alias — it is reachable only at 0x5010_8000. */
+#define NRF54L_WDT_NUM_CHANNELS 8
+typedef struct nrf54l_wdt_state {
+    arm_platform_t *plat;
+    uint32_t        crv;          /* counter reload value, in 32.768 kHz ticks */
+    uint32_t        rren;         /* per-channel reload enable */
+    uint32_t        config;
+    uint32_t        tsen;
+    uint32_t        inten;
+    uint32_t        evt_timeout;
+    uint32_t        evt_stopped;
+    uint32_t        reqstatus;    /* channels still owing a reload this period */
+    bool            running;
+    arm_event_t     timeout_event;
+    int             timeout_scheduled;
+    uint32_t        base_addr;
+} nrf54l_wdt_state_t;
+
 typedef struct nrf54l15_soc {
     nrf54l_global_clock_state_t global_clock;
     nrf54l_uarte_state_t        uarte20;
@@ -570,6 +605,8 @@ typedef struct nrf54l15_soc {
     nrf54l_ficr_state_t         ficr;
     nrf54l_vpr_state_t          vpr;
     nrf54l_gpio_state_t         gpio[3];   /* P0, P1, P2 */
+    nrf54l_wdt_state_t          wdt30;
+    uint32_t                    icache_enable;
     /* Three EGU instances at 0x5001_5000 (EGU00), 0x5008_7000 (EGU10),
      * 0x500C_7000 (EGU20).  Channel allocation across instances is
      * domain-local on real HW; csim collapses to the global DPPI. */
