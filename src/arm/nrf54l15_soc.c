@@ -429,11 +429,74 @@ void nrf54l_dppi_unsubscribe(nrf54l_dppi_state_t *d, int channel,
     }
 }
 
+static int trc54_dppi = -1;   /* NRF54L_DPPI_TRACE: publishes, group tasks, CHEN/CHG writes */
+static int nrf54l_trace_flag(int *cache, const char *name);
+
+static void nrf54l_dppi_apply_group_tasks(nrf54l_dppi_state_t *d) {
+    while (d->pending_chg_en || d->pending_chg_dis) {
+        uint32_t en = d->pending_chg_en, dis = d->pending_chg_dis;
+        d->pending_chg_en = d->pending_chg_dis = 0;
+        for (int g = 0; g < NRF54L_DPPI_NUM_GROUPS; g++) {
+            if (en  & (1u << g)) d->chen |=  d->chg[g];
+            if (dis & (1u << g)) d->chen &= ~d->chg[g];
+        }
+        if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+            fprintf(stderr, "[dppi cpu=0x%04x] group en=%x dis=%x -> chen=%08x\n",
+                    (unsigned)((uintptr_t)&d->plat->cpu & 0xFFFF), en, dis, d->chen);
+    }
+}
+
 void nrf54l_dppi_publish(nrf54l_dppi_state_t *d, int channel) {
     if (channel < 0 || channel >= NRF54L_DPPI_NUM_CHANNELS) return;
+    if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+        fprintf(stderr, "[dppi cpu=0x%04x] publish ch%d %s subs=%s\n",
+                (unsigned)((uintptr_t)&d->plat->cpu & 0xFFFF), channel,
+                (d->chen & (1u << channel)) ? "enabled" : "GATED",
+                d->subs[channel] ? "yes" : "none");
     if (!(d->chen & (1u << channel))) return;   /* channel gated off */
+    /* Group tasks raised by this publish's subscribers apply once this
+     * publish has reached every subscriber — not once an enclosing publish
+     * has (a subscriber that is itself a publisher, EGU here, nests them).
+     * The enclosing publish's pending set is parked meanwhile. */
+    uint32_t outer_en = d->pending_chg_en, outer_dis = d->pending_chg_dis;
+    d->pending_chg_en = d->pending_chg_dis = 0;
+    d->publish_depth++;
     for (nrf54l_dppi_subscriber_t *s = d->subs[channel]; s; s = s->next)
         s->cb(s->user);
+    d->publish_depth--;
+    nrf54l_dppi_apply_group_tasks(d);
+    d->pending_chg_en  |= outer_en;
+    d->pending_chg_dis |= outer_dis;
+}
+
+/* TASKS_CHG[n].EN / .DIS — from the CPU they take effect at once; from a
+ * DPPI subscription they are deferred to the end of the publish that
+ * raised them. */
+static void nrf54l_dppi_chg_task(nrf54l_dppi_state_t *d, int g, bool enable) {
+    if (enable) d->pending_chg_en  |= 1u << g;
+    else        d->pending_chg_dis |= 1u << g;
+    if (d->publish_depth == 0)
+        nrf54l_dppi_apply_group_tasks(d);
+}
+static void dppi_chg_en_sub_cb(void *user) {
+    nrf54l_dppi_chg_ctx_t *c = (nrf54l_dppi_chg_ctx_t *)user;
+    nrf54l_dppi_chg_task(c->d, c->g, true);
+}
+static void dppi_chg_dis_sub_cb(void *user) {
+    nrf54l_dppi_chg_ctx_t *c = (nrf54l_dppi_chg_ctx_t *)user;
+    nrf54l_dppi_chg_task(c->d, c->g, false);
+}
+static void nrf54l_dppi_set_chg_subscription(nrf54l_dppi_state_t *d, int g, bool enable,
+                                             uint32_t value) {
+    uint32_t *slot = enable ? &d->sub_chg_en[g] : &d->sub_chg_dis[g];
+    nrf54l_dppi_sub_cb cb = enable ? dppi_chg_en_sub_cb : dppi_chg_dis_sub_cb;
+    d->chg_ctx[g].d = d;
+    d->chg_ctx[g].g = g;
+    if (*slot & 0x80000000u)
+        nrf54l_dppi_unsubscribe(d, (int)(*slot & 0x1Fu), cb, &d->chg_ctx[g]);
+    *slot = value;
+    if (value & 0x80000000u)
+        nrf54l_dppi_subscribe(d, (int)(value & 0x1Fu), cb, &d->chg_ctx[g]);
 }
 
 static int nrf54l_dppic_read(void *user_data, uint32_t addr) {
@@ -441,6 +504,12 @@ static int nrf54l_dppic_read(void *user_data, uint32_t addr) {
     /* DPPIC bases overlap by region in addressing; the meaningful sub-
      * offset is the low 12 bits. */
     uint32_t off = addr & 0xFFFu;
+    if (off >= 0x080 && off < 0x080 + 8 * NRF54L_DPPI_NUM_GROUPS) {
+        int g = (int)(off - 0x080) / 8;
+        return (int)((off & 4) ? d->sub_chg_dis[g] : d->sub_chg_en[g]);
+    }
+    if (off >= 0x800 && off < 0x800 + 4 * NRF54L_DPPI_NUM_GROUPS)
+        return (int)d->chg[(off - 0x800) / 4];
     switch (off) {
         case NRF54L_DPPI_CHEN:
         case NRF54L_DPPI_CHENSET:
@@ -452,11 +521,26 @@ static int nrf54l_dppic_read(void *user_data, uint32_t addr) {
 static void nrf54l_dppic_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf54l_dppi_state_t *d = (nrf54l_dppi_state_t *)user_data;
     uint32_t off = addr & 0xFFFu;
+    if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+        fprintf(stderr, "[dppi cpu=0x%04x] W off=0x%03x = 0x%08x (chen=%08x)\n",
+                (unsigned)((uintptr_t)&d->plat->cpu & 0xFFFF), off, value, d->chen);
+    if (off < 8 * NRF54L_DPPI_NUM_GROUPS) {                  /* TASKS_CHG[n].EN/DIS */
+        if (value == 1) nrf54l_dppi_chg_task(d, (int)off / 8, (off & 4) == 0);
+        return;
+    }
+    if (off >= 0x080 && off < 0x080 + 8 * NRF54L_DPPI_NUM_GROUPS) {   /* SUBSCRIBE_CHG[n] */
+        nrf54l_dppi_set_chg_subscription(d, (int)(off - 0x080) / 8, (off & 4) == 0, value);
+        return;
+    }
+    if (off >= 0x800 && off < 0x800 + 4 * NRF54L_DPPI_NUM_GROUPS) {   /* CHG[n] membership */
+        d->chg[(off - 0x800) / 4] = value;
+        return;
+    }
     switch (off) {
         case NRF54L_DPPI_CHEN:    d->chen  = value;  break;
         case NRF54L_DPPI_CHENSET: d->chen |= value;  break;
         case NRF54L_DPPI_CHENCLR: d->chen &= ~value; break;
-        default: /* TASKS_CHG, SUBSCRIBE_CHG, CHG cluster: no-op */ break;
+        default: break;
     }
 }
 
@@ -907,6 +991,10 @@ static int nrf54l_egu_read(void *user_data, uint32_t addr) {
 static void nrf54l_egu_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf54l_egu_state_t *e = (nrf54l_egu_state_t *)user_data;
     uint32_t off = addr & 0xFFFu;
+    if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+        fprintf(stderr, "[egu cpu=0x%04x cyc=%lld W off=0x%03x = 0x%08x]\n",
+                (unsigned)((uintptr_t)&e->plat->cpu & 0xFFFF),
+                (long long)e->plat->cpu.cycles, off, value);
     /* TASKS_TRIGGER[0..15] — write 1 to fire. */
     if (off < E_TASKS_BASE + 4 * NRF54L_EGU_NUM_CHANNELS) {
         if (value == 1) egu_fire_event(e, (off - E_TASKS_BASE) / 4);
@@ -1999,12 +2087,18 @@ static void nrf54l_timer_compare_fired(void *user, cpu_event_t *ev) {
                 (long long)t->plat->cpu.cycles,
                 t->base_addr, n, t->cc[n], irq_fired, pub);
     }
-    /* SHORTS: COMPARE_CLEAR (bit n), COMPARE_STOP (bit 8+n). */
+    /* SHORTS: COMPARE[n]_CLEAR is bit n, COMPARE[n]_STOP is bit 16+n on
+     * this SoC (TIMER_SHORTS_COMPARE0_STOP_Pos = 16; the 8+n layout belongs
+     * to older nRF5x parts). With STOP read from the wrong bit, TIMER10 free-
+     * ran after nrf_802154 armed COMPARE0_STOP, so the timestamp the driver
+     * samples when deciding whether it can still transmit an acknowledgement
+     * came back in the millions of ticks and every acknowledgement was
+     * abandoned as too late. */
     if (t->shorts & (1u << n)) {
         t->snapshot = 0;
         t->t0_ns = nrf54l_timer_now_ns(t);
     }
-    if (t->shorts & (1u << (8 + n))) {
+    if (t->shorts & (1u << (16 + n))) {
         if (t->running) t->snapshot = nrf54l_timer_counter_now(t);
         t->running = false;
     }
@@ -2022,7 +2116,7 @@ static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
      * the driver. */
     bool inten   = (t->inten & (1u << (16 + n))) != 0;
     bool publish = (t->publish_compare[n] & 0x80000000u) != 0;
-    bool shorts  = (t->shorts & ((1u << n) | (1u << (8 + n)))) != 0;
+    bool shorts  = (t->shorts & ((1u << n) | (1u << (16 + n)))) != 0;
     if (!inten && !publish && !shorts) return;
     uint32_t now = nrf54l_timer_counter_now(t);
     uint32_t target = t->cc[n] & nrf54l_timer_mask(t);
@@ -2036,6 +2130,12 @@ static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
 static void nrf54l_timer_capture(nrf54l_timer_state_t *t, int n) {
     if (n < 0 || n >= NRF54L_TIMER_NUM_CC) return;
     t->cc[n] = nrf54l_timer_counter_now(t);
+    if (nrf54l_trace_flag(&trc54_timer, "NRF54L_TIMER_TRACE"))
+        fprintf(stderr, "[timerC cpu=0x%04x cyc=%lld base=0x%08x capture cc%d=%u running=%d "
+                        "cc0=%u cc1=%u]\n",
+                (unsigned)((uintptr_t)&t->plat->cpu & 0xFFFF),
+                (long long)t->plat->cpu.cycles, t->base_addr, n, t->cc[n],
+                (int)t->running, t->cc[0], t->cc[1]);
 }
 
 static void nrf54l_timer_task(nrf54l_timer_state_t *t, uint32_t off) {
@@ -2581,6 +2681,7 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
      * DPPIC base addresses (DPPIC00/10/20/30).  Subscribers register
      * via nrf54l_dppi_subscribe(); publishers call nrf54l_dppi_publish().
      * No state to initialise — channels start disabled, subs list empty. */
+    soc->dppi.plat = plat;
     for (size_t i = 0; i < sizeof(nrf54l_dppic_bases) / sizeof(nrf54l_dppic_bases[0]); i++) {
         arm_register_io(&plat->cpu,
                         nrf54l_dppic_bases[i], NRF54L_DPPIC_SIZE,
