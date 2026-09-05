@@ -174,6 +174,7 @@ if [ $WRITE_PROVENANCE -eq 1 ]; then
     BUILD_CMD="tools/build-device-firmware.sh --target $TARGET${BOARD:+ --board $BOARD} --example $EXAMPLE --output $OUTPUT"
     [ -n "$SRC_FILE_ARG" ]   && BUILD_CMD="$BUILD_CMD --source-file $SRC_FILE_ARG"
     [ -n "$EXTRA_MAKE_ARGS" ] && BUILD_CMD="$BUILD_CMD --make-args \"$EXTRA_MAKE_ARGS\""
+    [ $USE_DOCKER -eq 0 ]     && BUILD_CMD="$BUILD_CMD --local"
     DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     BUILDER="$(git config user.name 2>/dev/null || whoami)"
 

@@ -118,6 +118,11 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # through the UARTE20 EasyDMA receive path (bytes paced at the baud rate).
 ./build/test_runner test configs/test-shell-nrf54l15-dk.yaml   # ~4s sim
 
+# nRF54L15-DK two-node RPL-UDP. Firmware for this CPU acknowledges in hardware
+# only (CSMA_CONF_SEND_SOFT_ACK 0), so this is also the test that the Nordic
+# driver's own acknowledgement path works — docs/design/nrf54l15-ack-gap.md.
+./build/test_runner test configs/test-2node-nrf54l15-dk.json   # ~60s sim
+
 # nRF54L15 FLPR dual-core / RISC-V (Contiki-NG nrf-vpr). One M33 image launches
 # the RV32E FLPR; the M33 prints "[FLPR] tick N" (advances ~2/sec). Add --ui 8080
 # to watch LED0 (P2.9, 1 Hz, RISC-V) + LED1 (P1.10, 2 Hz, M33) blink in the browser.
