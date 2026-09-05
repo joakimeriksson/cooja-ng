@@ -45,6 +45,7 @@ void sim_runtime_destroy(sim_runtime_t *sim) {
     sim->ui_panel_count = 0;
     sim->run_state = SIM_RUN_STOPPED;
     sim->now_ns = 0;
+    sim->past_wakeups_clamped = 0;
     sim->end_ns = 0;
 }
 
@@ -97,15 +98,33 @@ char *sim_runtime_ui_panels_json(const sim_runtime_t *sim) {
  * slot remove/reboot.
  * ============================================================ */
 
+/* An event cannot be scheduled before the current simulation time: the
+ * dispatcher sets now_ns from the popped event, so a wakeup in the past
+ * would run the global clock backwards (every other mote then sees time
+ * go back and fires its timers again).  Clamp to now, count, warn once. */
+static int64_t clamp_to_now(sim_runtime_t *sim, int mote_index, int64_t time_ns) {
+    if (time_ns >= sim->now_ns) return time_ns;
+    if (sim->past_wakeups_clamped++ == 0) {
+        fprintf(stderr,
+                "WARNING: mote %d requested a wakeup %.6f s in the past "
+                "(t=%.6f s, now=%.6f s); clamped to now. Caller bug.\n",
+                mote_index, (double)(sim->now_ns - time_ns) / 1e9,
+                (double)time_ns / 1e9, (double)sim->now_ns / 1e9);
+    }
+    return sim->now_ns;
+}
+
 void sim_schedule_mote_wakeup(sim_runtime_t *sim, int mote_index,
                               int64_t time_ns) {
     uint32_t gen = sim_runtime_mote_generation(sim, mote_index);
+    time_ns = clamp_to_now(sim, mote_index, time_ns);
     sim_eq_schedule_gen(&sim->event_queue, mote_index, time_ns, gen);
 }
 
 void sim_schedule_mote_wakeup_if_earlier(sim_runtime_t *sim, int mote_index,
                                           int64_t time_ns) {
     uint32_t gen = sim_runtime_mote_generation(sim, mote_index);
+    time_ns = clamp_to_now(sim, mote_index, time_ns);
     sim_eq_schedule_if_earlier_gen(&sim->event_queue, mote_index, time_ns, gen);
 }
 

@@ -290,7 +290,7 @@ static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
     if (old_size > 2048) old_size = 2048;
     int space = 2048 - old_size;
     if (space <= 0) {
-        int64_t wake_ns = nat->sim_time_ns;
+        int64_t wake_ns = sim_runtime_now_ns(env->sim);
         if (env->node_start_ns[idx] > wake_ns)
             wake_ns = env->node_start_ns[idx];
         sim_schedule_mote_wakeup_if_earlier(env->sim, idx, wake_ns);
@@ -308,9 +308,14 @@ static int native_mote_serial_input(sim_mote_t *m, const uint8_t *buf,
      * is injected, the mote must be re-run at the current simulation
      * time rather than waiting for a stale timer-based wakeup. This is
      * the native equivalent of the immediate reschedule used for MSP430
-     * serial injection. */
+     * serial injection.  "Current" is the kernel clock: a native mote is
+     * stepped per event, so its own sim_time_ns is where it last ran,
+     * which can be far behind now (the border router in the TUN
+     * traceroute case idled from 1.6 s while tunslip6 talked to it at
+     * 60 s).  Waking it at that stale time scheduled an event in the past
+     * and ran the whole simulation's clock backwards. */
     {
-        int64_t wake_ns = nat->sim_time_ns;
+        int64_t wake_ns = sim_runtime_now_ns(env->sim);
         if (env->node_start_ns[idx] > wake_ns)
             wake_ns = env->node_start_ns[idx];
         sim_schedule_mote_wakeup_if_earlier(env->sim, idx, wake_ns);
