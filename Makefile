@@ -16,7 +16,7 @@ endif
 # a second hand-copied flag string is deliberate: the old PGO_CFLAGS drifted out
 # of sync with CFLAGS and `make pgo` stopped compiling entirely.
 PGO_FLAGS =
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs $(NATIVE_FLAG) -flto -MMD -MP $(PGO_FLAGS)
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml $(NATIVE_FLAG) -flto -MMD -MP $(PGO_FLAGS)
 # -rdynamic exports the host's dynamic symbol table so a dlopen'd plugin can
 # resolve host library functions (e.g. the radio_medium accessors a medium
 # plugin uses).  Behavior-neutral (symbol visibility only).
@@ -108,7 +108,8 @@ SIM_SOURCES = $(SIM_SRC_DIR)/sim_runtime.c \
               $(SIM_SRC_DIR)/sim_board.c \
               $(SIM_SRC_DIR)/sim_registry.c \
               $(SIM_SRC_DIR)/sim_plugin.c \
-              $(SIM_SRC_DIR)/sim_config.c
+              $(SIM_SRC_DIR)/sim_config.c \
+              $(SIM_SRC_DIR)/sim_config_yaml.c
 
 SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
                    $(SERVICES_SRC_DIR)/pcap_service.c \
@@ -168,6 +169,17 @@ NATIVE_OBJECTS = $(patsubst $(NATIVE_SRC_DIR)/%.c, $(NATIVE_BUILD_DIR)/%.o, $(NA
 UI_OBJECTS = $(patsubst $(UI_SRC_DIR)/%.c, $(UI_BUILD_DIR)/%.o, $(UI_SOURCES))
 LIB_OBJECTS = $(patsubst $(LIB_SRC_DIR)/%.c, $(LIB_BUILD_DIR)/%.o, $(LIB_SOURCES))
 
+# libyaml 0.2.5, parser half only (lib/yaml/README.md).  Built like QuickJS:
+# upstream code, so warnings are silenced; version defines replace its
+# configure-generated config.h.
+YAML_SRC_DIR   = lib/yaml
+YAML_BUILD_DIR = build/yaml
+YAML_SOURCES   = $(YAML_SRC_DIR)/api.c $(YAML_SRC_DIR)/parser.c \
+                 $(YAML_SRC_DIR)/scanner.c $(YAML_SRC_DIR)/reader.c \
+                 $(YAML_SRC_DIR)/loader.c
+YAML_OBJECTS   = $(patsubst $(YAML_SRC_DIR)/%.c, $(YAML_BUILD_DIR)/%.o, $(YAML_SOURCES))
+YAML_DEFS      = -DYAML_VERSION_MAJOR=0 -DYAML_VERSION_MINOR=2 -DYAML_VERSION_PATCH=5 -DYAML_VERSION_STRING=\"0.2.5\"
+
 TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_correctness.c \
                $(TEST_DIR)/test_benchmark.c \
@@ -176,6 +188,7 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_arm_benchmark.c \
                $(TEST_DIR)/test_arm_decode.c \
                $(TEST_DIR)/test_arm_jit.c \
+               $(TEST_DIR)/test_config.c \
                $(TEST_DIR)/test_arm_firmware.c \
                $(TEST_DIR)/test_mixed_multinode.c \
                $(TEST_DIR)/test_timeline.c \
@@ -232,6 +245,9 @@ $(LIB_BUILD_DIR):
 $(QUICKJS_BUILD_DIR):
 	mkdir -p $(QUICKJS_BUILD_DIR)
 
+$(YAML_BUILD_DIR):
+	mkdir -p $(YAML_BUILD_DIR)
+
 $(COMMON_BUILD_DIR)/%.o: $(COMMON_SRC_DIR)/%.c | $(COMMON_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -266,10 +282,13 @@ $(LIB_BUILD_DIR)/%.o: $(LIB_SRC_DIR)/%.c | $(LIB_BUILD_DIR)
 $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I lib/quickjs -DCONFIG_VERSION=\"2024-01-13\" -w $(PGO_FLAGS) -c $< -o $@
 
+$(YAML_BUILD_DIR)/%.o: $(YAML_SRC_DIR)/%.c | $(YAML_BUILD_DIR)
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I lib/yaml $(YAML_DEFS) -w $(PGO_FLAGS) -c $< -o $@
+
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(RISCV_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(RISCV_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(YAML_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Auto-generated header dependencies (from -MMD). Catches the case where
@@ -318,7 +337,7 @@ configure:
 	@echo "Wrote csim.conf: CONTIKI_DIR=$(CONTIKI_DIR)"
 
 # Debug build
-debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -DDEBUG
+debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml -DDEBUG
 debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 

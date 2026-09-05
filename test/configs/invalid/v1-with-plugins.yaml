@@ -1,0 +1,5 @@
+title: v1 cannot have plugins
+timeout_ms: 1000
+plugins: [energest]
+nodes:
+  - { firmware: firmware/cooja/udp-server.cooja, id: 1 }

@@ -1,0 +1,10 @@
+version: 2
+title: typo
+timeout_ms: 1000
+medium:
+  type: udgm
+  tx_rang: 50
+mote_types:
+  - { name: a, firmware: firmware/cooja/udp-server.cooja }
+nodes:
+  - { type: a, id: 1 }

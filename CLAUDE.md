@@ -78,6 +78,15 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner arm-multinode firmware/cc2538dk/nullnet-broadcast.cc2538dk -t 20000
 ./build/test_runner arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000
 
+# Config format (YAML primary, JSON accepted — one schema, one strict validator)
+./build/test_runner test configs/chain-4node-sky.yaml          # any test/mixed-multinode mode takes .yaml/.yml/.json
+./build/test_runner test configs/chain-4node-sky.yaml --save-config setup.yaml   # write the LIVE setup (positions,
+                                         # added/removed nodes, effective seed/duration) as canonical YAML at run end
+./build/test_runner config-roundtrip configs/*.json configs/*.yaml   # load -> YAML -> load: lossless + idempotent
+./build/test_runner config-reject test/configs/invalid/*   # every fixture (typo'd key, anchor, "Norway" boolean,
+                                         # hex, 2nd document, wrong type ...) MUST fail to load — fail loudly
+./build/test_runner config-convert in.json out.yaml        # canonical v2 YAML
+
 # Chip-driver + radio-medium unit suites
 ./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)
 ./build/test_runner radio-medium            # 241 radio-medium routing tests
@@ -179,7 +188,8 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
 | `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, services, and radio media; `csim_register_builtin_{platforms,mote_types,services,media}` populate it; services + media (Phase 11: "udgm"/"none" + plugins) resolve by name via owned name→ops catalogs |
 | `sim_plugin.c` | Dynamic plugin loader (Phase 9): `sim_plugin_load` dlopens a `.so` (RTLD_NOW\|RTLD_LOCAL), resolves `csim_plugin_init`, and hands it a `csim_api_t` so the plugin registers a service. ABI is additive/version-gated (`include/sim/csim_plugin.h`): v1 `register_service`, v2 `+register_radio_medium`, v3 `+ui->publish_panel` (a plugin draws a live web-UI panel — see [`docs/design/ui-plugins.md`](docs/design/ui-plugins.md)). Dynamic `.so` examples: `plugins/packet_sink.c` (service), `plugins/lossy_medium.c` (medium). A plugin can also be **compiled in** as a built-in service (registered in `sim_registry.c`) and selected by config name (`"plugins": ["energest"]`, Cooja's built-in-plugin style) — example: the energy estimator `src/services/energest_{engine,service}.c` |
-| `sim_config.c` | JSON config loader (Phase 7): `sim_config_load` dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
+| `sim_config.c` | Config loader (Phase 7): `sim_config_load` picks the front end by extension (`.yaml`/`.yml` → libyaml, `.json` → cJSON), runs the schema validator, then dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
+| `sim_config_yaml.c` | YAML front end (strict YAML-1.2-core subset: no anchors/tags/multi-doc, YAML-1.1 booleans rejected), the table-driven schema validator both formats share (unknown/duplicate keys and wrong types are errors), and the canonical v2 YAML **writer** (`--save-config`, `config-convert`). libyaml's parser half is vendored in `lib/yaml/` (see its README) |
 | `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |
 | `sim_serial_bridge.c` | TCP serial socket service (Cooja serial-socket protocol) |
 | `sim_external_command.c` | External command service (border-router etc. helper processes) |

@@ -7,6 +7,7 @@
  * (sim_normalized_config_t); the runtime consumes only that struct.
  */
 #include "sim_config.h"
+#include "sim_config_internal.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 static int parse_v1(cJSON *root, sim_normalized_config_t *cfg);
 static int parse_v2(cJSON *root, sim_normalized_config_t *cfg);
 static void parse_medium_object(cJSON *medium, sim_normalized_config_t *cfg);
+static void parse_description(cJSON *root, sim_normalized_config_t *cfg);
 static int  parse_test(cJSON *test, sim_normalized_config_t *cfg);
 
 int sim_config_load(sim_normalized_config_t *cfg, const char *json_path) {
@@ -61,13 +63,26 @@ int sim_config_load(sim_normalized_config_t *cfg, const char *json_path) {
     buf[len] = '\0';
     fclose(f);
 
-    /* Parse JSON */
-    cJSON *root = cJSON_Parse(buf);
-    free(buf);
-    if (!root) {
-        const char *err = cJSON_GetErrorPtr();
-        fprintf(stderr, "sim_config: JSON parse error near: %.40s\n",
-                err ? err : "(unknown)");
+    /* Parse: the extension picks the front end, both yield one cJSON tree. */
+    cJSON *root = NULL;
+    const char *ext = strrchr(json_path, '.');
+    if (ext && (strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0)) {
+        root = sim_config_yaml_to_cjson(buf, (size_t)len, json_path);
+        free(buf);
+        if (!root) return -1;                 /* diagnostic already printed */
+    } else if (ext && strcmp(ext, ".json") == 0) {
+        root = cJSON_Parse(buf);
+        free(buf);
+        if (!root) {
+            const char *err = cJSON_GetErrorPtr();
+            fprintf(stderr, "%s: JSON parse error near: %.40s\n", json_path,
+                    err ? err : "(unknown)");
+            return -1;
+        }
+    } else {
+        free(buf);
+        fprintf(stderr, "%s: unknown config extension '%s' (use .yaml, .yml or .json)\n",
+                json_path, ext ? ext : "");
         return -1;
     }
 
@@ -76,10 +91,18 @@ int sim_config_load(sim_normalized_config_t *cfg, const char *json_path) {
     if (cJSON_IsNumber(ver))
         cfg->version = ver->valueint;
 
+    /* Every key known, every value the right type — or the load fails. */
+    if (sim_config_validate_tree(root, cfg->version, json_path) != 0) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
     int rc = (cfg->version >= 2) ? parse_v2(root, cfg) : parse_v1(root, cfg);
     cJSON_Delete(root);
-    if (rc != 0)
+    if (rc != 0) {
+        fprintf(stderr, "%s: invalid config (see above)\n", json_path);
         return rc;
+    }
 
     /* Auto-assign IDs for nodes without explicit id */
     for (int i = 0; i < cfg->node_count; i++) {
@@ -98,6 +121,7 @@ static int parse_v1(cJSON *root, sim_normalized_config_t *cfg) {
     if (cJSON_IsString(title) && title->valuestring) {
         snprintf(cfg->title, sizeof(cfg->title), "%s", title->valuestring);
     }
+    parse_description(root, cfg);
 
     cJSON *timeout = cJSON_GetObjectItemCaseSensitive(root, "timeout_ms");
     if (cJSON_IsNumber(timeout)) {
@@ -214,6 +238,15 @@ static int parse_v1(cJSON *root, sim_normalized_config_t *cfg) {
     return 0;
 }
 
+/* Free-text "description" (or the legacy "note") at the root — kept so the
+ * writer can round-trip it. */
+static void parse_description(cJSON *root, sim_normalized_config_t *cfg) {
+    cJSON *d = cJSON_GetObjectItemCaseSensitive(root, "description");
+    if (!cJSON_IsString(d)) d = cJSON_GetObjectItemCaseSensitive(root, "note");
+    if (cJSON_IsString(d) && d->valuestring)
+        snprintf(cfg->description, sizeof(cfg->description), "%s", d->valuestring);
+}
+
 /* Shared medium-object parser (v1 "radiomedium" / v2 "medium").  No-op when
  * `medium` is not an object. */
 static void parse_medium_object(cJSON *medium, sim_normalized_config_t *cfg) {
@@ -245,6 +278,11 @@ static void parse_medium_object(cJSON *medium, sim_normalized_config_t *cfg) {
  * step (missing 'wait'); the caller owns cJSON_Delete(root). */
 static int parse_test(cJSON *test, sim_normalized_config_t *cfg) {
     cfg->has_test = 1;
+
+    cJSON *desc = cJSON_GetObjectItemCaseSensitive(test, "description");
+    if (cJSON_IsString(desc) && desc->valuestring)
+        snprintf(cfg->test.description, sizeof(cfg->test.description), "%s",
+                 desc->valuestring);
 
     /* Check for JavaScript test script */
     cJSON *js_path = cJSON_GetObjectItemCaseSensitive(test, "js_script");
@@ -405,6 +443,9 @@ static int parse_test(cJSON *test, sim_normalized_config_t *cfg) {
             if (cJSON_IsString(adata) && adata->valuestring)
                 snprintf(a->data, sizeof(a->data), "%s", adata->valuestring);
 
+            cJSON *amt = cJSON_GetObjectItemCaseSensitive(act_item, "mote_type");
+            if (cJSON_IsNumber(amt)) a->mote_type = amt->valueint;
+
             ai++;
         }
         cfg->test.action_count = ai;
@@ -433,6 +474,7 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
     cJSON *title = cJSON_GetObjectItemCaseSensitive(root, "title");
     if (cJSON_IsString(title) && title->valuestring)
         snprintf(cfg->title, sizeof(cfg->title), "%s", title->valuestring);
+    parse_description(root, cfg);
     cJSON *timeout = cJSON_GetObjectItemCaseSensitive(root, "timeout_ms");
     if (cJSON_IsNumber(timeout)) cfg->timeout_ms = timeout->valueint;
     cJSON *seed = cJSON_GetObjectItemCaseSensitive(root, "seed");
@@ -569,6 +611,17 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
     }
 
     return 0;
+}
+
+void sim_config_free(sim_normalized_config_t *cfg) {
+    free(cfg->js_script_inline);
+    cfg->js_script_inline = NULL;
+}
+
+int sim_config_is_file(const char *path) {
+    const char *dot = strrchr(path, '.');
+    return dot && (strcmp(dot, ".json") == 0 || strcmp(dot, ".yaml") == 0 ||
+                   strcmp(dot, ".yml") == 0);
 }
 
 void sim_config_print(const sim_normalized_config_t *cfg) {

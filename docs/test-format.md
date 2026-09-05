@@ -1,20 +1,91 @@
-# Simulation Test Format
+# Simulation Configuration and Test Format
 
-csim uses JSON configuration files to define simulations and automated tests. This document describes the full config schema, the test engine behavior, and the `csc2json.py` converter for importing Cooja `.csc` files.
+Cooja-NG simulations are described by a config file — **YAML** (`.yaml` /
+`.yml`, the primary format) or JSON (`.json`, still fully supported; every
+existing JSON config keeps working unchanged). One file defines the nodes,
+the radio medium and, optionally, an automated test. This document describes
+the schema, the strictness rules, the test engine, saving a running setup, and
+the `csc2json.py` converter for importing Cooja `.csc` files.
+
+The two formats are the same schema: JSON is a subset of YAML, and both go
+through one validator and one parser. What YAML adds is what people actually
+want in a config: **comments**, **literal blocks** for the test script
+(`js_script_inline: |` — the script verbatim, no escaping), and readable
+one-line node entries in flow style. Examples in the tree:
+`configs/chain-4node-sky.yaml`, `configs/test-js-hello.yaml`,
+`configs/test-rpl-udp-sky.yaml`, `configs/medium-plugin-gilbert-elliott.yaml`
+— each a twin of a `.json` next to it, and CI proves the pairs simulate
+byte-identically.
+
+## Strictness: a config that loads is a config that was understood
+
+The loader rejects — with a `file:line:column` message — anything it would
+otherwise have to guess about. There is no key it ignores silently:
+
+| the file contains | what happens |
+|---|---|
+| a key the schema does not know (`tx_rang:`) | error naming the key and where (`config.medium`) |
+| a key of the wrong type (`timeout_ms: "60000"`) | error: must be a number, got a string |
+| a duplicate key (JSON or YAML) | error |
+| a `v1` key in a `v2` file or vice versa (`medium` vs `radiomedium`, `plugins` without `version: 2`) | error, with the hint |
+| YAML anchors/aliases (`&x` / `*x`), explicit tags (`!!str`), a second document (`---`) | error |
+| YAML 1.1 booleans — `yes`, `no`, `on`, `off`, `Yes`, `TRUE`, `~`-less `Null` … | error: write `true`/`false`/`null` in lowercase, or quote it to mean the string. (This is the "Norway problem": `country: NO` must never read as `false`.) |
+| `.inf`, `.nan`, hex/octal (`0x1f`), `1_000` | error: plain decimal only |
+
+Plain scalars follow YAML 1.2 core typing: `true`/`false`, `null`/`~`,
+integers and decimals are typed; everything else is a string. Anything
+quoted (`"007"`, `'true'`) or in a block scalar is always a string. The only
+keys the runtime does not read are the ones `csc2json.py` writes for the
+firmware build tooling (`nodes[].build`, `nodes[]._mote_type_desc`,
+`mote_types[].description`) and free-text `description`/`note` fields.
+
+`test_runner config-reject test/configs/invalid/*` runs the fixtures that
+each contain exactly one forbidden thing; CI requires all of them to fail.
+
+## Saving a running setup
+
+```sh
+./build/test_runner test configs/chain-4node-sky.yaml --save-config my-setup.yaml
+```
+
+`--save-config` writes, at the end of the run, the configuration that was
+**actually running** — not the file that was loaded: node positions come from
+the radio medium (so a node moved by a test action is saved where it ended
+up), the node list is the live one (nodes the script added, minus the ones it
+removed), and the duration and seed are the effective ones (`-t` and `--seed`
+win over the file). The file starts with a comment saying where and when it
+was saved, and the loader re-reads it before reporting success. The saved
+file plus its seed reproduces the run.
+
+It works without a config too: `test_runner mixed-multinode a.sky b.sky
+--save-config setup.yaml` turns a command line into a config file.
+
+## Config tooling
+
+```sh
+./build/test_runner config-convert   old.json new.yaml     # canonical v2 YAML, header says where it came from
+./build/test_runner config-roundtrip configs/*.json configs/*.yaml  # load -> YAML -> load must be lossless + idempotent
+./build/test_runner config-reject    test/configs/invalid/*         # every file must be refused
+```
+
+The writer always emits **v2**: a v1 config is lifted (mote types are
+synthesized from the distinct firmware paths, keeping the order of any
+existing `mote_types` so `getMoteTypes()[i]` in a JS script still refers to
+the same type).
 
 ## Config File Structure
 
-```json
-{
-    "title": "My test",
-    "timeout_ms": 60000,
-    "seed": 1,
-    "startup_delay_ms": 1000,
-    "speed": 10.0,
-    "radiomedium": { ... },
-    "nodes": [ ... ],
-    "test": { ... }
-}
+```yaml
+version: 2                 # omit for the legacy v1 layout (see below)
+title: My test
+timeout_ms: 60000
+seed: 1
+startup_delay_ms: 1000
+speed: 10.0
+medium: { ... }            # v1: radiomedium
+mote_types: [ ... ]        # v2 only: named types the nodes reference
+nodes: [ ... ]
+test: { ... }
 ```
 
 ### Top-Level Fields
@@ -29,14 +100,13 @@ csim uses JSON configuration files to define simulations and automated tests. Th
 
 ### Radio Medium
 
-```json
-"radiomedium": {
-    "type": "udgm",
-    "tx_range": 50.0,
-    "interference_range": 100.0,
-    "success_ratio_tx": 1.0,
-    "success_ratio_rx": 1.0
-}
+```yaml
+medium:                    # v1: radiomedium
+  type: udgm
+  tx_range: 50.0           # metres
+  interference_range: 100.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
 ```
 
 | Field | Type | Default | Description |
@@ -51,11 +121,19 @@ Two nodes can communicate if their distance is within `tx_range`. Frames from no
 
 ### Nodes
 
-```json
-"nodes": [
-    { "firmware": "firmware/cc2538dk/udp-server.cc2538dk", "id": 1, "x": 0.0, "y": 0.0 },
-    { "firmware": "firmware/cc2538dk/udp-client.cc2538dk", "id": 2, "x": 30.0, "y": 30.0 }
-]
+```yaml
+# v2: nodes reference a named mote type
+mote_types:
+  - { name: server, firmware: firmware/cc2538dk/udp-server.cc2538dk }
+  - { name: client, firmware: firmware/cc2538dk/udp-client.cc2538dk }
+nodes:
+  - { type: server, id: 1, x: 0.0, y: 0.0 }
+  - { type: client, id: 2, x: 30.0, y: 30.0 }
+
+# v1: nodes carry the firmware path directly
+nodes:
+  - { firmware: firmware/cc2538dk/udp-server.cc2538dk, id: 1, x: 0.0, y: 0.0 }
+  - { firmware: firmware/cc2538dk/udp-client.cc2538dk, id: 2, x: 30.0, y: 30.0 }
 ```
 
 | Field | Type | Default | Description |
@@ -76,24 +154,22 @@ Node type is auto-detected from the firmware file extension:
 
 The `test` section defines automated pass/fail criteria. A simulation with a `test` section exits with code 0 on pass, 1 on failure.
 
-```json
-"test": {
-    "steps": [ ... ],
-    "fail_on": [ ... ],
-    "timeout_is_success": false,
-    "actions": [ ... ]
-}
+```yaml
+test:
+  steps: [ ... ]
+  fail_on: [ ... ]
+  timeout_is_success: false
+  actions: [ ... ]
 ```
 
 ### Test Steps
 
 Steps are evaluated **sequentially**. The test engine waits for step 0 to match before checking step 1, and so on. When all steps match, the test passes.
 
-```json
-"steps": [
-    { "wait": "Hello, world" },
-    { "wait": "Data received from", "node": 1, "count": 3, "timeout_ms": 600000 }
-]
+```yaml
+steps:
+  - { wait: "Hello, world" }
+  - { wait: "Data received from", node: 1, count: 3, timeout_ms: 600000 }
 ```
 
 | Field | Type | Default | Description |
@@ -111,8 +187,8 @@ Steps are evaluated **sequentially**. The test engine waits for step 0 to match 
 
 ### Fail-On Patterns
 
-```json
-"fail_on": ["FAILED", "assertion failed", "stack overflow"]
+```yaml
+fail_on: ["FAILED", "assertion failed", "stack overflow"]
 ```
 
 An array of substrings. If **any** console output line from **any** node contains one of these patterns, the test **immediately fails** — regardless of step progress.
@@ -127,11 +203,10 @@ The test engine has two timeout modes:
 
 **Timeout-is-success (`timeout_is_success: true`):** If the simulation reaches `timeout_ms` without hitting a `fail_on` pattern, the test **passes**. This is for tests that verify the *absence* of errors over a time period (e.g., "run RPL for 10 minutes with zero packet loss").
 
-```json
-"test": {
-    "timeout_is_success": true,
-    "fail_on": ["packet loss", "parent switch: -> (NULL"]
-}
+```yaml
+test:
+  timeout_is_success: true
+  fail_on: ["packet loss", "parent switch: -> (NULL"]
 ```
 
 **No-steps tests:** If `steps` is empty (or absent) and `timeout_is_success` is not set, the test passes if no `fail_on` pattern is hit during the simulation. This is equivalent to a `fail_on`-only test.
@@ -140,14 +215,12 @@ The test engine has two timeout modes:
 
 Validators are pattern counters that run throughout the entire simulation and are checked at the end. Unlike steps (which are sequential and end the test early on completion), validators never affect test flow — they just count and are evaluated at timeout.
 
-```json
-"test": {
-    "timeout_is_success": true,
-    "validators": [
-        { "pattern": "Data", "min_count": 16 },
-        { "pattern": "fd00::", "min_count": 4, "node": 1 }
-    ]
-}
+```yaml
+test:
+  timeout_is_success: true
+  validators:
+    - { pattern: Data, min_count: 16 }
+    - { pattern: "fd00::", min_count: 4, node: 1 }
 ```
 
 | Field | Type | Default | Description |
@@ -177,14 +250,13 @@ TEST FAILED: validator "fd00::" matched 2/4 times
 
 Actions execute at specific simulation times, enabling dynamic scenarios like topology changes, serial input, and node reboot.
 
-```json
-"actions": [
-    { "at_ms": 60000,  "type": "move", "node": 4, "x": 58.0, "y": 108.0 },
-    { "at_ms": 120000, "type": "send", "node": 1, "data": "rpl-set-root 1\n" },
-    { "at_ms": 120000, "type": "send_all", "data": "ip-addr\n" },
-    { "at_ms": 180000, "type": "remove", "node": 3 },
-    { "at_ms": 200000, "type": "add", "node": 3 }
-]
+```yaml
+actions:
+  - { at_ms: 60000,  type: move, node: 4, x: 58.0, y: 108.0 }
+  - { at_ms: 120000, type: send, node: 1, data: "rpl-set-root 1\n" }
+  - { at_ms: 120000, type: send_all, data: "ip-addr\n" }
+  - { at_ms: 180000, type: remove, node: 3 }
+  - { at_ms: 200000, type: add, node: 3, mote_type: 0 }
 ```
 
 #### Move Action
@@ -267,159 +339,136 @@ Validator check: if any validator's count is below its `min_count`, the test fai
 
 ### Simple message check
 
-```json
-{
-    "timeout_ms": 5000,
-    "nodes": [
-        { "firmware": "firmware/cc2538dk/hello-world.cc2538dk", "id": 1 }
-    ],
-    "test": {
-        "steps": [
-            { "wait": "Hello, world" }
-        ]
-    }
-}
+```yaml
+timeout_ms: 5000
+nodes:
+  - { firmware: firmware/cc2538dk/hello-world.cc2538dk, id: 1 }
+test:
+  steps:
+    - { wait: "Hello, world" }
 ```
 
 Passes when node 1 prints "Hello, world". Fails if 5 seconds elapse without the message.
 
 ### Multi-node broadcast
 
-```json
-{
-    "timeout_ms": 60000,
-    "radiomedium": { "type": "udgm", "tx_range": 50.0 },
-    "nodes": [
-        { "firmware": "firmware/cc2538dk/nullnet-broadcast.cc2538dk", "id": 1, "x": 0, "y": 0 },
-        { "firmware": "firmware/cc2538dk/nullnet-broadcast.cc2538dk", "id": 2, "x": 25, "y": 0 }
-    ],
-    "test": {
-        "steps": [
-            { "wait": "Received", "node": 1 },
-            { "wait": "Received", "node": 2 }
-        ]
-    }
-}
+```yaml
+timeout_ms: 60000
+radiomedium:
+  type: udgm
+  tx_range: 50.0
+nodes:
+  - { firmware: firmware/cc2538dk/nullnet-broadcast.cc2538dk, id: 1, x: 0, y: 0 }
+  - { firmware: firmware/cc2538dk/nullnet-broadcast.cc2538dk, id: 2, x: 25, y: 0 }
+test:
+  steps:
+    - { wait: Received, node: 1 }
+    - { wait: Received, node: 2 }
 ```
 
 Passes when both nodes have received a broadcast from the other.
 
 ### RPL convergence (timeout-is-success)
 
-```json
-{
-    "timeout_ms": 1000000,
-    "seed": 1,
-    "startup_delay_ms": 1000,
-    "radiomedium": { "type": "udgm", "tx_range": 50.0, "interference_range": 50.0 },
-    "nodes": [
-        { "firmware": "firmware/cc2538dk/root-node.cc2538dk",     "id": 3, "x": 0, "y": 0 },
-        { "firmware": "firmware/cc2538dk/sender-node.cc2538dk",   "id": 2, "x": 130, "y": 146 },
-        { "firmware": "firmware/cc2538dk/receiver-node.cc2538dk", "id": 1, "x": 7, "y": -26 }
-    ],
-    "test": {
-        "timeout_is_success": true,
-        "fail_on": ["packet loss"]
-    }
-}
+```yaml
+timeout_ms: 1000000
+seed: 1
+startup_delay_ms: 1000
+radiomedium:
+  type: udgm
+  tx_range: 50.0
+  interference_range: 50.0
+nodes:
+  - { firmware: firmware/cc2538dk/root-node.cc2538dk, id: 3, x: 0, y: 0 }
+  - { firmware: firmware/cc2538dk/sender-node.cc2538dk, id: 2, x: 130, y: 146 }
+  - { firmware: firmware/cc2538dk/receiver-node.cc2538dk, id: 1, x: 7, y: -26 }
+test:
+  timeout_is_success: true
+  fail_on:
+    - "packet loss"
 ```
 
 Runs for 1000 seconds of simulated time. Passes if no "packet loss" message appears.
 
 ### Data structure self-test (fail-on only)
 
-```json
-{
-    "timeout_ms": 10000,
-    "nodes": [
-        { "firmware": "firmware/cc2538dk/test-ringbufindex.cc2538dk", "id": 1 }
-    ],
-    "test": {
-        "fail_on": ["FAILED"],
-        "steps": [
-            { "wait": "DONE" }
-        ]
-    }
-}
+```yaml
+timeout_ms: 10000
+nodes:
+  - { firmware: firmware/cc2538dk/test-ringbufindex.cc2538dk, id: 1 }
+test:
+  fail_on:
+    - FAILED
+  steps:
+    - { wait: DONE }
 ```
 
 Fails immediately if any output contains "FAILED". Passes when "DONE" appears.
 
 ### RPL data exchange validation (validators)
 
-```json
-{
-    "timeout_ms": 2000000,
-    "radiomedium": { "type": "udgm", "tx_range": 50.0 },
-    "nodes": [
-        { "firmware": "firmware/cooja/root-node.cooja",     "id": 3, "x": 0, "y": 0 },
-        { "firmware": "firmware/cooja/sender-node.cooja",   "id": 2, "x": 30, "y": 0 },
-        { "firmware": "firmware/cooja/receiver-node.cooja", "id": 1, "x": 7, "y": -26 }
-    ],
-    "test": {
-        "timeout_is_success": true,
-        "validators": [
-            { "pattern": "Data", "min_count": 16 }
-        ]
-    }
-}
+```yaml
+timeout_ms: 2000000
+radiomedium:
+  type: udgm
+  tx_range: 50.0
+nodes:
+  - { firmware: firmware/cooja/root-node.cooja, id: 3, x: 0, y: 0 }
+  - { firmware: firmware/cooja/sender-node.cooja, id: 2, x: 30, y: 0 }
+  - { firmware: firmware/cooja/receiver-node.cooja, id: 1, x: 7, y: -26 }
+test:
+  timeout_is_success: true
+  validators:
+    - { pattern: Data, min_count: 16 }
 ```
 
 Runs for 2000 seconds. Passes only if at least 16 lines containing "Data" appear in console output. This validates that RPL converges and UDP data exchange actually happens, rather than just "no crash".
 
 ### Node reboot with serial query
 
-```json
-{
-    "timeout_ms": 300000,
-    "nodes": [ "..." ],
-    "test": {
-        "timeout_is_success": true,
-        "validators": [
-            { "pattern": "fd00::", "min_count": 4 }
-        ],
-        "actions": [
-            { "at_ms": 1000,  "type": "send", "node": 4, "data": "rpl-set-root 1\n" },
-            { "at_ms": 61000, "type": "send_all", "data": "ip-addr\n" },
-            { "at_ms": 63000, "type": "remove", "node": 4 },
-            { "at_ms": 64000, "type": "add",    "node": 4 },
-            { "at_ms": 65000, "type": "send", "node": 4, "data": "rpl-set-root 1\n" },
-            { "at_ms": 125000, "type": "send_all", "data": "ip-addr\n" }
-        ]
-    }
-}
+```yaml
+timeout_ms: 300000
+nodes:
+  - ...
+test:
+  timeout_is_success: true
+  validators:
+    - { pattern: "fd00::", min_count: 4 }
+  actions:
+    - { at_ms: 1000, type: send, node: 4, data: "rpl-set-root 1\n" }
+    - { at_ms: 61000, type: send_all, data: "ip-addr\n" }
+    - { at_ms: 63000, type: remove, node: 4 }
+    - { at_ms: 64000, type: add, node: 4 }
+    - { at_ms: 65000, type: send, node: 4, data: "rpl-set-root 1\n" }
+    - { at_ms: 125000, type: send_all, data: "ip-addr\n" }
 ```
 
 Sets node 4 as RPL root, queries all nodes for IP addresses, reboots the root, re-queries. Validates that at least 4 `fd00::` address lines appear (meaning nodes have RPL addresses).
 
 ### Dynamic topology with timed actions
 
-```json
-{
-    "timeout_ms": 300000,
-    "radiomedium": { "type": "udgm", "tx_range": 50.0 },
-    "nodes": [
-        { "firmware": "firmware/cc2538dk/root-node.cc2538dk", "id": 1, "x": 0, "y": 0 },
-        { "firmware": "firmware/cc2538dk/node.cc2538dk",      "id": 2, "x": 25, "y": 0 },
-        { "firmware": "firmware/cc2538dk/node.cc2538dk",      "id": 3, "x": 50, "y": 0 }
-    ],
-    "test": {
-        "actions": [
-            { "at_ms": 120000, "type": "move", "node": 3, "x": 200, "y": 0 },
-            { "at_ms": 240000, "type": "move", "node": 3, "x": 50,  "y": 0 }
-        ],
-        "steps": [
-            { "wait": "route restored", "node": 3 }
-        ]
-    }
-}
+```yaml
+timeout_ms: 300000
+radiomedium:
+  type: udgm
+  tx_range: 50.0
+nodes:
+  - { firmware: firmware/cc2538dk/root-node.cc2538dk, id: 1, x: 0, y: 0 }
+  - { firmware: firmware/cc2538dk/node.cc2538dk, id: 2, x: 25, y: 0 }
+  - { firmware: firmware/cc2538dk/node.cc2538dk, id: 3, x: 50, y: 0 }
+test:
+  actions:
+    - { at_ms: 120000, type: move, node: 3, x: 200, y: 0 }
+    - { at_ms: 240000, type: move, node: 3, x: 50, y: 0 }
+  steps:
+    - { wait: "route restored", node: 3 }
 ```
 
 Moves node 3 out of range at 120s, back in range at 240s, and waits for it to re-establish its route.
 
 ## Converting Cooja `.csc` Files
 
-The `tools/csc2json.py` script converts Cooja simulation files to csim JSON format.
+The `tools/csc2json.py` script converts Cooja simulation files to Cooja-NG's JSON config format (which the loader takes as-is; `test_runner config-convert` turns it into YAML).
 
 ### Usage
 

@@ -22,6 +22,7 @@
 #include "native_node.h"
 #include "js_node.h"
 #include "sim_config.h"
+#include "csim_version.h"
 #include "radio_medium.h"
 #include "ws_server.h"
 #include "sim_state.h"
@@ -1521,10 +1522,9 @@ static void sync_node_channels(void) {
 /* --- Main entry point --- */
 
 /* Check if path ends with .json */
-static int is_json_file(const char *path) {
-    const char *dot = strrchr(path, '.');
-    return dot && strcmp(dot, ".json") == 0;
-}
+/* A config argument is anything with a config extension (.yaml/.yml/.json);
+ * everything else is a firmware path.  One definition, in sim_config. */
+static int is_json_file(const char *path) { return sim_config_is_file(path); }
 
 /* ============================================================
  * Kernel-pump event dispatch (M10).
@@ -1727,6 +1727,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * take effect.  0 is rejected: it is the struct's "not set" value, so a
      * silent no-op is exactly the kind of green-by-accident we do not ship. */
     int seed_override = 0;
+    /* --save-config PATH: at the end of the run, write the configuration
+     * that was actually running — live node positions, nodes added or
+     * removed by the test script, the effective seed and duration — as
+     * canonical YAML.  The saved file plus its seed reproduces the run. */
+    const char *save_config_path = NULL;
+    const char *config_path = NULL;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--ui") == 0) {
@@ -1784,6 +1790,15 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--save-config") == 0 && i + 1 < argc) {
+            save_config_path = argv[++i];
+            const char *dot = strrchr(save_config_path, '.');
+            if (!dot || (strcmp(dot, ".yaml") != 0 && strcmp(dot, ".yml") != 0)) {
+                fprintf(stderr, "--save-config: '%s' must end in .yaml or .yml\n",
+                        save_config_path);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -1806,6 +1821,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 if (sim_config_load(&config, argv[i]) != 0)
                     return 1;
                 config_loaded = 1;
+                config_path = argv[i];
                 sim_config_print(&config);
             } else {
                 if (firmware_count < MAX_NODES)
@@ -1841,8 +1857,8 @@ int run_mixed_multinode_test(int argc, char **argv) {
     }
 
     if (firmware_count < 1) {
-        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [--seed N] [-v] [-q] [--ui [port]]\n");
-        printf("       test_runner mixed-multinode <config.json> [-t ms] [--seed N] [-v] [-q] [--ui [port]]\n");
+        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port]]\n");
+        printf("       test_runner mixed-multinode <config.yaml|json> [-t ms] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port]]\n");
         printf("  Firmware types detected by extension:\n");
         printf("    .sky      -> MSP430 (Tmote Sky)\n");
         printf("    .cc2538dk -> ARM (CC2538DK)\n");
@@ -2755,6 +2771,66 @@ sim_restart:
     }
 
     printf("\n--- Simulation complete ---\n");
+
+    if (save_config_path) {
+        /* Snapshot of what ran, not of what was loaded: positions come from
+         * the radio medium (moved nodes), the node list from the runtime
+         * (nodes the script added, minus the ones it removed — a removed
+         * node has node_start_ns == INT64_MAX), duration and seed are the
+         * effective ones (-t / --seed win over the file). */
+        static sim_normalized_config_t live;
+        live = config;
+        live.timeout_ms = sim_ms;
+        if (radio_medium.type == RADIO_MEDIUM_UDGM &&
+            (config.medium_type == 1 || !config.medium_name[0])) {
+            live.medium_type = 1;
+            snprintf(live.medium_name, sizeof(live.medium_name), "udgm");
+            live.tx_range           = radio_medium.udgm.tx_range;
+            live.interference_range = radio_medium.udgm.interference_range;
+            live.success_ratio_tx   = radio_medium.udgm.success_ratio_tx;
+            live.success_ratio_rx   = radio_medium.udgm.success_ratio_rx;
+        }
+        live.node_count = 0;
+        for (int i = 0; i < node_count && live.node_count < MAX_SIM_NODES; i++) {
+            if (node_start_ns[i] == INT64_MAX) continue;      /* removed */
+            sim_node_config_t *n = &live.nodes[live.node_count++];
+            int from_cfg = config_loaded && i < config.node_count;
+            memset(n, 0, sizeof(*n));
+            snprintf(n->firmware, sizeof(n->firmware), "%s",
+                     from_cfg ? config.nodes[i].firmware : nodes[i].firmware_path);
+            n->id = nodes[i].id;
+            n->x = radio_medium.nodes[i].x;
+            n->y = radio_medium.nodes[i].y;
+            n->has_position = (from_cfg && config.nodes[i].has_position) ||
+                              n->x != 0.0 || n->y != 0.0;
+            n->clock_deviation = from_cfg ? config.nodes[i].clock_deviation : 1.0;
+            if (n->clock_deviation == 0.0) n->clock_deviation = 1.0;
+        }
+        char header[512];
+        snprintf(header, sizeof(header),
+                 "saved by cooja-ng %s at simulated time %.3f s\nfrom: %s\n"
+                 "positions and node list are the live state at save time",
+                 CSIM_VERSION, (double)sim_ns / 1e9,
+                 config_path ? config_path : "(firmware arguments)");
+        FILE *sf = fopen(save_config_path, "w");
+        int save_rc = sf ? sim_config_write_yaml(&live, sf, header) : -1;
+        if (sf) fclose(sf);
+        if (save_rc == 0) {
+            /* The saved file must load back, or the save is worthless. */
+            static sim_normalized_config_t check;
+            if (sim_config_load(&check, save_config_path) != 0) {
+                fprintf(stderr, "--save-config: %s was written but does not load back\n",
+                        save_config_path);
+                save_rc = -1;
+            } else {
+                sim_config_free(&check);
+                printf("Saved config: %s (%d nodes)\n", save_config_path, live.node_count);
+            }
+        } else {
+            fprintf(stderr, "--save-config: cannot write %s\n", save_config_path);
+        }
+        if (save_rc != 0) test_exit_code = 1;
+    }
     pcap_service_close(&pcap_svc);
     extern void msp430_timer_dump_ccr_counts(void);
     msp430_timer_dump_ccr_counts();

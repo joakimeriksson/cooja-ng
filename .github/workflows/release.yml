@@ -119,6 +119,10 @@ jobs:
           Firmware is compiled from the Contiki-NG tree by the runner
           (tools/build-test-firmware.sh); this package contains no firmware.
 
+          Own simulations: build/test_runner test my-sim.yaml (YAML or JSON;
+          --save-config out.yaml writes the live setup back). Schema:
+          https://github.com/joakimeriksson/cooja-ng/blob/main/docs/test-format.md
+
           Requires: python3 (csc conversion), a Contiki-NG checkout, and the
           usual embedded toolchains for the firmware builds.
 

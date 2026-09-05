@@ -1,0 +1,26 @@
+# Gilbert-Elliott burst-loss radio medium (a plugin medium selected by name).
+# Tune it with the CSIM_GE_* environment variables, e.g.
+#   CSIM_GE_AVG_DROP=0.2 CSIM_GE_BURST_LEN=8 ./build/test_runner test configs/medium-plugin-gilbert-elliott.yaml
+# Twin of configs/medium-plugin-gilbert-elliott.json.
+version: 2
+title: "Gilbert-Elliott burst-loss radio-medium plugin demo (Sky, 2-node UDP)"
+timeout_ms: 60000
+seed: 42          # same seed => byte-identical run
+
+medium:
+  type: gilbert-elliott
+  tx_range: 55.0           # metres
+  interference_range: 1.1e+02
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+plugins:
+  - build/plugins/gilbert_elliott_medium.so
+
+mote_types:
+  - { name: sky-server, kind: emulated-elf, cpu: msp430, soc: msp430f1611, board: sky, firmware: firmware/sky/udp-server.sky }
+  - { name: sky-client, kind: emulated-elf, cpu: msp430, soc: msp430f1611, board: sky, firmware: firmware/sky/udp-client.sky }
+
+nodes:
+  - { type: sky-server, id: 1, x: 0.0, y: 0.0 }
+  - { type: sky-client, id: 2, x: 3e+01, y: 0.0 }

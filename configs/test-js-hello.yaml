@@ -1,0 +1,23 @@
+# Single cc2538 node running hello-world, asserted by a Cooja-style JS
+# test script.  The script is a YAML literal block (|-) — written exactly as
+# it would be in a Cooja .csc, no escaping.  Twin of configs/test-js-hello.json.
+version: 2
+title: "JS engine test: hello-world"
+timeout_ms: 10000
+
+mote_types:
+  - { name: hello-world, firmware: firmware/cc2538dk/hello-world.cc2538dk }
+
+nodes:
+  - { type: hello-world, id: 1 }
+
+test:
+  js_script_inline: |-
+    TIMEOUT(10000);
+    while(true) {
+      YIELD();
+      if(msg.contains('Hello')) {
+        log.log('Found hello message from node ' + id);
+        log.testOK();
+      }
+    }
