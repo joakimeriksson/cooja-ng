@@ -4,6 +4,22 @@
 > explicitly out of scope. For the device contract see
 > [`SPEC.md`](SPEC.md).
 
+## SPI peripherals (2026-09-06) — SPIM + MX25R6435F + ENC28J60
+
+Goal: run the Contiki-NG `feature/nrf-spi-driver` examples
+(`examples/platform-specific/nrf/spi-flash`, `enc28j60-test`) headless
+with the firmware that ran on the real DK on 2026-09-06; the DK's serial
+output is the oracle (see `firmware/nrf54l15-dk/PROVENANCE.md`).
+
+- **L1 — SPIM model: done.** `src/arm/nrf54l15_spim.c`, instances 00/22/30
+  registered by the SoC, EasyDMA through `arm_read8/write8`, completion
+  scheduled on the cycle-derived clock.  GPIO gained `PIN_CNF` so a
+  `nrf_gpio_cfg_output`'d chip-select shows up in `DIR`.  Evidence:
+  `./build/test_runner nrf54l15-spim` → 90 passed, 0 failed.
+- **L2 — MX25R6435F on SPIM00 / CS P2.05:** pending.
+- **L3 — ENC28J60 on SPIM22 / CS P1.12:** pending.
+- **L4 — Ethernet frame path (TAP/pcap):** not started; only after L3 review.
+
 ## Current state — short version
 
 **L3 reached — full Contiki banner prints on emulated nrf54l15-dk.**

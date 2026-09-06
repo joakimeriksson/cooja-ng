@@ -75,6 +75,9 @@ extern int run_mock_host_tests(int verbose);
 /* CC1200 chip-driver mock-host unit tests (L−1) */
 extern int run_cc1200_tests(int verbose);
 
+/* nRF54L15 SPIM peripheral model unit tests (mock host, no CPU) */
+extern int run_nrf54l15_spim_tests(int verbose);
+
 /* radio_medium_t unit tests (pure C, no CPU) */
 extern int run_radio_medium_tests(int verbose);
 
@@ -403,6 +406,11 @@ int main(int argc, char **argv) {
     /* CC1200 chip-driver unit tests (L−1) */
     if (strcmp(mode, "cc1200-mock-host") == 0 || strcmp(mode, "all") == 0) {
         failures += run_cc1200_tests(verbose);
+    }
+
+    /* nRF54L15 SPIM register model (mock host, EasyDMA on a byte array) */
+    if (strcmp(mode, "nrf54l15-spim") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_nrf54l15_spim_tests(verbose);
     }
 
     /* radio_medium_t unit tests */

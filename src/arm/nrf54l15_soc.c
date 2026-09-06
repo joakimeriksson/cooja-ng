@@ -21,11 +21,12 @@
 #include "nrf_radio_common.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* sim_host shims — identical to nRF52's. Off-SoC chip drivers reach
- * the CPU's event scheduler through this vtable.  No external chips
- * are wired on either nrf54l15 board today, but the host fields must
- * still be valid for anything that touches plat->host. */
+ * the CPU's event scheduler through this vtable.  The SPI chips on the
+ * DK (flash on SPIM00, ENC28J60 on SPIM22) get the `live_host` copy
+ * built in soc_init, whose now_ns is cycle-derived. */
 static int64_t nrf54l_host_now_ns(void *cpu) {
     return ((arm_cpu_t *)cpu)->sim_time_ns;
 }
@@ -2288,6 +2289,10 @@ static void nrf54l_spu_write(void *user, uint32_t addr, uint32_t value) {
 #define NRF54L_P2_BASE     0x50050400u
 #define NRF54L_GPIO_SIZE   0x100u
 
+static inline void nrf54l_gpio_changed(nrf54l_gpio_state_t *g) {
+    if (g->change_cb) g->change_cb(g->change_user, g);
+}
+
 static void nrf54l_gpio_set_out(nrf54l_gpio_state_t *g, uint32_t newout) {
     uint32_t changed = (g->out ^ newout) & g->dir;
     if (changed) {
@@ -2298,12 +2303,32 @@ static void nrf54l_gpio_set_out(nrf54l_gpio_state_t *g, uint32_t newout) {
                     t / 1e9, g->port, g->out, newout, changed);
         }
     }
+    bool any = g->out != newout;
     g->out = newout;
+    if (any) nrf54l_gpio_changed(g);
+}
+
+/* DIR and PIN_CNF[n].DIR are two views of the same bit (NRF_GPIO_Type:
+ * DIR @ 0x10, PIN_CNF[32] @ 0x80, DIR = bit 0).  nrf_gpio_cfg_output —
+ * what Contiki's gpio_hal_arch_pin_set_output expands to — only writes
+ * PIN_CNF, so a chip-select pin never shows up in DIR unless the two
+ * are kept in sync here. */
+static void nrf54l_gpio_set_dir(nrf54l_gpio_state_t *g, uint32_t newdir) {
+    if (g->dir == newdir) return;
+    uint32_t changed = g->dir ^ newdir;
+    g->dir = newdir;
+    for (int n = 0; n < 32; n++)
+        if (changed & (1u << n))
+            g->pin_cnf[n] = (g->pin_cnf[n] & ~1u) | ((newdir >> n) & 1u);
+    nrf54l_gpio_changed(g);
 }
 
 static int nrf54l_gpio_read(void *user, uint32_t addr) {
     nrf54l_gpio_state_t *g = user;
-    switch (addr - g->base) {
+    uint32_t off = addr - g->base;
+    if (off >= 0x80 && off < 0x80 + 32 * 4)
+        return (int)g->pin_cnf[(off - 0x80) / 4];
+    switch (off) {
         case 0x00: case 0x04: case 0x08: return (int)g->out;  /* OUT/SET/CLR */
         case 0x0c: return (int)g->out;                        /* IN (loopback) */
         case 0x10: case 0x14: case 0x18: return (int)g->dir;  /* DIR/SET/CLR */
@@ -2313,14 +2338,133 @@ static int nrf54l_gpio_read(void *user, uint32_t addr) {
 
 static void nrf54l_gpio_write(void *user, uint32_t addr, uint32_t value) {
     nrf54l_gpio_state_t *g = user;
-    switch (addr - g->base) {
+    uint32_t off = addr - g->base;
+    if (off >= 0x80 && off < 0x80 + 32 * 4) {                          /* PIN_CNF[n] */
+        int n = (int)((off - 0x80) / 4);
+        g->pin_cnf[n] = value;
+        uint32_t dir = (value & 1u) ? (g->dir | (1u << n)) : (g->dir & ~(1u << n));
+        if (dir != g->dir) nrf54l_gpio_set_dir(g, dir);
+        else nrf54l_gpio_changed(g);
+        return;
+    }
+    switch (off) {
         case 0x00: nrf54l_gpio_set_out(g, value);            return; /* OUT    */
         case 0x04: nrf54l_gpio_set_out(g, g->out |  value);  return; /* OUTSET */
         case 0x08: nrf54l_gpio_set_out(g, g->out & ~value);  return; /* OUTCLR */
-        case 0x10: g->dir  =  value; return;                          /* DIR    */
-        case 0x14: g->dir |=  value; return;                          /* DIRSET */
-        case 0x18: g->dir &= ~value; return;                          /* DIRCLR */
+        case 0x10: nrf54l_gpio_set_dir(g, value);            return; /* DIR    */
+        case 0x14: nrf54l_gpio_set_dir(g, g->dir |  value);  return; /* DIRSET */
+        case 0x18: nrf54l_gpio_set_dir(g, g->dir & ~value);  return; /* DIRCLR */
         default:   return;
+    }
+}
+
+/* ============================================================
+ * SPIM00 / SPIM22 / SPIM30 + the off-SoC SPI chips on them.
+ * The register model lives in nrf54l15_spim.c; this section binds it
+ * to the CPU (EasyDMA through arm_read8/arm_write8, completion events
+ * on the live clock) and does the board-level part: which chip sees a
+ * byte (chip-select routing) and chip-select edge forwarding.
+ * ============================================================ */
+static int64_t nrf54l_host_now_ns_live(void *cpu) {
+    arm_cpu_t *c = cpu;
+    return arm_cycles_to_ns(c->cycles, c->cpu_freq_hz);
+}
+
+static uint8_t nrf54l_spim_mem_read8(void *mem, uint32_t addr) {
+    return arm_read8((arm_cpu_t *)mem, addr);
+}
+static void nrf54l_spim_mem_write8(void *mem, uint32_t addr, uint8_t value) {
+    arm_write8((arm_cpu_t *)mem, addr, value);
+}
+
+static int nrf54l_spim_mmio_read(void *user, uint32_t addr) {
+    nrf54l_spim_t *s = user;
+    return (int)nrf54l_spim_read(s, addr & (NRF54L_SPIM_SIZE - 1));
+}
+static void nrf54l_spim_mmio_write(void *user, uint32_t addr, uint32_t value) {
+    nrf54l_spim_t *s = user;
+    nrf54l_spim_write(s, addr & (NRF54L_SPIM_SIZE - 1), value);
+}
+
+static const struct { int id; uint32_t base; } nrf54l_spim_instances[NRF54L_NUM_SPIM] = {
+    {  0, NRF54L_SPIM00_BASE },
+    { 22, NRF54L_SPIM22_BASE },
+    { 30, NRF54L_SPIM30_BASE },
+};
+
+nrf54l_spim_t *nrf54l15_soc_spim(nrf54l15_soc_t *soc, int spim_id) {
+    for (int i = 0; i < NRF54L_NUM_SPIM; i++)
+        if (nrf54l_spim_instances[i].id == spim_id) return &soc->spim[i];
+    return NULL;
+}
+
+/* Byte router: the chip whose CS is low on this instance answers. */
+static uint8_t nrf54l_soc_spi_exchange(void *user, int instance, uint8_t mosi) {
+    nrf54l15_soc_t *soc = user;
+    for (int i = 0; i < NRF54L_MAX_SPI_CHIPS; i++) {
+        nrf54l_spi_chip_t *c = &soc->spi_chips[i];
+        if (c->name[0] && c->spim == instance && c->cs_low && c->exchange)
+            return c->exchange(c->chip, mosi);
+    }
+    return 0xFF;
+}
+
+/* GPIO change → chip-select edges.  Selected = pin is an output AND
+ * driven low; an unconfigured pin (input, external pull-up on the DK)
+ * leaves the chip deselected. */
+static void nrf54l_soc_gpio_changed(void *user, nrf54l_gpio_state_t *g) {
+    nrf54l15_soc_t *soc = user;
+    for (int i = 0; i < NRF54L_MAX_SPI_CHIPS; i++) {
+        nrf54l_spi_chip_t *c = &soc->spi_chips[i];
+        if (!c->name[0] || c->cs_port != g->port) continue;
+        uint32_t bit = 1u << c->cs_pin;
+        bool low = (g->dir & bit) && !(g->out & bit);
+        if (low != c->cs_low) {
+            c->cs_low = low;
+            if (c->set_cs) c->set_cs(c->chip, low);
+        }
+    }
+}
+
+/* Chip kinds are registered per level: L2 adds mx25r6435f, L3 enc28j60. */
+static int nrf54l_soc_bind_spi_chip(nrf54l_spi_chip_t *c, const char *name,
+                                    const sim_host_t *host) {
+    (void)c; (void)name; (void)host;
+    return -1;
+}
+
+int nrf54l15_soc_attach_spi_chip(nrf54l15_soc_t *soc, const char *name,
+                                 int spim_id, int cs_port, int cs_pin) {
+    if (!soc || !name || !nrf54l15_soc_spim(soc, spim_id) ||
+        cs_port < 0 || cs_port > 2 || cs_pin < 0 || cs_pin > 31)
+        return -1;
+    int slot = -1;
+    for (int i = 0; i < NRF54L_MAX_SPI_CHIPS; i++)
+        if (!soc->spi_chips[i].name[0]) { slot = i; break; }
+    if (slot < 0) return -1;
+    nrf54l_spi_chip_t *c = &soc->spi_chips[slot];
+    memset(c, 0, sizeof(*c));
+    if (nrf54l_soc_bind_spi_chip(c, name, &soc->live_host) != 0) {
+        fprintf(stderr, "nrf54l15: unknown SPI chip '%s'\n", name);
+        return -1;
+    }
+    snprintf(c->name, sizeof(c->name), "%s", name);
+    c->spim    = spim_id;
+    c->cs_port = cs_port;
+    c->cs_pin  = cs_pin;
+    c->cs_low  = false;
+    /* Pick up the current pin level in case the firmware configured CS
+     * before the chip was attached (config applied after boot). */
+    nrf54l_soc_gpio_changed(soc, &soc->gpio[cs_port]);
+    return slot;
+}
+
+void nrf54l15_soc_clear_spi_chips(nrf54l15_soc_t *soc) {
+    if (!soc) return;
+    for (int i = 0; i < NRF54L_MAX_SPI_CHIPS; i++) {
+        nrf54l_spi_chip_t *c = &soc->spi_chips[i];
+        if (c->name[0] && c->destroy) c->destroy(c->chip);
+        memset(c, 0, sizeof(*c));
     }
 }
 
@@ -2382,14 +2526,37 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
     }
 
     /* GPIO P0/P1/P2 — drives + observes the demo LEDs (LED0=P2.9 FLPR,
-     * LED1=P1.10 M33). */
+     * LED1=P1.10 M33) and carries the SPI chip-selects. */
     uint32_t gpio_bases[3] = { NRF54L_P0_BASE, NRF54L_P1_BASE, NRF54L_P2_BASE };
     for (int p = 0; p < 3; p++) {
         soc->gpio[p].plat = plat;
         soc->gpio[p].base = gpio_bases[p];
         soc->gpio[p].port = p;
+        for (int n = 0; n < 32; n++) soc->gpio[p].pin_cnf[n] = 0x2;  /* GPIO_PIN_CNF_ResetValue */
+        soc->gpio[p].change_cb   = nrf54l_soc_gpio_changed;
+        soc->gpio[p].change_user = soc;
         arm_register_io(&plat->cpu, gpio_bases[p], NRF54L_GPIO_SIZE,
                         nrf54l_gpio_read, nrf54l_gpio_write, &soc->gpio[p]);
+    }
+
+    /* Live-time host vtable for the SPIM completion events and the SPI
+     * chips: same as plat->host but now_ns comes from CPU cycles, so an
+     * event armed mid-step lands bytes*8/bit-rate ahead of *now*, not of
+     * the step's start. */
+    soc->live_host        = plat->host;
+    soc->live_host.now_ns = nrf54l_host_now_ns_live;
+
+    /* SPIM00 / SPIM22 / SPIM30 — SPI masters with EasyDMA. */
+    for (int i = 0; i < NRF54L_NUM_SPIM; i++) {
+        nrf54l_spim_t *s = &soc->spim[i];
+        nrf54l_spim_init(s, &soc->live_host, nrf54l_spim_instances[i].id);
+        s->mem_read8     = nrf54l_spim_mem_read8;
+        s->mem_write8    = nrf54l_spim_mem_write8;
+        s->mem           = &plat->cpu;
+        s->exchange      = nrf54l_soc_spi_exchange;
+        s->exchange_user = soc;
+        arm_register_io(&plat->cpu, nrf54l_spim_instances[i].base, NRF54L_SPIM_SIZE,
+                        nrf54l_spim_mmio_read, nrf54l_spim_mmio_write, s);
     }
 
     /* VPR00 launch control + SPU00 permission gate — FLPR coprocessor.
@@ -2452,6 +2619,9 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
 static void nrf54l15_soc_destroy(arm_platform_t *plat) {
     nrf54l15_soc_t *soc = (nrf54l15_soc_t *)plat->soc;
     if (soc) {
+        nrf54l15_soc_clear_spi_chips(soc);
+        for (int i = 0; i < NRF54L_NUM_SPIM; i++)
+            if (soc->spim[i].busy) arm_cancel_event(&plat->cpu, &soc->spim[i].xfer_event);
         /* Cancel + free any armed GRTC CC events. */
         for (int i = 0; i < NRF54L_GRTC_NUM_CC; i++) {
             if (soc->grtc.cc[i].event) {
