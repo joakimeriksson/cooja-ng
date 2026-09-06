@@ -75,6 +75,7 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/nrf52840_soc.c \
               $(ARM_SRC_DIR)/nrf54l15_soc.c \
               $(ARM_SRC_DIR)/nrf54l15_spim.c \
+              $(ARM_SRC_DIR)/mx25r6435f.c \
               $(ARM_SRC_DIR)/nrf_radio_common.c \
               $(ARM_SRC_DIR)/cc2538_uart.c \
               $(ARM_SRC_DIR)/cc2538_gpio.c \
@@ -196,6 +197,7 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_mock_host.c \
                $(TEST_DIR)/test_cc1200.c \
                $(TEST_DIR)/test_nrf54l15_spim.c \
+               $(TEST_DIR)/test_mx25r6435f.c \
                $(TEST_DIR)/test_radio_medium.c \
                $(TEST_DIR)/test_radio_bus.c
 

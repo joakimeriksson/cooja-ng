@@ -81,6 +81,15 @@ typedef struct arm_platform_config {
     arm_gpio_pin_t       cc1200_reset;     /* reset       (active low) */
     arm_gpio_pin_t       cc1200_gdo0;      /* GDO0        (input to MCU) */
     arm_gpio_pin_t       cc1200_gdo2;      /* GDO2        (input to MCU, optional) */
+    /* Off-SoC SPI chips the board ships with (nRF54L15-DK: MX25R6435F on
+     * SPIM00/P2.05, ENC28J60 on SPIM22/P1.12).  Attached by the SoC init
+     * unless a node's config "peripherals" list replaces them.  A NULL
+     * chip name terminates the list. */
+    struct {
+        const char *chip;     /* "mx25r6435f", "enc28j60", … */
+        int         spim;     /* SPIM instance id */
+        int         cs_port, cs_pin;
+    } spi_chips[4];
     /* Per-board VTOR override. 0 → use SoC's `arm_config_t::vtor_default`
      * (and fall back to flash_base / CCA discovery). Non-zero → that
      * absolute address. Lets two boards with the same SoC differ on

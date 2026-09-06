@@ -83,6 +83,16 @@ typedef struct {
     sim_test_validator_t validators[MAX_TEST_VALIDATORS];
 } sim_test_config_t;
 
+/* One off-SoC SPI chip on a node ("peripherals" list entry).  Today only
+ * the nRF54L15 SoC consumes these; other boards report and ignore them. */
+#define MAX_NODE_PERIPHERALS 4
+typedef struct {
+    char chip[16];   /* "mx25r6435f", "enc28j60", ... */
+    int  spim;       /* SPIM instance id: 0 (SPIM00), 22, 30 */
+    int  cs_port;    /* chip-select GPIO, "P<port>.<pin>" in the file */
+    int  cs_pin;
+} sim_peripheral_config_t;
+
 typedef struct {
     char firmware[256];
     int  id;         /* 0 = auto-assign */
@@ -90,6 +100,11 @@ typedef struct {
     int  has_position; /* true if x,y specified in JSON */
     double clock_deviation; /* 1.0 = normal, <1.0 = slower (Cooja MspClock deviation) */
     char type_name[64]; /* v2: the named mote-type this node uses ("" for v1) */
+    /* "peripherals": absent → board defaults; present (even empty) →
+     * exactly this list replaces the defaults. */
+    int  has_peripherals;
+    int  peripheral_count;
+    sim_peripheral_config_t peripherals[MAX_NODE_PERIPHERALS];
 } sim_node_config_t;
 
 /* v2 named mote type (config v2 §8.2).  In Phase 7 only `firmware` drives

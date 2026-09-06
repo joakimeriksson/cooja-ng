@@ -15,6 +15,57 @@
 
 static int parse_v1(cJSON *root, sim_normalized_config_t *cfg);
 static int parse_v2(cJSON *root, sim_normalized_config_t *cfg);
+/* "peripherals": [ { "chip": "mx25r6435f", "spim": 0, "cs": "P2.05" }, ... ]
+ * cs is written the way the firmware prints it (P<port>.<pin>). */
+static int parse_cs_pin(const char *txt, int *port, int *pin) {
+    if (!txt || (txt[0] != 'P' && txt[0] != 'p')) return -1;
+    char *end;
+    long p = strtol(txt + 1, &end, 10);
+    if (end == txt + 1 || *end != '.') return -1;
+    long n = strtol(end + 1, &end, 10);
+    if (*end != '\0' || p < 0 || p > 2 || n < 0 || n > 31) return -1;
+    *port = (int)p; *pin = (int)n;
+    return 0;
+}
+
+static int parse_node_peripherals(cJSON *node_item, sim_node_config_t *n, int idx) {
+    cJSON *list = cJSON_GetObjectItemCaseSensitive(node_item, "peripherals");
+    if (!list) return 0;
+    if (!cJSON_IsArray(list)) {
+        fprintf(stderr, "sim_config: node %d 'peripherals' must be a list\n", idx);
+        return -1;
+    }
+    n->has_peripherals = 1;
+    n->peripheral_count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, list) {
+        if (n->peripheral_count >= MAX_NODE_PERIPHERALS) {
+            fprintf(stderr, "sim_config: node %d has more than %d peripherals\n",
+                    idx, MAX_NODE_PERIPHERALS);
+            return -1;
+        }
+        sim_peripheral_config_t *pc = &n->peripherals[n->peripheral_count];
+        cJSON *chip = cJSON_GetObjectItemCaseSensitive(item, "chip");
+        cJSON *spim = cJSON_GetObjectItemCaseSensitive(item, "spim");
+        cJSON *cs   = cJSON_GetObjectItemCaseSensitive(item, "cs");
+        if (!cJSON_IsString(chip) || !chip->valuestring[0] ||
+            !cJSON_IsNumber(spim) || !cJSON_IsString(cs)) {
+            fprintf(stderr, "sim_config: node %d peripherals[%d] needs chip (string), "
+                    "spim (number) and cs (\"P<port>.<pin>\")\n", idx, n->peripheral_count);
+            return -1;
+        }
+        if (parse_cs_pin(cs->valuestring, &pc->cs_port, &pc->cs_pin) != 0) {
+            fprintf(stderr, "sim_config: node %d peripherals[%d]: bad cs '%s' "
+                    "(want P<0-2>.<0-31>)\n", idx, n->peripheral_count, cs->valuestring);
+            return -1;
+        }
+        snprintf(pc->chip, sizeof(pc->chip), "%s", chip->valuestring);
+        pc->spim = spim->valueint;
+        n->peripheral_count++;
+    }
+    return 0;
+}
+
 static void parse_medium_object(cJSON *medium, sim_normalized_config_t *cfg);
 static void parse_description(cJSON *root, sim_normalized_config_t *cfg);
 static int  parse_test(cJSON *test, sim_normalized_config_t *cfg);
@@ -190,6 +241,9 @@ static int parse_v1(cJSON *root, sim_normalized_config_t *cfg) {
         /* Optional clock deviation (Cooja MspClock deviation) */
         cJSON *dev = cJSON_GetObjectItemCaseSensitive(node_item, "clock_deviation");
         cfg->nodes[count].clock_deviation = cJSON_IsNumber(dev) ? dev->valuedouble : 1.0;
+
+        if (parse_node_peripherals(node_item, &cfg->nodes[count], count) != 0)
+            return -1;
 
         count++;
     }
@@ -585,6 +639,9 @@ static int parse_v2(cJSON *root, sim_normalized_config_t *cfg) {
 
         cJSON *dev = cJSON_GetObjectItemCaseSensitive(node_item, "clock_deviation");
         n->clock_deviation = cJSON_IsNumber(dev) ? dev->valuedouble : 1.0;
+
+        if (parse_node_peripherals(node_item, n, count) != 0)
+            return -1;
 
         count++;
     }

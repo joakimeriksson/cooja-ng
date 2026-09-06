@@ -105,6 +105,12 @@ jobs:
       - name: CC1200 chip-driver mock-host tests
         run: ./build/test_runner cc1200-mock-host
 
+      - name: nRF54L15 SPIM model unit tests
+        run: ./build/test_runner nrf54l15-spim
+
+      - name: MX25R6435F flash chip-driver mock-host tests
+        run: ./build/test_runner mx25r6435f-mock-host
+
       - name: Radio medium unit tests
         run: ./build/test_runner radio-medium
 
@@ -183,6 +189,14 @@ jobs:
             firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000 > out.txt 2>&1
           n=$(grep -c 'Received and replied' out.txt || true)
           echo "echo replies: $n"; [ "$n" -ge 5 ]
+
+      - name: nRF54L15-DK SPI flash over the Contiki-NG SPI HAL (15 s sim)
+        # examples/platform-specific/nrf/spi-flash on the DK's on-board
+        # MX25R6435F: JEDEC ID, SFDP, a 256-byte staged read, and seven
+        # SPIM re-inits across 1..32 MHz.  Also the regression for the
+        # LDREXB/STREXB decode fix — mutex_try_lock, hence every
+        # spi_acquire(), depends on it.
+        run: ./build/test_runner test configs/test-spi-flash-nrf54l15-dk.json
 
       - name: Determinism guard (sky RPL-UDP run twice → byte-identical)
         run: tools/check-determinism.sh multinode firmware/sky/udp-server.sky firmware/sky/udp-client.sky -t 20000

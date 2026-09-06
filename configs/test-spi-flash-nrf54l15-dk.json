@@ -1,0 +1,26 @@
+{
+    "title": "nRF54L15-DK on-board SPI flash (MX25R6435F on SPIM00) via the Contiki-NG SPI HAL",
+    "timeout_ms": 25000,
+    "seed": 1,
+    "nodes": [
+        {
+            "firmware": "firmware/nrf54l15-dk/spi-flash.nrf54l15-dk",
+            "id": 1,
+            "peripherals": [
+                { "chip": "mx25r6435f", "spim": 0, "cs": "P2.05" }
+            ]
+        }
+    ],
+    "test": {
+        "description": "examples/platform-specific/nrf/spi-flash (Contiki-NG feature/nrf-spi-driver) reads the JEDEC ID and SFDP header of the DK's MX25R6435F through arch/cpu/nrf/dev/spi-arch.c (blocking nrfx_spim, EasyDMA, 64-byte staging). The expected lines are the real PCA10156's serial output from 2026-09-06: JEDEC c2 28 17, SFDP 53 46 44 50, a 256-byte staged read, and seven consecutive SPIM re-inits at 1..32 MHz all reading the ID back. The report repeats every 5 s; two rounds are required. NB: the bit-rate line is matched as the firmware at contiki-ng 55e7ef6c8 prints it (\"bit rates:\"); the hardware log captured on 2026-09-06 shows a longer label (\"bit rates (requested, driver rounds down):\"), so that run used a slightly different build of the example. Every value on every line is identical.",
+        "steps": [
+            { "wait": "JEDEC ID: c2 28 17  OK (MX25R6435F)", "node": 1 },
+            { "wait": "flash-buf: c2 28 17  OK (DMA staging)", "node": 1 },
+            { "wait": "SFDP:     53 46 44 50  OK", "node": 1 },
+            { "wait": "long SFDP: 53 46 44 50 ... ff ff  OK (256 B staged)", "node": 1 },
+            { "wait": "bit rates: 1:ok 2:ok 4:ok 8:ok 16:ok 20:ok 32:ok (MHz)", "node": 1 },
+            { "wait": "SPI OK", "node": 1, "count": 2 }
+        ],
+        "fail_on": [ "FAIL", "MISMATCH", "SPI FAILED", ":bad", ":rej" ]
+    }
+}

@@ -16,7 +16,24 @@ output is the oracle (see `firmware/nrf54l15-dk/PROVENANCE.md`).
   scheduled on the cycle-derived clock.  GPIO gained `PIN_CNF` so a
   `nrf_gpio_cfg_output`'d chip-select shows up in `DIR`.  Evidence:
   `./build/test_runner nrf54l15-spim` → 90 passed, 0 failed.
-- **L2 — MX25R6435F on SPIM00 / CS P2.05:** pending.
+- **L2 — MX25R6435F flash: done.** `src/arm/mx25r6435f.c` (RDID, RDSFDP
+  with a real JESD216B table, RDSR/RDCR, WREN/WRDI, READ/FAST_READ, page
+  program with AND semantics and page wrap, sector/block/chip erase with
+  datasheet-typical WIP windows, RES/REMS, deep power-down).  Chips are
+  wired through the config: a node's `peripherals` list, defaulting to
+  the board's own placements.  Evidence: `mx25r6435f-mock-host` → 49
+  passed, and `test configs/test-spi-flash-nrf54l15-dk.json` reproduces
+  the hardware report (one label differs, see below).
+- **Emulator bug found and fixed on the way:** `LDREXB`/`STREXB` were
+  not decoded and fell through to LDRD/STRD, which reads `hw2[11:8]` as
+  Rt2 — 0xF, the PC.  Contiki's `mutex_try_lock` uses byte exclusives,
+  so *every* `spi_acquire()` failed and the firmware ran on from PC 0.
+  Commit `82a5723`, with instruction tests in `arm-correctness`.
+- **Oracle discrepancy (cosmetic, unresolved):** the 2026-09-06 DK log
+  shows `bit rates (requested, driver rounds down):` but the example at
+  contiki-ng `55e7ef6c8` prints `bit rates:`.  Every value matches; the
+  hardware run evidently used a slightly different build of the example.
+  The test matches the committed source.
 - **L3 — ENC28J60 on SPIM22 / CS P1.12:** pending.
 - **L4 — Ethernet frame path (TAP/pcap):** not started; only after L3 review.
 

@@ -19,6 +19,7 @@
 #include "arm_nvic.h"
 #include "ieee_802154.h"
 #include "nrf_radio_common.h"
+#include "mx25r6435f.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2426,10 +2427,26 @@ static void nrf54l_soc_gpio_changed(void *user, nrf54l_gpio_state_t *g) {
     }
 }
 
-/* Chip kinds are registered per level: L2 adds mx25r6435f, L3 enc28j60. */
+/* --- chip kinds ------------------------------------------------------- */
+static uint8_t flash_exchange(void *chip, uint8_t mosi) {
+    return mx25r6435f_spi_exchange((mx25r6435f_t *)chip, mosi);
+}
+static void flash_set_cs(void *chip, bool low) { mx25r6435f_set_cs((mx25r6435f_t *)chip, low); }
+static void flash_destroy(void *chip) {
+    mx25r6435f_destroy((mx25r6435f_t *)chip);
+    free(chip);
+}
+
 static int nrf54l_soc_bind_spi_chip(nrf54l_spi_chip_t *c, const char *name,
                                     const sim_host_t *host) {
-    (void)c; (void)name; (void)host;
+    if (strcmp(name, "mx25r6435f") == 0) {
+        mx25r6435f_t *f = calloc(1, sizeof(*f));
+        if (!f) return -1;
+        mx25r6435f_init(f, host);
+        c->chip = f; c->exchange = flash_exchange; c->set_cs = flash_set_cs;
+        c->destroy = flash_destroy;
+        return 0;
+    }
     return -1;
 }
 
@@ -2557,6 +2574,19 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
         s->exchange_user = soc;
         arm_register_io(&plat->cpu, nrf54l_spim_instances[i].base, NRF54L_SPIM_SIZE,
                         nrf54l_spim_mmio_read, nrf54l_spim_mmio_write, s);
+    }
+
+    /* Board-default SPI chips (platform table).  A node config with an
+     * explicit "peripherals" list clears these and attaches its own. */
+    if (plat->config) {
+        for (int i = 0; i < 4 && plat->config->spi_chips[i].chip; i++) {
+            if (nrf54l15_soc_attach_spi_chip(soc, plat->config->spi_chips[i].chip,
+                                             plat->config->spi_chips[i].spim,
+                                             plat->config->spi_chips[i].cs_port,
+                                             plat->config->spi_chips[i].cs_pin) < 0)
+                fprintf(stderr, "nrf54l15: could not attach default chip '%s'\n",
+                        plat->config->spi_chips[i].chip);
+        }
     }
 
     /* VPR00 launch control + SPU00 permission gate — FLPR coprocessor.
