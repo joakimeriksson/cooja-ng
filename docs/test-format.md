@@ -141,6 +141,30 @@ nodes:
 | `firmware` | string | **required** | Path to firmware ELF file |
 | `id` | int | auto (index+1) | Node ID, used for MAC address and test step filtering |
 | `x`, `y` | float | 0, 0 | Position in meters (for radio medium) |
+| `clock_deviation` | float | 1.0 | Clock speed factor (Cooja MspClock deviation) |
+| `peripherals` | list | board defaults | Off-SoC SPI chips on this node, see below |
+
+`peripherals` names the SPI chips hanging off the node's SPI masters.
+Leave it out to get the board's own set (nRF54L15-DK: the on-board
+MX25R6435F flash on SPIM00 with CS P2.05, and an ENC28J60 on SPIM22 with
+CS P1.12); give a list — even an empty one — to replace that set.  Only
+the nRF54L15 boards act on it today; other boards print a note and ignore
+it.
+
+```yaml
+nodes:
+  - firmware: firmware/nrf54l15-dk/spi-flash.nrf54l15-dk
+    id: 1
+    peripherals:
+      - { chip: mx25r6435f, spim: 0,  cs: P2.05 }   # SPIM00
+      - { chip: enc28j60,   spim: 22, cs: P1.12 }   # SPIM22
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `chip` | string | `mx25r6435f` (64 Mbit NOR flash) or `enc28j60` (Ethernet controller) |
+| `spim` | int | SPIM instance id as in the peripheral name: `0` = SPIM00, `22` = SPIM22, `30` = SPIM30 |
+| `cs` | string | Chip-select GPIO as the firmware prints it, `P<port>.<pin>` (the driver toggles it as a plain GPIO) |
 
 Node type is auto-detected from the firmware file extension:
 

@@ -4,6 +4,57 @@
 > explicitly out of scope. For the device contract see
 > [`SPEC.md`](SPEC.md).
 
+## SPI peripherals (2026-09-06) — SPIM + MX25R6435F + ENC28J60
+
+Goal: run the Contiki-NG `feature/nrf-spi-driver` examples
+(`examples/platform-specific/nrf/spi-flash`, `enc28j60-test`) headless
+with the firmware that ran on the real DK on 2026-09-06; the DK's serial
+output is the oracle (see `firmware/nrf54l15-dk/PROVENANCE.md`).
+
+- **L1 — SPIM model: done.** `src/arm/nrf54l15_spim.c`, instances 00/22/30
+  registered by the SoC, EasyDMA through `arm_read8/write8`, completion
+  scheduled on the cycle-derived clock.  GPIO gained `PIN_CNF` so a
+  `nrf_gpio_cfg_output`'d chip-select shows up in `DIR`.  Evidence:
+  `./build/test_runner nrf54l15-spim` → 90 passed, 0 failed.
+- **L2 — MX25R6435F flash: done.** `src/arm/mx25r6435f.c` (RDID, RDSFDP
+  with a real JESD216B table, RDSR/RDCR, WREN/WRDI, READ/FAST_READ, page
+  program with AND semantics and page wrap, sector/block/chip erase with
+  datasheet-typical WIP windows, RES/REMS, deep power-down).  Chips are
+  wired through the config: a node's `peripherals` list, defaulting to
+  the board's own placements.  Evidence: `mx25r6435f-mock-host` → 49
+  passed, and `test configs/test-spi-flash-nrf54l15-dk.json` reproduces
+  the hardware report (one label differs, see below).
+- **Emulator bug found and fixed on the way:** `LDREXB`/`STREXB` were
+  not decoded and fell through to LDRD/STRD, which reads `hw2[11:8]` as
+  Rt2 — 0xF, the PC.  Contiki's `mutex_try_lock` uses byte exclusives,
+  so *every* `spi_acquire()` failed and the firmware ran on from PC 0.
+  Commit `82a5723`, with instruction tests in `arm-correctness`.
+- **Oracle discrepancy (cosmetic, unresolved):** the 2026-09-06 DK log
+  shows `bit rates (requested, driver rounds down):` but the example at
+  contiki-ng `55e7ef6c8` prints `bit rates:`.  Every value matches; the
+  hardware run evidently used a slightly different build of the example.
+  The test matches the committed source.
+- **L3 — ENC28J60: done.** `src/arm/enc28j60.c` (RCR/RBM/WCR/WBM/BFS/BFC/
+  SRC, four banks with the common EIE..ECON1 window, the MAC/MII dummy
+  read byte with the datasheet's per-bank map, an 8 KiB buffer behind
+  RBM/WBM with AUTOINC and the ERXND→ERXST wrap, the PHY behind
+  MIREGADR/MIWR/MIRD/MICMD/MISTAT, ESTAT.CLKRDY after the OST, and
+  ECON1.TXRTS self-clearing with EIR.TXIF).  Evidence:
+  `enc28j60-mock-host` → 47 passed, and
+  `test configs/test-enc28j60-nrf54l15-dk.json` reproduces the hardware
+  report line for line.
+- **Runner bug found and fixed on the way:** the JSON test engine was
+  attached *after* `init_node`, but the ELF boot policy runs each mote
+  for up to 8M cycles inside `init_node` (~10 ms of sim time at
+  128 MHz).  Every console line printed in that window was emitted with
+  no observer attached and silently dropped, so no test step could match
+  boot-time output — which is all the enc28j60-test probe report is.
+  The engine is now armed before the boot loop.
+- **L4 — Ethernet frame path (TAP/pcap):** not started, waiting for a
+  look at L3 first.  The model already keeps the buffer memory,
+  EPKTCNT/PKTDEC and the TXRTS handshake that path needs.
+- **L4 — Ethernet frame path (TAP/pcap):** not started; only after L3 review.
+
 ## Current state — short version
 
 **L3 reached — full Contiki banner prints on emulated nrf54l15-dk.**

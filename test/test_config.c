@@ -83,6 +83,9 @@ static int compare(const sim_normalized_config_t *a, const sim_normalized_config
         CHECK(strcmp(x->firmware, y->firmware) == 0 && x->id == y->id &&
               x->has_position == y->has_position && x->x == y->x && x->y == y->y &&
               x->clock_deviation == y->clock_deviation, what);
+        CHECK(x->has_peripherals == y->has_peripherals &&
+              x->peripheral_count == y->peripheral_count &&
+              memcmp(x->peripherals, y->peripherals, sizeof(x->peripherals)) == 0, what);
     }
     CHECK(a->plugin_count == b->plugin_count && memcmp(a->plugins, b->plugins, sizeof(a->plugins)) == 0, "plugins");
     CHECK(a->has_serial_socket == b->has_serial_socket && a->serial_socket_port == b->serial_socket_port &&

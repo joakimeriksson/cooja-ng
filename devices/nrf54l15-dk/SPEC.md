@@ -115,8 +115,54 @@ Source: `arch/platform/nrf/nrf54l15/dk/nrf54l15-dk-def.h`.
 
 ## Off-SoC chips
 
-**None.** Single-chip SoC. The SEGGER J-Link onboard the dev kit is a
-flashing/debug interface, not visible to firmware.
+Two SPI chips hang off the SPIM buses (the SEGGER J-Link on the DK is a
+flashing/debug interface, not visible to firmware):
+
+| Chip | Bus | SCK | MOSI | MISO | CS (GPIO, active low) | Rate / mode | Model |
+|------|-----|-----|------|------|-----------------------|-------------|-------|
+| **MX25R6435F** 64 Mbit NOR flash (on-board, DK schematic) | SPIM00 | P2.01 | P2.02 | P2.04 | P2.05 | 8 MHz, mode 0 | `src/arm/mx25r6435f.c` |
+| **ENC28J60** Ethernet controller (module on the expansion header) | SPIM22 | P1.11 | P1.06 | P1.07 | P1.12 | 4 MHz, mode 0 | `src/arm/enc28j60.c` |
+
+Chip-select is a plain GPIO driven by `os/dev/spi.c` (`spi_select` →
+`gpio_hal_arch_clear_pin`), never SPIM's `PSEL.CSN`.  The SoC therefore
+routes each SPIM byte to the chip whose CS pin is *configured as output
+and driven low* on that instance; with none selected MISO reads 0xFF.
+Both placements are the platform default for `nrf54l15-dk`; a node's
+config `peripherals` list overrides them (see `docs/test-format.md`).
+
+Firmware side: `arch/cpu/nrf/dev/spi-arch.c` (blocking `nrfx_spim`:
+init → `TASKS_START` → poll `EVENTS_END` → `TASKS_STOP` → poll
+`EVENTS_STOPPED` → `ENABLE=0`; EasyDMA `DMA.TX/RX.PTR+MAXCNT`; ORC pads a
+short TX; 64-byte staging chunks for non-RAM or discard transfers) and
+`arch/dev/ethernet/enc28j60/enc28j60-arch-spi-hal.c` (one byte per
+transfer, bus acquired per chip-select assertion).
+
+### SPIM (SPI master + EasyDMA)
+
+Register layout and instance parameters taken from the nrfx MDK, not
+the product spec: `nrf54l15_types.h` (`NRF_SPIM_Type`, DMA-register
+layout — buffers under `DMA.TX/RX` @ 0x700, per-direction end events
+under `EVENTS_DMA.*` @ 0x14C/0x168), `nrf54l15_global.h` (bases) and
+`nrf54l15_application_peripherals.h` (core frequency, divisor range).
+
+| Instance | Base (secure alias) | Core clock | PRESCALER divisor | Modelled |
+|----------|--------------------|------------|-------------------|----------|
+| SPIM00 | 0x5004A000 | 128 MHz | 4..126 (≤ 32 MHz) | yes (on-board flash) |
+| SPIM20 | 0x500C6000 | 16 MHz | 2..126 | no — SERIAL20 slot is the console UARTE20 |
+| SPIM21 | 0x500C7000 | 16 MHz | 2..126 | no — base currently registered as EGU20 in `nrf54l15_soc.c` (MDK puts EGU20 at 0x500C9000; pre-existing discrepancy, out of scope here) |
+| SPIM22 | 0x500C8000 | 16 MHz | 2..126 (≤ 8 MHz) | yes (expansion header / ENC28J60) |
+| SPIM30 | 0x50104000 | 16 MHz | 2..126 | yes (unused) |
+
+Model: `src/arm/nrf54l15_spim.c` (`include/arm/nrf54l15_spim.h`).
+`TASKS_START` with `ENABLE == 7` clocks `max(TX.MAXCNT, RX.MAXCNT)`
+bytes — TX from `DMA.TX.PTR` then `ORC`, MISO stored to `DMA.RX.PTR`
+while RX has room — and completes `bytes × 8 / (core / PRESCALER)` ns
+later (scheduled on the cycle-derived clock), setting `AMOUNT`,
+`EVENTS_END`, `EVENTS_DMA.TX.END`, `EVENTS_DMA.RX.END`.  `TASKS_STOP`
+raises `EVENTS_STOPPED`.  `INTENSET/INTENCLR` are kept and can pend the
+SERIAL IRQ, but the blocking driver never enables them.  GPIO gained
+`PIN_CNF[32]` (@ 0x80) with its `DIR` bit mirrored into `DIR`, because
+`nrf_gpio_cfg_output` only writes `PIN_CNF`.
 
 ## Clock tree
 
@@ -234,7 +280,9 @@ tools/build-device-firmware.sh --target nrf --board nrf54l15/dk \
 | L5    | 2-node `nullnet`/RPL: ≥1 RX per node                           | <30 s sim |
 | L6    | 2-node RPL-UDP: ≥1 hello/response                              | <60 s sim |
 
-No `L−1` row — there's no off-SoC chip to mock-host test.
+| L−1   | `test_runner nrf54l15-spim` (SPIM model via mock host, 90 checks); `mx25r6435f-mock-host`; `enc28j60-mock-host` | <100 ms |
+| SPI-L2 | `test configs/test-spi-flash-nrf54l15-dk.json` prints the real-DK flash block and `SPI OK` | <10 s |
+| SPI-L3 | `test configs/test-enc28j60-nrf54l15-dk.json` prints the real-DK ENC block and `ENC28J60 OK` | <10 s |
 
 ## Definition of done
 

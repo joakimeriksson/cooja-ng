@@ -1265,6 +1265,116 @@ static void test_ldaex_stlex(void) {
 }
 
 /* ===================================================================
+ * LDREX/STREX byte and halfword — ARMv7-M A5.3.6 op1 = 01
+ *
+ * Regression cover for the nRF SPI driver bug: Contiki-NG's
+ * `mutex_try_lock` on a one-byte lock compiles to
+ *   LDREXB r3, [r5] ; ... ; STREXB r3, r2, [r5]
+ * Without these encodings the interpreter fell through to LDRD/STRD,
+ * which reads hw2[11:8] as Rt2 — 0xF, the PC — so LDREXB loaded a
+ * stack word into PC and STREXB wrote the PC to memory.  Every
+ * spi_acquire() failed and the firmware ran on from PC 0.
+ * =================================================================== */
+static void test_ldrex_strex_byte_halfword(void) {
+    printf("--- LDREXB / STREXB / LDREXH / STREXH tests ---\n");
+
+    /* LDREXB R3, [R5] — hw1=0xE8D5 (Rn=R5), hw2=0x3F4F (Rt=R3, op3=0100) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, 0x20001000, 0xAABBCCDDu);
+        cpu.reg[5] = 0x20001000;
+        cpu.reg[3] = 0xFFFFFFFFu;
+        write_thumb32(&cpu, CODE_BASE, 0xE8D5, 0x3F4F);
+        arm_step(&cpu, 1);
+        assert_eq("LDREXB R3, [R5] zero-extends the byte", 0xDDu, cpu.reg[3]);
+        assert_eq("LDREXB leaves PC at the next instruction",
+                  CODE_BASE + 4, cpu.reg[15] & ~1u);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* STREXB R3, R2, [R5] — hw1=0xE8C5, hw2=0x2F43 (Rt=R2, op3=0100, Rd=R3) */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, 0x20001000, 0xAABBCCDDu);
+        cpu.reg[5] = 0x20001000;
+        cpu.reg[2] = 0x01;
+        cpu.reg[3] = 0xFFFFFFFFu;
+        write_thumb32(&cpu, CODE_BASE, 0xE8C5, 0x2F43);
+        arm_step(&cpu, 1);
+        assert_eq("STREXB R3 = 0 (always succeeds in csim)", 0u, cpu.reg[3]);
+        assert_eq("STREXB wrote only the low byte", 0xAABBCC01u,
+                  arm_read32(&cpu, 0x20001000));
+        assert_eq("STREXB leaves PC at the next instruction",
+                  CODE_BASE + 4, cpu.reg[15] & ~1u);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* LDREXH R3, [R5] — hw2 op3 = 0101 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, 0x20001000, 0xAABBCCDDu);
+        cpu.reg[5] = 0x20001000;
+        write_thumb32(&cpu, CODE_BASE, 0xE8D5, 0x3F5F);
+        arm_step(&cpu, 1);
+        assert_eq("LDREXH R3, [R5] zero-extends the halfword", 0xCCDDu, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* STREXH R3, R2, [R5] — hw2 op3 = 0101 */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, 0x20001000, 0xAABBCCDDu);
+        cpu.reg[5] = 0x20001000;
+        cpu.reg[2] = 0x1234;
+        cpu.reg[3] = 0xFFFFFFFFu;
+        write_thumb32(&cpu, CODE_BASE, 0xE8C5, 0x2F53);
+        arm_step(&cpu, 1);
+        assert_eq("STREXH R3 = 0", 0u, cpu.reg[3]);
+        assert_eq("STREXH wrote only the low halfword", 0xAABB1234u,
+                  arm_read32(&cpu, 0x20001000));
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* The mutex_try_lock sequence itself: LDREXB sees 0 (free), STREXB
+     * claims it, a second LDREXB sees 1 (taken). */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, 0x20001000, 0x00000000u);
+        cpu.reg[5] = 0x20001000;
+        cpu.reg[2] = 1;
+        write_thumb32(&cpu, CODE_BASE,     0xE8D5, 0x3F4F);   /* LDREXB r3,[r5] */
+        write_thumb32(&cpu, CODE_BASE + 4, 0xE8C5, 0x2F43);   /* STREXB r3,r2,[r5] */
+        write_thumb32(&cpu, CODE_BASE + 8, 0xE8D5, 0x3F4F);   /* LDREXB r3,[r5] */
+        arm_step(&cpu, 1);
+        assert_eq("mutex free before the claim", 0u, cpu.reg[3]);
+        arm_step(&cpu, 1);
+        arm_step(&cpu, 1);
+        assert_eq("mutex taken after STREXB", 1u, cpu.reg[3]);
+        arm_cpu_destroy(&cpu);
+    }
+
+    /* TBB still decodes as a table branch, not as an exclusive access:
+     * hw2 op3 = 0000 must stay in the TBB path. */
+    {
+        arm_cpu_t cpu;
+        setup_arm(&cpu);
+        arm_write32(&cpu, 0x20001000, 0x00000004u);   /* table[0] = 4 halfwords */
+        cpu.reg[5] = 0x20001000;
+        cpu.reg[1] = 0;
+        write_thumb32(&cpu, CODE_BASE, 0xE8D5, 0xF001);   /* TBB [r5, r1] */
+        arm_step(&cpu, 1);
+        assert_eq("TBB branches to PC+4 + 2*table[idx]",
+                  CODE_BASE + 4 + 8, cpu.reg[15] & ~1u);
+        arm_cpu_destroy(&cpu);
+    }
+}
+
+/* ===================================================================
  * LDRD/STRD and 64-bit arithmetic tests
  *
  * These exercise the instruction patterns used by the Mbed TLS DTLS
@@ -2359,6 +2469,7 @@ int run_arm_correctness_tests(int v) {
     test_ldrd_strd();
     test_bit_field_ops();
     test_ldaex_stlex();
+    test_ldrex_strex_byte_halfword();
     test_m4_dsp_halfword_multiply();
     test_m4_vfp();
     test_anti_replay_ops();

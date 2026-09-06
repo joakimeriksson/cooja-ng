@@ -22,6 +22,7 @@
 #define NRF54L15_SOC_H
 
 #include "arm_platform.h"
+#include "nrf54l15_spim.h"
 
 /* GLOBAL_CLOCK at 0x5010_E000 (peripheral ID 0x10E in the application
  * domain).  Offsets discovered empirically — see the trace comment in
@@ -494,14 +495,50 @@ typedef struct nrf54l_vpr_state {
  * SET/CLR aliases. Enough to drive + observe the demo LEDs — LED0 on
  * P2.9 (FLPR) and LED1 on P1.10 (M33). out_toggles counts OUT-bit
  * transitions so a test can assert the blink actually happens. */
+struct nrf54l_gpio_state;
+typedef void (*nrf54l_gpio_change_cb)(void *user, struct nrf54l_gpio_state *g);
+
 typedef struct nrf54l_gpio_state {
     arm_platform_t *plat;
     uint32_t        base;
     int             port;         /* 0/1/2 for diagnostics */
     uint32_t        out;          /* OUT latch */
-    uint32_t        dir;          /* DIR (1 = output) */
+    uint32_t        dir;          /* DIR (1 = output) — mirrors PIN_CNF[n].DIR */
+    uint32_t        pin_cnf[32];  /* PIN_CNF[n] @ 0x80 (nrf_gpio_cfg writes these) */
     uint64_t        out_toggles;  /* total OUT-bit flips since reset */
+    /* Fired after any OUT / DIR / PIN_CNF change so the SoC can forward
+     * chip-select edges to off-SoC SPI chips. */
+    nrf54l_gpio_change_cb change_cb;
+    void           *change_user;
 } nrf54l_gpio_state_t;
+
+/* --- Off-SoC SPI chips on the SPIM buses --------------------------------
+ * Contiki's os/dev/spi.c drives chip-select as a plain GPIO, so a chip is
+ * "selected" while its CS pin is configured as an output and driven low.
+ * The SoC routes each SPIM byte to the chip whose CS is low on that
+ * instance; with none selected MISO floats high (0xFF).  Chips are
+ * attached by name (nrf54l15_soc_attach_spi_chip) from the platform
+ * defaults or a node's config "peripherals" list. */
+#define NRF54L_MAX_SPI_CHIPS 4
+
+typedef struct nrf54l_spi_chip {
+    char     name[16];            /* "mx25r6435f", "enc28j60", … ("" = free slot) */
+    int      spim;                /* SPIM instance id: 0, 22 or 30 */
+    int      cs_port, cs_pin;
+    bool     cs_low;              /* last chip-select level delivered to the chip */
+    /* Chip vtable, filled by the attach code per chip kind.  The chip
+     * state itself is heap-allocated so this header needs no chip types. */
+    uint8_t (*exchange)(void *chip, uint8_t mosi);
+    void    (*set_cs)(void *chip, bool low);
+    void    (*destroy)(void *chip);
+    void    *chip;
+} nrf54l_spi_chip_t;
+
+/* SPIM instances modelled: 00 (fast domain, on-board flash), 22 (DK
+ * expansion header), 30.  20 is the console's SERIAL20 slot and 21's base
+ * (0x500C7000) is where this SoC currently registers EGU20, so neither is
+ * instantiated. */
+#define NRF54L_NUM_SPIM 3
 
 typedef struct nrf54l15_soc {
     nrf54l_global_clock_state_t global_clock;
@@ -522,8 +559,27 @@ typedef struct nrf54l15_soc {
      * lptimer backend. */
     nrf54l_timer_state_t        timer10;
     nrf54l_timer_state_t        timer20;
+    /* SPIM00 / SPIM22 / SPIM30 (see NRF54L_NUM_SPIM) + the chips hanging
+     * off them.  `live_host` is plat->host with a cycle-derived now_ns —
+     * the transfer-completion event must be armed from live time, not
+     * the batch-stale sim_time_ns (docs/porting-a-device.md §8). */
+    nrf54l_spim_t               spim[NRF54L_NUM_SPIM];
+    nrf54l_spi_chip_t           spi_chips[NRF54L_MAX_SPI_CHIPS];
+    sim_host_t                  live_host;
     arm_platform_t             *plat;
 } nrf54l15_soc_t;
+
+/* Attach an off-SoC SPI chip by name to a SPIM instance with its
+ * chip-select on P<port>.<pin>.  Known names: "mx25r6435f", "enc28j60".
+ * Returns the slot index, or -1 (unknown chip / instance, or no slot).
+ * nrf54l15_soc_clear_spi_chips() drops every attached chip — the runner
+ * calls it before applying an explicit per-node "peripherals" list so
+ * the platform defaults do not linger. */
+int  nrf54l15_soc_attach_spi_chip(nrf54l15_soc_t *soc, const char *name,
+                                  int spim_id, int cs_port, int cs_pin);
+void nrf54l15_soc_clear_spi_chips(nrf54l15_soc_t *soc);
+/* The SPIM instance with the given id (0/22/30), or NULL. */
+nrf54l_spim_t *nrf54l15_soc_spim(nrf54l15_soc_t *soc, int spim_id);
 
 /* nrf54l15 RADIO STATE enum (from SVD). */
 #define NRF54L_RADIO_STATE_DISABLED   0

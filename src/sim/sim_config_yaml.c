@@ -313,7 +313,8 @@ struct schema { const char *name; const field_t *fields; };
 
 static const schema_t medium_schema, node_v1_schema, node_v2_schema,
     mote_type_schema, test_schema, step_schema, validator_schema,
-    action_schema, serial_schema, build_schema, root_v1_schema, root_v2_schema;
+    action_schema, serial_schema, build_schema, root_v1_schema, root_v2_schema,
+    peripheral_schema;
 
 static const field_t medium_fields[] = {
     {"type", 's', 0}, {"tx_range", 'n', 0}, {"interference_range", 'n', 0},
@@ -322,14 +323,17 @@ static const field_t medium_fields[] = {
 static const field_t build_fields[] = {   /* csc2json metadata, runtime-inert */
     {"make_args", 'S', 0}, {"source_dir", 's', 0}, {"target", 's', 0}, {0, 0, 0}
 };
+static const field_t peripheral_fields[] = {   /* off-SoC SPI chip on a node */
+    {"chip", 's', 0}, {"spim", 'n', 0}, {"cs", 's', 0}, {0, 0, 0}
+};
 static const field_t node_v1_fields[] = {
     {"firmware", 's', 0}, {"id", 'n', 0}, {"x", 'n', 0}, {"y", 'n', 0},
-    {"clock_deviation", 'n', 0},
+    {"clock_deviation", 'n', 0}, {"peripherals", 'a', &peripheral_schema},
     {"build", 'o', &build_schema}, {"_mote_type_desc", 's', 0}, {0, 0, 0}
 };
 static const field_t node_v2_fields[] = {
     {"type", 's', 0}, {"id", 'n', 0}, {"x", 'n', 0}, {"y", 'n', 0},
-    {"clock_deviation", 'n', 0},
+    {"clock_deviation", 'n', 0}, {"peripherals", 'a', &peripheral_schema},
     {"build", 'o', &build_schema}, {"_mote_type_desc", 's', 0}, {0, 0, 0}
 };
 static const field_t mote_type_fields[] = {
@@ -372,6 +376,7 @@ static const field_t root_v2_fields[] = {
 };
 static const schema_t medium_schema    = {"medium", medium_fields};
 static const schema_t build_schema     = {"build", build_fields};
+static const schema_t peripheral_schema = {"peripheral", peripheral_fields};
 static const schema_t node_v1_schema   = {"node", node_v1_fields};
 static const schema_t node_v2_schema   = {"node", node_v2_fields};
 static const schema_t mote_type_schema = {"mote_type", mote_type_fields};
@@ -708,6 +713,15 @@ int sim_config_write_yaml(const sim_normalized_config_t *cfg, FILE *f,
         }
         if (n->clock_deviation != 1.0 && n->clock_deviation != 0.0) {
             fputs(", clock_deviation: ", f); put_num(f, n->clock_deviation);
+        }
+        if (n->has_peripherals) {
+            fputs(", peripherals: [", f);
+            for (int k = 0; k < n->peripheral_count; k++) {
+                const sim_peripheral_config_t *pc = &n->peripherals[k];
+                fprintf(f, "%s{ chip: ", k ? ", " : " "); put_str(f, pc->chip);
+                fprintf(f, ", spim: %d, cs: P%d.%02d }", pc->spim, pc->cs_port, pc->cs_pin);
+            }
+            fputs(n->peripheral_count ? " ]" : "]", f);
         }
         fputs(" }\n", f);
     }

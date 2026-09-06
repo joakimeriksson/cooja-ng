@@ -38,6 +38,7 @@
 #include "sim_event_queue.h"
 #include "sim_runtime.h"
 #include "sim_board.h"
+#include "nrf54l15_soc.h"
 #include "sim_registry.h"
 #include "sim_serial_bridge.h"
 #include "sim_external_command.h"
@@ -1420,6 +1421,12 @@ static const sim_mote_env_t mixed_mote_env = {
     .native_channel_sync   = mixed_native_channel_sync,
 };
 
+/* The loaded config, for per-node attributes init_node applies after boot
+ * (peripherals).  `config` itself is a local of the runner entry point;
+ * this pointer is set once it has been loaded and stays valid for the
+ * run (reboots and timed "add" actions go through init_node too). */
+static const sim_normalized_config_t *node_cfg_src = NULL;
+
 static int init_node(int idx, const char *firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     memset(node, 0, sizeof(*node));
@@ -1452,6 +1459,34 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     int rc = kind->boot(node, idx, firmware_path, node_id, &mixed_mote_env);
     if (rc != 0)
         return rc;
+
+    /* Per-node "peripherals" (off-SoC SPI chips).  An explicit list
+     * replaces the board defaults the SoC attached during boot; only the
+     * nRF54L15 SoC consumes it today. */
+    if (node_cfg_src && idx < node_cfg_src->node_count &&
+        node_cfg_src->nodes[idx].has_peripherals) {
+        const sim_node_config_t *nc = &node_cfg_src->nodes[idx];
+        nrf54l15_soc_t *soc = (node->board->kind == SIM_BOARD_KIND_ARM)
+                              ? arm_platform_nrf54l15(&node->plat.arm) : NULL;
+        if (!soc) {
+            fprintf(stderr, "Node %d: 'peripherals' ignored — board %s has no SPI chip support\n",
+                    node_id, node->board->label);
+        } else {
+            nrf54l15_soc_clear_spi_chips(soc);
+            for (int k = 0; k < nc->peripheral_count; k++) {
+                const sim_peripheral_config_t *pc = &nc->peripherals[k];
+                if (nrf54l15_soc_attach_spi_chip(soc, pc->chip, pc->spim,
+                                                 pc->cs_port, pc->cs_pin) < 0) {
+                    fprintf(stderr, "Node %d: cannot attach peripheral '%s' on SPIM%02d "
+                            "CS P%d.%02d\n", node_id, pc->chip, pc->spim, pc->cs_port, pc->cs_pin);
+                    return -1;
+                }
+                if (verbose)
+                    printf("  Node %d: %s on SPIM%02d, CS P%d.%02d\n",
+                           node_id, pc->chip, pc->spim, pc->cs_port, pc->cs_pin);
+            }
+        }
+    }
 
     /* M9.3/9.4: radio endpoint ops + delivery mode onto the bus.  Done
      * here (not in a one-shot loop in main) so reboots and dynamically
@@ -1861,6 +1896,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 if (sim_config_load(&config, argv[i]) != 0)
                     return 1;
                 config_loaded = 1;
+                node_cfg_src = &config;
                 config_path = argv[i];
                 sim_config_print(&config);
             } else {
@@ -1927,6 +1963,32 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("Time step: %lld ns\n\n", (long long)TIME_STEP_NS);
 
     num_nodes = node_count;
+
+    /* Arm the JSON test engine BEFORE the motes boot.
+     *
+     * arm_elf_mote_boot / msp430_elf_mote_boot deliberately run the
+     * firmware for up to 8M cycles inside init_node (see the boot-policy
+     * comment there), which on a 128 MHz part is ~10 ms of simulated
+     * time — long enough for a Contiki banner and a one-shot self-test
+     * report to come and go.  Those console lines are emitted as
+     * SIM_OBS_MOTE_LOG_LINE like any other, so with the observer
+     * attached only after the boot loop they were dropped on the floor
+     * and a test step waiting for boot output could never match.  The
+     * nRF54L15 enc28j60-test prints its whole probe report exactly once,
+     * at boot, so this is the difference between a testable firmware and
+     * an untestable one.
+     *
+     * The service only reads lines, so arming it earlier is safe; the
+     * JS-script path still starts its own engine below (the two are
+     * mutually exclusive, and this pre-start is a no-op for it). */
+    if (config_loaded && config.has_test && !config.has_js_script)
+        json_test_service_start(&json_test_svc, &config.test);
+    else
+        json_test_service_start(&json_test_svc, NULL);
+    sim_service_attach(&sim_rt,
+                       sim_registry_find_service(&g_registry, "json-test"),
+                       &json_test_svc);
+
 sim_restart:
     for (int i = 0; i < node_count; i++) {
         const char *fw = firmware_paths[i < firmware_count ? i : firmware_count - 1];
@@ -2117,7 +2179,7 @@ sim_restart:
         }
         json_test_service_start(&json_test_svc, NULL);
     } else if (config_loaded && config.has_test) {
-        json_test_service_start(&json_test_svc, &config.test);
+        /* already armed before the boot loop above */
         printf("Test: %d steps", config.test.step_count);
         if (config.test.fail_on_count > 0)
             printf(", %d fail_on patterns", config.test.fail_on_count);
@@ -2128,14 +2190,7 @@ sim_restart:
         if (config.test.action_count > 0)
             printf(", %d actions", config.test.action_count);
         printf("\n");
-    } else {
-        json_test_service_start(&json_test_svc, NULL);
     }
-    /* M35: register the JSON test runner once; its on_event consumes
-     * SIM_OBS_MOTE_LOG_LINE via the host fan-out (a no-op when inactive). */
-    sim_service_attach(&sim_rt,
-                       sim_registry_find_service(&g_registry, "json-test"),
-                       &json_test_svc);
 
     /* Initialize timeline and node state tracking.
      * M32: the timeline is a service now — attach runs tl_init() and the
@@ -2855,6 +2910,11 @@ sim_restart:
                               n->x != 0.0 || n->y != 0.0;
             n->clock_deviation = from_cfg ? config.nodes[i].clock_deviation : 1.0;
             if (n->clock_deviation == 0.0) n->clock_deviation = 1.0;
+            if (from_cfg && config.nodes[i].has_peripherals) {
+                n->has_peripherals  = 1;
+                n->peripheral_count = config.nodes[i].peripheral_count;
+                memcpy(n->peripherals, config.nodes[i].peripherals, sizeof(n->peripherals));
+            }
         }
         char header[512];
         snprintf(header, sizeof(header),

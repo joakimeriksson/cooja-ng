@@ -1,0 +1,28 @@
+{
+    "title": "nRF54L15-DK ENC28J60 Ethernet controller (SPIM22) via the Contiki-NG SPI HAL",
+    "timeout_ms": 20000,
+    "seed": 1,
+    "nodes": [
+        {
+            "firmware": "firmware/nrf54l15-dk/enc28j60-test.nrf54l15-dk",
+            "id": 1,
+            "peripherals": [
+                { "chip": "enc28j60", "spim": 22, "cs": "P1.12" }
+            ]
+        }
+    ],
+    "test": {
+        "description": "examples/platform-specific/nrf/enc28j60-test (Contiki-NG feature/nrf-spi-driver) probes an ENC28J60 on SPIM22 through arch/dev/ethernet/enc28j60/enc28j60-arch-spi-hal.c: soft reset, ESTAT.CLKRDY after the oscillator start-up, EREVID, a scratch register round-trip, and a six-register MAC address round-trip that needs the dummy byte MAC reads return. It then runs enc28j60_init() and polls for frames. The expected lines are the real PCA10156's serial output from 2026-09-06. With no frame path yet, 'alive: 0 frames' is the correct steady state.",
+        "steps": [
+            { "wait": "ESTAT:    01  OK (CLKRDY set)", "node": 1 },
+            { "wait": "EREVID:   06  OK (silicon rev B7)", "node": 1 },
+            { "wait": "reg r/w:  5a  OK", "node": 1 },
+            { "wait": "MAC r/w:  02:de:ad:be:ef:01  OK", "node": 1 },
+            { "wait": "ENC28J60 OK", "node": 1 },
+            { "wait": "initialising driver, MAC 02:00:00:00:00:01", "node": 1 },
+            { "wait": "polling for frames -- plug the module into a switch", "node": 1 },
+            { "wait": "alive: 0 frames so far (no cable, or nothing on the link yet)", "node": 1, "count": 2 }
+        ],
+        "fail_on": [ "FAIL", "ENC28J60 NOT FOUND", "MISMATCH" ]
+    }
+}

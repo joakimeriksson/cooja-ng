@@ -122,6 +122,14 @@ static const arm_platform_config_t platform_nrf54l15_dk = {
         { .port = 2, .pin = 7,  .active_low = true },   /* LED3 P2.7  */
     },
     .button        = { .port = 1, .pin = 13, .active_low = true },  /* BUTTON1 P1.13 */
+    /* On-board MX25R6435F flash (DK schematic: SPIM00, CS P2.05) and the
+     * ENC28J60 module on the expansion header (SPIM22, CS P1.12) — the
+     * placements the Contiki-NG spi-flash / enc28j60-test examples use
+     * and that were validated on a real PCA10156 on 2026-09-06. */
+    .spi_chips = {
+        { "mx25r6435f", 0,  2, 5  },
+        { "enc28j60",   22, 1, 12 },
+    },
     .vtor_override = 0,
 };
 
