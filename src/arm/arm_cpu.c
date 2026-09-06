@@ -1500,10 +1500,11 @@ static inline void arm_trace_step(arm_cpu_t *cpu) {
     arm_trace_count++;
     fprintf(stderr,
             "[t#%d cyc=%lld pc=0x%08x sp=0x%08x lr=0x%08x "
-            "r0=%08x r1=%08x r2=%08x r3=%08x xpsr=%08x cpu=%p]\n",
+            "r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x xpsr=%08x cpu=%p]\n",
             arm_trace_count, (long long)cpu->cycles,
             cpu->reg[15] & ~1u, cpu->reg[13], cpu->reg[14],
             cpu->reg[0], cpu->reg[1], cpu->reg[2], cpu->reg[3],
+            cpu->reg[4], cpu->reg[5], cpu->reg[6], cpu->reg[7],
             cpu->xpsr, (void*)cpu);
 }
 
@@ -2666,7 +2667,6 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                 cpu->cycles += 1;
             } else if (op1 == 1 && (op2_5 & 0x64) == 0x04) {
                 /* Load/store dual, exclusive, table branch */
-                int op2_2 = (hw1 >> 4) & 3;
                 int rn = hw1 & 0xF;
                 int rt = (hw2 >> 12) & 0xF;
                 int rt2 = (hw2 >> 8) & 0xF;
@@ -2716,6 +2716,60 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         cpu->reg[rd] = 0;
                     }
                     cpu->cycles += 2;
+                } else if (P == 0 && U == 1 && W == 0 &&
+                           (((hw2 >> 4) & 0xF) == 0x4 ||
+                            ((hw2 >> 4) & 0xF) == 0x5 ||
+                            ((hw2 >> 4) & 0xF) == 0x7)) {
+                    /* LDREX{B,H,D} / STREX{B,H,D} — ARMv7-M A5.3.6
+                     * "Load/store dual, load/store exclusive, table branch",
+                     * op1 = hw1[8:7] = 01 (P=0, U=1), op2 = hw1[5:4] = 0L:
+                     *
+                     *   STREXB  hw1 1110 1000 1100 Rn   hw2 Rt 1111 0100 Rd
+                     *   STREXH  hw1 1110 1000 1100 Rn   hw2 Rt 1111 0101 Rd
+                     *   STREXD  hw1 1110 1000 1100 Rn   hw2 Rt Rt2  0111 Rd
+                     *   LDREXB  hw1 1110 1000 1101 Rn   hw2 Rt 1111 0100 1111
+                     *   LDREXH  hw1 1110 1000 1101 Rn   hw2 Rt 1111 0101 1111
+                     *   LDREXD  hw1 1110 1000 1101 Rn   hw2 Rt Rt2  0111 1111
+                     *
+                     * op3 = hw2[7:4] separates them from TBB/TBH (op3 = 0000 /
+                     * 0001, handled below) and from the ARMv8-M acquire/release
+                     * forms (op3 = 11xx, handled above).  Rd is hw2[3:0] here,
+                     * unlike word STREX where it sits at hw2[11:8].
+                     *
+                     * Without this branch the encodings fell through to the
+                     * LDRD/STRD case, which reads hw2[11:8] as Rt2 — 0xF for
+                     * the byte/halfword forms, i.e. the PC.  A byte LDREXB
+                     * then loaded a stack word into PC.  Contiki-NG's
+                     * `mutex_try_lock` (os/sys/mutex.h) compiles to exactly
+                     * LDREXB/STREXB on a one-byte lock, so every `spi_acquire`
+                     * on the nRF SPI driver hit it: the firmware printed
+                     * "could not acquire the SPI bus" and ran on from PC 0.
+                     * Same shape as the LDREX (word) misdecode fixed below.
+                     *
+                     * No exclusive monitor is modelled (single-CPU
+                     * simulation), so the store always succeeds: Rd = 0. */
+                    int op3 = (hw2 >> 4) & 0xF;
+                    uint32_t addr = cpu->reg[rn];
+                    if (L) {
+                        switch (op3) {
+                            case 0x4: cpu->reg[rt] = mem_read8(cpu, addr);  break;
+                            case 0x5: cpu->reg[rt] = mem_read16(cpu, addr); break;
+                            default:  cpu->reg[rt]  = mem_read32(cpu, addr);
+                                      cpu->reg[rt2] = mem_read32(cpu, addr + 4);
+                                      break;
+                        }
+                    } else {
+                        int rd = hw2 & 0xF;
+                        switch (op3) {
+                            case 0x4: mem_write8 (cpu, addr, cpu->reg[rt] & 0xFF);   break;
+                            case 0x5: mem_write16(cpu, addr, cpu->reg[rt] & 0xFFFF); break;
+                            default:  mem_write32(cpu, addr, cpu->reg[rt]);
+                                      mem_write32(cpu, addr + 4, cpu->reg[rt2]);
+                                      break;
+                        }
+                        cpu->reg[rd] = 0;   /* always succeeds */
+                    }
+                    cpu->cycles += 1;
                 } else if ((hw2 & 0xFFE0) == 0xF000) {
                     /* TBB / TBH (Table Branch Byte / Halfword) */
                     int H = (hw2 >> 4) & 1;
