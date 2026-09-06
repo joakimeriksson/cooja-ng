@@ -114,6 +114,10 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # Two-node UDP echo over 802.15.4/6LoWPAN/IPv6/RPL; server logs "Received and replied", 0 timeouts.
 ./build/test_runner nrf52840-dk-multinode firmware/nrf52840-dk/zephyr-echo-server.nrf52840-dk firmware/nrf52840-dk/zephyr-echo-client.nrf52840-dk -t 40000
 
+# nRF54L15 console input: the Contiki-NG shell example on the DK, driven
+# through the UARTE20 EasyDMA receive path (bytes paced at the baud rate).
+./build/test_runner test configs/test-shell-nrf54l15-dk.yaml   # ~4s sim
+
 # nRF54L15 FLPR dual-core / RISC-V (Contiki-NG nrf-vpr). One M33 image launches
 # the RV32E FLPR; the M33 prints "[FLPR] tick N" (advances ~2/sec). Add --ui 8080
 # to watch LED0 (P2.9, 1 Hz, RISC-V) + LED1 (P1.10, 2 Hz, M33) blink in the browser.
@@ -525,4 +529,5 @@ CSIM_ARM_JIT_VERIFY=1     # lockstep: run each block, rewind (incl. SRAM), re-ru
 CSIM_ARM_JIT_MIN_BLOCK=n  # minimum block length to compile (default 1 — NOT a tuning
                           # knob, see the comment in arm_jit.c: 4 costs 3x)
 CSIM_ARM_JIT_THRESHOLD=n  # executions before compiling (default 50)
+NRF54L_UART_RX_TRACE=1    # nRF54L15 console bytes delivered into the firmware's receive buffer
 ```

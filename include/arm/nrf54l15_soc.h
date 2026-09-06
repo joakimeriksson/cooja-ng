@@ -77,7 +77,29 @@ typedef struct nrf54l_uarte_state {
     uint32_t             enable;
     arm_uart_tx_callback tx_cb;
     void                *tx_user;
+    /* Receive side, EasyDMA like the transmit side. Contiki arms a
+     * single-byte transfer and re-arms it from the completion handler, so a
+     * byte arriving while a transfer is armed is written straight to the
+     * buffer and completes it. Bytes arriving with no transfer armed wait in
+     * the ring until one is. */
+    uint32_t             rx_ptr, rx_maxcnt, rx_amount;
+    uint32_t             evt_dma_rx_end, evt_dma_rx_ready, evt_rxdrdy;
+    uint32_t             inten;
+    bool                 rx_active;
+    uint8_t              rx_fifo[256];
+    int                  rx_head, rx_tail;
+    int                  irq_num;
+    /* Received bytes are paced at one character time, as they arrive on a
+     * wire. Without it a whole injected line lands as fast as the firmware
+     * can re-arm its single-byte transfer, and the driver overwrites the
+     * buffer under itself. */
+    arm_event_t          rx_pace_event;
+    int                  rx_pace_scheduled;
 } nrf54l_uarte_state_t;
+
+struct nrf54l15_soc;
+/* Feed received bytes to the console (the harness's serial input). */
+void nrf54l_uarte_feed_rx(struct nrf54l15_soc *soc, const uint8_t *buf, int len);
 
 /* DPPI (Distributed Programmable Peripheral Interconnect) — a 32-channel
  * routing fabric.  Peripherals publish events on a channel (via their

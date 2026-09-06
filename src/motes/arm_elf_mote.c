@@ -586,13 +586,16 @@ static int64_t arm_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
  * the legacy UART RX register; Nordic boards take the UARTE EasyDMA RX ring. */
 static int arm_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len) {
     arm_platform_t *plat = &MOTE_IMPL(m)->plat.arm;
-    cc2538_soc_t   *cc  = arm_platform_cc2538(plat);
-    nrf52840_soc_t *nrf = arm_platform_nrf52840(plat);
+    cc2538_soc_t     *cc   = arm_platform_cc2538(plat);
+    nrf52840_soc_t   *nrf  = arm_platform_nrf52840(plat);
+    nrf54l15_soc_t   *nrfl = arm_platform_nrf54l15(plat);
     if (cc)
         for (int i = 0; i < len; i++)
             cc2538_uart_receive_byte(&cc->uart0, buf[i]);
     else if (nrf)
         nrf_uart_feed_rx(&nrf->uart0, buf, len);
+    else if (nrfl)
+        nrf54l_uarte_feed_rx(nrfl, buf, len);
     return len;
 }
 
