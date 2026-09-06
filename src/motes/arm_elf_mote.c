@@ -152,13 +152,24 @@ int arm_elf_mote_boot(mixed_node_t *node, int slot,
          * (f4:ce:36) into the EUI-64 stored in linkaddr_node_addr.
          * Every node booting from the same FICR snapshot ends up with
          * the same MAC, RPL drops incoming DIOs as self-frames, and
-         * the DAG never forms. Seed with the same per-node hash the
-         * nRF52840 path uses for FICR.DEVICEADDR. */
+         * the DAG never forms.
+         *
+         * Same layout as the nRF52840 DEVICEADDR seed above: Contiki
+         * copies DEVICEID[0] little-endian into the EUI's last 4 bytes
+         * and node_id_init() reads node_id from the last TWO linkaddr
+         * bytes, i.e. DEVICEID[0]'s top two bytes. Put the mote's node
+         * id there so single-image firmware (6tisch/simple-node) gets
+         * node_id == 1 on node 1 and can self-select the coordinator;
+         * a pure hash here gave node ids like 8251/16758 and no TSCH
+         * coordinator ever on this board. Hash stays in the low half
+         * for EUI entropy. */
         uint32_t h = (uint32_t)node_id;
         h ^= h << 13; h ^= h >> 17; h ^= h << 5;
         h *= 2654435761u;
         h ^= h >> 16;
-        nrfl_soc->ficr.deviceid0 = h;
+        nrfl_soc->ficr.deviceid0 = ((uint32_t)(node_id & 0xFF) << 24)
+                                 | ((uint32_t)((node_id >> 8) & 0xFF) << 16)
+                                 | (h & 0xFFFF);
         nrfl_soc->ficr.deviceid1 = (uint32_t)node_id;
 
         if (*env->verbose)
