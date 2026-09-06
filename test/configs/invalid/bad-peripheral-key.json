@@ -1,0 +1,13 @@
+{
+    "title": "peripherals: unknown key inside a peripheral entry",
+    "timeout_ms": 1000,
+    "nodes": [
+        {
+            "firmware": "firmware/nrf54l15-dk/hello-world.nrf54l15-dk",
+            "id": 1,
+            "peripherals": [
+                { "chip": "mx25r6435f", "spim": 0, "cs": "P2.05", "csn": 5 }
+            ]
+        }
+    ]
+}
