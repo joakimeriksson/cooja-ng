@@ -48,7 +48,7 @@ Then sets `IOCFG0` back to `PKT_SYNC_RXTX` after TX completes.
 
 ### What csim currently gets wrong
 
-`src/arm/cc1200.c` does **not** implement IOCFG multiplexing. It only
+`src/chips/cc1200.c` does **not** implement IOCFG multiplexing. It only
 calls `drive_gdo0()` from a few hard-coded chip-state events (sync
 match, frame_done, TX start) and gates each on
 `c->regs[CC1200_REG_IOCFG0] == CC1200_IOCFG_PKT_SYNC_RXTX`.
@@ -70,7 +70,7 @@ Two consequences:
 
 ### The right fix
 
-Implement IOCFG-driven multiplexing in `src/arm/cc1200.c`:
+Implement IOCFG-driven multiplexing in `src/chips/cc1200.c`:
 
 - For each GDOx pin, track the current selected signal in
   `c->regs[CC1200_REG_IOCFGx]`.

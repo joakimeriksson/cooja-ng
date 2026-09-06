@@ -17,7 +17,7 @@ If you're not sure, default to the smallest scope. Most ports look like row 1 on
 
 Before writing anything new, read the closest existing port end-to-end. Pattern-matching to an existing port is faster and safer than designing from the datasheet alone.
 
-- **MSP430 reference**: `firmware/sky/`, `src/msp430/msp430_platform.c`, `include/msp430/msp430_platform.h`, `src/msp430/cc2420.c` (off-SoC chip example).
+- **MSP430 reference**: `firmware/sky/`, `src/msp430/msp430_platform.c`, `include/msp430/msp430_platform.h`, `src/chips/cc2420.c` (off-SoC chip example).
 - **ARM Cortex-M3 reference**: `firmware/cc2538dk/`, `src/arm/arm_platform.c`, `include/arm/arm_platform.h`, `src/arm/cc2538_rfcore.c` (on-chip radio example).
 - **Architecture overview**: `docs/architecture.md`.
 - **CPU↔peripheral API and off-SoC chip recipe**: same file, sections "Emulation API" and "Off-SoC chips".
@@ -35,14 +35,20 @@ The template covers identity, CPU, console, LEDs, buttons, off-SoC chips, clock 
 | New CPU header | `include/<arch>/<arch>_*.h` | e.g. `arm_cpu.h` |
 | New CPU source | `src/<arch>/<arch>_*.c` | |
 | New peripheral on existing CPU | `include/<arch>/<chip>_<peripheral>.h` and `src/<arch>/<chip>_<peripheral>.c` | e.g. `cc2538_uart.h` |
-| Off-SoC chip header | `include/<arch>/<chip>.h` (today) — see §6 for cross-CPU plan | e.g. `cc2420.h` |
-| Off-SoC chip source | `src/<arch>/<chip>.c` | |
+| Off-SoC chip header | `include/chips/<chip>.h` | e.g. `cc2420.h` |
+| Off-SoC chip source | `src/chips/<chip>.c` | |
 | Platform glue | extend `<arch>_platform.{c,h}` with a new entry in the platform table | |
 | Pre-built firmware | `firmware/<board>/<name>.<board>` | extension == platform name (auto-detect in `test_mixed_multinode.c`) |
 | Tests | extend `test/test_main.c` and add entries in `test_firmware.c` / `test_mixed_multinode.c` | |
 | Makefile | add new `.c` files to the appropriate `*_SOURCES` list | |
 
-The Makefile does not auto-discover sources. New `.c` files must be added to `MSP430_SOURCES`, `ARM_SOURCES`, `COMMON_SOURCES`, etc.
+Off-SoC chips live in `src/chips/`, not under an architecture, because they
+talk to the node only through `sim_host_t` — no CPU or GPIO types — so the same
+file serves an MSP430 and an ARM board alike. That is the test for whether
+something belongs there: if the header names `arm_cpu_t`, `msp430_gpio_t` or a
+`*_soc_t`, it is a SoC peripheral and belongs under `src/<arch>/` with its SoC.
+
+The Makefile does not auto-discover sources. New `.c` files must be added to `MSP430_SOURCES`, `ARM_SOURCES`, `CHIPS_SOURCES`, `COMMON_SOURCES`, etc.
 
 ## 5. The test ladder
 
@@ -117,12 +123,12 @@ Always in this order. Each layer depends on the previous:
 
 If the device has an off-SoC chip (radio, flash, sensor):
 
-1. Implement the chip driver in `src/<arch>/<chip>.c` and have it take `const sim_host_t *host` — never `*_cpu_t` / `*_gpio_t` directly. This is what makes the same chip portable to a different CPU later.
+1. Implement the chip driver in `src/chips/<chip>.c` and have it take `const sim_host_t *host` — never `*_cpu_t` / `*_gpio_t` directly. This is what makes the same chip portable to a different CPU later, and it is why these files sit outside the per-architecture directories.
 2. The platform installs the SPI exchange callback (`*_usart_set_spi_exchange` on MSP430, equivalent on ARM SSI when added) that routes by CSn.
 3. The platform watches `gpio->output_callback` for transitions on chip control pins (CSn, VREG, RESET) and forwards to the chip's API.
 4. The chip drives status pins back via `host->set_input_pin(...)`. Edge-driven IRQ requirements use `host->force_irq_edge(...)`.
 
-See `src/msp430/cc2420.c` for the canonical example — every CPU/GPIO touch point goes through `r->host->...`, no direct types.
+See `src/chips/cc2420.c` for the canonical example — every CPU/GPIO touch point goes through `r->host->...`, no direct types.
 
 ### 6.5 Radio integration
 
@@ -165,9 +171,9 @@ These are real issues from past porting work. Watch for the *category*, not just
 - **RXFIFO overflow during replay.** Buffered RX bytes from concurrent transmissions (collisions on real hardware) must be discarded, not replayed when the radio re-enters RX. Replaying triggers overflows that real hardware never sees.
 - **Symbol/byte timing not in nanoseconds.** All radio timing should be in ns and use `*_schedule_event_ns()`, not cycles. Otherwise DCO calibration breaks the timing. Already a project-wide invariant; don't break it.
 - **Forgotten init quirks.** Real firmware often does undocumented init writes to "reserved" registers. If the firmware halts early, log every IO write before the halt — the missing one is usually obvious in retrospect.
-- **Synchronous side effects in chip-driver byte handlers — fix with events, not `step_node_until`.** When a chip driver receives an on-air byte and needs to surface a state change to firmware (raise an IRQ, drop a status pin, transition state), the change MUST be scheduled via `host->schedule_ns()` rather than acted on synchronously inside the byte-delivery callback. The simulator's main loop is event-driven: it advances `sim_time_ns` to the next scheduled event, then steps each node up to that time. If a chip driver pends an IRQ synchronously and schedules nothing, the receiver CPU will not be woken until its next periodic wakeup — by which point the sender's MAC-level ACK_WAIT has typically already expired. Symptom: the firmware appears to ignore RX'd frames; ACKs are never sent in time; CSMA retransmits and the network never converges. Anti-pattern: working around this by inserting `step_node_until(...)` calls in the harness's per-byte delivery path. Always check the canonical pattern in `src/msp430/cc2420.c` (every state inflection has a `HOST_SCHEDULE_NS` call). This was the root cause of the original CC1200/Firefly L6 RPL-UDP non-convergence — `src/arm/cc1200.c`'s end-of-frame GDO0 drop was inline; moving it onto a `frame_done_event` scheduled one byte-period after the last on-air CRC byte was the fix. See git log for `cc1200: event-driven RX frame-done`.
+- **Synchronous side effects in chip-driver byte handlers — fix with events, not `step_node_until`.** When a chip driver receives an on-air byte and needs to surface a state change to firmware (raise an IRQ, drop a status pin, transition state), the change MUST be scheduled via `host->schedule_ns()` rather than acted on synchronously inside the byte-delivery callback. The simulator's main loop is event-driven: it advances `sim_time_ns` to the next scheduled event, then steps each node up to that time. If a chip driver pends an IRQ synchronously and schedules nothing, the receiver CPU will not be woken until its next periodic wakeup — by which point the sender's MAC-level ACK_WAIT has typically already expired. Symptom: the firmware appears to ignore RX'd frames; ACKs are never sent in time; CSMA retransmits and the network never converges. Anti-pattern: working around this by inserting `step_node_until(...)` calls in the harness's per-byte delivery path. Always check the canonical pattern in `src/chips/cc2420.c` (every state inflection has a `HOST_SCHEDULE_NS` call). This was the root cause of the original CC1200/Firefly L6 RPL-UDP non-convergence — `src/chips/cc1200.c`'s end-of-frame GDO0 drop was inline; moving it onto a `frame_done_event` scheduled one byte-period after the last on-air CRC byte was the fix. See git log for `cc1200: event-driven RX frame-done`.
 - **L6 convergence failure ≠ csim bug. Validate firmware on hardware first.** When 2-node L6 (RPL-UDP) doesn't converge after L0–L5 are all green, the temptation is to chase csim emulation gaps. Stop and run the *same* firmware on real hardware before any deeper csim diagnosis. The Firefly/CC1200 port spent days investigating "rx_incoming during turnaround" and "Node 1 CPU starvation" as csim fidelity gaps; on real Firefly silicon the same firmware showed the *same* convergence failure, which immediately re-pointed the investigation at upstream Contiki-NG. Two firmware bugs followed: `CSMA_CONF_ACK_WAIT_TIME` (5 ms) was below the actual cc1200 ACK round-trip on SUN FSK 50 kbps (~12.5 ms), and `pending_packet()` polled tightly enough to starve the cc1200 RX IRQ chain over SPI. Neither needed csim changes. Rule of thumb: if you've burned >1 hour of investigation without a hypothesis pinning the failure to csim specifically, run on hardware.
-- **Don't add fidelity buffers to mask firmware races.** It's tempting to mirror `src/msp430/cc2420.c`'s `rx_incoming[]` buffer in any new chip driver where bytes get dropped during state transitions. Confirm first that the buffer corresponds to a *documented* hardware behavior — cc2420's buffers bytes during a well-defined RX→TX→RX turnaround window per the datasheet — and is not just a workaround for a firmware-side race that csim is faithfully exposing. `devices/zoul-firefly/archive/CC1200-RX-ACK-CHAIN.md` proposed exactly such a buffer for cc1200; with hindsight it would have hidden a real CSMA bug. csim's job is to reproduce hardware faithfully, including its firmware-level bugs. A faithful simulator's silver bullet is to make hardware bugs reproducible, not to paper over them.
+- **Don't add fidelity buffers to mask firmware races.** It's tempting to mirror `src/chips/cc2420.c`'s `rx_incoming[]` buffer in any new chip driver where bytes get dropped during state transitions. Confirm first that the buffer corresponds to a *documented* hardware behavior — cc2420's buffers bytes during a well-defined RX→TX→RX turnaround window per the datasheet — and is not just a workaround for a firmware-side race that csim is faithfully exposing. `devices/zoul-firefly/archive/CC1200-RX-ACK-CHAIN.md` proposed exactly such a buffer for cc1200; with hindsight it would have hidden a real CSMA bug. csim's job is to reproduce hardware faithfully, including its firmware-level bugs. A faithful simulator's silver bullet is to make hardware bugs reproducible, not to paper over them.
 - **Datasheet citations are mandatory for chip-behavior commits.** Every commit that changes a chip driver's externally observable behavior (signal output, state transition, register semantics, timing) should cite a datasheet page in the commit body. If you can't, it's a guess and should not land. The cc1200 port had at least one such guess (`1a694cd cc1200: drive GDO0/GDO2 on sync match regardless of IOCFG selection`) which was reverted in `71acbb4` once the IOCFG semantics were properly modeled. The `devices/zoul-firefly/DATASHEET-FINDINGS.md` artifact pattern (a table of citations per finding) emerged as a recovery mechanism — make it the rule from day one, not a way to back-fill correctness later.
 - **A new device often exposes pre-existing simulator infrastructure debt — scope it separately.** The CC1200 port triggered a 15-commit refactor of the radio medium to support per-radio multi-channel state (`8a2d03b` → `72665bb`), which fixed a pre-existing "TSCH channel matching is fake" gap that affected every test on every platform. When you find this pattern (a device's correct behavior requires changing simulator infrastructure that was always wrong), finish the port first against whatever the medium currently exposes, then file the infrastructure fix as its own series. Bundling them ties two unrelated risks together and makes review nearly impossible.
 
@@ -180,7 +186,7 @@ A port is considered done when **all** of the following are true. Paste actual c
 - [ ] `devices/<board>/SPEC.md` exists, no `TODO` fields remain.
 - [ ] `make clean && make` succeeds with zero new warnings.
 - [ ] Firmware ELFs committed under `firmware/<board>/` (bring-up + at least one networking firmware) **with a `PROVENANCE.md` next to them** (auto-stamped by `tools/build-device-firmware.sh`).
-- [ ] If a new off-SoC chip was added: at least one mock-host unit test in `test/test_<chip>.c` exercising the chip's state machine without a real CPU.
+- [ ] If a new off-SoC chip was added: it lives in `src/chips/`, and has at least one mock-host unit test in `test/test_<chip>.c` exercising the chip's state machine without a real CPU.
 - [ ] `./build/test_runner <platform>-firmware` passes (covers L0–L4).
 - [ ] `./build/test_runner <platform>-multinode <bringup>.<board> -t 5000 -q` passes (L5 if applicable).
 - [ ] If radio-equipped: 2-node nullnet-broadcast logs ≥1 RX per node within 30 s sim.

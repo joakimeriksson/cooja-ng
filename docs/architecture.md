@@ -200,6 +200,7 @@ are already tabled in `CLAUDE.md`. The rest of the tree:
 | `radio_medium.c`    | Per-radio medium: spectrum + channel + RX-enabled gating, distance-based RX probability, xorshift32 PRNG, 802.15.4 + 802.15.4g frame trackers. Detailed reference: [`docs/radio-medium.md`](radio-medium.md). |
 | `sim_event_queue.c` | Min-heap event queue keyed on `(time_ns, seq)` for FIFO at equal times (matches COOJA)                          |
 | `mock_sim_host.c`   | Standalone `sim_host_t` implementation backing the host-only chip-driver unit suites (`cc1200-mock-host`, `radio-medium`, `radio-bus`) — no CPU required |
+| `src/chips/*.c`     | Off-SoC chip drivers (CC2420, CC1200, MX25R6435F, ENC28J60) — reach the node only through `sim_host_t`, so one file serves every architecture |
 | `timeline.c`        | Ring buffer of TX/RX/INTF/LED/log events, JSON + CBOR serialization                                             |
 
 ### `src/native/` — non-emulated node types
@@ -347,7 +348,7 @@ Boards differ in *which* chips sit outside the SoC and *how* they connect. csim 
 | **fr5969** | MSP430FR5969     | (no radio)     | —                | FRAM-based MSP430X with eUSCI (per-module IFG/IE) and CS clock module (DCO lookup table, password-unlock); MPY32 32×32→64 multiplier |
 | **cc2538dk** | CC2538 (Cortex-M3) | RF Core *on-chip* | —          | Memory-mapped at `0x40088000` + FFSM regs; NVIC IRQ direct              |
 | **openmote** | CC2538 (Cortex-M3) | RF Core *on-chip* | —          | Same as cc2538dk; only board glue (LEDs / button) differs               |
-| **zoul-firefly** | CC2538 (Cortex-M3) | RF Core *on-chip*; CC1200 *off* (sub-GHz) | — | RF Core same as cc2538dk. CC1200 driver (`src/arm/cc1200.c`, `sim_host_t`-only) over SSI0 (`src/arm/cc2538_ssi.c`) with CSn=PB5, RESET=PC7, GDO0=PB4, GDO2=PB0. Per-node radio fan-out in `test_mixed_multinode.c` feeds delivered bytes to both chips; `radio_medium`'s reserved sub-GHz channel range (≥`RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE`) plus a `cross_band_drop()` filter keeps the two bands isolated without a true dual-radio refactor. |
+| **zoul-firefly** | CC2538 (Cortex-M3) | RF Core *on-chip*; CC1200 *off* (sub-GHz) | — | RF Core same as cc2538dk. CC1200 driver (`src/chips/cc1200.c`, `sim_host_t`-only) over SSI0 (`src/arm/cc2538_ssi.c`) with CSn=PB5, RESET=PC7, GDO0=PB4, GDO2=PB0. Per-node radio fan-out in `test_mixed_multinode.c` feeds delivered bytes to both chips; `radio_medium`'s reserved sub-GHz channel range (≥`RADIO_MEDIUM_SUBGHZ_CHANNEL_BASE`) plus a `cross_band_drop()` filter keeps the two bands isolated without a true dual-radio refactor. |
 | **nrf52840-dongle** | nRF52840 (Cortex-M4F) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic PCA10059 USB Dongle. Single-chip — no off-SoC peripherals. SoC bundle in `src/arm/nrf52840_soc.c` (CLOCK / RTC0 / TIMER0..4 / UARTE0 legacy window / RADIO with EasyDMA + SHORTS / RNG / FICR.DEVICEADDR for per-node IEEE EUI-64). M4 DSP halfword multiply in `src/arm/arm_cpu.c`; FPv4-SP-D16 single-precision VFP in `src/arm/arm_vfp.c`. VTOR=0x1000 because PCA10059 reserves 0x0..0xfff for the Open Bootloader. Reaches L6 (RPL-UDP) — two nodes form a DODAG and exchange `hello N` over the on-chip 2.4 GHz radio. |
 | **nrf52840-dk** | nRF52840 (Cortex-M4F) | RADIO *on-chip* (2.4 GHz 802.15.4) | — | Nordic PCA10056 Development Kit, identical SoC to the Dongle. Reuses `nrf52840_soc.c` verbatim — only board glue differs: 4× LEDs at P0.13–P0.16, 4× buttons at P0.11/P0.12/P0.24/P0.25, console via SEGGER VCP, no bootloader region so VTOR=0x0. Same L6 result as the Dongle; DK ↔ Dongle interop works (same on-air format, same channel). Also runs stock unmodified **Zephyr** 802.15.4 echo as a regression test. |
 | **nrf54l15-dk** | nRF54L15 (Cortex-M33, ARMv8-M) | RADIO *on-chip* (2.4 GHz 802.15.4) | MX25R6435F flash (SPIM00), ENC28J60 Ethernet (SPIM22) | Nordic nRF54L15-DK. Newer SoC family — SoC bundle in `src/arm/nrf54l15_soc.c`: GRTC global timer (live-counter reads, RELATIVE/absolute COMPARE), TIMER, EGU10 → NVIC IRQ, RADIO (edge-triggered TX/RX with debounce, deferred PHYEND/END), FICR.DEVICEID per node. ARMv8-M core support (load-acquire / store-release) in `arm_cpu.c`. On-air format shared with the nRF52840 via `nrf_radio_common.c`. Also models GPIO P0/P1/P2 (OUT/DIR) and the VPR/SPU FLPR-launch registers (see below). **The only platform with the ARMv8-M security extension (TrustZone-M) enabled** — `has_trustzone` on `nrf54l15_config`; SAU/IDAU attribution in `src/arm/arm_trustzone.c`, security state + transition instructions in `arm_cpu.c`, `NVIC_ITNS` banking in `arm_nvic.c`. See [`design/trustzone-m-plan.md`](design/trustzone-m-plan.md). |
@@ -473,7 +474,10 @@ Sky's ADC12 (temp, light, humidity) is currently **not** modeled — `msp430_pla
 
 ### How to add a new off-SoC chip
 
-1. Implement `mychip_init / mychip_spi_exchange / mychip_set_xxx_pin` in `src/msp430/mychip.c`.
+1. Implement `mychip_init / mychip_spi_exchange / mychip_set_xxx_pin` in
+   `src/chips/mychip.c`, taking a `const sim_host_t *` and no CPU/GPIO types —
+   that is what keeps the file usable from any architecture, and why it lives
+   outside `src/msp430/` and `src/arm/`.
 2. In the platform: `msp430_usart_set_spi_exchange` → routing function that picks chip by CS.
 3. Watch `mychip`'s output pins (CS, RESET, ...) via `msp430_gpio_set_output_callback`.
 4. Drive `mychip`'s status pins back via `msp430_gpio_set_input_pin` from inside its state machine.

@@ -167,7 +167,7 @@ infrastructure beyond the platform glue. List ordered by dependency:
    platform fills in to route bytes to chip drivers (analogous to
    `msp430_usart_set_spi_exchange`). Only SSI0 is required for the
    Firefly, but build both for symmetry — costs nothing.
-2. **`src/arm/cc1200.{c,h}` — CC1200 chip driver.** Takes
+2. **`src/chips/cc1200.{c,h}` — CC1200 chip driver.** Takes
    `const sim_host_t *host` only — never `arm_cpu_t` /
    `cc2538_gpio_t` directly. Exposes:
      - `cc1200_init(chip, host)`
@@ -290,7 +290,7 @@ Standard L0–L6 for the platform, plus chip-driver checkpoints
 - [x] `./build/test_runner cc1200-mock-host` passes (chip-driver
       unit tests; 57/57 PASS — added strobe transition timing
       assertions when SIDLE/SRX/STX moved to event-driven MARCSTATE
-      transitions in `src/arm/cc1200.c`)
+      transitions in `src/chips/cc1200.c`)
 - [x] L0–L4 bringup tests pass — `./build/test_runner arm-firmware`
       runs `bringup.zoul-firefly` and asserts the
       `"Zolertia Firefly platform"` banner. (No dedicated
