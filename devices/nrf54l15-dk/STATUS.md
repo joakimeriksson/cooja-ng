@@ -16,7 +16,7 @@ output is the oracle (see `firmware/nrf54l15-dk/PROVENANCE.md`).
   scheduled on the cycle-derived clock.  GPIO gained `PIN_CNF` so a
   `nrf_gpio_cfg_output`'d chip-select shows up in `DIR`.  Evidence:
   `./build/test_runner nrf54l15-spim` → 90 passed, 0 failed.
-- **L2 — MX25R6435F flash: done.** `src/arm/mx25r6435f.c` (RDID, RDSFDP
+- **L2 — MX25R6435F flash: done.** `src/chips/mx25r6435f.c` (RDID, RDSFDP
   with a real JESD216B table, RDSR/RDCR, WREN/WRDI, READ/FAST_READ, page
   program with AND semantics and page wrap, sector/block/chip erase with
   datasheet-typical WIP windows, RES/REMS, deep power-down).  Chips are
@@ -34,7 +34,7 @@ output is the oracle (see `firmware/nrf54l15-dk/PROVENANCE.md`).
   contiki-ng `55e7ef6c8` prints `bit rates:`.  Every value matches; the
   hardware run evidently used a slightly different build of the example.
   The test matches the committed source.
-- **L3 — ENC28J60: done.** `src/arm/enc28j60.c` (RCR/RBM/WCR/WBM/BFS/BFC/
+- **L3 — ENC28J60: done.** `src/chips/enc28j60.c` (RCR/RBM/WCR/WBM/BFS/BFC/
   SRC, four banks with the common EIE..ECON1 window, the MAC/MII dummy
   read byte with the datasheet's per-bank map, an 8 KiB buffer behind
   RBM/WBM with AUTOINC and the ERXND→ERXST wrap, the PHY behind

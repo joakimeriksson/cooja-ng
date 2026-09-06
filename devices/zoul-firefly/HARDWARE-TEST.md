@@ -146,14 +146,14 @@ Compare:
 These are simulator approximations that hardware will reveal as
 correct or wrong:
 
-1. **CC1200 strobe transition times** in `src/arm/cc1200.c`:
+1. **CC1200 strobe transition times** in `src/chips/cc1200.c`:
    - `SIDLE = 50 µs`, `SRX/STX = 200 µs`, `SCAL = 720 µs`
    - These were sourced from Contiki's RTIMER_BUSYWAIT_UNTIL constants
      and CC1200 datasheet SWRU346B. Hardware measurement (logic
      analyzer on GDO0 configured to MARC_2PIN_STATUS_0) would
      confirm or correct.
 
-2. **CC1200 byte period at 50 kbps** in `src/arm/cc1200.c`:
+2. **CC1200 byte period at 50 kbps** in `src/chips/cc1200.c`:
    `CC1200_BYTE_PERIOD_NS = 160000` (160 µs/byte).
    - Should be exactly correct per the radio config.
 

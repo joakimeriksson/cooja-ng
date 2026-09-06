@@ -249,7 +249,7 @@ event, parseable, low overhead when disabled (one TLS bool check).
 | `[t=N.Ns] tx_byte node=N radio=N ch=N byte=0xNN state=N zc=N` | One TX byte from a sender |
 | `[t=N.Ns] tx_frame_complete node=N radio=N ch=N subghz=N expected_len=N payload_count=N` | Sender finished assembling a frame |
 | `[t=N.Ns] filter sender=N/N receiver=N/N ch=N/N -> DELIVER/DROP (channel_mismatch)` | Per-filter decision |
-| `[t=N.Ns] cc2420 node=N state X -> Y` | CC2420 chip state transition (from `src/msp430/cc2420.c`) |
+| `[t=N.Ns] cc2420 node=N state X -> Y` | CC2420 chip state transition (from `src/chips/cc2420.c`) |
 
 Useful diagnostic patterns:
 

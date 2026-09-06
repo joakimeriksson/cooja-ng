@@ -120,8 +120,8 @@ flashing/debug interface, not visible to firmware):
 
 | Chip | Bus | SCK | MOSI | MISO | CS (GPIO, active low) | Rate / mode | Model |
 |------|-----|-----|------|------|-----------------------|-------------|-------|
-| **MX25R6435F** 64 Mbit NOR flash (on-board, DK schematic) | SPIM00 | P2.01 | P2.02 | P2.04 | P2.05 | 8 MHz, mode 0 | `src/arm/mx25r6435f.c` |
-| **ENC28J60** Ethernet controller (module on the expansion header) | SPIM22 | P1.11 | P1.06 | P1.07 | P1.12 | 4 MHz, mode 0 | `src/arm/enc28j60.c` |
+| **MX25R6435F** 64 Mbit NOR flash (on-board, DK schematic) | SPIM00 | P2.01 | P2.02 | P2.04 | P2.05 | 8 MHz, mode 0 | `src/chips/mx25r6435f.c` |
+| **ENC28J60** Ethernet controller (module on the expansion header) | SPIM22 | P1.11 | P1.06 | P1.07 | P1.12 | 4 MHz, mode 0 | `src/chips/enc28j60.c` |
 
 Chip-select is a plain GPIO driven by `os/dev/spi.c` (`spi_select` →
 `gpio_hal_arch_clear_pin`), never SPIM's `PSEL.CSN`.  The SoC therefore

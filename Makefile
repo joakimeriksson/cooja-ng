@@ -16,7 +16,7 @@ endif
 # a second hand-copied flag string is deliberate: the old PGO_CFLAGS drifted out
 # of sync with CFLAGS and `make pgo` stopped compiling entirely.
 PGO_FLAGS =
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml $(NATIVE_FLAG) -flto -MMD -MP $(PGO_FLAGS)
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/chips -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml $(NATIVE_FLAG) -flto -MMD -MP $(PGO_FLAGS)
 # -rdynamic exports the host's dynamic symbol table so a dlopen'd plugin can
 # resolve host library functions (e.g. the radio_medium accessors a medium
 # plugin uses).  Behavior-neutral (symbol visibility only).
@@ -30,6 +30,7 @@ COMMON_SRC_DIR = src/common
 SIM_SRC_DIR = src/sim
 SERVICES_SRC_DIR = src/services
 MOTES_SRC_DIR = src/motes
+CHIPS_SRC_DIR = src/chips
 MSP430_SRC_DIR = src/msp430
 ARM_SRC_DIR = src/arm
 RISCV_SRC_DIR = src/riscv
@@ -42,6 +43,7 @@ COMMON_BUILD_DIR = build/common
 SIM_BUILD_DIR = build/sim
 SERVICES_BUILD_DIR = build/services
 MOTES_BUILD_DIR = build/motes
+CHIPS_BUILD_DIR = build/chips
 MSP430_BUILD_DIR = build/msp430
 ARM_BUILD_DIR = build/arm
 RISCV_BUILD_DIR = build/riscv
@@ -57,8 +59,7 @@ SOURCES = $(MSP430_SRC_DIR)/msp430_cpu.c \
           $(MSP430_SRC_DIR)/msp430_clock.c \
           $(MSP430_SRC_DIR)/msp430_gpio.c \
           $(MSP430_SRC_DIR)/msp430_decode.c \
-          $(MSP430_SRC_DIR)/msp430_platform.c \
-          $(MSP430_SRC_DIR)/cc2420.c
+          $(MSP430_SRC_DIR)/msp430_platform.c
 
 ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/arm_decode.c \
@@ -75,8 +76,6 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/nrf52840_soc.c \
               $(ARM_SRC_DIR)/nrf54l15_soc.c \
               $(ARM_SRC_DIR)/nrf54l15_spim.c \
-              $(ARM_SRC_DIR)/mx25r6435f.c \
-              $(ARM_SRC_DIR)/enc28j60.c \
               $(ARM_SRC_DIR)/nrf_radio_common.c \
               $(ARM_SRC_DIR)/cc2538_uart.c \
               $(ARM_SRC_DIR)/cc2538_gpio.c \
@@ -85,8 +84,15 @@ ARM_SOURCES = $(ARM_SRC_DIR)/arm_cpu.c \
               $(ARM_SRC_DIR)/cc2538_ioc.c \
               $(ARM_SRC_DIR)/cc2538_rfcore.c \
               $(ARM_SRC_DIR)/cc2538_sleeptimer.c \
-              $(ARM_SRC_DIR)/cc2538_ssi.c \
-              $(ARM_SRC_DIR)/cc1200.c
+              $(ARM_SRC_DIR)/cc2538_ssi.c
+
+# Off-SoC chips — drivers that talk to the node only through sim_host_t
+# (no CPU or GPIO types), so the same file serves any architecture.  See
+# docs/porting-a-device.md §6.4.
+CHIPS_SOURCES = $(CHIPS_SRC_DIR)/cc2420.c \
+                $(CHIPS_SRC_DIR)/cc1200.c \
+                $(CHIPS_SRC_DIR)/mx25r6435f.c \
+                $(CHIPS_SRC_DIR)/enc28j60.c
 
 # RISC-V — RV32E FLPR coprocessor (nRF54L15). See docs/design/riscv-vpr-plan.md.
 RISCV_SOURCES = $(RISCV_SRC_DIR)/riscv_cpu.c \
@@ -167,6 +173,7 @@ SERVICES_OBJECTS = $(patsubst $(SERVICES_SRC_DIR)/%.c, $(SERVICES_BUILD_DIR)/%.o
 MOTES_OBJECTS = $(patsubst $(MOTES_SRC_DIR)/%.c, $(MOTES_BUILD_DIR)/%.o, $(MOTES_SOURCES))
 OBJECTS = $(patsubst $(MSP430_SRC_DIR)/%.c, $(MSP430_BUILD_DIR)/%.o, $(SOURCES))
 ARM_OBJECTS = $(patsubst $(ARM_SRC_DIR)/%.c, $(ARM_BUILD_DIR)/%.o, $(ARM_SOURCES))
+CHIPS_OBJECTS = $(patsubst $(CHIPS_SRC_DIR)/%.c, $(CHIPS_BUILD_DIR)/%.o, $(CHIPS_SOURCES))
 RISCV_OBJECTS = $(patsubst $(RISCV_SRC_DIR)/%.c, $(RISCV_BUILD_DIR)/%.o, $(RISCV_SOURCES))
 NATIVE_OBJECTS = $(patsubst $(NATIVE_SRC_DIR)/%.c, $(NATIVE_BUILD_DIR)/%.o, $(NATIVE_SOURCES))
 UI_OBJECTS = $(patsubst $(UI_SRC_DIR)/%.c, $(UI_BUILD_DIR)/%.o, $(UI_SOURCES))
@@ -224,6 +231,9 @@ $(MSP430_BUILD_DIR):
 $(ARM_BUILD_DIR):
 	mkdir -p $(ARM_BUILD_DIR)
 
+$(CHIPS_BUILD_DIR):
+	mkdir -p $(CHIPS_BUILD_DIR)
+
 $(RISCV_BUILD_DIR):
 	mkdir -p $(RISCV_BUILD_DIR)
 
@@ -272,6 +282,9 @@ $(MSP430_BUILD_DIR)/%.o: $(MSP430_SRC_DIR)/%.c | $(MSP430_BUILD_DIR)
 $(ARM_BUILD_DIR)/%.o: $(ARM_SRC_DIR)/%.c | $(ARM_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(CHIPS_BUILD_DIR)/%.o: $(CHIPS_SRC_DIR)/%.c | $(CHIPS_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(RISCV_BUILD_DIR)/%.o: $(RISCV_SRC_DIR)/%.c | $(RISCV_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -294,7 +307,7 @@ $(YAML_BUILD_DIR)/%.o: $(YAML_SRC_DIR)/%.c | $(YAML_BUILD_DIR)
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(RISCV_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(YAML_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(CHIPS_OBJECTS) $(RISCV_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(YAML_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Auto-generated header dependencies (from -MMD). Catches the case where
@@ -343,7 +356,7 @@ configure:
 	@echo "Wrote csim.conf: CONTIKI_DIR=$(CONTIKI_DIR)"
 
 # Debug build
-debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml -DDEBUG
+debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/chips -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml -DDEBUG
 debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
