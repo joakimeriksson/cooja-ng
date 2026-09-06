@@ -34,7 +34,25 @@ output is the oracle (see `firmware/nrf54l15-dk/PROVENANCE.md`).
   contiki-ng `55e7ef6c8` prints `bit rates:`.  Every value matches; the
   hardware run evidently used a slightly different build of the example.
   The test matches the committed source.
-- **L3 — ENC28J60 on SPIM22 / CS P1.12:** pending.
+- **L3 — ENC28J60: done.** `src/arm/enc28j60.c` (RCR/RBM/WCR/WBM/BFS/BFC/
+  SRC, four banks with the common EIE..ECON1 window, the MAC/MII dummy
+  read byte with the datasheet's per-bank map, an 8 KiB buffer behind
+  RBM/WBM with AUTOINC and the ERXND→ERXST wrap, the PHY behind
+  MIREGADR/MIWR/MIRD/MICMD/MISTAT, ESTAT.CLKRDY after the OST, and
+  ECON1.TXRTS self-clearing with EIR.TXIF).  Evidence:
+  `enc28j60-mock-host` → 47 passed, and
+  `test configs/test-enc28j60-nrf54l15-dk.json` reproduces the hardware
+  report line for line.
+- **Runner bug found and fixed on the way:** the JSON test engine was
+  attached *after* `init_node`, but the ELF boot policy runs each mote
+  for up to 8M cycles inside `init_node` (~10 ms of sim time at
+  128 MHz).  Every console line printed in that window was emitted with
+  no observer attached and silently dropped, so no test step could match
+  boot-time output — which is all the enc28j60-test probe report is.
+  The engine is now armed before the boot loop.
+- **L4 — Ethernet frame path (TAP/pcap):** not started, waiting for a
+  look at L3 first.  The model already keeps the buffer memory,
+  EPKTCNT/PKTDEC and the TXRTS handshake that path needs.
 - **L4 — Ethernet frame path (TAP/pcap):** not started; only after L3 review.
 
 ## Current state — short version

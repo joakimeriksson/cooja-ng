@@ -1963,6 +1963,32 @@ int run_mixed_multinode_test(int argc, char **argv) {
     printf("Time step: %lld ns\n\n", (long long)TIME_STEP_NS);
 
     num_nodes = node_count;
+
+    /* Arm the JSON test engine BEFORE the motes boot.
+     *
+     * arm_elf_mote_boot / msp430_elf_mote_boot deliberately run the
+     * firmware for up to 8M cycles inside init_node (see the boot-policy
+     * comment there), which on a 128 MHz part is ~10 ms of simulated
+     * time — long enough for a Contiki banner and a one-shot self-test
+     * report to come and go.  Those console lines are emitted as
+     * SIM_OBS_MOTE_LOG_LINE like any other, so with the observer
+     * attached only after the boot loop they were dropped on the floor
+     * and a test step waiting for boot output could never match.  The
+     * nRF54L15 enc28j60-test prints its whole probe report exactly once,
+     * at boot, so this is the difference between a testable firmware and
+     * an untestable one.
+     *
+     * The service only reads lines, so arming it earlier is safe; the
+     * JS-script path still starts its own engine below (the two are
+     * mutually exclusive, and this pre-start is a no-op for it). */
+    if (config_loaded && config.has_test && !config.has_js_script)
+        json_test_service_start(&json_test_svc, &config.test);
+    else
+        json_test_service_start(&json_test_svc, NULL);
+    sim_service_attach(&sim_rt,
+                       sim_registry_find_service(&g_registry, "json-test"),
+                       &json_test_svc);
+
 sim_restart:
     for (int i = 0; i < node_count; i++) {
         const char *fw = firmware_paths[i < firmware_count ? i : firmware_count - 1];
@@ -2153,7 +2179,7 @@ sim_restart:
         }
         json_test_service_start(&json_test_svc, NULL);
     } else if (config_loaded && config.has_test) {
-        json_test_service_start(&json_test_svc, &config.test);
+        /* already armed before the boot loop above */
         printf("Test: %d steps", config.test.step_count);
         if (config.test.fail_on_count > 0)
             printf(", %d fail_on patterns", config.test.fail_on_count);
@@ -2164,14 +2190,7 @@ sim_restart:
         if (config.test.action_count > 0)
             printf(", %d actions", config.test.action_count);
         printf("\n");
-    } else {
-        json_test_service_start(&json_test_svc, NULL);
     }
-    /* M35: register the JSON test runner once; its on_event consumes
-     * SIM_OBS_MOTE_LOG_LINE via the host fan-out (a no-op when inactive). */
-    sim_service_attach(&sim_rt,
-                       sim_registry_find_service(&g_registry, "json-test"),
-                       &json_test_svc);
 
     /* Initialize timeline and node state tracking.
      * M32: the timeline is a service now — attach runs tl_init() and the

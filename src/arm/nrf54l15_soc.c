@@ -20,6 +20,7 @@
 #include "ieee_802154.h"
 #include "nrf_radio_common.h"
 #include "mx25r6435f.h"
+#include "enc28j60.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2437,8 +2438,25 @@ static void flash_destroy(void *chip) {
     free(chip);
 }
 
+static uint8_t eth_exchange(void *chip, uint8_t mosi) {
+    return enc28j60_spi_exchange((enc28j60_t *)chip, mosi);
+}
+static void eth_set_cs(void *chip, bool low) { enc28j60_set_cs((enc28j60_t *)chip, low); }
+static void eth_destroy(void *chip) {
+    enc28j60_destroy((enc28j60_t *)chip);
+    free(chip);
+}
+
 static int nrf54l_soc_bind_spi_chip(nrf54l_spi_chip_t *c, const char *name,
                                     const sim_host_t *host) {
+    if (strcmp(name, "enc28j60") == 0) {
+        enc28j60_t *e = calloc(1, sizeof(*e));
+        if (!e) return -1;
+        enc28j60_init(e, host);
+        c->chip = e; c->exchange = eth_exchange; c->set_cs = eth_set_cs;
+        c->destroy = eth_destroy;
+        return 0;
+    }
     if (strcmp(name, "mx25r6435f") == 0) {
         mx25r6435f_t *f = calloc(1, sizeof(*f));
         if (!f) return -1;

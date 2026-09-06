@@ -76,3 +76,32 @@
   ```
 - **Test**: `configs/test-spi-flash-nrf54l15-dk.json`
 
+## enc28j60-test.nrf54l15-dk
+
+- **Source**: contiki-ng commit `55e7ef6c889ed23a9d5c1da1a2e04395c3ee6c77`
+- **Source path**: `examples/platform-specific/nrf/enc28j60-test` (file: `enc28j60-test.c`)
+- **TARGET**: `nrf`
+- **BOARD**: `nrf54l15/dk`
+- **Branch**: `feature/nrf-spi-driver` (joakimeriksson/contiki-ng, PR contiki-ng/contiki-ng#3234)
+- **Make flags**: the example's own Makefile (`NRF_WITH_SPI=1`, `NRF_SPI_INSTANCES=22`, ENC28J60 driver + SPI-HAL arch layer by name)
+- **Toolchain**: host `arm-none-eabi-gcc 15.2.1` (Arm GNU Toolchain 15.2.Rel1), built with `--local`
+- **Built**: 2026-09-06T09:00:15Z by Joakim Eriksson
+- **Build command**: `tools/build-device-firmware.sh --target nrf --board nrf54l15/dk --example examples/platform-specific/nrf/enc28j60-test --output firmware/nrf54l15-dk/enc28j60-test.nrf54l15-dk`
+- **What it does**: probes an ENC28J60 on SPIM22 (SCK P1.11, MOSI P1.06, MISO P1.07, CS P1.12 as GPIO; 4 MHz mode 0) — soft reset, ESTAT.CLKRDY, EREVID, a scratch register round-trip and a six-register MAC address round-trip that exercises the dummy byte MAC reads return — then runs `enc28j60_init()` and polls for frames, printing a heartbeat every ~5 s.
+- **Hardware oracle** (real PCA10156, 2026-09-06 — the emulation prints the same):
+
+  ```
+  ENC28J60 test
+    controller 0, 4000000 Hz
+    SCK P1.11  MOSI P1.06  MISO P1.07  CS P1.12
+    ESTAT:    01  OK (CLKRDY set)
+    EREVID:   06  OK (silicon rev B7)
+    reg r/w:  5a  OK
+    MAC r/w:  02:de:ad:be:ef:01  OK
+  ENC28J60 OK
+  initialising driver, MAC 02:00:00:00:00:01
+  polling for frames -- plug the module into a switch
+  alive: 0 frames so far (no cable, or nothing on the link yet)
+  ```
+- **Test**: `configs/test-enc28j60-nrf54l15-dk.json`
+
