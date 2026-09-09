@@ -39,6 +39,34 @@ static void nrf54l_host_cancel(void *cpu, cpu_event_t *ev) {
     arm_cancel_event((arm_cpu_t *)cpu, ev);
 }
 
+/* Schedule an event at an absolute time in the CYCLE clock's ns base,
+ * arm_cycles_to_ns(cpu->cycles), which is the base the GRTC and TIMER
+ * models measure "now" in. arm_schedule_event_ns converts against
+ * cpu->sim_time_ns instead: a mirror the mote layer pins to kernel time
+ * at slice boundaries, which trails the cycle clock by the boot pre-run
+ * and by how far the current slice has advanced. A deadline computed from
+ * the cycle clock and converted against that mirror lands late by the
+ * gap; an absolute GRTC compare re-armed from inside its own ISR was late
+ * on every tick. Converting against the clock the deadline came from
+ * puts it on the cycle it names.
+ *
+ * The delta is rounded up: the event lands on the first cycle at or after
+ * the deadline, never the one before. A 62 ns TIMER tick is 7.9 cycles at
+ * 128 MHz; floored to 7 the compare fired at 54 ns, with the modelled
+ * counter still one tick short of CC. */
+static void nrf54l_schedule_at_cycle_ns(arm_cpu_t *cpu, arm_event_t *ev, int64_t fire_ns) {
+    int64_t now_ns = arm_cycles_to_ns(cpu->cycles, cpu->cpu_freq_hz);
+    int64_t delta  = fire_ns > now_ns ? fire_ns - now_ns : 0;
+    arm_schedule_event(cpu, ev, cpu->cycles + cpu_ns_to_cycles_ceil(delta, cpu->cpu_freq_hz));
+}
+
+/* schedule_ns for the `live_host` vtable: its now_ns is cycle-derived
+ * (nrf54l_host_now_ns_live), so a deadline computed from it must be
+ * converted the same way or the SPIM completion lands late by the gap. */
+static void nrf54l_host_schedule_ns_live(void *cpu, cpu_event_t *ev, int64_t fire_ns) {
+    nrf54l_schedule_at_cycle_ns((arm_cpu_t *)cpu, ev, fire_ns);
+}
+
 /* ============================================================
  * GLOBAL_CLOCK (0x5010_E000)
  *
@@ -401,11 +429,74 @@ void nrf54l_dppi_unsubscribe(nrf54l_dppi_state_t *d, int channel,
     }
 }
 
+static int trc54_dppi = -1;   /* NRF54L_DPPI_TRACE: publishes, group tasks, CHEN/CHG writes */
+static int nrf54l_trace_flag(int *cache, const char *name);
+
+static void nrf54l_dppi_apply_group_tasks(nrf54l_dppi_state_t *d) {
+    while (d->pending_chg_en || d->pending_chg_dis) {
+        uint32_t en = d->pending_chg_en, dis = d->pending_chg_dis;
+        d->pending_chg_en = d->pending_chg_dis = 0;
+        for (int g = 0; g < NRF54L_DPPI_NUM_GROUPS; g++) {
+            if (en  & (1u << g)) d->chen |=  d->chg[g];
+            if (dis & (1u << g)) d->chen &= ~d->chg[g];
+        }
+        if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+            fprintf(stderr, "[dppi cpu=0x%04x] group en=%x dis=%x -> chen=%08x\n",
+                    (unsigned)((uintptr_t)&d->plat->cpu & 0xFFFF), en, dis, d->chen);
+    }
+}
+
 void nrf54l_dppi_publish(nrf54l_dppi_state_t *d, int channel) {
     if (channel < 0 || channel >= NRF54L_DPPI_NUM_CHANNELS) return;
+    if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+        fprintf(stderr, "[dppi cpu=0x%04x] publish ch%d %s subs=%s\n",
+                (unsigned)((uintptr_t)&d->plat->cpu & 0xFFFF), channel,
+                (d->chen & (1u << channel)) ? "enabled" : "GATED",
+                d->subs[channel] ? "yes" : "none");
     if (!(d->chen & (1u << channel))) return;   /* channel gated off */
+    /* Group tasks raised by this publish's subscribers apply once this
+     * publish has reached every subscriber — not once an enclosing publish
+     * has (a subscriber that is itself a publisher, EGU here, nests them).
+     * The enclosing publish's pending set is parked meanwhile. */
+    uint32_t outer_en = d->pending_chg_en, outer_dis = d->pending_chg_dis;
+    d->pending_chg_en = d->pending_chg_dis = 0;
+    d->publish_depth++;
     for (nrf54l_dppi_subscriber_t *s = d->subs[channel]; s; s = s->next)
         s->cb(s->user);
+    d->publish_depth--;
+    nrf54l_dppi_apply_group_tasks(d);
+    d->pending_chg_en  |= outer_en;
+    d->pending_chg_dis |= outer_dis;
+}
+
+/* TASKS_CHG[n].EN / .DIS — from the CPU they take effect at once; from a
+ * DPPI subscription they are deferred to the end of the publish that
+ * raised them. */
+static void nrf54l_dppi_chg_task(nrf54l_dppi_state_t *d, int g, bool enable) {
+    if (enable) d->pending_chg_en  |= 1u << g;
+    else        d->pending_chg_dis |= 1u << g;
+    if (d->publish_depth == 0)
+        nrf54l_dppi_apply_group_tasks(d);
+}
+static void dppi_chg_en_sub_cb(void *user) {
+    nrf54l_dppi_chg_ctx_t *c = (nrf54l_dppi_chg_ctx_t *)user;
+    nrf54l_dppi_chg_task(c->d, c->g, true);
+}
+static void dppi_chg_dis_sub_cb(void *user) {
+    nrf54l_dppi_chg_ctx_t *c = (nrf54l_dppi_chg_ctx_t *)user;
+    nrf54l_dppi_chg_task(c->d, c->g, false);
+}
+static void nrf54l_dppi_set_chg_subscription(nrf54l_dppi_state_t *d, int g, bool enable,
+                                             uint32_t value) {
+    uint32_t *slot = enable ? &d->sub_chg_en[g] : &d->sub_chg_dis[g];
+    nrf54l_dppi_sub_cb cb = enable ? dppi_chg_en_sub_cb : dppi_chg_dis_sub_cb;
+    d->chg_ctx[g].d = d;
+    d->chg_ctx[g].g = g;
+    if (*slot & 0x80000000u)
+        nrf54l_dppi_unsubscribe(d, (int)(*slot & 0x1Fu), cb, &d->chg_ctx[g]);
+    *slot = value;
+    if (value & 0x80000000u)
+        nrf54l_dppi_subscribe(d, (int)(value & 0x1Fu), cb, &d->chg_ctx[g]);
 }
 
 static int nrf54l_dppic_read(void *user_data, uint32_t addr) {
@@ -413,6 +504,12 @@ static int nrf54l_dppic_read(void *user_data, uint32_t addr) {
     /* DPPIC bases overlap by region in addressing; the meaningful sub-
      * offset is the low 12 bits. */
     uint32_t off = addr & 0xFFFu;
+    if (off >= 0x080 && off < 0x080 + 8 * NRF54L_DPPI_NUM_GROUPS) {
+        int g = (int)(off - 0x080) / 8;
+        return (int)((off & 4) ? d->sub_chg_dis[g] : d->sub_chg_en[g]);
+    }
+    if (off >= 0x800 && off < 0x800 + 4 * NRF54L_DPPI_NUM_GROUPS)
+        return (int)d->chg[(off - 0x800) / 4];
     switch (off) {
         case NRF54L_DPPI_CHEN:
         case NRF54L_DPPI_CHENSET:
@@ -424,11 +521,26 @@ static int nrf54l_dppic_read(void *user_data, uint32_t addr) {
 static void nrf54l_dppic_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf54l_dppi_state_t *d = (nrf54l_dppi_state_t *)user_data;
     uint32_t off = addr & 0xFFFu;
+    if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+        fprintf(stderr, "[dppi cpu=0x%04x] W off=0x%03x = 0x%08x (chen=%08x)\n",
+                (unsigned)((uintptr_t)&d->plat->cpu & 0xFFFF), off, value, d->chen);
+    if (off < 8 * NRF54L_DPPI_NUM_GROUPS) {                  /* TASKS_CHG[n].EN/DIS */
+        if (value == 1) nrf54l_dppi_chg_task(d, (int)off / 8, (off & 4) == 0);
+        return;
+    }
+    if (off >= 0x080 && off < 0x080 + 8 * NRF54L_DPPI_NUM_GROUPS) {   /* SUBSCRIBE_CHG[n] */
+        nrf54l_dppi_set_chg_subscription(d, (int)(off - 0x080) / 8, (off & 4) == 0, value);
+        return;
+    }
+    if (off >= 0x800 && off < 0x800 + 4 * NRF54L_DPPI_NUM_GROUPS) {   /* CHG[n] membership */
+        d->chg[(off - 0x800) / 4] = value;
+        return;
+    }
     switch (off) {
         case NRF54L_DPPI_CHEN:    d->chen  = value;  break;
         case NRF54L_DPPI_CHENSET: d->chen |= value;  break;
         case NRF54L_DPPI_CHENCLR: d->chen &= ~value; break;
-        default: /* TASKS_CHG, SUBSCRIBE_CHG, CHG cluster: no-op */ break;
+        default: break;
     }
 }
 
@@ -554,8 +666,7 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
     int64_t  fire_ns;
     if (cc->absolute_mode) {
         /* Absolute mode: CCL/CCH form a 52-bit syscounter target.
-         * Convert to ns from the GRTC start anchor and let
-         * arm_schedule_event_ns figure out the fire cycle. If the
+         * Convert to ns from the GRTC start anchor. If the
          * target is already in the past relative to now, the firmware
          * scheduled it past-due; fire on the next event check, which
          * is what real-HW comparator-already-matched semantics
@@ -566,7 +677,7 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
                   (int64_t)(target * (uint64_t)NRF54L_GRTC_TICK_NS);
         if (fire_ns < now_ns) fire_ns = now_ns;
         cc->scheduled_ns = fire_ns;
-        arm_schedule_event_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
+        nrf54l_schedule_at_cycle_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
         return;
     }
     uint32_t delay_ticks = cc->ccadd & 0x7FFFFFFFu;
@@ -585,14 +696,14 @@ static void nrf54l_grtc_arm_cc(nrf54l_grtc_state_t *grtc, int idx) {
          * at 56% of sim time and the udp-client etimer never reaching
          * its 10 s SEND_INTERVAL.
          *
-         * arm_schedule_event_ns will fire the event on the next event
-         * check after the CPU's cycle passes `fire_ns`, so handing it a
+         * The event fires on the next event check after the CPU's
+         * cycle passes `fire_ns`, so handing it a
          * past timestamp just means "fire ASAP" — which is what real
          * comparator-already-matched semantics produce. */
         fire_ns = cc->scheduled_ns + delay_ns;
     }
     cc->scheduled_ns = fire_ns;
-    arm_schedule_event_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
+    nrf54l_schedule_at_cycle_ns(&grtc->plat->cpu, (arm_event_t *)cc->event, fire_ns);
 }
 
 static void nrf54l_grtc_compare_fire(void *user_data, cpu_event_t *event) {
@@ -880,6 +991,10 @@ static int nrf54l_egu_read(void *user_data, uint32_t addr) {
 static void nrf54l_egu_write(void *user_data, uint32_t addr, uint32_t value) {
     nrf54l_egu_state_t *e = (nrf54l_egu_state_t *)user_data;
     uint32_t off = addr & 0xFFFu;
+    if (nrf54l_trace_flag(&trc54_dppi, "NRF54L_DPPI_TRACE"))
+        fprintf(stderr, "[egu cpu=0x%04x cyc=%lld W off=0x%03x = 0x%08x]\n",
+                (unsigned)((uintptr_t)&e->plat->cpu & 0xFFFF),
+                (long long)e->plat->cpu.cycles, off, value);
     /* TASKS_TRIGGER[0..15] — write 1 to fire. */
     if (off < E_TASKS_BASE + 4 * NRF54L_EGU_NUM_CHANNELS) {
         if (value == 1) egu_fire_event(e, (off - E_TASKS_BASE) / 4);
@@ -1306,8 +1421,38 @@ static void nrf54l_radio_set_state(nrf54l_radio_state_t *r, uint32_t new_state) 
                 r->disabled_event_defer.callback  = nrf54l_radio_disabled_event_fire_cb;
                 r->disabled_event_defer.user_data = r;
                 r->disabled_event_defer_scheduled = 1;
+                /* Silicon ramps down into DISABLED in ~0.5 µs, but this
+                 * delay also stands in for an ordering the model cannot
+                 * otherwise express. On hardware the CRC result precedes
+                 * END by a few cycles, so the driver's receive ISR is
+                 * already running when DISABLED arrives; here CRCOK, END
+                 * and the disable land in one instant and the ISR can only
+                 * start afterwards. The value has to satisfy both sides of
+                 * that ISR:
+                 *
+                 *   - not before ~2.5 µs: the ISR must reach the point where
+                 *     it tears down the ramp-up chain before DISABLED fires,
+                 *     or the chain re-arms the receiver under it;
+                 *   - not after ~4 µs: DISABLED starts TIMER10, and the
+                 *     driver samples that timer ~6.6 µs after CRCOK to decide
+                 *     whether it can still transmit an acknowledgement. It
+                 *     needs to read a few ticks, and a late start reads too
+                 *     few and the acknowledgement is abandoned.
+                 *
+                 * The window was measured with the 2-node RPL-UDP tests: 2 µs
+                 * fails on the first side, 5 µs on the second, 2.5-4 µs pass.
+                 * The value the model shipped with, 8 µs, broke every
+                 * acknowledgement the driver itself transmits, which went
+                 * unnoticed only while the firmware also acknowledged from
+                 * its CSMA layer. NRF54L_DISABLED_DEFER_NS overrides it;
+                 * see docs/design/nrf54l15-ack-gap.md. */
+                static int64_t defer_ns = -1;
+                if (defer_ns < 0) {
+                    const char *e = getenv("NRF54L_DISABLED_DEFER_NS");
+                    defer_ns = e ? strtoll(e, NULL, 0) : 3000LL;
+                }
                 int64_t fire = cpu->cycles +
-                    cpu_ns_to_cycles(8000LL, cpu->cpu_freq_hz);
+                    cpu_ns_to_cycles(defer_ns, cpu->cpu_freq_hz);
                 arm_schedule_event(cpu, &r->disabled_event_defer, fire);
             }
             break;
@@ -1715,13 +1860,13 @@ void nrf54l_radio_receive_byte(nrf54l15_soc_t *soc, uint8_t byte) {
                 else
                     nrf54l_radio_fire_event(r, &r->evt_crcerror, INT_CRCERROR, PUB_CRCERROR);
 
-                /* No hardware-style auto-ACK: the Nordic 802.15.4 driver
-                 * schedules its own ACK via TIMER+PPI in response to
-                 * CRCOK with AR bit set, and now that emit_tx defers
-                 * PHYEND to actual air-time end the driver has time to
-                 * exit its critical section and arm the ACK on time.
-                 * Emitting one from the chip too produces a duplicate
-                 * ACK frame at the sender. */
+                /* No chip-fabricated auto-ACK: the Nordic 802.15.4 driver
+                 * builds and transmits the acknowledgement itself, timed off
+                 * TIMER10 and the DPPI fabric, so emitting one here would
+                 * duplicate it. Firmware built with CSMA_CONF_SEND_SOFT_ACK=0
+                 * (hardware-acknowledge only) depends on that driver path
+                 * completing; see the receive-completion ordering note on
+                 * disabled_event_defer. */
                 r->state    = NRF54L_RADIO_STATE_RXIDLE;
                 r->rx_phase = NRF54L_RX_WAIT_PREAMBLE;
                 nrf54l_radio_apply_shorts(r, R_SHORT_END_START);
@@ -1972,12 +2117,18 @@ static void nrf54l_timer_compare_fired(void *user, cpu_event_t *ev) {
                 (long long)t->plat->cpu.cycles,
                 t->base_addr, n, t->cc[n], irq_fired, pub);
     }
-    /* SHORTS: COMPARE_CLEAR (bit n), COMPARE_STOP (bit 8+n). */
+    /* SHORTS: COMPARE[n]_CLEAR is bit n, COMPARE[n]_STOP is bit 16+n on
+     * this SoC (TIMER_SHORTS_COMPARE0_STOP_Pos = 16; the 8+n layout belongs
+     * to older nRF5x parts). With STOP read from the wrong bit, TIMER10 free-
+     * ran after nrf_802154 armed COMPARE0_STOP, so the timestamp the driver
+     * samples when deciding whether it can still transmit an acknowledgement
+     * came back in the millions of ticks and every acknowledgement was
+     * abandoned as too late. */
     if (t->shorts & (1u << n)) {
         t->snapshot = 0;
         t->t0_ns = nrf54l_timer_now_ns(t);
     }
-    if (t->shorts & (1u << (8 + n))) {
+    if (t->shorts & (1u << (16 + n))) {
         if (t->running) t->snapshot = nrf54l_timer_counter_now(t);
         t->running = false;
     }
@@ -1995,7 +2146,7 @@ static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
      * the driver. */
     bool inten   = (t->inten & (1u << (16 + n))) != 0;
     bool publish = (t->publish_compare[n] & 0x80000000u) != 0;
-    bool shorts  = (t->shorts & ((1u << n) | (1u << (8 + n)))) != 0;
+    bool shorts  = (t->shorts & ((1u << n) | (1u << (16 + n)))) != 0;
     if (!inten && !publish && !shorts) return;
     uint32_t now = nrf54l_timer_counter_now(t);
     uint32_t target = t->cc[n] & nrf54l_timer_mask(t);
@@ -2003,12 +2154,18 @@ static void nrf54l_timer_schedule_cc(nrf54l_timer_state_t *t, int n) {
     if (delta == 0) delta = nrf54l_timer_mask(t) + 1u;  /* full wrap */
     uint64_t tn = nrf54l_timer_tick_ns(t);
     int64_t fire_ns = nrf54l_timer_now_ns(t) + (int64_t)(delta * tn);
-    arm_schedule_event_ns(&t->plat->cpu, &t->ev_compare[n], fire_ns);
+    nrf54l_schedule_at_cycle_ns(&t->plat->cpu, &t->ev_compare[n], fire_ns);
 }
 
 static void nrf54l_timer_capture(nrf54l_timer_state_t *t, int n) {
     if (n < 0 || n >= NRF54L_TIMER_NUM_CC) return;
     t->cc[n] = nrf54l_timer_counter_now(t);
+    if (nrf54l_trace_flag(&trc54_timer, "NRF54L_TIMER_TRACE"))
+        fprintf(stderr, "[timerC cpu=0x%04x cyc=%lld base=0x%08x capture cc%d=%u running=%d "
+                        "cc0=%u cc1=%u]\n",
+                (unsigned)((uintptr_t)&t->plat->cpu & 0xFFFF),
+                (long long)t->plat->cpu.cycles, t->base_addr, n, t->cc[n],
+                (int)t->running, t->cc[0], t->cc[1]);
 }
 
 static void nrf54l_timer_task(nrf54l_timer_state_t *t, uint32_t off) {
@@ -2554,6 +2711,7 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
      * DPPIC base addresses (DPPIC00/10/20/30).  Subscribers register
      * via nrf54l_dppi_subscribe(); publishers call nrf54l_dppi_publish().
      * No state to initialise — channels start disabled, subs list empty. */
+    soc->dppi.plat = plat;
     for (size_t i = 0; i < sizeof(nrf54l_dppic_bases) / sizeof(nrf54l_dppic_bases[0]); i++) {
         arm_register_io(&plat->cpu,
                         nrf54l_dppic_bases[i], NRF54L_DPPIC_SIZE,
@@ -2578,8 +2736,9 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
      * chips: same as plat->host but now_ns comes from CPU cycles, so an
      * event armed mid-step lands bytes*8/bit-rate ahead of *now*, not of
      * the step's start. */
-    soc->live_host        = plat->host;
-    soc->live_host.now_ns = nrf54l_host_now_ns_live;
+    soc->live_host             = plat->host;
+    soc->live_host.now_ns      = nrf54l_host_now_ns_live;
+    soc->live_host.schedule_ns = nrf54l_host_schedule_ns_live;
 
     /* SPIM00 / SPIM22 / SPIM30 — SPI masters with EasyDMA. */
     for (int i = 0; i < NRF54L_NUM_SPIM; i++) {

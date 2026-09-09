@@ -118,6 +118,11 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # through the UARTE20 EasyDMA receive path (bytes paced at the baud rate).
 ./build/test_runner test configs/test-shell-nrf54l15-dk.yaml   # ~4s sim
 
+# nRF54L15-DK two-node RPL-UDP. Firmware for this CPU acknowledges in hardware
+# only (CSMA_CONF_SEND_SOFT_ACK 0), so this is also the test that the Nordic
+# driver's own acknowledgement path works — docs/design/nrf54l15-ack-gap.md.
+./build/test_runner test configs/test-2node-nrf54l15-dk.json   # ~60s sim
+
 # nRF54L15 FLPR dual-core / RISC-V (Contiki-NG nrf-vpr). One M33 image launches
 # the RV32E FLPR; the M33 prints "[FLPR] tick N" (advances ~2/sec). Add --ui 8080
 # to watch LED0 (P2.9, 1 Hz, RISC-V) + LED1 (P1.10, 2 Hz, M33) blink in the browser.
@@ -530,4 +535,7 @@ CSIM_ARM_JIT_MIN_BLOCK=n  # minimum block length to compile (default 1 — NOT a
                           # knob, see the comment in arm_jit.c: 4 costs 3x)
 CSIM_ARM_JIT_THRESHOLD=n  # executions before compiling (default 50)
 NRF54L_UART_RX_TRACE=1    # nRF54L15 console bytes delivered into the firmware's receive buffer
+NRF54L_DPPI_TRACE=1       # nRF54L15 interconnect publishes, channel-group tasks, CHEN writes
+NRF54L_DISABLED_DEFER_NS  # nRF54L15 radio DISABLE->DISABLED latency, ns (default 3000; the
+                          # working window is 2500-4000 — docs/design/nrf54l15-ack-gap.md)
 ```

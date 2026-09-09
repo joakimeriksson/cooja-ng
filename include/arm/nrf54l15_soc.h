@@ -133,9 +133,30 @@ typedef struct nrf54l_dppi_subscriber {
     struct nrf54l_dppi_subscriber *next;
 } nrf54l_dppi_subscriber_t;
 
+#define NRF54L_DPPI_NUM_GROUPS    6
+struct nrf54l_dppi_state;
+typedef struct {
+    struct nrf54l_dppi_state *d;
+    int                       g;
+} nrf54l_dppi_chg_ctx_t;
 typedef struct nrf54l_dppi_state {
+    arm_platform_t            *plat;     /* back-pointer, for per-node tracing */
     uint32_t                   chen;     /* CHEN — bitmap of enabled channels */
     nrf54l_dppi_subscriber_t  *subs[NRF54L_DPPI_NUM_CHANNELS];
+    /* Channel groups: CHG[n] membership, TASKS_CHG[n].EN/DIS enable or
+     * disable every member channel at once, and SUBSCRIBE_CHG[n].EN/DIS
+     * let a DPPI event do that. nrf_802154 makes its radio ramp-up chain
+     * one-shot this way: the EGU event that fires RADIO TXEN/RXEN also
+     * triggers CHG0.DIS on its own channel. A group task raised from
+     * inside a publish is applied after that publish has reached every
+     * subscriber, as on silicon, so the chain fires exactly once. */
+    uint32_t                   chg[NRF54L_DPPI_NUM_GROUPS];
+    uint32_t                   sub_chg_en[NRF54L_DPPI_NUM_GROUPS];
+    uint32_t                   sub_chg_dis[NRF54L_DPPI_NUM_GROUPS];
+    nrf54l_dppi_chg_ctx_t      chg_ctx[NRF54L_DPPI_NUM_GROUPS];
+    uint32_t                   pending_chg_en;    /* group bitmaps raised by the publish in progress */
+    uint32_t                   pending_chg_dis;
+    int                        publish_depth;
 } nrf54l_dppi_state_t;
 
 /* GRTC (Global Real-Time Counter) at 0x500E_2000 — Contiki's tick source

@@ -183,6 +183,12 @@ jobs:
           n=$(grep -ciE 'Received (request|response)' out.txt || true)
           echo "RPL-UDP receptions: $n"; [ "$n" -ge 2 ]
 
+      - name: nRF54L15-DK Contiki RPL-UDP (hardware-only ACK path, 60s sim)
+        run: |
+          ./build/test_runner test configs/test-2node-nrf54l15-dk.json > nrf54.txt 2>&1
+          tail -5 nrf54.txt
+          grep -aq "TEST PASSED" nrf54.txt
+
       - name: nRF52840-DK Zephyr 802.15.4 echo (stock echo_server/client, 40s sim)
         # Experimental Zephyr path; the echo build has no log backend, so assert
         # on the server's own "Received and replied" line.
