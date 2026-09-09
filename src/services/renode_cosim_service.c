@@ -141,10 +141,28 @@ bool renode_cosim_active(const renode_cosim_service_t *s) {
  * Socket I/O
  * ============================================================ */
 
+/* A peer that has gone away must surface as an error return, never as a
+ * signal: SIGPIPE on a write to a closed socket would kill csim with exit
+ * -13, bypassing the clean shutdown that reports the run.  Linux suppresses
+ * it per call (MSG_NOSIGNAL); macOS/BSD per socket (SO_NOSIGPIPE, set by
+ * sock_no_sigpipe on every fd we own). */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+static void sock_no_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)fd;
+#endif
+}
+
 static int write_all(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     while (len > 0) {
-        ssize_t n = write(fd, p, len);
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
         if (n > 0) { p += n; len -= (size_t)n; continue; }
         if (n < 0 && (errno == EINTR || errno == EAGAIN))
             continue;
@@ -434,6 +452,7 @@ static int connect_with_retry(const char *host, int port, int timeout_ms) {
         if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            sock_no_sigpipe(fd);
             return fd;
         }
         close(fd);
@@ -515,6 +534,8 @@ int renode_cosim_attach_fds(renode_cosim_service_t *s, sim_runtime_t *sim,
         return -1;
     s->main_fd  = main_fd;
     s->async_fd = async_fd;
+    sock_no_sigpipe(main_fd);
+    sock_no_sigpipe(async_fd);
     return finish_attach(s, sim);
 }
 

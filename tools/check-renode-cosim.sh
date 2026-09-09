@@ -204,5 +204,25 @@ if ! grep -q 'peer closed the connection' "$TMP/run4.txt"; then
 fi
 echo "  csim exited cleanly and said why"
 
+# --- 5: a script action inside one coarse quantum ---------------------------
+
+echo "== run 5: remove at 5 s inside a 10 s quantum =="
+python3 "$MASTER" --ticks 3 --limit 10000000 --freq "$FREQ" --require-frames 0 --require-logs 0 \
+    --spawn "$RUNNER test configs/test-renode-actions.yaml --renode {2}:{0}:{1} --renode-freq $FREQ -v" \
+    >"$TMP/run5.txt" 2>&1 || { echo "FAIL: the mock master reported an error"; cat "$TMP/run5.txt"; exit 1; }
+# Node 2 exists until 5 s: it must have printed before then, and never after.
+before=$(grep -aE '^ +[0-4]\.[0-9]+ \[Node 2/' "$TMP/run5.txt" | wc -l | tr -d ' ')
+after=$(grep -aE '^ +([5-9]|[1-9][0-9])\.[0-9]+ \[Node 2/' "$TMP/run5.txt" | wc -l | tr -d ' ')
+if [ "$before" -eq 0 ]; then
+    echo "FAIL: node 2 never ran before its removal at 5 s (action applied at the quantum start)"
+    exit 1
+fi
+if [ "$after" -ne 0 ]; then
+    echo "FAIL: node 2 printed after its removal at 5 s"
+    grep -aE '^ +([5-9]|[1-9][0-9])\.[0-9]+ \[Node 2/' "$TMP/run5.txt" | head -3
+    exit 1
+fi
+echo "  node 2 ran until 5 s ($before lines) and not after"
+
 echo
 echo "PASS: Renode co-simulation checks"

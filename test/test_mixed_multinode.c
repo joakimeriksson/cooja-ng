@@ -2517,6 +2517,7 @@ sim_restart:
     double t_start = get_time_ms();
 
     int ss_has_command = sim_external_command_launched(&external_cmd);
+    int64_t clock_quantum_end = INT64_MIN;   /* end of the master's current quantum */
     while (sim_ns < end_ns || ui_service_active(&ui_svc) ||
            (sim_serial_bridge_active(&serial_bridge) && ss_has_command) ||
            sim_rt.clock_source) {
@@ -2540,10 +2541,31 @@ sim_restart:
          * the next event — stopping early would report the master's quantum
          * as finished when it was not.  See sim_clock_source_t. */
         if (sim_rt.clock_source) {
-            int64_t h = sim_rt.clock_source->next_horizon(
-                sim_rt.clock_source->state, sim_ns);
-            if (h < 0) break;          /* master gone, or asked us to stop */
-            sim_ns = h;
+            /* Ask the master for a new quantum only once the previous one
+             * has been fully run; the reply for it goes out on that call. */
+            if (clock_quantum_end <= sim_ns) {
+                int64_t h = sim_rt.clock_source->next_horizon(
+                    sim_rt.clock_source->state, sim_ns);
+                if (h < 0) break;      /* master gone, or asked us to stop */
+                clock_quantum_end = h;
+            }
+            /* Script actions are applied below at the loop's current time,
+             * BEFORE the pump runs the interval that ends there.  The normal
+             * path is only exact because a SIM_EV_TEST_ACTION pin keeps its
+             * horizons ms-dense, so the pump has already reached T-epsilon
+             * when the action at T applies.  A master's quantum ignores the
+             * queue: with a 10 s quantum a `remove` at 5 s would be applied
+             * before the node had run at all.  So sub-step the quantum at an
+             * upcoming action in two moves -- stop one ns short of it, so the
+             * pump reaches it, then land on it, so the action applies. */
+            int64_t sub = clock_quantum_end;
+            if (config_loaded && config.has_test &&
+                action_idx < config.test.action_count) {
+                int64_t at = config.test.actions[action_idx].at_ms * MS_TO_NS;
+                if (at > sim_ns && at <= sub)
+                    sub = (at - 1 > sim_ns) ? at - 1 : at;
+            }
+            sim_ns = sub;
         } else {
             int64_t next_event = sim_eq_peek_time(&sim_eq);
             int64_t max_ns = ui_service_active(&ui_svc) ? sim_ns + 100LL * MS_TO_NS

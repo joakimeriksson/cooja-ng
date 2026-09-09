@@ -775,6 +775,40 @@ static void test_service_disconnect(int verbose) {
     mock_teardown(&k);
 }
 
+/* The master's ASYNC side goes away while csim owes it a reply.  The next
+ * horizon call must flush the queued log line and the tick acknowledgement
+ * onto a socket nobody reads: that write has to come back as an error, not
+ * as SIGPIPE.  Before the fix this killed the whole test runner with -13,
+ * which is why the assertion below is simply that we are still running. */
+static void test_service_async_peer_loss(int verbose) {
+    if (verbose) printf("  -- service: async peer lost while a reply is owed --\n");
+    mock_t k;
+    mock_setup(&k);
+    renode_msg_t r;
+    master_recv(k.master_main, &r);                 /* handshake echo */
+
+    master_send(&k, RENODE_TICK_CLOCK, 0, 1000);
+    int64_t h = renode_cosim_next_horizon(&k.svc, 0);
+    ASSERT_EQ(h, 1000000LL, "first quantum granted; its reply is now owed");
+
+    /* Something to flush ahead of the acknowledgement, so the log write is
+     * the one that meets the dead socket. */
+    sim_observer_event_t ev = { .kind = SIM_OBS_MOTE_LOG_LINE, .time_ns = 500000,
+                                .mote_index = 1, .radio_idx = -1 };
+    ev.u.log_line.line = "bye"; ev.u.log_line.len = 3; ev.u.log_line.node_id = 1;
+    sim_runtime_emit(&k.sim, &ev);
+
+    close(k.master_async);
+    k.master_async = -1;
+    master_send(&k, RENODE_TICK_CLOCK, 0, 1000);   /* master keeps ticking */
+
+    h = renode_cosim_next_horizon(&k.svc, 1000000LL);
+    ASSERT_EQ(h, -1, "a dead async socket ends the run as an error return");
+    ASSERT(!renode_cosim_active(&k.svc), "service is inactive afterwards");
+    ASSERT(true, "still running: the write did not raise SIGPIPE");
+    mock_teardown(&k);
+}
+
 static void test_service_reset_and_unsupported(int verbose) {
     if (verbose) printf("  -- service: reset + unsupported actions --\n");
     mock_t k;
@@ -841,6 +875,7 @@ int run_renode_cosim_tests(int verbose) {
     test_service_bus(verbose);
     test_service_async_plane(verbose);
     test_service_disconnect(verbose);
+    test_service_async_peer_loss(verbose);
     test_service_reset_and_unsupported(verbose);
 
     printf("  %d passed, %d failed\n", passed, failed);
