@@ -1,0 +1,38 @@
+:name: csim RPL co-simulation
+:description: Watch a live Contiki-NG RPL-UDP network from firmware running in Renode.
+#
+# Renode starts csim itself.  Setting simulationFilePath is what makes Renode
+# open the two sockets, launch the peer with them on its command line, and
+# shake hands — so run this from the csim checkout root and let it do the
+# work:
+#
+#   make -C examples/renode/firmware       # once
+#   renode examples/renode/csim-rpl.resc
+#   (monitor) start
+#
+# The scenario csim runs comes from the environment, since Renode has no way
+# to pass it through:  CSIM_CONFIG, CSIM_RENODE_FREQ_HZ (must match
+# `frequency` in csim-host.repl — the tickClock message carries only a tick
+# count), and optionally CSIM_LOG to keep csim's own output out of Renode's.
+#
+# Renode drives csim's clock from here on: every 1000 ticks of its 1 MHz
+# clock it sends a tickClock and blocks until csim has simulated the same
+# millisecond.  The timestamps the firmware prints are csim's simulation
+# time, so its log lines up with csim's own.
+
+$fw ?= @examples/renode/firmware/sniffer.elf
+$launch ?= @tools/csim-renode-launch.sh
+
+mach create "csim-host"
+machine LoadPlatformDescription @examples/renode/csim-host.repl
+
+showAnalyzer uart
+
+csim SimulationFilePathMacOS $launch
+csim SimulationFilePathLinux $launch
+
+sysbus LoadELF $fw
+
+echo ""
+echo "csim window at 0x40100000, 1 ms quanta. 'start' to run, 'quit' to stop."
+echo ""

@@ -231,6 +231,12 @@ void sim_runtime_emit(sim_runtime_t *sim, const sim_observer_event_t *ev) {
  * Kernel event pump — milestone 10.
  * ============================================================ */
 
+void sim_runtime_set_clock_source(sim_runtime_t *sim,
+                                  const sim_clock_source_t *cs) {
+    if (!sim) return;
+    sim->clock_source = cs;
+}
+
 void sim_runtime_request_stop(sim_runtime_t *sim) {
     if (!sim) return;
     sim->run_state = SIM_RUN_STOP_REQUESTED;

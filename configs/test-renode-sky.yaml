@@ -1,0 +1,43 @@
+# Renode co-simulation: a Renode-driven device sitting in a Sky network.
+#
+# Node 3 is the co-simulation device (docs/design/renode-cosim-plan.md).  It
+# has no firmware of its own — the ".renode" extension only selects the mote
+# kind, and its behaviour arrives from Renode over the co-simulation socket:
+#
+#   ./build/test_runner test configs/test-renode-sky.yaml \
+#       --renode 127.0.0.1:MAIN:ASYNC --renode-freq 1000000
+#
+# Without --renode the device is passive: the two Sky nodes talk to each
+# other exactly as they would with no third node present, which is what
+# makes this config usable as a plain regression too.
+version: 2
+title: "Renode co-simulation device in a 2-node Sky nullnet network"
+timeout_ms: 20000
+seed: 42
+
+medium:
+  type: udgm
+  tx_range: 50.0
+  interference_range: 100.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+mote_types:
+  - { name: sky-nullnet, kind: emulated-elf, cpu: msp430, soc: msp430f1611, board: sky, firmware: firmware/sky/nullnet-broadcast.sky }
+  # The device kind is selected by the ".renode" extension; the path is
+  # never opened, so no such file needs to exist.
+  - { name: renode-device, kind: renode-cosim, firmware: dev.renode }
+
+nodes:
+  - { type: sky-nullnet, id: 1, x: 0.0, y: 0.0 }
+  - { type: sky-nullnet, id: 2, x: 5.0, y: 0.0 }
+  # The Renode device, in range of both.
+  - { type: renode-device, id: 3, x: 2.0, y: 0.0 }
+
+# The device itself prints nothing (it has no CPU and no console), so the
+# validators assert the surrounding network still works with it present.
+test:
+  timeout_is_success: true
+  validators:
+    - { pattern: "Received 0 from 0202.0200.0274.1200", node: 1, min_count: 1 }
+    - { pattern: "Received 0 from 0101.0100.0174.1200", node: 2, min_count: 1 }
