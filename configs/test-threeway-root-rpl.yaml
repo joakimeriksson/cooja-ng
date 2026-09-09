@@ -1,0 +1,43 @@
+# Three simulators, three instruction sets, one 6LoWPAN/RPL DAG -- rooted in
+# Renode.
+#
+#   Renode      emulates a CC2538 (ARM Cortex-M3): the RPL ROOT and UDP server,
+#               and OWNS THE CLOCK
+#   csim        emulates a Tmote Sky (MSP430, 16-bit): an rpl-udp client,
+#               and OWNS THE MEDIUM
+#   esp32sim    emulates an ESP32-C6 (RISC-V, 32-bit): another rpl-udp client,
+#               in its own process, on an unmodified ESP-IDF image
+#
+# Both clients hear the root's DIOs across a simulator boundary, register with
+# acknowledged DAOs, and complete UDP request/response round trips through a
+# root that lives in a third simulator. Verified against Renode 1.17: the root
+# serves both from their own IPv6 addresses (fd00::212:7401:1:101 and
+# fd00::ff:fe00:2), 900000 ticks of 100 us = exactly 90 s in every simulator.
+#
+#   CSIM_CONFIG=$PWD/configs/test-threeway-root-rpl.yaml \
+#       renode examples/renode/cc2538-csim-rpl.resc     # with $id = 3
+#
+# Without --renode the device is inert and this is a plain csim+esp32sim run.
+title: "RPL root in Renode; csim Sky + esp32sim ESP32-C6 join it (6LoWPAN/RPL/UDP)"
+timeout_ms: 150000
+seed: 42
+startup_delay_ms: 1000
+
+radiomedium:
+  type: udgm
+  tx_range: 55.0
+  interference_range: 110.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+nodes:
+  - { firmware: firmware/sky/udp-client.sky,  id: 1, x: 0.0, y: 0.0 }
+  - { firmware: examples/ext/esp32c6-rpl.py,  id: 2, x: 6.0, y: 0.0 }
+  # Renode's CC2538 root, as seen from csim; between the two clients.
+  - { firmware: dev.renode,                   id: 3, x: 3.0, y: 0.0 }
+
+test:
+  timeout_is_success: true
+  validators:
+    - { pattern: "Received response", node: 1, min_count: 1 }
+    - { pattern: "Received response", node: 2, min_count: 1 }

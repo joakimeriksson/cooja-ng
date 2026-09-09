@@ -451,3 +451,258 @@ socket"`), so an implementation that drifts back fails. And
 both sides waiting and neither able to say why; the trace showing csim's
 reply going out 3 ms after the tick, against Renode's 20-second timeout, is
 what turned a deadlock into a one-line fix.
+
+## 11. Sharing the air: Renode's radio on csim's medium
+
+§7 says csim's medium is the only medium and bridging Renode's own wireless
+model is out of scope. It is now prototyped, because it is the integration
+people actually want: firmware Renode can run, on a network csim models.
+
+`examples/renode/bridge/CsimBridge.cs` is a Renode radio that owns no
+hardware. It sits on Renode's `IEEE802_15_4Medium`, forwards every frame it
+hears into csim, and re-emits every frame csim delivers back — carried over
+the same co-simulation window that keeps the clocks in step, so there is no
+second protocol and no csim-side change. Renode compiles it at run time
+(`include @…/CsimBridge.cs`), so there is nothing to build.
+
+```
+Renode CC2538 ── wireless medium ── CsimBridge ── window ── csim UDGM medium
+   (Contiki-NG)                                                (Sky, …)
+```
+
+### What is proven
+
+Running `examples/renode/cc2538-csim-rpl.resc` against
+`configs/test-renode-bridge-sky.yaml`, with unmodified Contiki-NG on both
+sides (CC2538 in Renode, Tmote Sky in csim — different CPU architectures, in
+different simulators):
+
+- **Frames cross both ways.** csim's Sky transmits RPL DIOs; the bridge
+  delivers them to Renode's CC2538. The CC2538 transmits; csim's CC2420
+  reports `crc_ok`, so the frames arrive intact through csim's medium.
+- **The RPL DAG forms across the boundary.** The CC2538 emits unicast frames
+  addressed to `0101010001741200` — the Sky's link-layer address
+  `0012.7401.0001.0101`. It can only have learned that from the Sky's DIO, so
+  it parsed the DIO, ran the objective function, and selected a node in the
+  other simulator as its RPL parent.
+
+### Unicast works — once the acknowledgement respects the turnaround
+
+`configs/test-renode-root-rpl.yaml` runs the rpl-udp **server in Renode**
+(the CC2538 is the DAG root) and the **client in csim** (a Tmote Sky). The
+client hears the root's DIOs, selects it as parent, registers with a DAO, and
+completes UDP request/response round trips through it — every one of which
+crosses the simulator boundary:
+
+```
+[Renode root]  Received request 'hello 0' from fd00::212:7401:1:101
+[Renode root]  Sending response.
+[csim Sky]     Received response 'hello 0' from fd00::200:0:0:2
+```
+
+`configs/test-renode-root-rpl-2clients.yaml` adds an nRF52840 client
+alongside the Sky: the root serves both, from their own IPv6 addresses, in
+one run — two csim ISAs joining a DAG rooted in a third simulator.
+
+### The bug, found by reading the root's MAC log rather than csim's counters
+
+Rebuilding the root with `LOG_CONF_LEVEL_MAC=4` showed the whole failure in
+three lines:
+
+```
+[INFO: CSMA] received packet from 0012.7401.0001.0101, seqno 198, len 79
+[WARN: CSMA] drop duplicate link layer packet from 0012.7401.0001.0101, seqno 198
+[WARN: CSMA] drop duplicate link layer packet from 0012.7401.0001.0101, seqno 198
+```
+
+The root receives csim's DAO, acknowledges it, and processes it — then the
+client retransmits the *same* sequence number, and every retransmission is
+dropped as a duplicate. The client is retransmitting because it never
+accepted the acknowledgement: its CC2420 reported `ack_rx=0`, and
+`dropped=22` bytes — exactly two 11-byte ACK frames — arriving while the radio
+was not in receive.
+
+The acknowledgements were correct (`seq=0xc6` = 198, matching the DAO). They
+were **early**. Renode's radio has no air time, so its ACK is ready the same
+instant the frame is, and the bridge put it on csim's air immediately — while
+the Sky was still in its TX→RX turnaround and could not hear it. 802.15.4
+gives that turnaround 192 µs, and csim's own auto-ACK path waits exactly that
+long for exactly this reason (`sim_radio_bus.c`: "otherwise perpetual CSMA
+retransmits"). The bridge now holds a Renode-originated ACK in its own slot
+until `frame_end + 192 µs` of csim time, where `frame_end` is the on-air end
+of the frame it acknowledges (`RX_TIME + (len + 8) × 32 µs`). With that one
+change the Sky's `ack_rx` went from 0 to 12 and the DAG completed.
+
+This is the second time the frame-level/PHY-level mismatch has been the
+cause, and the two halves are symmetric: §11's air-time fix made csim able
+to receive Renode's frames; this makes csim able to accept Renode's
+acknowledgements. In both, the bridge's job is to supply the time Renode's
+model does not have.
+
+### The reverse direction, and why it is not pursued
+
+The **reverse** topology — Renode's CC2538 as a *client*, csim's node as
+root — does not complete RPL (`configs/test-renode-bridge-sky.yaml`). There
+csim generates the acknowledgement with correct turnaround and the bridge
+re-emits it into Renode's medium; whether Renode's `CC2538RF` model matches it
+to its pending transmission has not been instrumented.
+
+It is left alone by design. Renode is the natural **server** side of this
+pairing: its value is emulating the gateway — a Linux host such as a
+Raspberry Pi running a native border router (NBR) — at the head of a
+constrained network that csim models at chip level. In that arrangement
+Renode is always the RPL root and csim's nodes always join it, which is the
+direction that works. Renode as a leaf of a csim-rooted network has no
+corresponding use, so its ACK path is not worth the Renode-side
+instrumentation.
+
+### Ruled out on the way, each by measurement
+
+- Renode's medium is not lossy (`SimpleMediumFunction`, no range function).
+- The bridge does not write partial frames (whole 3/25/83/100-byte frames;
+  the device drops a short write rather than transmitting it).
+- The co-simulation quantum is not the limit: 1 ms, 100 µs and 50 µs quanta
+  behave identically, against a `CSMA_ACK_WAIT_TIME` of 400 µs.
+- Carrier sense was not the cause. The window exposes csim's own CCA
+  (`RENODE_REG_CCA`, 0x70) and the bridge defers on it, and it never asserts:
+  `tx_busy_until_ns` is written at frame_complete with the frame's air *end*,
+  so it is always already past when a peer polls. The register stays — it is
+  correct and any frame-level peer will want it — but it is not what was
+  breaking RPL.
+- csim's radio models are not the cause: Sky (CC2420), CC2538 (RF Core) and
+  nRF52840 all failed identically as the root before the fix, so the common
+  factor was the bridge.
+- csim's own acknowledgement path works (`auto_ack=8` in the same runs, and
+  `auto_ack=1` for a cleanly injected unicast with no Renode present).
+
+### Also found while building this
+
+- The 802.15.4 FCS is **CRC-16/KERMIT** (reflected 0x8408, init 0), not the
+  MSB-first CCITT variant. The bridge got this wrong at first and every
+  injected frame was silently dropped; it now recomputes the checksum of a
+  frame Renode transmitted and logs a warning if the two disagree, which
+  turns an invisible failure into one line.
+- An earlier revision also reported that csim's **nRF52840** receiver never
+  sees injected frames, "because not even the radio-level counters move".
+  Also wrong: the nRF has no per-chip RX counters to move — a known-good
+  two-node nRF RPL-UDP run prints the same zeroes. The nRF interoperates
+  happily with the Sky and the CC2538 in
+  `configs/test-mixed-platform-rpl.yaml`.
+- Both retracted claims came from reading a counter that was never wired up
+  for the platform in question. Absence of a counter is not evidence of
+  absence of delivery; the reliable question is whether the *application*
+  received something, which is what `configs/test-mixed-platform-rpl.yaml`
+  asserts.
+- And a third: csim's auto-ACK was reported as not arming for frames from a
+  frame-level sender. It does — `auto_ack=1` for a correctly addressed
+  injected unicast, no Renode involved. Every one of these retractions came
+  from reading a counter in a cross-simulator run and blaming the side that
+  was easier to instrument. The discipline that actually worked: reproduce it
+  with the mock master and one csim process before believing anything about
+  which simulator is at fault.
+
+## 12. Three simulators at once: csim as both clock slave and clock master
+
+The two co-simulation protocols in this tree run in opposite directions —
+Renode owns the clock in §2, csim owns it in `external-nodes-plan.md`. They
+compose. Running both at once makes csim a clock **slave** and a clock
+**master** simultaneously, while it owns the radio medium for everyone:
+
+```
+Renode ──tickClock──▶ csim ──step/done──▶ esp32sim
+ CC2538              Sky                  ESP32-C6
+ ARM Cortex-M3       MSP430, 16-bit       RISC-V, 32-bit
+ (binary, bus-shaped) (owns the medium)   (NDJSON, node-shaped)
+```
+
+Three independent emulators, three instruction sets, three separate OS
+processes, one 802.15.4 medium, one timeline. Every node runs unmodified
+vendor firmware: Contiki-NG on the Sky and the CC2538, and Contiki-NG on
+ESP-IDF (mask ROM, second-stage bootloader, FreeRTOS) on the C6.
+
+**The network is the standard stack.** IPv6 over 6LoWPAN, RPL Lite routing,
+UDP — IETF protocols, which is what makes this an interoperation claim rather
+than a frame-delivery one. The configuration is
+`configs/test-threeway-cosim.yaml`: the Sky is the RPL root and UDP server,
+the ESP32-C6 a client that must join the DAG and complete request/response
+round trips through it.
+
+### Measured, against real Renode 1.17
+
+**Standard-stack interoperation between two emulators.** csim's MSP430 and
+esp32sim's RISC-V complete UDP request/response round trips over 6LoWPAN and
+RPL, in separate OS processes, from different vendor SDKs:
+
+```
+24.247 [Node 2/EXT]    Sending request 0 to fd00::212:7401:1:101
+                       6LoWPAN output: sending IPv6 packet with len 63
+24.266 [Node 1/MSP430] Received request 'hello 0' from fd00::ff:fe00:2
+24.317 [Node 2/EXT]    Received response 'hello 0' from fd00::212:7401:1:101
+```
+
+This needs everything a real deployment needs: DAG formation, 6LoWPAN header
+compression and decompression across two independent implementations, unicast
+with link-layer acknowledgements, and CSMA. Ten round trips in a 120 s run
+without a clock master; five in 70 s under Renode.
+
+**The clocks stay locked.** 70 000 quanta of 1 ms drove exactly 70 s of
+simulated time in every simulator, with zero Renode errors.
+
+**Exact-time stepping survives the outer quantum.** This is the property that
+makes the composition worth having rather than merely possible. csim relays
+Renode's quantum to esp32sim as *event-driven* stepping, not as a grid:
+esp32sim's transmissions land at the times its own guest firmware chose,
+inside the quantum. A naive relay that forwarded the master's grid would
+round them and destroy exactly the acknowledgement timing that RPL's unicast
+depends on — which is why the two protocols keep their own time models and
+csim mediates between them, the asymmetry §7 gives for keeping them separate.
+
+**It is deterministic end to end.** Two full three-simulator runs under real
+Renode produce an identical sequence of application and radio events, and two
+runs under the mock master reproduce every frame timestamp to the nanosecond.
+Determinism is a gated guarantee in this tree, and composing three simulators
+across three processes does not cost it.
+
+### Renode as the root of the whole thing
+
+`configs/test-threeway-root-rpl.yaml` moves the RPL root *into Renode*: the
+CC2538 runs the rpl-udp server, and both other simulators' nodes — csim's
+MSP430 Sky and esp32sim's RISC-V ESP32-C6 — are clients that must join its
+DAG. Measured against Renode 1.17, in one 90 s run:
+
+- the root served **8** request/response round trips from the Sky
+  (`fd00::212:7401:1:101`) and **6** from the ESP32-C6 (`fd00::ff:fe00:2`);
+- 900 000 quanta of 100 µs drove exactly 90 s in every simulator, 0 errors.
+
+Every DIO, DAO, DAO-ACK, and UDP datagram in that network crosses at least
+one simulator boundary, and the root crossing is over Renode's own radio
+model. That makes Renode a **routed** participant, not merely a link-layer
+one — the gap §11 closed, by supplying the ACK turnaround its frame-level
+radio does not model.
+
+### Running it
+
+esp32sim is an out-of-tree binary (`ESP32SIM_C6`, default
+`~/work/esp32sim/target/release/esp32sim-c6`), so this is a documented
+harness, not a CI gate — same status as the real-Renode runs. The
+csim+esp32sim half needs no Renode and is a plain config run.
+
+```sh
+# two simulators, 6LoWPAN/RPL/UDP: csim drives esp32sim
+./build/test_runner test configs/test-threeway-cosim.yaml -v
+
+# all three: Renode drives csim, csim drives esp32sim
+CSIM_CONFIG=$PWD/configs/test-threeway-cosim.yaml \
+    renode examples/renode/cc2538-csim-rpl.resc
+```
+
+### What this demonstrates
+
+csim is not merely *connectable* to another simulator; it composes as a
+co-simulation **hub**. It accepts an external time authority through
+`sim_clock_source_t` (§3) without the runner loop naming the protocol, relays
+that authority to its own subordinate peers in a different protocol with a
+different time model, and remains the single owner of the shared physical
+medium that all of them transmit into — while the guests on top of it speak
+standard IPv6/6LoWPAN/RPL to each other. Adding a fourth participant on
+either side is a config line, not a code change.

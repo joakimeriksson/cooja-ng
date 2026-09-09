@@ -1,0 +1,40 @@
+# 6LoWPAN/RPL/UDP across two simulators, with the RPL root in Renode.
+#
+# Renode emulates a CC2538 running Contiki-NG's rpl-udp SERVER: it is the DAG
+# root. csim emulates a Tmote Sky running the rpl-udp CLIENT, which has to
+# hear the root's DIOs, select it as parent, register with a DAO -- unicast,
+# acknowledged, and DAO-ACKed back -- and then complete UDP request/response
+# round trips through it. All of that crosses the simulator boundary.
+#
+# The root does not appear here as a CPU; it is the co-simulation device node
+# below, which is where Renode's radio traffic enters csim's medium and where
+# the same window carries Renode's tick clock.
+#
+# Renode starts csim:
+#   CSIM_CONFIG=$PWD/configs/test-renode-root-rpl.yaml \
+#       renode examples/renode/cc2538-csim-rpl.resc
+#
+# See docs/design/renode-cosim-plan.md §11 and examples/renode/README.md.
+title: "RPL root in Renode (CC2538), client in csim (Sky), 6LoWPAN/RPL/UDP"
+timeout_ms: 120000
+seed: 42
+startup_delay_ms: 1000
+
+radiomedium:
+  type: udgm
+  tx_range: 55.0
+  interference_range: 110.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+nodes:
+  # csim's node: the rpl-udp client, MSP430 + CC2420.
+  - { firmware: firmware/sky/udp-client.sky, id: 1, x: 0.0,  y: 0.0 }
+  # Renode's CC2538 root, as seen from csim.
+  - { firmware: dev.renode,                  id: 2, x: 10.0, y: 0.0 }
+
+test:
+  timeout_is_success: true
+  validators:
+    # A response can only have come back through the DAG rooted in Renode.
+    - { pattern: "Received response", node: 1, min_count: 1 }

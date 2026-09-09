@@ -201,6 +201,9 @@ uint64_t renode_dev_read(renode_dev_t *d, uint64_t off, int width) {
     case RENODE_REG_UART_NODE:   v = (uint32_t)d->uart_node; break;
     case RENODE_REG_UART_COUNT:  v = (uint32_t)d->uo_count; break;
     case RENODE_REG_IRQ_STATUS:  v = dev_irq_status(d); break;
+    case RENODE_REG_CCA:
+        v = (d->channel_busy && d->channel_busy(d->user)) ? 1U : 0U;
+        break;
     case RENODE_REG_UART_DATA:
         if (d->uo_count > 0) {
             v = d->uart_out[d->uo_head];
