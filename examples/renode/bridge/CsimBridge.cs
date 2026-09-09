@@ -202,8 +202,15 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     return;
                 }
                 WriteFrame(pendingAck);
+                // The acknowledgement occupies the air like any frame -- 11
+                // bytes at 32 us -- and nothing else keeps queued data off it:
+                // the CCA register walks *neighbours*, so this bridge's own
+                // transmission never reads as busy. Reserve the ACK's air time
+                // and let the next poll release the data behind it.
+                mediumFreeNs = now + AirTimeNs(pendingAck);
                 pendingAck = null;
                 sentToCsim++;
+                return;
             }
 
             if(outgoing.Count == 0)
