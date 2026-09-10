@@ -40,7 +40,7 @@ typedef enum {
 #define ARM_SFSR_LSERR     (1u << 7)  /* lazy state error */
 
 /* Result of an IDAU attribution check for one address. */
-typedef struct {
+typedef struct arm_idau_result {
     bool ns;        /* IDAU considers the address non-secure */
     bool nsc;       /* IDAU marks it non-secure-callable */
     bool exempt;    /* address is exempt from security checking (always Secure-ish) */

@@ -13,6 +13,8 @@
  */
 #include "arm_trustzone.h"
 #include "arm_cpu.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /*
  * SAU-only attribution.
@@ -85,7 +87,9 @@ arm_sec_attr_t arm_security_attr(const arm_cpu_t *cpu, uint32_t addr)
     bool ns, nsc;
     arm_sau_check(cpu, addr, &ns, &nsc);
 
-    arm_idau_result_t idau = arm_idau_check_default(addr);
+    arm_idau_result_t idau = cpu->idau_check
+        ? cpu->idau_check(cpu->idau_user, addr)
+        : arm_idau_check_default(addr);
 
     if (idau.exempt)
         return ARM_SEC_SECURE;
@@ -114,6 +118,12 @@ bool arm_mem_access_permitted(const arm_cpu_t *cpu, uint32_t addr)
 
 void arm_record_secure_fault(arm_cpu_t *cpu, uint32_t addr)
 {
+    {
+        static int en = -1;
+        if (en < 0) en = getenv("ARM_TZ_TRACE") ? 1 : 0;
+        if (en) fprintf(stderr, "[tz] SecureFault: non-secure access to 0x%08x "
+                                "at pc=0x%08x\n", addr, cpu->reg[ARM_PC]);
+    }
     cpu->sfsr |= ARM_SFSR_AUVIOL | ARM_SFSR_SFARVALID;
     cpu->sfar = addr;
     cpu->secure_fault_pending = true;
@@ -143,6 +153,8 @@ int arm_sau_region(const arm_cpu_t *cpu, uint32_t addr)
 #define ARM_TT_SRVALID  (1u << 17)
 #define ARM_TT_R        (1u << 18)
 #define ARM_TT_RW       (1u << 19)
+#define ARM_TT_NSR      (1u << 20)
+#define ARM_TT_NSRW     (1u << 21)
 #define ARM_TT_S        (1u << 22)
 
 uint32_t arm_tt_response(const arm_cpu_t *cpu, uint32_t addr, bool alt)
@@ -162,5 +174,11 @@ uint32_t arm_tt_response(const arm_cpu_t *cpu, uint32_t addr, bool alt)
 
     /* Without an MPU model, memory is treated as read/write accessible. */
     resp |= ARM_TT_R | ARM_TT_RW;
+    /* NSR/NSRW: whether the Non-secure state could read / read-write this
+     * address. Only meaningful when executing Secure — which is the only
+     * state that can run TTA/TTAT, and the state cmse_check_address_range()
+     * builds its answer from. */
+    if (cpu->secure && attr == ARM_SEC_NONSECURE)
+        resp |= ARM_TT_NSR | ARM_TT_NSRW;
     return resp;
 }

@@ -162,11 +162,22 @@ static void trace_unmapped_mmio(uint32_t addr, int is_write, uint32_t val) {
  * security the SPU sees on the bus (independent of the core's state), which
  * the GRTC's per-CC/SYSCOUNTER-view FEATURE checks consult. One
  * predicted-false branch for every other SoC; SRAM/flash never come here. */
-static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr) {
+static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr,
+                                         bool is_write) {
     uint32_t a = *addr;
+    cpu->io_blocked = false;
     if (__builtin_expect(cpu->io_ns_alias, 0)) {
         bool ns = (a >> 28) == 4;
         cpu->io_txn_ns = ns;
+        /* The bus check sees the address as issued: which alias was used is
+         * what tells the security unit whether this is a Non-secure
+         * transaction. Refused accesses are dropped, not faulted — the
+         * security unit reports them through its own event and interrupt. */
+        if (__builtin_expect(cpu->io_access_check != NULL, 0) &&
+            !cpu->io_access_check(cpu->io_access_user, a, is_write)) {
+            cpu->io_blocked = true;
+            return NULL;
+        }
         if (ns) { a |= 0x10000000u; *addr = a; }
     }
     return find_io_region(cpu, a);
@@ -196,9 +207,9 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
         uint32_t val = arm_read32(cpu, base_addr);
         return (val >> bit) & 1;
     }
-    arm_io_region_t *r = io_lookup(cpu, &addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr, false);
     if (r) return r->read(r->user_data, addr);
-    trace_unmapped_mmio(addr, 0, 0);
+    if (!cpu->io_blocked) trace_unmapped_mmio(addr, 0, 0);
     return 0;
 }
 
@@ -344,7 +355,7 @@ uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
         uint32_t off = addr - cpu->sram_base;
         return cpu->sram[off] | (cpu->sram[off+1]<<8);
     }
-    arm_io_region_t *r = io_lookup(cpu, &addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr, false);
     if (r) return (uint16_t)r->read(r->user_data, addr);
     return 0;
 }
@@ -355,7 +366,7 @@ uint8_t arm_read8(arm_cpu_t *cpu, uint32_t addr) {
         return cpu->flash[addr - cpu->flash_base];
     if (addr >= cpu->sram_base && addr < cpu->sram_end)
         return cpu->sram[addr - cpu->sram_base];
-    arm_io_region_t *r = io_lookup(cpu, &addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr, false);
     if (r) return (uint8_t)r->read(r->user_data, addr);
     return 0;
 }
@@ -404,9 +415,9 @@ void arm_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
             arm_write32(cpu, base_addr, old & ~(1u << bit));
         return;
     }
-    arm_io_region_t *r = io_lookup(cpu, &addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr, true);
     if (r) r->write(r->user_data, addr, val);
-    else trace_unmapped_mmio(addr, 1, val);
+    else if (!cpu->io_blocked) trace_unmapped_mmio(addr, 1, val);
 }
 
 void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
@@ -418,9 +429,9 @@ void arm_write16(arm_cpu_t *cpu, uint32_t addr, uint16_t val) {
         return;
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
-    arm_io_region_t *r = io_lookup(cpu, &addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr, true);
     if (r) r->write(r->user_data, addr, val);
-    else trace_unmapped_mmio(addr, 1, val);
+    else if (!cpu->io_blocked) trace_unmapped_mmio(addr, 1, val);
 }
 
 void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
@@ -430,9 +441,9 @@ void arm_write8(arm_cpu_t *cpu, uint32_t addr, uint8_t val) {
         return;
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) return;
-    arm_io_region_t *r = io_lookup(cpu, &addr);
+    arm_io_region_t *r = io_lookup(cpu, &addr, true);
     if (r) r->write(r->user_data, addr, val);
-    else trace_unmapped_mmio(addr, 1, val);
+    else if (!cpu->io_blocked) trace_unmapped_mmio(addr, 1, val);
 }
 
 /* --- Inline fetch helpers --- */
@@ -714,6 +725,7 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->secure_fault_pending = false;
     cpu->exc_crossed_domain = false;
     cpu->exc_bg_secure = false;
+    cpu->fetch_page_checked = 0xFFFFFFFFu;
     cpu->primask_s = cpu->primask_ns = 0;
     cpu->basepri_s = cpu->basepri_ns = 0;
     cpu->faultmask_s = cpu->faultmask_ns = 0;
@@ -881,6 +893,7 @@ static void arm_tz_load_sp_bank(arm_cpu_t *cpu, bool secure) {
 static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
     if (!cpu->tz_enabled || cpu->secure == to_secure)
         return;
+    cpu->fetch_page_checked = 0xFFFFFFFFu;   /* re-check on the new state's first fetch */
     arm_tz_save_sp_bank(cpu, cpu->secure);
     cpu->secure = to_secure;
     arm_tz_load_sp_bank(cpu, to_secure);
@@ -1772,6 +1785,28 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         }
 
         uint32_t pc = cpu->reg[ARM_PC];
+
+        /* ARMv8-M: Non-secure code may not execute from Secure memory. The
+         * non-secure-callable window is the exception and must be allowed —
+         * that is where a gateway entry is fetched, and the gateway itself
+         * decides whether the entry point is valid. Checked once per 4 KB
+         * page rather than per instruction, and only while running
+         * Non-secure on a part that has the security extension, so the
+         * ordinary path is one predicted branch against a cached page. */
+        if (__builtin_expect(cpu->tz_enabled && !cpu->secure, 0) &&
+            (pc & ~0xFFFu) != cpu->fetch_page_checked) {
+            if (arm_security_attr(cpu, pc) == ARM_SEC_SECURE) {
+                /* Taken at the fetch, so the instruction never executes. */
+                cpu->sfsr |= ARM_SFSR_INVTRAN | ARM_SFSR_SFARVALID;
+                cpu->sfar = pc;
+                cpu->fetch_page_checked = 0xFFFFFFFFu;
+                cpu->instructions++;
+                remaining--;
+                arm_exception_entry(cpu, EXC_SECUREFAULT);
+                continue;
+            }
+            cpu->fetch_page_checked = pc & ~0xFFFu;
+        }
 
         /* Per-instruction debug facilities (PC watchpoints, the one-shot
          * Zephyr thread dump, the memory watch) behind ONE cached flag.

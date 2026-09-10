@@ -223,6 +223,19 @@ typedef struct arm_cpu {
     bool      tz_enabled;            /* SoC implements the security extension */
     bool      io_ns_alias;           /* config->periph_ns_alias: fold 0x4 onto 0x5 in IO dispatch */
     bool      io_txn_ns;             /* last IO access came through the Non-secure alias */
+    bool      io_blocked;            /* last IO lookup was refused by io_access_check */
+    uint32_t  fetch_page_checked;    /* last instruction page verified for Non-secure fetch */
+    /* SoC attribution unit (the Nordic security unit acts as the IDAU).
+     * Consulted by arm_security_attr() alongside the SAU; NULL leaves
+     * attribution entirely to the SAU. */
+    struct arm_idau_result (*idau_check)(void *user, uint32_t addr);
+    void     *idau_user;
+    /* Bus-side peripheral permission check. Runs on the address as the core
+     * issued it, so it sees which alias was used and therefore the security
+     * of the transaction, which is what the security unit gates on. Returns
+     * false to refuse the access. NULL on SoCs without one. */
+    bool    (*io_access_check)(void *user, uint32_t addr, bool is_write);
+    void     *io_access_user;
     uint32_t  cpuid;                 /* config->cpuid (0 = Cortex-M3 default) */
     /* DWT cycle counter (0xE0001000). CYCCNT counts core clocks while
      * CTRL.CYCCNTENA is set and DEMCR.TRCENA has clocked the trace block;

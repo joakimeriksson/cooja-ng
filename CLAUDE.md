@@ -156,6 +156,11 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # reports "Reset reason: watchdog0". Verified line-for-line against a Seeed
 # XIAO nRF54L15 — see devices/nrf54l15-xiao/HARDWARE-COMPARISON.md.
 ./build/test_runner test configs/test-tz-watchdog-nrf54l15-xiao.yaml  # ~32s sim
+# Peripheral-permission enforcement: a normal world built with the full
+# platform instead of the minimal one reaches for peripherals the secure world
+# has claimed. The SPU refuses the transaction, raises PERIPHACCERR, and the
+# secure world reboots reporting the violation.
+./build/test_runner test configs/test-tz-spu-violation-nrf54l15-xiao.yaml  # ~1s sim
 # Two-node RPL-UDP over TrustZone: each node's Non-secure world drives the
 # radio through SG veneers into the Secure world's driver, which acknowledges
 # in hardware only (CSMA_CONF_SEND_SOFT_ACK 0). The client joins the server's
@@ -363,7 +368,7 @@ scheduling policy is the one documented deferral. **The staged refactor
 | File | Purpose |
 |------|---------|
 | `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until, JIT dispatcher + lockstep verifier. On ARMv8-M also the **TrustZone-M** security state: banked SP/CONTROL, SG/BXNS/BLXNS/FNC_RETURN, TT/TTT/TTA/TTAT, secure exception entry/return with the integrity signature, and per-node transition counters. The JIT never runs Non-secure code — `arm_tz_blocks()` lives in the interpreter's memory path, so the dispatcher hands NS execution back |
-| `arm_trustzone.c` | **TrustZone-M attribution engine** (ARMv8-M security extension): SAU regions + SPU-as-IDAU, `arm_security_attr()`, memory-mapped SAU registers at `0xE000EDD0` (Secure-only, RAZ/WI from Non-secure), and `arm_tz_blocks()` hot-path access enforcement feeding SecureFault/SFSR. Gated per MCU by `has_trustzone` (nRF54L15 only) |
+| `arm_trustzone.c` | **TrustZone-M attribution engine** (ARMv8-M security extension): SAU regions combined with a per-SoC attribution hook (the nRF54L15 security unit), `arm_security_attr()`, memory-mapped SAU registers at `0xE000EDD0` (Secure-only, RAZ/WI from Non-secure), and `arm_tz_blocks()` hot-path access enforcement feeding SecureFault/SFSR. Non-secure instruction fetch is checked per 4 KB page. Gated per MCU by `has_trustzone` (nRF54L15 only) |
 | `arm_decode.c` | Stateless Thumb-16 decoder for the JIT-compilable subset -> `arm_decoded_insn_t`, basic-block decoder. Deliberately a *second* implementation of the semantics, differential-tested by `arm-decode` |
 | `arm_jit.c` | GNU Lightning code generator: compiles hot basic blocks (ALU, shifts, branches, guarded SRAM loads/stores, native self-loops under an iteration budget) to ARM64/x86-64 |
 | `arm_config.c` | MCU configurations: CC2538 (512KB flash, 32KB SRAM, 32MHz) |
@@ -627,6 +632,7 @@ NRF54L_UART_RX_TRACE=1    # nRF54L15 console bytes delivered into the firmware's
 ARM_TZ_TRACE=1            # log every world transition (SG / BLXNS / BXNS /
                           # FNC_RETURN / cross-domain exception) with ns time
 NRF54L_WDT_TRACE=1        # nRF54L15 watchdog timeout -> SoC reset
+NRF54L_SPU_TRACE=1        # nRF54L15 peripheral-permission violations (address, instance, slot)
 NRF54L_DPPI_TRACE=1       # nRF54L15 interconnect publishes, channel-group tasks, CHEN writes
 NRF54L_DISABLED_DEFER_NS  # nRF54L15 radio DISABLE->DISABLED latency, ns (default 3000; the
                           # working window is 2500-4000 — docs/design/nrf54l15-ack-gap.md)
