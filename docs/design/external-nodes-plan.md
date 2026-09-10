@@ -414,7 +414,19 @@ mergeable PR; M2–M4 can be dropped or reordered without touching M1.
   per-peripheral work, separate plan.
 - **Coordinator (co-simulation) mode**, i.e. PR #1's use case where another
   simulator owns the clock and the channel model: not needed now, but likely
-  the moment Cooja-NG has to integrate with other emulators. It is the same
+  the moment Cooja-NG has to integrate with other emulators.  *(Update: the
+  clock half of this is now built for one concrete master — see
+  [`renode-cosim-plan.md`](renode-cosim-plan.md), where Renode drives csim's
+  horizon through its own protocol.  It confirmed the sizing below: the
+  runner hook is a single gated branch, and no `sim_scheduler_ops_t` was
+  needed — it is one function returning a horizon, `sim_clock_source_t`,
+  checked against PR #1's own `time_advance`/`step_to`/`run_until`/`continue`
+  vocabulary and not just Renode's.  PR #1's `cosim_wait_command()` and that
+  hook turn out to be the same loop.  The channel half — routing csim's RF
+  through an external medium — is still unbuilt, and everything it needs is
+  already in the kernel: `medium: {"type":"none"}`, `SIM_OBS_RADIO_TX_START`,
+  `sim_radio_bus_deliver_bytes()`, and `sim_runtime_request_stop()` for
+  `run_until`'s pause-on-TX.  It would add no lines to existing core files.)* It is the same
   protocol with the roles swapped: the coordinator sends `step`, csim answers
   `done` once every node reached `t`, `rx` entries carry `node`, `tx`/`log`
   come back with `node`, `stop_on_tx` gives PR #1's run-until/continue cycle
@@ -755,3 +767,40 @@ time synchronisation is the solved part. **The unsolved part is the semantics
 of the synchronised quantity** — and it only becomes visible once the timing
 is correct enough for it to matter. Any spec for this protocol has to pin the
 reference point down in normative language, not prose.
+
+### 14.5 Renode's co-simulation protocol (added after this section was written)
+
+The table above compares standards. Renode's `CoSimulationPlugin` protocol is
+not one — it is a single tool's integration interface, in the same family as
+Verilator's DPI bridge — but it is the interface csim actually implements as
+a clock *slave*, so it belongs here for completeness. Full description:
+[`renode-cosim-plan.md`](renode-cosim-plan.md).
+
+| | Renode co-simulation |
+|---|---|
+| Shape | 24-byte binary messages over two TCP sockets; `handshake`, `tickClock`, bus read/write at an offset, async `interrupt` + `logMessage` |
+| Time | Fixed quantum. The master sends "advance N ticks" on a grid and blocks; the peer cannot request a wake-up time |
+| Data | Bus accesses at a register offset. No frame, no timestamp on one, no notion of a medium |
+| Fit | Same shape as `fmi3DoStep` and HLA's `timeAdvanceRequest`/`timeAdvanceGrant`, with master and step size fixed. Where DCP wraps that in a standardised PDU state machine, Renode ships raw bytes — which is why a peer can be written in an afternoon in any language |
+
+Two consequences, both consistent with §14.3's decision:
+
+**We implemented it, and it does not change the decision.** The value was in
+the connection people want, not the envelope: Renode is a widely used emulator
+with a large board library and no wireless network model, csim is a wireless
+network simulator, and speaking Renode's own protocol makes the pair work with
+*zero code on the Renode side*. No standard would have achieved that.
+
+**It is the wrong protocol for csim ↔ esp32sim, and that is the useful
+finding.** Renode's is a device-on-a-bus protocol; this document's is a
+node-in-a-network protocol. A fixed 100 µs grid (Renode's default scheduling
+quantum) would misplace every acknowledgement and every TSCH slot boundary,
+and there is nowhere in a bus access to put "when did the first preamble byte
+hit the air" — the very quantity §14.4 says the standards leave undefined and
+§13 shows was worth 160 µs. So the NDJSON node protocol stays for external
+nodes, unchanged.
+
+What Renode's protocol does better, and is worth borrowing here later: an
+asynchronous back-channel (our peer can only speak inside its `done`), a
+reset message, an index so one connection can carry several nodes, a TCP
+transport, and an in-process shared-library variant with no socket at all.

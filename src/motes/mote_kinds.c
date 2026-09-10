@@ -55,6 +55,14 @@ static sim_mote_kind_t kinds[] = {
         .register_radio = external_mote_register_radio,
         .ops            = &external_mote_ops,
     },
+    [SIM_BOARD_KIND_RENODE] = {
+        .name           = "renode-cosim",
+        .banner_label   = "RENODE",
+        .node_type      = NODE_RENODE,
+        .boot           = renode_mote_boot,
+        .register_radio = renode_mote_register_radio,
+        .ops            = &renode_mote_ops,
+    },
 };
 
 const sim_mote_kind_t *sim_mote_kind_for(sim_board_kind_t kind) {

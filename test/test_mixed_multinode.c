@@ -41,6 +41,7 @@
 #include "nrf54l15_soc.h"
 #include "sim_registry.h"
 #include "sim_serial_bridge.h"
+#include "renode_cosim_service.h"
 #include "sim_external_command.h"
 #include "sim_radio_bus.h"
 #include "sim_plugin.h"
@@ -261,6 +262,14 @@ static websocket_ui_service_t ui_svc;
  * mote vtable lands) and the external-command management (milestone
  * 8.2's external_command_service). */
 static sim_serial_bridge_t serial_bridge;
+
+/* Renode co-simulation (csim as clock slave, --renode).  When a master is
+ * attached it supplies the loop's horizon in place of the runner's own
+ * computation; with no --renode nothing below is touched, so the default
+ * path stays byte-identical.  See docs/design/renode-cosim-plan.md. */
+static renode_cosim_service_t renode_svc;
+static int renode_requested = 0;
+static uint64_t renode_freq_override = 0;   /* --renode-freq, applied last */
 static int ss_node_idx = -1;     /* index of the bridged node */
 
 /* External test-driver process + COOJA.testlog tee — milestone 8.2
@@ -1851,6 +1860,31 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 plugin_paths[plugin_path_count++] = argv[++i];
             else { fprintf(stderr, "--plugin: too many plugins\n"); i++; }
         }
+        else if (strcmp(argv[i], "--renode") == 0) {
+            /* --renode ADDR:MAIN:ASYNC, or bare --renode to take the
+             * connection from CSIM_RENODE (what the spawn wrapper uses). */
+            const char *spec = (i + 1 < argc && argv[i + 1][0] != '-')
+                                   ? argv[++i] : NULL;
+            int rc = spec ? renode_cosim_config_parse(&renode_svc.cfg, spec)
+                          : renode_cosim_config_from_env(&renode_svc.cfg);
+            if (rc != 0) {
+                fprintf(stderr, spec
+                        ? "--renode: expected ADDR:MAIN:ASYNC, got '%s'\n"
+                        : "--renode: CSIM_RENODE is unset or malformed%s\n",
+                        spec ? spec : "");
+                return 1;
+            }
+            renode_requested = 1;
+        }
+        else if (strcmp(argv[i], "--renode-freq") == 0 && i + 1 < argc) {
+            long long hz = atoll(argv[++i]);
+            if (hz <= 0) {
+                fprintf(stderr, "--renode-freq: expected a positive tick "
+                                "frequency in Hz, got '%s'\n", argv[i]);
+                return 1;
+            }
+            renode_freq_override = (uint64_t)hz;
+        }
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed_override = atoi(argv[++i]);
             if (seed_override == 0) {
@@ -1940,6 +1974,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
         printf("    .cc2538dk -> ARM (CC2538DK)\n");
         printf("    .cooja    -> Native (Cooja mote)\n");
         printf("    .js       -> JavaScript application mote\n");
+        printf("    .renode   -> Renode co-simulation device (see --renode)\n");
+        printf("  --renode ADDR:MAIN:ASYNC   let Renode drive the clock (csim as slave)\n");
+        printf("  --renode-freq HZ           tick frequency Renode was configured with\n");
         printf("Example:\n");
         printf("  test_runner mixed-multinode firmware/sky/udp-server.sky firmware/cooja/udp-client.cooja -t 60000\n");
         printf("  test_runner mixed-multinode configs/rpl-udp-native.json -v\n");
@@ -2339,6 +2376,24 @@ sim_restart:
                        sim_registry_find_service(&g_registry, "progress"),
                        &progress_svc);
 
+    /* Renode co-simulation.  Attached after every node exists, because the
+     * service has to find the device node before it can answer a bus access.
+     * A failure here is fatal rather than a warning: a run that quietly
+     * free-runs without the master that was meant to drive it would look
+     * like a pass. */
+    if (renode_requested) {
+        /* Applied here, not at parse time: --renode resets the config to its
+         * defaults, so a --renode-freq that came first would be lost. */
+        if (renode_freq_override)
+            renode_svc.cfg.freq_hz = renode_freq_override;
+        if (sim_service_attach(&sim_rt,
+                               sim_registry_find_service(&g_registry, "renode"),
+                               &renode_svc) < 0) {
+            fprintf(stderr, "renode: co-simulation could not start\n");
+            return 1;
+        }
+    }
+
     /* M65/M66: load plugins from --plugin (CLI) and config v2 plugins[] (after
      * the built-in services, so plugins observe last).  Register-then-attach:
      * record the catalog size, load each plugin (which registers its services),
@@ -2462,8 +2517,10 @@ sim_restart:
     double t_start = get_time_ms();
 
     int ss_has_command = sim_external_command_launched(&external_cmd);
+    int64_t clock_quantum_end = INT64_MIN;   /* end of the master's current quantum */
     while (sim_ns < end_ns || ui_service_active(&ui_svc) ||
-           (sim_serial_bridge_active(&serial_bridge) && ss_has_command)) {
+           (sim_serial_bridge_active(&serial_bridge) && ss_has_command) ||
+           sim_rt.clock_source) {
         /* Check for restart request from UI */
         if (ui_service_restart_requested(&ui_svc)) break;
 
@@ -2476,8 +2533,40 @@ sim_restart:
             goto ui_broadcast;
         }
 
-        /* Advance simulation time: jump to next event in queue, capped for UI. */
-        {
+        /* Advance simulation time: jump to next event in queue, capped for UI.
+         *
+         * With an external clock source installed the horizon is not ours to
+         * pick: whoever owns the clock decides it, and we run to exactly that
+         * time so the two clocks stay together.  Deliberately NOT capped to
+         * the next event — stopping early would report the master's quantum
+         * as finished when it was not.  See sim_clock_source_t. */
+        if (sim_rt.clock_source) {
+            /* Ask the master for a new quantum only once the previous one
+             * has been fully run; the reply for it goes out on that call. */
+            if (clock_quantum_end <= sim_ns) {
+                int64_t h = sim_rt.clock_source->next_horizon(
+                    sim_rt.clock_source->state, sim_ns);
+                if (h < 0) break;      /* master gone, or asked us to stop */
+                clock_quantum_end = h;
+            }
+            /* Script actions are applied below at the loop's current time,
+             * BEFORE the pump runs the interval that ends there.  The normal
+             * path is only exact because a SIM_EV_TEST_ACTION pin keeps its
+             * horizons ms-dense, so the pump has already reached T-epsilon
+             * when the action at T applies.  A master's quantum ignores the
+             * queue: with a 10 s quantum a `remove` at 5 s would be applied
+             * before the node had run at all.  So sub-step the quantum at an
+             * upcoming action in two moves -- stop one ns short of it, so the
+             * pump reaches it, then land on it, so the action applies. */
+            int64_t sub = clock_quantum_end;
+            if (config_loaded && config.has_test &&
+                action_idx < config.test.action_count) {
+                int64_t at = config.test.actions[action_idx].at_ms * MS_TO_NS;
+                if (at > sim_ns && at <= sub)
+                    sub = (at - 1 > sim_ns) ? at - 1 : at;
+            }
+            sim_ns = sub;
+        } else {
             int64_t next_event = sim_eq_peek_time(&sim_eq);
             int64_t max_ns = ui_service_active(&ui_svc) ? sim_ns + 100LL * MS_TO_NS
                 : sim_serial_bridge_active(&serial_bridge) ? sim_ns + TIME_STEP_NS

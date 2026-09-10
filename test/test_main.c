@@ -90,6 +90,9 @@ extern int run_radio_medium_tests(int verbose);
 /* sim_radio_bus unit tests (Phase 5 guardrail, no CPU) */
 extern int run_radio_bus_tests(int verbose);
 
+/* Renode co-simulation unit tests (codec + device window + mock master) */
+extern int run_renode_cosim_tests(int verbose);
+
 int main(int argc, char **argv) {
     int verbose = 0;
 
@@ -437,6 +440,11 @@ int main(int argc, char **argv) {
     /* sim_radio_bus unit tests (Phase 5 guardrail) */
     if (strcmp(mode, "radio-bus") == 0 || strcmp(mode, "all") == 0) {
         failures += run_radio_bus_tests(verbose);
+    }
+
+    /* Renode co-simulation (csim as clock slave) unit tests */
+    if (strcmp(mode, "renode-cosim") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_renode_cosim_tests(verbose);
     }
 
     if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {

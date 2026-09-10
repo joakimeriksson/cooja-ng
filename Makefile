@@ -106,6 +106,7 @@ COMMON_SOURCES = $(COMMON_SRC_DIR)/elf_loader.c \
                  $(COMMON_SRC_DIR)/sim_event_queue.c \
                  $(COMMON_SRC_DIR)/gdb_stub.c \
                  $(COMMON_SRC_DIR)/pcap_writer.c \
+                 $(COMMON_SRC_DIR)/renode_proto.c \
                  $(COMMON_SRC_DIR)/mock_sim_host.c
 
 # Simulation kernel — see docs/design/refactor-plan.md.
@@ -128,12 +129,14 @@ SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
                    $(SERVICES_SRC_DIR)/gdb_service.c \
                    $(SERVICES_SRC_DIR)/websocket_ui_service.c \
                    $(SERVICES_SRC_DIR)/energest_engine.c \
-                   $(SERVICES_SRC_DIR)/energest_service.c
+                   $(SERVICES_SRC_DIR)/energest_service.c \
+                   $(SERVICES_SRC_DIR)/renode_cosim_service.c
 
 # Per-kind mote modules (boot policy + adapters) + the mote-kind
 # registry — Phase 4, §3.17.
 MOTES_SOURCES = $(MOTES_SRC_DIR)/js_app_mote.c \
                 $(MOTES_SRC_DIR)/external_mote.c \
+                $(MOTES_SRC_DIR)/renode_mote.c \
                 $(MOTES_SRC_DIR)/native_cooja_mote.c \
                 $(MOTES_SRC_DIR)/msp430_elf_mote.c \
                 $(MOTES_SRC_DIR)/arm_elf_mote.c \
@@ -142,7 +145,8 @@ MOTES_SOURCES = $(MOTES_SRC_DIR)/js_app_mote.c \
 NATIVE_SOURCES = $(NATIVE_SRC_DIR)/native_node.c \
                  $(NATIVE_SRC_DIR)/native_radio.c \
                  $(NATIVE_SRC_DIR)/js_node.c \
-                 $(NATIVE_SRC_DIR)/ext_node.c
+                 $(NATIVE_SRC_DIR)/ext_node.c \
+                 $(NATIVE_SRC_DIR)/renode_dev.c
 
 UI_SOURCES = $(UI_SRC_DIR)/ws_server.c \
              $(UI_SRC_DIR)/sim_state.c
@@ -208,7 +212,8 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_mx25r6435f.c \
                $(TEST_DIR)/test_enc28j60.c \
                $(TEST_DIR)/test_radio_medium.c \
-               $(TEST_DIR)/test_radio_bus.c
+               $(TEST_DIR)/test_radio_bus.c \
+               $(TEST_DIR)/test_renode_cosim.c
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 

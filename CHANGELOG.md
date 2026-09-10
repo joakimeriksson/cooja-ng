@@ -7,6 +7,44 @@ then, 0.x minor releases may adjust the CLI, config, and plugin ABI.
 
 ## [Unreleased]
 
+### Added — Renode co-simulation: csim as a clock slave
+- **Renode can drive csim's simulation clock.** New
+  `src/services/renode_cosim_service.c` speaks Renode's `CoSimulationPlugin`
+  protocol — the 24-byte binary message over two TCP sockets, the handshake,
+  the fixed-quantum `tickClock`, bus reads and writes, and the asynchronous
+  `interrupt` and `logMessage` channel. Every `tickClock` becomes the runner's
+  next horizon, so Renode's virtual time and csim's advance together. From
+  Renode's side this needs **no Renode-side code**: one
+  `CoSimulated.CoSimulatedPeripheral` line in a `.repl`
+  (`examples/renode/csim.repl`). Everywhere else in csim, csim owns the clock;
+  this is the one inversion. See
+  [`docs/design/renode-cosim-plan.md`](docs/design/renode-cosim-plan.md).
+- **csim's whole 802.15.4 network as a memory-mapped device.** New
+  `src/native/renode_dev.c` is the register window behind that peripheral:
+  transmit a frame into csim's medium, read received frames back with their
+  sender, channel, per-receiver RSSI and **on-air start time**, bridge one
+  csim node's console, and take a level interrupt when something arrives. The
+  guest-side mirror of the map is `examples/renode/csim_dev.h`.
+- **New mote kind `renode-cosim`**, selected by a `.renode` firmware
+  extension the way `.py` selects an external node (the path is never opened).
+  It has no CPU and no clock of its own: it is the device's place in csim's
+  medium. Without a master attached it is inert, so a config containing one
+  still runs as a plain regression.
+- **New runner flags** `--renode ADDR:MAIN:ASYNC` and `--renode-freq HZ`
+  (`--renode-freq` must match the peripheral's `frequency`; the `tickClock`
+  message carries only a tick count). Also reachable as `plugins: ["renode"]`
+  with the connection in `CSIM_RENODE`. `tools/csim-renode-launch.sh` maps
+  Renode's positional spawn arguments onto the flag.
+- **Tests**: `./build/test_runner renode-cosim` covers the wire codec against
+  a hand-written byte vector, the register window and its FIFOs, and the real
+  protocol loop driven by a scripted mock master over a `socketpair`.
+  `tools/renode-mock-master.py` plus `tools/check-renode-cosim.sh` gate it end
+  to end: exact clock coupling, frames crossing in both directions, console
+  lines forwarded, determinism across identical runs, and a clean exit when
+  the master dies mid-run.
+- The runner's loop is touched in exactly two gated places, so with no
+  `--renode` the default path stays byte-identical.
+
 ### Added — ARMv8-M TrustZone-M (nRF54L15 Cortex-M33)
 - **The M33 runs secure/non-secure partitioned firmware**, not just non-secure.
   New `src/arm/arm_trustzone.c` implements the security-attribution engine —

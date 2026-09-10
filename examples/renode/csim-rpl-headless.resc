@@ -1,0 +1,32 @@
+:name: csim RPL co-simulation (headless)
+:description: Non-interactive variant of csim-rpl.resc for scripted runs.
+#
+# Runs a fixed span of VIRTUAL time and quits, so the result does not depend
+# on how fast the host is.  Renode starts csim itself; point CSIM_CONFIG at
+# the scenario:
+#
+#   export CSIM_CONFIG=$PWD/configs/test-renode-rpl-sky.yaml
+#   export CSIM_RENODE_FREQ_HZ=1000000
+#   export CSIM_LOG=/tmp/csim.log
+#   renode --disable-xwt --console --plain \
+#          -e "include @examples/renode/csim-rpl-headless.resc"
+#
+# $seconds is virtual seconds of the Renode machine, which — because Renode
+# drives the tick clock — is also how far csim advances.
+
+$fw ?= @examples/renode/firmware/sniffer.elf
+$launch ?= @tools/csim-renode-launch.sh
+$seconds ?= "20"
+
+mach create "csim-host"
+machine LoadPlatformDescription @examples/renode/csim-host.repl
+
+showAnalyzer uart
+
+csim SimulationFilePathMacOS $launch
+csim SimulationFilePathLinux $launch
+
+sysbus LoadELF $fw
+
+emulation RunFor $seconds
+quit

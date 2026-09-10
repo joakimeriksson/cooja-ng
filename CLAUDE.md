@@ -96,6 +96,11 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # Chip-driver + radio-medium unit suites
 ./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)
 ./build/test_runner radio-medium            # 241 radio-medium routing tests
+./build/test_runner renode-cosim -v         # Renode co-simulation (csim as clock SLAVE):
+                                            # 24-byte wire codec, the memory-mapped register
+                                            # window + its FIFOs, and the protocol/horizon
+                                            # loop driven by a scripted mock master over a
+                                            # socketpair. See docs/design/renode-cosim-plan.md
 
 # nRF52840 USB Dongle (PCA10059, Cortex-M4F + on-chip 802.15.4 radio)
 ./build/test_runner nrf52840-dongle-multinode firmware/nrf52840-dongle/udp-server.nrf52840-dongle firmware/nrf52840-dongle/udp-client.nrf52840-dongle -t 60000
@@ -173,6 +178,62 @@ CSIM_GE_AVG_DROP=0.2 CSIM_GE_BURST_LEN=8 ./build/test_runner test configs/medium
 tools/check-plugin.sh                           # plugin smoke check (service + medium + energy)
 ```
 
+```sh
+# Renode co-simulation — csim as clock SLAVE (docs/design/renode-cosim-plan.md).
+# Renode drives csim's horizon with its own fixed-quantum tickClock protocol,
+# and csim's whole 802.15.4 network appears in Renode as one memory-mapped
+# device.  No Renode-side code: one CoSimulated.CoSimulatedPeripheral line in
+# a .repl (examples/renode/csim-host.repl).  A ".renode" firmware entry selects
+# the device node the way ".py" selects an external node; the path is never
+# opened.  Verified against Renode 1.17 (a real RPL-UDP run: examples/renode).
+#
+# Renode STARTS csim (setting simulationFilePath is what opens the sockets and
+# launches the peer), so the scenario is passed through the environment:
+export CSIM_CONFIG=$PWD/configs/test-renode-rpl-sky.yaml
+export CSIM_RENODE_FREQ_HZ=1000000     # must match `frequency` in the .repl
+make -C examples/renode/firmware        # the demo guest sniffer, needs arm-none-eabi-gcc
+renode examples/renode/csim-rpl.resc    # then `start` in Renode's monitor
+#
+# CSIM_RENODE_TRACE=1 prints one line per protocol step with wall-clock times —
+# the symptom of a protocol mistake is both sides waiting and neither saying why.
+tools/check-renode-cosim.sh                     # end-to-end vs the Python mock master:
+                                                # exact clock coupling, frames both ways,
+                                                # determinism, clean exit when the master dies
+python3 tools/renode-mock-master.py --ticks 12000 --inject-at 9000 -v \
+    --spawn './build/test_runner test configs/test-renode-sky.yaml --renode {2}:{0}:{1} --renode-freq 1000000 -q'
+```
+
+The runner's loop does not name Renode: an external clock source installs
+itself on the kernel as a `sim_clock_source_t` (one function returning the
+next horizon, or -1 when the run is over) and the loop asks that instead of
+computing a horizon itself.  Renode's service is one implementation; a
+JSON co-simulation coordinator would be another and would add no lines to
+existing core files.
+
+The two protocols **compose**: running both at once makes csim a clock slave
+to Renode and a clock master to esp32sim at the same time, while it owns the
+medium for all of them (`configs/test-threeway-cosim.yaml`, §12 of the plan).
+Three emulators, three ISAs (ARM Cortex-M3 / MSP430 16-bit / RISC-V 32-bit),
+carrying the standard stack — IPv6 / 6LoWPAN / RPL / UDP — with
+csim's MSP430 and esp32sim's RISC-V completing UDP round trips through an RPL
+DAG while Renode drives the clock. Deterministic end to end. esp32sim is an
+out-of-tree binary, so like the real-Renode runs this is a documented harness
+rather than a CI gate.
+
+Renode's own CC2538 can be the **RPL root** of a csim network
+(`configs/test-renode-root-rpl.yaml`, `-2clients.yaml`): csim's Sky and
+nRF52840 clients join its DAG and complete UDP round trips through it, with
+`examples/renode/bridge/CsimBridge.cs` joining Renode's medium to csim's. The
+bridge supplies what Renode's frame-level radio lacks -- air time on the way
+in, and the 192 µs ACK turnaround on the way back (§11). The reverse, Renode
+as a *client* of a csim root, does not yet complete RPL.
+
+NB the co-simulation protocols run in opposite directions and are deliberately
+different. `.renode` = **Renode owns the clock**, binary, bus-shaped. `.py` =
+**csim owns the clock**, NDJSON, node-shaped, exact-time stepping with
+ns-stamped frames (`docs/design/external-nodes-plan.md`, and §14.5 there for
+why esp32sim keeps it).
+
 ## Project Structure
 
 ```
@@ -184,7 +245,8 @@ src/
   msp430/             MSP430 emulator source files
   arm/                ARM Cortex-M3/M4/M33 emulator source files
   riscv/              RV32E emulator (nRF54L15 FLPR coprocessor) + SoC bridge
-  native/             Native Cooja motes (dlopen) + JS app motes (QuickJS)
+  native/             Native Cooja motes (dlopen) + JS app motes (QuickJS) +
+                      external process motes + the Renode co-simulation device
   ui/                 WebSocket/state bridge (observation only)
 include/
   sim/                Kernel headers (sim_runtime.h, sim_mote.h, sim_radio_bus.h, sim_board.h, sim_registry.h, csim_plugin.h)
@@ -217,7 +279,9 @@ timeline), `pcap_service.c` (802.15.4 capture), `progress_service.c`
 (per-tick progress report), `json_test_service.c` (JSON step/validator
 runner), `js_test_service.c` (JS test-engine line feed), `gdb_service.c`
 (per-mote GDB stub; sets `cpu->gdb_stub`), `websocket_ui_service.c` (live
-UI: ws_server + console + serialization). The end-of-run statistics stay
+UI: ws_server + console + serialization), and `renode_cosim_service.c`
+(Renode co-simulation: the only service that *supplies* the runner's horizon
+instead of observing it — see `docs/design/renode-cosim-plan.md`). The end-of-run statistics stay
 runner-side (type-specific diagnostics that read chip memory + firmware
 symbols).
 
@@ -239,6 +303,7 @@ v3 plugin ABI. See [`docs/design/ui-plugins.md`](docs/design/ui-plugins.md).
 | `arm_elf_mote.c` | ARM boot policy (cc2538/firefly/nrf52840/nrf54l15 wiring, FICR seeding, linkaddr patches), execute tick, radio ops, full mote vtable (`arm_elf_mote_ops`) |
 | `native_cooja_mote.c` | Native Cooja mote: boot, full adapter table, tick helpers, SYNC radio ops |
 | `js_app_mote.c` | JS app mote: boot, full adapter table, BATCH radio ops |
+| `renode_mote.c` | Renode co-simulation device: a passive node with no CPU and no clock of its own, driven entirely by bus accesses from Renode. Gives the device its place in the medium (position, channel, RSSI) and the frame in/out path; the register window itself is `src/native/renode_dev.c` |
 
 The mote vtable (`include/sim/sim_mote.h`, `sim_mote_ops_t`) abstracts the four
 node kinds (MSP430/ARM/native/JS). All four kinds' ops tables are module-owned

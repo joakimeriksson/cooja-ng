@@ -37,6 +37,34 @@ typedef enum sim_run_state {
 
 struct sim_radio_bus;  /* see sim_radio_bus.h — owned storage lives with the runner until M10 */
 
+/*
+ * An external clock source — something outside csim that decides how far
+ * simulation time advances.
+ *
+ * Normally csim owns its clock: the runner picks a horizon from the event
+ * queue and the pump runs to it.  When a clock source is installed the
+ * runner asks it for the horizon instead, which is what lets another
+ * simulator (Renode's tick clock, a co-simulation coordinator, an FMI or
+ * DCP master) keep its virtual time locked to csim's.
+ *
+ * next_horizon() returns the time to run to, which must be >= cur_ns, or -1
+ * when the run is over (the master disconnected, or asked to stop).  It is
+ * called in place of the runner's own horizon computation, so it may block
+ * waiting for the master, and it is where a co-simulation service services
+ * whatever else the master asks for in the meantime.
+ *
+ * Because it receives cur_ns, an implementation can also tell that the pump
+ * stopped SHORT of the horizon it last returned — which is how a "run until
+ * something happens" command (paired with sim_runtime_request_stop() from an
+ * observer) reports its pause point.  And since csim's own next event time
+ * is one sim_eq_peek_time() away, a discrete-event master can be told when
+ * csim next needs to run rather than being made to guess a quantum.
+ */
+typedef struct sim_clock_source {
+    int64_t (*next_horizon)(void *state, int64_t cur_ns);
+    void    *state;
+} sim_clock_source_t;
+
 typedef struct sim_runtime {
     /* The five Phase 1 milestone 1 fields, in the order the plan lists them. */
     int64_t            now_ns;        /* current simulation time (ns)        */
@@ -96,6 +124,10 @@ typedef struct sim_runtime {
      * or by loading any plugin — a duty-cycle / energy service consumes the
      * stream.  See sim_runtime_set_radio_state_tracking(). */
     bool               radio_state_tracking;
+
+    /* Optional external clock source (see sim_clock_source_t).  NULL — the
+     * default — means csim owns its own clock and nothing below changes. */
+    const sim_clock_source_t *clock_source;
 
     /* Plugin UI panels (v3 csim_ui_ops): a small id→latest-JSON table a plugin
      * fills via sim_runtime_ui_publish_panel(); the websocket UI service
@@ -289,6 +321,11 @@ void sim_runtime_run_until(sim_runtime_t *sim, int64_t end_ns,
  * alternative to re-entering kernel dispatch APIs): the pump finishes
  * the current event and returns. */
 void sim_runtime_request_stop(sim_runtime_t *sim);
+
+/* Install (or clear, with NULL) the external clock source.  The runtime does
+ * not own it; it must outlive the run. */
+void sim_runtime_set_clock_source(sim_runtime_t *sim,
+                                  const sim_clock_source_t *cs);
 
 static inline bool sim_runtime_stop_requested(const sim_runtime_t *sim) {
     return sim->run_state == SIM_RUN_STOP_REQUESTED;

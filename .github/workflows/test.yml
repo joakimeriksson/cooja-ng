@@ -143,6 +143,30 @@ jobs:
         # simulation. The control for the co-simulation work below: if this
         # passes, a cross-simulator failure is not the emulated side.
         run: ./build/test_runner test configs/test-mixed-platform-rpl.yaml -q
+
+      - name: Renode co-simulation unit tests
+        # Wire codec, the memory-mapped register window, and the protocol +
+        # horizon loop driven by a scripted mock master over a socketpair.
+        run: ./build/test_runner renode-cosim
+
+      - name: Renode co-simulation — a mock master drives csim's clock
+        # End to end over real sockets and a real process, but PROTOCOL ONLY:
+        # Renode itself is not a CI dependency, and a mock master speaking its
+        # wire format covers the same exchange in half a second.  Gates exact
+        # clock coupling (elapsed sim time must equal ticks x limitBuffer /
+        # frequency), frames crossing in both directions (an injected frame
+        # must raise the emulated Sky nodes' CRC-valid reception count),
+        # console lines forwarded as log messages, determinism across
+        # identical runs, and a clean exit when the master dies mid-run.
+        #
+        # Runs coarse quanta (100 ms) on purpose: the protocol exchange is
+        # identical at any quantum size, and the cost here is socket round
+        # trips, not simulation — 1 ms quanta made this step ~8 minutes
+        # instead of ~0.5 s for exactly the same coverage.  The fine-grained
+        # timing belongs to a real Renode run (examples/renode/), which is
+        # documented and deliberately not gated.
+        run: tools/check-renode-cosim.sh
+
       - name: Version smoke
         run: ./build/test_runner --version
 
