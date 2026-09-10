@@ -34,6 +34,7 @@
 #include "timeline.h"
 #include "radio_medium.h"
 #include "sim_event_queue.h"   /* SIM_EQ_MAX_NODES */
+#include "sim_control.h"       /* pause/speed/move go through the control API */
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,9 +51,6 @@ typedef void (*ui_describe_fn)(int i, int *id, const char **type,
                                int64_t *cycles, uint32_t *freq,
                                int64_t *sim_time);
 
-/* Apply a UI "move node" command (node id is the Cooja id). */
-typedef void (*ui_move_fn)(int node_id, double x, double y);
-
 typedef struct websocket_ui_service {
     ws_server_t *server;          /* NULL = inactive                       */
 
@@ -63,9 +61,9 @@ typedef struct websocket_ui_service {
     char  console_new[UI_SVC_MAX_NODES][UI_CONSOLE_LINES][UI_CONSOLE_LINELEN];
     int   console_new_count[UI_SVC_MAX_NODES];
 
-    /* Control flags driven by ui_message_handler / the loop. */
-    double speed_ratio;           /* adjustable from UI, default 10x        */
-    int    paused;
+    /* Control flags driven by ui_message_handler / the loop.  Pause and
+     * speed live in sim_control now (shared with the shell and the loop);
+     * the UI only keeps what is UI-private. */
     int    full_state_requested;  /* send full state on next broadcast      */
     int    restart_requested;
 
@@ -79,7 +77,7 @@ typedef struct websocket_ui_service {
     timeline_t             *tl;
     const int              *node_count;
     ui_describe_fn          describe;
-    ui_move_fn              on_move;
+    sim_control_t          *ctl;      /* pause/play/speed/move target       */
 
     /* Live global stats the runner refreshes each broadcast. */
     int stat_rf_bytes, stat_uart_bytes;
@@ -102,22 +100,16 @@ bool ui_service_start(websocket_ui_service_t *svc, int port,
                       int64_t *prev_last_tx_ns,
                       radio_medium_t *medium, timeline_t *tl,
                       const int *node_count,
-                      ui_describe_fn describe, ui_move_fn on_move);
+                      ui_describe_fn describe, sim_control_t *ctl);
 
 static inline bool ui_service_active(const websocket_ui_service_t *svc) {
     return svc->server != NULL;
-}
-static inline bool ui_service_paused(const websocket_ui_service_t *svc) {
-    return svc->paused != 0;
 }
 static inline bool ui_service_restart_requested(const websocket_ui_service_t *svc) {
     return svc->restart_requested != 0;
 }
 static inline void ui_service_clear_restart(websocket_ui_service_t *svc) {
     svc->restart_requested = 0;
-}
-static inline double ui_service_speed_ratio(const websocket_ui_service_t *svc) {
-    return svc->speed_ratio;
 }
 
 /* Poll the socket (process incoming frames / accept clients). */

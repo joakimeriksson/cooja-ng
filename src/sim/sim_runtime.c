@@ -261,11 +261,17 @@ void sim_runtime_run_until(sim_runtime_t *sim, int64_t end_ns,
     static uint64_t spin_count = 0;
 
     if (!sim || !dispatch) return;
+    /* §3.12: paused means services keep polling but no event is
+     * dispatched.  PAUSED is set/cleared by sim_control only; the pump
+     * never overrides it (it used to write RUNNING unconditionally). */
+    if (sim->run_state == SIM_RUN_PAUSED)
+        return;
     if (sim->run_state != SIM_RUN_STOP_REQUESTED)
         sim->run_state = SIM_RUN_RUNNING;
 
     for (;;) {
-        if (sim->run_state == SIM_RUN_STOP_REQUESTED)
+        if (sim->run_state == SIM_RUN_STOP_REQUESTED ||
+            sim->run_state == SIM_RUN_PAUSED)   /* `step N` budget spent */
             return;
         int64_t next_ev_time = sim_eq_peek_time(&sim->event_queue);
         if (next_ev_time > end_ns)
