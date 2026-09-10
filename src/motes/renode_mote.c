@@ -57,6 +57,17 @@ static void renode_hook_set_power(void *user, int indicator) {
         node->env->radio_set_power(node, 0, indicator, 31);
 }
 
+/* Carrier sense, from the medium's own view of this node's position and
+ * channel.  The runner's CCA is generic despite its name -- it walks the
+ * TX-range neighbour list and reads the bus's per-sender medium-busy
+ * deadline, with a cross-band check. */
+static bool renode_hook_channel_busy(void *user) {
+    mixed_node_t *node = (mixed_node_t *)user;
+    if (!node->env->cc1200_channel_busy)
+        return false;
+    return node->env->cc1200_channel_busy(node);
+}
+
 /* Console bytes from Renode into a csim node.  Returns what the node took,
  * so the device can keep the rest and retry rather than lose it. */
 static int renode_hook_uart_inject(void *user, int slot, const uint8_t *buf,
@@ -92,6 +103,7 @@ int renode_mote_boot(mixed_node_t *node, int slot, const char *path,
     dev->set_channel = renode_hook_set_channel;
     dev->set_power   = renode_hook_set_power;
     dev->uart_inject = renode_hook_uart_inject;
+    dev->channel_busy = renode_hook_channel_busy;
     dev->self_id     = node_id;
     dev->uart_node   = 0;
 

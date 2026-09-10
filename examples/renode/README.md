@@ -14,11 +14,41 @@ Renode's standard external-simulator peripheral. Protocol and design:
 | File | |
 |---|---|
 | `csim-host.repl` | A minimal Cortex-M4 machine: CPU, memory, a PL011 UART, and the csim window at `0x40100000` |
+| `cc2538-csim-rpl.resc` | **Two-simulator RPL**: a CC2538 in Renode is the DAG root; csim's nodes join it over 6LoWPAN/RPL/UDP |
+| `bridge/CsimBridge.cs` | The radio bridge that makes that possible: joins Renode's medium to csim's, supplying the air time and ACK turnaround Renode's frame-level radio lacks |
 | `csim-rpl.resc` | Interactive run: watch a live RPL-UDP network from Renode through the register window |
 | `csim-rpl-headless.resc` | The same run bounded by virtual time, for scripts and CI |
 | `csim.repl`, `csim.resc` | The peripheral on its own, to drop into an existing platform |
 | `csim_dev.h` | Guest-side view of the register window (mirrors `include/native/renode_dev.h`) |
 | `firmware/` | The demo guest firmware: a bare-metal 802.15.4 sniffer |
+
+## RPL root in Renode, clients in csim
+
+The headline demo. Renode emulates a CC2538 running Contiki-NG's rpl-udp
+*server* — the RPL DAG root. csim emulates the clients: a Tmote Sky, or a Sky
+and an nRF52840 together. Each client hears the root's DIOs across the
+simulator boundary, picks it as parent, registers with an acknowledged DAO,
+and completes UDP request/response round trips through it. Verified against
+Renode 1.17; the root serves both clients from their own IPv6 addresses.
+
+```sh
+export CSIM_CONFIG=$PWD/configs/test-renode-root-rpl.yaml            # one client (Sky)
+# export CSIM_CONFIG=$PWD/configs/test-renode-root-rpl-2clients.yaml  # Sky + nRF52840; use $id=3
+export CSIM_RENODE_FREQ_HZ=1000000
+renode examples/renode/cc2538-csim-rpl.resc
+# then, in Renode's monitor:  start
+```
+
+What you should see, on Renode's side (the root) and csim's (the client):
+
+```
+[Renode root]  Received request 'hello 0' from fd00::212:7401:1:101
+[Renode root]  Sending response.
+[csim Sky]     Received response 'hello 0' from fd00::200:0:0:2
+```
+
+The reverse arrangement — Renode's CC2538 as a *client* joining a csim root —
+does not yet complete RPL; see the plan doc §11.
 
 ## Watching csim's network from Renode
 

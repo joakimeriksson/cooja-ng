@@ -1,0 +1,83 @@
+:name: RPL-UDP across Renode and csim
+:description: A CC2538 in Renode is the RPL root; csim's nodes join its DAG and exchange UDP with it.
+#
+# Two simulators, one radio medium, one RPL DAG. Renode emulates the CC2538
+# root and its radio chip; csim emulates the client nodes and the air between
+# them. Both run unmodified Contiki-NG with stock CSMA and RPL Lite.
+#
+# Renode drives the clock and starts csim itself, so this is the only thing
+# you run:
+#
+#   CSIM_CONFIG=$PWD/configs/test-renode-root-rpl.yaml \
+#   CSIM_LOG=/tmp/csim.log \
+#       renode examples/renode/cc2538-csim-rpl.resc
+#   (monitor) start
+#
+# How the frames cross:
+#
+#   CC2538 radio ─┐                                    ┌─ nRF52840 (csim)
+#                 ├─ Renode wireless ── CsimBridge ──> csim UDGM medium
+#   (Renode)     ─┘                        │
+#                                 co-simulation window at 0x50100000,
+#                                 which also keeps the two clocks in step
+#
+# The 100 us quantum (frequency x limitBuffer) is the latency budget for an
+# 802.15.4 acknowledgement crossing back from csim before the CC2538's driver
+# gives up on it -- see docs/design/renode-cosim-plan.md.
+
+$rom ?= @https://dl.antmicro.com/projects/renode/cc2538_rom_dump.bin-s_524288-0c196cdc21b5397f82e0ff42b206d1cc4b6d7522
+$fw ?= @firmware/cc2538dk/udp-server-v52.cc2538dk
+$launch ?= @tools/csim-renode-launch.sh
+$id ?= 2   # must match the dev.renode node's id in CSIM_CONFIG
+
+include @examples/renode/bridge/CsimBridge.cs
+
+# No range function: csim's UDGM decides who hears whom, so Renode's medium
+# is a plain hub and propagation is modelled once, not twice.
+emulation CreateIEEE802_15_4Medium "wireless"
+
+mach create "cc2538-client"
+using sysbus
+machine LoadPlatformDescription @platforms/cpus/cc2538.repl
+
+# csim itself: the clock master, and the pipe the bridge moves frames through.
+machine LoadPlatformDescriptionFromString "csim: CoSimulated.CoSimulatedPeripheral @ sysbus <0x50100000, +0x100> { frequency: 1000000; limitBuffer: 100; timeout: 240000; address: \"127.0.0.1\" }"
+
+# The seam between the two media.
+machine LoadPlatformDescriptionFromString "bridge: Wireless.CsimBridge @ sysbus <0x50000000, +0x20> { csimBase: 0x50100000; pollMicroseconds: 100; channel: 26 }"
+
+connector Connect radio wireless
+connector Connect bridge wireless
+
+# CLOCK_STATUS is a constant tag in cc2538.repl; Contiki polls it for the
+# oscillator-stable bit, so give it a bit that moves (Renode's own shim).
+machine PyDevFromFile @scripts/pydev/rolling-bit.py 0x400D2004 0x4 True "sysctrl"
+
+macro reset
+"""
+    # IEEE address in flash (0x00 0x12 0x4B is the TI OUI)
+    sysbus WriteDoubleWord 0x00280028 $id
+    sysbus WriteDoubleWord 0x0028002C 0x00
+    sysbus WriteDoubleWord 0x00280030 0xAB
+    sysbus WriteDoubleWord 0x00280034 0x89
+    sysbus WriteDoubleWord 0x00280038 0x00
+    sysbus WriteDoubleWord 0x0028003C 0x4B
+    sysbus WriteDoubleWord 0x00280040 0x12
+    sysbus WriteDoubleWord 0x00280044 0x00
+
+    sysbus LoadBinary $rom 0x0
+    sysbus LoadELF $fw
+    cpu VectorTableOffset `sysbus GetSymbolAddress "vectors"`
+"""
+runMacro $reset
+
+# Renode starts csim: setting the path is what opens the sockets and launches
+# the peer. The scenario comes from CSIM_CONFIG.
+csim SimulationFilePathMacOS $launch
+csim SimulationFilePathLinux $launch
+
+showAnalyzer sysbus.uart0
+
+echo ""
+echo "CC2538 RPL root in Renode; csim's clients join it. 'start' to run."
+echo ""

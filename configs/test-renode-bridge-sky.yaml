@@ -1,0 +1,41 @@
+# RPL-UDP across two simulators.
+#
+# The RPL root and UDP server is a Tmote Sky (MSP430 + CC2420) emulated by csim. Its peer, the
+# UDP client, is a CC2538 emulated by *Renode* — it does not appear in this
+# file as a CPU at all, only as the co-simulation device node below, which is
+# where Renode's radio traffic enters csim's medium.
+#
+# Both run unmodified Contiki-NG from the same source tree, with stock CSMA
+# and RPL Lite; neither knows the other is in a different simulator.
+#
+# Driven from Renode (it starts csim itself):
+#   make -C examples/renode/firmware
+#   CSIM_CONFIG=$PWD/configs/test-renode-bridge-sky.yaml \
+#       renode examples/renode/cc2538-csim-rpl.resc
+#
+# See docs/design/renode-cosim-plan.md and examples/renode/README.md.
+title: "RPL-UDP across simulators: Sky server in csim, CC2538 client in Renode"
+timeout_ms: 120000
+seed: 42
+startup_delay_ms: 1000
+
+radiomedium:
+  type: udgm
+  tx_range: 55.0
+  interference_range: 110.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+nodes:
+  # The RPL root / UDP server, fully emulated here. A different CPU
+  # architecture from the Renode node -- MSP430 here, Cortex-M3 there.
+  - { firmware: firmware/sky/udp-server.sky, id: 1, x: 0.0, y: 0.0 }
+  # Renode's CC2538, as seen from csim: a node in the medium whose frames
+  # arrive over the co-simulation window. The path is never opened.
+  - { firmware: dev.renode, id: 2, x: 10.0, y: 0.0 }
+
+test:
+  timeout_is_success: true
+  validators:
+    # The request can only have come from the CC2538 running in Renode.
+    - { pattern: "Received request", node: 1, min_count: 1 }

@@ -205,6 +205,24 @@ computing a horizon itself.  Renode's service is one implementation; a
 JSON co-simulation coordinator would be another and would add no lines to
 existing core files.
 
+The two protocols **compose**: running both at once makes csim a clock slave
+to Renode and a clock master to esp32sim at the same time, while it owns the
+medium for all of them (`configs/test-threeway-cosim.yaml`, §12 of the plan).
+Three emulators, three ISAs (ARM Cortex-M3 / MSP430 16-bit / RISC-V 32-bit),
+carrying the standard stack — IPv6 / 6LoWPAN / RPL / UDP — with
+csim's MSP430 and esp32sim's RISC-V completing UDP round trips through an RPL
+DAG while Renode drives the clock. Deterministic end to end. esp32sim is an
+out-of-tree binary, so like the real-Renode runs this is a documented harness
+rather than a CI gate.
+
+Renode's own CC2538 can be the **RPL root** of a csim network
+(`configs/test-renode-root-rpl.yaml`, `-2clients.yaml`): csim's Sky and
+nRF52840 clients join its DAG and complete UDP round trips through it, with
+`examples/renode/bridge/CsimBridge.cs` joining Renode's medium to csim's. The
+bridge supplies what Renode's frame-level radio lacks -- air time on the way
+in, and the 192 µs ACK turnaround on the way back (§11). The reverse, Renode
+as a *client* of a csim root, does not yet complete RPL.
+
 NB the co-simulation protocols run in opposite directions and are deliberately
 different. `.renode` = **Renode owns the clock**, binary, bus-shaped. `.py` =
 **csim owns the clock**, NDJSON, node-shaped, exact-time stepping with

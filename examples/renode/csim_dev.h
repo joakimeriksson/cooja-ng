@@ -77,6 +77,7 @@
                                            * empty.  write: inject a byte     */
 #define CSIM_UART_COUNT  CSIM_REG(0x68)
 #define CSIM_IRQ_STATUS  CSIM_REG(0x6C)   /* bit 0 RX, bit 1 console          */
+#define CSIM_CCA         CSIM_REG(0x70)   /* 1 = csim's medium is busy here   */
 
 #define CSIM_IRQ_SRC_RX   (1U << 0)
 #define CSIM_IRQ_SRC_UART (1U << 1)

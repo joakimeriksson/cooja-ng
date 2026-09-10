@@ -75,6 +75,7 @@ extern "C" {
 #define RENODE_REG_UART_DATA   0x64  /* RW  R: pop byte / W: inject byte     */
 #define RENODE_REG_UART_COUNT  0x68  /* R   console bytes available          */
 #define RENODE_REG_IRQ_STATUS  0x6C  /* R   unmasked interrupt sources       */
+#define RENODE_REG_CCA         0x70  /* R   1 = csim's medium is busy here    */
 
 #define RENODE_DEV_ID          0x4353494DU   /* "CSIM" */
 #define RENODE_DEV_VERSION     1U
@@ -148,6 +149,15 @@ typedef struct renode_dev {
     void    (*set_power)(void *user, int indicator);
     /* Push bytes into node `slot`'s console.  Returns bytes consumed. */
     int     (*uart_inject)(void *user, int slot, const uint8_t *buf, int len);
+    /* Carrier sense: is any in-range neighbour transmitting right now?
+     *
+     * A frame-level peer (Renode's radio model has no air time) cannot know
+     * this by itself, and injecting on top of a transmission already in
+     * flight is not a collision csim reports -- the receiver's radio is busy
+     * with the first frame, drops the opening bytes of the second, then locks
+     * SFD partway through it and fails CRC.  Exposing the medium's own CCA
+     * is what lets such a peer defer instead. */
+    bool    (*channel_busy)(void *user);
     void    *user;
 } renode_dev_t;
 
