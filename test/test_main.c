@@ -93,6 +93,9 @@ extern int run_radio_bus_tests(int verbose);
 /* Renode co-simulation unit tests (codec + device window + mock master) */
 extern int run_renode_cosim_tests(int verbose);
 
+/* Shell parser + script-engine unit tests (mock sim_control bundle) */
+extern int run_shell_tests(int verbose);
+
 int main(int argc, char **argv) {
     int verbose = 0;
 
@@ -123,6 +126,7 @@ int main(int argc, char **argv) {
         printf("Radio medium: radio-medium\n");
         printf("Radio bus:    radio-bus\n");
         printf("Test:         test <config.yaml|json> [-v] [-t ms] [--seed N] [--save-config out.yaml]\n");
+    printf("              ... [--shell] [--script FILE] [--paused] [--speed N|max|realtime]  (docs/shell.md)\n");
         printf("Config:       config-convert <in> <out.yaml> | config-roundtrip <config...> | config-reject <config...>\n");
         printf("Combined:     all\n");
         return 1;
@@ -445,6 +449,11 @@ int main(int argc, char **argv) {
     /* Renode co-simulation (csim as clock slave) unit tests */
     if (strcmp(mode, "renode-cosim") == 0 || strcmp(mode, "all") == 0) {
         failures += run_renode_cosim_tests(verbose);
+    }
+
+    /* Shell tokenizer / time / selector / script-engine unit tests */
+    if (strcmp(mode, "shell") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_shell_tests(verbose);
     }
 
     if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {

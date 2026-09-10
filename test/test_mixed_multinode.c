@@ -28,6 +28,7 @@
 #include "sim_state.h"
 #include "websocket_ui_service.h"
 #include "sim_control.h"
+#include "shell_service.h"
 #include "timeline.h"
 #include "timeline_service.h"
 #include "packet_analyzer.h"
@@ -254,6 +255,10 @@ static inline int node_active(int idx) {
  * + node_states[] the RF path also writes, feeding the service through
  * stored pointers). --- */
 static websocket_ui_service_t ui_svc;
+
+/* Command shell / script engine (docs/shell.md).  Active only with
+ * --shell or --script; when active it owns the per-line console print. */
+static shell_service_t shell_svc;
 
 /* --- Serial socket (TCP bridge for border-router tests) ---
  *
@@ -1136,7 +1141,9 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
         node->line_buf[node->line_pos] = '\0';
         int nidx = (int)(node - nodes);
         int64_t ns = node_sim_time_ns(nidx);
-        if (verbose)
+        /* The shell service prints this same line per its console mask
+         * when it is active (it also feeds log files). */
+        if (verbose && !shell_service_active(&shell_svc))
             printf("  %7.3f [Node %d/%s] %s\n", (double)ns / 1e9,
                    node->id, node_type_str(nidx), node->line_buf);
         /* test engines receive this line via test_engine_observer */
@@ -1635,6 +1642,82 @@ static void *ctl_get_interface(void *u, int idx, int iface) {
     sim_mote_t *m = &mote_store[idx];
     return m->ops->get_interface ? m->ops->get_interface(m, iface) : NULL;
 }
+/* --save-config / shell `save-config`: write the configuration that is
+ * actually running — live node positions, nodes added or removed, the
+ * effective seed and duration — as canonical YAML, then load it back to
+ * prove the save is usable.  Returns 0 on success. */
+static const sim_normalized_config_t *g_live_config = NULL;  /* the runner's config local */
+static const char *g_config_path = NULL;
+static int g_save_timeout_ms = 0;
+static int save_live_config(const char *path, int timeout_ms, int64_t sim_ns) {
+    static sim_normalized_config_t live;
+    const sim_normalized_config_t *config = g_live_config;
+    int config_loaded = node_cfg_src != NULL;
+    int nc = ctl_node_count(NULL);
+    live = *config;
+    live.timeout_ms = timeout_ms;
+    if (radio_medium.type == RADIO_MEDIUM_UDGM &&
+        (config->medium_type == 1 || !config->medium_name[0])) {
+        live.medium_type = 1;
+        snprintf(live.medium_name, sizeof(live.medium_name), "udgm");
+        live.tx_range           = radio_medium.udgm.tx_range;
+        live.interference_range = radio_medium.udgm.interference_range;
+        live.success_ratio_tx   = radio_medium.udgm.success_ratio_tx;
+        live.success_ratio_rx   = radio_medium.udgm.success_ratio_rx;
+    }
+    live.node_count = 0;
+    for (int i = 0; i < nc && live.node_count < MAX_SIM_NODES; i++) {
+        if (node_start_ns[i] == INT64_MAX) continue;      /* removed */
+        sim_node_config_t *n = &live.nodes[live.node_count++];
+        int from_cfg = config_loaded && i < config->node_count;
+        memset(n, 0, sizeof(*n));
+        snprintf(n->firmware, sizeof(n->firmware), "%s",
+                 from_cfg ? config->nodes[i].firmware : nodes[i].firmware_path);
+        snprintf(n->secure_firmware, sizeof(n->secure_firmware), "%s",
+                 from_cfg ? config->nodes[i].secure_firmware
+                          : nodes[i].secure_firmware_path);
+        n->id = nodes[i].id;
+        n->x = radio_medium.nodes[i].x;
+        n->y = radio_medium.nodes[i].y;
+        n->has_position = (from_cfg && config->nodes[i].has_position) ||
+                          n->x != 0.0 || n->y != 0.0;
+        n->clock_deviation = from_cfg ? config->nodes[i].clock_deviation : 1.0;
+        if (n->clock_deviation == 0.0) n->clock_deviation = 1.0;
+        if (from_cfg && config->nodes[i].has_peripherals) {
+            n->has_peripherals  = 1;
+            n->peripheral_count = config->nodes[i].peripheral_count;
+            memcpy(n->peripherals, config->nodes[i].peripherals, sizeof(n->peripherals));
+        }
+    }
+    char header[512];
+    snprintf(header, sizeof(header),
+             "saved by cooja-ng %s at simulated time %.3f s\nfrom: %s\n"
+             "positions and node list are the live state at save time",
+             CSIM_VERSION, (double)sim_ns / 1e9,
+             g_config_path ? g_config_path : "(firmware arguments)");
+    FILE *sf = fopen(path, "w");
+    int save_rc = sf ? sim_config_write_yaml(&live, sf, header) : -1;
+    if (sf) fclose(sf);
+    if (save_rc == 0) {
+        /* The saved file must load back, or the save is worthless. */
+        static sim_normalized_config_t check;
+        if (sim_config_load(&check, path) != 0) {
+            fprintf(stderr, "--save-config: %s was written but does not load back\n",
+                    path);
+            save_rc = -1;
+        } else {
+            sim_config_free(&check);
+            printf("Saved config: %s (%d nodes)\n", path, live.node_count);
+        }
+    } else {
+        fprintf(stderr, "--save-config: cannot write %s\n", path);
+    }
+    return save_rc;
+}
+static int ctl_save_config(void *u, const char *path) {
+    (void)u;
+    return save_live_config(path, g_save_timeout_ms, sim_runtime_now_ns(&sim_rt));
+}
 static const sim_control_ops_t ctl_ops = {
     .user              = NULL,
     .node_count        = ctl_node_count,
@@ -1647,7 +1730,7 @@ static const sim_control_ops_t ctl_ops = {
     .add               = ctl_add,
     .firmware_for_type = ctl_firmware_for_type,
     .get_interface     = ctl_get_interface,
-    .save_config       = NULL,
+    .save_config       = ctl_save_config,
 };
 
 /* --- Simulation step for one node ---
@@ -2092,6 +2175,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
         return 1;
     }
 
+    g_live_config = &config;
+    g_config_path = config_path;
+
     /* If a JSON config was loaded, populate firmware_paths from it */
     if (config_loaded) {
         if (firmware_count == 0) {
@@ -2177,6 +2263,20 @@ int run_mixed_multinode_test(int argc, char **argv) {
     sim_service_attach(&sim_rt,
                        sim_registry_find_service(&g_registry, "json-test"),
                        &json_test_svc);
+
+    /* Command shell / script engine (docs/shell.md): armed before the motes
+     * boot so boot-time console lines route through its console mask, and
+     * after the json-test service so fail_on/steps see a line first. */
+    if (shell_enabled || script_path) {
+        ctl_node_count_ptr = &node_count;
+        sim_control_init(&sim_ctl, &sim_rt, &ctl_ops);
+        if (shell_service_start(&shell_svc, &sim_rt, &sim_ctl, shell_enabled != 0,
+                                script_path, verbose != 0) != 0)
+            return 1;
+        sim_service_attach(&sim_rt,
+                           sim_registry_find_service(&g_registry, "shell"),
+                           &shell_svc);
+    }
 
 sim_restart:
     for (int i = 0; i < node_count; i++) {
@@ -2535,11 +2635,29 @@ sim_restart:
 
     int64_t sim_start_ns = sim_ns;   /* pacing baseline; end_ns may be unlimited */
     int64_t end_ns = sim_ns + total_ns;
+    int64_t progress_end_ns = end_ns;
+    if (shell_enabled) {
+        /* Interactive: no duration limit — the run ends at `exit`.  An
+         * explicit -t pauses the run at that time instead of ending it (the
+         * user keeps the prompt; `run` continues); a config timeout_ms is
+         * ignored, with a note, because a prompt that goes dead after the
+         * config's test duration is a surprise.  With --paused the user's
+         * first `run` already decides, so no auto-pause is armed. */
+        if (sim_ms_set && !start_paused) {
+            sim_ctl.pause_at_ns = end_ns;
+            printf("  --shell: -t %d ms pauses the simulation at that time (run to continue)\n", sim_ms);
+        } else if (!sim_ms_set && config_loaded && config.timeout_ms > 0) {
+            printf("  --shell: the config's timeout_ms (%d) is ignored; the run ends at `exit`\n",
+                   config.timeout_ms);
+        }
+        end_ns = INT64_MAX;
+    }
+    g_save_timeout_ms = sim_ms;
     /* M34: the per-tick progress report is a service now.  Cadence state +
      * the print move into progress_service; the explicit tick stays at the
      * original loop position so the line interleaves with mote UART output
      * byte-for-byte as before. */
-    progress_service_start(&progress_svc, sim_ns, total_ns, end_ns,
+    progress_service_start(&progress_svc, sim_ns, total_ns, progress_end_ns,
                            &node_count, progress_describe_node);
     sim_service_attach(&sim_rt,
                        sim_registry_find_service(&g_registry, "progress"),
@@ -2700,7 +2818,10 @@ sim_restart:
          * to the UI broadcast (no event is dispatched — §3.12). */
         if (sim_control_paused(&sim_ctl)) {
             if (ui_service_active(&ui_svc)) ui_service_poll(&ui_svc);
-            usleep(50000); /* 50ms */
+            if (shell_service_active(&shell_svc))
+                shell_service_pump_paused(&shell_svc, 50);   /* reads + runs commands */
+            else
+                usleep(50000); /* 50ms */
             /* Reset pacing baseline so resuming doesn't cause a burst */
             if (sim_control_pacing(&sim_ctl))
                 t_start = get_time_ms() - (double)(sim_ns - sim_start_ns) / 1e6 / sim_control_speed(&sim_ctl);
@@ -2746,6 +2867,13 @@ sim_restart:
                 : (sim_serial_bridge_active(&serial_bridge) ||
                    sim_control_pacing(&sim_ctl)) ? sim_ns + TIME_STEP_NS
                 : end_ns;
+            /* Shell: bound a slice so stdin is polled at least every
+             * simulated second (10 ms when pacing) even when the event queue
+             * is sparse. */
+            if (shell_service_interactive(&shell_svc)) {
+                int64_t cap = sim_ns + (sim_control_pacing(&sim_ctl) ? 10 : 1000) * MS_TO_NS;
+                if (cap < max_ns) max_ns = cap;
+            }
             /* `run <duration>` / `step <duration>`: never overshoot the
              * auto-pause horizon. */
             max_ns = sim_control_slice_cap(&sim_ctl, max_ns);
@@ -2885,7 +3013,8 @@ sim_restart:
          * poll_all walks attached services in order; the polls are
          * self-guarding no-ops when inactive. */
         if (sim_serial_bridge_active(&serial_bridge) ||
-            sim_external_command_running(&external_cmd)) {
+            sim_external_command_running(&external_cmd) ||
+            shell_service_active(&shell_svc)) {
             sim_service_poll_all(&sim_rt);
             if (sim_external_command_exited(&external_cmd))
                 break;
@@ -2925,7 +3054,8 @@ sim_restart:
             if (sim_runtime_stop_requested(&sim_rt))
                 break;
             /* run-for horizon / step budget reached → PAUSED. */
-            sim_control_after_pump(&sim_ctl);
+            if (sim_control_after_pump(&sim_ctl))
+                shell_service_on_autopause(&shell_svc);
 
             if (phase_timing_on())
                 time_step += get_time_ms() - t_phase;
@@ -3006,6 +3136,7 @@ sim_restart:
                     if (wait_ms > 50.0) wait_ms = 50.0;
                     usleep((useconds_t)(wait_ms * 1000.0));
                     ui_service_poll(&ui_svc);
+                    shell_service_poll_input(&shell_svc);
                 }
             }
         }
@@ -3024,8 +3155,9 @@ sim_restart:
             }
         }
 
-        progress_service_tick(&progress_svc, sim_ns,
-                              rf_byte_count, uart_byte_count);
+        if (sim_ns <= progress_end_ns)
+            progress_service_tick(&progress_svc, sim_ns,
+                                  rf_byte_count, uart_byte_count);
     }
 
     /* Handle restart request from UI */
@@ -3060,6 +3192,7 @@ sim_restart:
         memset(radio_bus.tx_busy_until_ns, 0, sizeof(radio_bus.tx_busy_until_ns));
         memset(node_start_ns, 0, sizeof(node_start_ns));
         ui_service_reset(&ui_svc);  /* clear console rings + arm full-state */
+        shell_service_on_restart(&shell_svc);
         memset(node_states, 0, sizeof(node_states));
         tl_init(&timeline_svc.tl);
         extern void cc2538_rfcore_reset_rxfifo_overflows(void);
@@ -3074,6 +3207,11 @@ sim_restart:
     /* End-of-run JSON test resolution + "--- Test Results ---" report
      * (M35: json_test service).  Returns the process exit code. */
     int test_exit_code = json_test_report(&json_test_svc, sim_ns);
+    /* Script verdict (shell service): FAIL → exit 1, like the JSON test. */
+    if (shell_service_report(&shell_svc, sim_ns) != 0)
+        test_exit_code = 1;
+    /* Under --shell the run length is whatever the user ran, not -t. */
+    int simulated_ms = shell_enabled ? (int)((sim_ns - sim_start_ns) / MS_TO_NS) : sim_ms;
 
     /* JS test engine results */
     if (use_js_engine) {
@@ -3091,73 +3229,10 @@ sim_restart:
 
     printf("\n--- Simulation complete ---\n");
 
-    if (save_config_path) {
-        /* Snapshot of what ran, not of what was loaded: positions come from
-         * the radio medium (moved nodes), the node list from the runtime
-         * (nodes the script added, minus the ones it removed — a removed
-         * node has node_start_ns == INT64_MAX), duration and seed are the
-         * effective ones (-t / --seed win over the file). */
-        static sim_normalized_config_t live;
-        live = config;
-        live.timeout_ms = sim_ms;
-        if (radio_medium.type == RADIO_MEDIUM_UDGM &&
-            (config.medium_type == 1 || !config.medium_name[0])) {
-            live.medium_type = 1;
-            snprintf(live.medium_name, sizeof(live.medium_name), "udgm");
-            live.tx_range           = radio_medium.udgm.tx_range;
-            live.interference_range = radio_medium.udgm.interference_range;
-            live.success_ratio_tx   = radio_medium.udgm.success_ratio_tx;
-            live.success_ratio_rx   = radio_medium.udgm.success_ratio_rx;
-        }
-        live.node_count = 0;
-        for (int i = 0; i < node_count && live.node_count < MAX_SIM_NODES; i++) {
-            if (node_start_ns[i] == INT64_MAX) continue;      /* removed */
-            sim_node_config_t *n = &live.nodes[live.node_count++];
-            int from_cfg = config_loaded && i < config.node_count;
-            memset(n, 0, sizeof(*n));
-            snprintf(n->firmware, sizeof(n->firmware), "%s",
-                     from_cfg ? config.nodes[i].firmware : nodes[i].firmware_path);
-            snprintf(n->secure_firmware, sizeof(n->secure_firmware), "%s",
-                     from_cfg ? config.nodes[i].secure_firmware
-                              : nodes[i].secure_firmware_path);
-            n->id = nodes[i].id;
-            n->x = radio_medium.nodes[i].x;
-            n->y = radio_medium.nodes[i].y;
-            n->has_position = (from_cfg && config.nodes[i].has_position) ||
-                              n->x != 0.0 || n->y != 0.0;
-            n->clock_deviation = from_cfg ? config.nodes[i].clock_deviation : 1.0;
-            if (n->clock_deviation == 0.0) n->clock_deviation = 1.0;
-            if (from_cfg && config.nodes[i].has_peripherals) {
-                n->has_peripherals  = 1;
-                n->peripheral_count = config.nodes[i].peripheral_count;
-                memcpy(n->peripherals, config.nodes[i].peripherals, sizeof(n->peripherals));
-            }
-        }
-        char header[512];
-        snprintf(header, sizeof(header),
-                 "saved by cooja-ng %s at simulated time %.3f s\nfrom: %s\n"
-                 "positions and node list are the live state at save time",
-                 CSIM_VERSION, (double)sim_ns / 1e9,
-                 config_path ? config_path : "(firmware arguments)");
-        FILE *sf = fopen(save_config_path, "w");
-        int save_rc = sf ? sim_config_write_yaml(&live, sf, header) : -1;
-        if (sf) fclose(sf);
-        if (save_rc == 0) {
-            /* The saved file must load back, or the save is worthless. */
-            static sim_normalized_config_t check;
-            if (sim_config_load(&check, save_config_path) != 0) {
-                fprintf(stderr, "--save-config: %s was written but does not load back\n",
-                        save_config_path);
-                save_rc = -1;
-            } else {
-                sim_config_free(&check);
-                printf("Saved config: %s (%d nodes)\n", save_config_path, live.node_count);
-            }
-        } else {
-            fprintf(stderr, "--save-config: cannot write %s\n", save_config_path);
-        }
-        if (save_rc != 0) test_exit_code = 1;
-    }
+    /* Snapshot of what ran, not of what was loaded (save_live_config). */
+    if (save_config_path &&
+        save_live_config(save_config_path, shell_enabled ? simulated_ms : sim_ms, sim_ns) != 0)
+        test_exit_code = 1;
     pcap_service_close(&pcap_svc);
     extern void msp430_timer_dump_ccr_counts(void);
     msp430_timer_dump_ccr_counts();
@@ -3306,8 +3381,8 @@ sim_restart:
 
     printf("\n--- Performance ---\n");
     printf("  Wall-clock time:  %.1f ms (%.2f s)\n", elapsed_ms, elapsed_ms / 1000.0);
-    printf("  Simulated time:   %d ms (%.1f s)\n", sim_ms, sim_ms / 1000.0);
-    double speedup = sim_ms / elapsed_ms;
+    printf("  Simulated time:   %d ms (%.1f s)\n", simulated_ms, simulated_ms / 1000.0);
+    double speedup = simulated_ms / elapsed_ms;
     printf("  Speed ratio:      %.1fx real-time (%d nodes, 1 thread)\n",
            speedup, node_count);
     printf("  Total cycles:     %lld across %d nodes\n",

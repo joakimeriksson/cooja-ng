@@ -131,7 +131,11 @@ SERVICES_SOURCES = $(SERVICES_SRC_DIR)/timeline_service.c \
                    $(SERVICES_SRC_DIR)/websocket_ui_service.c \
                    $(SERVICES_SRC_DIR)/energest_engine.c \
                    $(SERVICES_SRC_DIR)/energest_service.c \
-                   $(SERVICES_SRC_DIR)/renode_cosim_service.c
+                   $(SERVICES_SRC_DIR)/renode_cosim_service.c \
+                   $(SERVICES_SRC_DIR)/shell_parse.c \
+                   $(SERVICES_SRC_DIR)/shell_commands.c \
+                   $(SERVICES_SRC_DIR)/shell_script.c \
+                   $(SERVICES_SRC_DIR)/shell_service.c
 
 # Per-kind mote modules (boot policy + adapters) + the mote-kind
 # registry — Phase 4, §3.17.
@@ -222,7 +226,8 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_enc28j60.c \
                $(TEST_DIR)/test_radio_medium.c \
                $(TEST_DIR)/test_radio_bus.c \
-               $(TEST_DIR)/test_renode_cosim.c
+               $(TEST_DIR)/test_renode_cosim.c \
+               $(TEST_DIR)/test_shell.c
 
 TEST_OBJECTS = $(patsubst $(TEST_DIR)/%.c, $(BUILD_DIR)/test_%.o, $(TEST_SOURCES))
 

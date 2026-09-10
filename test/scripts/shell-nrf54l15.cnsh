@@ -1,0 +1,13 @@
+# Contiki-NG shell smoke test, driven from the Cooja-NG shell.
+#   ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
+count "Command not found" 1
+wait-until 2s
+sendln 1 help
+expect 1 "Shows this help" 4s
+sendln 1 ip-addr
+expect 1 "Node IPv6 addresses" 4s
+sendln 1 no-such-command
+expect 1 "Command not found" 2s
+assert count "Command not found" == 1
+assert time < 4s
+pass
