@@ -138,6 +138,11 @@ jobs:
         # config needs the config-v2 `external.args` block (M3).
         run: JAM_PERIOD_MS=2 ./build/test_runner test configs/test-ext-jammer-sky.json -q
 
+      - name: Cross-platform interoperation (Sky + CC2538 + nRF52840 on one DAG)
+        # Three CPU architectures and three radio models in one csim
+        # simulation. The control for the co-simulation work below: if this
+        # passes, a cross-simulator failure is not the emulated side.
+        run: ./build/test_runner test configs/test-mixed-platform-rpl.yaml -q
       - name: Version smoke
         run: ./build/test_runner --version
 

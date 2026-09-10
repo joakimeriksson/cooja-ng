@@ -1,0 +1,33 @@
+# Three CPU architectures and three radio models on one medium, all in csim.
+#
+# The RPL root is a Tmote Sky (MSP430 + CC2420); the clients are a CC2538
+# (Cortex-M3 + RF Core) and an nRF52840 (Cortex-M4F + its own radio). All
+# three join one DAG and exchange UDP through it.
+#
+# This is the internal counterpart to the Renode co-simulation demos: it pins
+# that cross-platform interoperation works *within* csim, so when a
+# cross-simulator run misbehaves the emulated side is not the suspect.
+title: "Mixed platforms: Sky (MSP430) + CC2538 (ARM) + nRF52840 (ARM) on one DAG"
+timeout_ms: 90000
+seed: 42
+startup_delay_ms: 1000
+
+radiomedium:
+  type: udgm
+  tx_range: 55.0
+  interference_range: 110.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+nodes:
+  - { firmware: firmware/sky/udp-server.sky,                 id: 1, x:  0.0, y: 0.0 }
+  - { firmware: firmware/cc2538dk/udp-client.cc2538dk,       id: 2, x: 20.0, y: 0.0 }
+  - { firmware: firmware/nrf52840-dk/udp-client.nrf52840-dk, id: 3, x: 40.0, y: 0.0 }
+
+test:
+  validators:
+    # The root must serve BOTH clients, so each architecture's frames have to
+    # be parsed by the other two.
+    - { pattern: "Received request", node: 1, min_count: 2 }
+    - { pattern: "Received response", node: 2, min_count: 1 }
+    - { pattern: "Received response", node: 3, min_count: 1 }

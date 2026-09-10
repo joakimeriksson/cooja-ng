@@ -87,6 +87,12 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
                                          # hex, 2nd document, wrong type ...) MUST fail to load — fail loudly
 ./build/test_runner config-convert in.json out.yaml        # canonical v2 YAML
 
+# Cross-platform interoperation (all csim-internal, no co-simulation)
+# Three CPU architectures + three radio models on one DAG. This is the control
+# for any cross-simulator work: if it passes, the emulated side is not the
+# suspect.
+./build/test_runner test configs/test-mixed-platform-rpl.yaml       # Sky + CC2538 + nRF52840
+
 # Chip-driver + radio-medium unit suites
 ./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)
 ./build/test_runner radio-medium            # 241 radio-medium routing tests

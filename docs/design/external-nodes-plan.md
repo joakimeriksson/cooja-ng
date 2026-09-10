@@ -691,3 +691,67 @@ Three probe runs byte-identical once the peer's own wall-clock line is
 excluded. `configs/test-ext-esp32c6-nullnet.json` fails, identically before
 and after this branch — its validators predate the peer's stage-2 radio
 logging.
+
+## 14. Relationship to co-simulation standards
+
+Asked directly: is there a standard for this? The protocol has two halves and
+they have different answers.
+
+### 14.1 The time-stepping half is standardised, three times over
+
+| Standard | Shape | Fit |
+|---|---|---|
+| **FMI 3.0** (Modelica Association, 2022) | C ABI + XML in a zip; `fmi3DoStep(t, h)` advances a component by one communication step | Our `step`/`done` *is* `fmi3DoStep`. But FMI is an in-process ABI, not a wire protocol, and its data model is continuous variables — it has no notion of a frame |
+| **DCP 1.0** (Modelica Association, 2019) | "FMI over the wire": UDP/TCP/CAN, PDU state machine, free and openly licensed | The closest formal match to what we built. Heavy — a full real-time state machine aimed at HIL rigs |
+| **HLA 4** (IEEE 1516-2025) | Federates + a run-time infrastructure; `timeAdvanceRequest` → `timeAdvanceGrant`, LBTS | The canonical answer to "N simulators, one time axis". Requires an RTI (Portico, CERTI, Pitch) — a large dependency |
+| **DIS** (IEEE 1278) | PDU broadcast, no time management | Wrong shape |
+
+### 14.2 The radio half is not standardised
+
+Nothing standardises "an 802.15.4 frame on a shared medium, with per-receiver
+RSSI and air-time collision windows". The closest work is de facto:
+
+- `mac80211_hwsim` + **wmediumd** — the de facto Linux answer, but 802.11 only.
+- `mac802154_hwsim` is the in-kernel 802.15.4 counterpart, and **wmediumd was
+  extended to drive it in 2025** (Fontes et al., CNSM 2025), explicitly on the
+  grounds that no 802.15.4 equivalent existed.
+
+That last one is directly adjacent work and belongs in any write-up. The
+distinction that matters: wmediumd mediates between *real Linux network
+stacks* on virtual radios; this protocol mediates between *emulated firmware*
+running on modelled chips, with an instruction-level CPU behind each one.
+Different layer, different fidelity claim.
+
+### 14.3 Decision: adopt the semantics, not the envelope
+
+**Do not adopt FMI, DCP or HLA.** None of them models a radio frame, a
+per-receiver RSSI or a collision window, so we would be defining the payload
+semantics anyway — just inside a heavier envelope, with an RTI or FMU
+packaging dependency attached. The cost is real and the benefit is
+hypothetical until someone actually wants to federate csim with a non-radio
+simulator.
+
+**Do name the correspondence.** One sentence, wherever the protocol is
+described: `step`/`done` corresponds to `fmi3DoStep` and to HLA's
+`timeAdvanceRequest`/`timeAdvanceGrant`. It costs nothing and pre-empts the
+obvious reviewer question.
+
+**We already use the one standard that fits**: pcap with the 802.15.4 link
+type, for the frames themselves.
+
+If interop ever becomes a real requirement, **DCP is the one to target**, and
+it would be a transport wrapper rather than a redesign.
+
+### 14.4 The lesson none of the standards would have taught us
+
+The §13 bug is the point. FMI, DCP and HLA all standardise **when** a step
+happens. Not one of them says what a timestamp *on a radio frame* refers to —
+first preamble byte, SFD, or start of PSDU. That ambiguity was worth 160 µs
+and silently destroyed every acknowledgement, while both sides passed all
+their own timing checks.
+
+So: at the boundary between a network simulator and an external emulator,
+time synchronisation is the solved part. **The unsolved part is the semantics
+of the synchronised quantity** — and it only becomes visible once the timing
+is correct enough for it to matter. Any spec for this protocol has to pin the
+reference point down in normative language, not prose.
