@@ -1905,6 +1905,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int sim_ms_set = 0;  /* track if -t was given (overrides config) */
     int ui_enabled = 0;
     int ui_port = 8080;
+    /* Shell / run-control flags (docs/shell.md).  cli_speed < 0 = not
+     * given; 0 = unpaced ("max"); > 0 = sim seconds per wall second. */
+    int shell_enabled = 0;
+    const char *script_path = NULL;
+    int start_paused = 0;
+    double cli_speed = -1.0;
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
     /* Optional plugin .so paths (--plugin PATH, repeatable) — Phase 9 M65 */
@@ -2019,6 +2025,36 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--shell") == 0) {
+            shell_enabled = 1;
+        }
+        else if (strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
+            script_path = argv[++i];
+        }
+        else if (strncmp(argv[i], "--script=", 9) == 0) {
+            script_path = argv[i] + 9;
+        }
+        else if (strcmp(argv[i], "--paused") == 0) {
+            start_paused = 1;
+        }
+        else if (strcmp(argv[i], "--realtime") == 0) {
+            cli_speed = 1.0;
+        }
+        else if ((strcmp(argv[i], "--speed") == 0 && i + 1 < argc) ||
+                 strncmp(argv[i], "--speed=", 8) == 0) {
+            const char *v = argv[i][7] == '=' ? argv[i] + 8 : argv[++i];
+            if (strcmp(v, "max") == 0) cli_speed = 0.0;
+            else if (strcmp(v, "realtime") == 0) cli_speed = 1.0;
+            else {
+                char *end = NULL;
+                double d = strtod(v, &end);
+                if (!end || *end || d <= 0.0) {
+                    fprintf(stderr, "--speed: expected a positive ratio, 'max' or 'realtime', got '%s'\n", v);
+                    return 1;
+                }
+                cli_speed = d;
+            }
+        }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -2049,6 +2085,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
                     firmware_paths[firmware_count++] = argv[i];
             }
         }
+    }
+
+    if (start_paused && !shell_enabled && !script_path && !ui_enabled) {
+        fprintf(stderr, "--paused: nothing could resume the simulation (add --shell, --script or --ui)\n");
+        return 1;
     }
 
     /* If a JSON config was loaded, populate firmware_paths from it */
@@ -2362,7 +2403,6 @@ sim_restart:
      * before the UI service, which is one of its clients. */
     ctl_node_count_ptr = &node_count;
     sim_control_init(&sim_ctl, &sim_rt, &ctl_ops);
-    sim_control_set_speed(&sim_ctl, 10.0);
     if (ui_enabled && !ui_service_active(&ui_svc)) {
         if (!ui_service_start(&ui_svc, ui_port,
                               node_states, prev_node_states,
@@ -2417,6 +2457,24 @@ sim_restart:
             }
         }
     }
+
+    /* Wall-clock pacing target.  0 = unpaced (the headless default: run as
+     * fast as possible).  The live UI and the serial bridge default to 10x
+     * as before; a config `speed`, --speed/--realtime, or the shell's
+     * `speed` command override that.  The loop paces whenever the ratio is
+     * non-zero (sim_control_pacing). */
+    {
+        double spd = 0.0;
+        if (ui_service_active(&ui_svc) || sim_serial_bridge_active(&serial_bridge))
+            spd = 10.0;
+        if (config_loaded && config.speed > 0)
+            spd = config.speed;
+        if (cli_speed >= 0.0)
+            spd = cli_speed;
+        sim_control_set_speed(&sim_ctl, spd);
+    }
+    if (start_paused)
+        sim_control_pause(&sim_ctl);
 
     /* Apply per-node startup delay to desynchronize timers.
      * Each node gets a random start_ns offset. Before its start time,
@@ -2475,6 +2533,7 @@ sim_restart:
     printf("  Initial sim_time: %lld ns (%lld ms)\n",
            (long long)sim_ns, (long long)(sim_ns / MS_TO_NS));
 
+    int64_t sim_start_ns = sim_ns;   /* pacing baseline; end_ns may be unlimited */
     int64_t end_ns = sim_ns + total_ns;
     /* M34: the per-tick progress report is a service now.  Cadence state +
      * the print move into progress_service; the explicit tick stays at the
@@ -2633,13 +2692,18 @@ sim_restart:
            sim_rt.clock_source) {
         /* Check for restart request from UI */
         if (ui_service_restart_requested(&ui_svc)) break;
+        /* A stop requested while paused (shell `exit`) must not run one
+         * more slice. */
+        if (sim_runtime_stop_requested(&sim_rt)) break;
 
-        /* When paused, poll WebSocket and sleep but skip to UI broadcast */
-        if (sim_control_paused(&sim_ctl) && ui_service_active(&ui_svc)) {
-            ui_service_poll(&ui_svc);
+        /* When paused, poll the WebSocket / shell input and sleep, but skip
+         * to the UI broadcast (no event is dispatched — §3.12). */
+        if (sim_control_paused(&sim_ctl)) {
+            if (ui_service_active(&ui_svc)) ui_service_poll(&ui_svc);
             usleep(50000); /* 50ms */
             /* Reset pacing baseline so resuming doesn't cause a burst */
-            t_start = get_time_ms() - (double)(sim_ns - (end_ns - total_ns)) / 1e6 / sim_control_speed(&sim_ctl);
+            if (sim_control_pacing(&sim_ctl))
+                t_start = get_time_ms() - (double)(sim_ns - sim_start_ns) / 1e6 / sim_control_speed(&sim_ctl);
             goto ui_broadcast;
         }
 
@@ -2679,8 +2743,12 @@ sim_restart:
         } else {
             int64_t next_event = sim_eq_peek_time(&sim_eq);
             int64_t max_ns = ui_service_active(&ui_svc) ? sim_ns + 100LL * MS_TO_NS
-                : sim_serial_bridge_active(&serial_bridge) ? sim_ns + TIME_STEP_NS
+                : (sim_serial_bridge_active(&serial_bridge) ||
+                   sim_control_pacing(&sim_ctl)) ? sim_ns + TIME_STEP_NS
                 : end_ns;
+            /* `run <duration>` / `step <duration>`: never overshoot the
+             * auto-pause horizon. */
+            max_ns = sim_control_slice_cap(&sim_ctl, max_ns);
             if (next_event < max_ns) max_ns = next_event;
             if (max_ns <= sim_ns) max_ns = sim_ns + 1000;  /* min 1µs advance */
             sim_ns = max_ns;
@@ -2822,6 +2890,10 @@ sim_restart:
             if (sim_external_command_exited(&external_cmd))
                 break;
         }
+        /* A service (the shell) may have paused or stopped the run from its
+         * poll: skip the pump — the paused branch at the loop top waits. */
+        if (sim_runtime_stop_requested(&sim_rt)) break;
+        if (sim_control_paused(&sim_ctl)) goto ui_broadcast;
 
         /* Native channels are now sampled inline at every byte/frame
          * delivery site (sync_native_node_channel), so the periodic lazy
@@ -2852,6 +2924,8 @@ sim_restart:
                                   NULL);
             if (sim_runtime_stop_requested(&sim_rt))
                 break;
+            /* run-for horizon / step budget reached → PAUSED. */
+            sim_control_after_pump(&sim_ctl);
 
             if (phase_timing_on())
                 time_step += get_time_ms() - t_phase;
@@ -2923,8 +2997,8 @@ sim_restart:
                 /* Real-time pacing: throttle to target speed for UI.
                  * Sleep in small increments (50ms max) so the socket poll
                  * can process incoming speed changes promptly. */
-                double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
-                for (;;) {
+                double sim_elapsed_ms = (double)(sim_ns - sim_start_ns) / 1e6;
+                for (;sim_control_pacing(&sim_ctl);) {
                     double wall_elapsed = get_time_ms() - t_start;
                     double target_wall = sim_elapsed_ms / sim_control_speed(&sim_ctl);
                     double wait_ms = target_wall - wall_elapsed;
@@ -2936,10 +3010,11 @@ sim_restart:
             }
         }
 
-        /* Real-time pacing for serial socket mode (no UI server needed).
-         * Throttle simulation to match wall-clock time at ui_speed_ratio. */
-        if (sim_serial_bridge_active(&serial_bridge) && !ui_service_active(&ui_svc)) {
-            double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
+        /* Real-time pacing without the UI server (serial-socket mode,
+         * --speed/--realtime, the shell's `speed` command): throttle the
+         * simulation to wall-clock time at the sim_control speed ratio. */
+        if (sim_control_pacing(&sim_ctl) && !ui_service_active(&ui_svc)) {
+            double sim_elapsed_ms = (double)(sim_ns - sim_start_ns) / 1e6;
             double wall_elapsed = get_time_ms() - t_start;
             double target_wall = sim_elapsed_ms / sim_control_speed(&sim_ctl);
             double wait_ms = target_wall - wall_elapsed;
