@@ -1,0 +1,43 @@
+# RPL-UDP over Renode co-simulation.
+#
+# Two Tmote Sky nodes run a real Contiki-NG RPL-UDP exchange (node 1 is the
+# DAG root and UDP server, node 2 the client).  Node 3 is the Renode
+# co-simulation device, in range of both: firmware running inside Renode sees
+# every frame of that RPL network through a memory-mapped register window,
+# while Renode drives csim's clock.
+#
+#   ./build/test_runner test configs/test-renode-rpl-sky.yaml \
+#       --renode 127.0.0.1:3456:3457 --renode-freq 1000000
+#   renode examples/renode/csim-rpl.resc
+#
+# Without --renode the device is inert and this is a plain 2-node RPL test.
+version: 2
+title: "RPL-UDP on Sky, observed from Renode"
+timeout_ms: 120000
+seed: 42
+
+medium:
+  type: udgm
+  tx_range: 50.0
+  interference_range: 100.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+
+mote_types:
+  - { name: sky-server, kind: emulated-elf, cpu: msp430, soc: msp430f1611, board: sky, firmware: firmware/sky/udp-server.sky }
+  - { name: sky-client, kind: emulated-elf, cpu: msp430, soc: msp430f1611, board: sky, firmware: firmware/sky/udp-client.sky }
+  # The device kind is selected by the ".renode" extension; the path is
+  # never opened, so no such file needs to exist.
+  - { name: renode-device, kind: renode-cosim, firmware: dev.renode }
+
+nodes:
+  - { type: sky-server,    id: 1, x: 0.0,  y: 0.0 }
+  - { type: sky-client,    id: 2, x: 20.0, y: 0.0 }
+  # In range of both, so it hears the whole exchange.
+  - { type: renode-device, id: 3, x: 10.0, y: 0.0 }
+
+test:
+  timeout_is_success: true
+  validators:
+    - { pattern: "Received request", node: 1, min_count: 1 }
+    - { pattern: "Received response", node: 2, min_count: 1 }

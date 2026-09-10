@@ -1,0 +1,46 @@
+// Minimal Cortex-M4 machine whose only interesting peripheral is a whole
+// csim 802.15.4 network.
+//
+// Deliberately self-contained rather than built on one of Renode's board
+// files: the demo firmware needs a CPU, some memory, a UART to talk to, and
+// the csim window — nothing else — so everything the scenario depends on is
+// visible in one place.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+flash: Memory.MappedMemory @ sysbus 0x0
+    size: 0x100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000
+
+uart: UART.PL011 @ sysbus 0x40000000
+    -> nvic@5
+
+// csim itself.  Renode drives its clock: every limitBuffer ticks of Renode
+// virtual time it sends a tickClock and blocks until csim has run the same
+// span.  frequency x limitBuffer = 1 MHz / 1000 = a 1 ms quantum.
+//
+// csim must be started with a matching --renode-freq, because the tickClock
+// message carries only a tick count.
+//
+// Renode starts csim itself: setting simulationFilePath (done from the .resc,
+// so the path can stay relative to your checkout) is what makes Renode open
+// the two sockets, launch the peer with them on its command line, and shake
+// hands.  tools/csim-renode-launch.sh maps those arguments onto csim's
+// --renode flag and picks the scenario up from CSIM_CONFIG.
+//
+// cosimToRenodeSignalRange declares how many interrupt lines the peer may
+// drive; csim uses one, line 0, raised while a frame is waiting.
+csim: CoSimulated.CoSimulatedPeripheral @ sysbus <0x40100000, +0x100>
+    frequency: 1000000
+    limitBuffer: 1000
+    timeout: 240000
+    address: "127.0.0.1"
+    cosimToRenodeSignalRange: <0, +1>
+    0 -> nvic@10

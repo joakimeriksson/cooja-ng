@@ -1,0 +1,21 @@
+# Script actions must land at their own time inside a co-simulation quantum.
+#
+# The runner applies a config's `actions` at the loop's current time, and in
+# the normal path a SIM_EV_TEST_ACTION pin in the event queue makes the loop
+# stop exactly there.  A clock master's quantum ignores the queue, so with a
+# 10 s quantum a `remove` at 5 s would be applied before the node had run at
+# all.  tools/check-renode-cosim.sh drives this with 10 s quanta and checks
+# that node 2 prints before 5 s and never after.
+title: "Script action inside a coarse co-simulation quantum"
+timeout_ms: 30000
+seed: 42
+startup_delay_ms: 1000
+radiomedium: { type: udgm, tx_range: 50.0, interference_range: 100.0, success_ratio_tx: 1.0, success_ratio_rx: 1.0 }
+nodes:
+  - { firmware: firmware/sky/udp-server.sky, id: 1, x: 0.0, y: 0.0 }
+  - { firmware: firmware/sky/udp-client.sky, id: 2, x: 5.0, y: 0.0 }
+  - { firmware: dev.renode,                  id: 3, x: 2.0, y: 0.0 }
+test:
+  timeout_is_success: true
+  actions:
+    - { at_ms: 5000, type: remove, node: 2 }

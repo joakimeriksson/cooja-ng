@@ -35,6 +35,9 @@ static const sim_board_desc_t boards[] = {
     { ".cooja", NULL, SIM_BOARD_KIND_NATIVE, "Native/Cooja" },
     { ".js",    NULL, SIM_BOARD_KIND_JS,     "JS/QuickJS"   },
     { ".py",    NULL, SIM_BOARD_KIND_EXTERNAL, "External/process" },
+    /* Renode co-simulation device.  The path is never opened — the
+     * extension only selects the kind, as ".py" does for external nodes. */
+    { ".renode", NULL, SIM_BOARD_KIND_RENODE, "Renode/CoSim" },
 };
 
 #define BOARD_COUNT ((int)(sizeof(boards) / sizeof(boards[0])))

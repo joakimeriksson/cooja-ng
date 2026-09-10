@@ -1,0 +1,31 @@
+:name: csim co-simulation
+:description: Drive a csim 802.15.4 network from Renode as a memory-mapped device.
+#
+# Start csim first, then run this script in Renode:
+#
+#   ./build/test_runner test configs/test-renode-sky.yaml \
+#       --renode 127.0.0.1:3456:3457 --renode-freq 1000000
+#
+# The ports below must match, and --renode-freq must match the peripheral's
+# `frequency` in csim.repl: the tickClock message carries only a tick count,
+# so csim learns the frequency from its command line.
+#
+# Renode's own scheduling quantum is 100 us by default, so a csim quantum
+# below that buys no accuracy.  See docs/design/renode-cosim-plan.md.
+
+mach create "csim-host"
+
+# Any Renode platform works — the co-simulated peripheral is independent of
+# the CPU.  Substitute your own board here.
+machine LoadPlatformDescription @platforms/cpus/stm32f4.repl
+machine LoadPlatformDescription @examples/renode/csim.repl
+
+showAnalyzer sysbus.usart2
+
+macro reset
+"""
+    sysbus LoadELF @path/to/your/firmware.elf
+"""
+runMacro $reset
+
+echo "csim device mapped at 0x40100000; start csim with --renode 127.0.0.1:3456:3457"

@@ -1,0 +1,41 @@
+// csim as a co-simulated peripheral in Renode.
+//
+// Maps a whole csim 802.15.4 network into the emulated CPU's address space.
+// Renode drives csim's clock: every `limitBuffer` ticks of Renode virtual
+// time it sends a tickClock and blocks until csim has run the same span.
+//
+// Nothing here is csim-specific to Renode — CoSimulatedPeripheral is
+// Renode's standard external-simulator peripheral, so no Renode plugin or
+// C# code is needed.  See docs/design/renode-cosim-plan.md.
+//
+// Include this alongside a real platform, e.g. in a .resc:
+//     machine LoadPlatformDescription @platforms/cpus/stm32f4.repl
+//     machine LoadPlatformDescription @examples/renode/csim.repl
+
+csim: CoSimulated.CoSimulatedPeripheral @ sysbus <0x40100000, +0x100>
+    // Tick clock.  frequency x limitBuffer sets the quantum:
+    // 1 MHz / 1000 ticks = 1 ms of simulated time per synchronisation.
+    // Finer than Renode's own 100 us scheduling quantum buys no accuracy
+    // and costs a socket round trip each time.
+    frequency: 1000000
+    limitBuffer: 1000
+
+    // How long Renode waits for csim to finish a quantum.  Raise it if a
+    // quantum covers a lot of simulated work.
+    timeout: 10000
+
+    // Renode listens and csim connects.  Start csim yourself with
+    //     ./build/test_runner test <config> --renode 127.0.0.1:MAIN:ASYNC
+    // or drop `address` and set simulationFilePath below to have Renode
+    // start it (tools/csim-renode-launch.sh maps the arguments).
+    address: "127.0.0.1"
+    mainListenPort: 3456
+    asyncListenPort: 3457
+    // simulationFilePath: "/path/to/csim/tools/csim-renode-launch.sh"
+
+    // Interrupt 0 is a level line: high while a frame is waiting in the RX
+    // queue, or console output is waiting, with that source unmasked in
+    // CTRL.  cosimToRenodeSignalRange declares how many lines the peer may
+    // drive; wire line 0 to whatever your platform's interrupt controller is.
+    cosimToRenodeSignalRange: <0, +1>
+    0 -> nvic@10
