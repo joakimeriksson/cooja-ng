@@ -41,25 +41,26 @@ static void ui_message_handler(const char *data, int len, void *userdata) {
             cJSON *val = cJSON_GetObjectItem(root, "value");
             if (val && cJSON_IsNumber(val)) {
                 double v = val->valuedouble;
-                if (v >= 0.1 && v <= 1000.0)
-                    svc->speed_ratio = v;
+                if (v >= 0.1 && v <= 1000.0 && svc->ctl)
+                    sim_control_set_speed(svc->ctl, v);
             }
         } else if (strcmp(cmd->valuestring, "pause") == 0) {
-            svc->paused = 1;
+            if (svc->ctl) sim_control_pause(svc->ctl);
         } else if (strcmp(cmd->valuestring, "play") == 0) {
-            svc->paused = 0;
+            if (svc->ctl) sim_control_resume(svc->ctl);
         } else if (strcmp(cmd->valuestring, "full") == 0) {
             svc->full_state_requested = 1;
         } else if (strcmp(cmd->valuestring, "restart") == 0) {
             svc->restart_requested = 1;
-            svc->paused = 0;
+            if (svc->ctl) sim_control_resume(svc->ctl);
         } else if (strcmp(cmd->valuestring, "move") == 0) {
             cJSON *jnode = cJSON_GetObjectItem(root, "node");
             cJSON *jx = cJSON_GetObjectItem(root, "x");
             cJSON *jy = cJSON_GetObjectItem(root, "y");
             if (jnode && cJSON_IsNumber(jnode) && jx && cJSON_IsNumber(jx) &&
-                jy && cJSON_IsNumber(jy) && svc->on_move) {
-                svc->on_move(jnode->valueint, jx->valuedouble, jy->valuedouble);
+                jy && cJSON_IsNumber(jy) && svc->ctl) {
+                sim_control_move(svc->ctl, jnode->valueint,
+                                 jx->valuedouble, jy->valuedouble);
             }
         }
     }
@@ -97,7 +98,7 @@ bool ui_service_start(websocket_ui_service_t *svc, int port,
                       int64_t *prev_last_tx_ns,
                       radio_medium_t *medium, timeline_t *tl,
                       const int *node_count,
-                      ui_describe_fn describe, ui_move_fn on_move) {
+                      ui_describe_fn describe, sim_control_t *ctl) {
     svc->node_states = node_states;
     svc->prev_node_states = prev_node_states;
     svc->node_last_tx_ns = node_last_tx_ns;
@@ -106,7 +107,7 @@ bool ui_service_start(websocket_ui_service_t *svc, int port,
     svc->tl = tl;
     svc->node_count = node_count;
     svc->describe = describe;
-    svc->on_move = on_move;
+    svc->ctl = ctl;
 
     svc->server = ws_server_init(port);
     if (!svc->server)
@@ -143,8 +144,8 @@ void ui_service_broadcast(websocket_ui_service_t *svc, int64_t sim_ns) {
         .uart_bytes = svc->stat_uart_bytes,
         .rx_frames_queued = svc->stat_rx_frames_queued,
         .rx_frames_collided = svc->stat_rx_frames_collided,
-        .speed_ratio = svc->speed_ratio,
-        .paused = svc->paused,
+        .speed_ratio = svc->ctl ? sim_control_speed(svc->ctl) : 0.0,
+        .paused = svc->ctl ? (sim_control_paused(svc->ctl) ? 1 : 0) : 0,
     };
 
     int has_clients = ws_server_client_count(svc->server) > 0;

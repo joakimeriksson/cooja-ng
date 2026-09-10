@@ -93,6 +93,15 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # suspect.
 ./build/test_runner test configs/test-mixed-platform-rpl.yaml       # Sky + CC2538 + nRF52840
 
+# Interactive shell + command scripts (docs/shell.md): --shell reads commands
+# from stdin (line editing/history on a TTY, plain lines from a pipe);
+# --script FILE runs a command script with blocking expect/sleep/wait-until and
+# a pass/fail verdict (exit code), so one shell firmware serves many tests.
+./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell
+./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
+./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)
+tools/check-shell.sh                        # scripted pass/fail, pipe session, --paused, determinism diff
+
 # Chip-driver + radio-medium unit suites
 ./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)
 ./build/test_runner radio-medium            # 241 radio-medium routing tests
@@ -282,6 +291,7 @@ firmware/cc2538dk/    Pre-compiled Contiki-NG firmware for CC2538DK
 | `sim_board.c` | Board registry: firmware extension → {mote kind, platform name, label} |
 | `sim_registry.c` | Static built-in registry (Phase 8): one `sim_registry_t` lookup surface for boards, mote kinds, services, and radio media; `csim_register_builtin_{platforms,mote_types,services,media}` populate it; services + media (Phase 11: "udgm"/"none" + plugins) resolve by name via owned name→ops catalogs |
 | `sim_plugin.c` | Dynamic plugin loader (Phase 9): `sim_plugin_load` dlopens a `.so` (RTLD_NOW\|RTLD_LOCAL), resolves `csim_plugin_init`, and hands it a `csim_api_t` so the plugin registers a service. ABI is additive/version-gated (`include/sim/csim_plugin.h`): v1 `register_service`, v2 `+register_radio_medium`, v3 `+ui->publish_panel` (a plugin draws a live web-UI panel — see [`docs/design/ui-plugins.md`](docs/design/ui-plugins.md)). Dynamic `.so` examples: `plugins/packet_sink.c` (service), `plugins/lossy_medium.c` (medium). A plugin can also be **compiled in** as a built-in service (registered in `sim_registry.c`) and selected by config name (`"plugins": ["energest"]`, Cooja's built-in-plugin style) — example: the energy estimator `src/services/energest_{engine,service}.c` |
+| `sim_control.c` | The one implementation of every live mutation — add/move/remove/reboot/send a node, pause/resume/run-for/step, speed — over a bundle of runner primitives (`sim_control_ops_t`); the JSON/JS action executors, the WebSocket UI and the shell all call it. Only writer of `run_state` PAUSED/RUNNING |
 | `sim_config.c` | Config loader (Phase 7): `sim_config_load` picks the front end by extension (`.yaml`/`.yml` → libyaml, `.json` → cJSON), runs the schema validator, then dispatches on `version` to `parse_v1`/`parse_v2`, both populating one `sim_normalized_config_t` the runtime consumes |
 | `sim_config_yaml.c` | YAML front end (strict YAML-1.2-core subset: no anchors/tags/multi-doc, YAML-1.1 booleans rejected), the table-driven schema validator both formats share (unknown/duplicate keys and wrong types are errors), and the canonical v2 YAML **writer** (`--save-config`, `config-convert`). libyaml's parser half is vendored in `lib/yaml/` (see its README) |
 | `sim_service.c` | Service host (Phase 6 M31): `sim_service_ops_t` vtable table + one fan-out observer + ordered poll/teardown + error policy |
@@ -301,6 +311,13 @@ UI: ws_server + console + serialization), and `renode_cosim_service.c`
 instead of observing it — see `docs/design/renode-cosim-plan.md`). The end-of-run statistics stay
 runner-side (type-specific diagnostics that read chip memory + firmware
 symbols).
+
+The command shell (`shell_service.c` + `shell_parse.c` + `shell_commands.c` +
+`shell_script.c`, builtin name `shell`, [`docs/shell.md`](docs/shell.md)) is
+attached by `--shell` / `--script`: terminal or pipe input, a sequential
+command stream with blocking `expect`/`sleep`/`wait-until`, `at`/`every`/`on`
+queues, per-node console masks and log files, and a script verdict that sets
+the exit code. Line editing is the vendored linenoise (`lib/linenoise/`).
 
 A later addition is the energy estimator, shipped as a **compiled-in plugin**:
 `energest_engine.c` (host-agnostic core — per-mote radio duty cycle + Energest

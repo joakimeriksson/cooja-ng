@@ -27,6 +27,8 @@
 #include "ws_server.h"
 #include "sim_state.h"
 #include "websocket_ui_service.h"
+#include "sim_control.h"
+#include "shell_service.h"
 #include "timeline.h"
 #include "timeline_service.h"
 #include "packet_analyzer.h"
@@ -254,6 +256,10 @@ static inline int node_active(int idx) {
  * stored pointers). --- */
 static websocket_ui_service_t ui_svc;
 
+/* Command shell / script engine (docs/shell.md).  Active only with
+ * --shell or --script; when active it owns the per-line console print. */
+static shell_service_t shell_svc;
+
 /* --- Serial socket (TCP bridge for border-router tests) ---
  *
  * Milestone 8.1: socket + ring-buffer plumbing lives in the
@@ -427,18 +433,9 @@ static void update_led_state(int idx) {
 }
 
 /* M39: ui_message_handler + ui_add_console_line moved to the websocket_ui
- * service.  The "move" command calls back into the runner through
- * ui_move_node (it needs nodes[]/radio_medium); the service supplies the
- * other per-node scalars via ui_describe_node. */
-static void ui_move_node(int node_id, double x, double y) {
-    for (int i = 0; i < num_nodes; i++) {
-        if (nodes[i].id == node_id) {
-            radio_medium_set_position(&radio_medium, i, x, y);
-            radio_medium_compute_neighbors(&radio_medium);
-            break;
-        }
-    }
-}
+ * service.  The "move" command (and pause/play/speed) now go through the
+ * sim_control API — see the ctl_* adapters below reboot_node(); the service
+ * supplies the other per-node scalars via ui_describe_node. */
 
 /* --- Test scripting state --- */
 
@@ -1144,7 +1141,9 @@ static void mixed_uart_callback(void *user_data, uint8_t byte) {
         node->line_buf[node->line_pos] = '\0';
         int nidx = (int)(node - nodes);
         int64_t ns = node_sim_time_ns(nidx);
-        if (verbose)
+        /* The shell service prints this same line per its console mask
+         * when it is active (it also feeds log files). */
+        if (verbose && !shell_service_active(&shell_svc))
             printf("  %7.3f [Node %d/%s] %s\n", (double)ns / 1e9,
                    node->id, node_type_str(nidx), node->line_buf);
         /* test engines receive this line via test_engine_observer */
@@ -1549,6 +1548,191 @@ static int reboot_node(int idx) {
     return init_node(idx, fw, sfw, node_id);
 }
 
+/* ============================================================
+ * sim_control adapters — the runner's primitives behind the one
+ * mutation API (include/sim/sim_control.h).  Each wraps exactly one of
+ * the statics above; the policy (reboot = reboot+start, send = inject+
+ * wake, add = init+counts+position) lives in src/sim/sim_control.c and
+ * is shared by the JSON/JS action executors, the WebSocket UI and the
+ * shell.  node_count is a local of run_mixed_multinode_test, hence the
+ * pointer.
+ * ============================================================ */
+static sim_control_t sim_ctl;
+static int *ctl_node_count_ptr = NULL;
+
+static int ctl_node_count(void *u) {
+    (void)u;
+    return ctl_node_count_ptr ? *ctl_node_count_ptr : num_nodes;
+}
+static bool ctl_describe(void *u, int idx, sim_control_node_info_t *o) {
+    (void)u;
+    if (idx < 0 || idx >= ctl_node_count(NULL)) return false;
+    o->index       = idx;
+    o->id          = nodes[idx].id;
+    o->type        = node_type_str(idx);
+    o->firmware    = nodes[idx].firmware_path;
+    o->secure_firmware = nodes[idx].secure_firmware_path;
+    o->x           = radio_medium.nodes[idx].x;
+    o->y           = radio_medium.nodes[idx].y;
+    o->start_ns    = node_start_ns[idx];
+    o->removed     = node_start_ns[idx] == INT64_MAX;
+    o->active      = node_active(idx) != 0;
+    o->sim_time_ns = node_sim_time_ns(idx);
+    o->cycles      = node_cycles(idx);
+    o->freq_hz     = node_freq(idx);
+    return true;
+}
+static int ctl_inject(void *u, int idx, const uint8_t *buf, int len) {
+    (void)u;
+    return inject_serial(idx, buf, len);
+}
+static void ctl_set_position(void *u, int idx, double x, double y) {
+    (void)u;
+    radio_medium_set_position(&radio_medium, idx, x, y);
+    radio_medium_compute_neighbors(&radio_medium);
+}
+static int ctl_reboot(void *u, int idx) {
+    (void)u;
+    return reboot_node(idx);
+}
+static void ctl_start(void *u, int idx) {
+    (void)u;
+    int64_t now = sim_runtime_now_ns(&sim_rt);
+    /* Re-seed the mote clock to current time so stepping resumes
+     * correctly (M15 op), then open the start gate. */
+    mote_store[idx].ops->reset_time(&mote_store[idx], now);
+    node_start_ns[idx] = now;
+}
+static void ctl_remove(void *u, int idx) {
+    (void)u;
+    /* Stop node: set start_ns to far future so it's never active */
+    node_start_ns[idx] = INT64_MAX;
+}
+static int ctl_add(void *u, const char *fw, const char *sfw, int node_id) {
+    (void)u;
+    int nc = ctl_node_count(NULL);
+    if (nc >= MAX_NODES) return -1;
+    nodes[nc].id = node_id;
+    if (init_node(nc, fw, sfw, node_id) != 0) return -1;
+    nc++;
+    if (ctl_node_count_ptr) *ctl_node_count_ptr = nc;
+    num_nodes = nc;
+    radio_medium.node_count = nc;
+    radio_medium_compute_neighbors(&radio_medium);
+    return nc - 1;
+}
+static const char *ctl_firmware_for_type(void *u, const char *type_name,
+                                         const char **secure_firmware) {
+    (void)u;
+    if (secure_firmware) *secure_firmware = NULL;
+    if (!node_cfg_src || !type_name) return NULL;
+    for (int i = 0; i < node_cfg_src->mote_type_count; i++) {
+        if (strcmp(node_cfg_src->mote_types[i].name, type_name) == 0 &&
+            node_cfg_src->mote_type_firmware[i][0]) {
+            if (secure_firmware)
+                *secure_firmware = node_cfg_src->mote_type_secure_firmware[i];
+            return node_cfg_src->mote_type_firmware[i];
+        }
+    }
+    return NULL;
+}
+static void *ctl_get_interface(void *u, int idx, int iface) {
+    (void)u;
+    if (idx < 0 || idx >= ctl_node_count(NULL)) return NULL;
+    sim_mote_t *m = &mote_store[idx];
+    return m->ops->get_interface ? m->ops->get_interface(m, iface) : NULL;
+}
+/* --save-config / shell `save-config`: write the configuration that is
+ * actually running — live node positions, nodes added or removed, the
+ * effective seed and duration — as canonical YAML, then load it back to
+ * prove the save is usable.  Returns 0 on success. */
+static const sim_normalized_config_t *g_live_config = NULL;  /* the runner's config local */
+static const char *g_config_path = NULL;
+static int g_save_timeout_ms = 0;
+static int save_live_config(const char *path, int timeout_ms, int64_t sim_ns) {
+    static sim_normalized_config_t live;
+    const sim_normalized_config_t *config = g_live_config;
+    int config_loaded = node_cfg_src != NULL;
+    int nc = ctl_node_count(NULL);
+    live = *config;
+    live.timeout_ms = timeout_ms;
+    if (radio_medium.type == RADIO_MEDIUM_UDGM &&
+        (config->medium_type == 1 || !config->medium_name[0])) {
+        live.medium_type = 1;
+        snprintf(live.medium_name, sizeof(live.medium_name), "udgm");
+        live.tx_range           = radio_medium.udgm.tx_range;
+        live.interference_range = radio_medium.udgm.interference_range;
+        live.success_ratio_tx   = radio_medium.udgm.success_ratio_tx;
+        live.success_ratio_rx   = radio_medium.udgm.success_ratio_rx;
+    }
+    live.node_count = 0;
+    for (int i = 0; i < nc && live.node_count < MAX_SIM_NODES; i++) {
+        if (node_start_ns[i] == INT64_MAX) continue;      /* removed */
+        sim_node_config_t *n = &live.nodes[live.node_count++];
+        int from_cfg = config_loaded && i < config->node_count;
+        memset(n, 0, sizeof(*n));
+        snprintf(n->firmware, sizeof(n->firmware), "%s",
+                 from_cfg ? config->nodes[i].firmware : nodes[i].firmware_path);
+        snprintf(n->secure_firmware, sizeof(n->secure_firmware), "%s",
+                 from_cfg ? config->nodes[i].secure_firmware
+                          : nodes[i].secure_firmware_path);
+        n->id = nodes[i].id;
+        n->x = radio_medium.nodes[i].x;
+        n->y = radio_medium.nodes[i].y;
+        n->has_position = (from_cfg && config->nodes[i].has_position) ||
+                          n->x != 0.0 || n->y != 0.0;
+        n->clock_deviation = from_cfg ? config->nodes[i].clock_deviation : 1.0;
+        if (n->clock_deviation == 0.0) n->clock_deviation = 1.0;
+        if (from_cfg && config->nodes[i].has_peripherals) {
+            n->has_peripherals  = 1;
+            n->peripheral_count = config->nodes[i].peripheral_count;
+            memcpy(n->peripherals, config->nodes[i].peripherals, sizeof(n->peripherals));
+        }
+    }
+    char header[512];
+    snprintf(header, sizeof(header),
+             "saved by cooja-ng %s at simulated time %.3f s\nfrom: %s\n"
+             "positions and node list are the live state at save time",
+             CSIM_VERSION, (double)sim_ns / 1e9,
+             g_config_path ? g_config_path : "(firmware arguments)");
+    FILE *sf = fopen(path, "w");
+    int save_rc = sf ? sim_config_write_yaml(&live, sf, header) : -1;
+    if (sf) fclose(sf);
+    if (save_rc == 0) {
+        /* The saved file must load back, or the save is worthless. */
+        static sim_normalized_config_t check;
+        if (sim_config_load(&check, path) != 0) {
+            fprintf(stderr, "--save-config: %s was written but does not load back\n",
+                    path);
+            save_rc = -1;
+        } else {
+            sim_config_free(&check);
+            printf("Saved config: %s (%d nodes)\n", path, live.node_count);
+        }
+    } else {
+        fprintf(stderr, "--save-config: cannot write %s\n", path);
+    }
+    return save_rc;
+}
+static int ctl_save_config(void *u, const char *path) {
+    (void)u;
+    return save_live_config(path, g_save_timeout_ms, sim_runtime_now_ns(&sim_rt));
+}
+static const sim_control_ops_t ctl_ops = {
+    .user              = NULL,
+    .node_count        = ctl_node_count,
+    .describe          = ctl_describe,
+    .inject_serial     = ctl_inject,
+    .set_position      = ctl_set_position,
+    .reboot            = ctl_reboot,
+    .start             = ctl_start,
+    .remove            = ctl_remove,
+    .add               = ctl_add,
+    .firmware_for_type = ctl_firmware_for_type,
+    .get_interface     = ctl_get_interface,
+    .save_config       = ctl_save_config,
+};
+
 /* --- Simulation step for one node ---
  *
  * Used by the main time-stepping loop to advance a node's CPU. Do NOT
@@ -1713,6 +1897,7 @@ static void dispatch_mote_wakeup(const sim_event_t *ev) {
 
 static void mixed_dispatch_event(void *user, const sim_event_t *ev) {
     (void)user;
+    sim_control_note_event(&sim_ctl);   /* `step N` budget (no-op unless armed) */
     switch (ev->kind) {
     case SIM_EV_TEST_ACTION:
         /* Timed test-action marker (milestone 8.3b): its sole job was
@@ -1803,6 +1988,12 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int sim_ms_set = 0;  /* track if -t was given (overrides config) */
     int ui_enabled = 0;
     int ui_port = 8080;
+    /* Shell / run-control flags (docs/shell.md).  cli_speed < 0 = not
+     * given; 0 = unpaced ("max"); > 0 = sim seconds per wall second. */
+    int shell_enabled = 0;
+    const char *script_path = NULL;
+    int start_paused = 0;
+    double cli_speed = -1.0;
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
     /* Optional plugin .so paths (--plugin PATH, repeatable) — Phase 9 M65 */
@@ -1917,6 +2108,36 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--shell") == 0) {
+            shell_enabled = 1;
+        }
+        else if (strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
+            script_path = argv[++i];
+        }
+        else if (strncmp(argv[i], "--script=", 9) == 0) {
+            script_path = argv[i] + 9;
+        }
+        else if (strcmp(argv[i], "--paused") == 0) {
+            start_paused = 1;
+        }
+        else if (strcmp(argv[i], "--realtime") == 0) {
+            cli_speed = 1.0;
+        }
+        else if ((strcmp(argv[i], "--speed") == 0 && i + 1 < argc) ||
+                 strncmp(argv[i], "--speed=", 8) == 0) {
+            const char *v = argv[i][7] == '=' ? argv[i] + 8 : argv[++i];
+            if (strcmp(v, "max") == 0) cli_speed = 0.0;
+            else if (strcmp(v, "realtime") == 0) cli_speed = 1.0;
+            else {
+                char *end = NULL;
+                double d = strtod(v, &end);
+                if (!end || *end || d <= 0.0) {
+                    fprintf(stderr, "--speed: expected a positive ratio, 'max' or 'realtime', got '%s'\n", v);
+                    return 1;
+                }
+                cli_speed = d;
+            }
+        }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -1948,6 +2169,14 @@ int run_mixed_multinode_test(int argc, char **argv) {
             }
         }
     }
+
+    if (start_paused && !shell_enabled && !script_path && !ui_enabled) {
+        fprintf(stderr, "--paused: nothing could resume the simulation (add --shell, --script or --ui)\n");
+        return 1;
+    }
+
+    g_live_config = &config;
+    g_config_path = config_path;
 
     /* If a JSON config was loaded, populate firmware_paths from it */
     if (config_loaded) {
@@ -2034,6 +2263,20 @@ int run_mixed_multinode_test(int argc, char **argv) {
     sim_service_attach(&sim_rt,
                        sim_registry_find_service(&g_registry, "json-test"),
                        &json_test_svc);
+
+    /* Command shell / script engine (docs/shell.md): armed before the motes
+     * boot so boot-time console lines route through its console mask, and
+     * after the json-test service so fail_on/steps see a line first. */
+    if (shell_enabled || script_path) {
+        ctl_node_count_ptr = &node_count;
+        sim_control_init(&sim_ctl, &sim_rt, &ctl_ops);
+        if (shell_service_start(&shell_svc, &sim_rt, &sim_ctl, shell_enabled != 0,
+                                script_path, verbose != 0) != 0)
+            return 1;
+        sim_service_attach(&sim_rt,
+                           sim_registry_find_service(&g_registry, "shell"),
+                           &shell_svc);
+    }
 
 sim_restart:
     for (int i = 0; i < node_count; i++) {
@@ -2255,25 +2498,21 @@ sim_restart:
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
 
     /* Initialize WebSocket UI service (only on first run, not restart).
-     * M39: speed_ratio defaults to 10x and is shared with serial-socket
-     * pacing, so set it before the service even starts (it owns the value
-     * but serial mode reads it via ui_service_speed_ratio when the UI is
-     * off). */
-    ui_svc.speed_ratio = 10.0;
+     * The speed ratio (default 10x, shared with serial-socket pacing) and
+     * the pause state live in sim_control, which is initialized here —
+     * before the UI service, which is one of its clients. */
+    ctl_node_count_ptr = &node_count;
+    sim_control_init(&sim_ctl, &sim_rt, &ctl_ops);
     if (ui_enabled && !ui_service_active(&ui_svc)) {
         if (!ui_service_start(&ui_svc, ui_port,
                               node_states, prev_node_states,
                               node_last_tx_ns, prev_last_tx_ns,
                               &radio_medium, &timeline_svc.tl,
-                              &node_count, ui_describe_node, ui_move_node))
+                              &node_count, ui_describe_node, &sim_ctl))
             fprintf(stderr, "Warning: failed to start UI server on port %d\n",
                     ui_port);
         ui_svc.rt = &sim_rt;   /* plugin UI panels source */
     }
-
-    /* Set initial simulation speed from config */
-    if (config_loaded && config.speed > 0)
-        ui_svc.speed_ratio = config.speed;
 
     /* Set up serial socket server for border-router tests */
     if (config_loaded && config.has_serial_socket) {
@@ -2318,6 +2557,24 @@ sim_restart:
             }
         }
     }
+
+    /* Wall-clock pacing target.  0 = unpaced (the headless default: run as
+     * fast as possible).  The live UI and the serial bridge default to 10x
+     * as before; a config `speed`, --speed/--realtime, or the shell's
+     * `speed` command override that.  The loop paces whenever the ratio is
+     * non-zero (sim_control_pacing). */
+    {
+        double spd = 0.0;
+        if (ui_service_active(&ui_svc) || sim_serial_bridge_active(&serial_bridge))
+            spd = 10.0;
+        if (config_loaded && config.speed > 0)
+            spd = config.speed;
+        if (cli_speed >= 0.0)
+            spd = cli_speed;
+        sim_control_set_speed(&sim_ctl, spd);
+    }
+    if (start_paused)
+        sim_control_pause(&sim_ctl);
 
     /* Apply per-node startup delay to desynchronize timers.
      * Each node gets a random start_ns offset. Before its start time,
@@ -2376,12 +2633,31 @@ sim_restart:
     printf("  Initial sim_time: %lld ns (%lld ms)\n",
            (long long)sim_ns, (long long)(sim_ns / MS_TO_NS));
 
+    int64_t sim_start_ns = sim_ns;   /* pacing baseline; end_ns may be unlimited */
     int64_t end_ns = sim_ns + total_ns;
+    int64_t progress_end_ns = end_ns;
+    if (shell_enabled) {
+        /* Interactive: no duration limit — the run ends at `exit`.  An
+         * explicit -t pauses the run at that time instead of ending it (the
+         * user keeps the prompt; `run` continues); a config timeout_ms is
+         * ignored, with a note, because a prompt that goes dead after the
+         * config's test duration is a surprise.  With --paused the user's
+         * first `run` already decides, so no auto-pause is armed. */
+        if (sim_ms_set && !start_paused) {
+            sim_ctl.pause_at_ns = end_ns;
+            printf("  --shell: -t %d ms pauses the simulation at that time (run to continue)\n", sim_ms);
+        } else if (!sim_ms_set && config_loaded && config.timeout_ms > 0) {
+            printf("  --shell: the config's timeout_ms (%d) is ignored; the run ends at `exit`\n",
+                   config.timeout_ms);
+        }
+        end_ns = INT64_MAX;
+    }
+    g_save_timeout_ms = sim_ms;
     /* M34: the per-tick progress report is a service now.  Cadence state +
      * the print move into progress_service; the explicit tick stays at the
      * original loop position so the line interleaves with mote UART output
      * byte-for-byte as before. */
-    progress_service_start(&progress_svc, sim_ns, total_ns, end_ns,
+    progress_service_start(&progress_svc, sim_ns, total_ns, progress_end_ns,
                            &node_count, progress_describe_node);
     sim_service_attach(&sim_rt,
                        sim_registry_find_service(&g_registry, "progress"),
@@ -2534,13 +2810,21 @@ sim_restart:
            sim_rt.clock_source) {
         /* Check for restart request from UI */
         if (ui_service_restart_requested(&ui_svc)) break;
+        /* A stop requested while paused (shell `exit`) must not run one
+         * more slice. */
+        if (sim_runtime_stop_requested(&sim_rt)) break;
 
-        /* When paused, poll WebSocket and sleep but skip to UI broadcast */
-        if (ui_service_paused(&ui_svc) && ui_service_active(&ui_svc)) {
-            ui_service_poll(&ui_svc);
-            usleep(50000); /* 50ms */
+        /* When paused, poll the WebSocket / shell input and sleep, but skip
+         * to the UI broadcast (no event is dispatched — §3.12). */
+        if (sim_control_paused(&sim_ctl)) {
+            if (ui_service_active(&ui_svc)) ui_service_poll(&ui_svc);
+            if (shell_service_active(&shell_svc))
+                shell_service_pump_paused(&shell_svc, 50);   /* reads + runs commands */
+            else
+                usleep(50000); /* 50ms */
             /* Reset pacing baseline so resuming doesn't cause a burst */
-            t_start = get_time_ms() - (double)(sim_ns - (end_ns - total_ns)) / 1e6 / ui_service_speed_ratio(&ui_svc);
+            if (sim_control_pacing(&sim_ctl))
+                t_start = get_time_ms() - (double)(sim_ns - sim_start_ns) / 1e6 / sim_control_speed(&sim_ctl);
             goto ui_broadcast;
         }
 
@@ -2580,8 +2864,19 @@ sim_restart:
         } else {
             int64_t next_event = sim_eq_peek_time(&sim_eq);
             int64_t max_ns = ui_service_active(&ui_svc) ? sim_ns + 100LL * MS_TO_NS
-                : sim_serial_bridge_active(&serial_bridge) ? sim_ns + TIME_STEP_NS
+                : (sim_serial_bridge_active(&serial_bridge) ||
+                   sim_control_pacing(&sim_ctl)) ? sim_ns + TIME_STEP_NS
                 : end_ns;
+            /* Shell: bound a slice so stdin is polled at least every
+             * simulated second (10 ms when pacing) even when the event queue
+             * is sparse. */
+            if (shell_service_interactive(&shell_svc)) {
+                int64_t cap = sim_ns + (sim_control_pacing(&sim_ctl) ? 10 : 1000) * MS_TO_NS;
+                if (cap < max_ns) max_ns = cap;
+            }
+            /* `run <duration>` / `step <duration>`: never overshoot the
+             * auto-pause horizon. */
+            max_ns = sim_control_slice_cap(&sim_ctl, max_ns);
             if (next_event < max_ns) max_ns = next_event;
             if (max_ns <= sim_ns) max_ns = sim_ns + 1000;  /* min 1µs advance */
             sim_ns = max_ns;
@@ -2597,71 +2892,43 @@ sim_restart:
             while (action_idx < config.test.action_count &&
                    sim_ns >= config.test.actions[action_idx].at_ms * MS_TO_NS) {
                 const sim_test_action_t *act = &config.test.actions[action_idx];
+                /* The bodies live in sim_control (shared with the JS
+                 * executor, the UI and the shell); the log lines stay here
+                 * so the output is unchanged.  No WAKE flag: the JSON path
+                 * never woke the node after a send or reboot. */
                 if (act->type == TEST_ACTION_MOVE) {
-                    /* Find node index by ID */
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) {
-                            radio_medium_set_position(&radio_medium, i, act->x, act->y);
-                            radio_medium_compute_neighbors(&radio_medium);
-                            if (verbose)
-                                printf("  ACTION: move node %d to (%.1f, %.1f) at %lld ms\n",
-                                       act->node, act->x, act->y,
-                                       (long long)(sim_ns / MS_TO_NS));
-                            break;
-                        }
-                    }
+                    if (sim_control_move(&sim_ctl, act->node, act->x, act->y) == 0 &&
+                        verbose)
+                        printf("  ACTION: move node %d to (%.1f, %.1f) at %lld ms\n",
+                               act->node, act->x, act->y,
+                               (long long)(sim_ns / MS_TO_NS));
                 } else if (act->type == TEST_ACTION_SEND) {
-                    /* Find node index by ID and send data via serial input
-                     * (M14: one platform-dispatched path; natives get the
-                     * Cooja append + immediate-wakeup contract). */
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) {
-                            inject_serial(i, (const uint8_t *)act->data,
-                                          (int)strlen(act->data));
-                            if (verbose)
-                                printf("  ACTION: send to node %d \"%s\" at %lld ms\n",
-                                       act->node, act->data,
-                                       (long long)(sim_ns / MS_TO_NS));
-                            break;
-                        }
-                    }
+                    /* M14: one platform-dispatched path; natives get the
+                     * Cooja append + immediate-wakeup contract. */
+                    if (sim_control_send(&sim_ctl, act->node,
+                                         (const uint8_t *)act->data,
+                                         (int)strlen(act->data), 0) >= 0 &&
+                        verbose)
+                        printf("  ACTION: send to node %d \"%s\" at %lld ms\n",
+                               act->node, act->data,
+                               (long long)(sim_ns / MS_TO_NS));
                 } else if (act->type == TEST_ACTION_SEND_ALL) {
-                    /* Send data via serial input to all active nodes */
-                    for (int i = 0; i < node_count; i++) {
-                        if (node_start_ns[i] > sim_ns)
-                            continue;  /* not yet started or removed */
-                        inject_serial(i, (const uint8_t *)act->data,
-                                      (int)strlen(act->data));
-                    }
+                    sim_control_send_all(&sim_ctl, (const uint8_t *)act->data,
+                                         (int)strlen(act->data), 0);
                     if (verbose)
                         printf("  ACTION: send_all \"%s\" at %lld ms\n",
                                act->data, (long long)(sim_ns / MS_TO_NS));
                 } else if (act->type == TEST_ACTION_REMOVE) {
-                    /* Stop node: set start_ns to far future so it's never active */
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) {
-                            node_start_ns[i] = INT64_MAX;
-                            if (verbose)
-                                printf("  ACTION: remove node %d at %lld ms\n",
-                                       act->node, (long long)(sim_ns / MS_TO_NS));
-                            break;
-                        }
-                    }
+                    if (sim_control_remove(&sim_ctl, act->node) == 0 && verbose)
+                        printf("  ACTION: remove node %d at %lld ms\n",
+                               act->node, (long long)(sim_ns / MS_TO_NS));
                 } else if (act->type == TEST_ACTION_ADD) {
                     /* Reboot node: destroy, reinitialize, set time to now */
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) {
-                            if (verbose)
-                                printf("  ACTION: add (reboot) node %d at %lld ms\n",
-                                       act->node, (long long)(sim_ns / MS_TO_NS));
-                            reboot_node(i);
-                            /* Re-seed the mote clock to current time so
-                             * stepping resumes correctly (M15 op). */
-                            mote_store[i].ops->reset_time(&mote_store[i],
-                                                          sim_ns);
-                            node_start_ns[i] = sim_ns;
-                            break;
-                        }
+                    if (sim_control_index_of_id(&sim_ctl, act->node) >= 0) {
+                        if (verbose)
+                            printf("  ACTION: add (reboot) node %d at %lld ms\n",
+                                   act->node, (long long)(sim_ns / MS_TO_NS));
+                        sim_control_reboot(&sim_ctl, act->node, 0);
                     }
                 }
                 action_idx++;
@@ -2675,48 +2942,35 @@ sim_restart:
             int js_act_count = js_test_drain_actions(&js_engine, js_actions, 16);
             for (int ja = 0; ja < js_act_count; ja++) {
                 const sim_test_action_t *act = &js_actions[ja];
+                /* Same sim_control bodies as the JSON executor; the JS
+                 * path's one historical difference — it wakes a rebooted
+                 * node at once — is the WAKE flag on reboot. */
                 if (act->type == TEST_ACTION_SEND) {
                     /* M14: same platform-dispatched injection as the JSON
                      * action path.  Natives now use the Cooja append +
                      * immediate-wakeup contract instead of overwrite +
                      * synchronous step — the wakeup fires in the next pump
                      * at the mote's own sim time. */
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) {
-                            inject_serial(i, (const uint8_t *)act->data,
-                                          (int)strlen(act->data));
-                            if (verbose)
-                                printf("  JS ACTION: send node %d \"%s\"\n",
-                                       act->node, act->data);
-                            break;
-                        }
-                    }
+                    if (sim_control_send(&sim_ctl, act->node,
+                                         (const uint8_t *)act->data,
+                                         (int)strlen(act->data), 0) >= 0 &&
+                        verbose)
+                        printf("  JS ACTION: send node %d \"%s\"\n",
+                               act->node, act->data);
                 } else if (act->type == TEST_ACTION_SEND_ALL) {
-                    for (int i = 0; i < node_count; i++) {
-                        if (node_start_ns[i] > sim_ns) continue;
-                        inject_serial(i, (const uint8_t *)act->data,
-                                      (int)strlen(act->data));
-                    }
+                    sim_control_send_all(&sim_ctl, (const uint8_t *)act->data,
+                                         (int)strlen(act->data), 0);
                     if (verbose)
                         printf("  JS ACTION: send_all \"%s\"\n", act->data);
                 } else if (act->type == TEST_ACTION_REMOVE) {
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) {
-                            node_start_ns[i] = INT64_MAX;
-                            if (verbose)
-                                printf("  JS ACTION: remove node %d\n", act->node);
-                            break;
-                        }
-                    }
+                    if (sim_control_remove(&sim_ctl, act->node) == 0 && verbose)
+                        printf("  JS ACTION: remove node %d\n", act->node);
                 } else if (act->type == TEST_ACTION_ADD) {
                     if (verbose)
                         printf("  JS ACTION: add node %d (type=%d, types=%d)\n",
                                act->node, act->mote_type, config.mote_type_count);
-                    int found = -1;
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) { found = i; break; }
-                    }
-                    if (found < 0 && node_count < MAX_NODES) {
+                    int found = sim_control_index_of_id(&sim_ctl, act->node);
+                    if (found < 0) {
                         /* Dynamic node creation using mote_types from config */
                         int type_idx = act->mote_type;
                         const char *fw = NULL, *sfw = NULL;
@@ -2726,45 +2980,25 @@ sim_restart:
                             sfw = config.mote_type_secure_firmware[type_idx];
                         }
                         if (fw) {
-                            found = node_count;
-                            nodes[found].id = act->node;
-                            if (init_node(found, fw, sfw, act->node) == 0) {
-                                node_count++;
-                                num_nodes = node_count;
-                                radio_medium.node_count = node_count;
-                                if (act->x != 0.0 || act->y != 0.0)
-                                    radio_medium_set_position(&radio_medium, found, act->x, act->y);
-                                radio_medium_compute_neighbors(&radio_medium);
-                                if (verbose)
-                                    printf("  JS ACTION: create new node %d (type %d, fw=%s)\n",
-                                           act->node, type_idx, fw);
-                            } else {
-                                found = -1;
-                            }
+                            found = sim_control_add(&sim_ctl, fw, sfw, act->node,
+                                                    act->x, act->y, 0);
+                            if (found >= 0 && verbose)
+                                printf("  JS ACTION: create new node %d (type %d, fw=%s)\n",
+                                       act->node, type_idx, fw);
                         }
                     }
                     if (found >= 0) {
-                        int i = found;
                         if (verbose)
                             printf("  JS ACTION: add (reboot) node %d\n", act->node);
-                        reboot_node(i);
-                        mote_store[i].ops->reset_time(&mote_store[i], sim_ns);
-                        node_start_ns[i] = sim_ns;
-                        /* Schedule the rebooted node in the event queue
-                         * so it gets ticked immediately */
-                        sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, sim_ns);
+                        /* Reboot + re-seed clock + open the start gate, and
+                         * schedule the node so it gets ticked immediately. */
+                        sim_control_reboot(&sim_ctl, act->node, SIM_CONTROL_WAKE);
                     }
                 } else if (act->type == TEST_ACTION_MOVE) {
-                    for (int i = 0; i < node_count; i++) {
-                        if (nodes[i].id == act->node) {
-                            radio_medium_set_position(&radio_medium, i, act->x, act->y);
-                            radio_medium_compute_neighbors(&radio_medium);
-                            if (verbose)
-                                printf("  JS ACTION: move node %d to (%.1f, %.1f)\n",
-                                       act->node, act->x, act->y);
-                            break;
-                        }
-                    }
+                    if (sim_control_move(&sim_ctl, act->node, act->x, act->y) == 0 &&
+                        verbose)
+                        printf("  JS ACTION: move node %d to (%.1f, %.1f)\n",
+                               act->node, act->x, act->y);
                 }
             }
 
@@ -2779,11 +3013,16 @@ sim_restart:
          * poll_all walks attached services in order; the polls are
          * self-guarding no-ops when inactive. */
         if (sim_serial_bridge_active(&serial_bridge) ||
-            sim_external_command_running(&external_cmd)) {
+            sim_external_command_running(&external_cmd) ||
+            shell_service_active(&shell_svc)) {
             sim_service_poll_all(&sim_rt);
             if (sim_external_command_exited(&external_cmd))
                 break;
         }
+        /* A service (the shell) may have paused or stopped the run from its
+         * poll: skip the pump — the paused branch at the loop top waits. */
+        if (sim_runtime_stop_requested(&sim_rt)) break;
+        if (sim_control_paused(&sim_ctl)) goto ui_broadcast;
 
         /* Native channels are now sampled inline at every byte/frame
          * delivery site (sync_native_node_channel), so the periodic lazy
@@ -2814,6 +3053,9 @@ sim_restart:
                                   NULL);
             if (sim_runtime_stop_requested(&sim_rt))
                 break;
+            /* run-for horizon / step budget reached → PAUSED. */
+            if (sim_control_after_pump(&sim_ctl))
+                shell_service_on_autopause(&shell_svc);
 
             if (phase_timing_on())
                 time_step += get_time_ms() - t_phase;
@@ -2873,9 +3115,9 @@ sim_restart:
          * the end-of-run perf print). */
         ui_broadcast:
         if (ui_service_active(&ui_svc)) {
-            if (!ui_service_paused(&ui_svc)) ui_service_poll(&ui_svc);
-            if (sim_ns >= next_ui_ns || ui_service_paused(&ui_svc)) {
-                if (!ui_service_paused(&ui_svc)) next_ui_ns = sim_ns + ui_interval_ns;
+            if (!sim_control_paused(&sim_ctl)) ui_service_poll(&ui_svc);
+            if (sim_ns >= next_ui_ns || sim_control_paused(&sim_ctl)) {
+                if (!sim_control_paused(&sim_ctl)) next_ui_ns = sim_ns + ui_interval_ns;
 
                 ui_service_set_stats(&ui_svc, rf_byte_count, uart_byte_count,
                                      (int)radio_medium.next_frame_id + stat_rf_frames,
@@ -2885,25 +3127,27 @@ sim_restart:
                 /* Real-time pacing: throttle to target speed for UI.
                  * Sleep in small increments (50ms max) so the socket poll
                  * can process incoming speed changes promptly. */
-                double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
-                for (;;) {
+                double sim_elapsed_ms = (double)(sim_ns - sim_start_ns) / 1e6;
+                for (;sim_control_pacing(&sim_ctl);) {
                     double wall_elapsed = get_time_ms() - t_start;
-                    double target_wall = sim_elapsed_ms / ui_service_speed_ratio(&ui_svc);
+                    double target_wall = sim_elapsed_ms / sim_control_speed(&sim_ctl);
                     double wait_ms = target_wall - wall_elapsed;
                     if (wait_ms <= 0) break;
                     if (wait_ms > 50.0) wait_ms = 50.0;
                     usleep((useconds_t)(wait_ms * 1000.0));
                     ui_service_poll(&ui_svc);
+                    shell_service_poll_input(&shell_svc);
                 }
             }
         }
 
-        /* Real-time pacing for serial socket mode (no UI server needed).
-         * Throttle simulation to match wall-clock time at ui_speed_ratio. */
-        if (sim_serial_bridge_active(&serial_bridge) && !ui_service_active(&ui_svc)) {
-            double sim_elapsed_ms = (double)(sim_ns - (end_ns - total_ns)) / 1e6;
+        /* Real-time pacing without the UI server (serial-socket mode,
+         * --speed/--realtime, the shell's `speed` command): throttle the
+         * simulation to wall-clock time at the sim_control speed ratio. */
+        if (sim_control_pacing(&sim_ctl) && !ui_service_active(&ui_svc)) {
+            double sim_elapsed_ms = (double)(sim_ns - sim_start_ns) / 1e6;
             double wall_elapsed = get_time_ms() - t_start;
-            double target_wall = sim_elapsed_ms / ui_service_speed_ratio(&ui_svc);
+            double target_wall = sim_elapsed_ms / sim_control_speed(&sim_ctl);
             double wait_ms = target_wall - wall_elapsed;
             if (wait_ms > 0) {
                 if (wait_ms > 10.0) wait_ms = 10.0;
@@ -2911,8 +3155,9 @@ sim_restart:
             }
         }
 
-        progress_service_tick(&progress_svc, sim_ns,
-                              rf_byte_count, uart_byte_count);
+        if (sim_ns <= progress_end_ns)
+            progress_service_tick(&progress_svc, sim_ns,
+                                  rf_byte_count, uart_byte_count);
     }
 
     /* Handle restart request from UI */
@@ -2947,6 +3192,7 @@ sim_restart:
         memset(radio_bus.tx_busy_until_ns, 0, sizeof(radio_bus.tx_busy_until_ns));
         memset(node_start_ns, 0, sizeof(node_start_ns));
         ui_service_reset(&ui_svc);  /* clear console rings + arm full-state */
+        shell_service_on_restart(&shell_svc);
         memset(node_states, 0, sizeof(node_states));
         tl_init(&timeline_svc.tl);
         extern void cc2538_rfcore_reset_rxfifo_overflows(void);
@@ -2961,6 +3207,11 @@ sim_restart:
     /* End-of-run JSON test resolution + "--- Test Results ---" report
      * (M35: json_test service).  Returns the process exit code. */
     int test_exit_code = json_test_report(&json_test_svc, sim_ns);
+    /* Script verdict (shell service): FAIL → exit 1, like the JSON test. */
+    if (shell_service_report(&shell_svc, sim_ns) != 0)
+        test_exit_code = 1;
+    /* Under --shell the run length is whatever the user ran, not -t. */
+    int simulated_ms = shell_enabled ? (int)((sim_ns - sim_start_ns) / MS_TO_NS) : sim_ms;
 
     /* JS test engine results */
     if (use_js_engine) {
@@ -2978,73 +3229,10 @@ sim_restart:
 
     printf("\n--- Simulation complete ---\n");
 
-    if (save_config_path) {
-        /* Snapshot of what ran, not of what was loaded: positions come from
-         * the radio medium (moved nodes), the node list from the runtime
-         * (nodes the script added, minus the ones it removed — a removed
-         * node has node_start_ns == INT64_MAX), duration and seed are the
-         * effective ones (-t / --seed win over the file). */
-        static sim_normalized_config_t live;
-        live = config;
-        live.timeout_ms = sim_ms;
-        if (radio_medium.type == RADIO_MEDIUM_UDGM &&
-            (config.medium_type == 1 || !config.medium_name[0])) {
-            live.medium_type = 1;
-            snprintf(live.medium_name, sizeof(live.medium_name), "udgm");
-            live.tx_range           = radio_medium.udgm.tx_range;
-            live.interference_range = radio_medium.udgm.interference_range;
-            live.success_ratio_tx   = radio_medium.udgm.success_ratio_tx;
-            live.success_ratio_rx   = radio_medium.udgm.success_ratio_rx;
-        }
-        live.node_count = 0;
-        for (int i = 0; i < node_count && live.node_count < MAX_SIM_NODES; i++) {
-            if (node_start_ns[i] == INT64_MAX) continue;      /* removed */
-            sim_node_config_t *n = &live.nodes[live.node_count++];
-            int from_cfg = config_loaded && i < config.node_count;
-            memset(n, 0, sizeof(*n));
-            snprintf(n->firmware, sizeof(n->firmware), "%s",
-                     from_cfg ? config.nodes[i].firmware : nodes[i].firmware_path);
-            snprintf(n->secure_firmware, sizeof(n->secure_firmware), "%s",
-                     from_cfg ? config.nodes[i].secure_firmware
-                              : nodes[i].secure_firmware_path);
-            n->id = nodes[i].id;
-            n->x = radio_medium.nodes[i].x;
-            n->y = radio_medium.nodes[i].y;
-            n->has_position = (from_cfg && config.nodes[i].has_position) ||
-                              n->x != 0.0 || n->y != 0.0;
-            n->clock_deviation = from_cfg ? config.nodes[i].clock_deviation : 1.0;
-            if (n->clock_deviation == 0.0) n->clock_deviation = 1.0;
-            if (from_cfg && config.nodes[i].has_peripherals) {
-                n->has_peripherals  = 1;
-                n->peripheral_count = config.nodes[i].peripheral_count;
-                memcpy(n->peripherals, config.nodes[i].peripherals, sizeof(n->peripherals));
-            }
-        }
-        char header[512];
-        snprintf(header, sizeof(header),
-                 "saved by cooja-ng %s at simulated time %.3f s\nfrom: %s\n"
-                 "positions and node list are the live state at save time",
-                 CSIM_VERSION, (double)sim_ns / 1e9,
-                 config_path ? config_path : "(firmware arguments)");
-        FILE *sf = fopen(save_config_path, "w");
-        int save_rc = sf ? sim_config_write_yaml(&live, sf, header) : -1;
-        if (sf) fclose(sf);
-        if (save_rc == 0) {
-            /* The saved file must load back, or the save is worthless. */
-            static sim_normalized_config_t check;
-            if (sim_config_load(&check, save_config_path) != 0) {
-                fprintf(stderr, "--save-config: %s was written but does not load back\n",
-                        save_config_path);
-                save_rc = -1;
-            } else {
-                sim_config_free(&check);
-                printf("Saved config: %s (%d nodes)\n", save_config_path, live.node_count);
-            }
-        } else {
-            fprintf(stderr, "--save-config: cannot write %s\n", save_config_path);
-        }
-        if (save_rc != 0) test_exit_code = 1;
-    }
+    /* Snapshot of what ran, not of what was loaded (save_live_config). */
+    if (save_config_path &&
+        save_live_config(save_config_path, shell_enabled ? simulated_ms : sim_ms, sim_ns) != 0)
+        test_exit_code = 1;
     pcap_service_close(&pcap_svc);
     extern void msp430_timer_dump_ccr_counts(void);
     msp430_timer_dump_ccr_counts();
@@ -3193,8 +3381,8 @@ sim_restart:
 
     printf("\n--- Performance ---\n");
     printf("  Wall-clock time:  %.1f ms (%.2f s)\n", elapsed_ms, elapsed_ms / 1000.0);
-    printf("  Simulated time:   %d ms (%.1f s)\n", sim_ms, sim_ms / 1000.0);
-    double speedup = sim_ms / elapsed_ms;
+    printf("  Simulated time:   %d ms (%.1f s)\n", simulated_ms, simulated_ms / 1000.0);
+    double speedup = simulated_ms / elapsed_ms;
     printf("  Speed ratio:      %.1fx real-time (%d nodes, 1 thread)\n",
            speedup, node_count);
     printf("  Total cycles:     %lld across %d nodes\n",
