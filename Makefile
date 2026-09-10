@@ -16,7 +16,7 @@ endif
 # a second hand-copied flag string is deliberate: the old PGO_CFLAGS drifted out
 # of sync with CFLAGS and `make pgo` stopped compiling entirely.
 PGO_FLAGS =
-CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/chips -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml $(NATIVE_FLAG) -flto -MMD -MP $(PGO_FLAGS)
+CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/chips -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml -I lib/linenoise $(NATIVE_FLAG) -flto -MMD -MP $(PGO_FLAGS)
 # -rdynamic exports the host's dynamic symbol table so a dlopen'd plugin can
 # resolve host library functions (e.g. the radio_medium accessors a medium
 # plugin uses).  Behavior-neutral (symbol visibility only).
@@ -195,6 +195,14 @@ YAML_SOURCES   = $(YAML_SRC_DIR)/api.c $(YAML_SRC_DIR)/parser.c \
 YAML_OBJECTS   = $(patsubst $(YAML_SRC_DIR)/%.c, $(YAML_BUILD_DIR)/%.o, $(YAML_SOURCES))
 YAML_DEFS      = -DYAML_VERSION_MAJOR=0 -DYAML_VERSION_MINOR=2 -DYAML_VERSION_PATCH=5 -DYAML_VERSION_STRING=\"0.2.5\"
 
+# linenoise (lib/linenoise/README.md) — the shell's line editor, vendored
+# like libyaml so the feature is in every binary.  Upstream code, warnings
+# silenced.
+LINENOISE_SRC_DIR   = lib/linenoise
+LINENOISE_BUILD_DIR = build/linenoise
+LINENOISE_SOURCES   = $(LINENOISE_SRC_DIR)/linenoise.c
+LINENOISE_OBJECTS   = $(patsubst $(LINENOISE_SRC_DIR)/%.c, $(LINENOISE_BUILD_DIR)/%.o, $(LINENOISE_SOURCES))
+
 TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_correctness.c \
                $(TEST_DIR)/test_benchmark.c \
@@ -270,6 +278,9 @@ $(QUICKJS_BUILD_DIR):
 $(YAML_BUILD_DIR):
 	mkdir -p $(YAML_BUILD_DIR)
 
+$(LINENOISE_BUILD_DIR):
+	mkdir -p $(LINENOISE_BUILD_DIR)
+
 $(COMMON_BUILD_DIR)/%.o: $(COMMON_SRC_DIR)/%.c | $(COMMON_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -310,10 +321,13 @@ $(QUICKJS_BUILD_DIR)/%.o: $(QUICKJS_SRC_DIR)/%.c | $(QUICKJS_BUILD_DIR)
 $(YAML_BUILD_DIR)/%.o: $(YAML_SRC_DIR)/%.c | $(YAML_BUILD_DIR)
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I lib/yaml $(YAML_DEFS) -w $(PGO_FLAGS) -c $< -o $@
 
+$(LINENOISE_BUILD_DIR)/%.o: $(LINENOISE_SRC_DIR)/%.c | $(LINENOISE_BUILD_DIR)
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I lib/linenoise -w $(PGO_FLAGS) -c $< -o $@
+
 $(BUILD_DIR)/test_%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(CHIPS_OBJECTS) $(RISCV_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(YAML_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_runner: $(COMMON_OBJECTS) $(SIM_OBJECTS) $(SERVICES_OBJECTS) $(MOTES_OBJECTS) $(OBJECTS) $(ARM_OBJECTS) $(CHIPS_OBJECTS) $(RISCV_OBJECTS) $(NATIVE_OBJECTS) $(UI_OBJECTS) $(LIB_OBJECTS) $(QUICKJS_OBJECTS) $(YAML_OBJECTS) $(LINENOISE_OBJECTS) $(TEST_OBJECTS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Auto-generated header dependencies (from -MMD). Catches the case where
@@ -362,7 +376,7 @@ configure:
 	@echo "Wrote csim.conf: CONTIKI_DIR=$(CONTIKI_DIR)"
 
 # Debug build
-debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/chips -I include/msp430 -I include/arm -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml -DDEBUG
+debug: CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -I include/common -I include/sim -I include/chips -I include/msp430 -I include/arm -I include/riscv -I include/native -I include/ui -I src/motes -I lib -I lib/quickjs -I lib/yaml -I lib/linenoise -DDEBUG
 debug: LDFLAGS = -lm -lpthread
 debug: clean $(BUILD_DIR)/test_runner
 
