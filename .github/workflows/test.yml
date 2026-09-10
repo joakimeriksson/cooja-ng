@@ -289,6 +289,35 @@ jobs:
           tail -5 shell54.txt
           grep -aq "TEST PASSED" shell54.txt
 
+      - name: TrustZone-M split-image boot (nRF54L15 XIAO)
+        run: |
+          ./build/test_runner test configs/test-tz-boot-nrf54l15-xiao.yaml > tz.txt 2>&1
+          tail -5 tz.txt
+          grep -aq "TEST PASSED" tz.txt
+
+      - name: TrustZone-M watchdog reboot (nRF54L15 XIAO)
+        run: |
+          ./build/test_runner test configs/test-tz-watchdog-nrf54l15-xiao.yaml > tzwd.txt 2>&1
+          tail -5 tzwd.txt
+          grep -aq "TEST PASSED" tzwd.txt
+
+      - name: TrustZone-M two-node RPL-UDP through SG veneers (nRF54L15 XIAO)
+        run: |
+          ./build/test_runner test configs/test-tz-rpl-udp-nrf54l15-xiao.yaml > tzrpl.txt 2>&1
+          tail -5 tzrpl.txt
+          grep -aq "TEST PASSED" tzrpl.txt
+
+      - name: TrustZone-M determinism (split image run twice -> byte-identical)
+        run: tools/check-determinism.sh test configs/test-tz-boot-nrf54l15-xiao.yaml
+
+      - name: JIT cycle-exactness on nRF54L15 (CSIM_ARM_JIT=0 vs 1)
+        run: |
+          filter='Wall-clock|Speed ratio|Throughput|MIPS'
+          CSIM_ARM_JIT=0 ./build/test_runner test configs/test-tz-boot-nrf54l15-xiao.yaml | grep -vE "$filter" > tzjit-off.txt
+          ./build/test_runner test configs/test-tz-boot-nrf54l15-xiao.yaml | grep -vE "$filter" > tzjit-on.txt
+          grep -q "TEST PASSED" tzjit-on.txt
+          cmp tzjit-off.txt tzjit-on.txt
+
       - name: Config v1 <-> v2 equivalence (chain-4node-sky)
         run: tools/check-config-equivalence.sh configs/chain-4node-sky.json configs/chain-4node-sky-v2.json
 

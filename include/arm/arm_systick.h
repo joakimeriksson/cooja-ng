@@ -34,6 +34,9 @@ typedef struct arm_systick {
 /* Initialize SysTick (registers IO at 0xE000E010) */
 void arm_systick_init(arm_systick_t *st, arm_cpu_t *cpu, arm_nvic_t *nvic);
 
+/* Reset to power-on state and cancel the pending tick (SoC reset path) */
+void arm_systick_reset(arm_systick_t *st);
+
 /* Recalculate and schedule next tick event */
 void arm_systick_update(arm_systick_t *st);
 

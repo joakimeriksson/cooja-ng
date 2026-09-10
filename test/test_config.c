@@ -57,6 +57,7 @@ static void blank_lifted(sim_normalized_config_t *c) {
     for (int i = 0; i < c->node_count; i++) memset(c->nodes[i].type_name, 0, sizeof(c->nodes[i].type_name));
     memset(c->mote_types, 0, sizeof(c->mote_types));
     memset(c->mote_type_firmware, 0, sizeof(c->mote_type_firmware));
+    memset(c->mote_type_secure_firmware, 0, sizeof(c->mote_type_secure_firmware));
     c->mote_type_count = 0;
     c->js_script_inline = NULL;
 }
@@ -80,7 +81,8 @@ static int compare(const sim_normalized_config_t *a, const sim_normalized_config
     for (int i = 0; i < a->node_count && i < b->node_count; i++) {
         const sim_node_config_t *x = &a->nodes[i], *y = &b->nodes[i];
         char what[64]; snprintf(what, sizeof(what), "node[%d]", i);
-        CHECK(strcmp(x->firmware, y->firmware) == 0 && x->id == y->id &&
+        CHECK(strcmp(x->firmware, y->firmware) == 0 &&
+              strcmp(x->secure_firmware, y->secure_firmware) == 0 && x->id == y->id &&
               x->has_position == y->has_position && x->x == y->x && x->y == y->y &&
               x->clock_deviation == y->clock_deviation, what);
         CHECK(x->has_peripherals == y->has_peripherals &&

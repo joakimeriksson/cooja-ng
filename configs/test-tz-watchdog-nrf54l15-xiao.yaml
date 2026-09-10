@@ -1,0 +1,32 @@
+# nRF54L15 TrustZone-M watchdog.  The Secure world owns WDT30; the Non-secure
+# world feeds it through an SG veneer and is built to stop feeding after its
+# second iteration.  Verified line for line against a Seeed XIAO nRF54L15
+# (devices/nrf54l15-xiao/HARDWARE-COMPARISON.md).
+
+version: 2
+title: "nRF54L15 TrustZone-M watchdog reboot (XIAO nRF54L15)"
+timeout_ms: 60000
+seed: 42          # same seed => byte-identical run
+
+mote_types:
+  - { name: normal-world-hang, firmware: firmware/nrf54l15-xiao/normal-world-hang.nrf54l15-xiao, secure_firmware: firmware/nrf54l15-xiao/secure-world-example.nrf54l15-xiao }
+
+nodes:
+  - { type: normal-world-hang, id: 1, x: 0.0, y: 0.0 }
+
+test:
+  description: >
+    The Secure world owns WDT30 (2 s timeout) and the Non-secure world feeds
+    it through an SG veneer on every scheduler pass. This normal world is
+    built with NORMAL_WORLD_CONF_HANG_AT_ITERATION=2 and stops feeding after
+    its second iteration (~20 s). Passes when the watchdog resets the SoC and
+    the Secure world's next boot reports 'Reset reason: watchdog0' and hands
+    off again.
+  steps:
+    - { wait: "Hanging the normal world", node: 1 }
+    - { wait: "Reset reason: watchdog0", node: 1 }
+    - { wait: "Initialize TrustZone API: SUCCESS", node: 1 }
+  fail_on:
+    - "Non-secure image has incorrect permissions"
+    - "Not jumping to the normal world"
+    - "Reboot caused by SPU violation"

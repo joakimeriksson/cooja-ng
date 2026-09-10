@@ -54,6 +54,9 @@ typedef struct arm_soc_ops {
     const char *name;             /* "cc2538", "nrf52840", … */
     void   (*init)(struct arm_platform *plat);
     void   (*destroy)(struct arm_platform *plat);
+    /* Optional: reset peripheral state in place on a system reset, keeping
+     * IO registrations and host wiring. NULL = SoC has no reset support. */
+    void   (*reset)(struct arm_platform *plat);
     void   (*set_console)(struct arm_platform *plat,
                           arm_uart_tx_callback cb, void *user_data);
 } arm_soc_ops_t;
@@ -116,6 +119,9 @@ typedef struct arm_platform {
 
 /* Initialize all peripherals from platform config */
 void arm_platform_init(arm_platform_t *plat, const arm_platform_config_t *config);
+
+/* Reset hook body (installed by arm_platform_init). */
+void arm_platform_reset_peripherals(void *user);
 
 /* Clean up */
 void arm_platform_destroy(arm_platform_t *plat);

@@ -68,6 +68,7 @@ typedef struct mixed_node {
     char line_buf[256];
     int line_pos;
     char firmware_path[256];
+    char secure_firmware_path[256]; /* TrustZone-M Secure-world ELF ("" = single image) */
     double clock_deviation; /* 1.0 = normal, <1.0 = slower (Cooja MspClock) */
     int64_t last_execute_ns; /* last tick sim_ns (for ns-precision stepping) */
     double ideal_cycles;     /* cumulative ideal cycle target (like MSPSim lastMicrosCycles) */

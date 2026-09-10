@@ -6,8 +6,10 @@
 
 #include "arm_cpu.h"
 
-/* NVIC supports up to 240 external IRQs (CC2538 uses ~179) */
-#define NVIC_MAX_IRQ 240
+/* NVIC supports up to 480 external IRQs (ARMv8-M maximum; the nRF54L15 uses
+ * lines up to WDT31 = 265, CC2538 ~179). 16 words of enable/pending bits. */
+#define NVIC_MAX_IRQ 480
+#define NVIC_IRQ_WORDS (NVIC_MAX_IRQ / 32)
 
 /* NVIC register offsets within System Control Space (0xE000E000) */
 #define NVIC_ISER_BASE  0x100   /* Interrupt Set-Enable Registers */
@@ -29,6 +31,7 @@
 #define SCB_SHPR3   0xD20  /* System Handler Priority Register 3 */
 #define SCB_SHCSR   0xD24  /* System Handler Control and State Register */
 #define SCB_CPUID   0xD00  /* CPUID Base Register */
+#define SCB_DEMCR   0xDFC  /* Debug Exception and Monitor Control (TRCENA) */
 
 /* ARMv8-M Security Attribution Unit (SAU) register offsets within the SCS.
  * Secure-only (RAZ/WI from Non-secure). See arm_trustzone.c. */
@@ -37,22 +40,31 @@
 #define SAU_RNR     0xDD8  /* SAU Region Number Register */
 #define SAU_RBAR    0xDDC  /* SAU Region Base Address Register */
 #define SAU_RLAR    0xDE0  /* SAU Region Limit Address Register */
+#define SAU_SFSR    0xDE4  /* Secure Fault Status Register (W1C) */
+#define SAU_SFAR    0xDE8  /* Secure Fault Address Register */
+
+/* ARMv8-M Non-secure alias of the SCS (0xE002E000): Secure code's window
+ * onto the Non-secure view (VTOR_NS, NVIC_NS->ISPR for the S->NS doorbell). */
+#define NVIC_NS_ALIAS_BASE 0xE002E000
 
 typedef struct arm_nvic {
     arm_cpu_t *cpu;
 
-    /* Enable bits: 1 = IRQ enabled (8 x 32-bit words = 256 IRQs) */
-    uint32_t  iser[8];
+    /* Enable bits: 1 = IRQ enabled */
+    uint32_t  iser[NVIC_IRQ_WORDS];
 
     /* Pending bits: 1 = IRQ pending */
-    uint32_t  ispr[8];
+    uint32_t  ispr[NVIC_IRQ_WORDS];
 
     /* Active bits: 1 = IRQ currently being serviced */
-    uint32_t  iabr[8];
+    uint32_t  iabr[NVIC_IRQ_WORDS];
 
     /* ARMv8-M target-security: bit set => IRQ targets Non-secure. Reset 0
-     * (all interrupts Secure). Secure-only registers. */
-    uint32_t  itns[8];
+     * (all interrupts Secure). Secure-only registers; from the Non-secure
+     * view every NVIC register is filtered through this mask. */
+    uint32_t  itns[NVIC_IRQ_WORDS];
+
+    uint32_t  cpuid;      /* SCB CPUID (per SoC config) */
 
     /* Priority: 8-bit priority per IRQ (only upper bits used) */
     uint8_t   ipr[NVIC_MAX_IRQ];
@@ -94,7 +106,11 @@ typedef struct arm_nvic {
 /* Initialize NVIC and register IO regions */
 void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu);
 
-/* Set an IRQ pending (irq_num = 0-239, maps to exception 16+irq_num) */
+/* Reset the NVIC to its power-on state (SoC reset path). Keeps the CPU
+ * back-pointer and IO registration; re-derives VTOR from the flash base. */
+void arm_nvic_reset(arm_nvic_t *nvic);
+
+/* Set an IRQ pending (irq_num = 0-479, maps to exception 16+irq_num) */
 void arm_nvic_set_pending(arm_nvic_t *nvic, int irq_num);
 
 /* Clear an IRQ pending */

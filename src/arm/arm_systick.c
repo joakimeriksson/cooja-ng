@@ -112,6 +112,12 @@ void arm_systick_init(arm_systick_t *st, arm_cpu_t *cpu, arm_nvic_t *nvic) {
                     systick_read, systick_write, st);
 }
 
+void arm_systick_reset(arm_systick_t *st) {
+    arm_cancel_event(st->cpu, &st->tick_event);
+    st->csr = st->rvr = st->cvr = 0;
+    st->last_cycle = 0;
+}
+
 void arm_systick_update(arm_systick_t *st) {
     if ((st->csr & SYST_CSR_ENABLE) && st->rvr > 0) {
         arm_schedule_event(st->cpu, &st->tick_event,

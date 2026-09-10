@@ -34,6 +34,15 @@ typedef struct arm_config {
      * nRF54L15 (Cortex-M33 + Nordic SPU) sets it once the extension is
      * implemented. See docs/design/trustzone-m-plan.md. */
     bool has_trustzone;
+    /* Peripherals are reachable through two aliases: 0x5xxx_xxxx (Secure)
+     * and 0x4xxx_xxxx (Non-secure), as on the Nordic nRF54L/nRF53 IDAU
+     * scheme. The SoC registers each peripheral once at its 0x5 base; the
+     * IO dispatch folds a 0x4 access onto it and records the transaction
+     * security for the SPU/attribution checks. */
+    bool periph_ns_alias;
+    /* SCB CPUID value. 0 = the historical Cortex-M3 r2p1 id (0x412FC231),
+     * kept as the default so existing SoC output is unchanged. */
+    uint32_t cpuid;
 } arm_config_t;
 
 /* Pre-defined configurations */

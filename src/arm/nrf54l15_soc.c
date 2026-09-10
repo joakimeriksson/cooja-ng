@@ -107,6 +107,7 @@ static void nrf54l_host_schedule_ns_live(void *cpu, cpu_event_t *ev, int64_t fir
 #define NRF54L_GC_DOMAIN_STATUS           0x44C   /* RD: bit 16 = domain running */
 
 #define NRF54L_GC_DOMAIN_STATUS_RUNNING   (1u << 16)
+#define NRF54L_GC_RESETREAS               0x600   /* RESET.RESETREAS (same page) */
 
 static int nrf54l_global_clock_read(void *user_data, uint32_t addr) {
     nrf54l_global_clock_state_t *gc = (nrf54l_global_clock_state_t *)user_data;
@@ -115,6 +116,7 @@ static int nrf54l_global_clock_read(void *user_data, uint32_t addr) {
         case NRF54L_GC_EVENTS_HFCLKSTARTED:  return (int)gc->hfclkstarted;
         case NRF54L_GC_EVENTS_LFCLKSTARTED:  return (int)gc->lfclkstarted;
         case NRF54L_GC_EVENTS_HFXOSTARTED:   return (int)gc->hfxostarted;
+        case NRF54L_GC_RESETREAS:            return (int)gc->resetreas;
         case NRF54L_GC_DOMAIN_STATUS:
             /* Bit 16 = "clock domain running".  clock_init's tight spin
              * (PC 0x152c..0x1534 in hello-world.nrf54l15-dk) polls this
@@ -148,6 +150,9 @@ static void nrf54l_global_clock_write(void *user_data, uint32_t addr, uint32_t v
             break;
         case NRF54L_GC_EVENTS_HFXOSTARTED:
             gc->hfxostarted = value & 1;
+            break;
+        case NRF54L_GC_RESETREAS:
+            gc->resetreas &= ~value;   /* write-1-to-clear */
             break;
         case NRF54L_GC_DOMAIN_ENABLE:
             /* Writing 1 brings the corresponding clock domain up; the
@@ -430,6 +435,7 @@ void nrf54l_dppi_unsubscribe(nrf54l_dppi_state_t *d, int channel,
 }
 
 static int trc54_dppi = -1;   /* NRF54L_DPPI_TRACE: publishes, group tasks, CHEN/CHG writes */
+static int trc54_wdt  = -1;   /* NRF54L_WDT_TRACE: watchdog timeout */
 static int nrf54l_trace_flag(int *cache, const char *name);
 
 static void nrf54l_dppi_apply_group_tasks(nrf54l_dppi_state_t *d) {
@@ -602,6 +608,10 @@ static void nrf54l_dppic_write(void *user_data, uint32_t addr, uint32_t value) {
 #define NRF54L_GRTC_INTEN0                0x300
 #define NRF54L_GRTC_INTENSET0             0x304
 #define NRF54L_GRTC_INTENCLR0             0x308
+#define NRF54L_GRTC_INTEN1                0x310   /* GRTC_1 group: TrustZone normal world */
+#define NRF54L_GRTC_INTENSET1             0x314
+#define NRF54L_GRTC_INTENCLR1             0x318
+#define NRF54L_GRTC_INTPEND1              0x31C
 #define NRF54L_GRTC_INTEN2                0x320
 #define NRF54L_GRTC_INTENSET2             0x324
 #define NRF54L_GRTC_INTENCLR2             0x328
@@ -621,6 +631,10 @@ static void nrf54l_dppic_write(void *user_data, uint32_t addr, uint32_t value) {
 
 #define NRF54L_GRTC_TICK_NS               1000    /* 1 MHz syscounter */
 #define NRF54L_GRTC_IRQ                   228     /* GRTC_2_IRQn on app core */
+#define NRF54L_GRTC1_IRQ                  227     /* GRTC_1_IRQn — group 1, routed Non-secure by the TZ secure world */
+
+static int nrf54l_trace_flag(int *cache, const char *name);   /* defined with the radio traces below */
+static int trc54_grtc = -1;   /* NRF54L_GRTC_TRACE: compare fires, INTEN and CC writes */
 
 /* Live "now" in ns derived from CPU cycles. cpu->sim_time_ns is only
  * synced at arm_step / arm_step_until boundaries, so reads from
@@ -716,8 +730,17 @@ static void nrf54l_grtc_compare_fire(void *user_data, cpu_event_t *event) {
     if (idx < 0) return;
     /* Latch the event and pend the IRQ if enabled. */
     grtc->evt_compare[idx] = 1;
+    if (nrf54l_trace_flag(&trc54_grtc, "NRF54L_GRTC_TRACE"))
+        fprintf(stderr, "[grtc] fire cc%d at %llu inten2=%03x inten1=%03x\n", idx,
+                (unsigned long long)grtc_counter_now(grtc), grtc->inten, grtc->inten1);
     if (grtc->inten & (1u << idx)) {
         arm_nvic_set_pending(&grtc->plat->nvic, grtc->irq_num);
+    }
+    /* Group 1 (INTEN1 / GRTC_1): the TrustZone normal world's clock. The
+     * secure world routes IRQ 227 Non-secure through NVIC_ITNS and hands
+     * CC[0..2] to the normal world via SPU FEATURE.GRTC. */
+    if (grtc->inten1 & (1u << idx)) {
+        arm_nvic_set_pending(&grtc->plat->nvic, NRF54L_GRTC1_IRQ);
     }
     /* FLPR's IRQ group (INTEN0 / GRTC_0): raise the RV32E machine external
      * interrupt + wake it from WFI. Zephyr drives the VPR system tick exactly
@@ -802,6 +825,17 @@ static int nrf54l_grtc_read(void *user_data, uint32_t addr) {
         case NRF54L_GRTC_INTEN2:
         case NRF54L_GRTC_INTENSET2:
             return (int)grtc->inten;
+        case NRF54L_GRTC_INTEN1:
+        case NRF54L_GRTC_INTENSET1:
+            return (int)grtc->inten1;
+        case NRF54L_GRTC_INTPEND1: {   /* INTPEND1 — pending+enabled, group 1 */
+            uint32_t pending = 0;
+            for (int i = 0; i < NRF54L_GRTC_NUM_CC; i++) {
+                if (grtc->evt_compare[i] && (grtc->inten1 & (1u << i)))
+                    pending |= (1u << i);
+            }
+            return (int)pending;
+        }
         case 0x32C: {       /* INTPEND2 — pending+enabled bitmap */
             uint32_t pending = 0;
             for (int i = 0; i < NRF54L_GRTC_NUM_CC; i++) {
@@ -855,6 +889,11 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
     if (off >= NRF54L_GRTC_CC_BASE && off < NRF54L_GRTC_CC_END) {
         int idx = (off - NRF54L_GRTC_CC_BASE) / NRF54L_GRTC_CC_STRIDE;
         int sub = (off - NRF54L_GRTC_CC_BASE) % NRF54L_GRTC_CC_STRIDE;
+        if (nrf54l_trace_flag(&trc54_grtc, "NRF54L_GRTC_TRACE"))
+            fprintf(stderr, "[grtc] cc%d.%s = 0x%08x (%s) now=%llu\n", idx,
+                    sub == 0 ? "ccl" : sub == 4 ? "cch" : sub == 8 ? "ccadd" : "ccen",
+                    value, grtc->plat->cpu.io_txn_ns ? "NS" : "S",
+                    (unsigned long long)grtc_counter_now(grtc));
         switch (sub) {
             case 0x0:
                 grtc->cc[idx].ccl = value;
@@ -882,6 +921,11 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
         return;
     }
 
+    if ((off >= NRF54L_GRTC_INTEN0 && off <= NRF54L_GRTC_INTENCLR2 + 8) &&
+        nrf54l_trace_flag(&trc54_grtc, "NRF54L_GRTC_TRACE"))
+        fprintf(stderr, "[grtc] reg 0x%03x = 0x%08x (%s)\n", off, value,
+                grtc->plat->cpu.io_txn_ns ? "NS" : "S");
+
     switch (off) {
         case NRF54L_GRTC_TASKS_START:
             if (value == 1) {
@@ -907,6 +951,9 @@ static void nrf54l_grtc_write(void *user_data, uint32_t addr, uint32_t value) {
         case NRF54L_GRTC_INTEN2:    grtc->inten  = value;          break;
         case NRF54L_GRTC_INTENSET2: grtc->inten |= value;          break;
         case NRF54L_GRTC_INTENCLR2: grtc->inten &= ~value;         break;
+        case NRF54L_GRTC_INTEN1:    grtc->inten1  = value;         break;
+        case NRF54L_GRTC_INTENSET1: grtc->inten1 |= value;         break;
+        case NRF54L_GRTC_INTENCLR1: grtc->inten1 &= ~value;        break;
         /* INTEN0 = the FLPR's IRQ group (GRTC_0). Compares enabled here fire to
          * the RV32E core, not the M33 NVIC. */
         case NRF54L_GRTC_INTEN0:    grtc->inten_flpr  = value;     break;
@@ -2517,6 +2564,153 @@ static void nrf54l_gpio_write(void *user, uint32_t addr, uint32_t value) {
     }
 }
 
+
+/* ============================================================
+ * WDT30 (0x5010_8000) — watchdog. See nrf54l_wdt_state_t.
+ *
+ * The counter runs at 32.768 kHz from CRV down to zero. Every reload
+ * channel enabled in RREN must be fed with the magic value before the
+ * period elapses; REQSTATUS tracks which ones still owe a reload, and the
+ * period restarts once all of them have. A timeout resets the SoC and is
+ * reported afterwards in RESETREAS.DOG0. No interrupt: the nRF54L15
+ * watchdogs reset directly, and Contiki builds with NRFX_WDT_CONFIG_NO_IRQ.
+ * ============================================================ */
+#define NRF54L_WDT30_BASE      0x50108000u
+#define NRF54L_WDT30_SIZE      0x1000u
+#define NRF54L_WDT_RR_MAGIC    0x6E524635u
+#define NRF54L_WDT_TICK_HZ     32768u
+
+#define W_TASKS_START          0x000
+#define W_TASKS_STOP           0x004
+#define W_EVENTS_TIMEOUT       0x100
+#define W_EVENTS_STOPPED       0x104
+#define W_INTENSET             0x304
+#define W_INTENCLR             0x308
+#define W_RUNSTATUS            0x400
+#define W_REQSTATUS            0x404
+#define W_CRV                  0x504
+#define W_RREN                 0x508
+#define W_CONFIG               0x50C
+#define W_TSEN                 0x520
+#define W_RR_BASE              0x600
+
+static void nrf54l_wdt_timeout_cb(void *user, arm_event_t *ev);
+
+/* (Re)arm the timeout for a full CRV period from now. */
+static void nrf54l_wdt_arm(nrf54l_wdt_state_t *w) {
+    arm_cpu_t *cpu = &w->plat->cpu;
+    arm_cancel_event(cpu, &w->timeout_event);
+    w->timeout_scheduled = 0;
+    if (!w->running) return;
+    w->timeout_event.callback  = nrf54l_wdt_timeout_cb;
+    w->timeout_event.user_data = w;
+    w->timeout_scheduled = 1;
+    int64_t period_ns = (int64_t)((uint64_t)w->crv * 1000000000ull / NRF54L_WDT_TICK_HZ);
+    if (period_ns <= 0) period_ns = 1000;
+    arm_schedule_event(cpu, &w->timeout_event,
+                       cpu->cycles + cpu_ns_to_cycles(period_ns, cpu->cpu_freq_hz));
+    w->reqstatus = w->rren;
+}
+
+static void nrf54l_wdt_timeout_cb(void *user, arm_event_t *ev) {
+    (void)ev;
+    nrf54l_wdt_state_t *w = (nrf54l_wdt_state_t *)user;
+    w->timeout_scheduled = 0;
+    w->evt_timeout = 1;
+    nrf54l15_soc_t *soc = (nrf54l15_soc_t *)w->plat->soc;
+    soc->global_clock.resetreas |= NRF54L_RESETREAS_DOG0;
+    if (nrf54l_trace_flag(&trc54_wdt, "NRF54L_WDT_TRACE"))
+        fprintf(stderr, "[wdt cpu=0x%04x] timeout after %u ticks — resetting SoC\n",
+                (unsigned)((uintptr_t)&w->plat->cpu & 0xFFFF), w->crv);
+    arm_request_reset(&w->plat->cpu);
+}
+
+static int nrf54l_wdt_read(void *user_data, uint32_t addr) {
+    nrf54l_wdt_state_t *w = (nrf54l_wdt_state_t *)user_data;
+    uint32_t off = addr - w->base_addr;
+    switch (off) {
+        case W_EVENTS_TIMEOUT: return (int)w->evt_timeout;
+        case W_EVENTS_STOPPED: return (int)w->evt_stopped;
+        case W_RUNSTATUS:      return w->running ? 1 : 0;
+        case W_REQSTATUS:      return (int)w->reqstatus;
+        case W_CRV:            return (int)w->crv;
+        case W_RREN:           return (int)w->rren;
+        case W_CONFIG:         return (int)w->config;
+        case W_TSEN:           return (int)w->tsen;
+        case W_INTENSET:
+        case W_INTENCLR:       return (int)w->inten;
+        default:               return 0;
+    }
+}
+
+static void nrf54l_wdt_write(void *user_data, uint32_t addr, uint32_t value) {
+    nrf54l_wdt_state_t *w = (nrf54l_wdt_state_t *)user_data;
+    uint32_t off = addr - w->base_addr;
+    if (off >= W_RR_BASE && off < W_RR_BASE + 4 * NRF54L_WDT_NUM_CHANNELS) {
+        int n = (int)(off - W_RR_BASE) / 4;
+        if (value != NRF54L_WDT_RR_MAGIC || !w->running) return;
+        if (!(w->rren & (1u << n))) return;
+        w->reqstatus &= ~(1u << n);
+        /* Period restarts once every enabled channel has reloaded. */
+        if (w->reqstatus == 0) nrf54l_wdt_arm(w);
+        return;
+    }
+    switch (off) {
+        case W_TASKS_START:
+            /* Config and CRV latch at start; the watchdog then ignores
+             * writes to them until it is stopped (as on silicon). */
+            if (value == 1 && !w->running) {
+                w->running = true;
+                nrf54l_wdt_arm(w);
+            }
+            break;
+        case W_TASKS_STOP:
+            if (value == 1 && w->running) {
+                /* STOPEN (CONFIG bit 6) gates TASKS_STOP on real hardware. */
+                if (w->config & (1u << 6)) {
+                    w->running = false;
+                    w->evt_stopped = 1;
+                    arm_cancel_event(&w->plat->cpu, &w->timeout_event);
+                    w->timeout_scheduled = 0;
+                }
+            }
+            break;
+        case W_EVENTS_TIMEOUT: w->evt_timeout = value & 1; break;
+        case W_EVENTS_STOPPED: w->evt_stopped = value & 1; break;
+        case W_CRV:    if (!w->running) w->crv = value; break;
+        case W_RREN:   if (!w->running) w->rren = value; break;
+        case W_CONFIG: if (!w->running) w->config = value; break;
+        case W_TSEN:   w->tsen = value; break;
+        case W_INTENSET: w->inten |= value; break;
+        case W_INTENCLR: w->inten &= ~value; break;
+        default: break;
+    }
+}
+
+/* ICACHE — instruction cache control (nRF54L15: 0xE008_2000, in the M33's
+ * external private peripheral space, not the peripheral APB). Firmware
+ * triggers the invalidate task, polls STATUS.BUSY and writes ENABLE; csim
+ * has no cache model, so the task completes at once and ENABLE is only
+ * remembered. */
+#define NRF54L_ICACHE_BASE   0xE0082000u
+#define NRF54L_ICACHE_SIZE   0x1000u
+#define NRF54L_ICACHE_STATUS 0x400
+#define NRF54L_ICACHE_ENABLE 0x404
+
+static int nrf54l_icache_read(void *user_data, uint32_t addr) {
+    uint32_t *enable = (uint32_t *)user_data;
+    switch (addr - NRF54L_ICACHE_BASE) {
+        case NRF54L_ICACHE_ENABLE: return (int)*enable;
+        case NRF54L_ICACHE_STATUS: return 0;   /* bit 0 BUSY: never */
+        default:                    return 0;
+    }
+}
+
+static void nrf54l_icache_write(void *user_data, uint32_t addr, uint32_t value) {
+    uint32_t *enable = (uint32_t *)user_data;
+    if (addr - NRF54L_ICACHE_BASE == NRF54L_ICACHE_ENABLE) *enable = value & 1u;
+}
+
 /* ============================================================
  * SPIM00 / SPIM22 / SPIM30 + the off-SoC SPI chips on them.
  * The register model lives in nrf54l15_spim.c; this section binds it
@@ -2816,6 +3010,20 @@ static void nrf54l15_soc_init(arm_platform_t *plat) {
                         nrf54l_egu_read, nrf54l_egu_write, egus[i]);
     }
 
+    /* ICACHE (0xE008_2000) — the secure world enables the code cache at
+     * boot and never reads it back. Accept ENABLE and report it; csim has
+     * no cache model, so this changes no timing. Secure-only on silicon
+     * (no Non-secure alias), and outside the peripheral aliasing window. */
+    arm_register_io(&plat->cpu, NRF54L_ICACHE_BASE, NRF54L_ICACHE_SIZE,
+                    nrf54l_icache_read, nrf54l_icache_write, &soc->icache_enable);
+
+    /* WDT30 — the TrustZone secure world's watchdog (no Non-secure alias). */
+    soc->wdt30.plat      = plat;
+    soc->wdt30.base_addr = NRF54L_WDT30_BASE;
+    soc->wdt30.crv       = 0xFFFFFFFFu;   /* reset value */
+    arm_register_io(&plat->cpu, NRF54L_WDT30_BASE, NRF54L_WDT30_SIZE,
+                    nrf54l_wdt_read, nrf54l_wdt_write, &soc->wdt30);
+
     /* TIMER10/20 — used by nrf_802154 lptimer backend (TIMER20). */
     nrf54l_timer_setup(&soc->timer10, plat, &soc->dppi,
                        NRF54L_TIMER10_BASE, NRF54L_TIMER10_IRQ);
@@ -2852,6 +3060,144 @@ static void nrf54l15_soc_destroy(arm_platform_t *plat) {
     }
 }
 
+
+/* Reset the SoC's peripherals in place on a system reset (SYSRESETREQ or a
+ * watchdog timeout). IO registrations, host wiring (console callback, radio
+ * TX listener, the per-node FICR seed) and RESETREAS all survive, matching a
+ * warm reset on silicon: the RESET peripheral and the always-on watchdog are
+ * in a power domain the core reset does not clear, and SRAM keeps its
+ * contents so the secure world's .noinit violation record is still there.
+ * Also runs on the initial boot reset, so it must be a pure re-init. */
+static void nrf54l15_soc_reset(arm_platform_t *plat) {
+    nrf54l15_soc_t *soc = (nrf54l15_soc_t *)plat->soc;
+    if (!soc) return;
+    arm_cpu_t *cpu = &plat->cpu;
+
+    /* Cancel everything this SoC has scheduled before the queue is dropped. */
+    for (int i = 0; i < NRF54L_GRTC_NUM_CC; i++)
+        if (soc->grtc.cc[i].event)
+            arm_cancel_event(cpu, (arm_event_t *)soc->grtc.cc[i].event);
+    arm_cancel_event(cpu, &soc->radio.tx_end_event);
+    arm_cancel_event(cpu, &soc->radio.rx_disable_timeout_event);
+    arm_cancel_event(cpu, &soc->radio.disabled_event_defer);
+    nrf54l_timer_state_t *timers[2] = { &soc->timer10, &soc->timer20 };
+    for (int t = 0; t < 2; t++)
+        for (int n = 0; n < NRF54L_TIMER_NUM_CC; n++)
+            arm_cancel_event(cpu, &timers[t]->ev_compare[n]);
+
+    /* DPPI: drop every subscription the firmware made. */
+    for (int i = 0; i < NRF54L_DPPI_NUM_CHANNELS; i++) {
+        nrf54l_dppi_subscriber_t *s = soc->dppi.subs[i];
+        while (s) { nrf54l_dppi_subscriber_t *next = s->next; free(s); s = next; }
+        soc->dppi.subs[i] = NULL;
+    }
+    arm_platform_t *dppi_plat = soc->dppi.plat;
+    memset(&soc->dppi, 0, sizeof(soc->dppi));
+    soc->dppi.plat = dppi_plat;
+
+    /* GRTC — keep the CC event allocations, clear the programming. */
+    {
+        void *evs[NRF54L_GRTC_NUM_CC];
+        for (int i = 0; i < NRF54L_GRTC_NUM_CC; i++) evs[i] = soc->grtc.cc[i].event;
+        arm_platform_t *p = soc->grtc.plat;
+        int irq = soc->grtc.irq_num;
+        memset(&soc->grtc, 0, sizeof(soc->grtc));
+        soc->grtc.plat = p;
+        soc->grtc.dppi = &soc->dppi;
+        soc->grtc.irq_num = irq;
+        for (int i = 0; i < NRF54L_GRTC_NUM_CC; i++) soc->grtc.cc[i].event = evs[i];
+    }
+
+    /* RADIO — keep the TX listener and IRQ wiring. */
+    {
+        nrf54l_radio_state_t *r = &soc->radio;
+        arm_platform_t *p = r->plat;
+        int irq0 = r->irq_num_0, irq1 = r->irq_num_1;
+        nrf54l_radio_tx_listener_t cb = r->tx_cb;
+        void *cbu = r->tx_user;
+        memset(r, 0, sizeof(*r));
+        r->plat = p; r->dppi = &soc->dppi;
+        r->irq_num_0 = irq0; r->irq_num_1 = irq1;
+        r->tx_cb = cb; r->tx_user = cbu;
+        r->state = NRF54L_RADIO_STATE_DISABLED;
+        for (int i = 0; i < NRF54L_RADIO_NUM_SUBSCRIBES; i++) r->sub_channel[i] = -1;
+    }
+
+    /* EGU / TIMER — keep base addresses and IRQ numbers. */
+    nrf54l_egu_state_t *egus[3] = { &soc->egu00, &soc->egu10, &soc->egu20 };
+    for (int i = 0; i < 3; i++) {
+        arm_platform_t *p = egus[i]->plat;
+        int irq = egus[i]->irq_num;
+        memset(egus[i], 0, sizeof(*egus[i]));
+        egus[i]->plat = p; egus[i]->dppi = &soc->dppi; egus[i]->irq_num = irq;
+        for (int n = 0; n < NRF54L_EGU_NUM_CHANNELS; n++) egus[i]->sub_channel[n] = -1;
+    }
+    for (int t = 0; t < 2; t++) {
+        nrf54l_timer_state_t *tm = timers[t];
+        arm_platform_t *p = tm->plat;
+        int irq = tm->irq_num;
+        uint32_t base = tm->base_addr;
+        memset(tm, 0, sizeof(*tm));
+        nrf54l_timer_setup(tm, p, &soc->dppi, base, irq);
+    }
+
+    /* UARTE20 — keep the console callback so output survives the reboot. */
+    {
+        arm_uart_tx_callback cb = soc->uarte20.tx_cb;
+        void *cbu = soc->uarte20.tx_user;
+        arm_platform_t *p = soc->uarte20.plat;
+        memset(&soc->uarte20, 0, sizeof(soc->uarte20));
+        soc->uarte20.plat = p; soc->uarte20.tx_cb = cb; soc->uarte20.tx_user = cbu;
+        soc->uarte20.irq_num = NRF54L_UARTE20_IRQ;
+    }
+
+    /* SPIM — drop an in-flight transfer, re-init keeping the bus hooks. */
+    for (int i = 0; i < NRF54L_NUM_SPIM; i++) {
+        nrf54l_spim_t *s = &soc->spim[i];
+        arm_cancel_event(cpu, &s->xfer_event);
+        nrf54l_spim_t keep = *s;
+        nrf54l_spim_init(s, keep.host, keep.instance);
+        s->mem_read8     = keep.mem_read8;
+        s->mem_write8    = keep.mem_write8;
+        s->mem           = keep.mem;
+        s->exchange      = keep.exchange;
+        s->exchange_user = keep.exchange_user;
+    }
+
+    /* GPIO — pins return to their reset (input, low) state. The off-SoC SPI
+     * chips are not reset with the SoC; releasing their chip-select pins
+     * through the normal pin-change path deselects them. */
+    for (int p = 0; p < 3; p++) {
+        soc->gpio[p].out = 0;
+        soc->gpio[p].dir = 0;
+        for (int n = 0; n < 32; n++) soc->gpio[p].pin_cnf[n] = 0x2;
+        nrf54l_soc_gpio_changed(soc, &soc->gpio[p]);
+    }
+    soc->icache_enable = 0;
+
+    /* CLOCK/POWER/RESET page: clear the clock latches, keep RESETREAS. */
+    {
+        uint32_t reas = soc->global_clock.resetreas;
+        memset(&soc->global_clock, 0, sizeof(soc->global_clock));
+        soc->global_clock.resetreas = reas;
+    }
+
+    /* VPR/FLPR launch gate returns to its reset value; a launched FLPR keeps
+     * running (the core reset does not reach the coprocessor here). */
+    soc->vpr.initpc = 0;
+    soc->vpr.cpurun = 0;
+    soc->vpr.spu_periph12 = 0x8001000au;
+
+    /* WDT30 is in the always-on domain: it keeps running across a warm
+     * reset, and its pending timeout event was cancelled above only if it
+     * was ours to cancel — re-arm it so the period continues. */
+    arm_cancel_event(cpu, &soc->wdt30.timeout_event);
+    soc->wdt30.timeout_scheduled = 0;
+    soc->wdt30.evt_timeout = 0;
+    soc->wdt30.evt_stopped = 0;
+    if (soc->wdt30.running) nrf54l_wdt_arm(&soc->wdt30);
+}
+
 static void nrf54l15_soc_set_console(arm_platform_t *plat,
                                       arm_uart_tx_callback cb, void *user_data) {
     nrf54l15_soc_t *soc = (nrf54l15_soc_t *)plat->soc;
@@ -2863,5 +3209,6 @@ const arm_soc_ops_t nrf54l15_soc_ops = {
     .name        = "nrf54l15",
     .init        = nrf54l15_soc_init,
     .destroy     = nrf54l15_soc_destroy,
+    .reset       = nrf54l15_soc_reset,
     .set_console = nrf54l15_soc_set_console,
 };

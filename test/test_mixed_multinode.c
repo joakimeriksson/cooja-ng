@@ -1436,7 +1436,8 @@ static const sim_mote_env_t mixed_mote_env = {
  * run (reboots and timed "add" actions go through init_node too). */
 static const sim_normalized_config_t *node_cfg_src = NULL;
 
-static int init_node(int idx, const char *firmware_path, int node_id) {
+static int init_node(int idx, const char *firmware_path,
+                     const char *secure_firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     memset(node, 0, sizeof(*node));
     /* Phase 3: one registry lookup owns the board decision — node kind,
@@ -1450,6 +1451,9 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     node->slot = idx;
     node->env = &mixed_mote_env;
     snprintf(node->firmware_path, sizeof(node->firmware_path), "%s", firmware_path);
+    if (secure_firmware_path && secure_firmware_path[0])
+        snprintf(node->secure_firmware_path, sizeof(node->secure_firmware_path),
+                 "%s", secure_firmware_path);
     /* M11: bind + register the kernel-facing mote object early so the
      * node_* vtable accessors work during platform init below. */
     register_node_mote(idx, kind->ops);
@@ -1462,8 +1466,12 @@ static int init_node(int idx, const char *firmware_path, int node_id) {
     emu_rx_end_ns[idx] = 0;
     sim_radio_bus_asm_reset(&tx_asm[idx]);
 
-    printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
-           node->board->label);
+    if (node->secure_firmware_path[0])
+        printf("Initializing node %d (%s + secure %s) as %s...\n", node_id,
+               firmware_path, node->secure_firmware_path, node->board->label);
+    else
+        printf("Initializing node %d (%s) as %s...\n", node_id, firmware_path,
+               node->board->label);
 
     int rc = kind->boot(node, idx, firmware_path, node_id, &mixed_mote_env);
     if (rc != 0)
@@ -1520,8 +1528,9 @@ static void destroy_node(int idx) {
 static int reboot_node(int idx) {
     int node_id = nodes[idx].id;
     /* Copy firmware path before destroy — init_node's memset would zero it */
-    char fw[256];
+    char fw[256], sfw[256];
     snprintf(fw, sizeof(fw), "%s", nodes[idx].firmware_path);
+    snprintf(sfw, sizeof(sfw), "%s", nodes[idx].secure_firmware_path);
 
     /* Clear RF state for this node */
     memset(&rf_pending[idx], 0, sizeof(rf_pending[idx]));
@@ -1537,7 +1546,7 @@ static int reboot_node(int idx) {
      * what matters is that any events queued between this point and the
      * old slot's last activity are guaranteed to miss the new generation. */
     destroy_node(idx);
-    return init_node(idx, fw, node_id);
+    return init_node(idx, fw, sfw, node_id);
 }
 
 /* --- Simulation step for one node ---
@@ -2031,7 +2040,9 @@ sim_restart:
         const char *fw = firmware_paths[i < firmware_count ? i : firmware_count - 1];
         int node_id = (config_loaded && i < config.node_count)
                       ? config.nodes[i].id : i + 1;
-        if (init_node(i, fw, node_id) != 0) {
+        const char *sfw = (config_loaded && i < config.node_count)
+                          ? config.nodes[i].secure_firmware : NULL;
+        if (init_node(i, fw, sfw, node_id) != 0) {
             fprintf(stderr, "Failed to initialize node %d\n", node_id);
             return 1;
         }
@@ -2708,15 +2719,16 @@ sim_restart:
                     if (found < 0 && node_count < MAX_NODES) {
                         /* Dynamic node creation using mote_types from config */
                         int type_idx = act->mote_type;
-                        const char *fw = NULL;
+                        const char *fw = NULL, *sfw = NULL;
                         if (type_idx >= 0 && type_idx < config.mote_type_count &&
                             config.mote_type_firmware[type_idx][0]) {
                             fw = config.mote_type_firmware[type_idx];
+                            sfw = config.mote_type_secure_firmware[type_idx];
                         }
                         if (fw) {
                             found = node_count;
                             nodes[found].id = act->node;
-                            if (init_node(found, fw, act->node) == 0) {
+                            if (init_node(found, fw, sfw, act->node) == 0) {
                                 node_count++;
                                 num_nodes = node_count;
                                 radio_medium.node_count = node_count;
@@ -2992,6 +3004,9 @@ sim_restart:
             memset(n, 0, sizeof(*n));
             snprintf(n->firmware, sizeof(n->firmware), "%s",
                      from_cfg ? config.nodes[i].firmware : nodes[i].firmware_path);
+            snprintf(n->secure_firmware, sizeof(n->secure_firmware), "%s",
+                     from_cfg ? config.nodes[i].secure_firmware
+                              : nodes[i].secure_firmware_path);
             n->id = nodes[i].id;
             n->x = radio_medium.nodes[i].x;
             n->y = radio_medium.nodes[i].y;
@@ -3121,6 +3136,8 @@ sim_restart:
                nodes[i].id, node_type_str(i),
                (long long)node_cycles(i), (long long)node_instructions(i),
                cur_pc);
+        if (m->ops->dump_diagnostics)
+            m->ops->dump_diagnostics(m, SIM_MOTE_DIAG_TRUSTZONE);
         total_node_cycles += node_cycles(i);
         total_node_instructions += node_instructions(i);
     }

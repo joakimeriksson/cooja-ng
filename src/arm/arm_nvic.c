@@ -10,53 +10,75 @@
 #define NVIC_IO_BASE  0xE000E000
 #define NVIC_IO_SIZE  0x1000
 
+/* ARMv8-M: which view of the SCS is this access? The Non-secure view applies
+ * to Non-secure code at 0xE000E000 and to Secure code using the 0xE002E000
+ * alias. In it, the NVIC registers are filtered by ITNS (a Non-secure
+ * targeted line is the only kind NS may see or touch), VTOR is the NS bank,
+ * and ITNS/SAU/SFSR/SFAR read as zero and ignore writes. Without the
+ * security extension it is never the NS view, so nothing changes. */
+static inline bool nvic_ns_view(const arm_nvic_t *nvic, uint32_t addr) {
+    if (!nvic->cpu->tz_enabled) return false;
+    if ((addr & 0xFFFFF000u) == NVIC_NS_ALIAS_BASE) return true;
+    return !nvic->cpu->secure;
+}
+
+/* Word mask of IRQs visible in the NS view (ITNS) or all in the S view. */
+static inline uint32_t nvic_view_mask(const arm_nvic_t *nvic, bool ns, int idx) {
+    return ns ? nvic->itns[idx] : 0xFFFFFFFFu;
+}
+
 static int nvic_read(void *user_data, uint32_t addr) {
     arm_nvic_t *nvic = (arm_nvic_t *)user_data;
-    uint32_t offset = addr - NVIC_IO_BASE;
+    uint32_t offset = addr & 0xFFFu;
+    bool ns = nvic_ns_view(nvic, addr);
 
     /* NVIC_ISER */
-    if (offset >= NVIC_ISER_BASE && offset < NVIC_ISER_BASE + 32) {
+    if (offset >= NVIC_ISER_BASE && offset < NVIC_ISER_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ISER_BASE) / 4;
-        return (int)nvic->iser[idx];
+        return (int)(nvic->iser[idx] & nvic_view_mask(nvic, ns, idx));
     }
     /* NVIC_ICER */
-    if (offset >= NVIC_ICER_BASE && offset < NVIC_ICER_BASE + 32) {
+    if (offset >= NVIC_ICER_BASE && offset < NVIC_ICER_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ICER_BASE) / 4;
-        return (int)nvic->iser[idx];
+        return (int)(nvic->iser[idx] & nvic_view_mask(nvic, ns, idx));
     }
     /* NVIC_ISPR */
-    if (offset >= NVIC_ISPR_BASE && offset < NVIC_ISPR_BASE + 32) {
+    if (offset >= NVIC_ISPR_BASE && offset < NVIC_ISPR_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ISPR_BASE) / 4;
-        return (int)nvic->ispr[idx];
+        return (int)(nvic->ispr[idx] & nvic_view_mask(nvic, ns, idx));
     }
     /* NVIC_ICPR */
-    if (offset >= NVIC_ICPR_BASE && offset < NVIC_ICPR_BASE + 32) {
+    if (offset >= NVIC_ICPR_BASE && offset < NVIC_ICPR_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ICPR_BASE) / 4;
-        return (int)nvic->ispr[idx];
+        return (int)(nvic->ispr[idx] & nvic_view_mask(nvic, ns, idx));
     }
     /* NVIC_IABR */
-    if (offset >= NVIC_IABR_BASE && offset < NVIC_IABR_BASE + 32) {
+    if (offset >= NVIC_IABR_BASE && offset < NVIC_IABR_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_IABR_BASE) / 4;
-        return (int)nvic->iabr[idx];
+        return (int)(nvic->iabr[idx] & nvic_view_mask(nvic, ns, idx));
     }
-    /* NVIC_ITNS (ARMv8-M) — Secure-only; RAZ from Non-secure. */
-    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 32) {
-        if (!arm_cpu_is_secure(nvic->cpu)) return 0;
+    /* NVIC_ITNS (ARMv8-M) — Secure-only; RAZ from the Non-secure view. */
+    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 4 * NVIC_IRQ_WORDS) {
+        if (ns) return 0;
         return (int)nvic->itns[(offset - NVIC_ITNS_BASE) / 4];
     }
     /* NVIC_IPR — assemble up to 4 bytes, clamped at the array end so an
-     * unaligned word read near the top of the range can't read past ipr[]. */
-    if (offset >= NVIC_IPR_BASE && offset < NVIC_IPR_BASE + 240) {
+     * unaligned word read near the top of the range can't read past ipr[].
+     * In the NS view a Secure-targeted line's byte reads as zero. */
+    if (offset >= NVIC_IPR_BASE && offset < NVIC_IPR_BASE + NVIC_MAX_IRQ) {
         int base_idx = offset - NVIC_IPR_BASE;
         uint32_t val = 0;
-        for (int b = 0; b < 4 && base_idx + b < 240; b++)
-            val |= (uint32_t)nvic->ipr[base_idx + b] << (8 * b);
+        for (int b = 0; b < 4 && base_idx + b < NVIC_MAX_IRQ; b++) {
+            int irq = base_idx + b;
+            if (ns && !(nvic->itns[irq >> 5] & (1u << (irq & 31)))) continue;
+            val |= (uint32_t)nvic->ipr[irq] << (8 * b);
+        }
         return (int)val;
     }
 
     /* System Control Block */
     switch (offset) {
-        case SCB_CPUID: return 0x412FC231; /* Cortex-M3 r2p1 */
+        case SCB_CPUID: return (int)nvic->cpuid;
         case SCB_ICSR: {
             uint32_t val = 0;
             if (nvic->active_exception > 0)
@@ -76,8 +98,14 @@ static int nvic_read(void *user_data, uint32_t addr) {
             if (nvic->sys_pending & (1u << EXC_PENDSV))  val |= (1u << 28); /* PENDSVSET reads back */
             return (int)val;
         }
-        case SCB_VTOR:  return (int)nvic->vtor;
-        case SCB_AIRCR: return (int)nvic->aircr;
+        case SCB_VTOR:
+            /* Banked on ARMv8-M: cpu->vtor is the (only, or Non-secure)
+             * table, cpu->vtor_s the Secure one. */
+            if (nvic->cpu->tz_enabled && !ns) return (int)nvic->cpu->vtor_s;
+            return (int)nvic->cpu->vtor;
+        case SCB_AIRCR:
+            /* SYSRESETREQS / BFHFNMINS / PRIS are Secure-only (RAZ from NS). */
+            return (int)(ns ? (nvic->aircr & ~0x6008u) : nvic->aircr);
         case SCB_SCR:   return (int)nvic->scr;
         case SCB_CCR:   return (int)nvic->ccr;
         case SCB_SHPR1:
@@ -90,15 +118,18 @@ static int nvic_read(void *user_data, uint32_t addr) {
             return nvic->shpr[8] | (nvic->shpr[9] << 8) |
                    (nvic->shpr[10] << 16) | (nvic->shpr[11] << 24);
         case SCB_SHCSR: return (int)nvic->shcsr;
+        case SCB_DEMCR: return (int)nvic->cpu->demcr;
 
         /* SAU — Secure-only; reads as zero (RAZ) from Non-secure. */
         case SAU_CTRL:
         case SAU_TYPE:
         case SAU_RNR:
         case SAU_RBAR:
-        case SAU_RLAR: {
+        case SAU_RLAR:
+        case SAU_SFSR:
+        case SAU_SFAR: {
             arm_cpu_t *cpu = nvic->cpu;
-            if (!arm_cpu_is_secure(cpu))
+            if (!arm_cpu_is_secure(cpu) || ns)
                 return 0;
             uint32_t r = cpu->sau_rnr;
             switch (offset) {
@@ -107,6 +138,8 @@ static int nvic_read(void *user_data, uint32_t addr) {
                 case SAU_RNR:  return (int)cpu->sau_rnr;
                 case SAU_RBAR: return (r < cpu->sau_sregions) ? (int)cpu->sau_rbar[r] : 0;
                 case SAU_RLAR: return (r < cpu->sau_sregions) ? (int)cpu->sau_rlar[r] : 0;
+                case SAU_SFSR: return (int)cpu->sfsr;
+                case SAU_SFAR: return (int)cpu->sfar;
             }
             return 0;
         }
@@ -117,43 +150,46 @@ static int nvic_read(void *user_data, uint32_t addr) {
 
 static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
     arm_nvic_t *nvic = (arm_nvic_t *)user_data;
-    uint32_t offset = addr - NVIC_IO_BASE;
+    uint32_t offset = addr & 0xFFFu;
+    bool ns = nvic_ns_view(nvic, addr);
 
     /* NVIC_ISER (set-enable) */
-    if (offset >= NVIC_ISER_BASE && offset < NVIC_ISER_BASE + 32) {
+    if (offset >= NVIC_ISER_BASE && offset < NVIC_ISER_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ISER_BASE) / 4;
-        nvic->iser[idx] |= value;
+        nvic->iser[idx] |= value & nvic_view_mask(nvic, ns, idx);
         nvic->scan_valid = false;
         nvic->has_pending = true;   /* newly-enabled IRQ may already be pending */
         arm_nvic_check_pending(nvic);
         return;
     }
     /* NVIC_ICER (clear-enable) */
-    if (offset >= NVIC_ICER_BASE && offset < NVIC_ICER_BASE + 32) {
+    if (offset >= NVIC_ICER_BASE && offset < NVIC_ICER_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ICER_BASE) / 4;
-        nvic->iser[idx] &= ~value;
+        nvic->iser[idx] &= ~(value & nvic_view_mask(nvic, ns, idx));
         nvic->scan_valid = false;
         return;
     }
     /* NVIC_ITNS (ARMv8-M target-security) — Secure-only; WI from Non-secure. */
-    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 32) {
-        if (arm_cpu_is_secure(nvic->cpu))
+    if (offset >= NVIC_ITNS_BASE && offset < NVIC_ITNS_BASE + 4 * NVIC_IRQ_WORDS) {
+        if (!ns && arm_cpu_is_secure(nvic->cpu)) {
             nvic->itns[(offset - NVIC_ITNS_BASE) / 4] = value;
+            nvic->scan_valid = false;
+        }
         return;
     }
     /* NVIC_ISPR (set-pending) */
-    if (offset >= NVIC_ISPR_BASE && offset < NVIC_ISPR_BASE + 32) {
+    if (offset >= NVIC_ISPR_BASE && offset < NVIC_ISPR_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ISPR_BASE) / 4;
-        nvic->ispr[idx] |= value;
+        nvic->ispr[idx] |= value & nvic_view_mask(nvic, ns, idx);
         nvic->scan_valid = false;
         nvic->has_pending = true;
         arm_nvic_check_pending(nvic);
         return;
     }
     /* NVIC_ICPR (clear-pending) */
-    if (offset >= NVIC_ICPR_BASE && offset < NVIC_ICPR_BASE + 32) {
+    if (offset >= NVIC_ICPR_BASE && offset < NVIC_ICPR_BASE + 4 * NVIC_IRQ_WORDS) {
         int idx = (offset - NVIC_ICPR_BASE) / 4;
-        nvic->ispr[idx] &= ~value;
+        nvic->ispr[idx] &= ~(value & nvic_view_mask(nvic, ns, idx));
         nvic->scan_valid = false;
         return;
     }
@@ -161,13 +197,13 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
      * one byte at a time.  Treat an aligned write whose value exceeds a byte as
      * a packed 4-IRQ word; otherwise a single-byte priority write (which the
      * old 4-byte-always path would have clobbered the 3 neighbours of). */
-    if (offset >= NVIC_IPR_BASE && offset < NVIC_IPR_BASE + 240) {
+    if (offset >= NVIC_IPR_BASE && offset < NVIC_IPR_BASE + NVIC_MAX_IRQ) {
         int idx = offset - NVIC_IPR_BASE;
-        if ((offset & 3u) == 0 && value > 0xFFu) {
-            for (int b = 0; b < 4 && idx + b < 240; b++)
-                nvic->ipr[idx + b] = (value >> (8 * b)) & 0xFF;
-        } else {
-            nvic->ipr[idx] = value & 0xFF;
+        int nbytes = ((offset & 3u) == 0 && value > 0xFFu) ? 4 : 1;
+        for (int b = 0; b < nbytes && idx + b < NVIC_MAX_IRQ; b++) {
+            int irq = idx + b;
+            if (ns && !(nvic->itns[irq >> 5] & (1u << (irq & 31)))) continue;
+            nvic->ipr[irq] = (value >> (8 * b)) & 0xFF;
         }
         nvic->scan_valid = false;
         return;
@@ -214,15 +250,26 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             }
             break;
         case SCB_VTOR:
-            nvic->vtor = value & 0xFFFFFF80;
-            nvic->cpu->vtor = nvic->vtor;
+            if (nvic->cpu->tz_enabled && !ns) {
+                nvic->cpu->vtor_s = value & 0xFFFFFF80;
+            } else {
+                nvic->vtor = value & 0xFFFFFF80;
+                nvic->cpu->vtor = nvic->vtor;
+            }
             break;
         case SCB_AIRCR:
             if ((value & 0xFFFF0000) == 0x05FA0000) {
-                nvic->aircr = value & 0xFFFF;
-                if (value & 4) {
-                    /* SYSRESETREQ */
-                    arm_cpu_reset(nvic->cpu);
+                uint32_t v = value & 0xFFFF;
+                if (ns) {
+                    /* Secure-only bits are preserved; a Non-secure reset
+                     * request is refused once Secure set SYSRESETREQS. */
+                    v = (v & ~0x6008u) | (nvic->aircr & 0x6008u);
+                    if (nvic->aircr & 0x8u) v &= ~4u;
+                }
+                nvic->aircr = v & ~4u;
+                if (v & 4) {
+                    /* SYSRESETREQ — taken at the next instruction boundary. */
+                    arm_request_reset(nvic->cpu);
                 }
             }
             break;
@@ -256,15 +303,22 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         case SCB_SHCSR:
             nvic->shcsr = value;
             break;
+        case SCB_DEMCR:
+            /* TRCENA clocks the trace block (DWT); the debug-monitor and
+             * vector-catch bits are stored but have no effect here. */
+            nvic->cpu->demcr = value;
+            break;
 
         /* SAU — Secure-only; writes are ignored (WI) from Non-secure. */
         case SAU_CTRL:
         case SAU_TYPE:
         case SAU_RNR:
         case SAU_RBAR:
-        case SAU_RLAR: {
+        case SAU_RLAR:
+        case SAU_SFSR:
+        case SAU_SFAR: {
             arm_cpu_t *cpu = nvic->cpu;
-            if (!arm_cpu_is_secure(cpu))
+            if (!arm_cpu_is_secure(cpu) || ns)
                 break;
             uint32_t r = cpu->sau_rnr;
             switch (offset) {
@@ -285,6 +339,11 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
                     if (r < cpu->sau_sregions)
                         cpu->sau_rlar[r] = value & 0xFFFFFFE3u;  /* limit[31:5]|NSC|ENABLE */
                     break;
+                case SAU_SFSR:
+                    cpu->sfsr &= ~value;   /* write-1-to-clear */
+                    break;
+                case SAU_SFAR:
+                    break;                 /* read-only */
             }
             break;
         }
@@ -295,24 +354,46 @@ bool arm_nvic_targets_secure(const arm_nvic_t *nvic, int exception_num) {
     if (exception_num < 16)
         return true;   /* system exceptions: Secure (refined later) */
     int irq = exception_num - 16;
-    if (irq >= 256)
+    if (irq >= NVIC_MAX_IRQ)
         return true;
     /* ITNS bit set => Non-secure target. */
     return !(nvic->itns[irq >> 5] & (1u << (irq & 31)));
 }
 
+void arm_nvic_reset(arm_nvic_t *nvic) {
+    arm_cpu_t *cpu = nvic->cpu;
+    memset(nvic->iser, 0, sizeof(nvic->iser));
+    memset(nvic->ispr, 0, sizeof(nvic->ispr));
+    memset(nvic->iabr, 0, sizeof(nvic->iabr));
+    memset(nvic->itns, 0, sizeof(nvic->itns));
+    memset(nvic->ipr,  0, sizeof(nvic->ipr));
+    memset(nvic->shpr, 0, sizeof(nvic->shpr));
+    nvic->vtor = cpu->flash_base; /* SoC's flash base — VTOR points at the vector table */
+    nvic->aircr = 0;
+    nvic->scr = 0;
+    nvic->ccr = 0x200; /* STKALIGN=1 by default */
+    nvic->shcsr = 0;
+    nvic->active_exception = 0;
+    nvic->sys_pending = 0;
+    nvic->has_pending = false;
+    nvic->scan_valid = false;
+    nvic->scan_exc = -1;
+    nvic->scan_prio = 256;
+    nvic->cpuid = cpu->cpuid ? cpu->cpuid : 0x412FC231u; /* Cortex-M3 r2p1 default */
+}
+
 void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu) {
     memset(nvic, 0, sizeof(*nvic));
     nvic->cpu = cpu;
-    nvic->active_exception = 0;
-    nvic->sys_pending = 0;
-    nvic->vtor = cpu->flash_base; /* SoC's flash base — VTOR points at the vector table */
-    nvic->ccr = 0x200; /* STKALIGN=1 by default */
+    arm_nvic_reset(nvic);
 
     /* Set back-pointer so exception_return can access NVIC */
     cpu->nvic = nvic;
 
     arm_register_io(cpu, NVIC_IO_BASE, NVIC_IO_SIZE, nvic_read, nvic_write, nvic);
+    /* ARMv8-M: Secure code's window onto the Non-secure SCS view. */
+    if (cpu->tz_enabled)
+        arm_register_io(cpu, NVIC_NS_ALIAS_BASE, NVIC_IO_SIZE, nvic_read, nvic_write, nvic);
 }
 
 void arm_nvic_set_pending(arm_nvic_t *nvic, int irq_num) {
@@ -381,7 +462,7 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
         }
 
         /* Check external IRQs */
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < NVIC_IRQ_WORDS; i++) {
             uint32_t pending_enabled = nvic->ispr[i] & nvic->iser[i];
             if (pending_enabled == 0) continue;
             for (int bit = 0; bit < 32; bit++) {

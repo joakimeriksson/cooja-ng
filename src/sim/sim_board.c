@@ -31,6 +31,7 @@ static const sim_board_desc_t boards[] = {
     /* .nrf52840 without board suffix: built with BOARD=dk (the default). */
     { ".nrf52840",        "nrf52840-dk",     SIM_BOARD_KIND_ARM, "ARM/nRF52840-DK"     },
     { ".nrf54l15-dk",     "nrf54l15-dk",     SIM_BOARD_KIND_ARM, "ARM/nRF54L15-DK"     },
+    { ".nrf54l15-xiao",   "nrf54l15-xiao",   SIM_BOARD_KIND_ARM, "ARM/nRF54L15-XIAO"   },
     /* Host-process motes */
     { ".cooja", NULL, SIM_BOARD_KIND_NATIVE, "Native/Cooja" },
     { ".js",    NULL, SIM_BOARD_KIND_JS,     "JS/QuickJS"   },

@@ -39,6 +39,7 @@ typedef enum sim_mote_diag {
     SIM_MOTE_DIAG_CC2420_STATS,
     SIM_MOTE_DIAG_NEIGHBOR_TABLE,
     SIM_MOTE_DIAG_SR_TABLE,
+    SIM_MOTE_DIAG_TRUSTZONE,   /* per-node TrustZone-M transition counters */
 } sim_mote_diag_t;
 
 /* Typed-interface ids for sim_mote_ops_t.get_interface (M16).  An
