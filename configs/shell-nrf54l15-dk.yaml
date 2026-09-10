@@ -1,0 +1,12 @@
+version: 2
+title: "nRF54L15-DK Contiki-NG shell, driven from the Cooja-NG shell"
+description: >
+  One node running the Contiki-NG shell example.  No test section: the
+  Cooja-NG shell (--shell) or a script (--script test/scripts/*.cnsh)
+  drives it — see docs/shell.md.
+timeout_ms: 10000
+seed: 42
+mote_types:
+  - { name: shell, firmware: firmware/nrf54l15-dk/shell.nrf54l15-dk }
+nodes:
+  - { type: shell, id: 1, x: 0.0, y: 0.0 }

@@ -18,6 +18,7 @@
 /* Compiled-in example "plugin": the energy estimator as a built-in service,
  * selectable by config name (its engine is shared with plugins/energest.so). */
 extern const sim_service_ops_t energest_service_ops;
+extern const sim_service_ops_t shell_service_ops;
 
 /* Renode co-simulation (csim as clock slave).  Normally selected by the
  * runner's --renode flag, which hands over its own config; also reachable
@@ -41,6 +42,7 @@ void csim_register_builtin_services(sim_registry_t *r) {
     sim_registry_register_service(r, &gdb_service_ops);
     sim_registry_register_service(r, &energest_service_ops);
     sim_registry_register_service(r, &renode_cosim_service_ops);
+    sim_registry_register_service(r, &shell_service_ops);
 }
 
 int sim_registry_register_service(sim_registry_t *r,
