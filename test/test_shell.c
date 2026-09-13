@@ -391,6 +391,24 @@ static void test_review_fixes(void) {
     shell_script_tick(&sh);
     CHECK(sh.atq_count == 1 && sh.watch_count == 0, "only the non-blocking 'at +1s run' was scheduled (atq=%d watches=%d)", sh.atq_count, sh.watch_count);
     CHECK(!sh.failed, "refusals typed at the prompt do not set a verdict");
+
+    /* at list / at clear, and the atq / atrm aliases. */
+    mock_reset();
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "at 5s echo a");
+    shell_enqueue_line(&sh, "at 6s echo b");
+    shell_enqueue_line(&sh, "every 1s echo c");
+    shell_enqueue_line(&sh, "at list");
+    shell_enqueue_line(&sh, "at clear 1");
+    shell_enqueue_line(&sh, "atrm 2");
+    shell_enqueue_line(&sh, "atq");
+    shell_enqueue_line(&sh, "at clear 9");
+    shell_script_tick(&sh);
+    CHECK(sh.atq_count == 1 && sh.atq[0].id == 3, "at clear and atrm cancel by id (%d left)", sh.atq_count);
+    CHECK(!sh.failed, "at clear of a missing id is a prompt error only");
+    shell_enqueue_line(&sh, "at clear all");
+    shell_script_tick(&sh);
+    CHECK(sh.atq_count == 0, "at clear all empties the queue");
     mock_reset();
     p = write_script("f3", "at +100ms sleep 10s\nsleep 1s\necho after\npass\n");
     shell_script_source(&sh, p);

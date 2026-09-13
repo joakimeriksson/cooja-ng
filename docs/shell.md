@@ -94,7 +94,7 @@ serial-line buffer) prints a warning, since the node would truncate it;
 |---|---|
 | `at <time> <command...>` | run a command at an exact simulation time |
 | `every <period> <command...>` | run a command periodically (first after one period) |
-| `atq`, `atrm <id>\|all` | list / cancel scheduled commands |
+| `at list`, `at clear <id>\|all` | list / cancel scheduled commands (`at` and `every`); `atq` and `atrm` are aliases, as in the Unix commands |
 
 `at`, `every` and `on` run one command beside the command stream, so they
 refuse the commands that would hold it: `expect`, `sleep`, `wait-until`,

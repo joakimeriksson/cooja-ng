@@ -467,9 +467,21 @@ static int check_command_text(shell_service_t *s, const char *what, const char *
     return 0;
 }
 
+static int cmd_atq(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos);
+static int cmd_atrm(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos);
+
 static int cmd_at(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)argc;
     int64_t t;
+    /* `at list` / `at clear` manage the queue (atq / atrm are aliases). */
+    if (strcmp(argv[1], "list") == 0) {
+        if (argc != 2) { shell_error(s, "usage: at list"); return -1; }
+        return cmd_atq(s, 1, argv + 1, line, argpos);
+    }
+    if (strcmp(argv[1], "clear") == 0) {
+        if (argc != 3) { shell_error(s, "usage: at clear <id>|all"); return -1; }
+        return cmd_atrm(s, 2, argv + 1, line, argpos);
+    }
+    if (argc < 3) { shell_error(s, "usage: at <time> <command...>"); return -1; }
     if (shell_refuse_external_clock(s, "at")) return -1;
     if (parse_instant(s, argv[1], &t) != 0) return -1;
     if (t <= now_ns(s)) { shell_error(s, "at: time %.3f s is not in the future", (double)t / 1e9); return -1; }
@@ -513,8 +525,8 @@ static int cmd_atrm(shell_service_t *s, int argc, char **argv, const char *line,
     (void)argc; (void)line; (void)argpos;
     if (strcmp(argv[1], "all") == 0) { shell_script_at_remove(s, -1); return 0; }
     long id;
-    if (shell_parse_int(argv[1], &id) != 0) { shell_error(s, "atrm: bad id '%s'", argv[1]); return -1; }
-    if (shell_script_at_remove(s, (int)id) == 0) { shell_error(s, "atrm: no scheduled command #%ld", id); return -1; }
+    if (shell_parse_int(argv[1], &id) != 0) { shell_error(s, "bad scheduled command id '%s'", argv[1]); return -1; }
+    if (shell_script_at_remove(s, (int)id) == 0) { shell_error(s, "no scheduled command #%ld", id); return -1; }
     return 0;
 }
 
@@ -741,10 +753,10 @@ static const shell_command_t commands[] = {
     { "log-file",   "log-file [<path> [nodes] | off [path]]", "append console lines of nodes to a file (same format); off closes", 0, 2, IMM, cmd_logfile },
     { "send",       "send <nodes> <text...>",          "console input (escapes like \\n honoured; no newline added)", 2, -1, 0, cmd_send },
     { "sendln",     "sendln <nodes> <text...>",        "send + one \"\\n\" — one Contiki-NG shell command", 2, -1, 0, cmd_sendln },
-    { "at",         "at <time> <command...>",          "run a command at a simulation time (5s, 1500ms, +2s)", 2, -1, IMM, cmd_at },
+    { "at",         "at <time> <command...> | at list | at clear <id>|all", "run a command at a simulation time (5s, 1500ms, +2s); list or cancel scheduled commands", 1, -1, IMM, cmd_at },
     { "every",      "every <period> <command...>",     "run a command periodically, first after one period", 2, -1, IMM, cmd_every },
-    { "atq",        "atq",                             "list scheduled commands", 0, 0, IMM, cmd_atq },
-    { "atrm",       "atrm <id>|all",                   "cancel scheduled command(s)", 1, 1, IMM, cmd_atrm },
+    { "atq",        "atq",                             "list scheduled commands (= at list)", 0, 0, IMM, cmd_atq },
+    { "atrm",       "atrm <id>|all",                   "cancel scheduled command(s) (= at clear)", 1, 1, IMM, cmd_atrm },
     { "source",     "source <file>",                   "run a script file (nested up to 8 deep; relative to the calling script first)", 1, 1, BLK, cmd_source },
     { "expect",     "expect <nodes|any> \"<pattern>\" [timeout]", "block until a console line contains pattern; timeout fails the script", 2, 3, BLK, cmd_expect },
     { "sleep",      "sleep <duration>",                "block for a simulated duration", 1, 1, BLK, cmd_sleep },
