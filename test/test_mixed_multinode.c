@@ -1613,7 +1613,15 @@ static int ctl_add(void *u, const char *fw, const char *sfw, int node_id) {
     int nc = ctl_node_count(NULL);
     if (nc >= MAX_NODES) return -1;
     nodes[nc].id = node_id;
-    if (init_node(nc, fw, sfw, node_id) != 0) return -1;
+    if (init_node(nc, fw, sfw, node_id) != 0) {
+        /* init_node registered the slot before boot failed (boot already
+         * freed its platform): unregister it so nothing reaches a dead
+         * mote, and drop anything it scheduled. */
+        sim_cancel_mote_events(&sim_rt, nc);
+        sim_runtime_bump_mote_generation(&sim_rt, nc);
+        sim_runtime_register_mote(&sim_rt, nc, NULL);
+        return -1;
+    }
     nc++;
     if (ctl_node_count_ptr) *ctl_node_count_ptr = nc;
     num_nodes = nc;
@@ -1649,6 +1657,9 @@ static void *ctl_get_interface(void *u, int idx, int iface) {
 static const sim_normalized_config_t *g_live_config = NULL;  /* the runner's config local */
 static const char *g_config_path = NULL;
 static int g_save_timeout_ms = 0;
+/* Shell/script runs have no fixed duration: save the time actually run. */
+static int g_save_elapsed = 0;
+static int64_t g_sim_start_ns = 0;
 static int save_live_config(const char *path, int timeout_ms, int64_t sim_ns) {
     static sim_normalized_config_t live;
     const sim_normalized_config_t *config = g_live_config;
@@ -1716,7 +1727,9 @@ static int save_live_config(const char *path, int timeout_ms, int64_t sim_ns) {
 }
 static int ctl_save_config(void *u, const char *path) {
     (void)u;
-    return save_live_config(path, g_save_timeout_ms, sim_runtime_now_ns(&sim_rt));
+    int64_t now = sim_runtime_now_ns(&sim_rt);
+    int ms = g_save_elapsed ? (int)((now - g_sim_start_ns) / MS_TO_NS) : g_save_timeout_ms;
+    return save_live_config(path, ms, now);
 }
 static const sim_control_ops_t ctl_ops = {
     .user              = NULL,
@@ -2276,6 +2289,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
         sim_service_attach(&sim_rt,
                            sim_registry_find_service(&g_registry, "shell"),
                            &shell_svc);
+        /* The web UI can resume a paused run, so a script blocked while
+         * paused is not a deadlock when it is up. */
+        shell_svc.external_resume = ui_enabled != 0;
     }
 
 sim_restart:
@@ -2653,6 +2669,8 @@ sim_restart:
         end_ns = INT64_MAX;
     }
     g_save_timeout_ms = sim_ms;
+    g_save_elapsed = shell_enabled || script_path;
+    g_sim_start_ns = sim_start_ns;
     /* M34: the per-tick progress report is a service now.  Cadence state +
      * the print move into progress_service; the explicit tick stays at the
      * original loop position so the line interleaves with mote UART output
@@ -2802,6 +2820,11 @@ sim_restart:
     double time_step = 0;
 
     double t_start = get_time_ms();
+    /* Pacing baseline, separate from t_start (the end-of-run wall time):
+     * rebased on every speed change / resume and continuously while paused. */
+    double  pace_t0 = t_start;
+    int64_t pace_base_ns = sim_start_ns;
+    uint32_t pace_epoch = sim_ctl.speed_epoch;
 
     int ss_has_command = sim_external_command_launched(&external_cmd);
     int64_t clock_quantum_end = INT64_MIN;   /* end of the master's current quantum */
@@ -2813,6 +2836,11 @@ sim_restart:
         /* A stop requested while paused (shell `exit`) must not run one
          * more slice. */
         if (sim_runtime_stop_requested(&sim_rt)) break;
+        if (sim_ctl.speed_epoch != pace_epoch) {
+            pace_epoch = sim_ctl.speed_epoch;
+            pace_t0 = get_time_ms();
+            pace_base_ns = sim_ns;
+        }
 
         /* When paused, poll the WebSocket / shell input and sleep, but skip
          * to the UI broadcast (no event is dispatched — §3.12). */
@@ -2822,9 +2850,10 @@ sim_restart:
                 shell_service_pump_paused(&shell_svc, 50);   /* reads + runs commands */
             else
                 usleep(50000); /* 50ms */
-            /* Reset pacing baseline so resuming doesn't cause a burst */
-            if (sim_control_pacing(&sim_ctl))
-                t_start = get_time_ms() - (double)(sim_ns - sim_start_ns) / 1e6 / sim_control_speed(&sim_ctl);
+            /* Keep the pacing baseline at "now" so resuming doesn't cause a
+             * burst (and t_start still measures the whole run). */
+            pace_t0 = get_time_ms();
+            pace_base_ns = sim_ns;
             goto ui_broadcast;
         }
 
@@ -2878,7 +2907,14 @@ sim_restart:
              * auto-pause horizon. */
             max_ns = sim_control_slice_cap(&sim_ctl, max_ns);
             if (next_event < max_ns) max_ns = next_event;
-            if (max_ns <= sim_ns) max_ns = sim_ns + 1000;  /* min 1µs advance */
+            if (next_event <= sim_ns) {
+                /* Events are still due at the current instant — a pause or a
+                 * `step` budget stopped the pump mid-slice.  Finish them
+                 * before moving on, so now_ns never steps back. */
+                max_ns = sim_ns;
+            } else if (max_ns <= sim_ns) {
+                max_ns = sim_ns + 1000;  /* min 1µs advance */
+            }
             sim_ns = max_ns;
         }
         sim_rt.now_ns = sim_ns;
@@ -3127,9 +3163,9 @@ sim_restart:
                 /* Real-time pacing: throttle to target speed for UI.
                  * Sleep in small increments (50ms max) so the socket poll
                  * can process incoming speed changes promptly. */
-                double sim_elapsed_ms = (double)(sim_ns - sim_start_ns) / 1e6;
+                double sim_elapsed_ms = (double)(sim_ns - pace_base_ns) / 1e6;
                 for (;sim_control_pacing(&sim_ctl);) {
-                    double wall_elapsed = get_time_ms() - t_start;
+                    double wall_elapsed = get_time_ms() - pace_t0;
                     double target_wall = sim_elapsed_ms / sim_control_speed(&sim_ctl);
                     double wait_ms = target_wall - wall_elapsed;
                     if (wait_ms <= 0) break;
@@ -3145,8 +3181,8 @@ sim_restart:
          * --speed/--realtime, the shell's `speed` command): throttle the
          * simulation to wall-clock time at the sim_control speed ratio. */
         if (sim_control_pacing(&sim_ctl) && !ui_service_active(&ui_svc)) {
-            double sim_elapsed_ms = (double)(sim_ns - sim_start_ns) / 1e6;
-            double wall_elapsed = get_time_ms() - t_start;
+            double sim_elapsed_ms = (double)(sim_ns - pace_base_ns) / 1e6;
+            double wall_elapsed = get_time_ms() - pace_t0;
             double target_wall = sim_elapsed_ms / sim_control_speed(&sim_ctl);
             double wait_ms = target_wall - wall_elapsed;
             if (wait_ms > 0) {
@@ -3211,7 +3247,8 @@ sim_restart:
     if (shell_service_report(&shell_svc, sim_ns) != 0)
         test_exit_code = 1;
     /* Under --shell the run length is whatever the user ran, not -t. */
-    int simulated_ms = shell_enabled ? (int)((sim_ns - sim_start_ns) / MS_TO_NS) : sim_ms;
+    int simulated_ms = (shell_enabled || script_path)
+                       ? (int)((sim_ns - sim_start_ns) / MS_TO_NS) : sim_ms;
 
     /* JS test engine results */
     if (use_js_engine) {
@@ -3231,7 +3268,7 @@ sim_restart:
 
     /* Snapshot of what ran, not of what was loaded (save_live_config). */
     if (save_config_path &&
-        save_live_config(save_config_path, shell_enabled ? simulated_ms : sim_ms, sim_ns) != 0)
+        save_live_config(save_config_path, simulated_ms, sim_ns) != 0)
         test_exit_code = 1;
     pcap_service_close(&pcap_svc);
     extern void msp430_timer_dump_ccr_counts(void);

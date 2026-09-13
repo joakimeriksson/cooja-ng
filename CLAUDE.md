@@ -100,7 +100,10 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
 ./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)
-tools/check-shell.sh                        # scripted pass/fail, pipe session, --paused, determinism diff
+tools/check-shell.sh                        # scripted pass/fail, piped session (sequential, deterministic),
+                                            # --paused, speed change, deadlock, determinism diffs
+python3 tools/check-shell-tty.py            # terminal-only paths via a pseudo-terminal (editor, "!cmd",
+                                            # exit verdict, blocked-while-paused hint)
 
 # Chip-driver + radio-medium unit suites
 ./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)

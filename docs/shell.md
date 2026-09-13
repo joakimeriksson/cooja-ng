@@ -13,6 +13,7 @@ what the node prints.
 printf 'sendln 1 help\nexpect 1 "Shows this help" 5s\nexit\n' \
     | ./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell       # piped session
 tools/check-shell.sh                                                       # smoke check
+python3 tools/check-shell-tty.py                                           # terminal-only paths
 ```
 
 Every simulation mode that takes a config or firmware list (`test`,
@@ -22,8 +23,8 @@ Every simulation mode that takes a config or firmware list (`test`,
 
 | flag | meaning |
 |---|---|
-| `--shell` | read commands from stdin.  On a terminal: line editing, history (`~/.cooja-ng_history`, or `$CSIM_SHELL_HISTORY`; empty disables), tab completion of command names.  From a pipe: plain lines, each executed command echoed as `> cmd`, EOF = `exit`. |
-| `--script FILE` | run FILE at simulation start, with or without `--shell`.  Without `--shell` the run ends when the script passes, fails or reaches its end. |
+| `--shell` | read commands from stdin.  On a terminal: line editing, history (`~/.cooja-ng_history`, or `$CSIM_SHELL_HISTORY`; empty disables), tab completion of command names.  From a pipe: lines run strictly in order, like a script (see *Pipes*), each echoed as `> cmd`; EOF = `exit`. |
+| `--script FILE` | run FILE at simulation start, with or without `--shell`.  Without `--shell` the run ends when the script passes or fails, or when it reaches its end and every `at`/`every` it scheduled has fired (or the duration ends the run). |
 | `--paused` | start paused (needs `--shell`, `--script` or `--ui` to resume). |
 | `--speed N` / `--speed max` / `--realtime` | wall-clock pacing: N simulated seconds per wall second; `max` = unpaced (the headless default; the live UI and the serial bridge default to 10x). |
 
@@ -32,6 +33,12 @@ With `--shell` the run has no duration: it ends at `exit`.  An explicit `-t`
 continues), and the config's `timeout_ms` is ignored, with a note at start.
 Without `--shell` (including `--script` alone) the duration ends the run as
 before.
+
+SIGINT and SIGTERM end the run through the normal teardown (reports,
+`--save-config`); a second signal kills the process.  While an external clock
+source drives the simulation (Renode co-simulation), `pause`, `run`, `step`,
+`speed`, `sleep`, `wait-until`, `at` and `every` are refused: the master owns
+time.
 
 The default prompt shows the simulation time and state:
 `cooja 12.345s> `, `cooja 12.345s [paused]> `, `cooja 12.345s [expect]> `.
@@ -71,12 +78,15 @@ Times: `5s`, `250ms`, `1500us`, `1.5s`, `2m`; a bare number is milliseconds;
 |---|---|
 | `log [on\|off [nodes] \| only <nodes>]` | which nodes' console lines print here (default all; none under `-q`) |
 | `log-file <path> [nodes]`, `log-file off [path]`, `log-file` | append nodes' console lines to a file (same line format, flushed per line); close; list |
-| `send <nodes> <text...>` | console input, escapes honoured, no newline added |
+| `send <nodes> <text...>` | console input, escapes honoured, spacing kept as typed, no newline added |
 | `sendln <nodes> <text...>` | `send` + one `\n`, i.e. one Contiki-NG shell command (the Contiki shell ends a line on `\n` *or* `\r`, so `\r\n` would be two commands) |
 
 Input is delivered the way each platform's model paces it (nRF54L15: one
 UARTE byte per character time; MSP430: baud-paced; unconsumed bytes are
-retried automatically).
+retried automatically, up to 512 queued bytes per node — beyond that `send`
+reports an error).  A line reaching `max-line` bytes (default 128, Contiki-NG's
+serial-line buffer) prints a warning, since the node would truncate it;
+`set max-line 0` silences it.
 
 **Scheduling**
 
@@ -86,11 +96,17 @@ retried automatically).
 | `every <period> <command...>` | run a command periodically (first after one period) |
 | `atq`, `atrm <id>\|all` | list / cancel scheduled commands |
 
+`at`, `every` and `on` run one command beside the command stream, so they
+refuse the commands that would hold it: `expect`, `sleep`, `wait-until`,
+`step`, `source`, and `run` with a duration.  Put such sequences in a script.
+An error in a scheduled command fails the script only if a script file
+scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
+
 **Scripting** (see below)
 
 | command | |
 |---|---|
-| `source <file>` | run a script file (nested up to 8 deep) |
+| `source <file>` | run a script file (nested up to 8 deep); from a script, a relative path is looked up next to that script first, then in the working directory |
 | `expect <nodes\|any> "<pattern>" [timeout]` | block until a console line contains the pattern (substring); the timeout (default 30 s, `set expect-timeout`) fails the script |
 | `sleep <duration>`, `wait-until <time>` | block for a duration / until a time |
 | `assert time <op> <t>`, `assert nodes <op> N`, `assert node <id> active\|removed\|exists`, `assert count "<pat>" <op> N` | checks (`== != < <= > >=`); a false assert fails the script |
@@ -98,7 +114,7 @@ retried automatically).
 | `fail-on "<pattern>" [nodes\|any]` | fail as soon as a console line contains the pattern |
 | `count "<pattern>" [nodes\|any]` | count matching lines from now on, for `assert count` |
 | `on <nodes\|any> "<pattern>" <command...>` | run a command whenever a line matches (e.g. `on any "SecureFault" fail "unexpected fault"`) |
-| `set [expect-timeout <duration>]`, `echo`, `save-config <file.yaml>`, `help [command]` | |
+| `set [expect-timeout <duration> \| max-line <bytes>]`, `echo <text...>`, `save-config <file.yaml>`, `help [command]` | `save-config` records the time run so far as `timeout_ms` |
 
 ## Scripts
 
@@ -118,20 +134,43 @@ input, and the script is race-free.  Deadlines and matches are pinned on the
 event queue, so a scripted run is deterministic and byte-identical across
 runs (`tools/check-shell.sh` checks that).
 
-While a script or a blocking command holds the stream, lines typed at the
-prompt queue behind it.  Two escape hatches: a line starting with `!` runs
-immediately if the command is safe to interleave (`status`, `nodes`, `log`,
-`log-file`, `pause`, `run`, `step`, `speed`, `at`, `atq`, `atrm`, `echo`,
-`help`, `exit`), and Ctrl-C aborts the script.
+While a script or a blocking command holds the stream, lines typed at a
+terminal prompt queue behind it.  Two escape hatches: a line starting with `!`
+runs immediately if the command is safe to interleave (`status`, `nodes`,
+`log`, `log-file`, `pause`, `run`, `step`, `speed`, `at`, `atq`, `atrm`,
+`echo`, `help`, `exit`) — `!run 500ms` and `!step` run beside the stream
+without holding it — and Ctrl-C aborts the script.  A mistyped `!` command
+prints an error but never fails the running script.
+
+**Paused while blocked.**  Simulated time does not advance while paused, so a
+blocked `sleep`, `wait-until` or `expect` can only continue after a resume.
+At a terminal the shell says so once (`type !run to continue`).  If nothing can
+resume the run — a pipe, whose lines queue behind the block, or `--script`
+alone, and no web UI — the shell fails the script as a deadlock instead of
+hanging.
 
 **Exit codes.**  A script fails on an `expect` timeout, a false `assert`,
-`fail`, a matched `fail-on`, or any command error inside a script file
-(unknown node, bad syntax, unreadable `source`); the process then exits 1 and
-prints `--- Script Results ---` like the JSON test runner.  Reaching the end
-of the script without `pass`/`fail` is a pass.  A script still blocked when
-the run ends (duration reached, or `exit` typed at the prompt) is reported as
-"did not complete" and fails.  Without any script or verdict command the shell
-does not touch the exit code.
+`fail`, a matched `fail-on`, a deadlock, or any command error on a script's
+own line (unknown node, bad syntax, unreadable `source`); the process then
+exits 1 and prints `--- Script Results ---` like the JSON test runner.
+Reaching the end of the script without `pass`/`fail` is a pass, and `exit`
+inside a script file ends it normally.  A command still blocked, or a script
+file not yet finished, when the run ends — duration reached, `exit` typed at
+the prompt, or a signal — is reported as "did not complete" and fails.
+Without any script or verdict command the shell does not touch the exit code.
+
+## Pipes
+
+When stdin is not a terminal, `--shell` reads it **synchronously**: whenever
+the command stream is idle the simulation waits for the next line.  A piped
+session therefore behaves exactly like a script — each command runs at a
+simulation time decided by the commands before it, never by how fast the
+host reads the pipe — and two runs of the same input are byte-identical.
+Simulated time advances only through blocking commands (`run`, `sleep`,
+`wait-until`, `expect`) or after EOF's implied `exit`.  A pipe's `!` lines run
+in order like any other line; a driver process that writes commands over
+time should use `run <duration>` / `sleep` to move the simulation between
+them.
 
 Example, `test/scripts/shell-nrf54l15.cnsh`:
 
@@ -160,6 +199,9 @@ pass
 - The Contiki-NG shell prompt (`#<lladdr>> `) has no trailing newline, so it
   appears as a prefix of the node's next line; substring `expect` is not
   affected.
+- An `on` command that sends to a node whose output matches the same pattern
+  again (for example an echoing shell) feeds back on itself; more than 16
+  firings between two slices are dropped with a warning.
 - Not yet available from the shell (planned follow-ups): memory/register
   peek and poke, per-node TrustZone counters, radio-medium knobs.
 
@@ -172,4 +214,6 @@ all call it.  `src/services/shell_parse.c` (tokenizer, times, selectors — pure
 unit-tested), `shell_commands.c` (the table), `shell_script.c` (the command
 stream, blocking, `at`/`on` queues), `shell_service.c` (terminal/pipe I/O,
 prompt, console routing, service glue).  `test/test_shell.c` runs the parser
-and the engine against a mock control bundle (`test_runner shell`).
+and the engine against a mock control bundle (`test_runner shell`);
+`tools/check-shell.sh` runs the end-to-end checks and `tools/check-shell-tty.py`
+the terminal-only ones through a pseudo-terminal.

@@ -22,6 +22,7 @@ const char *shell_origin(shell_service_t *s, char *buf, size_t len);
 /* --- command execution (shell_commands.c) ------------------------------ */
 
 #define SHELL_CMD_IMMEDIATE 1u   /* allowed via "!" while the stream is blocked */
+#define SHELL_CMD_BLOCKING  2u   /* holds the command stream: not from at/every/on */
 
 typedef int (*shell_cmd_fn)(shell_service_t *s, int argc, char **argv,
                             const char *line, const int *argpos);
@@ -41,7 +42,14 @@ void shell_complete(const char *prefix, linenoiseCompletions *lc);
 /* Execute one line now (tokenize + dispatch).  `immediate_only` restricts
  * to SHELL_CMD_IMMEDIATE commands ("!" prefix while blocked).  Returns 0,
  * or -1 after printing an error. */
-int  shell_exec_line(shell_service_t *s, const char *line, bool immediate_only);
+int  shell_exec_line(shell_service_t *s, const char *line, bool immediate_only,
+                     const shell_origin_t *origin);
+/* Would this command line block the stream?  (expect, sleep, wait-until,
+ * step, source, and run with a duration.) */
+bool shell_line_blocks(const char *line);
+/* Refuse a command that needs the simulation's own clock while an external
+ * clock source (Renode) drives it.  Returns true (and prints) if refused. */
+bool shell_refuse_external_clock(shell_service_t *s, const char *what);
 
 /* Resolve a selector against the current node table (prints errors).
  * Returns the count, 0 with *any for "any", -1 on error. */
@@ -75,9 +83,13 @@ int  shell_script_watch_add(shell_service_t *s, shell_watch_kind_t kind,
                             bool any, const char *cmd);
 /* Pin a slice boundary at t (SIM_EV_TEST_ACTION, dispatch is a no-op). */
 void shell_pin(shell_service_t *s, int64_t t);
-static inline bool shell_in_script(const shell_service_t *s) {
-    return s->depth > 0;
-}
+/* Hide the prompt for a burst of output; release redraws it once. */
+void shell_hold_output(shell_service_t *s);
+void shell_release_output(shell_service_t *s);
+/* Wait (blocking) for piped stdin to yield a line or EOF (sync_stdin). */
+void shell_read_stdin_sync(shell_service_t *s);
+/* Deliver a pending SIGINT/SIGTERM as `exit`.  True if one was pending. */
+bool shell_check_signal(shell_service_t *s);
 /* Enqueue a stdin line for the stream ("!cmd" runs at once when allowed). */
 void shell_enqueue_line(shell_service_t *s, const char *line);
 

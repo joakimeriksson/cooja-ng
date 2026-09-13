@@ -183,6 +183,7 @@ void sim_control_resume(sim_control_t *c) {
     if (!c || !c->sim) return;
     if (c->sim->run_state != SIM_RUN_STOP_REQUESTED)
         c->sim->run_state = SIM_RUN_RUNNING;
+    c->speed_epoch++;
     c->pause_at_ns = INT64_MAX;
     c->step_armed = false;
     c->step_events_left = 0;
@@ -212,6 +213,7 @@ void sim_control_request_exit(sim_control_t *c) {
 void sim_control_set_speed(sim_control_t *c, double ratio) {
     if (!c) return;
     c->speed_ratio = ratio > 0.0 ? ratio : 0.0;
+    c->speed_epoch++;
 }
 
 /* --- loop hooks -------------------------------------------------------- */

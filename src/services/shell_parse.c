@@ -15,6 +15,44 @@ static int hexval(int c) {
     return -1;
 }
 
+/* Decode the escape whose backslash precedes *pp.  On return *pp points at
+ * the escape's last character (the caller advances past it).  0 on success,
+ * -1 with `err` filled. */
+static int decode_escape(const char **pp, char *out, char *err, size_t errlen) {
+    const char *p = *pp;
+    char c;
+    switch (*p) {
+    case 'n': c = '\n'; break;
+    case 'r': c = '\r'; break;
+    case 't': c = '\t'; break;
+    case 'e': c = 27;   break;
+    case '\\': c = '\\'; break;
+    case '"': c = '"'; break;
+    case '\'': c = '\''; break;
+    case ' ': c = ' '; break;
+    case '#': c = '#'; break;
+    case 'x': {
+        int h = hexval(p[1]), l = (h >= 0) ? hexval(p[2]) : -1;
+        if (h < 0 || l < 0) {
+            if (err) snprintf(err, errlen, "bad \\x escape");
+            return -1;
+        }
+        c = (char)(h * 16 + l);
+        p += 2;
+        break;
+    }
+    case '\0':
+        if (err) snprintf(err, errlen, "trailing backslash");
+        return -1;
+    default:
+        if (err) snprintf(err, errlen, "unknown escape \\%c", *p);
+        return -1;
+    }
+    *pp = p;
+    *out = c;
+    return 0;
+}
+
 int shell_tokenize(const char *line, char **argv, int *argpos, int max_args,
                    char *storage, size_t storage_len, char *err, size_t errlen) {
     int argc = 0;
@@ -47,33 +85,7 @@ int shell_tokenize(const char *line, char **argv, int *argpos, int max_args,
                 char c = *p;
                 if (c == '\\' && q != '\'') {
                     p++;
-                    switch (*p) {
-                    case 'n': c = '\n'; break;
-                    case 'r': c = '\r'; break;
-                    case 't': c = '\t'; break;
-                    case 'e': c = 27;   break;
-                    case '\\': c = '\\'; break;
-                    case '"': c = '"'; break;
-                    case '\'': c = '\''; break;
-                    case ' ': c = ' '; break;
-                    case '#': c = '#'; break;
-                    case 'x': {
-                        int h = hexval(p[1]), l = (h >= 0) ? hexval(p[2]) : -1;
-                        if (h < 0 || l < 0) {
-                            if (err) snprintf(err, errlen, "bad \\x escape");
-                            return -1;
-                        }
-                        c = (char)(h * 16 + l);
-                        p += 2;
-                        break;
-                    }
-                    case '\0':
-                        if (err) snprintf(err, errlen, "trailing backslash");
-                        return -1;
-                    default:
-                        if (err) snprintf(err, errlen, "unknown escape \\%c", *p);
-                        return -1;
-                    }
+                    if (decode_escape(&p, &c, err, errlen) != 0) return -1;
                 }
                 if (sp + 2 > storage_len) {
                     if (err) snprintf(err, errlen, "line too long");
@@ -242,6 +254,52 @@ int shell_parse_selector(const char *s, const int *ids, int nids,
         }
     }
     return n;
+}
+
+int shell_unquote_rest(const char *rest, char *out, size_t outlen,
+                       char *err, size_t errlen) {
+    size_t n = 0, keep = 0;        /* keep = length up to the last char that
+                                    * must survive trailing-space trimming */
+    char q = 0;
+    bool word_start = true;
+    if (err && errlen) err[0] = '\0';
+    for (const char *p = rest; *p; p++) {
+        char c = *p;
+        bool quoted = false;
+        if (!q && (c == '"' || c == '\'')) {
+            q = c;
+            keep = n;              /* an (even empty) quoted part is content */
+            word_start = false;
+            continue;
+        }
+        if (q && c == q) {
+            q = 0;
+            keep = n;
+            continue;
+        }
+        if (!q && c == '#' && word_start)
+            break;                 /* comment */
+        if (c == '\\' && q != '\'') {
+            p++;
+            if (decode_escape(&p, &c, err, errlen) != 0) return -1;
+            quoted = true;         /* an escaped space is content, not padding */
+        } else if (q) {
+            quoted = true;
+        }
+        if (n + 1 >= outlen) {
+            if (err) snprintf(err, errlen, "line too long");
+            return -1;
+        }
+        out[n++] = c;
+        if (quoted || !isspace((unsigned char)c)) keep = n;
+        word_start = !q && !quoted && isspace((unsigned char)c);
+    }
+    if (q) {
+        if (err) snprintf(err, errlen, "unterminated %c quote", q);
+        return -1;
+    }
+    out[keep] = '\0';
+    return (int)keep;
 }
 
 const char *shell_format_time(int64_t ns, char *buf, size_t len) {

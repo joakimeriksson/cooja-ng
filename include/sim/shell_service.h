@@ -49,6 +49,22 @@ extern "C" {
 #define SHELL_PATH_MAX      512
 #define SHELL_REASON_MAX    512
 
+/* Where a command line came from.  Errors fail the script only for lines
+ * a script owns: FILE lines, and at/every/on commands a script file
+ * scheduled (`script`).  A typo at the prompt never fails a script. */
+typedef enum shell_origin_kind {
+    SHELL_ORIGIN_STDIN = 0,   /* typed or piped                              */
+    SHELL_ORIGIN_FILE,        /* a --script / source file line               */
+    SHELL_ORIGIN_AT,          /* a due at/every entry                        */
+    SHELL_ORIGIN_ON,          /* an `on` watch firing                        */
+} shell_origin_kind_t;
+
+typedef struct shell_origin {
+    shell_origin_kind_t kind;
+    bool script;              /* owned by a script file (errors fail it)     */
+    char where[128];          /* "file.cnsh:12", "stdin", "at #3 (f:4)"      */
+} shell_origin_t;
+
 typedef struct shell_source {
     FILE *f;
     char  path[SHELL_PATH_MAX];
@@ -68,6 +84,7 @@ typedef struct shell_at_entry {
     int64_t at_ns;
     int64_t period_ns;     /* > 0: `every` — re-armed after each run */
     char    cmd[SHELL_LINE_MAX];
+    shell_origin_t origin; /* where the `at`/`every` line was typed         */
 } shell_at_entry_t;
 
 typedef struct shell_logfile {
@@ -90,7 +107,13 @@ typedef struct shell_watch {
     int     nids;
     int     count;
     char    cmd[SHELL_LINE_MAX];
+    shell_origin_t origin; /* where the `on`/`fail-on`/`count` line was typed */
 } shell_watch_t;
+
+typedef struct shell_trigger {
+    char cmd[SHELL_LINE_MAX];
+    shell_origin_t origin;
+} shell_trigger_t;
 
 typedef struct shell_service {
     sim_runtime_t *sim;
@@ -98,6 +121,12 @@ typedef struct shell_service {
     bool active;            /* --shell or --script                         */
     bool interactive;       /* --shell: stdin is a command source          */
     bool tty;               /* stdin and stdout are a terminal             */
+    /* Non-terminal stdin is read synchronously: when the command stream is
+     * idle the simulation waits for the next line, so a piped session runs
+     * exactly like a script (deterministic).  = interactive && !tty. */
+    bool sync_stdin;
+    /* Something outside the shell can resume a paused run (the web UI). */
+    bool external_resume;
     bool verbose;           /* runner's -v/-q (console mask default, echo) */
     bool started;           /* first tick done (editor started lazily)     */
 
@@ -106,6 +135,8 @@ typedef struct shell_service {
     char   linebuf[SHELL_LINE_MAX];
     bool   editing;
     char   prompt[96];
+    bool   hidden;          /* prompt hidden for a burst of output          */
+    bool   paused_hint;     /* "blocked while paused" hint already shown    */
     char   history_path[SHELL_PATH_MAX];
     int64_t prompt_ns;      /* sim time the prompt currently shows          */
     double  prompt_ms;      /* wall time of the last prompt refresh         */
@@ -139,8 +170,15 @@ typedef struct shell_service {
     /* Log-line watches and the commands they trigger (run at the tick). */
     shell_watch_t watches[SHELL_WATCH_MAX];
     int    watch_count;
-    char   triggers[SHELL_TRIGGER_MAX][SHELL_LINE_MAX];
+    shell_trigger_t triggers[SHELL_TRIGGER_MAX];
     int    trigger_count;
+    int    triggers_dropped;   /* reported at the next tick                 */
+
+    /* The line being executed (see shell_origin_t), and whether it runs
+     * outside the command stream ("!cmd" at a terminal), in which case a
+     * run/step must not hold the stream. */
+    shell_origin_t origin;
+    bool   exec_immediate;
 
     /* Command stream: source stack (depth 0 = stdin) + blocking state. */
     shell_source_t stack[SHELL_SOURCE_DEPTH];
@@ -157,6 +195,7 @@ typedef struct shell_service {
     int    matched_node;
     int64_t matched_ns;
     int64_t default_expect_timeout_ns;
+    int     max_line;       /* warn when one sent line exceeds it; 0 = off  */
 
     /* Verdict (docs/shell.md "Exit codes"). */
     bool   script_used;     /* a script ran or a verdict command was used  */
@@ -165,6 +204,7 @@ typedef struct shell_service {
     bool   passed;          /* `pass` seen                                 */
     bool   exited;          /* `exit`/`quit` executed                      */
     bool   finished;        /* root script reached its end                 */
+    bool   waiting_note;    /* "script ended, waiting for at" note shown    */
     int    expect_pass, expect_fail;
     bool   pending_fail;    /* set from the observer, applied at the tick   */
     char   pending_fail_reason[SHELL_REASON_MAX];

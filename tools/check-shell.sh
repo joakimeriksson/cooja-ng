@@ -46,4 +46,32 @@ echo "== log-file"
 printf "log-file $TMP/n1.log 1\nsendln 1 help\nexpect 1 \"Shows this help\" 5s\nexit\n" | $BIN test $CFG --shell -q > /dev/null 2>&1 || fail "log-file session"
 grep -q "\[Node 1/ARM\]" "$TMP/n1.log" || fail "log file empty"
 
+echo "== speed change while running does not stall"
+SECONDS=0
+printf 'sleep 30s\nspeed 1\nsleep 1s\nexit\n' \
+    | timeout 30 $BIN test $CFG --shell -q > "$TMP/speed.out" 2>&1 || fail "speed session"
+[ "$SECONDS" -lt 5 ] || fail "1 s at speed 1 took ${SECONDS}s wall (pacing not rebased)"
+
+echo "== paused + blocked pipe fails instead of hanging"
+if printf 'pause\nsleep 1s\nexit\n' | timeout 20 $BIN test $CFG --shell -q > "$TMP/dead.out" 2>&1; then
+    fail "deadlocked session exited 0"
+fi
+grep -q "deadlock" "$TMP/dead.out" || fail "deadlock not reported (hang or wrong failure)"
+
+echo "== piped session is deterministic"
+PIPED='sendln 1 help\nexpect 1 "Shows this help" 5s\nstatus\nsleep 250ms\nsendln 1 ip-addr\nexpect 1 "Node IPv6" 5s\nnodes\nexit\n'
+printf "$PIPED" | $BIN test $CFG --shell > "$TMP/piped1.out" 2>&1 || fail "piped run 1"
+printf "$PIPED" | $BIN test $CFG --shell > "$TMP/piped2.out" 2>&1 || fail "piped run 2"
+diff <(strip "$TMP/piped1.out") <(strip "$TMP/piped2.out") > /dev/null || fail "piped session is not deterministic"
+
+echo "== --script EOF waits for pending at"
+printf 'at 2s echo fired-at-2s\n' > "$TMP/ateof.cnsh"
+$BIN test $CFG -q --script "$TMP/ateof.cnsh" > "$TMP/ateof.out" 2>&1 || fail "at-EOF script"
+grep -q "fired-at-2s" "$TMP/ateof.out" || fail "pending at did not fire before the run ended"
+
+if command -v python3 > /dev/null; then
+    echo "== terminal paths (tools/check-shell-tty.py)"
+    python3 tools/check-shell-tty.py > "$TMP/tty.out" 2>&1 || { cat "$TMP/tty.out"; fail "tty checks"; }
+fi
+
 echo "check-shell: OK"

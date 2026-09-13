@@ -15,6 +15,20 @@
 
 static int64_t now_ns(shell_service_t *s) { return sim_runtime_now_ns(s->sim); }
 
+bool shell_refuse_external_clock(shell_service_t *s, const char *what) {
+    if (!s->sim || !s->sim->clock_source) return false;
+    shell_error(s, "%s is not available while an external clock source "
+                "(e.g. Renode) drives the simulation", what);
+    return true;
+}
+
+/* A run/step typed as "!cmd" runs beside the stream and must not hold it;
+ * from the stream itself it holds it until the auto-pause. */
+static void hold_stream_for_run(shell_service_t *s, int64_t deadline_ns) {
+    if (s->exec_immediate) return;
+    shell_script_block_until(s, SHELL_BLOCK_RUN, deadline_ns);
+}
+
 /* All node ids in slot order (removed slots included). */
 static int all_ids(shell_service_t *s, int *ids, int max) {
     int n = sim_control_node_count(s->ctl), k = 0;
@@ -76,6 +90,7 @@ static const char *node_state(const sim_control_node_info_t *info, int64_t now) 
 
 static int cmd_run(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)line; (void)argpos;
+    if (shell_refuse_external_clock(s, "run")) return -1;
     if (argc >= 2) {
         int64_t d;
         if (parse_dur(s, argv[1], &d) != 0) return -1;
@@ -83,7 +98,7 @@ static int cmd_run(shell_service_t *s, int argc, char **argv, const char *line, 
         s->run_for_target_ns = now_ns(s) + d;
         /* Hold the command stream until the auto-pause, so `run 500ms`
          * followed by `status` in a script/pipe sees the later time. */
-        shell_script_block_until(s, SHELL_BLOCK_RUN, s->run_for_target_ns);
+        hold_stream_for_run(s, s->run_for_target_ns);
     } else {
         sim_control_resume(s->ctl);
     }
@@ -92,28 +107,30 @@ static int cmd_run(shell_service_t *s, int argc, char **argv, const char *line, 
 
 static int cmd_pause(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)argv; (void)line; (void)argpos;
+    if (shell_refuse_external_clock(s, "pause")) return -1;
     sim_control_pause(s->ctl);
     return 0;
 }
 
 static int cmd_step(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)line; (void)argpos;
+    if (shell_refuse_external_clock(s, "step")) return -1;
     if (argc < 2) {
         sim_control_step_events(s->ctl, 1);
-        shell_script_block_until(s, SHELL_BLOCK_RUN, INT64_MAX);
+        hold_stream_for_run(s, INT64_MAX);
         return 0;
     }
     long n;
     if (shell_parse_int(argv[1], &n) == 0) {
         if (n < 1) { shell_error(s, "step count must be >= 1"); return -1; }
         sim_control_step_events(s->ctl, (int)(n > INT_MAX ? INT_MAX : n));
-        shell_script_block_until(s, SHELL_BLOCK_RUN, INT64_MAX);
+        hold_stream_for_run(s, INT64_MAX);
         return 0;
     }
     int64_t d;
     if (parse_dur(s, argv[1], &d) != 0) return -1;
     sim_control_run_for(s->ctl, d);
-    shell_script_block_until(s, SHELL_BLOCK_RUN, now_ns(s) + d);
+    hold_stream_for_run(s, now_ns(s) + d);
     return 0;
 }
 
@@ -125,6 +142,7 @@ static int cmd_speed(shell_service_t *s, int argc, char **argv, const char *line
         else shell_out(s, "speed: max (unpaced)\n");
         return 0;
     }
+    if (shell_refuse_external_clock(s, "speed")) return -1;
     if (strcmp(argv[1], "max") == 0) { sim_control_set_speed(s->ctl, 0.0); return 0; }
     if (strcmp(argv[1], "realtime") == 0) { sim_control_set_speed(s->ctl, 1.0); return 0; }
     double r;
@@ -187,6 +205,12 @@ static int cmd_time(shell_service_t *s, int argc, char **argv, const char *line,
 
 static int cmd_exit(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)argv; (void)line; (void)argpos;
+    /* `exit` inside a script file ends that script normally: it counts as
+     * finished, not as a script cut short by the end of the run. */
+    if (s->origin.kind == SHELL_ORIGIN_FILE) {
+        shell_script_abort(s);
+        s->finished = true;
+    }
     s->exited = true;
     sim_control_request_exit(s->ctl);
     return 0;
@@ -368,53 +392,89 @@ static int cmd_logfile(shell_service_t *s, int argc, char **argv, const char *li
     return 0;
 }
 
-static int do_send(shell_service_t *s, int argc, char **argv, bool newline) {
+/* The text after argument `from`, spacing preserved (shell_unquote_rest). */
+static int rest_text(shell_service_t *s, const char *line, const int *argpos,
+                     int argc, int from, char *out, size_t outlen) {
+    if (argc <= from) { out[0] = '\0'; return 0; }
+    char err[128];
+    int n = shell_unquote_rest(line + argpos[from], out, outlen, err, sizeof(err));
+    if (n < 0) { shell_error(s, "%s", err); return -1; }
+    return n;
+}
+
+static int do_send(shell_service_t *s, int argc, char **argv, const char *line,
+                   const int *argpos, bool newline) {
     int ids[SIM_EQ_MAX_NODES];
     int n = shell_resolve_selector(s, argv[1], ids, SIM_EQ_MAX_NODES, false, NULL);
     if (n < 0) return -1;
     char text[SHELL_LINE_MAX];
-    join_args(argc, argv, 2, text, sizeof(text) - 1);
-    if (newline) strncat(text, "\n", sizeof(text) - strlen(text) - 1);
-    int len = (int)strlen(text);
+    int len = rest_text(s, line, argpos, argc, 2, text, sizeof(text) - 1);
+    if (len < 0) return -1;
+    if (newline) text[len++] = '\n';
+    /* A Contiki-NG node drops a line longer than its serial-line buffer;
+     * say so rather than let an expect time out mysteriously. */
+    if (s->max_line > 0) {
+        int run = 0, longest = 0;
+        for (int i = 0; i < len; i++) {
+            if (text[i] == '\n' || text[i] == '\r') run = 0;
+            else if (++run > longest) longest = run;
+        }
+        if (longest >= s->max_line)
+            shell_out(s, "warning: a line of %d bytes reaches max-line %d (the node's "
+                      "serial-line buffer); it may be truncated (set max-line 0 to silence)\n",
+                      longest, s->max_line);
+    }
     for (int i = 0; i < n; i++) {
         int idx = sim_control_index_of_id(s->ctl, ids[i]);
         if (idx < 0 || !sim_control_node_active(s->ctl, idx)) {
             shell_error(s, "node %d is not running", ids[i]); return -1;
         }
-        sim_control_send(s->ctl, ids[i], (const uint8_t *)text, len,
-                         SIM_CONTROL_WAKE | SIM_CONTROL_RETRY);
+        int took = sim_control_send(s->ctl, ids[i], (const uint8_t *)text, len,
+                                    SIM_CONTROL_WAKE | SIM_CONTROL_RETRY);
+        if (took < len) {
+            shell_error(s, "node %d: console input truncated, %d of %d bytes queued "
+                        "(the node is not reading its console)", ids[i],
+                        took < 0 ? 0 : took, len);
+            return -1;
+        }
     }
     return 0;
 }
 
 static int cmd_send(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)line; (void)argpos;
-    return do_send(s, argc, argv, false);
+    return do_send(s, argc, argv, line, argpos, false);
 }
 
 static int cmd_sendln(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)line; (void)argpos;
-    return do_send(s, argc, argv, true);
+    return do_send(s, argc, argv, line, argpos, true);
 }
 
 /* --- scheduling ------------------------------------------------------------ */
 
-static int check_command_text(shell_service_t *s, const char *cmd) {
+/* Validate a command that at/every/on will run later.  Blocking commands
+ * are refused: they would take over the command stream's own wait. */
+static int check_command_text(shell_service_t *s, const char *what, const char *cmd) {
     char *argv[SHELL_MAX_ARGS]; char storage[SHELL_LINE_MAX]; char err[128];
     int argc = shell_tokenize(cmd, argv, NULL, SHELL_MAX_ARGS, storage, sizeof(storage), err, sizeof(err));
     if (argc < 0) { shell_error(s, "%s", err); return -1; }
     if (argc == 0) { shell_error(s, "missing command"); return -1; }
     if (!shell_find_command(argv[0])) { shell_error(s, "unknown command '%s'", argv[0]); return -1; }
+    if (shell_line_blocks(cmd)) {
+        shell_error(s, "%s cannot run '%s': it would block the command stream "
+                    "(put the sequence in a script instead)", what, argv[0]);
+        return -1;
+    }
     return 0;
 }
 
 static int cmd_at(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc;
     int64_t t;
+    if (shell_refuse_external_clock(s, "at")) return -1;
     if (parse_instant(s, argv[1], &t) != 0) return -1;
     if (t <= now_ns(s)) { shell_error(s, "at: time %.3f s is not in the future", (double)t / 1e9); return -1; }
     const char *cmd = line + argpos[2];
-    if (check_command_text(s, cmd) != 0) return -1;
+    if (check_command_text(s, "at", cmd) != 0) return -1;
     int id = shell_script_at_add(s, t, 0, cmd);
     if (id < 0) { shell_error(s, "at: queue full (max %d)", SHELL_ATQ_MAX); return -1; }
     if (s->verbose) shell_out(s, "at #%d scheduled for %.3f s\n", id, (double)t / 1e9);
@@ -424,10 +484,11 @@ static int cmd_at(shell_service_t *s, int argc, char **argv, const char *line, c
 static int cmd_every(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc;
     int64_t d;
+    if (shell_refuse_external_clock(s, "every")) return -1;
     if (parse_dur(s, argv[1], &d) != 0) return -1;
     if (d <= 0) { shell_error(s, "every: period must be > 0"); return -1; }
     const char *cmd = line + argpos[2];
-    if (check_command_text(s, cmd) != 0) return -1;
+    if (check_command_text(s, "every", cmd) != 0) return -1;
     int id = shell_script_at_add(s, now_ns(s) + d, d, cmd);
     if (id < 0) { shell_error(s, "every: queue full (max %d)", SHELL_ATQ_MAX); return -1; }
     if (s->verbose) shell_out(s, "every #%d scheduled, period %.3f s\n", id, (double)d / 1e9);
@@ -461,6 +522,17 @@ static int cmd_atrm(shell_service_t *s, int argc, char **argv, const char *line,
 
 static int cmd_source(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)line; (void)argpos;
+    /* From a script file, a relative path is looked up next to that file
+     * first, then in the working directory. */
+    if (s->origin.kind == SHELL_ORIGIN_FILE && s->depth > 0 && argv[1][0] != '/') {
+        const char *cur = s->stack[s->depth - 1].path;
+        const char *slash = strrchr(cur, '/');
+        if (slash) {
+            char path[SHELL_PATH_MAX];
+            snprintf(path, sizeof(path), "%.*s/%s", (int)(slash - cur), cur, argv[1]);
+            if (shell_script_source(s, path) == 0) return 0;
+        }
+    }
     if (shell_script_source(s, argv[1]) != 0) { shell_error(s, "source: cannot open %s", argv[1]); return -1; }
     return 0;
 }
@@ -480,6 +552,7 @@ static int cmd_expect(shell_service_t *s, int argc, char **argv, const char *lin
 static int cmd_sleep(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)line; (void)argpos;
     int64_t d;
+    if (shell_refuse_external_clock(s, "sleep")) return -1;
     if (parse_dur(s, argv[1], &d) != 0) return -1;
     shell_script_block_until(s, SHELL_BLOCK_SLEEP, now_ns(s) + d);
     return 0;
@@ -488,6 +561,7 @@ static int cmd_sleep(shell_service_t *s, int argc, char **argv, const char *line
 static int cmd_wait_until(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)line; (void)argpos;
     int64_t t;
+    if (shell_refuse_external_clock(s, "wait-until")) return -1;
     if (parse_instant(s, argv[1], &t) != 0) return -1;
     if (t <= now_ns(s)) {
         if (s->verbose) shell_out(s, "wait-until: %.3f s already passed\n", (double)t / 1e9);
@@ -569,6 +643,7 @@ static int cmd_set(shell_service_t *s, int argc, char **argv, const char *line, 
     (void)line; (void)argpos;
     if (argc < 2) {
         shell_out(s, "expect-timeout: %.3f s\n", (double)s->default_expect_timeout_ns / 1e9);
+        shell_out(s, "max-line: %d%s\n", s->max_line, s->max_line ? "" : " (off)");
         return 0;
     }
     if (strcmp(argv[1], "expect-timeout") == 0 && argc == 3) {
@@ -577,7 +652,15 @@ static int cmd_set(shell_service_t *s, int argc, char **argv, const char *line, 
         s->default_expect_timeout_ns = d;
         return 0;
     }
-    shell_error(s, "usage: set expect-timeout <duration>");
+    if (strcmp(argv[1], "max-line") == 0 && argc == 3) {
+        long v;
+        if (shell_parse_int(argv[2], &v) != 0 || v < 0 || v > SHELL_LINE_MAX) {
+            shell_error(s, "max-line: expected 0..%d", SHELL_LINE_MAX); return -1;
+        }
+        s->max_line = (int)v;
+        return 0;
+    }
+    shell_error(s, "usage: set [expect-timeout <duration> | max-line <bytes>]");
     return -1;
 }
 
@@ -607,16 +690,16 @@ static int cmd_count(shell_service_t *s, int argc, char **argv, const char *line
 static int cmd_on(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc;
     const char *cmd = line + argpos[3];
-    if (check_command_text(s, cmd) != 0) return -1;
+    if (check_command_text(s, "on", cmd) != 0) return -1;
     return add_watch(s, SHELL_WATCH_RUN, argv[1], argv[2], cmd);
 }
 
 /* --- misc ------------------------------------------------------------------ */
 
 static int cmd_echo(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)line; (void)argpos;
+    (void)argv;
     char text[SHELL_LINE_MAX];
-    join_args(argc, argv, 1, text, sizeof(text));
+    if (rest_text(s, line, argpos, argc, 1, text, sizeof(text)) < 0) return -1;
     shell_out(s, "%s\n", text);
     return 0;
 }
@@ -639,10 +722,11 @@ static int cmd_help(shell_service_t *s, int argc, char **argv, const char *line,
 /* --- table ----------------------------------------------------------------- */
 
 #define IMM SHELL_CMD_IMMEDIATE
+#define BLK SHELL_CMD_BLOCKING
 static const shell_command_t commands[] = {
     { "run",        "run [duration]",                  "resume; with a duration, pause again after it (run 500ms)", 0, 1, IMM, cmd_run },
     { "pause",      "pause",                           "stop dispatching events (services keep polling)", 0, 0, IMM, cmd_pause },
-    { "step",       "step [N|duration]",               "run N events (default 1) or a duration, then pause", 0, 1, IMM, cmd_step },
+    { "step",       "step [N|duration]",               "run N events (default 1) or a duration, then pause", 0, 1, IMM | BLK, cmd_step },
     { "speed",      "speed [ratio|max|realtime]",      "wall-clock pacing: sim seconds per wall second; max = unpaced", 0, 1, IMM, cmd_speed },
     { "status",     "status",                          "time, run state, speed, node count, script/queue state", 0, 0, IMM, cmd_status },
     { "time",       "time",                            "print the simulation time", 0, 0, IMM, cmd_time },
@@ -661,22 +745,23 @@ static const shell_command_t commands[] = {
     { "every",      "every <period> <command...>",     "run a command periodically, first after one period", 2, -1, IMM, cmd_every },
     { "atq",        "atq",                             "list scheduled commands", 0, 0, IMM, cmd_atq },
     { "atrm",       "atrm <id>|all",                   "cancel scheduled command(s)", 1, 1, IMM, cmd_atrm },
-    { "source",     "source <file>",                   "run a script file (nested up to 8 deep)", 1, 1, 0, cmd_source },
-    { "expect",     "expect <nodes|any> \"<pattern>\" [timeout]", "block until a console line contains pattern; timeout fails the script", 2, 3, 0, cmd_expect },
-    { "sleep",      "sleep <duration>",                "block for a simulated duration", 1, 1, 0, cmd_sleep },
-    { "wait-until", "wait-until <time>",               "block until a simulation time (absolute or +relative)", 1, 1, 0, cmd_wait_until },
+    { "source",     "source <file>",                   "run a script file (nested up to 8 deep; relative to the calling script first)", 1, 1, BLK, cmd_source },
+    { "expect",     "expect <nodes|any> \"<pattern>\" [timeout]", "block until a console line contains pattern; timeout fails the script", 2, 3, BLK, cmd_expect },
+    { "sleep",      "sleep <duration>",                "block for a simulated duration", 1, 1, BLK, cmd_sleep },
+    { "wait-until", "wait-until <time>",               "block until a simulation time (absolute or +relative)", 1, 1, BLK, cmd_wait_until },
     { "assert",     "assert time|nodes <op> <v> | node <id> active|removed|exists | count \"pat\" <op> N", "check a condition; failure fails the script", 3, 4, 0, cmd_assert },
     { "pass",       "pass",                            "end the script with a PASS verdict", 0, 0, 0, cmd_pass },
     { "fail",       "fail [message...]",               "end the script with a FAIL verdict (non-zero exit code)", 0, -1, 0, cmd_fail },
     { "fail-on",    "fail-on \"<pattern>\" [nodes|any]", "fail the script as soon as a console line contains pattern", 1, 2, 0, cmd_fail_on },
     { "count",      "count \"<pattern>\" [nodes|any]", "count console lines containing pattern (see assert count)", 1, 2, 0, cmd_count },
     { "on",         "on <nodes|any> \"<pattern>\" <command...>", "run a command whenever a console line contains pattern", 3, -1, 0, cmd_on },
-    { "set",        "set [expect-timeout <duration>]", "settings; default expect timeout is 30s", 0, 2, IMM, cmd_set },
+    { "set",        "set [expect-timeout <dur> | max-line <bytes>]", "settings; defaults: expect-timeout 30s, max-line 128", 0, 2, IMM, cmd_set },
     { "echo",       "echo <text...>",                  "print text", 0, -1, IMM, cmd_echo },
     { "save-config","save-config <file.yaml>",         "write the live setup (positions, nodes, seed) as a config", 1, 1, IMM, cmd_save_config },
     { "help",       "help [command]",                  "this list, or one command's syntax", 0, 1, IMM, cmd_help },
 };
 #undef IMM
+#undef BLK
 static const int command_count = (int)(sizeof(commands) / sizeof(commands[0]));
 
 const shell_command_t *shell_find_command(const char *name) {
@@ -706,7 +791,18 @@ void shell_complete(const char *prefix, linenoiseCompletions *lc) {
             linenoiseAddCompletion(lc, commands[i].name);
 }
 
-int shell_exec_line(shell_service_t *s, const char *line, bool immediate_only) {
+bool shell_line_blocks(const char *line) {
+    char *argv[SHELL_MAX_ARGS]; char storage[SHELL_LINE_MAX];
+    int argc = shell_tokenize(line, argv, NULL, SHELL_MAX_ARGS, storage,
+                              sizeof(storage), NULL, 0);
+    if (argc <= 0) return false;
+    const shell_command_t *c = shell_find_command(argv[0]);
+    if (!c) return false;
+    if (c->flags & SHELL_CMD_BLOCKING) return true;
+    return strcmp(c->name, "run") == 0 && argc >= 2;   /* run <duration> */
+}
+
+static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only) {
     char *argv[SHELL_MAX_ARGS];
     int argpos[SHELL_MAX_ARGS];
     char storage[SHELL_LINE_MAX];
@@ -721,10 +817,30 @@ int shell_exec_line(shell_service_t *s, const char *line, bool immediate_only) {
         shell_error(s, "'%s' cannot run while a script blocks (Ctrl-C aborts it)", c->name);
         return -1;
     }
+    /* Scheduled commands were validated when scheduled; this is the
+     * backstop for anything that slipped through. */
+    if ((s->origin.kind == SHELL_ORIGIN_AT || s->origin.kind == SHELL_ORIGIN_ON) &&
+        shell_line_blocks(line)) {
+        shell_error(s, "'%s' cannot run from at/every/on: it would block the command stream",
+                    c->name);
+        return -1;
+    }
     int nargs = argc - 1;
     if (nargs < c->min_args || (c->max_args >= 0 && nargs > c->max_args)) {
         shell_error(s, "usage: %s", c->syntax);
         return -1;
     }
     return c->fn(s, argc, argv, line, argpos);
+}
+
+int shell_exec_line(shell_service_t *s, const char *line, bool immediate_only,
+                    const shell_origin_t *origin) {
+    shell_origin_t saved = s->origin;
+    bool saved_imm = s->exec_immediate;
+    if (origin) s->origin = *origin;
+    s->exec_immediate = immediate_only;
+    int rc = exec_tokens(s, line, immediate_only);
+    s->origin = saved;
+    s->exec_immediate = saved_imm;
+    return rc;
 }

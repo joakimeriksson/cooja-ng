@@ -121,6 +121,11 @@ typedef struct sim_control {
     /* Wall-clock pacing target: sim seconds per wall second.  0 = unpaced
      * (run as fast as possible).  Only stored here; the loop paces. */
     double             speed_ratio;
+    /* Bumped whenever the pacing target changes or the run resumes; the
+     * loop rebases its wall-clock/sim-time pacing baseline when it sees a
+     * new value, so a speed change never "catches up" on time spent at
+     * another speed (or paused). */
+    uint32_t           speed_epoch;
 
     /* Auto-pause horizon for `run <duration>`: INT64_MAX = none.  The loop
      * clamps its slice to it (sim_control_slice_cap) and after_pump pauses

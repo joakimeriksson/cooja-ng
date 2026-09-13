@@ -332,6 +332,174 @@ static void test_engine(void) {
     CHECK(sim_control_add(&mock_ctl, "sky", NULL, 7, 0, 0, 0) == -1, "duplicate id refused");
 }
 
+/* --- review fixes ----------------------------------------------------------- */
+
+static void test_unquote_rest(void) {
+    char out[128]; char err[64];
+    int n = shell_unquote_rest("a  b   ", out, sizeof(out), err, sizeof(err));
+    CHECK(n == 4 && strcmp(out, "a  b") == 0, "inner spacing kept, trailing trimmed ('%s')", out);
+    n = shell_unquote_rest("\"x  \"", out, sizeof(out), err, sizeof(err));
+    CHECK(n == 3 && strcmp(out, "x  ") == 0, "quoted trailing spaces kept ('%s')", out);
+    n = shell_unquote_rest("help # comment", out, sizeof(out), err, sizeof(err));
+    CHECK(strcmp(out, "help") == 0, "comment stripped ('%s')", out);
+    n = shell_unquote_rest("a#b \"#c\"", out, sizeof(out), err, sizeof(err));
+    CHECK(strcmp(out, "a#b #c") == 0, "# inside a word or quotes is text ('%s')", out);
+    n = shell_unquote_rest("tab\\there", out, sizeof(out), err, sizeof(err));
+    CHECK(strcmp(out, "tab\\there") == 0 || strcmp(out, "tab\there") == 0, "escape decoded");
+    n = shell_unquote_rest("'lit\\n'", out, sizeof(out), err, sizeof(err));
+    CHECK(strcmp(out, "lit\\n") == 0, "single quotes literal ('%s')", out);
+    n = shell_unquote_rest("\"open", out, sizeof(out), err, sizeof(err));
+    CHECK(n == -1, "unterminated quote -> error");
+}
+
+static int m_inject_none(void *u, int idx, const uint8_t *b, int n) {
+    (void)u; (void)idx; (void)b; (void)n; mock_inject_calls++; return 0;
+}
+
+static void test_review_fixes(void) {
+    const char *p;
+
+    /* A typo typed at the prompt beside a running script does not fail it. */
+    mock_reset();
+    sh.interactive = true; sh.tty = true;          /* "!" runs immediately */
+    p = write_script("f1", "sleep 1s\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    shell_enqueue_line(&sh, "!stauts");
+    CHECK(!sh.failed, "!typo beside a script does not fail it");
+    mock_sim.now_ns = 1000000000LL;
+    shell_script_tick(&sh);
+    CHECK(sh.passed && !sh.failed, "script still passes");
+    unlink(p);
+
+    /* ...but an error on the script's own line still does. */
+    mock_reset();
+    p = write_script("f2", "stauts\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "f2_"), "script's own error fails it, blaming the file (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* Blocking commands are refused from at/every/on. */
+    mock_reset();
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "at +1s sleep 1s");
+    shell_enqueue_line(&sh, "on any \"x\" expect 1 \"y\"");
+    shell_enqueue_line(&sh, "every 1s run 5ms");
+    shell_enqueue_line(&sh, "at +1s step");
+    shell_enqueue_line(&sh, "at +1s run");
+    shell_script_tick(&sh);
+    CHECK(sh.atq_count == 1 && sh.watch_count == 0, "only the non-blocking 'at +1s run' was scheduled (atq=%d watches=%d)", sh.atq_count, sh.watch_count);
+    CHECK(!sh.failed, "refusals typed at the prompt do not set a verdict");
+    mock_reset();
+    p = write_script("f3", "at +100ms sleep 10s\nsleep 1s\necho after\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "block"), "blocking at inside a script fails it at definition (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* at/on errors are attributed to where they were scheduled. */
+    mock_reset();
+    p = write_script("f4", "at +1s send 9 x\nsleep 2s\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    mock_sim.now_ns = 1000000000LL;
+    shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "at #1") && strstr(sh.fail_reason, "f4_"), "failing at names itself and its script line (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* Exit verdict: exit while blocked fails; exit inside a script is a finish. */
+    mock_reset();
+    sh.interactive = true; sh.tty = true;
+    shell_enqueue_line(&sh, "expect 1 \"never\" 10s");
+    shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_EXPECT, "blocked on expect");
+    shell_enqueue_line(&sh, "!exit");
+    CHECK(sim_runtime_stop_requested(&mock_sim), "!exit requested the stop");
+    CHECK(shell_service_report(&sh, 0) == 1 && strstr(sh.fail_reason, "did not complete"), "exit while blocked fails the verdict (%s)", sh.fail_reason);
+    mock_reset();
+    p = write_script("f5", "echo hi\nexit\necho unreachable\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(shell_service_report(&sh, 0) == 0, "exit inside a script file passes (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* Deadlock: paused and blocked with nothing able to resume. */
+    mock_reset();
+    shell_enqueue_line(&sh, "sleep 1s");   /* tty false, interactive false */
+    shell_script_tick(&sh);
+    sim_control_pause(&mock_ctl);
+    shell_service_pump_paused(&sh, 0);
+    CHECK(sh.failed && strstr(sh.fail_reason, "deadlock"), "paused + blocked + no input = deadlock failure (%s)", sh.fail_reason);
+    mock_reset();
+    shell_enqueue_line(&sh, "sleep 1s");
+    shell_script_tick(&sh);
+    sh.external_resume = true;             /* e.g. the web UI is up */
+    sim_control_pause(&mock_ctl);
+    shell_service_pump_paused(&sh, 0);
+    CHECK(!sh.failed, "not a deadlock when something outside can resume");
+
+    /* --script alone: EOF waits for pending at entries, then ends the run. */
+    mock_reset();
+    sh.stop_when_done = true;
+    p = write_script("f6", "at 2s echo fired\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.finished && !sim_runtime_stop_requested(&mock_sim), "EOF with a pending at keeps running");
+    mock_sim.now_ns = 2000000000LL;
+    shell_script_tick(&sh);
+    CHECK(sh.atq_count == 0 && sim_runtime_stop_requested(&mock_sim), "run ends once the at fired");
+    unlink(p);
+    mock_reset();
+    sh.stop_when_done = true;
+    p = write_script("f7", "at 2s echo fired\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sim_runtime_stop_requested(&mock_sim), "pass ends at once despite pending at");
+    unlink(p);
+
+    /* External clock source: time commands are refused. */
+    static const sim_clock_source_t fake_clock;
+    mock_reset();
+    mock_sim.clock_source = &fake_clock;
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "pause");
+    shell_enqueue_line(&sh, "sleep 1s");
+    shell_enqueue_line(&sh, "at +1s echo x");
+    shell_script_tick(&sh);
+    CHECK(!sim_control_paused(&mock_ctl) && sh.block == SHELL_BLOCK_NONE && sh.atq_count == 0,
+          "pause/sleep/at refused under an external clock");
+    mock_sim.clock_source = NULL;
+
+    /* send keeps spacing; truncation is an error, not silent. */
+    mock_reset();
+    p = write_script("f8", "sendln 1 a  b   # comment\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(strcmp(mock_last_inject, "a  b\n") == 0, "sendln keeps inner spacing ('%s')", mock_last_inject);
+    unlink(p);
+    mock_reset();
+    mock_ops.inject_serial = m_inject_none;
+    sim_control_init(&mock_ctl, &mock_sim, &mock_ops);
+    char big[700] = "send 1 ";
+    memset(big + 7, 'x', 600); big[607] = '\0';
+    sh.interactive = true;
+    shell_enqueue_line(&sh, big);
+    shell_script_tick(&sh);
+    CHECK(sim_control_pending_len(&mock_ctl, 0) == SIM_CONTROL_PENDING_MAX, "pending buffer filled to its limit");
+    mock_ops.inject_serial = m_inject;
+
+    /* on trigger overflow is counted and reported, then reset. */
+    mock_reset();
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "on any \"hit\" echo got-it");
+    shell_script_tick(&sh);
+    for (int i = 0; i < SHELL_TRIGGER_MAX + 4; i++) emit_line(0, "hit");
+    CHECK(sh.trigger_count == SHELL_TRIGGER_MAX && sh.triggers_dropped == 4, "overflow counted (%d dropped)", sh.triggers_dropped);
+    shell_script_tick(&sh);
+    CHECK(sh.trigger_count == 0 && sh.triggers_dropped == 0, "reported and reset at the tick");
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -339,6 +507,8 @@ int run_shell_tests(int verbose) {
     test_time();
     test_selector();
     test_engine();
+    test_unquote_rest();
+    test_review_fixes();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }

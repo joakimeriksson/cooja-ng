@@ -27,6 +27,14 @@ extern "C" {
 int shell_tokenize(const char *line, char **argv, int *argpos, int max_args,
                    char *storage, size_t storage_len, char *err, size_t errlen);
 
+/* The text of a command's trailing argument, spacing preserved: quotes are
+ * stripped, escapes decoded (not inside '...'), an unquoted '#' at a word
+ * start ends the text, trailing unquoted whitespace is trimmed.  Used by
+ * send/sendln/echo so "a  b" keeps both spaces.  Returns the length (the
+ * text may contain NUL from \x00), or -1 with `err` filled. */
+int shell_unquote_rest(const char *rest, char *out, size_t outlen,
+                       char *err, size_t errlen);
+
 /* Time literal: "5s" "250ms" "1500us" "12345ns" "1.5s" "2m" "1h"; a bare
  * number is milliseconds; a leading '+' marks it relative (the caller adds
  * `now`).  Returns 0 and fills out_ns/relative, or -1. */

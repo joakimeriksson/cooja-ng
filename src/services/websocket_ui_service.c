@@ -36,7 +36,16 @@ static void ui_message_handler(const char *data, int len, void *userdata) {
     cJSON *root = cJSON_ParseWithLength(data, len);
     if (!root) return;
     cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
-    if (cmd && cJSON_IsString(cmd)) {
+    /* Under an external clock source (Renode) the master owns time: pause,
+     * play and speed would stall or desynchronise it, so they are ignored. */
+    bool clock_external = svc->rt && svc->rt->clock_source;
+    if (cmd && cJSON_IsString(cmd) && clock_external &&
+        (strcmp(cmd->valuestring, "speed") == 0 ||
+         strcmp(cmd->valuestring, "pause") == 0 ||
+         strcmp(cmd->valuestring, "play") == 0)) {
+        fprintf(stderr, "ui: '%s' ignored: an external clock source drives the simulation\n",
+                cmd->valuestring);
+    } else if (cmd && cJSON_IsString(cmd)) {
         if (strcmp(cmd->valuestring, "speed") == 0) {
             cJSON *val = cJSON_GetObjectItem(root, "value");
             if (val && cJSON_IsNumber(val)) {

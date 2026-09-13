@@ -64,9 +64,20 @@ static void pop_source(shell_service_t *s) {
     src->f = NULL;
 }
 
-static void root_finished(shell_service_t *s) {
+/* The root script is done.  With --script alone the run ends here — unless
+ * the script left `at`/`every` entries behind, which keep it running until
+ * they have fired (or the duration ends the run).  `pass`/`fail` force the
+ * end. */
+static void root_finished(shell_service_t *s, bool force) {
     s->finished = true;
-    if (s->stop_when_done) sim_control_request_exit(s->ctl);
+    if (!s->stop_when_done) return;
+    if (force || s->atq_count == 0) {
+        sim_control_request_exit(s->ctl);
+    } else if (!s->waiting_note) {
+        s->waiting_note = true;
+        shell_out(s, "script ended; running on for %d scheduled command(s)\n",
+                  s->atq_count);
+    }
 }
 
 void shell_script_abort(shell_service_t *s) {
@@ -82,15 +93,14 @@ void shell_script_fail(shell_service_t *s, const char *reason) {
     }
     shell_out(s, "SCRIPT FAILED: %s\n", reason);
     shell_script_abort(s);
-    s->finished = true;
-    if (s->stop_when_done) sim_control_request_exit(s->ctl);
+    root_finished(s, true);
 }
 
 void shell_script_pass(shell_service_t *s) {
     s->script_used = true;
     s->passed = true;
     shell_script_abort(s);
-    root_finished(s);
+    root_finished(s, true);
 }
 
 /* --- blocking ------------------------------------------------------------ */
@@ -129,6 +139,7 @@ int shell_script_at_add(shell_service_t *s, int64_t at_ns, int64_t period_ns,
     e->at_ns = at_ns;
     e->period_ns = period_ns;
     snprintf(e->cmd, sizeof(e->cmd), "%s", cmd);
+    e->origin = s->origin;
     shell_pin(s, at_ns);
     return e->id;
 }
@@ -181,6 +192,7 @@ int shell_script_watch_add(shell_service_t *s, shell_watch_kind_t kind,
     w->nids = nids < SIM_EQ_MAX_NODES ? nids : SIM_EQ_MAX_NODES;
     memcpy(w->ids, ids, (size_t)w->nids * sizeof(int));
     if (cmd) snprintf(w->cmd, sizeof(w->cmd), "%s", cmd);
+    w->origin = s->origin;
     return s->watch_count - 1;
 }
 
@@ -212,9 +224,15 @@ void shell_script_on_log_line(shell_service_t *s, int idx, int node_id,
             break;
         case SHELL_WATCH_RUN:
             if (s->trigger_count < SHELL_TRIGGER_MAX) {
-                snprintf(s->triggers[s->trigger_count++], SHELL_LINE_MAX, "%s",
-                         w->cmd);
+                shell_trigger_t *t = &s->triggers[s->trigger_count++];
+                snprintf(t->cmd, sizeof(t->cmd), "%s", w->cmd);
+                t->origin.kind = SHELL_ORIGIN_ON;
+                t->origin.script = w->origin.script;
+                snprintf(t->origin.where, sizeof(t->origin.where), "on \"%.40s\" (%.60s)",
+                         w->pattern, w->origin.where);
                 shell_pin(s, ns + 1000);
+            } else {
+                s->triggers_dropped++;
             }
             break;
         }
@@ -270,7 +288,8 @@ static void resolve_block(shell_service_t *s, int64_t now) {
     }
 }
 
-/* Next line for the stream: the top file, else the stdin queue. */
+/* Next line for the stream: the top file, else the stdin queue (read
+ * synchronously from a pipe when it is empty).  Sets s->origin. */
 static const char *next_line(shell_service_t *s, char *buf, size_t len) {
     while (s->depth > 0) {
         shell_source_t *src = &s->stack[s->depth - 1];
@@ -278,11 +297,22 @@ static const char *next_line(shell_service_t *s, char *buf, size_t len) {
             src->lineno++;
             size_t n = strlen(buf);
             while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+            const char *base = strrchr(src->path, '/');
+            s->origin.kind = SHELL_ORIGIN_FILE;
+            s->origin.script = true;
+            snprintf(s->origin.where, sizeof(s->origin.where), "%.100s:%d",
+                     base ? base + 1 : src->path, src->lineno);
             return buf;
         }
         pop_source(s);
-        if (s->depth == 0 && !s->finished) root_finished(s);
+        if (s->depth == 0 && !s->finished) root_finished(s, false);
     }
+    if (s->qcount == 0 && s->sync_stdin && !s->stdin_eof &&
+        !sim_runtime_stop_requested(s->sim))
+        shell_read_stdin_sync(s);
+    s->origin.kind = SHELL_ORIGIN_STDIN;
+    s->origin.script = false;
+    snprintf(s->origin.where, sizeof(s->origin.where), "stdin");
     return shell_dequeue_line(s, buf, len);
 }
 
@@ -294,14 +324,23 @@ void shell_script_tick(shell_service_t *s) {
     shell_at_entry_t e;
     int guard = 0;
     while (at_pop_due(s, now, &e) && guard++ < SHELL_ATQ_MAX * 4) {
+        shell_hold_output(s);
         if (s->verbose) shell_out(s, "at #%d> %s\n", e.id, e.cmd);
-        shell_exec_line(s, e.cmd, false);
+        shell_origin_t o = { .kind = SHELL_ORIGIN_AT, .script = e.origin.script };
+        snprintf(o.where, sizeof(o.where), "at #%d (%.100s)", e.id, e.origin.where);
+        shell_exec_line(s, e.cmd, false, &o);
     }
     for (int i = 0; i < s->trigger_count; i++) {
-        if (s->verbose) shell_out(s, "on> %s\n", s->triggers[i]);
-        shell_exec_line(s, s->triggers[i], false);
+        shell_hold_output(s);
+        if (s->verbose) shell_out(s, "on> %s\n", s->triggers[i].cmd);
+        shell_exec_line(s, s->triggers[i].cmd, false, &s->triggers[i].origin);
     }
     s->trigger_count = 0;
+    if (s->triggers_dropped) {
+        shell_out(s, "warning: %d `on` command(s) dropped: more than %d fired "
+                  "between two slices\n", s->triggers_dropped, SHELL_TRIGGER_MAX);
+        s->triggers_dropped = 0;
+    }
 
     if (s->pending_fail) {
         s->pending_fail = false;
@@ -321,8 +360,18 @@ void shell_script_tick(shell_service_t *s) {
          * comment-only lines are not echoed. */
         const char *first = l;
         while (*first == ' ' || *first == '\t') first++;
+        if (*first && *first != '#') shell_hold_output(s);
         if (s->verbose && (from_file || !s->tty) && *first && *first != '#')
             shell_out(s, "> %s\n", l);
-        shell_exec_line(s, l, false);
+        /* A pipe's "!" lines are queued in order; run them as plain lines. */
+        if (!from_file && *first == '!') first++;
+        shell_origin_t o = s->origin;
+        shell_exec_line(s, from_file ? l : first, false, &o);
     }
+
+    /* --script alone: a finished script that was waiting for its scheduled
+     * commands ends the run once they have all fired. */
+    if (s->finished && s->stop_when_done && s->atq_count == 0 &&
+        !sim_runtime_stop_requested(s->sim))
+        sim_control_request_exit(s->ctl);
 }
