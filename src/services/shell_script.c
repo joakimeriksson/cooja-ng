@@ -58,6 +58,7 @@ int shell_script_source(shell_service_t *s, const char *path) {
     src->send_idx = -1;
     src->send_id = -1;
     src->send_timeout_ns = 0;
+    src->nframes = 0;
     snprintf(src->path, sizeof(src->path), "%s", path);
     s->script_used = true;
     s->finished = false;
@@ -411,6 +412,8 @@ void shell_script_on_log_line(shell_service_t *s, int idx, int node_id,
             }
             break;
         case SHELL_WATCH_RUN:
+            if (w->dead) break;
+            if (w->once) w->dead = true;
             if (s->trigger_count < SHELL_TRIGGER_MAX) {
                 shell_trigger_t *t = &s->triggers[s->trigger_count++];
                 snprintf(t->cmd, sizeof(t->cmd), "%s", w->cmd);
@@ -641,6 +644,17 @@ static const char *next_line(shell_service_t *s, char *buf, size_t len) {
             s->line_send_timeout_ns = src->send_timeout_ns;
             return buf;
         }
+        if (src->nframes > 0) {
+            snprintf(s->origin.where, sizeof(s->origin.where), "%.100s:%d",
+                     strrchr(src->path, '/') ? strrchr(src->path, '/') + 1 : src->path,
+                     src->lineno);
+            s->origin.kind = SHELL_ORIGIN_FILE;
+            s->origin.script = true;
+            src->nframes = 0;
+            shell_error(s, "end of file inside a %s block (missing `end`)",
+                        src->frames[0].kind == 1 ? "repeat" : "if");
+            if (s->depth == 0) continue;     /* the error aborted every source */
+        }
         pop_source(s);
         if (s->depth == 0 && !s->finished) root_finished(s, false);
     }
@@ -680,6 +694,13 @@ void shell_script_tick(shell_service_t *s) {
         shell_exec_line(s, s->triggers[i].cmd, false, &s->triggers[i].origin);
     }
     s->trigger_count = 0;
+    for (int i = 0; i < s->watch_count; i++) {       /* drop fired --once watches */
+        if (!s->watches[i].dead) continue;
+        memmove(&s->watches[i], &s->watches[i + 1],
+                (size_t)(s->watch_count - i - 1) * sizeof(s->watches[0]));
+        s->watch_count--;
+        i--;
+    }
     if (s->triggers_dropped) {
         shell_out(s, "warning: %d `on` command(s) dropped: more than %d fired "
                   "between two slices\n", s->triggers_dropped, SHELL_TRIGGER_MAX);
@@ -733,6 +754,7 @@ void shell_script_tick(shell_service_t *s) {
         if (s->verbose && (from_file || !s->editor) && *first && *first != '#')
             shell_out(s, "> %s\n", l);
         /* A pipe's "!" lines are queued in order; run them as plain lines. */
+        if (!from_file && *first) shell_transcript_record(s, first);
         if (!from_file && *first == '!') first++;
         shell_origin_t o = s->origin;
         shell_exec_line(s, from_file ? l : first, false, &o);

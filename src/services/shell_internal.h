@@ -95,6 +95,12 @@ void shell_script_on_uart_byte(shell_service_t *s, int idx, uint8_t byte,
 /* `console`: switch the terminal to talking to one node. */
 int  shell_console_enter(shell_service_t *s, int idx, int node_id);
 
+/* Append a typed/piped command line to the transcript, if one is open. */
+void shell_transcript_record(shell_service_t *s, const char *line);
+/* Condition shared by assert and if (argv[0] is the keyword). */
+int  shell_eval_condition(shell_service_t *s, int argc, char **argv,
+                          bool *result, const char **why);
+
 /* Variables. */
 const char *shell_var_get(void *s, const char *name);   /* shell_var_lookup_fn */
 int  shell_var_set(shell_service_t *s, const char *name, const char *value);

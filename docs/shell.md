@@ -64,7 +64,7 @@ Times: `5s`, `250ms`, `1500us`, `1.5s`, `2m`; a bare number is milliseconds;
 | `pause` | stop dispatching events (services and input keep running) |
 | `step [N\|duration]` | run exactly N events (default 1) or a duration, then pause |
 | `speed [ratio\|max\|realtime]` | wall-clock pacing; no argument prints it |
-| `status`, `time`, `nodes` | state summary; simulation time; the node table |
+| `status`, `time`, `nodes`, `stats` | state summary; simulation time; the node table; RF/console counters and per-node cycles and instructions |
 | `exit`, `quit` | end the run: normal teardown, test reports, `--save-config` |
 
 **Nodes**
@@ -113,6 +113,15 @@ retried automatically, up to 512 queued bytes per node — beyond that `send`
 reports an error).  A line reaching `max-line` bytes (default 128, Contiki-NG's
 serial-line buffer) prints a warning, since the node would truncate it;
 `set max-line 0` silences it.
+
+**History and watches**
+
+| command | |
+|---|---|
+| `tail [-n N] [nodes]` | the last N (default 20) console lines, from the 2000 the shell remembers |
+| `grep [-re] [-c] "<pattern>" [nodes]` | remembered console lines matching a substring or regex; `-c` prints only the count |
+| `on list`, `on clear <n>\|all` | list and remove `on` / `fail-on` / `count` watches |
+| `transcript <file>\|off`, `history save <file>` | append every command line you type or pipe to a file (replayable with `--script`); save the terminal's line-editing history |
 
 **Variables**
 
@@ -163,7 +172,9 @@ scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 | `pass`, `fail [message]` | end the script with a verdict |
 | `fail-on "<pattern>" [nodes\|any]` | fail as soon as a console line contains the pattern |
 | `count "<pattern>" [nodes\|any]` | count matching lines from now on, for `assert count` |
-| `on <nodes\|any> "<pattern>" <command...>` | run a command whenever a line matches (e.g. `on any "SecureFault" fail "unexpected fault"`) |
+| `on [--once] <nodes\|any> "<pattern>" <command...>` | run a command whenever (with `--once`: the first time) a line matches (e.g. `on any "SecureFault" fail "unexpected fault"`) |
+| `repeat <count> [var]` … `end` | run the lines up to `end` count times; `$var` counts 1..count |
+| `if <condition>` … [`else` …] `end` | conditions as for `assert`: `time`, `nodes`, `node`, `count`, `mem`, `var` |
 | `set [expect-timeout <duration> \| max-line <bytes> \| prompt "<glob>"]`, `echo <text...>`, `save-config <file.yaml>`, `help [command]` | `save-config` records the time run so far as `timeout_ms` |
 
 **Inspecting a node** (ARM nodes; the debugger's view)
@@ -274,6 +285,18 @@ Simulated time advances only through blocking commands (`run`, `sleep`,
 in order like any other line; a driver process that writes commands over
 time should use `run <duration>` / `sleep` to move the simulation between
 them.
+
+`repeat`, `if`, `else` and `end` work in script files (not at the prompt) and
+nest up to 8 deep; blocking commands inside a loop resume the loop:
+
+```
+repeat 5 i
+  cmd -c rtt "time=([0-9]+)" 2 ping $addr
+  if var rtt > 100
+    echo slow round trip $i: $rtt ms
+  end
+end
+```
 
 Example, `test/scripts/shell-nrf54l15.cnsh`:
 

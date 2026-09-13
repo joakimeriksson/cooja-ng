@@ -51,8 +51,19 @@ typedef struct sim_control_node_info {
     bool        removed;
     int64_t     sim_time_ns;  /* the mote's own clock                       */
     int64_t     cycles;
+    int64_t     instructions;
+    double      clock_deviation;  /* 1.0 = exact                          */
     uint32_t    freq_hz;
 } sim_control_node_info_t;
+
+/* Simulation-wide counters for `stats`. */
+typedef struct sim_control_stats {
+    long rf_bytes;           /* bytes put on the air                         */
+    long uart_bytes;         /* console bytes from all motes                 */
+    long frames;             /* frames sent                                  */
+    long frames_collided;    /* frames lost to collisions                    */
+    long rx_dropped;         /* received bytes a radio could not take        */
+} sim_control_stats_t;
 
 /* Runner-populated primitives.  Each wraps ONE runner static; none of them
  * carries policy.  `user` is passed back verbatim.  A NULL member means the
@@ -91,6 +102,8 @@ typedef struct sim_control_ops {
     void *(*get_interface)(void *u, int idx, int iface);
     /* Write the LIVE configuration (the --save-config writer).  0 on ok. */
     int   (*save_config)(void *u, const char *path);
+    /* Simulation-wide counters (NULL = unavailable). */
+    void  (*stats)(void *u, sim_control_stats_t *out);
 } sim_control_ops_t;
 
 /* Flags for the mutation calls. */

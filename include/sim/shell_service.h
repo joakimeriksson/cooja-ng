@@ -50,6 +50,9 @@ extern "C" {
 #define SHELL_REASON_MAX    512
 #define SHELL_VARS_MAX      32
 #define SHELL_VAR_NAME_MAX  32
+#define SHELL_FRAMES_MAX    8
+#define SHELL_HISTORY_LINES 2000
+#define SHELL_HISTORY_LEN   200
 
 /* Where a command line came from.  Errors fail the script only for lines
  * a script owns: FILE lines, and at/every/on commands a script file
@@ -75,7 +78,22 @@ typedef struct shell_source {
      * a shell command.  send_idx < 0 for a script. */
     int     send_idx, send_id;
     int64_t send_timeout_ns;
+    /* repeat / if blocks open in this file. */
+    struct {
+        int  kind;                  /* 1 = repeat, 2 = if                  */
+        long pos;                   /* repeat: file offset of the body      */
+        int  lineno;                /* repeat: line number before the body  */
+        long count, total;          /* repeat: current pass, passes         */
+        char var[SHELL_VAR_NAME_MAX];
+    } frames[SHELL_FRAMES_MAX];
+    int     nframes;
 } shell_source_t;
+
+typedef struct shell_hline {        /* one remembered console line */
+    int     node_id;
+    int64_t ns;
+    char    text[SHELL_HISTORY_LEN];
+} shell_hline_t;
 
 typedef struct shell_var {
     char name[SHELL_VAR_NAME_MAX];
@@ -122,6 +140,8 @@ typedef struct shell_watch {
     int     count;
     char    cmd[SHELL_LINE_MAX];
     shell_origin_t origin; /* where the `on`/`fail-on`/`count` line was typed */
+    bool    once;          /* `on --once`: removed after it fires            */
+    bool    dead;          /* fired once; compacted at the next tick         */
 } shell_watch_t;
 
 typedef struct shell_trigger {
@@ -276,6 +296,14 @@ typedef struct shell_service {
     bool     line_is_send;
     int      line_send_idx, line_send_id;
     int64_t  line_send_timeout_ns;
+
+    /* Console history for tail/grep: a ring of the last lines (heap). */
+    shell_hline_t *hist;
+    int      hist_head, hist_count;
+
+    /* `transcript <file>`: every command line typed or piped is appended. */
+    FILE    *transcript;
+    char     transcript_path[SHELL_PATH_MAX];
 
     /* Variables ($name). */
     shell_var_t vars[SHELL_VARS_MAX];

@@ -1101,8 +1101,13 @@ static int cmd_wait_until(shell_service_t *s, int argc, char **argv, const char 
     return 0;
 }
 
-static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)line; (void)argpos;
+/* A condition shared by `assert` and `if`: argv[1..] is "time <op> <t>",
+ * "mem ...", etc.  Returns -1 after printing a usage/lookup error; else 0
+ * with *result set and, when false, cond_desc describing why. */
+static char cond_desc[SHELL_REASON_MAX];
+static int eval_condition(shell_service_t *s, int argc, char **argv, bool *result) {
+    *result = true;
+    cond_desc[0] = '\0';
     const char *what = argv[1];
     if (strcmp(what, "mem") == 0 && argc == 6) {
         sim_control_node_info_t info;
@@ -1119,7 +1124,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         else if (!strcmp(argv[4], "!=")) r = v != (uint32_t)want;
         else r = shell_compare((long)v, argv[4], (long)(uint32_t)want);
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[4]); return -1; }
-        if (!r) { shell_error(s, "assertion failed: mem %s 0x%08x (= 0x%08x) %s %s", argv[2], addr, v, argv[4], argv[5]); return -1; }
+        if (!r) { snprintf(cond_desc, sizeof(cond_desc), "mem %s 0x%08x (= 0x%08x) %s %s", argv[2], addr, v, argv[4], argv[5]); *result = false; return 0; }
         return 0;
     }
     if (strcmp(what, "var") == 0 && argc == 5) {
@@ -1132,7 +1137,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         else if (!strcmp(argv[3], "!=")) r = strcmp(v, argv[4]) != 0;
         else { shell_error(s, "assert var: '%s' needs numbers", argv[3]); return -1; }
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[3]); return -1; }
-        if (!r) { shell_error(s, "assertion failed: %s (\"%s\") %s %s", argv[2], v, argv[3], argv[4]); return -1; }
+        if (!r) { snprintf(cond_desc, sizeof(cond_desc), "%s (\"%s\") %s %s", argv[2], v, argv[3], argv[4]); *result = false; return 0; }
         return 0;
     }
     if (strcmp(what, "time") == 0 && argc == 4) {
@@ -1140,7 +1145,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         if (parse_dur(s, argv[3], &t) != 0) return -1;
         int r = shell_compare((long)(now_ns(s) / 1000), argv[2], (long)(t / 1000));
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[2]); return -1; }
-        if (!r) { shell_assert_failed(s, "assertion failed: time (%.6f s) %s %s", (double)now_ns(s) / 1e9, argv[2], argv[3]); return -1; }
+        if (!r) { snprintf(cond_desc, sizeof(cond_desc), "time (%.6f s) %s %s", (double)now_ns(s) / 1e9, argv[2], argv[3]); *result = false; return 0; }
         return 0;
     }
     if (strcmp(what, "nodes") == 0 && argc == 4) {
@@ -1150,7 +1155,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         for (int i = 0; i < n; i++) if (sim_control_node_active(s->ctl, i)) active++;
         int r = shell_compare(active, argv[2], v);
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[2]); return -1; }
-        if (!r) { shell_assert_failed(s, "assertion failed: nodes (%d active) %s %ld", active, argv[2], v); return -1; }
+        if (!r) { snprintf(cond_desc, sizeof(cond_desc), "nodes (%d active) %s %ld", active, argv[2], v); *result = false; return 0; }
         return 0;
     }
     if (strcmp(what, "node") == 0 && argc == 4) {
@@ -1170,7 +1175,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
             ok = arm_cpu_is_secure(cpu) == (argv[3][0] == 's');
         }
         else { shell_error(s, "assert node: expected active|removed|exists|secure|non-secure"); return -1; }
-        if (!ok) { shell_assert_failed(s, "assertion failed: node %ld %s", id, argv[3]); return -1; }
+        if (!ok) { snprintf(cond_desc, sizeof(cond_desc), "node %ld %s", id, argv[3]); *result = false; return 0; }
         return 0;
     }
     if (strcmp(what, "count") == 0 && argc == 5) {
@@ -1183,11 +1188,281 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         if (!w) { shell_error(s, "assert count: no `count \"%s\"` watch", argv[2]); return -1; }
         int r = shell_compare(w->count, argv[3], v);
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[3]); return -1; }
-        if (!r) { shell_assert_failed(s, "assertion failed: count \"%s\" (%d) %s %ld", argv[2], w->count, argv[3], v); return -1; }
+        if (!r) { snprintf(cond_desc, sizeof(cond_desc), "count \"%s\" (%d) %s %ld", argv[2], w->count, argv[3], v); *result = false; return 0; }
         return 0;
     }
-    shell_error(s, "usage: assert time <op> <t> | nodes <op> N | node <id> active|removed|exists|secure|non-secure | count \"pat\" <op> N");
+    shell_error(s, "usage: %s time <op> <t> | nodes <op> N | node <id> active|removed|exists|secure|non-secure | count \"pat\" <op> N | mem <node> <addr> <op> <word> | var <name> <op> <value>", argv[0]);
     return -1;
+}
+
+int shell_eval_condition(shell_service_t *s, int argc, char **argv,
+                         bool *result, const char **why) {
+    int rc = eval_condition(s, argc, argv, result);
+    if (why) *why = cond_desc;
+    return rc;
+}
+
+/* --- script control flow: repeat / if / else / end ---------------------- */
+
+static shell_source_t *script_source(shell_service_t *s, const char *what) {
+    if (s->origin.kind != SHELL_ORIGIN_FILE || s->depth == 0 ||
+        s->stack[s->depth - 1].send_idx >= 0) {
+        shell_error(s, "%s is only available in script files", what);
+        return NULL;
+    }
+    return &s->stack[s->depth - 1];
+}
+
+/* Skip lines of `src` to the `else` (when stop_at_else) or `end` matching
+ * the block just entered.  Returns 1 at `else`, 0 at `end`, -1 at EOF. */
+static int skip_block(shell_service_t *s, shell_source_t *src, bool stop_at_else) {
+    char buf[SHELL_LINE_MAX], storage[SHELL_LINE_MAX];
+    int depth = 0;
+    while (fgets(buf, sizeof(buf), src->f)) {
+        src->lineno++;
+        char *argv[4];
+        int argc = shell_tokenize(buf, argv, NULL, 4, storage, sizeof(storage), NULL, 0);
+        if (argc < 0) {                      /* >3 words, or a bad line: first word only */
+            char *p = buf;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t n = strcspn(p, " \t\r\n");
+            if (n == 0 || n >= sizeof(storage)) continue;
+            memcpy(storage, p, n); storage[n] = '\0';
+            argv[0] = storage; argc = 1;
+        }
+        if (argc == 0) continue;
+        if (!strcmp(argv[0], "repeat") || !strcmp(argv[0], "if")) depth++;
+        else if (!strcmp(argv[0], "end")) { if (depth-- == 0) return 0; }
+        else if (!strcmp(argv[0], "else") && depth == 0 && stop_at_else) return 1;
+    }
+    shell_error(s, "end of file inside a block (missing `end`)");
+    return -1;
+}
+
+static int push_frame(shell_service_t *s, shell_source_t *src, int kind) {
+    if (src->nframes >= SHELL_FRAMES_MAX) {
+        shell_error(s, "blocks nested too deep (max %d)", SHELL_FRAMES_MAX);
+        return -1;
+    }
+    memset(&src->frames[src->nframes], 0, sizeof(src->frames[0]));
+    src->frames[src->nframes].kind = kind;
+    return src->nframes++;
+}
+
+/* repeat <count> [var] ... end */
+static int cmd_repeat(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    shell_source_t *src = script_source(s, "repeat");
+    if (!src) return -1;
+    long n;
+    if (shell_parse_int(argv[1], &n) != 0 || n < 0) { shell_error(s, "repeat: expected a count >= 0, got '%s'", argv[1]); return -1; }
+    if (argc == 3 && !shell_var_name_ok(argv[2])) { shell_error(s, "repeat: bad variable name '%s'", argv[2]); return -1; }
+    if (n == 0) return skip_block(s, src, false) < 0 ? -1 : 0;
+    int f = push_frame(s, src, 1);
+    if (f < 0) return -1;
+    src->frames[f].pos = ftell(src->f);
+    src->frames[f].lineno = src->lineno;
+    src->frames[f].count = 1;
+    src->frames[f].total = n;
+    if (argc == 3) {
+        snprintf(src->frames[f].var, sizeof(src->frames[f].var), "%s", argv[2]);
+        if (shell_var_set(s, argv[2], "1") != 0) { shell_error(s, "too many variables"); return -1; }
+    }
+    return 0;
+}
+
+/* if <condition> ... [else ...] end — conditions as for assert. */
+static int cmd_if(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    shell_source_t *src = script_source(s, "if");
+    if (!src) return -1;
+    bool ok;
+    if (eval_condition(s, argc, argv, &ok) != 0) return -1;
+    if (ok) return push_frame(s, src, 2) < 0 ? -1 : 0;
+    int r = skip_block(s, src, true);
+    if (r < 0) return -1;
+    if (r == 1) return push_frame(s, src, 2) < 0 ? -1 : 0;   /* in the else branch */
+    return 0;
+}
+
+static int cmd_else(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)argv; (void)line; (void)argpos;
+    shell_source_t *src = script_source(s, "else");
+    if (!src) return -1;
+    if (src->nframes == 0 || src->frames[src->nframes - 1].kind != 2) {
+        shell_error(s, "else without if"); return -1;
+    }
+    /* Reached at the end of the taken branch: skip the other one. */
+    src->nframes--;
+    return skip_block(s, src, false) < 0 ? -1 : 0;
+}
+
+static int cmd_end(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)argv; (void)line; (void)argpos;
+    shell_source_t *src = script_source(s, "end");
+    if (!src) return -1;
+    if (src->nframes == 0) { shell_error(s, "end without repeat or if"); return -1; }
+    int f = src->nframes - 1;
+    if (src->frames[f].kind == 1 && src->frames[f].count < src->frames[f].total) {
+        src->frames[f].count++;
+        if (src->frames[f].var[0]) {
+            char num[24];
+            snprintf(num, sizeof(num), "%ld", src->frames[f].count);
+            shell_var_set(s, src->frames[f].var, num);
+        }
+        fseek(src->f, src->frames[f].pos, SEEK_SET);
+        src->lineno = src->frames[f].lineno;
+        return 0;
+    }
+    src->nframes--;
+    return 0;
+}
+
+/* --- console history, watches, transcript, stats -------------------------- */
+
+static bool id_in_list(const int *ids, int n, int id) {
+    for (int i = 0; i < n; i++) if (ids[i] == id) return true;
+    return false;
+}
+
+/* tail [-n N] [nodes] */
+static int cmd_tail(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    long want = 20;
+    int i = 1;
+    if (argc >= 3 && !strcmp(argv[1], "-n")) {
+        if (shell_parse_int(argv[2], &want) != 0 || want < 1) { shell_error(s, "tail: -n needs a count >= 1"); return -1; }
+        i = 3;
+    }
+    if (argc - i > 1) { shell_error(s, "usage: tail [-n N] [nodes]"); return -1; }
+    int ids[SIM_EQ_MAX_NODES], n = -1;
+    if (argc - i == 1 && (n = shell_resolve_selector(s, argv[i], ids, SIM_EQ_MAX_NODES, false, NULL)) < 0) return -1;
+    if (!s->hist) return 0;
+    int found = 0, start = 0;
+    for (int k = s->hist_count - 1; k >= 0 && found < want; k--) {
+        const shell_hline_t *h = &s->hist[(s->hist_head + k) % SHELL_HISTORY_LINES];
+        if (n < 0 || id_in_list(ids, n, h->node_id)) { found++; start = k; }
+    }
+    for (int k = start; found > 0 && k < s->hist_count; k++) {
+        const shell_hline_t *h = &s->hist[(s->hist_head + k) % SHELL_HISTORY_LINES];
+        if (n >= 0 && !id_in_list(ids, n, h->node_id)) continue;
+        shell_out(s, "  %7.3f [Node %d] %s\n", (double)h->ns / 1e9, h->node_id, h->text);
+    }
+    return 0;
+}
+
+/* grep [-re] [-c] "<pattern>" [nodes] */
+static int cmd_grep(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    bool use_re = false, count_only = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "-re")) use_re = true;
+        else if (!strcmp(argv[i], "-c")) count_only = true;
+        else { shell_error(s, "grep: unknown option '%s'", argv[i]); return -1; }
+    }
+    if (argc - i < 1 || argc - i > 2) { shell_error(s, "usage: grep [-re] [-c] \"<pattern>\" [nodes]"); return -1; }
+    int ids[SIM_EQ_MAX_NODES], n = -1;
+    if (argc - i == 2 && (n = shell_resolve_selector(s, argv[i + 1], ids, SIM_EQ_MAX_NODES, false, NULL)) < 0) return -1;
+    void *re = NULL;
+    if (use_re) {
+        char err[160];
+        if (!(re = shell_regex_compile(argv[i], err, sizeof(err)))) { shell_error(s, "%s", err); return -1; }
+    }
+    int hits = 0;
+    for (int k = 0; s->hist && k < s->hist_count; k++) {
+        const shell_hline_t *h = &s->hist[(s->hist_head + k) % SHELL_HISTORY_LINES];
+        if (n >= 0 && !id_in_list(ids, n, h->node_id)) continue;
+        if (!shell_line_match(h->text, argv[i], re, NULL, 0)) continue;
+        hits++;
+        if (!count_only)
+            shell_out(s, "  %7.3f [Node %d] %s\n", (double)h->ns / 1e9, h->node_id, h->text);
+    }
+    shell_regex_free(&re);
+    if (count_only) shell_out(s, "%d\n", hits);
+    return 0;
+}
+
+static int cmd_on_list(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)argv; (void)line; (void)argpos;
+    if (s->watch_count == 0) { shell_out(s, "no watches\n"); return 0; }
+    for (int i = 0; i < s->watch_count; i++) {
+        const shell_watch_t *w = &s->watches[i];
+        char nodes[128] = "any";
+        if (!w->any) {
+            nodes[0] = '\0';
+            for (int k = 0; k < w->nids; k++)
+                snprintf(nodes + strlen(nodes), sizeof(nodes) - strlen(nodes), "%s%d", k ? "," : "", w->ids[k]);
+        }
+        const char *kind = w->kind == SHELL_WATCH_COUNT ? "count" : w->kind == SHELL_WATCH_FAIL ? "fail-on" : w->once ? "on --once" : "on";
+        shell_out(s, "  #%d %-9s %-8s \"%s\"%s%s  (%d matches)\n", i + 1, kind, nodes, w->pattern,
+                  w->kind == SHELL_WATCH_RUN ? " -> " : "", w->kind == SHELL_WATCH_RUN ? w->cmd : "", w->count);
+    }
+    return 0;
+}
+
+static int cmd_on_clear(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)line; (void)argpos;
+    if (!strcmp(argv[1], "all")) { s->watch_count = 0; return 0; }
+    long n;
+    if (shell_parse_int(argv[1], &n) != 0 || n < 1 || n > s->watch_count) {
+        shell_error(s, "on clear: no watch #%s (see on list)", argv[1]); return -1;
+    }
+    memmove(&s->watches[n - 1], &s->watches[n], (size_t)(s->watch_count - n) * sizeof(s->watches[0]));
+    s->watch_count--;
+    return 0;
+}
+
+static int cmd_transcript(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    if (argc == 1) {
+        shell_out(s, s->transcript ? "transcript: %s\n" : "transcript: off\n", s->transcript_path);
+        return 0;
+    }
+    if (s->transcript) { fclose(s->transcript); s->transcript = NULL; }
+    if (!strcmp(argv[1], "off")) return 0;
+    FILE *f = fopen(argv[1], "a");
+    if (!f) { shell_error(s, "transcript: cannot open %s", argv[1]); return -1; }
+    fprintf(f, "# transcript started at simulated time %.3f s\n", (double)now_ns(s) / 1e9);
+    fflush(f);
+    s->transcript = f;
+    snprintf(s->transcript_path, sizeof(s->transcript_path), "%s", argv[1]);
+    return 0;
+}
+
+static int cmd_history(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    if (argc != 3 || strcmp(argv[1], "save") != 0) { shell_error(s, "usage: history save <file>"); return -1; }
+    if (!s->editor) { shell_error(s, "history: no line-editing history without a terminal"); return -1; }
+    if (linenoiseHistorySave(argv[2]) != 0) { shell_error(s, "history: cannot write %s", argv[2]); return -1; }
+    return 0;
+}
+
+static int cmd_stats(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)argv; (void)line; (void)argpos;
+    if (s->ctl->ops.stats) {
+        sim_control_stats_t st = {0};
+        s->ctl->ops.stats(s->ctl->ops.user, &st);
+        shell_out(s, "  time %.3f s  rf bytes %ld  frames %ld  collided %ld  rx dropped %ld  console bytes %ld\n",
+                  (double)now_ns(s) / 1e9, st.rf_bytes, st.frames, st.frames_collided, st.rx_dropped, st.uart_bytes);
+    }
+    int nn = sim_control_node_count(s->ctl);
+    for (int i = 0; i < nn; i++) {
+        sim_control_node_info_t info;
+        if (!sim_control_describe(s->ctl, i, &info)) continue;
+        shell_out(s, "  node %-4d %-7s %14lld cycles %14lld instructions  %.1f MHz%s\n", info.id,
+                  info.type ? info.type : "?", (long long)info.cycles, (long long)info.instructions,
+                  info.freq_hz / 1e6, info.removed ? "  (removed)" : "");
+    }
+    return 0;
+}
+
+static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    bool ok;
+    if (eval_condition(s, argc, argv, &ok) != 0) return -1;
+    if (!ok) { shell_assert_failed(s, "assertion failed: %s", cond_desc); return -1; }
+    return 0;
 }
 
 static int cmd_pass(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
@@ -1265,10 +1540,24 @@ static int cmd_count(shell_service_t *s, int argc, char **argv, const char *line
 }
 
 static int cmd_on(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)argc;
-    const char *cmd = line + argpos[3];
+    /* `on list` / `on clear` manage every console-line watch: on, fail-on, count. */
+    if (!strcmp(argv[1], "list")) {
+        if (argc != 2) { shell_error(s, "usage: on list"); return -1; }
+        return cmd_on_list(s, 1, argv + 1, line, argpos);
+    }
+    if (!strcmp(argv[1], "clear")) {
+        if (argc != 3) { shell_error(s, "usage: on clear <n>|all"); return -1; }
+        return cmd_on_clear(s, 2, argv + 1, line, argpos);
+    }
+    bool once = !strcmp(argv[1], "--once");
+    int a = once ? 2 : 1;
+    if (argc < a + 3) { shell_error(s, "usage: on [--once] <nodes|any> \"<pattern>\" <command...>"); return -1; }
+    const char *cmd = line + argpos[a + 2];
     if (check_command_text(s, "on", cmd) != 0) return -1;
-    return add_watch(s, SHELL_WATCH_RUN, argv[1], argv[2], cmd);
+    int before = s->watch_count;
+    if (add_watch(s, SHELL_WATCH_RUN, argv[a], argv[a + 1], cmd) != 0) return -1;
+    if (s->watch_count > before) s->watches[s->watch_count - 1].once = once;
+    return 0;
 }
 
 /* --- misc ------------------------------------------------------------------ */
@@ -1309,6 +1598,15 @@ static const shell_command_t commands[] = {
     { "time",       "time",                            "print the simulation time", 0, 0, IMM, cmd_time },
     { "exit",       "exit",                            "end the run (normal teardown, reports, --save-config)", 0, 0, IMM, cmd_exit },
     { "quit",       "quit",                            "same as exit", 0, 0, IMM, cmd_exit },
+    { "stats",      "stats",                           "RF bytes, frames, collisions, console bytes; per-node cycles and instructions", 0, 0, IMM, cmd_stats },
+    { "tail",       "tail [-n N] [nodes]",             "the last N console lines (default 20) from the remembered 2000", 0, 3, IMM, cmd_tail },
+    { "grep",       "grep [-re] [-c] \"<pattern>\" [nodes]", "remembered console lines matching a pattern (-c: just count)", 1, 4, IMM, cmd_grep },
+    { "transcript", "transcript [<file>|off]",         "append every command line you type or pipe to a file, to replay as a script", 0, 1, IMM, cmd_transcript },
+    { "history",    "history save <file>",             "save the line-editing history (terminal only)", 2, 2, IMM, cmd_history },
+    { "repeat",     "repeat <count> [var] ... end",    "scripts: run the lines up to `end` count times; $var counts 1..count", 1, 2, 0, cmd_repeat },
+    { "if",         "if <condition> ... [else ...] end", "scripts: conditions as for assert (time, nodes, node, count, mem, var)", 3, 5, 0, cmd_if },
+    { "else",       "else",                            "scripts: see if", 0, 0, 0, cmd_else },
+    { "end",        "end",                             "scripts: closes repeat / if", 0, 0, 0, cmd_end },
     { "nodes",      "nodes",                           "list nodes: id, kind, state, position, time, firmware", 0, 0, IMM, cmd_nodes },
     { "add",        "add <firmware|type> [id] [x y]",  "add a node (config mote-type name or firmware path); id defaults to max+1", 1, 4, 0, cmd_add },
     { "remove",     "remove <nodes>",                  "stop nodes for good (start gate closed; reboot revives)", 1, 1, 0, cmd_remove },
@@ -1343,7 +1641,7 @@ static const shell_command_t commands[] = {
     { "fail",       "fail [message...]",               "end the script with a FAIL verdict (non-zero exit code)", 0, -1, 0, cmd_fail },
     { "fail-on",    "fail-on \"<pattern>\" [nodes|any]", "fail the script as soon as a console line contains pattern", 1, 2, 0, cmd_fail_on },
     { "count",      "count \"<pattern>\" [nodes|any]", "count console lines containing pattern (see assert count)", 1, 2, 0, cmd_count },
-    { "on",         "on <nodes|any> \"<pattern>\" <command...>", "run a command whenever a console line contains pattern", 3, -1, 0, cmd_on },
+    { "on",         "on [--once] <nodes|any> \"<pattern>\" <command...> | on list | on clear <n>|all", "run a command whenever (or the first time) a console line contains pattern; list or remove on / fail-on / count watches", 1, -1, IMM, cmd_on },
     { "set",        "set [expect-timeout <dur> | max-line <bytes> | prompt \"<glob>\"]", "settings; defaults: expect-timeout 30s, max-line 128, prompt \"#*> \"", 0, 2, IMM, cmd_set },
     { "echo",       "echo <text...>",                  "print text", 0, -1, IMM, cmd_echo },
     { "save-config","save-config <file.yaml>",         "write the live setup (positions, nodes, seed) as a config", 1, 1, IMM, cmd_save_config },

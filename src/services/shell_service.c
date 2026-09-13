@@ -148,6 +148,14 @@ static void shell_error_code(shell_service_t *s, int code, const char *msg) {
 static void console_line(shell_service_t *s, int idx, int node_id,
                          const char *line, int64_t ns) {
     if (idx < 0 || idx >= SIM_EQ_MAX_NODES) return;
+    if (s->hist) {
+        int slot = (s->hist_head + s->hist_count) % SHELL_HISTORY_LINES;
+        if (s->hist_count < SHELL_HISTORY_LINES) s->hist_count++;
+        else s->hist_head = (s->hist_head + 1) % SHELL_HISTORY_LINES;
+        s->hist[slot].node_id = node_id;
+        s->hist[slot].ns = ns;
+        snprintf(s->hist[slot].text, sizeof(s->hist[slot].text), "%s", line);
+    }
     const char *type = "?";
     sim_control_node_info_t info;
     if (sim_control_describe(s->ctl, idx, &info) && info.type) type = info.type;
@@ -400,6 +408,7 @@ void shell_enqueue_line(shell_service_t *s, const char *line) {
      * pipe is sequential (sync_stdin): its "!" lines queue in order and
      * run like any other line. */
     if (line[0] == '!' && !s->sync_stdin) {
+        shell_transcript_record(s, line);
         shell_origin_t o = { .kind = SHELL_ORIGIN_STDIN, .script = false, .where = "stdin" };
         shell_exec_line(s, line + 1, true, &o);
         return;
@@ -675,6 +684,15 @@ static void shell_on_event(sim_runtime_t *sim, void *state,
                              ev->u.log_line.line, ev->time_ns);
 }
 
+void shell_transcript_record(shell_service_t *s, const char *line) {
+    if (!s->transcript) return;
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p || !strncmp(p, "transcript", 10)) return;
+    fprintf(s->transcript, "%s\n", line);
+    fflush(s->transcript);
+}
+
 static void close_logfiles(shell_service_t *s) {
     for (int i = 0; i < s->logfile_count; i++) {
         if (s->logfiles[i].f) { fclose(s->logfiles[i].f); s->logfiles[i].f = NULL; }
@@ -691,6 +709,9 @@ static void shell_destroy(sim_runtime_t *sim, void *state) {
     edit_end(s);
     if (s->history_path[0]) linenoiseHistorySave(s->history_path);
     close_logfiles(s);
+    if (s->transcript) { fclose(s->transcript); s->transcript = NULL; }
+    free(s->hist);
+    s->hist = NULL;
     shell_script_abort(s);
     install_signals(false);
     s->active = false;
@@ -728,6 +749,7 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
     s->next_at_id = 1;
     s->default_expect_timeout_ns = 30LL * 1000 * SHELL_MS_TO_NS;
     s->max_line = 128;   /* Contiki-NG SERIAL_LINE_CONF_BUFSIZE default */
+    s->hist = calloc(SHELL_HISTORY_LINES, sizeof(*s->hist));
     snprintf(s->prompt_glob, sizeof(s->prompt_glob), "#*> ");  /* Contiki-NG */
     s->stop_when_done = !interactive;
     memset(s->console_mask, verbose ? 1 : 0, sizeof(s->console_mask));

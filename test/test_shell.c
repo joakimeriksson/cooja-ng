@@ -916,6 +916,110 @@ static void test_arm_inspection(void) {
           !shell_line_blocks("mem 1 0x0"), "blocking classification");
 }
 
+static void test_workflow(void) {
+    const char *p;
+
+    /* repeat / if / else / end, nested, with a loop variable. */
+    mock_reset();
+    p = write_script("w1",
+        "var acc x\n"
+        "repeat 3 i\n"
+        "  if var i == 2\n"
+        "    var acc ${acc}T\n"
+        "  else\n"
+        "    repeat 2\n"
+        "      var acc ${acc}e\n"
+        "    end\n"
+        "  end\n"
+        "end\n"
+        "repeat 0\n"
+        "  fail \"repeat 0 ran\"\n"
+        "end\n"
+        "if nodes == 99\n"
+        "  fail \"false if ran\"\n"
+        "end\n"
+        "assert var acc == xeeTee\n"
+        "assert var i == 3\n"
+        "pass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.passed && !sh.failed, "nested repeat/if/else (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* A blocking command inside a loop resumes the loop. */
+    mock_reset();
+    p = write_script("w2", "repeat 2 k\n  sleep 1s\nend\nassert var k == 2\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_SLEEP, "first sleep");
+    advance(1000000000LL); shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_SLEEP, "second sleep after looping back");
+    advance(1000000000LL); shell_script_tick(&sh);
+    CHECK(sh.passed && !sh.failed, "loop with blocking body (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* Structure errors. */
+    mock_reset();
+    p = write_script("w3", "repeat 2\necho x\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "missing `end`"), "missing end (%s)", sh.fail_reason);
+    unlink(p);
+    mock_reset();
+    p = write_script("w4", "else\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "else without if"), "else without if (%s)", sh.fail_reason);
+    unlink(p);
+    mock_reset();
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "repeat 2");
+    shell_script_tick(&sh);
+    CHECK(!sh.failed, "repeat at the prompt is an error, not a verdict");
+
+    /* on --once, on list / on clear, history ring, exit status, transcript. */
+    mock_reset();
+    sh.interactive = true;
+    sh.hist = calloc(SHELL_HISTORY_LINES, sizeof(*sh.hist));
+    shell_enqueue_line(&sh, "on --once any \"boom\" echo once");
+    shell_enqueue_line(&sh, "count \"boom\" any");
+    shell_script_tick(&sh);
+    CHECK(sh.watch_count == 2 && sh.watches[0].once, "--once watch added");
+    emit_line(0, "boom"); emit_line(0, "boom");
+    CHECK(sh.trigger_count == 1, "--once fires once (%d)", sh.trigger_count);
+    shell_script_tick(&sh);
+    CHECK(sh.watch_count == 1 && sh.watches[0].kind == SHELL_WATCH_COUNT, "fired --once watch removed");
+    shell_enqueue_line(&sh, "on list");
+    shell_enqueue_line(&sh, "on clear 1");
+    shell_script_tick(&sh);
+    CHECK(sh.watch_count == 0, "on clear");
+    for (int i = 0; i < SHELL_HISTORY_LINES + 5; i++) {
+        char l[32]; snprintf(l, sizeof(l), "line %d", i);
+        /* the service's observer fills the ring; mimic it */
+        int slot = (sh.hist_head + sh.hist_count) % SHELL_HISTORY_LINES;
+        if (sh.hist_count < SHELL_HISTORY_LINES) sh.hist_count++; else sh.hist_head = (sh.hist_head + 1) % SHELL_HISTORY_LINES;
+        sh.hist[slot].node_id = 1 + (i % 2); snprintf(sh.hist[slot].text, sizeof(sh.hist[slot].text), "%s", l);
+    }
+    CHECK(sh.hist_count == SHELL_HISTORY_LINES && !strcmp(sh.hist[sh.hist_head].text, "line 5"), "ring keeps the newest %d lines", SHELL_HISTORY_LINES);
+    char tpath[128];
+    snprintf(tpath, sizeof(tpath), "/tmp/csim_shell_test_transcript_%d.cnsh", (int)getpid());
+    unlink(tpath);
+    char tcmd[200]; snprintf(tcmd, sizeof(tcmd), "transcript %s", tpath);
+    shell_enqueue_line(&sh, tcmd);
+    shell_enqueue_line(&sh, "echo one");
+    shell_enqueue_line(&sh, "move 1 2 3");
+    shell_enqueue_line(&sh, "transcript off");
+    shell_enqueue_line(&sh, "echo not recorded");
+    shell_enqueue_line(&sh, "exit");
+    shell_script_tick(&sh);
+    FILE *tf = fopen(tpath, "r");
+    char tbuf[512] = ""; size_t tn = tf ? fread(tbuf, 1, sizeof(tbuf) - 1, tf) : 0; tbuf[tn] = 0;
+    if (tf) fclose(tf);
+    CHECK(strstr(tbuf, "echo one\nmove 1 2 3\n") && !strstr(tbuf, "not recorded") && !strstr(tbuf, "transcript off") && !strstr(tbuf, "\ntranscript /"),
+          "transcript records typed lines ('%s')", tbuf);
+    unlink(tpath);
+    CHECK(shell_service_report(&sh, 0) == 0, "exit ends the run");
+    free(sh.hist); sh.hist = NULL;
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -933,6 +1037,7 @@ int run_shell_tests(int verbose) {
     test_expand();
     test_node_commands();
     test_arm_inspection();
+    test_workflow();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }
