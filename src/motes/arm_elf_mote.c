@@ -581,6 +581,12 @@ static int64_t arm_mote_execute(sim_mote_t *m, int64_t now_ns) {
      * gdb service at attach.  If the CPU is halted at a breakpoint, skip
      * the tick and return a +1µs wakeup so we keep checking the stub. */
     arm_cpu_t *cpu = &node->plat.arm.cpu;
+    /* Stopped at a shell breakpoint/watchpoint: skip the tick until the shell
+     * continues (it pauses the whole simulation at the hit). */
+    if (cpu->dbg_halted) {
+        cpu->stopping = false;
+        return now_ns + 1000LL;
+    }
     gdb_stub_t *gdb = (gdb_stub_t *)cpu->gdb_stub;
     if (gdb) {
         gdb_stub_poll(gdb);

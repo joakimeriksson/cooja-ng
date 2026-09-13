@@ -727,6 +727,8 @@ static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
 static void *msp_mote_get_interface(sim_mote_t *m, int iface) {
     if (iface == SIM_MOTE_IFACE_CC2420)
         return &MOTE_IMPL(m)->plat.msp.cc2420;
+    if (iface == SIM_MOTE_IFACE_MSP430_CPU)
+        return &MOTE_IMPL(m)->plat.msp.cpu;
     return NULL;
 }
 

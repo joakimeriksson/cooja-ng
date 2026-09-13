@@ -523,6 +523,18 @@ static void resolve_block(shell_service_t *s, int64_t now) {
                           (double)(s->block_deadline_ns - s->block_start_ns) / 1e9);
         }
         return;
+    case SHELL_BLOCK_HALT:
+        /* Released by shell_debug_tick when the node hits; here only the
+         * timeout. */
+        if (now >= s->block_deadline_ns) {
+            s->block = SHELL_BLOCK_NONE;
+            s->expect_fail++;
+            char reason[SHELL_REASON_MAX];
+            snprintf(reason, sizeof(reason), "expect-halt: node %d hit no breakpoint or watchpoint within %.3f s",
+                     s->halt_node_id, (double)(s->block_deadline_ns - s->block_start_ns) / 1e9);
+            shell_script_fail(s, reason);
+        }
+        return;
     case SHELL_BLOCK_FAULT: {
         void *iface = s->ctl->ops.get_interface
             ? s->ctl->ops.get_interface(s->ctl->ops.user, s->fault_idx, SIM_MOTE_IFACE_ARM_CPU)
@@ -678,6 +690,7 @@ void shell_script_tick(shell_service_t *s) {
     if (!s->active) return;
     int64_t now = sim_runtime_now_ns(s->sim);
     sim_control_send_flush_pending(s->ctl);
+    shell_debug_tick(s);
 
     shell_at_entry_t e;
     int guard = 0;

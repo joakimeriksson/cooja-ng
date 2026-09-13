@@ -8,6 +8,8 @@
 #include "sim_mote.h"
 #include "arm_cpu.h"
 #include "arm_trustzone.h"
+#include "msp430_cpu.h"
+#include "msp430_config.h"
 #include "elf_loader.h"
 #include "radio_medium.h"
 
@@ -637,8 +639,64 @@ static int cmd_sym(shell_service_t *s, int argc, char **argv, const char *line, 
     return 0;
 }
 
+/* Memory of an ARM or MSP430 node, in the debugger's view. */
+typedef struct node_mem {
+    arm_cpu_t     *arm;
+    msp430_cpu_t  *msp;
+    int            word;             /* native word: 4 (ARM) or 2 (MSP430) */
+    int            id, idx;
+    sim_control_node_info_t info;
+} node_mem_t;
+
+static int node_mem_open(shell_service_t *s, const char *what, const char *arg, node_mem_t *m) {
+    memset(m, 0, sizeof(*m));
+    long id;
+    if (shell_parse_int(arg, &id) != 0) { shell_error(s, "%s: expected one node id, got '%s'", what, arg); return -1; }
+    m->id = (int)id;
+    m->idx = sim_control_index_of_id(s->ctl, (int)id);
+    if (m->idx < 0 || !sim_control_describe(s->ctl, m->idx, &m->info)) { shell_error(s, "no node with id %ld", id); return -1; }
+    if (s->ctl->ops.get_interface) {
+        m->arm = s->ctl->ops.get_interface(s->ctl->ops.user, m->idx, SIM_MOTE_IFACE_ARM_CPU);
+        if (!m->arm) m->msp = s->ctl->ops.get_interface(s->ctl->ops.user, m->idx, SIM_MOTE_IFACE_MSP430_CPU);
+    }
+    if (!m->arm && !m->msp) { shell_error(s, "%s: node %ld has no emulated CPU (ARM and MSP430 only)", what, id); return -1; }
+    m->word = m->arm ? 4 : 2;
+    return 0;
+}
+
+static bool node_mem_read8(const node_mem_t *m, uint32_t a, uint8_t *v) {
+    if (m->arm) { *v = arm_read8(m->arm, a); return true; }
+    if (a >= m->msp->max_mem) return false;
+    *v = m->msp->memory[a];
+    return true;
+}
+
+static bool node_mem_read_word(const node_mem_t *m, uint32_t a, uint32_t *v) {
+    *v = 0;
+    for (int b = 0; b < m->word; b++) {
+        uint8_t x;
+        if (!node_mem_read8(m, a + (uint32_t)b, &x)) return false;
+        *v |= (uint32_t)x << (8 * b);
+    }
+    return true;
+}
+
+/* NULL if [first, last] may be written, else why not. */
+static const char *node_mem_write_refusal(const node_mem_t *m, uint32_t first, uint32_t last) {
+    if (m->arm) {
+        if (first < m->arm->flash_end && last >= m->arm->flash_base)
+            return "is flash, which is read-only here (as on hardware)";
+        return NULL;
+    }
+    const msp430_config_t *c = m->msp->config;
+    if (!c || first < c->ram_start || last >= c->ram_start + c->ram_size)
+        return "is outside RAM (MSP430 writes are limited to RAM)";
+    return NULL;
+}
+
 /* mem [-w] [-c var] <node> <addr|sym> [count]   read
- * mem [-w] <node> <addr|sym> = <value...>       write */
+ * mem [-w] <node> <addr|sym> = <value...>       write
+ * -w: native words (32-bit ARM, 16-bit MSP430), little-endian. */
 static int cmd_mem(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)line; (void)argpos;
     bool words = false;
@@ -652,26 +710,26 @@ static int cmd_mem(shell_service_t *s, int argc, char **argv, const char *line, 
         } else { shell_error(s, "mem: unknown option '%s'", argv[i]); return -1; }
     }
     if (argc - i < 2) { shell_error(s, "usage: mem [-w] [-c <var>] <node> <addr|symbol> [count] | mem [-w] <node> <addr> = <values...>"); return -1; }
-    sim_control_node_info_t info;
-    arm_cpu_t *cpu = node_arm_cpu(s, "mem", argv[i], NULL, &info);
-    if (!cpu) return -1;
+    node_mem_t m;
+    if (node_mem_open(s, "mem", argv[i], &m) != 0) return -1;
     uint32_t addr;
-    if (resolve_addr(s, &info, argv[i + 1], &addr) != 0) return -1;
-    int step = words ? 4 : 1;
+    if (resolve_addr(s, &m.info, argv[i + 1], &addr) != 0) return -1;
+    int step = words ? m.word : 1;
 
     if (argc - i >= 3 && !strcmp(argv[i + 2], "=")) {
         if (argc - i < 4) { shell_error(s, "mem: nothing to write"); return -1; }
         uint32_t last = addr + (uint32_t)((argc - i - 3) * step) - 1;
-        if (addr < cpu->flash_end && last >= cpu->flash_base) {
-            shell_error(s, "mem: 0x%08x-0x%08x is flash, which is read-only here (as on hardware)", addr, last);
-            return -1;
-        }
+        const char *why = node_mem_write_refusal(&m, addr, last);
+        if (why) { shell_error(s, "mem: 0x%08x-0x%08x %s", addr, last, why); return -1; }
         for (int k = i + 3; k < argc; k++) {
             long v;
             if (shell_parse_int(argv[k], &v) != 0) { shell_error(s, "mem: bad value '%s'", argv[k]); return -1; }
-            uint32_t a = addr + (uint32_t)((k - i - 3) * step);
-            for (int b = 0; b < step; b++)
-                arm_write8(cpu, a + (uint32_t)b, (uint8_t)((unsigned long)v >> (8 * b)));
+            uint32_t at = addr + (uint32_t)((k - i - 3) * step);
+            for (int b = 0; b < step; b++) {
+                uint8_t byte = (uint8_t)((unsigned long)v >> (8 * b));
+                if (m.arm) arm_write8(m.arm, at + (uint32_t)b, byte);
+                else m.msp->memory[at + (uint32_t)b] = byte;
+            }
         }
         if (s->verbose) shell_out(s, "wrote %d %s at 0x%08x\n", argc - i - 3, words ? "word(s)" : "byte(s)", addr);
         return 0;
@@ -681,13 +739,19 @@ static int cmd_mem(shell_service_t *s, int argc, char **argv, const char *line, 
     if (argc - i >= 3 && shell_parse_int(argv[i + 2], &count) != 0) { shell_error(s, "mem: bad count '%s'", argv[i + 2]); return -1; }
     if (count < 1 || count > 4096) { shell_error(s, "mem: count must be 1..4096"); return -1; }
     if (var && count != 1) { shell_error(s, "mem: -c needs a count of 1"); return -1; }
+    if (m.msp && addr + (uint32_t)(count * step) > m.msp->max_mem) {
+        shell_error(s, "mem: 0x%08x+%ld is beyond the 0x%x bytes of address space", addr, count * step, m.msp->max_mem);
+        return -1;
+    }
+    char buf[24];
     if (words) {
         for (long k = 0; k < count; k++) {
-            uint32_t a = addr + (uint32_t)(k * 4), v = 0;
-            for (int b = 0; b < 4; b++) v |= (uint32_t)arm_read8(cpu, a + (uint32_t)b) << (8 * b);
-            if (var) { char buf[16]; snprintf(buf, sizeof(buf), "0x%08x", v); shell_var_set(s, var, buf); }
-            if (k % 4 == 0) shell_out(s, "%s0x%08x:", k ? "\n" : "", a);
-            shell_out(s, " 0x%08x", v);
+            uint32_t at = addr + (uint32_t)(k * m.word), v;
+            node_mem_read_word(&m, at, &v);
+            snprintf(buf, sizeof(buf), m.word == 4 ? "0x%08x" : "0x%04x", v);
+            if (var) shell_var_set(s, var, buf);
+            if (k % (m.word == 4 ? 4 : 8) == 0) shell_out(s, "%s0x%08x:", k ? "\n" : "", at);
+            shell_out(s, " %s", buf);
         }
         shell_out(s, "\n");
         return 0;
@@ -696,8 +760,9 @@ static int cmd_mem(shell_service_t *s, int argc, char **argv, const char *line, 
         char hex[64] = "", asc[20] = "";
         int n = (int)((count - k) < 16 ? (count - k) : 16);
         for (int b = 0; b < n; b++) {
-            uint8_t v = arm_read8(cpu, addr + (uint32_t)(k + b));
-            if (var) { char buf[8]; snprintf(buf, sizeof(buf), "0x%02x", v); shell_var_set(s, var, buf); }
+            uint8_t v = 0;
+            node_mem_read8(&m, addr + (uint32_t)(k + b), &v);
+            if (var) { snprintf(buf, sizeof(buf), "0x%02x", v); shell_var_set(s, var, buf); }
             snprintf(hex + strlen(hex), sizeof(hex) - strlen(hex), " %02x", v);
             asc[b] = (v >= 32 && v < 127) ? (char)v : '.';
             asc[b + 1] = '\0';
@@ -712,47 +777,60 @@ static int cmd_reg(shell_service_t *s, int argc, char **argv, const char *line, 
     const char *var;
     int i = take_capture_opt(s, argc, argv, &var);
     if (i < 0) return -1;
-    /* reg <node> <name> = <value>: r0-r12, sp, lr, pc, xpsr. */
-    if (!var && argc - i == 4 && !strcmp(argv[i + 2], "=")) {
-        arm_cpu_t *cpu = node_arm_cpu(s, "reg", argv[i], NULL, NULL);
-        if (!cpu) return -1;
+    bool writing = !var && argc - i == 4 && !strcmp(argv[i + 2], "=");
+    if (!writing && (argc - i < 1 || argc - i > 2)) {
+        shell_error(s, "usage: reg [-c <var>] <node> [name] | reg <node> <name> = <value>"); return -1;
+    }
+    node_mem_t m;
+    if (node_mem_open(s, "reg", argv[i], &m) != 0) return -1;
+
+    /* The register table for this CPU: name, pointer, width. */
+    struct { const char *name; uint32_t *p; bool tz; } r[40];
+    int nr = 0;
+#define REG(n, ptr, tzonly) do { r[nr].name = (n); r[nr].p = (ptr); r[nr].tz = (tzonly); nr++; } while (0)
+    static const char *const armn[13] = { "r0","r1","r2","r3","r4","r5","r6","r7","r8","r9","r10","r11","r12" };
+    static const char *const mspn[16] = { "pc","sp","sr","r3","r4","r5","r6","r7","r8","r9","r10","r11","r12","r13","r14","r15" };
+    if (m.arm) {
+        arm_cpu_t *c = m.arm;
+        for (int k = 0; k < 13; k++) REG(armn[k], &c->reg[k], false);
+        REG("sp", &c->reg[ARM_SP], false); REG("lr", &c->reg[ARM_LR], false); REG("pc", &c->reg[ARM_PC], false);
+        REG("xpsr", &c->xpsr, false); REG("primask", &c->primask, false);
+        REG("basepri", &c->basepri, false); REG("faultmask", &c->faultmask, false);
+        REG("msp_s", &c->msp_s, true); REG("psp_s", &c->psp_s, true);
+        REG("msp_ns", &c->msp_ns, true); REG("psp_ns", &c->psp_ns, true);
+        REG("control_s", &c->control_s, true); REG("control_ns", &c->control_ns, true);
+    } else {
+        for (int k = 0; k < 16; k++) REG(mspn[k], &m.msp->reg[k], false);
+    }
+#undef REG
+    bool tz = m.arm && arm_cpu_has_trustzone(m.arm);
+
+    if (writing) {
         long v;
         if (shell_parse_int(argv[i + 3], &v) != 0) { shell_error(s, "reg: bad value '%s'", argv[i + 3]); return -1; }
         const char *n = argv[i + 1];
-        int r = -1;
-        if (n[0] == 'r' && isdigit((unsigned char)n[1])) {
-            long k;
-            if (shell_parse_int(n + 1, &k) == 0 && k >= 0 && k <= 12) r = (int)k;
-        } else if (!strcmp(n, "sp")) r = ARM_SP;
-        else if (!strcmp(n, "lr")) r = ARM_LR;
-        else if (!strcmp(n, "pc")) r = ARM_PC;
-        if (r == ARM_PC) cpu->reg[ARM_PC] = (uint32_t)v & ~1u;   /* Thumb bit is not part of PC */
-        else if (r >= 0) cpu->reg[r] = (uint32_t)v;
-        else if (!strcmp(n, "xpsr")) cpu->xpsr = (uint32_t)v;
-        else { shell_error(s, "reg: can write r0-r12, sp, lr, pc, xpsr (not '%s')", n); return -1; }
-        if (s->verbose) shell_out(s, "%s = 0x%08x\n", n, (uint32_t)v);
+        uint32_t *target = NULL;
+        for (int k = 0; k < nr; k++) if (!strcmp(r[k].name, n) && !r[k].tz) target = r[k].p;
+        if (m.arm && target && (!strcmp(n, "primask") || !strcmp(n, "basepri") || !strcmp(n, "faultmask")))
+            target = NULL;     /* banked by security state: not a plain write */
+        if (!target) {
+            shell_error(s, "reg: can write %s (not '%s')",
+                        m.arm ? "r0-r12, sp, lr, pc, xpsr" : "pc, sp, sr, r3-r15", n);
+            return -1;
+        }
+        uint32_t val = (uint32_t)v;
+        if (m.arm && target == &m.arm->reg[ARM_PC]) val &= ~1u;      /* Thumb bit is not PC */
+        if (m.msp) val &= m.msp->is_msp430x ? 0xfffffu : 0xffffu;
+        *target = val;
+        if (s->verbose) shell_out(s, "%s = 0x%08x\n", n, val);
         return 0;
     }
-    if (argc - i < 1 || argc - i > 2) { shell_error(s, "usage: reg [-c <var>] <node> [name] | reg <node> <name> = <value>"); return -1; }
-    arm_cpu_t *cpu = node_arm_cpu(s, "reg", argv[i], NULL, NULL);
-    if (!cpu) return -1;
-    struct { const char *name; uint32_t v; bool tz; } r[] = {
-        {"r0", cpu->reg[0], false}, {"r1", cpu->reg[1], false}, {"r2", cpu->reg[2], false}, {"r3", cpu->reg[3], false},
-        {"r4", cpu->reg[4], false}, {"r5", cpu->reg[5], false}, {"r6", cpu->reg[6], false}, {"r7", cpu->reg[7], false},
-        {"r8", cpu->reg[8], false}, {"r9", cpu->reg[9], false}, {"r10", cpu->reg[10], false}, {"r11", cpu->reg[11], false},
-        {"r12", cpu->reg[12], false}, {"sp", cpu->reg[ARM_SP], false}, {"lr", cpu->reg[ARM_LR], false}, {"pc", cpu->reg[ARM_PC], false},
-        {"xpsr", cpu->xpsr, false}, {"primask", cpu->primask, false}, {"basepri", cpu->basepri, false}, {"faultmask", cpu->faultmask, false},
-        {"msp_s", cpu->msp_s, true}, {"psp_s", cpu->psp_s, true}, {"msp_ns", cpu->msp_ns, true},
-        {"psp_ns", cpu->psp_ns, true}, {"control_s", cpu->control_s, true}, {"control_ns", cpu->control_ns, true},
-    };
-    int nr = (int)(sizeof(r) / sizeof(r[0]));
     if (argc - i == 2) {
         for (int k = 0; k < nr; k++) {
-            if (strcmp(r[k].name, argv[i + 1]) != 0) continue;
-            if (r[k].tz && !arm_cpu_has_trustzone(cpu)) break;
+            if (strcmp(r[k].name, argv[i + 1]) != 0 || (r[k].tz && !tz)) continue;
             char label[32];
             snprintf(label, sizeof(label), "%s = ", r[k].name);
-            emit_value(s, var, label, r[k].v);
+            emit_value(s, var, label, *r[k].p);
             return 0;
         }
         shell_error(s, "reg: no register '%s' on this CPU", argv[i + 1]);
@@ -761,12 +839,230 @@ static int cmd_reg(shell_service_t *s, int argc, char **argv, const char *line, 
     if (var) { shell_error(s, "reg: -c needs a register name"); return -1; }
     int col = 0;
     for (int k = 0; k < nr; k++) {
-        if (r[k].tz && !arm_cpu_has_trustzone(cpu)) continue;
-        shell_out(s, "  %-10s 0x%08x%s", r[k].name, r[k].v, (++col % 4) ? "" : "\n");
+        if (r[k].tz && !tz) continue;
+        shell_out(s, "  %-10s 0x%08x%s", r[k].name, *r[k].p, (++col % 4) ? "" : "\n");
     }
     if (col % 4) shell_out(s, "\n");
-    if (arm_cpu_has_trustzone(cpu))
-        shell_out(s, "  state: %s\n", arm_cpu_is_secure(cpu) ? "Secure" : "Non-secure");
+    if (tz) shell_out(s, "  state: %s\n", arm_cpu_is_secure(m.arm) ? "Secure" : "Non-secure");
+    return 0;
+}
+
+/* --- breakpoints and watchpoints (ARM) -------------------------------------- */
+
+static arm_cpu_t *dbg_cpu(shell_service_t *s, int node_id) {
+    int idx = sim_control_index_of_id(s->ctl, node_id);
+    if (idx < 0 || !s->ctl->ops.get_interface) return NULL;
+    return s->ctl->ops.get_interface(s->ctl->ops.user, idx, SIM_MOTE_IFACE_ARM_CPU);
+}
+
+/* Write a node's breakpoint/watchpoint tables from the shell's list, in list
+ * order (so cpu->dbg_hit_index maps back to it).  Watch shadows restart from
+ * the current memory. */
+static void dbg_arm_node(shell_service_t *s, int node_id) {
+    arm_cpu_t *cpu = dbg_cpu(s, node_id);
+    if (!cpu) return;
+    cpu->dbg_bp_n = cpu->dbg_wp_n = 0;
+    for (int i = 0; i < s->dbg_count; i++) {
+        const shell_dbg_t *d = &s->dbg[i];
+        if (d->node_id != node_id) continue;
+        if (d->kind == 1 && cpu->dbg_bp_n < ARM_DBG_MAX_BP) {
+            cpu->dbg_bp[cpu->dbg_bp_n++] = d->addr;
+        } else if (d->kind == 2 && cpu->dbg_wp_n < ARM_DBG_MAX_WP) {
+            int w = cpu->dbg_wp_n++;
+            cpu->dbg_wp[w].addr = d->addr;
+            cpu->dbg_wp[w].len = d->len;
+            uint32_t v = 0;
+            for (int b = 0; b < d->len; b++) v |= (uint32_t)arm_read8(cpu, d->addr + (uint32_t)b) << (8 * b);
+            cpu->dbg_wp[w].shadow = v;
+        }
+    }
+    cpu->dbg_count = cpu->dbg_bp_n + cpu->dbg_wp_n;
+    if (cpu->dbg_count == 0) cpu->dbg_halted = cpu->dbg_hit_new = false;
+}
+
+/* The shell entry behind a CPU's hit (kind, index into that kind's table). */
+static shell_dbg_t *dbg_entry_for_hit(shell_service_t *s, int node_id, int kind, int index) {
+    for (int i = 0; i < s->dbg_count; i++) {
+        shell_dbg_t *d = &s->dbg[i];
+        if (d->node_id != node_id || d->kind != kind) continue;
+        if (index-- == 0) return d;
+    }
+    return NULL;
+}
+
+void shell_debug_tick(shell_service_t *s) {
+    if (s->dbg_count == 0) return;
+    int done[SHELL_DBG_MAX], ndone = 0;
+    for (int i = 0; i < s->dbg_count; i++) {
+        int node_id = s->dbg[i].node_id;
+        bool seen = false;
+        for (int k = 0; k < ndone; k++) seen |= done[k] == node_id;
+        if (seen) continue;
+        done[ndone++] = node_id;
+        arm_cpu_t *cpu = dbg_cpu(s, node_id);
+        if (!cpu) continue;
+        int want = 0;
+        for (int k = 0; k < s->dbg_count; k++) want += s->dbg[k].node_id == node_id;
+        if (cpu->dbg_count != want) dbg_arm_node(s, node_id);       /* rebooted */
+        if (!cpu->dbg_hit_new) continue;
+        cpu->dbg_hit_new = false;
+        shell_dbg_t *d = dbg_entry_for_hit(s, node_id, cpu->dbg_hit_kind, cpu->dbg_hit_index);
+        if (d) d->hits++;
+        shell_hold_output(s);
+        if (cpu->dbg_hit_kind == 1)
+            shell_out(s, "breakpoint #%d: node %d at pc 0x%08x (%.6f s)\n", d ? d->id : 0, node_id,
+                      cpu->dbg_hit_pc, (double)now_ns(s) / 1e9);
+        else
+            shell_out(s, "watchpoint #%d: node %d 0x%08x changed 0x%x -> 0x%x, written at pc 0x%08x (%.6f s)\n",
+                      d ? d->id : 0, node_id, d ? d->addr : 0, cpu->dbg_hit_old, cpu->dbg_hit_value,
+                      cpu->dbg_hit_pc, (double)now_ns(s) / 1e9);
+        if (!s->sim->clock_source) sim_control_pause(s->ctl);
+        if (s->block == SHELL_BLOCK_HALT && s->halt_node_id == node_id) {
+            s->block = SHELL_BLOCK_NONE;
+            s->expect_pass++;
+        }
+    }
+}
+
+/* break <node> <addr|sym[+off]>, watch <node> <addr|sym[+off]> [bytes] */
+static int cmd_break(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos, int kind) {
+    (void)line; (void)argpos;
+    const char *what = kind == 1 ? "break" : "watch";
+    if (argc < 3) { shell_error(s, "usage: %s", shell_find_command(what)->syntax); return -1; }
+    sim_control_node_info_t info;
+    arm_cpu_t *cpu = node_arm_cpu(s, what, argv[1], NULL, &info);
+    if (!cpu) return -1;
+    uint32_t addr;
+    if (resolve_addr(s, &info, argv[2], &addr) != 0) return -1;
+    long len = 4;
+    if (kind == 1) {
+        addr &= ~1u;                          /* Thumb bit of a function symbol */
+        if (argc > 3) { shell_error(s, "usage: break <node> <addr|symbol>"); return -1; }
+    } else {
+        if (argc == 4 && (shell_parse_int(argv[3], &len) != 0 || len < 1 || len > 4)) {
+            shell_error(s, "watch: length is 1..4 bytes"); return -1;
+        }
+        if (addr < cpu->sram_base || addr + (uint32_t)len > cpu->sram_end) {
+            shell_error(s, "watch: 0x%08x is not SRAM (watching peripherals would read their registers every instruction)", addr);
+            return -1;
+        }
+    }
+    int per_kind = 0;
+    for (int i = 0; i < s->dbg_count; i++)
+        per_kind += s->dbg[i].node_id == info.id && s->dbg[i].kind == kind;
+    if (s->dbg_count >= SHELL_DBG_MAX || per_kind >= (kind == 1 ? ARM_DBG_MAX_BP : ARM_DBG_MAX_WP)) {
+        shell_error(s, "%s: at most %d per node", what, kind == 1 ? ARM_DBG_MAX_BP : ARM_DBG_MAX_WP); return -1;
+    }
+    shell_dbg_t *d = &s->dbg[s->dbg_count++];
+    memset(d, 0, sizeof(*d));
+    d->id = s->next_dbg_id++;
+    d->node_id = info.id;
+    d->kind = kind;
+    d->addr = addr;
+    d->len = (int)len;
+    dbg_arm_node(s, info.id);
+    if (s->verbose)
+        shell_out(s, "%s #%d on node %d at 0x%08x%s\n", kind == 1 ? "breakpoint" : "watchpoint", d->id,
+                  info.id, addr, kind == 1 ? " (the node runs interpreted while it is armed)" : "");
+    return 0;
+}
+
+static int cmd_break_list(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos);
+static int cmd_break_clear(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos);
+
+/* `break list` / `break clear` cover watchpoints too: they share one list. */
+static int cmd_breakpoint(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    if (!strcmp(argv[1], "list")) {
+        if (argc != 2) { shell_error(s, "usage: break list"); return -1; }
+        return cmd_break_list(s, 1, argv + 1, line, argpos);
+    }
+    if (!strcmp(argv[1], "clear")) {
+        if (argc != 3) { shell_error(s, "usage: break clear <n>|all"); return -1; }
+        return cmd_break_clear(s, 2, argv + 1, line, argpos);
+    }
+    return cmd_break(s, argc, argv, line, argpos, 1);
+}
+
+static int cmd_watch(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    return cmd_break(s, argc, argv, line, argpos, 2);
+}
+
+static int cmd_break_list(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)argv; (void)line; (void)argpos;
+    if (s->dbg_count == 0) { shell_out(s, "no breakpoints or watchpoints\n"); return 0; }
+    for (int i = 0; i < s->dbg_count; i++) {
+        const shell_dbg_t *d = &s->dbg[i];
+        arm_cpu_t *cpu = dbg_cpu(s, d->node_id);
+        bool halted_here = cpu && cpu->dbg_halted && dbg_entry_for_hit(s, d->node_id, cpu->dbg_hit_kind, cpu->dbg_hit_index) == d;
+        if (d->kind == 1)
+            shell_out(s, "  #%d breakpoint node %d 0x%08x  hits %d%s\n", d->id, d->node_id, d->addr, d->hits,
+                      halted_here ? "  (halted here)" : "");
+        else
+            shell_out(s, "  #%d watchpoint node %d 0x%08x/%d  hits %d%s\n", d->id, d->node_id, d->addr, d->len,
+                      d->hits, halted_here ? "  (halted here)" : "");
+    }
+    return 0;
+}
+
+static int cmd_break_clear(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)line; (void)argpos;
+    bool all = !strcmp(argv[1], "all");
+    long id = 0;
+    if (!all && shell_parse_int(argv[1], &id) != 0) { shell_error(s, "break clear: expected a number or all"); return -1; }
+    int nodes[SHELL_DBG_MAX], nn = 0, removed = 0;
+    for (int i = 0; i < s->dbg_count; i++) {
+        if (!all && s->dbg[i].id != id) continue;
+        nodes[nn++] = s->dbg[i].node_id;
+        memmove(&s->dbg[i], &s->dbg[i + 1], (size_t)(s->dbg_count - i - 1) * sizeof(s->dbg[0]));
+        s->dbg_count--;
+        i--;
+        removed++;
+    }
+    if (!removed) { shell_error(s, "break clear: no breakpoint or watchpoint #%ld", id); return -1; }
+    for (int k = 0; k < nn; k++) dbg_arm_node(s, nodes[k]);
+    return 0;
+}
+
+/* continue [node]: release halted nodes (a breakpoint is not hit again on
+ * the way out) and resume the simulation. */
+static int cmd_continue(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    int only = -1;
+    if (argc == 2) {
+        long id;
+        if (shell_parse_int(argv[1], &id) != 0) { shell_error(s, "continue: expected a node id"); return -1; }
+        only = (int)id;
+    }
+    int released = 0;
+    int n = sim_control_node_count(s->ctl);
+    for (int i = 0; i < n; i++) {
+        sim_control_node_info_t info;
+        if (!sim_control_describe(s->ctl, i, &info) || (only >= 0 && info.id != only)) continue;
+        arm_cpu_t *cpu = dbg_cpu(s, info.id);
+        if (!cpu || !cpu->dbg_halted) continue;
+        if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->reg[ARM_PC] & ~1u;
+        cpu->dbg_halted = false;
+        sim_schedule_mote_wakeup_if_earlier(s->sim, i, now_ns(s));
+        released++;
+    }
+    if (only >= 0 && !released) { shell_error(s, "continue: node %d is not halted", only); return -1; }
+    if (!shell_refuse_external_clock(s, "continue")) sim_control_resume(s->ctl);
+    return 0;
+}
+
+/* expect-halt <node> [timeout] */
+static int cmd_expect_halt(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    long id;
+    if (shell_parse_int(argv[1], &id) != 0) { shell_error(s, "expect-halt: expected a node id"); return -1; }
+    arm_cpu_t *cpu = dbg_cpu(s, (int)id);
+    if (!cpu) { shell_error(s, "expect-halt: node %ld has no ARM CPU", id); return -1; }
+    int64_t timeout = s->default_expect_timeout_ns;
+    if (argc == 3 && parse_dur(s, argv[2], &timeout) != 0) return -1;
+    s->script_used = true;
+    if (cpu->dbg_halted && !cpu->dbg_hit_new) { s->expect_pass++; return 0; }   /* already stopped */
+    s->halt_node_id = (int)id;
+    shell_script_block_until(s, SHELL_BLOCK_HALT, now_ns(s) + timeout);
     return 0;
 }
 
@@ -1111,15 +1407,14 @@ static int eval_condition(shell_service_t *s, int argc, char **argv, bool *resul
     cond_desc[0] = '\0';
     const char *what = argv[1];
     if (strcmp(what, "mem") == 0 && argc == 6) {
-        sim_control_node_info_t info;
-        arm_cpu_t *cpu = node_arm_cpu(s, "assert mem", argv[2], NULL, &info);
-        if (!cpu) return -1;
+        node_mem_t m;
+        if (node_mem_open(s, "assert mem", argv[2], &m) != 0) return -1;
         uint32_t addr;
-        if (resolve_addr(s, &info, argv[3], &addr) != 0) return -1;
+        if (resolve_addr(s, &m.info, argv[3], &addr) != 0) return -1;
         long want;
         if (shell_parse_int(argv[5], &want) != 0) { shell_error(s, "assert mem: bad value '%s'", argv[5]); return -1; }
-        uint32_t v = 0;
-        for (int b = 0; b < 4; b++) v |= (uint32_t)arm_read8(cpu, addr + (uint32_t)b) << (8 * b);
+        uint32_t v;
+        if (!node_mem_read_word(&m, addr, &v)) { shell_error(s, "assert mem: 0x%08x is outside the address space", addr); return -1; }
         int r;
         if (!strcmp(argv[4], "==")) r = v == (uint32_t)want;
         else if (!strcmp(argv[4], "!=")) r = v != (uint32_t)want;
@@ -1905,6 +2200,10 @@ static const shell_command_t commands[] = {
     { "sym",        "sym [-c <var>] <node> <symbol>",  "address of a firmware symbol (Non-secure image, then Secure image)", 2, 4, IMM, cmd_sym },
     { "mem",        "mem [-w] [-c <var>] <node> <addr|sym[+off]> [count] | mem [-w] <node> <addr> = <values...>", "read (hexdump, -w 32-bit words) or write memory, debugger view: no TrustZone checks, IO reads reach peripherals", 2, -1, IMM, cmd_mem },
     { "reg",        "reg [-c <var>] <node> [name] | reg <node> <name> = <value>", "read CPU registers (ARM; banked TrustZone stacks and CONTROL on ARMv8-M), or write r0-r12/sp/lr/pc/xpsr", 1, 4, IMM, cmd_reg },
+    { "break",      "break <node> <addr|sym[+off]> | break list | break clear <n>|all", "stop the node (and pause the simulation) before it executes that address; list or remove breakpoints and watchpoints", 1, 3, IMM, cmd_breakpoint },
+    { "watch",      "watch <node> <addr|sym[+off]> [bytes]", "stop when an SRAM value (1-4 bytes, default 4) changes; reports the writing pc", 2, 3, IMM, cmd_watch },
+    { "continue",   "continue [node]",                 "release halted nodes and resume", 0, 1, IMM, cmd_continue },
+    { "expect-halt","expect-halt <node> [timeout]",    "block until the node hits a breakpoint or watchpoint", 1, 2, BLK, cmd_expect_halt },
     { "tz",         "tz <node>",                       "TrustZone-M state: security state, SG/BXNS/secure-exception counters, SFSR/SFAR, SAU regions, banked stacks", 1, 1, IMM, cmd_tz },
     { "faults",     "faults <node>",                   "fault exception counts, the last fault (pc, security state), SFSR/SFAR", 1, 1, IMM, cmd_faults },
     { "expect-fault","expect-fault <node> [kind[,kind]|any] [timeout]", "block until the node takes a fault (hardfault, memmanage, busfault, usagefault, securefault)", 1, 3, BLK, cmd_expect_fault },

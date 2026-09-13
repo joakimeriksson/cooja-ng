@@ -1098,6 +1098,57 @@ static void test_environment(void) {
     CHECK(!sh.restart_pending && sh.qcount == 0, "the stream resumes after the restart");
 }
 
+static void test_debug(void) {
+    const char *p;
+
+    /* Breakpoint: armed into the CPU, hit, reported, simulation paused,
+     * expect-halt released, continue steps past it. */
+    mock_reset();
+    mock_cpu.reg[ARM_PC] = 0x1000;
+    mock_cpu.dbg_skip_pc = UINT32_MAX;
+    p = write_script("d1", "break 1 0x2001\nexpect-halt 1 1s\nreg -c pc 1 pc\ncontinue\nexpect-halt 1 1s\nbreak clear all\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.dbg_count == 1 && mock_cpu.dbg_bp[0] == 0x2000, "breakpoint armed (Thumb bit dropped)");
+    CHECK(sh.block == SHELL_BLOCK_HALT, "expect-halt blocks");
+    CHECK(!arm_dbg_check(&mock_cpu), "no hit elsewhere");
+    mock_cpu.reg[ARM_PC] = 0x2000;
+    CHECK(arm_dbg_check(&mock_cpu) && mock_cpu.dbg_halted, "hit at the address");
+    advance(1000); shell_script_tick(&sh);
+    CHECK(sh.expect_pass == 1 && sh.dbg[0].hits == 1, "the hit released expect-halt");
+    CHECK(!strcmp(shell_var_get(&sh, "pc") ? shell_var_get(&sh, "pc") : "", "0x00002000"), "script continued at the hit");
+    CHECK(!mock_cpu.dbg_halted && !sim_control_paused(&mock_ctl), "continue releases and resumes");
+    CHECK(!arm_dbg_check(&mock_cpu), "not hit again on the way out");
+    mock_cpu.reg[ARM_PC] = 0x2002; arm_dbg_check(&mock_cpu);
+    mock_cpu.reg[ARM_PC] = 0x2000;
+    CHECK(arm_dbg_check(&mock_cpu), "hit again on the next pass");
+    advance(1000); shell_script_tick(&sh);
+    CHECK(sh.passed && mock_cpu.dbg_count == 0 && !mock_cpu.dbg_halted, "second halt seen; break clear disarms (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* Watchpoint: a changed SRAM value is reported with the writer's pc. */
+    mock_reset();
+    mock_cpu.dbg_skip_pc = UINT32_MAX;
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "watch 1 0x20000100 2");
+    shell_enqueue_line(&sh, "watch 1 0x40000000");       /* not SRAM */
+    shell_enqueue_line(&sh, "break 2 0x100");                 /* node 2: no ARM CPU */
+    shell_script_tick(&sh);
+    CHECK(sh.dbg_count == 1 && mock_cpu.dbg_wp_n == 1 && mock_cpu.dbg_wp[0].len == 2, "one watchpoint armed, bad ones refused");
+    mock_cpu.reg[ARM_PC] = 0x3000;
+    CHECK(!arm_dbg_check(&mock_cpu), "no change, no hit");
+    mock_sram[0x101] = 0xAB;                                   /* the instruction at 0x3000 writes */
+    mock_cpu.reg[ARM_PC] = 0x3004;
+    CHECK(arm_dbg_check(&mock_cpu) && mock_cpu.dbg_hit_kind == 2 && mock_cpu.dbg_hit_pc == 0x3000 &&
+          mock_cpu.dbg_hit_old == 0 && mock_cpu.dbg_hit_value == 0xAB00, "watch hit: old/new value and writer pc");
+    shell_script_tick(&sh);
+    CHECK(sim_control_paused(&mock_ctl) && sh.dbg[0].hits == 1, "reported and paused");
+    /* A rebooted CPU (tables wiped) is re-armed at the next tick. */
+    mock_cpu.dbg_count = 0; mock_cpu.dbg_wp_n = 0;
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.dbg_count == 1 && mock_cpu.dbg_wp[0].shadow == 0xAB00, "re-armed after a reboot with a fresh shadow");
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -1117,6 +1168,7 @@ int run_shell_tests(int verbose) {
     test_arm_inspection();
     test_workflow();
     test_environment();
+    test_debug();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }

@@ -1710,7 +1710,13 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
      * MSP430's interpreter has neither obligation at all — it has no
      * per-instruction GDB check and no ROM-trap dispatch — which is part of
      * the measured ARM/MSP430 interpreter gap. */
-    gdb_stub_t *const gdb_stub = (gdb_stub_t *)cpu->gdb_stub;
+    /* GDB and shell breakpoints/watchpoints are armed between slices, never
+     * inside one, so one hoisted pointer covers both: per instruction this is
+     * the same single compare the loop always had for gdb_stub, and the whole
+     * check lives out of line in arm_debug_stop (arm_debug.c).  An inline
+     * two-condition version measured 5-8% slower on arm-bench. */
+    const void *const dbg_hook = cpu->gdb_stub ? cpu->gdb_stub
+                               : (cpu->dbg_count > 0 ? (void *)cpu : NULL);
     /*
      * The two ROM-trap addresses, hoisted so the per-instruction test is two
      * register compares rather than a call.
@@ -1734,14 +1740,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         /* GDB stub: check breakpoint at current PC, then poll for halt
          * commands. If halted, stop the inner loop so the multinode
          * driver can pump the stub's command processor. */
-        if (__builtin_expect(gdb_stub != NULL, 0)) {
-            gdb_stub_t *g = gdb_stub;
-            uint32_t pc_check = cpu->reg[ARM_PC] & ~1u;
-            if (gdb_stub_check_breakpoint(g, pc_check)) {
-                cpu->stopping = true;
-                break;
-            }
-            if (g->halted) {
+        if (__builtin_expect(dbg_hook != NULL, 0)) {
+            if (arm_debug_stop(cpu)) {
                 cpu->stopping = true;
                 break;
             }
@@ -4408,7 +4408,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
          * exception entry/return are all interpreter-only), so gating entry
          * here is exact.  Non-secure execution takes the interpreter, whose
          * attribution checks and SecureFault recording are the reference. */
-        int interp_only = cpu->cpu_off || cpu->gdb_stub != NULL ||
+        int interp_only = cpu->cpu_off || cpu->gdb_stub != NULL || cpu->dbg_count > 0 ||
                           (cpu->it_state & 0xF) != 0 ||
                           (cpu->tz_enabled && !cpu->secure) ||
                           cpu->cycles >= cpu->next_event_cycle;
@@ -4484,7 +4484,7 @@ int arm_step(arm_cpu_t *cpu, int count) {
 void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
     if (cpu->cycles >= target_cycle) return;
     cpu->cycle_limit = target_cycle;
-    while (cpu->cycles < target_cycle && !cpu->stopping) {
+    while (cpu->cycles < target_cycle && !cpu->stopping && !cpu->dbg_halted) {
         /* Estimate instructions needed, batch for efficiency */
         int64_t remaining = target_cycle - cpu->cycles;
         int steps;

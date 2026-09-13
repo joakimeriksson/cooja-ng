@@ -53,6 +53,7 @@ typedef enum sim_mote_iface {
                                     * window; how a co-simulation service
                                     * reaches it without including the
                                     * private mote header */
+    SIM_MOTE_IFACE_MSP430_CPU = 4, /* msp430_cpu_t* — shell mem/reg     */
 } sim_mote_iface_t;
 
 typedef struct sim_mote_ops {

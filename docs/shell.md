@@ -196,14 +196,26 @@ scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 
 | command | |
 |---|---|
-| `sym [-c <var>] <node> <symbol>` | address of a symbol in the node's firmware, then its Secure-world image |
-| `mem [-w] [-c <var>] <node> <addr\|sym[+off]> [count]` | hexdump bytes (default 64), or 32-bit little-endian words with `-w` (default 8) |
-| `mem [-w] <node> <addr\|sym> = <value...>` | write bytes (or words); flash is refused, as on hardware |
-| `reg [-c <var>] <node> [name]`, `reg <node> <name> = <value>` | registers r0-r12 sp lr pc xpsr primask basepri faultmask, plus msp_s psp_s msp_ns psp_ns control_s control_ns on ARMv8-M; writes r0-r12, sp, lr, pc, xpsr — e.g. to inject a fault |
+| `sym [-c <var>] <node> <symbol>` | address of a symbol in the node's firmware, then its Secure-world image (any node kind) |
+| `mem [-w] [-c <var>] <node> <addr\|sym[+off]> [count]` | hexdump bytes (default 64), or native little-endian words with `-w` (32-bit ARM, 16-bit MSP430; default 8) |
+| `mem [-w] <node> <addr\|sym> = <value...>` | write bytes (or words); ARM flash is refused, as on hardware; MSP430 writes are limited to RAM |
+| `reg [-c <var>] <node> [name]`, `reg <node> <name> = <value>` | ARM: r0-r12 sp lr pc xpsr primask basepri faultmask, plus msp_s psp_s msp_ns psp_ns control_s control_ns on ARMv8-M; writes r0-r12, sp, lr, pc, xpsr — e.g. to inject a fault. MSP430: pc sp sr r3-r15, all writable |
 | `tz <node>` | TrustZone-M: security state, SG / BXNS / secure-exception counters, SFSR+SFAR decoded, SAU regions, banked stacks |
 | `faults <node>` | HardFault / MemManage / BusFault / UsageFault / SecureFault entry counts, the last fault's pc and the security state it came from, SFSR/SFAR |
 | `expect-fault <node> [kind[,kind]\|any] [timeout]` | block until the node takes one of those faults (checked every simulated ms); the timeout fails the script |
-| `assert mem <node> <addr\|sym> <op> <word>`, `assert node <id> secure\|non-secure` | memory and security-state checks |
+| `assert mem <node> <addr\|sym> <op> <word>`, `assert node <id> secure\|non-secure` | memory (native word) and security-state checks |
+| `break <node> <addr\|sym[+off]>` | stop the node before it executes that address and pause the simulation (ARM) |
+| `watch <node> <addr\|sym[+off]> [bytes]` | stop when 1-4 bytes of SRAM change; the report names the pc of the instruction that wrote them (ARM) |
+| `break list`, `break clear <n>\|all` | list breakpoints and watchpoints (with hit counts, and where a node is halted) and remove them |
+| `continue [node]` | release halted nodes — a breakpoint is not hit again on the way out — and resume |
+| `expect-halt <node> [timeout]` | block until the node hits a breakpoint or watchpoint |
+
+A hit halts that node where it is and pauses the simulation at the next slice
+boundary (other nodes may finish the slice they are in).  `run` resumes the
+others with the node still halted; `continue` releases it.  An armed node runs
+in the interpreter, never the JIT, and costs one out-of-line check per
+instruction; nodes without breakpoints are unaffected.  Breakpoints survive a
+reboot of the node.  MSP430 nodes have `mem`/`reg` but no breakpoints.
 
 Memory access bypasses TrustZone (it is the debugger's view, like a probe on
 the SWD port); reads of peripheral registers go through the peripheral model
@@ -354,8 +366,8 @@ pass
 - An `on` command that sends to a node whose output matches the same pattern
   again (for example an echoing shell) feeds back on itself; more than 16
   firings between two slices are dropped with a warning.
-- Not yet available from the shell (planned follow-ups): breakpoints and
-  watchpoints, MSP430 memory/registers, radio-medium knobs, input pins.
+- Not yet available from the shell: single-instruction stepping, MSP430
+  breakpoints, Nordic GPIOTE (pin interrupts from `gpio`/`button` on nRF).
 
 ## Implementation
 

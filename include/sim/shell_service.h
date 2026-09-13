@@ -53,6 +53,7 @@ extern "C" {
 #define SHELL_FRAMES_MAX    8
 #define SHELL_HISTORY_LINES 2000
 #define SHELL_HISTORY_LEN   200
+#define SHELL_DBG_MAX       16
 
 /* Where a command line came from.  Errors fail the script only for lines
  * a script owns: FILE lines, and at/every/on commands a script file
@@ -89,6 +90,15 @@ typedef struct shell_source {
     int     nframes;
 } shell_source_t;
 
+typedef struct shell_dbg {           /* one breakpoint or watchpoint */
+    int      id;
+    int      node_id;
+    int      kind;                   /* 1 = breakpoint, 2 = watchpoint */
+    uint32_t addr;
+    int      len;                    /* watchpoint bytes, 1..4 */
+    int      hits;
+} shell_dbg_t;
+
 typedef struct shell_hline {        /* one remembered console line */
     int     node_id;
     int64_t ns;
@@ -109,6 +119,7 @@ typedef enum shell_block {
     SHELL_BLOCK_CMD,        /* `cmd`: until the node prints its prompt    */
     SHELL_BLOCK_EXPECT_NOT, /* `expect-not`: fail on a match, pass at time */
     SHELL_BLOCK_FAULT,      /* `expect-fault`: until a node takes a fault */
+    SHELL_BLOCK_HALT,       /* `expect-halt`: until a breakpoint/watchpoint hits */
 } shell_block_t;
 
 typedef struct shell_at_entry {
@@ -304,6 +315,12 @@ typedef struct shell_service {
     /* `transcript <file>`: every command line typed or piped is appended. */
     FILE    *transcript;
     char     transcript_path[SHELL_PATH_MAX];
+
+    /* Breakpoints and watchpoints (ARM nodes). */
+    shell_dbg_t dbg[SHELL_DBG_MAX];
+    int      dbg_count;
+    int      next_dbg_id;
+    int      halt_node_id;           /* expect-halt target                  */
 
     /* `restart` asked for; lines wait until the runner has restarted. */
     bool     restart_pending;

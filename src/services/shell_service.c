@@ -39,6 +39,7 @@ static void build_prompt(shell_service_t *s) {
     else if (s->block == SHELL_BLOCK_CMD) state = " [cmd]";
     else if (s->block == SHELL_BLOCK_EXPECT_NOT) state = " [expect-not]";
     else if (s->block == SHELL_BLOCK_FAULT) state = " [expect-fault]";
+    else if (s->block == SHELL_BLOCK_HALT) state = " [expect-halt]";
     else if (s->depth > 0) state = " [script]";
     snprintf(s->prompt, sizeof(s->prompt), "cooja %.3fs%s> ",
              (double)now / 1e9, state);
@@ -557,6 +558,7 @@ static const char *block_name(shell_block_t b) {
     case SHELL_BLOCK_CMD:        return "cmd";
     case SHELL_BLOCK_EXPECT_NOT: return "expect-not";
     case SHELL_BLOCK_FAULT:      return "expect-fault";
+    case SHELL_BLOCK_HALT:       return "expect-halt";
     default:                     return "nothing";
     }
 }
@@ -586,7 +588,8 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
                           s->block == SHELL_BLOCK_EXPECT ||
                           s->block == SHELL_BLOCK_CMD ||
                           s->block == SHELL_BLOCK_EXPECT_NOT ||
-                          s->block == SHELL_BLOCK_FAULT;
+                          s->block == SHELL_BLOCK_FAULT ||
+                          s->block == SHELL_BLOCK_HALT;
         if (time_block && !can_resume) {
             char reason[SHELL_REASON_MAX];
             char cause[SHELL_LINE_MAX + 96] = "";
@@ -747,6 +750,7 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
     s->origin.kind = SHELL_ORIGIN_STDIN;
     snprintf(s->origin.where, sizeof(s->origin.where), "stdin");
     s->next_at_id = 1;
+    s->next_dbg_id = 1;
     s->default_expect_timeout_ns = 30LL * 1000 * SHELL_MS_TO_NS;
     s->max_line = 128;   /* Contiki-NG SERIAL_LINE_CONF_BUFSIZE default */
     s->hist = calloc(SHELL_HISTORY_LINES, sizeof(*s->hist));
