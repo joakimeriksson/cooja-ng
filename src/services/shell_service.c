@@ -787,10 +787,14 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
 
 void shell_service_on_restart(shell_service_t *s) {
     if (!shell_service_active(s)) return;
+    /* A restart the stream itself asked for keeps the stream: stdin lines
+     * after `restart` run against the new simulation.  Script files are
+     * aborted — their state described the old run. */
     shell_script_abort(s);
     shell_script_at_remove(s, -1);
     s->trigger_count = 0;
     s->triggers_dropped = 0;
+    s->restart_pending = false;
 }
 
 int shell_service_report(shell_service_t *s, int64_t elapsed_ns) {

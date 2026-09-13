@@ -305,6 +305,9 @@ typedef struct shell_service {
     FILE    *transcript;
     char     transcript_path[SHELL_PATH_MAX];
 
+    /* `restart` asked for; lines wait until the runner has restarted. */
+    bool     restart_pending;
+
     /* Variables ($name). */
     shell_var_t vars[SHELL_VARS_MAX];
     int      var_count;

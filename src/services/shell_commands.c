@@ -9,6 +9,7 @@
 #include "arm_cpu.h"
 #include "arm_trustzone.h"
 #include "elf_loader.h"
+#include "radio_medium.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1318,6 +1319,268 @@ static int cmd_end(shell_service_t *s, int argc, char **argv, const char *line, 
     return 0;
 }
 
+/* --- environment: radio medium, capture, clocks, pins, LEDs, run ----------- */
+
+static int one_node(shell_service_t *s, const char *what, const char *arg, int *idx) {
+    long id;
+    if (shell_parse_int(arg, &id) != 0) { shell_error(s, "%s: expected one node id, got '%s'", what, arg); return -1; }
+    *idx = sim_control_index_of_id(s->ctl, (int)id);
+    if (*idx < 0) { shell_error(s, "no node with id %ld", id); return -1; }
+    return (int)id;
+}
+
+static int slot_id(shell_service_t *s, int idx) {
+    sim_control_node_info_t info;
+    return sim_control_describe(s->ctl, idx, &info) ? info.id : -1;
+}
+
+/* radio | radio range <tx> [interference] | radio success <tx> [rx] */
+static int cmd_radio(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    radio_medium_t *rm = &s->sim->radio_medium;
+    if (argc == 1) {
+        shell_out(s, "  medium: %s%s\n", rm->ops && rm->ops->name ? rm->ops->name : "?",
+                  rm->type == RADIO_MEDIUM_NONE ? " (every frame reaches every node)" : "");
+        if (rm->type != RADIO_MEDIUM_NONE)
+            shell_out(s, "  tx range %.1f m  interference range %.1f m  success tx %.2f rx %.2f\n",
+                      rm->udgm.tx_range, rm->udgm.interference_range,
+                      rm->udgm.success_ratio_tx, rm->udgm.success_ratio_rx);
+        if (rm->any_link_blocked) shell_out(s, "  some links are cut (see links)\n");
+        return 0;
+    }
+    if (rm->type == RADIO_MEDIUM_NONE) {
+        shell_error(s, "radio: the medium is 'none' (all-to-all); range and success do not apply");
+        return -1;
+    }
+    double a = 0, b = 0;
+    if (argc < 3 || argc > 4 || shell_parse_double(argv[2], &a) != 0 ||
+        (argc == 4 && shell_parse_double(argv[3], &b) != 0)) {
+        shell_error(s, "usage: radio [range <tx> [interference] | success <tx> [rx]]");
+        return -1;
+    }
+    if (!strcmp(argv[1], "range")) {
+        if (a < 0 || (argc == 4 && b < 0)) { shell_error(s, "radio range: metres must be >= 0"); return -1; }
+        rm->udgm.tx_range = a;
+        if (argc == 4) rm->udgm.interference_range = b;
+        radio_medium_compute_neighbors(rm);
+    } else if (!strcmp(argv[1], "success")) {
+        if (a < 0 || a > 1 || (argc == 4 && (b < 0 || b > 1))) { shell_error(s, "radio success: ratios are 0..1"); return -1; }
+        rm->udgm.success_ratio_tx = a;
+        if (argc == 4) rm->udgm.success_ratio_rx = b;
+    } else {
+        shell_error(s, "usage: radio [range <tx> [interference] | success <tx> [rx]]");
+        return -1;
+    }
+    return 0;
+}
+
+/* link <a> <b> off|on    (both directions)
+ * link <a> -> <b> off|on (one direction) */
+static int cmd_link(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    bool oneway = argc == 5 && !strcmp(argv[2], "->");
+    if (!(argc == 4 || oneway)) { shell_error(s, "usage: link <a> <b> off|on | link <a> -> <b> off|on"); return -1; }
+    const char *state = argv[argc - 1];
+    bool off = !strcmp(state, "off");
+    if (!off && strcmp(state, "on")) { shell_error(s, "link: expected off or on, got '%s'", state); return -1; }
+    int ia, ib;
+    if (one_node(s, "link", argv[1], &ia) < 0 || one_node(s, "link", argv[oneway ? 3 : 2], &ib) < 0) return -1;
+    if (ia == ib) { shell_error(s, "link: a node has no link to itself"); return -1; }
+    radio_medium_set_link_blocked(&s->sim->radio_medium, ia, ib, off);
+    if (!oneway) radio_medium_set_link_blocked(&s->sim->radio_medium, ib, ia, off);
+    return 0;
+}
+
+static int cmd_links(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)argv; (void)line; (void)argpos;
+    const radio_medium_t *rm = &s->sim->radio_medium;
+    int n = sim_control_node_count(s->ctl), cut = 0;
+    for (int a = 0; a < n; a++)
+        for (int b = 0; b < n; b++)
+            if (radio_medium_link_blocked(rm, a, b)) {
+                bool both = radio_medium_link_blocked(rm, b, a);
+                if (both && b < a) continue;
+                shell_out(s, "  %d %s %d cut\n", slot_id(s, a), both ? "<->" : "->", slot_id(s, b));
+                cut++;
+            }
+    if (!cut) shell_out(s, "no links are cut\n");
+    return 0;
+}
+
+static int cmd_neighbors(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    const radio_medium_t *rm = &s->sim->radio_medium;
+    int n = sim_control_node_count(s->ctl);
+    int only = -1;
+    if (argc == 2 && one_node(s, "neighbors", argv[1], &only) < 0) return -1;
+    if (rm->type == RADIO_MEDIUM_NONE) { shell_out(s, "medium 'none': every node hears every node\n"); return 0; }
+    for (int i = 0; i < n && i < RADIO_MEDIUM_MAX_NODES; i++) {
+        if (only >= 0 && i != only) continue;
+        char buf[512] = "";
+        const neighbor_list_t *nl = &rm->neighbors[i];
+        for (int k = 0; k < nl->count; k++) {
+            int j = nl->neighbors[k];
+            snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%d%s", k ? " " : "",
+                     slot_id(s, j), radio_medium_link_blocked(rm, i, j) ? "(cut)" : "");
+        }
+        shell_out(s, "  node %d hears: %s\n", slot_id(s, i), buf[0] ? buf : "(nobody)");
+    }
+    return 0;
+}
+
+static int cmd_pcap(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)line; (void)argpos;
+    if (!s->ctl->ops.pcap) { shell_error(s, "pcap is not available in this mode"); return -1; }
+    const char *path = strcmp(argv[1], "off") ? argv[1] : NULL;
+    if (s->ctl->ops.pcap(s->ctl->ops.user, path) != 0) { shell_error(s, "pcap: cannot write %s", argv[1]); return -1; }
+    return 0;
+}
+
+static int cmd_clock(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    int idx;
+    int id = one_node(s, "clock", argv[1], &idx);
+    if (id < 0) return -1;
+    if (argc == 2) {
+        sim_control_node_info_t info;
+        sim_control_describe(s->ctl, idx, &info);
+        shell_out(s, "node %d clock deviation %.10f\n", id, info.clock_deviation);
+        return 0;
+    }
+    double d;
+    if (shell_parse_double(argv[2], &d) != 0 || d <= 0.5 || d >= 1.5) {
+        shell_error(s, "clock: deviation must be a ratio between 0.5 and 1.5 (1.0 = exact)"); return -1;
+    }
+    if (!s->ctl->ops.set_clock_deviation) { shell_error(s, "clock is not available in this mode"); return -1; }
+    s->ctl->ops.set_clock_deviation(s->ctl->ops.user, idx, d);
+    return 0;
+}
+
+static int cmd_leds(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    int ids[SIM_EQ_MAX_NODES];
+    int n = shell_resolve_selector(s, argc == 2 ? argv[1] : "all", ids, SIM_EQ_MAX_NODES, false, NULL);
+    if (n < 0) return -1;
+    for (int k = 0; k < n; k++) {
+        uint8_t l[3];
+        int idx = sim_control_index_of_id(s->ctl, ids[k]);
+        if (!s->ctl->ops.leds || !s->ctl->ops.leds(s->ctl->ops.user, idx, l))
+            shell_out(s, "  node %d: no LEDs modelled\n", ids[k]);
+        else
+            shell_out(s, "  node %d: LED1 %s  LED2 %s  LED3 %s\n", ids[k],
+                      l[0] ? "on" : "off", l[1] ? "on" : "off", l[2] ? "on" : "off");
+    }
+    return 0;
+}
+
+/* "1.13", "P1.13", "A.3" (CC2538 ports A-D). */
+static int parse_pin(const char *spec, int *port, int *pin) {
+    const char *p = spec;
+    if (*p == 'P' || *p == 'p') p++;
+    if (isalpha((unsigned char)*p) && p[1] == '.') { *port = toupper((unsigned char)*p) - 'A'; p += 2; }
+    else {
+        char *end;
+        long v = strtol(p, &end, 10);
+        if (end == p || *end != '.') return -1;
+        *port = (int)v;
+        p = end + 1;
+    }
+    char *end;
+    long v = strtol(p, &end, 10);
+    if (end == p || *end) return -1;
+    *pin = (int)v;
+    return 0;
+}
+
+static int drive_pin(shell_service_t *s, const char *what, int idx, int port, int pin, int level) {
+    if (!s->ctl->ops.set_input_pin ||
+        s->ctl->ops.set_input_pin(s->ctl->ops.user, idx, port, pin, level) != 0) {
+        shell_error(s, "%s: node %d has no modelled GPIO input %d.%d", what, slot_id(s, idx), port, pin);
+        return -1;
+    }
+    sim_schedule_mote_wakeup_if_earlier(s->sim, idx, now_ns(s));
+    return 0;
+}
+
+/* Schedule the release half of a pulse/click through the at-queue. */
+static int schedule_release(shell_service_t *s, int64_t dur, const char *cmd) {
+    if (shell_script_at_add(s, now_ns(s) + dur, 0, cmd) < 0) {
+        shell_error(s, "at queue full (max %d)", SHELL_ATQ_MAX); return -1;
+    }
+    return 0;
+}
+
+/* gpio <node> <port.pin> high|low|pulse [duration] */
+static int cmd_gpio(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    int idx;
+    int id = one_node(s, "gpio", argv[1], &idx);
+    if (id < 0) return -1;
+    int port, pin;
+    if (parse_pin(argv[2], &port, &pin) != 0) { shell_error(s, "gpio: expected <port>.<pin>, got '%s'", argv[2]); return -1; }
+    const char *op = argv[3];
+    if (!strcmp(op, "high") || !strcmp(op, "low"))
+        return drive_pin(s, "gpio", idx, port, pin, op[0] == 'h');
+    if (!strcmp(op, "pulse")) {
+        int64_t dur = 100 * SHELL_MS_TO_NS;
+        if (argc == 5 && parse_dur(s, argv[4], &dur) != 0) return -1;
+        if (drive_pin(s, "gpio", idx, port, pin, 1) != 0) return -1;
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "gpio %d %d.%d low", id, port, pin);
+        return schedule_release(s, dur, cmd);
+    }
+    shell_error(s, "gpio: expected high, low or pulse, got '%s'", op);
+    return -1;
+}
+
+/* button <node> press|release|click [duration] */
+static int cmd_button(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    int idx;
+    int id = one_node(s, "button", argv[1], &idx);
+    if (id < 0) return -1;
+    int port, pin;
+    bool active_low;
+    if (!s->ctl->ops.button_pin || s->ctl->ops.button_pin(s->ctl->ops.user, idx, &port, &pin, &active_low) != 0) {
+        shell_error(s, "button: node %d's board describes no user button (use gpio)", id); return -1;
+    }
+    const char *op = argv[2];
+    int pressed = active_low ? 0 : 1;
+    if (!strcmp(op, "press"))   return drive_pin(s, "button", idx, port, pin, pressed);
+    if (!strcmp(op, "release")) return drive_pin(s, "button", idx, port, pin, !pressed);
+    if (!strcmp(op, "click")) {
+        int64_t dur = 100 * SHELL_MS_TO_NS;
+        if (argc == 4 && parse_dur(s, argv[3], &dur) != 0) return -1;
+        if (drive_pin(s, "button", idx, port, pin, pressed) != 0) return -1;
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "button %d release", id);
+        return schedule_release(s, dur, cmd);
+    }
+    shell_error(s, "button: expected press, release or click, got '%s'", op);
+    return -1;
+}
+
+static int cmd_restart(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)argv; (void)line; (void)argpos;
+    if (!s->ctl->ops.restart) { shell_error(s, "restart is not available in this mode"); return -1; }
+    if (shell_refuse_external_clock(s, "restart")) return -1;
+    s->ctl->ops.restart(s->ctl->ops.user);
+    s->restart_pending = true;      /* the next line runs after the restart */
+    return 0;
+}
+
+static int cmd_ui(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)line; (void)argpos;
+    long port;
+    if (shell_parse_int(argv[1], &port) != 0 || port < 1 || port > 65535) { shell_error(s, "ui: expected a TCP port"); return -1; }
+    if (!s->ctl->ops.start_ui || s->ctl->ops.start_ui(s->ctl->ops.user, (int)port) != 0) {
+        shell_error(s, "ui: cannot start the web UI on port %ld (already running, or the port is taken)", port);
+        return -1;
+    }
+    shell_out(s, "web UI on http://localhost:%ld/\n", port);
+    return 0;
+}
+
 /* --- console history, watches, transcript, stats -------------------------- */
 
 static bool id_in_list(const int *ids, int n, int id) {
@@ -1598,6 +1861,17 @@ static const shell_command_t commands[] = {
     { "time",       "time",                            "print the simulation time", 0, 0, IMM, cmd_time },
     { "exit",       "exit",                            "end the run (normal teardown, reports, --save-config)", 0, 0, IMM, cmd_exit },
     { "quit",       "quit",                            "same as exit", 0, 0, IMM, cmd_exit },
+    { "radio",      "radio [range <tx> [interference] | success <tx> [rx]]", "show or change the radio medium (UDGM range in metres, success ratios 0..1)", 0, 3, IMM, cmd_radio },
+    { "link",       "link <a> <b> off|on | link <a> -> <b> off|on", "cut or restore a radio link (both directions, or one)", 3, 4, IMM, cmd_link },
+    { "links",      "links",                           "list cut links", 0, 0, IMM, cmd_links },
+    { "neighbors",  "neighbors [node]",                "who each node hears (the medium's neighbour lists)", 0, 1, IMM, cmd_neighbors },
+    { "pcap",       "pcap <file>|off",                 "start or stop an 802.15.4 capture", 1, 1, IMM, cmd_pcap },
+    { "clock",      "clock <node> [deviation]",        "show or set a node's clock deviation (1.0 exact, e.g. 1.00002 = 20 ppm fast)", 1, 2, IMM, cmd_clock },
+    { "leds",       "leds [nodes]",                    "LED states", 0, 1, IMM, cmd_leds },
+    { "gpio",       "gpio <node> <port>.<pin> high|low|pulse [duration]", "drive a GPIO input pin (MSP430 P1-P10, CC2538 A-D, nRF54L15 P0-P2 without GPIOTE)", 3, 4, IMM, cmd_gpio },
+    { "button",     "button <node> press|release|click [duration]", "the board's user button (click = press, release after 100ms)", 2, 3, IMM, cmd_button },
+    { "restart",    "restart",                         "restart the simulation from its configuration (aborts scripts, clears at)", 0, 0, IMM, cmd_restart },
+    { "ui",         "ui <port>",                       "start the live web UI now", 1, 1, IMM, cmd_ui },
     { "stats",      "stats",                           "RF bytes, frames, collisions, console bytes; per-node cycles and instructions", 0, 0, IMM, cmd_stats },
     { "tail",       "tail [-n N] [nodes]",             "the last N console lines (default 20) from the remembered 2000", 0, 3, IMM, cmd_tail },
     { "grep",       "grep [-re] [-c] \"<pattern>\" [nodes]", "remembered console lines matching a pattern (-c: just count)", 1, 4, IMM, cmd_grep },

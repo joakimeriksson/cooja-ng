@@ -11,6 +11,7 @@
 #include "shell_parse.h"
 #include "sim_mote.h"
 #include "arm_cpu.h"
+#include "radio_medium.h"
 #include "sim_runtime.h"
 #include "sim_control.h"
 #include "../src/services/shell_internal.h"
@@ -158,11 +159,31 @@ static void *m_get_interface(void *u, int idx, int iface) {
     return (idx == 0 && iface == SIM_MOTE_IFACE_ARM_CPU) ? &mock_cpu : NULL;
 }
 
+static int m_pin_port, m_pin_pin, m_pin_level, m_pin_calls, m_restarts;
+static double m_deviation = 1.0;
+static int m_set_input_pin(void *u, int idx, int port, int pin, int level) {
+    (void)u;
+    if (idx != 0) return -1;              /* only node 1 has GPIO */
+    m_pin_port = port; m_pin_pin = pin; m_pin_level = level; m_pin_calls++;
+    return 0;
+}
+static int m_button_pin(void *u, int idx, int *port, int *pin, bool *active_low) {
+    (void)u;
+    if (idx != 0) return -1;
+    *port = 1; *pin = 13; *active_low = true;
+    return 0;
+}
+static bool m_leds(void *u, int idx, uint8_t l[3]) { (void)u; l[0] = 1; l[1] = 0; l[2] = (uint8_t)idx; return true; }
+static void m_set_clock(void *u, int idx, double d) { (void)u; (void)idx; m_deviation = d; }
+static void m_restart(void *u) { (void)u; m_restarts++; }
+
 static sim_control_ops_t mock_ops = {
     .node_count = m_node_count, .describe = m_describe, .inject_serial = m_inject,
     .set_position = m_set_position, .reboot = m_reboot, .start = m_start,
     .remove = m_remove, .add = m_add, .firmware_for_type = m_fw_for_type,
     .get_interface = m_get_interface,
+    .set_input_pin = m_set_input_pin, .button_pin = m_button_pin, .leds = m_leds,
+    .set_clock_deviation = m_set_clock, .restart = m_restart,
 };
 
 static sim_control_t mock_ctl;
@@ -1020,6 +1041,63 @@ static void test_workflow(void) {
     free(sh.hist); sh.hist = NULL;
 }
 
+static void test_environment(void) {
+    const char *p;
+    mock_reset();
+    radio_medium_init(&mock_sim.radio_medium, 3);
+    radio_medium_configure_udgm(&mock_sim.radio_medium, 50.0, 100.0, 1.0, 1.0);
+    for (int i = 0; i < 3; i++) radio_medium_set_position(&mock_sim.radio_medium, i, i * 10.0, 0);
+    radio_medium_compute_neighbors(&mock_sim.radio_medium);
+    radio_medium_t *rm = &mock_sim.radio_medium;
+    m_pin_calls = 0; m_restarts = 0; m_deviation = 1.0;
+    p = write_script("e1",
+        "link 1 2 off\n"
+        "link 3 -> 1 off\n"
+        "radio range 25 40\n"
+        "radio success 0.5\n"
+        "clock 2 1.00002\n"
+        "gpio 1 P1.6 high\n"
+        "button 1 click 20ms\n"
+        "gpio 1 2.3 pulse 5ms\n"
+        "leds\n"
+        "pass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(!sh.failed, "environment commands run (%s)", sh.fail_reason);
+    CHECK(!radio_medium_filter_frame(rm, 0, 1) && !radio_medium_filter_frame(rm, 1, 0), "link 1 2 off cuts both ways");
+    CHECK(!radio_medium_filter_frame(rm, 2, 0) && radio_medium_filter_frame(rm, 0, 2), "link 3 -> 1 off cuts one way");
+    CHECK(!radio_medium_filter_byte(rm, 0, 1, 0x7a), "byte path honours the cut too");
+    CHECK(rm->udgm.tx_range == 25.0 && rm->udgm.interference_range == 40.0 && rm->udgm.success_ratio_tx == 0.5,
+          "radio range / success");
+    CHECK(m_deviation == 1.00002, "clock deviation set");
+    CHECK(m_pin_calls == 3 && m_pin_port == 2 && m_pin_pin == 3 && m_pin_level == 1, "gpio pulse drives high first");
+    CHECK(sh.atq_count == 2, "click and pulse schedule their releases (%d)", sh.atq_count);
+    advance(5 * SHELL_MS_TO_NS); shell_script_tick(&sh);
+    CHECK(m_pin_level == 0 && m_pin_pin == 3, "pulse released after 5 ms");
+    advance(15 * SHELL_MS_TO_NS); shell_script_tick(&sh);
+    CHECK(m_pin_port == 1 && m_pin_pin == 13 && m_pin_level == 1, "button release drives the active-low pin high");
+    unlink(p);
+
+    mock_reset();
+    radio_medium_init(&mock_sim.radio_medium, 3);
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "gpio 2 1.1 high");      /* node 2: no GPIO */
+    shell_enqueue_line(&sh, "button 3 press");
+    shell_enqueue_line(&sh, "gpio 1 bad high");
+    shell_enqueue_line(&sh, "radio range 10");       /* medium none */
+    shell_enqueue_line(&sh, "link 1 1 off");
+    shell_enqueue_line(&sh, "clock 1 3");
+    shell_script_tick(&sh);
+    CHECK(!sh.failed && sh.atq_count == 0, "unsupported pins, bad pin, none medium, self link, bad deviation are errors");
+    shell_enqueue_line(&sh, "restart");
+    shell_enqueue_line(&sh, "echo after");
+    shell_script_tick(&sh);
+    CHECK(m_restarts == 1 && sh.restart_pending && sh.qcount == 1, "lines wait for the restart");
+    shell_service_on_restart(&sh);
+    shell_script_tick(&sh);
+    CHECK(!sh.restart_pending && sh.qcount == 0, "the stream resumes after the restart");
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -1038,6 +1116,7 @@ int run_shell_tests(int verbose) {
     test_node_commands();
     test_arm_inspection();
     test_workflow();
+    test_environment();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }

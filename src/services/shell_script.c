@@ -715,7 +715,7 @@ void shell_script_tick(shell_service_t *s) {
 
     char line[SHELL_LINE_MAX];
     int lines = 0;
-    while (s->block == SHELL_BLOCK_NONE &&
+    while (s->block == SHELL_BLOCK_NONE && !s->restart_pending &&
            !sim_runtime_stop_requested(s->sim) && lines++ < 10000) {
         bool from_file = s->depth > 0;
         const char *l = next_line(s, line, sizeof(line));

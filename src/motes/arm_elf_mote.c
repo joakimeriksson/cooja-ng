@@ -645,6 +645,37 @@ static void arm_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
     cpu->cycles = now_ns * cpu->cpu_freq_hz / 1000000000LL;
 }
 
+/* GPIO input from outside: CC2538 latches the level and raises the edge
+ * interrupt the firmware configured; nRF54L15 overrides IN for the pin (no
+ * GPIOTE modelled); nRF52840 has no GPIO model. */
+static int arm_mote_set_input_pin(sim_mote_t *m, int port, int pin, int level) {
+    arm_platform_t *plat = &MOTE_IMPL(m)->plat.arm;
+    cc2538_soc_t   *cc   = arm_platform_cc2538(plat);
+    nrf54l15_soc_t *nrfl = arm_platform_nrf54l15(plat);
+    if (cc) {
+        if (port < 0 || port >= CC2538_GPIO_NUM_PORTS || pin < 0 || pin > 7) return -1;
+        bool old = (cc->gpio.ports[port].data >> pin) & 1u;
+        cc2538_gpio_set_input(&cc->gpio, port, pin, level != 0);
+        if (old != (level != 0))
+            cc2538_gpio_force_irq_edge(&cc->gpio, port, pin, level != 0);
+        return 0;
+    }
+    if (nrfl) return nrf54l15_soc_set_input_pin(nrfl, port, pin, level);
+    return -1;
+}
+
+static int arm_mote_button_pin(const sim_mote_t *m, int *port, int *pin, bool *active_low) {
+    const arm_platform_config_t *cfg = MOTE_IMPL(m)->plat.arm.config;
+    if (!cfg) return -1;
+    const arm_gpio_pin_t *b = &cfg->button;
+    /* All-zero = not described (P0.0 active-low, the XIAO button, is not). */
+    if (b->port < 0 || (b->port == 0 && b->pin == 0 && !b->active_low)) return -1;
+    *port = b->port;
+    *pin = b->pin;
+    *active_low = b->active_low;
+    return 0;
+}
+
 static void arm_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
     arm_platform_t *plat = &MOTE_IMPL(m)->plat.arm;
     cc2538_soc_t *soc = arm_platform_cc2538(plat);
@@ -707,6 +738,8 @@ const sim_mote_ops_t arm_elf_mote_ops = {
     .reset_time      = arm_mote_reset_time,
     .ui_radio_state  = NULL, /* CC2538 pushes state via async callback */
     .ui_leds         = arm_mote_ui_leds,
+    .set_input_pin   = arm_mote_set_input_pin,
+    .button_pin      = arm_mote_button_pin,
     .dump_diagnostics = arm_mote_dump_diagnostics,
     .get_interface   = arm_mote_get_interface,
     .receive_frame   = NULL, /* per-byte / staged delivery */

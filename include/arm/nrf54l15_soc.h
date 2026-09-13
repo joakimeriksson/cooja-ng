@@ -111,6 +111,10 @@ typedef struct nrf54l_uarte_state {
 } nrf54l_uarte_state_t;
 
 struct nrf54l15_soc;
+/* Drive an input pin of GPIO port 0..2 from outside (see in_forced).
+ * Returns 0, or -1 for a bad port/pin. */
+int nrf54l15_soc_set_input_pin(struct nrf54l15_soc *soc, int port, int pin, int level);
+
 /* Feed received bytes to the console (the harness's serial input). */
 void nrf54l_uarte_feed_rx(struct nrf54l15_soc *soc, const uint8_t *buf, int len);
 
@@ -540,6 +544,11 @@ typedef struct nrf54l_gpio_state {
     uint32_t        dir;          /* DIR (1 = output) — mirrors PIN_CNF[n].DIR */
     uint32_t        pin_cnf[32];  /* PIN_CNF[n] @ 0x80 (nrf_gpio_cfg writes these) */
     uint64_t        out_toggles;  /* total OUT-bit flips since reset */
+    /* Input pins driven from outside (shell `gpio` / `button`).  IN reads
+     * the OUT latch back (no input model), except for pins in in_forced,
+     * which read in_level.  No GPIOTE/SENSE interrupt is raised. */
+    uint32_t        in_forced;
+    uint32_t        in_level;
     /* Fired after any OUT / DIR / PIN_CNF change so the SoC can forward
      * chip-select edges to off-SoC SPI chips. */
     nrf54l_gpio_change_cb change_cb;

@@ -104,6 +104,18 @@ typedef struct sim_control_ops {
     int   (*save_config)(void *u, const char *path);
     /* Simulation-wide counters (NULL = unavailable). */
     void  (*stats)(void *u, sim_control_stats_t *out);
+    /* Start (path) or stop (NULL) the 802.15.4 PCAP capture.  0 on success. */
+    int   (*pcap)(void *u, const char *path);
+    /* Set a slot's clock deviation (1.0 = exact, Cooja's MspClock). */
+    void  (*set_clock_deviation)(void *u, int idx, double deviation);
+    /* Restart the run from its configuration at the next loop turn. */
+    void  (*restart)(void *u);
+    /* Start the live web UI on a port.  0 on success. */
+    int   (*start_ui)(void *u, int port);
+    /* sim_mote_ops_t pass-throughs; -1 / false = unsupported. */
+    int   (*set_input_pin)(void *u, int idx, int port, int pin, int level);
+    int   (*button_pin)(void *u, int idx, int *port, int *pin, bool *active_low);
+    bool  (*leds)(void *u, int idx, uint8_t leds[3]);
 } sim_control_ops_t;
 
 /* Flags for the mutation calls. */
