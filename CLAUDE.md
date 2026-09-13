@@ -121,6 +121,9 @@ tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 k
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15-cmd.cnsh  # `cmd`: send a
                                             # line, wait for the node's prompt, check its output
+./build/test_runner test configs/shell-tz-nrf54l15-xiao.yaml --script test/scripts/tz-securefault-nrf54l15-xiao.cnsh
+                                            # TrustZone from the shell: secure + `ns` shells, tz/faults,
+                                            # SecureFault injected with `reg pc =`, caught by expect-fault
 ./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)
 tools/check-shell.sh                        # scripted pass/fail, piped session (sequential, deterministic),
                                             # --paused, speed change, deadlock, determinism diffs

@@ -1,0 +1,14 @@
+# The nRF54L15 TrustZone-M split image (Secure + Normal world on one XIAO
+# node) with no test section: driven from the Cooja-NG shell or a script
+# (docs/shell.md), e.g. test/scripts/tz-securefault-nrf54l15-xiao.cnsh.
+
+version: 2
+title: "nRF54L15 TrustZone-M split image, shell-driven (XIAO nRF54L15)"
+timeout_ms: 10000
+seed: 42
+
+mote_types:
+  - { name: normal-world-example, firmware: firmware/nrf54l15-xiao/normal-world-example.nrf54l15-xiao, secure_firmware: firmware/nrf54l15-xiao/secure-world-example.nrf54l15-xiao }
+
+nodes:
+  - { type: normal-world-example, id: 1, x: 0.0, y: 0.0 }

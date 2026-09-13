@@ -114,6 +114,27 @@ reports an error).  A line reaching `max-line` bytes (default 128, Contiki-NG's
 serial-line buffer) prints a warning, since the node would truncate it;
 `set max-line 0` silences it.
 
+**Variables**
+
+| command | |
+|---|---|
+| `var`, `var <name>`, `var <name> <value...>`, `var -d <name>` | list, show, set (spacing kept), delete |
+| `capture <var> <nodes\|any> "<regex>" [timeout]` | block until a console line matches the extended regex; group 1 (or the whole match) goes into `$var` |
+
+`$name` and `${name}` expand in every command line before it is parsed —
+also inside double quotes, never inside single quotes, after `\`, or in a
+comment.  `$$` is a literal `$`, so `at +5s echo $$x` expands `$x` when the
+`at` fires rather than when it is scheduled.  An undefined variable is an
+error.  `cmd -c <var> "<regex>"`, `expect -c <var>`, `sym -c`, `reg -c` and
+`mem -c` store into variables too; `assert var <name> <op> <value>` compares
+(numerically when both sides are numbers, else `==`/`!=` as text).
+
+```
+cmd -c addr "(fe80::[0-9a-f:]+)" 1 ip-addr
+sendln 2 ping $addr
+expect 2 "Received ping reply" 5s
+```
+
 **Scheduling**
 
 | command | |
@@ -123,8 +144,9 @@ serial-line buffer) prints a warning, since the node would truncate it;
 | `at list`, `at clear <id>\|all` | list / cancel scheduled commands (`at` and `every`); `atq` and `atrm` are aliases, as in the Unix commands |
 
 `at`, `every` and `on` run one command beside the command stream, so they
-refuse the commands that would hold it: `cmd`, `expect`, `sleep`,
-`wait-until`, `step`, `source`, and `run` with a duration.  Put such sequences in a script.
+refuse the commands that would hold it: `cmd`, `expect`, `expect-not`,
+`capture`, `expect-fault`, `sendfile`, `sleep`, `wait-until`, `step`, `source`,
+and `run` with a duration.  Put such sequences in a script.
 An error in a scheduled command fails the script only if a script file
 scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 
@@ -133,7 +155,9 @@ scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 | command | |
 |---|---|
 | `source <file>` | run a script file (nested up to 8 deep); from a script, a relative path is looked up next to that script first, then in the working directory |
-| `expect <nodes\|any> "<pattern>" [timeout]` | block until a console line contains the pattern (substring); the timeout (default 30 s, `set expect-timeout`) fails the script |
+| `expect [-re] [-n N] [-c <var>] <nodes\|any> "<pattern>" [timeout]` | block until N console lines (default 1) contain the pattern — a substring, or with `-re` a POSIX extended regex; `-c` captures group 1 (or the match; for a substring, the line); the timeout (default 30 s, `set expect-timeout`) fails the script |
+| `expect-not [-re] <nodes\|any> "<pattern>" <duration>` | block for the duration; a matching line fails the script at once |
+| `sendfile [-t <timeout>] <node> <path>` | send a file to a node line by line, each as a `cmd` (waits for the prompt); lines go verbatim, no comments or variables |
 | `sleep <duration>`, `wait-until <time>` | block for a duration / until a time |
 | `assert time <op> <t>`, `assert nodes <op> N`, `assert node <id> active\|removed\|exists`, `assert count "<pat>" <op> N` | checks (`== != < <= > >=`); a false assert fails the script |
 | `pass`, `fail [message]` | end the script with a verdict |
@@ -142,13 +166,45 @@ scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 | `on <nodes\|any> "<pattern>" <command...>` | run a command whenever a line matches (e.g. `on any "SecureFault" fail "unexpected fault"`) |
 | `set [expect-timeout <duration> \| max-line <bytes> \| prompt "<glob>"]`, `echo <text...>`, `save-config <file.yaml>`, `help [command]` | `save-config` records the time run so far as `timeout_ms` |
 
+**Inspecting a node** (ARM nodes; the debugger's view)
+
+| command | |
+|---|---|
+| `sym [-c <var>] <node> <symbol>` | address of a symbol in the node's firmware, then its Secure-world image |
+| `mem [-w] [-c <var>] <node> <addr\|sym[+off]> [count]` | hexdump bytes (default 64), or 32-bit little-endian words with `-w` (default 8) |
+| `mem [-w] <node> <addr\|sym> = <value...>` | write bytes (or words); flash is refused, as on hardware |
+| `reg [-c <var>] <node> [name]`, `reg <node> <name> = <value>` | registers r0-r12 sp lr pc xpsr primask basepri faultmask, plus msp_s psp_s msp_ns psp_ns control_s control_ns on ARMv8-M; writes r0-r12, sp, lr, pc, xpsr — e.g. to inject a fault |
+| `tz <node>` | TrustZone-M: security state, SG / BXNS / secure-exception counters, SFSR+SFAR decoded, SAU regions, banked stacks |
+| `faults <node>` | HardFault / MemManage / BusFault / UsageFault / SecureFault entry counts, the last fault's pc and the security state it came from, SFSR/SFAR |
+| `expect-fault <node> [kind[,kind]\|any] [timeout]` | block until the node takes one of those faults (checked every simulated ms); the timeout fails the script |
+| `assert mem <node> <addr\|sym> <op> <word>`, `assert node <id> secure\|non-secure` | memory and security-state checks |
+
+Memory access bypasses TrustZone (it is the debugger's view, like a probe on
+the SWD port); reads of peripheral registers go through the peripheral model
+and can have its read side effects.  CFSR/HFSR are not modelled; the fault
+counters are, and they survive a SoC reset.
+
+Example, `test/scripts/tz-securefault-nrf54l15-xiao.cnsh` on
+`configs/shell-tz-nrf54l15-xiao.yaml`:
+
+```
+wait-until 3s
+assert node 1 non-secure
+tz 1
+reg 1 pc = 0x00001000                     # branch the Normal world into Secure flash
+expect-fault 1 securefault 100ms
+faults 1
+pass
+```
+
 ## Scripts
 
 A script is one command per line.  Commands run **sequentially in
 simulation time**: non-blocking commands run back to back at the same
-instant, a blocking command (`cmd`, `expect`, `sleep`, `wait-until`,
-`run <dur>`, `step`) holds the stream until it is satisfied, and then the next
-line runs at exactly that instant.  So
+instant, a blocking command (`cmd`, `expect`, `expect-not`, `capture`,
+`expect-fault`, `sendfile`, `sleep`, `wait-until`, `run <dur>`, `step`) holds
+the stream until it is satisfied, and then the next line runs at exactly that
+instant.  So
 
 ```
 sendln 1 help
@@ -260,8 +316,8 @@ pass
 - An `on` command that sends to a node whose output matches the same pattern
   again (for example an echoing shell) feeds back on itself; more than 16
   firings between two slices are dropped with a warning.
-- Not yet available from the shell (planned follow-ups): memory/register
-  peek and poke, per-node TrustZone counters, radio-medium knobs.
+- Not yet available from the shell (planned follow-ups): breakpoints and
+  watchpoints, MSP430 memory/registers, radio-medium knobs, input pins.
 
 ## Implementation
 

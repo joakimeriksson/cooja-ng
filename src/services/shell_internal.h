@@ -94,6 +94,34 @@ void shell_script_on_uart_byte(shell_service_t *s, int idx, uint8_t byte,
                                int64_t ns);
 /* `console`: switch the terminal to talking to one node. */
 int  shell_console_enter(shell_service_t *s, int idx, int node_id);
+
+/* Variables. */
+const char *shell_var_get(void *s, const char *name);   /* shell_var_lookup_fn */
+int  shell_var_set(shell_service_t *s, const char *name, const char *value);
+bool shell_var_name_ok(const char *name);
+
+/* Compile a POSIX extended regex (heap); NULL with `err` filled on error. */
+void *shell_regex_compile(const char *pattern, char *err, size_t errlen);
+void  shell_regex_free(void **re);
+/* Substring or regex match; with `cap`, the capture (group 1, else the whole
+ * match; for a substring, the whole line). */
+bool  shell_line_match(const char *line, const char *pattern, void *re,
+                       char *cap, size_t caplen);
+
+/* expect / capture / expect-not.  `re` (may be NULL) is adopted. */
+void shell_script_block_expect2(shell_service_t *s, shell_block_t kind,
+                                const char *pattern, void *re, int needed,
+                                const char *var, const int *ids, int nids,
+                                bool any, int64_t timeout_ns);
+/* `cmd -c var "re"`: set after shell_script_block_cmd.  `re` is adopted. */
+void shell_script_cmd_capture(shell_service_t *s, const char *var, void *re);
+/* `expect-fault`. */
+void shell_script_block_fault(shell_service_t *s, int idx, int node_id,
+                              unsigned mask, const char *what,
+                              const uint64_t *base, int64_t timeout_ns);
+/* `sendfile`: push a file whose lines are sent to a node as `cmd`s. */
+int  shell_script_sendfile(shell_service_t *s, const char *path, int idx,
+                           int node_id, int64_t timeout_ns);
 int  shell_script_at_add(shell_service_t *s, int64_t at_ns, int64_t period_ns,
                          const char *cmd);
 int  shell_script_at_remove(shell_service_t *s, int id);   /* id < 0 = all */

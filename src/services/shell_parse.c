@@ -31,6 +31,7 @@ static int decode_escape(const char **pp, char *out, char *err, size_t errlen) {
     case '\'': c = '\''; break;
     case ' ': c = ' '; break;
     case '#': c = '#'; break;
+    case '$': c = '$'; break;
     case 'x': {
         int h = hexval(p[1]), l = (h >= 0) ? hexval(p[2]) : -1;
         if (h < 0 || l < 0) {
@@ -300,6 +301,68 @@ int shell_unquote_rest(const char *rest, char *out, size_t outlen,
     }
     out[keep] = '\0';
     return (int)keep;
+}
+
+static bool is_name_start(int c) { return isalpha(c) || c == '_'; }
+static bool is_name_char(int c)  { return isalnum(c) || c == '_'; }
+
+int shell_expand_vars(const char *in, char *out, size_t outlen,
+                      shell_var_lookup_fn lookup, void *user,
+                      char *err, size_t errlen) {
+    size_t n = 0;
+    char q = 0;
+    bool word_start = true;
+    if (err && errlen) err[0] = '\0';
+#define EMIT(ch) do { if (n + 1 >= outlen) { if (err) snprintf(err, errlen, "line too long after expanding variables"); return -1; } out[n++] = (ch); } while (0)
+    for (const char *p = in; *p; p++) {
+        char c = *p;
+        if (!q && c == '#' && word_start) {          /* comment: copy verbatim */
+            for (; *p; p++) EMIT(*p);
+            break;
+        }
+        if (c == '\\' && q != '\'' && p[1]) {      /* escaped char, incl. \$ */
+            EMIT(c);
+            EMIT(p[1]);
+            p++;
+            word_start = false;
+            continue;
+        }
+        if (c == '$' && q != '\'') {
+            if (p[1] == '$') { EMIT('$'); p++; word_start = false; continue; }
+            char name[64];
+            size_t k = 0;
+            const char *e = p + 1;
+            if (*e == '{') {
+                e++;
+                while (*e && *e != '}' && k < sizeof(name) - 1) name[k++] = *e++;
+                if (*e != '}' || k == 0) {
+                    if (err) snprintf(err, errlen, "bad ${...} variable reference");
+                    return -1;
+                }
+                e++;
+            } else if (is_name_start((unsigned char)*e)) {
+                while (is_name_char((unsigned char)*e) && k < sizeof(name) - 1) name[k++] = *e++;
+            }
+            if (k == 0) { EMIT('$'); word_start = false; continue; }   /* a lone $ */
+            name[k] = '\0';
+            const char *val = lookup ? lookup(user, name) : NULL;
+            if (!val) {
+                if (err) snprintf(err, errlen, "undefined variable '%s'", name);
+                return -1;
+            }
+            for (const char *v = val; *v; v++) EMIT(*v);
+            p = e - 1;
+            word_start = false;
+            continue;
+        }
+        if (!q && (c == '"' || c == '\'')) q = c;
+        else if (q && c == q) q = 0;
+        EMIT(c);
+        word_start = !q && isspace((unsigned char)c);
+    }
+#undef EMIT
+    out[n] = '\0';
+    return (int)n;
 }
 
 bool shell_glob_match(const char *p, const char *t) {

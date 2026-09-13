@@ -59,6 +59,17 @@ int shell_parse_selector(const char *s, const int *ids, int nids,
                          int *out, int max_out, bool allow_any, bool *any,
                          char *err, size_t errlen);
 
+/* Variable expansion for a command line, before tokenizing: $name and
+ * ${name} are replaced by lookup(user, name) (NULL = undefined, an error);
+ * $$ is a literal $ (so `at +5s echo $$x` expands when the at fires); a $ not
+ * followed by a name stays; nothing inside '...', after a comment '#', or
+ * after a backslash (\$) is expanded.  Values are substituted as text, before
+ * quotes are processed.  Returns the length or -1 with `err` filled. */
+typedef const char *(*shell_var_lookup_fn)(void *user, const char *name);
+int shell_expand_vars(const char *in, char *out, size_t outlen,
+                      shell_var_lookup_fn lookup, void *user,
+                      char *err, size_t errlen);
+
 /* Whole-string glob match with '*' (any run, including empty) as the only
  * wildcard.  Used for shell prompts: "#*> " is the Contiki-NG prompt. */
 bool shell_glob_match(const char *pattern, const char *text);

@@ -1,0 +1,23 @@
+# TrustZone-M from the Cooja-NG shell, on the checked-in XIAO split image:
+# the Secure world's shell answers, the Normal world's shell answers through
+# `ns`, and a Non-secure branch into Secure flash is taken as a SecureFault.
+#   ./build/test_runner test configs/shell-tz-nrf54l15-xiao.yaml --script test/scripts/tz-securefault-nrf54l15-xiao.cnsh
+log off all
+wait-until 2s
+cmd -e "Sends a line to the normal world's shell" 1 help
+sendln 1 ns help                          # forwarded: no usable prompt (docs/shell.md)
+expect 1 "rpl-global-repair" 2s
+
+# Idle in the Normal world, with world transitions already counted.
+wait-until 3s
+assert node 1 non-secure
+tz 1
+faults 1
+sym -c main 1 main                        # the Non-secure image's main
+mem -w 1 $main 2
+
+# Branch the Non-secure world into Secure flash.
+reg 1 pc = 0x00001000
+expect-fault 1 securefault 100ms
+faults 1
+pass

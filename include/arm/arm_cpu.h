@@ -326,6 +326,16 @@ typedef struct arm_cpu {
     uint64_t  tz_bxns_count;         /* BXNS returns to Non-secure */
     uint64_t  tz_secexc_count;       /* secure exceptions taken from NS */
 
+    /* Exception entries per system exception number (1..15) and the most
+     * recent fault (HardFault..SecureFault).  Instrumentation for the shell's
+     * `faults` / `expect-fault`: written only at exception entry, never read
+     * by the core, and — like the counters above — not cleared by
+     * arm_cpu_reset, so a fault handler that resets the SoC keeps them. */
+    uint64_t  exc_entry_count[16];
+    int       last_fault_exc;        /* 3..7, 0 = none yet                  */
+    uint32_t  last_fault_pc;         /* PC when the fault was taken         */
+    bool      last_fault_bg_secure;  /* security state it was taken from    */
+
     /* ROM utility traps */
     uint32_t  rom_util_memcpy;    /* Address of rom_util_memcpy entry */
     uint32_t  rom_util_memset;    /* Address of rom_util_memset entry */

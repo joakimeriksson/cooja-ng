@@ -37,6 +37,8 @@ static void build_prompt(shell_service_t *s) {
     else if (s->block == SHELL_BLOCK_WAIT_UNTIL) state = " [wait]";
     else if (s->block == SHELL_BLOCK_RUN) state = " [run]";
     else if (s->block == SHELL_BLOCK_CMD) state = " [cmd]";
+    else if (s->block == SHELL_BLOCK_EXPECT_NOT) state = " [expect-not]";
+    else if (s->block == SHELL_BLOCK_FAULT) state = " [expect-fault]";
     else if (s->depth > 0) state = " [script]";
     snprintf(s->prompt, sizeof(s->prompt), "cooja %.3fs%s> ",
              (double)now / 1e9, state);
@@ -544,6 +546,8 @@ static const char *block_name(shell_block_t b) {
     case SHELL_BLOCK_WAIT_UNTIL: return "wait-until";
     case SHELL_BLOCK_RUN:        return "run";
     case SHELL_BLOCK_CMD:        return "cmd";
+    case SHELL_BLOCK_EXPECT_NOT: return "expect-not";
+    case SHELL_BLOCK_FAULT:      return "expect-fault";
     default:                     return "nothing";
     }
 }
@@ -571,7 +575,9 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
         bool time_block = s->block == SHELL_BLOCK_SLEEP ||
                           s->block == SHELL_BLOCK_WAIT_UNTIL ||
                           s->block == SHELL_BLOCK_EXPECT ||
-                          s->block == SHELL_BLOCK_CMD;
+                          s->block == SHELL_BLOCK_CMD ||
+                          s->block == SHELL_BLOCK_EXPECT_NOT ||
+                          s->block == SHELL_BLOCK_FAULT;
         if (time_block && !can_resume) {
             char reason[SHELL_REASON_MAX];
             char cause[SHELL_LINE_MAX + 96] = "";

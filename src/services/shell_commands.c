@@ -5,6 +5,10 @@
  */
 #include "shell_internal.h"
 #include "sim_runtime.h"
+#include "sim_mote.h"
+#include "arm_cpu.h"
+#include "arm_trustzone.h"
+#include "elf_loader.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -464,7 +468,7 @@ static int cmd_sendln(shell_service_t *s, int argc, char **argv, const char *lin
  * Send one line, then hold the stream until the node prints its shell
  * prompt again.  -e: the output must contain the pattern; -f: it must not. */
 static int cmd_cmd(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    const char *expect = NULL, *fail_on = NULL;
+    const char *expect = NULL, *fail_on = NULL, *cap_var = NULL, *cap_re = NULL;
     int64_t timeout = s->default_expect_timeout_ns;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
@@ -472,13 +476,16 @@ static int cmd_cmd(shell_service_t *s, int argc, char **argv, const char *line, 
         bool is_e = !strcmp(o, "-e") || !strcmp(o, "--expect");
         bool is_f = !strcmp(o, "-f") || !strcmp(o, "--fail-on");
         bool is_t = !strcmp(o, "-t") || !strcmp(o, "--timeout");
-        if (!is_e && !is_f && !is_t) { shell_error(s, "cmd: unknown option '%s'", o); return -1; }
-        if (i + 1 >= argc) { shell_error(s, "cmd: %s needs a value", o); return -1; }
+        bool is_c = !strcmp(o, "-c") || !strcmp(o, "--capture");
+        if (!is_e && !is_f && !is_t && !is_c) { shell_error(s, "cmd: unknown option '%s'", o); return -1; }
+        if (i + (is_c ? 2 : 1) >= argc) { shell_error(s, "cmd: %s needs %s", o, is_c ? "a variable and a regex" : "a value"); return -1; }
         i++;
         if (is_e) expect = argv[i];
         else if (is_f) fail_on = argv[i];
+        else if (is_c) { cap_var = argv[i]; cap_re = argv[++i]; }
         else if (parse_dur(s, argv[i], &timeout) != 0) return -1;
     }
+    if (cap_var && !shell_var_name_ok(cap_var)) { shell_error(s, "cmd: bad variable name '%s'", cap_var); return -1; }
     if ((expect && !expect[0]) || (fail_on && !fail_on[0])) {
         shell_error(s, "cmd: empty pattern"); return -1;
     }
@@ -505,9 +512,361 @@ static int cmd_cmd(shell_service_t *s, int argc, char **argv, const char *line, 
                     id, took < 0 ? 0 : took, len + 1);
         return -1;
     }
+    void *re = NULL;
+    if (cap_re) {
+        char err[160];
+        if (!(re = shell_regex_compile(cap_re, err, sizeof(err)))) { shell_error(s, "%s", err); return -1; }
+    }
     /* Armed in the same tick as the send, before the node runs a single
      * instruction, so neither its output nor its prompt can be missed. */
     shell_script_block_cmd(s, idx, (int)id, text, expect, fail_on, timeout);
+    if (re) shell_script_cmd_capture(s, cap_var, re);
+    return 0;
+}
+
+/* --- variables --------------------------------------------------------------- */
+
+static int cmd_var(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    if (argc == 1) {
+        if (s->var_count == 0) { shell_out(s, "no variables\n"); return 0; }
+        for (int i = 0; i < s->var_count; i++)
+            shell_out(s, "  %s = \"%s\"\n", s->vars[i].name, s->vars[i].value);
+        return 0;
+    }
+    if (!strcmp(argv[1], "-d")) {
+        if (argc != 3) { shell_error(s, "usage: var -d <name>"); return -1; }
+        for (int i = 0; i < s->var_count; i++) {
+            if (strcmp(s->vars[i].name, argv[2]) != 0) continue;
+            memmove(&s->vars[i], &s->vars[i + 1], (size_t)(s->var_count - i - 1) * sizeof(s->vars[0]));
+            s->var_count--;
+            return 0;
+        }
+        shell_error(s, "undefined variable '%s'", argv[2]);
+        return -1;
+    }
+    if (!shell_var_name_ok(argv[1])) { shell_error(s, "bad variable name '%s'", argv[1]); return -1; }
+    if (argc == 2) {
+        const char *v = shell_var_get(s, argv[1]);
+        if (!v) { shell_error(s, "undefined variable '%s'", argv[1]); return -1; }
+        shell_out(s, "%s\n", v);
+        return 0;
+    }
+    char text[SHELL_LINE_MAX];
+    if (rest_text(s, line, argpos, argc, 2, text, sizeof(text)) < 0) return -1;
+    if (shell_var_set(s, argv[1], text) != 0) {
+        shell_error(s, "too many variables (max %d)", SHELL_VARS_MAX); return -1;
+    }
+    return 0;
+}
+
+/* --- ARM node inspection ------------------------------------------------------ */
+
+static arm_cpu_t *node_arm_cpu(shell_service_t *s, const char *what, const char *arg,
+                               int *idx_out, sim_control_node_info_t *info) {
+    long id;
+    if (shell_parse_int(arg, &id) != 0) { shell_error(s, "%s: expected one node id, got '%s'", what, arg); return NULL; }
+    int idx = sim_control_index_of_id(s->ctl, (int)id);
+    if (idx < 0) { shell_error(s, "no node with id %ld", id); return NULL; }
+    arm_cpu_t *cpu = s->ctl->ops.get_interface
+        ? (arm_cpu_t *)s->ctl->ops.get_interface(s->ctl->ops.user, idx, SIM_MOTE_IFACE_ARM_CPU)
+        : NULL;
+    if (!cpu) { shell_error(s, "%s: node %ld has no ARM CPU", what, id); return NULL; }
+    if (idx_out) *idx_out = idx;
+    if (info) sim_control_describe(s->ctl, idx, info);
+    return cpu;
+}
+
+/* "0x2000", "main", "main+0x10": a number, or a symbol of the node's
+ * firmware (then its Secure-world image) plus an optional offset. */
+static int resolve_addr(shell_service_t *s, const sim_control_node_info_t *info,
+                        const char *spec, uint32_t *out) {
+    long v;
+    if (shell_parse_int(spec, &v) == 0) { *out = (uint32_t)v; return 0; }
+    char name[128];
+    snprintf(name, sizeof(name), "%s", spec);
+    long off = 0;
+    char *plus = strchr(name, '+');
+    if (plus) {
+        *plus = '\0';
+        if (shell_parse_int(plus + 1, &off) != 0) { shell_error(s, "bad offset in '%s'", spec); return -1; }
+    }
+    uint32_t a = 0;
+    if (info->firmware && info->firmware[0]) a = elf_find_symbol(info->firmware, name);
+    if (!a && info->secure_firmware && info->secure_firmware[0])
+        a = elf_find_symbol(info->secure_firmware, name);
+    if (!a) { shell_error(s, "no symbol '%s' in node %d's firmware", name, info->id); return -1; }
+    *out = a + (uint32_t)off;
+    return 0;
+}
+
+/* Leading "-c <var>" on single-value commands; returns the index after it. */
+static int take_capture_opt(shell_service_t *s, int argc, char **argv, const char **var) {
+    *var = NULL;
+    if (argc >= 3 && !strcmp(argv[1], "-c")) {
+        if (!shell_var_name_ok(argv[2])) { shell_error(s, "bad variable name '%s'", argv[2]); return -1; }
+        *var = argv[2];
+        return 3;
+    }
+    return 1;
+}
+
+static void emit_value(shell_service_t *s, const char *var, const char *label, uint32_t v) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "0x%08x", v);
+    if (var) shell_var_set(s, var, buf);
+    shell_out(s, "%s%s\n", label, buf);
+}
+
+static int cmd_sym(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    const char *var;
+    int i = take_capture_opt(s, argc, argv, &var);
+    if (i < 0) return -1;
+    if (argc - i != 2) { shell_error(s, "usage: sym [-c <var>] <node> <symbol>"); return -1; }
+    sim_control_node_info_t info;
+    long id;
+    if (shell_parse_int(argv[i], &id) != 0) { shell_error(s, "sym: expected one node id"); return -1; }
+    int idx = sim_control_index_of_id(s->ctl, (int)id);
+    if (idx < 0 || !sim_control_describe(s->ctl, idx, &info)) { shell_error(s, "no node with id %ld", id); return -1; }
+    uint32_t a;
+    if (resolve_addr(s, &info, argv[i + 1], &a) != 0) return -1;
+    char label[160];
+    snprintf(label, sizeof(label), "%s = ", argv[i + 1]);
+    emit_value(s, var, label, a);
+    return 0;
+}
+
+/* mem [-w] [-c var] <node> <addr|sym> [count]   read
+ * mem [-w] <node> <addr|sym> = <value...>       write */
+static int cmd_mem(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    bool words = false;
+    const char *var = NULL;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] && !isdigit((unsigned char)argv[i][1]); i++) {
+        if (!strcmp(argv[i], "-w")) words = true;
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
+            var = argv[++i];
+            if (!shell_var_name_ok(var)) { shell_error(s, "bad variable name '%s'", var); return -1; }
+        } else { shell_error(s, "mem: unknown option '%s'", argv[i]); return -1; }
+    }
+    if (argc - i < 2) { shell_error(s, "usage: mem [-w] [-c <var>] <node> <addr|symbol> [count] | mem [-w] <node> <addr> = <values...>"); return -1; }
+    sim_control_node_info_t info;
+    arm_cpu_t *cpu = node_arm_cpu(s, "mem", argv[i], NULL, &info);
+    if (!cpu) return -1;
+    uint32_t addr;
+    if (resolve_addr(s, &info, argv[i + 1], &addr) != 0) return -1;
+    int step = words ? 4 : 1;
+
+    if (argc - i >= 3 && !strcmp(argv[i + 2], "=")) {
+        if (argc - i < 4) { shell_error(s, "mem: nothing to write"); return -1; }
+        uint32_t last = addr + (uint32_t)((argc - i - 3) * step) - 1;
+        if (addr < cpu->flash_end && last >= cpu->flash_base) {
+            shell_error(s, "mem: 0x%08x-0x%08x is flash, which is read-only here (as on hardware)", addr, last);
+            return -1;
+        }
+        for (int k = i + 3; k < argc; k++) {
+            long v;
+            if (shell_parse_int(argv[k], &v) != 0) { shell_error(s, "mem: bad value '%s'", argv[k]); return -1; }
+            uint32_t a = addr + (uint32_t)((k - i - 3) * step);
+            for (int b = 0; b < step; b++)
+                arm_write8(cpu, a + (uint32_t)b, (uint8_t)((unsigned long)v >> (8 * b)));
+        }
+        if (s->verbose) shell_out(s, "wrote %d %s at 0x%08x\n", argc - i - 3, words ? "word(s)" : "byte(s)", addr);
+        return 0;
+    }
+
+    long count = words ? 8 : 64;
+    if (argc - i >= 3 && shell_parse_int(argv[i + 2], &count) != 0) { shell_error(s, "mem: bad count '%s'", argv[i + 2]); return -1; }
+    if (count < 1 || count > 4096) { shell_error(s, "mem: count must be 1..4096"); return -1; }
+    if (var && count != 1) { shell_error(s, "mem: -c needs a count of 1"); return -1; }
+    if (words) {
+        for (long k = 0; k < count; k++) {
+            uint32_t a = addr + (uint32_t)(k * 4), v = 0;
+            for (int b = 0; b < 4; b++) v |= (uint32_t)arm_read8(cpu, a + (uint32_t)b) << (8 * b);
+            if (var) { char buf[16]; snprintf(buf, sizeof(buf), "0x%08x", v); shell_var_set(s, var, buf); }
+            if (k % 4 == 0) shell_out(s, "%s0x%08x:", k ? "\n" : "", a);
+            shell_out(s, " 0x%08x", v);
+        }
+        shell_out(s, "\n");
+        return 0;
+    }
+    for (long k = 0; k < count; k += 16) {
+        char hex[64] = "", asc[20] = "";
+        int n = (int)((count - k) < 16 ? (count - k) : 16);
+        for (int b = 0; b < n; b++) {
+            uint8_t v = arm_read8(cpu, addr + (uint32_t)(k + b));
+            if (var) { char buf[8]; snprintf(buf, sizeof(buf), "0x%02x", v); shell_var_set(s, var, buf); }
+            snprintf(hex + strlen(hex), sizeof(hex) - strlen(hex), " %02x", v);
+            asc[b] = (v >= 32 && v < 127) ? (char)v : '.';
+            asc[b + 1] = '\0';
+        }
+        shell_out(s, "0x%08x:%-48s |%s|\n", addr + (uint32_t)k, hex, asc);
+    }
+    return 0;
+}
+
+static int cmd_reg(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    const char *var;
+    int i = take_capture_opt(s, argc, argv, &var);
+    if (i < 0) return -1;
+    /* reg <node> <name> = <value>: r0-r12, sp, lr, pc, xpsr. */
+    if (!var && argc - i == 4 && !strcmp(argv[i + 2], "=")) {
+        arm_cpu_t *cpu = node_arm_cpu(s, "reg", argv[i], NULL, NULL);
+        if (!cpu) return -1;
+        long v;
+        if (shell_parse_int(argv[i + 3], &v) != 0) { shell_error(s, "reg: bad value '%s'", argv[i + 3]); return -1; }
+        const char *n = argv[i + 1];
+        int r = -1;
+        if (n[0] == 'r' && isdigit((unsigned char)n[1])) {
+            long k;
+            if (shell_parse_int(n + 1, &k) == 0 && k >= 0 && k <= 12) r = (int)k;
+        } else if (!strcmp(n, "sp")) r = ARM_SP;
+        else if (!strcmp(n, "lr")) r = ARM_LR;
+        else if (!strcmp(n, "pc")) r = ARM_PC;
+        if (r == ARM_PC) cpu->reg[ARM_PC] = (uint32_t)v & ~1u;   /* Thumb bit is not part of PC */
+        else if (r >= 0) cpu->reg[r] = (uint32_t)v;
+        else if (!strcmp(n, "xpsr")) cpu->xpsr = (uint32_t)v;
+        else { shell_error(s, "reg: can write r0-r12, sp, lr, pc, xpsr (not '%s')", n); return -1; }
+        if (s->verbose) shell_out(s, "%s = 0x%08x\n", n, (uint32_t)v);
+        return 0;
+    }
+    if (argc - i < 1 || argc - i > 2) { shell_error(s, "usage: reg [-c <var>] <node> [name] | reg <node> <name> = <value>"); return -1; }
+    arm_cpu_t *cpu = node_arm_cpu(s, "reg", argv[i], NULL, NULL);
+    if (!cpu) return -1;
+    struct { const char *name; uint32_t v; bool tz; } r[] = {
+        {"r0", cpu->reg[0], false}, {"r1", cpu->reg[1], false}, {"r2", cpu->reg[2], false}, {"r3", cpu->reg[3], false},
+        {"r4", cpu->reg[4], false}, {"r5", cpu->reg[5], false}, {"r6", cpu->reg[6], false}, {"r7", cpu->reg[7], false},
+        {"r8", cpu->reg[8], false}, {"r9", cpu->reg[9], false}, {"r10", cpu->reg[10], false}, {"r11", cpu->reg[11], false},
+        {"r12", cpu->reg[12], false}, {"sp", cpu->reg[ARM_SP], false}, {"lr", cpu->reg[ARM_LR], false}, {"pc", cpu->reg[ARM_PC], false},
+        {"xpsr", cpu->xpsr, false}, {"primask", cpu->primask, false}, {"basepri", cpu->basepri, false}, {"faultmask", cpu->faultmask, false},
+        {"msp_s", cpu->msp_s, true}, {"psp_s", cpu->psp_s, true}, {"msp_ns", cpu->msp_ns, true},
+        {"psp_ns", cpu->psp_ns, true}, {"control_s", cpu->control_s, true}, {"control_ns", cpu->control_ns, true},
+    };
+    int nr = (int)(sizeof(r) / sizeof(r[0]));
+    if (argc - i == 2) {
+        for (int k = 0; k < nr; k++) {
+            if (strcmp(r[k].name, argv[i + 1]) != 0) continue;
+            if (r[k].tz && !arm_cpu_has_trustzone(cpu)) break;
+            char label[32];
+            snprintf(label, sizeof(label), "%s = ", r[k].name);
+            emit_value(s, var, label, r[k].v);
+            return 0;
+        }
+        shell_error(s, "reg: no register '%s' on this CPU", argv[i + 1]);
+        return -1;
+    }
+    if (var) { shell_error(s, "reg: -c needs a register name"); return -1; }
+    int col = 0;
+    for (int k = 0; k < nr; k++) {
+        if (r[k].tz && !arm_cpu_has_trustzone(cpu)) continue;
+        shell_out(s, "  %-10s 0x%08x%s", r[k].name, r[k].v, (++col % 4) ? "" : "\n");
+    }
+    if (col % 4) shell_out(s, "\n");
+    if (arm_cpu_has_trustzone(cpu))
+        shell_out(s, "  state: %s\n", arm_cpu_is_secure(cpu) ? "Secure" : "Non-secure");
+    return 0;
+}
+
+static const char *const sfsr_bits[8] = {
+    "INVEP", "INVIS", "INVER", "AUVIOL", "INVTRAN", "LSPERR", "SFARVALID", "LSERR"
+};
+
+static void print_sfsr(shell_service_t *s, const arm_cpu_t *cpu) {
+    char bits[96] = "";
+    for (int b = 0; b < 8; b++)
+        if (cpu->sfsr & (1u << b))
+            snprintf(bits + strlen(bits), sizeof(bits) - strlen(bits), "%s%s", bits[0] ? " " : "", sfsr_bits[b]);
+    shell_out(s, "  SFSR 0x%08x [%s]  SFAR 0x%08x\n", cpu->sfsr, bits[0] ? bits : "-", cpu->sfar);
+}
+
+static int cmd_tz(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)line; (void)argpos;
+    sim_control_node_info_t info;
+    arm_cpu_t *cpu = node_arm_cpu(s, "tz", argv[1], NULL, &info);
+    if (!cpu) return -1;
+    if (!arm_cpu_has_trustzone(cpu)) {
+        shell_out(s, "node %d: no TrustZone-M (ARMv8-M security extension) on this CPU\n", info.id);
+        return 0;
+    }
+    shell_out(s, "node %d: TrustZone-M, state %s, pc 0x%08x\n", info.id,
+              arm_cpu_is_secure(cpu) ? "Secure" : "Non-secure", cpu->reg[ARM_PC]);
+    shell_out(s, "  SG entries %llu  BXNS returns %llu  secure exceptions from NS %llu\n",
+              (unsigned long long)cpu->tz_sg_count, (unsigned long long)cpu->tz_bxns_count,
+              (unsigned long long)cpu->tz_secexc_count);
+    print_sfsr(s, cpu);
+    shell_out(s, "  SAU_CTRL 0x%08x [%s%s]\n", cpu->sau_ctrl,
+              (cpu->sau_ctrl & ARM_SAU_CTRL_ENABLE) ? "ENABLE" : "disabled",
+              (cpu->sau_ctrl & ARM_SAU_CTRL_ALLNS) ? " ALLNS" : "");
+    for (int r = 0; r < 8; r++) {
+        if (!(cpu->sau_rlar[r] & ARM_SAU_RLAR_ENABLE)) continue;
+        shell_out(s, "  SAU region %d: 0x%08x-0x%08x %s\n", r, cpu->sau_rbar[r] & ~0x1fu,
+                  (cpu->sau_rlar[r] & ~0x1fu) | 0x1fu,
+                  (cpu->sau_rlar[r] & ARM_SAU_RLAR_NSC) ? "Non-secure callable" : "Non-secure");
+    }
+    shell_out(s, "  MSP_S 0x%08x  PSP_S 0x%08x  MSP_NS 0x%08x  PSP_NS 0x%08x\n",
+              cpu->msp_s, cpu->psp_s, cpu->msp_ns, cpu->psp_ns);
+    return 0;
+}
+
+static const char *const fault_names[16] = {
+    [3] = "HardFault", [4] = "MemManage", [5] = "BusFault", [6] = "UsageFault", [7] = "SecureFault"
+};
+
+static int cmd_faults(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)line; (void)argpos;
+    sim_control_node_info_t info;
+    arm_cpu_t *cpu = node_arm_cpu(s, "faults", argv[1], NULL, &info);
+    if (!cpu) return -1;
+    shell_out(s, "node %d fault entries:", info.id);
+    for (int k = 3; k <= 7; k++)
+        if (k != 7 || arm_cpu_has_trustzone(cpu))
+            shell_out(s, " %s %llu", fault_names[k], (unsigned long long)cpu->exc_entry_count[k]);
+    shell_out(s, "\n");
+    if (cpu->last_fault_exc)
+        shell_out(s, "  last: %s at pc 0x%08x, taken from %s\n", fault_names[cpu->last_fault_exc],
+                  cpu->last_fault_pc, cpu->last_fault_bg_secure ? "Secure" : "Non-secure");
+    if (arm_cpu_has_trustzone(cpu)) print_sfsr(s, cpu);
+    return 0;
+}
+
+/* expect-fault <node> [kind[,kind...]|any] [timeout] */
+static int cmd_expect_fault(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    int idx;
+    arm_cpu_t *cpu = node_arm_cpu(s, "expect-fault", argv[1], &idx, NULL);
+    if (!cpu) return -1;
+    unsigned mask = 0;
+    const char *what = "fault (any)";
+    int64_t timeout = s->default_expect_timeout_ns;
+    int next = 2;
+    if (argc > 2) {
+        int64_t t;
+        if (shell_parse_duration(argv[2], &t) == 0 && argc == 3) {
+            timeout = t;
+        } else {
+            char kinds[128];
+            snprintf(kinds, sizeof(kinds), "%s", argv[2]);
+            for (char *tok = strtok(kinds, ","); tok; tok = strtok(NULL, ",")) {
+                if (!strcmp(tok, "any")) mask |= 0xf8u;
+                else if (!strcmp(tok, "hardfault")) mask |= 1u << 3;
+                else if (!strcmp(tok, "memmanage") || !strcmp(tok, "memfault")) mask |= 1u << 4;
+                else if (!strcmp(tok, "busfault")) mask |= 1u << 5;
+                else if (!strcmp(tok, "usagefault")) mask |= 1u << 6;
+                else if (!strcmp(tok, "securefault")) mask |= 1u << 7;
+                else { shell_error(s, "expect-fault: unknown fault '%s' (hardfault, memmanage, busfault, usagefault, securefault, any)", tok); return -1; }
+            }
+            what = strcmp(argv[2], "any") ? argv[2] : "fault (any)";
+            next = 3;
+        }
+    }
+    if (argc > next && parse_dur(s, argv[next], &timeout) != 0) return -1;
+    if (argc > next + 1) { shell_error(s, "usage: expect-fault <node> [kind[,kind]|any] [timeout]"); return -1; }
+    if (!mask) mask = 0xf8u;
+    long id = 0;
+    shell_parse_int(argv[1], &id);
+    shell_script_block_fault(s, idx, (int)id, mask, what, cpu->exc_entry_count, timeout);
     return 0;
 }
 
@@ -634,15 +993,89 @@ static int cmd_source(shell_service_t *s, int argc, char **argv, const char *lin
     return 0;
 }
 
+/* Shared by expect, expect-not and capture:
+ *   [-re] [-n N] [-c var] <nodes|any> "<pattern>" [timeout]            */
+static int expect_common(shell_service_t *s, shell_block_t kind, const char *what,
+                         int argc, char **argv, const char *forced_var, bool force_re) {
+    bool use_re = force_re;
+    long needed = 1;
+    const char *var = forced_var;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] && !isdigit((unsigned char)argv[i][1]); i++) {
+        if (!strcmp(argv[i], "-re")) use_re = true;
+        else if (!strcmp(argv[i], "-n") && kind == SHELL_BLOCK_EXPECT && i + 1 < argc) {
+            if (shell_parse_int(argv[++i], &needed) != 0 || needed < 1) { shell_error(s, "%s: -n needs a count >= 1", what); return -1; }
+        } else if (!strcmp(argv[i], "-c") && kind == SHELL_BLOCK_EXPECT && i + 1 < argc) {
+            var = argv[++i];
+        } else { shell_error(s, "%s: unknown option '%s'", what, argv[i]); return -1; }
+    }
+    bool need_time = kind == SHELL_BLOCK_EXPECT_NOT;
+    int left = argc - i;
+    if (left < (need_time ? 3 : 2) || left > 3) {
+        shell_error(s, "usage: %s", shell_find_command(what)->syntax); return -1;
+    }
+    if (var && !shell_var_name_ok(var)) { shell_error(s, "%s: bad variable name '%s'", what, var); return -1; }
+    int ids[SIM_EQ_MAX_NODES]; bool any = false;
+    int n = shell_resolve_selector(s, argv[i], ids, SIM_EQ_MAX_NODES, true, &any);
+    if (n < 0) return -1;
+    const char *pattern = argv[i + 1];
+    if (!pattern[0]) { shell_error(s, "%s: empty pattern", what); return -1; }
+    int64_t timeout = s->default_expect_timeout_ns;
+    if (left == 3 && parse_dur(s, argv[i + 2], &timeout) != 0) return -1;
+    void *re = NULL;
+    if (use_re) {
+        char err[160];
+        if (!(re = shell_regex_compile(pattern, err, sizeof(err)))) { shell_error(s, "%s", err); return -1; }
+    }
+    shell_script_block_expect2(s, kind, pattern, re, (int)needed, var, ids, n, any, timeout);
+    return 0;
+}
+
 static int cmd_expect(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)line; (void)argpos;
-    int ids[SIM_EQ_MAX_NODES]; bool any = false;
-    int n = shell_resolve_selector(s, argv[1], ids, SIM_EQ_MAX_NODES, true, &any);
-    if (n < 0) return -1;
-    if (!argv[2][0]) { shell_error(s, "expect: empty pattern"); return -1; }
+    return expect_common(s, SHELL_BLOCK_EXPECT, "expect", argc, argv, NULL, false);
+}
+
+static int cmd_expect_not(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    return expect_common(s, SHELL_BLOCK_EXPECT_NOT, "expect-not", argc, argv, NULL, false);
+}
+
+/* capture <var> <nodes|any> "<regex>" [timeout] = expect -re -c <var> */
+static int cmd_capture(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
+    if (argc < 4) { shell_error(s, "usage: %s", shell_find_command("capture")->syntax); return -1; }
+    if (!shell_var_name_ok(argv[1])) { shell_error(s, "capture: bad variable name '%s'", argv[1]); return -1; }
+    return expect_common(s, SHELL_BLOCK_EXPECT, "capture", argc - 1, argv + 1, argv[1], true);
+}
+
+/* sendfile [-t timeout] <node> <path> */
+static int cmd_sendfile(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)line; (void)argpos;
     int64_t timeout = s->default_expect_timeout_ns;
-    if (argc >= 4 && parse_dur(s, argv[3], &timeout) != 0) return -1;
-    shell_script_block_expect(s, argv[2], ids, n, any, timeout);
+    int i = 1;
+    if (argc >= 3 && !strcmp(argv[1], "-t")) {
+        if (parse_dur(s, argv[2], &timeout) != 0) return -1;
+        i = 3;
+    }
+    if (argc - i != 2) { shell_error(s, "usage: sendfile [-t <timeout>] <node> <path>"); return -1; }
+    long id;
+    if (shell_parse_int(argv[i], &id) != 0) { shell_error(s, "sendfile: expected one node id, got '%s'", argv[i]); return -1; }
+    int idx = sim_control_index_of_id(s->ctl, (int)id);
+    if (idx < 0) { shell_error(s, "no node with id %ld", id); return -1; }
+    const char *path = argv[i + 1];
+    if (s->origin.kind == SHELL_ORIGIN_FILE && s->depth > 0 && path[0] != '/') {
+        const char *cur = s->stack[s->depth - 1].path;
+        const char *slash = strrchr(cur, '/');
+        if (slash) {
+            char rel[SHELL_PATH_MAX];
+            snprintf(rel, sizeof(rel), "%.*s/%s", (int)(slash - cur), cur, path);
+            if (shell_script_sendfile(s, rel, idx, (int)id, timeout) == 0) return 0;
+        }
+    }
+    if (shell_script_sendfile(s, path, idx, (int)id, timeout) != 0) {
+        shell_error(s, "sendfile: cannot open %s", path); return -1;
+    }
     return 0;
 }
 
@@ -671,6 +1104,37 @@ static int cmd_wait_until(shell_service_t *s, int argc, char **argv, const char 
 static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)line; (void)argpos;
     const char *what = argv[1];
+    if (strcmp(what, "mem") == 0 && argc == 6) {
+        sim_control_node_info_t info;
+        arm_cpu_t *cpu = node_arm_cpu(s, "assert mem", argv[2], NULL, &info);
+        if (!cpu) return -1;
+        uint32_t addr;
+        if (resolve_addr(s, &info, argv[3], &addr) != 0) return -1;
+        long want;
+        if (shell_parse_int(argv[5], &want) != 0) { shell_error(s, "assert mem: bad value '%s'", argv[5]); return -1; }
+        uint32_t v = 0;
+        for (int b = 0; b < 4; b++) v |= (uint32_t)arm_read8(cpu, addr + (uint32_t)b) << (8 * b);
+        int r;
+        if (!strcmp(argv[4], "==")) r = v == (uint32_t)want;
+        else if (!strcmp(argv[4], "!=")) r = v != (uint32_t)want;
+        else r = shell_compare((long)v, argv[4], (long)(uint32_t)want);
+        if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[4]); return -1; }
+        if (!r) { shell_error(s, "assertion failed: mem %s 0x%08x (= 0x%08x) %s %s", argv[2], addr, v, argv[4], argv[5]); return -1; }
+        return 0;
+    }
+    if (strcmp(what, "var") == 0 && argc == 5) {
+        const char *v = shell_var_get(s, argv[2]);
+        if (!v) { shell_error(s, "undefined variable '%s'", argv[2]); return -1; }
+        long a, b;
+        int r;
+        if (shell_parse_int(v, &a) == 0 && shell_parse_int(argv[4], &b) == 0) r = shell_compare(a, argv[3], b);
+        else if (!strcmp(argv[3], "==")) r = strcmp(v, argv[4]) == 0;
+        else if (!strcmp(argv[3], "!=")) r = strcmp(v, argv[4]) != 0;
+        else { shell_error(s, "assert var: '%s' needs numbers", argv[3]); return -1; }
+        if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[3]); return -1; }
+        if (!r) { shell_error(s, "assertion failed: %s (\"%s\") %s %s", argv[2], v, argv[3], argv[4]); return -1; }
+        return 0;
+    }
     if (strcmp(what, "time") == 0 && argc == 4) {
         int64_t t;
         if (parse_dur(s, argv[3], &t) != 0) return -1;
@@ -699,7 +1163,13 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         if (strcmp(argv[3], "exists") == 0) ok = exists;
         else if (strcmp(argv[3], "active") == 0) ok = exists && info.active;
         else if (strcmp(argv[3], "removed") == 0) ok = !exists || info.removed;
-        else { shell_error(s, "assert node: expected active|removed|exists"); return -1; }
+        else if (strcmp(argv[3], "secure") == 0 || strcmp(argv[3], "non-secure") == 0) {
+            arm_cpu_t *cpu = node_arm_cpu(s, "assert node", argv[2], NULL, NULL);
+            if (!cpu) return -1;
+            if (!arm_cpu_has_trustzone(cpu)) { shell_error(s, "assert node: node %ld has no TrustZone-M", id); return -1; }
+            ok = arm_cpu_is_secure(cpu) == (argv[3][0] == 's');
+        }
+        else { shell_error(s, "assert node: expected active|removed|exists|secure|non-secure"); return -1; }
         if (!ok) { shell_assert_failed(s, "assertion failed: node %ld %s", id, argv[3]); return -1; }
         return 0;
     }
@@ -716,7 +1186,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         if (!r) { shell_assert_failed(s, "assertion failed: count \"%s\" (%d) %s %ld", argv[2], w->count, argv[3], v); return -1; }
         return 0;
     }
-    shell_error(s, "usage: assert time <op> <t> | nodes <op> N | node <id> active|removed|exists | count \"pat\" <op> N");
+    shell_error(s, "usage: assert time <op> <t> | nodes <op> N | node <id> active|removed|exists|secure|non-secure | count \"pat\" <op> N");
     return -1;
 }
 
@@ -848,17 +1318,27 @@ static const shell_command_t commands[] = {
     { "log-file",   "log-file [<path> [nodes] | off [path]]", "append console lines of nodes to a file (same format); off closes", 0, 2, IMM, cmd_logfile },
     { "send",       "send <nodes> <text...>",          "console input (escapes like \\n honoured; no newline added)", 2, -1, 0, cmd_send },
     { "sendln",     "sendln <nodes> <text...>",        "send + one \"\\n\" — one Contiki-NG shell command", 2, -1, 0, cmd_sendln },
-    { "cmd",        "cmd [-e \"<pat>\"] [-f \"<pat>\"] [-t <timeout>] <node> [text...]", "sendln, then wait for the node's shell prompt; -e output must contain, -f must not", 1, -1, BLK, cmd_cmd },
+    { "cmd",        "cmd [-e \"<pat>\"] [-f \"<pat>\"] [-c <var> \"<regex>\"] [-t <timeout>] <node> [text...]", "sendln, then wait for the node's shell prompt; -e output must contain, -f must not, -c captures into $var", 1, -1, BLK, cmd_cmd },
     { "console",    "console <node>",                  "talk to a node's console directly (terminal only); ~. or Ctrl-D returns", 1, 1, IMM, cmd_console },
     { "at",         "at <time> <command...> | at list | at clear <id>|all", "run a command at a simulation time (5s, 1500ms, +2s); list or cancel scheduled commands", 1, -1, IMM, cmd_at },
     { "every",      "every <period> <command...>",     "run a command periodically, first after one period", 2, -1, IMM, cmd_every },
     { "atq",        "atq",                             "list scheduled commands (= at list)", 0, 0, IMM, cmd_atq },
     { "atrm",       "atrm <id>|all",                   "cancel scheduled command(s) (= at clear)", 1, 1, IMM, cmd_atrm },
     { "source",     "source <file>",                   "run a script file (nested up to 8 deep; relative to the calling script first)", 1, 1, BLK, cmd_source },
-    { "expect",     "expect <nodes|any> \"<pattern>\" [timeout]", "block until a console line contains pattern; timeout fails the script", 2, 3, BLK, cmd_expect },
+    { "expect",     "expect [-re] [-n N] [-c <var>] <nodes|any> \"<pattern>\" [timeout]", "block until N console lines (default 1) contain the pattern (-re: extended regex; -c: capture group 1 into $var); timeout fails the script", 2, -1, BLK, cmd_expect },
+    { "expect-not", "expect-not [-re] <nodes|any> \"<pattern>\" <duration>", "block for a duration; a console line containing the pattern fails the script", 3, -1, BLK, cmd_expect_not },
+    { "capture",    "capture <var> <nodes|any> \"<regex>\" [timeout]", "block until a line matches the regex; store group 1 (or the match) in $var", 3, 4, BLK, cmd_capture },
+    { "var",        "var [<name> [value...] | -d <name>]", "list variables, show one, set one ($name / ${name} expand in later lines; $$ is a literal $)", 0, -1, IMM, cmd_var },
+    { "sendfile",   "sendfile [-t <timeout>] <node> <path>", "send a file line by line, each as a cmd (waits for the prompt)", 2, 4, BLK, cmd_sendfile },
+    { "sym",        "sym [-c <var>] <node> <symbol>",  "address of a firmware symbol (Non-secure image, then Secure image)", 2, 4, IMM, cmd_sym },
+    { "mem",        "mem [-w] [-c <var>] <node> <addr|sym[+off]> [count] | mem [-w] <node> <addr> = <values...>", "read (hexdump, -w 32-bit words) or write memory, debugger view: no TrustZone checks, IO reads reach peripherals", 2, -1, IMM, cmd_mem },
+    { "reg",        "reg [-c <var>] <node> [name] | reg <node> <name> = <value>", "read CPU registers (ARM; banked TrustZone stacks and CONTROL on ARMv8-M), or write r0-r12/sp/lr/pc/xpsr", 1, 4, IMM, cmd_reg },
+    { "tz",         "tz <node>",                       "TrustZone-M state: security state, SG/BXNS/secure-exception counters, SFSR/SFAR, SAU regions, banked stacks", 1, 1, IMM, cmd_tz },
+    { "faults",     "faults <node>",                   "fault exception counts, the last fault (pc, security state), SFSR/SFAR", 1, 1, IMM, cmd_faults },
+    { "expect-fault","expect-fault <node> [kind[,kind]|any] [timeout]", "block until the node takes a fault (hardfault, memmanage, busfault, usagefault, securefault)", 1, 3, BLK, cmd_expect_fault },
     { "sleep",      "sleep <duration>",                "block for a simulated duration", 1, 1, BLK, cmd_sleep },
     { "wait-until", "wait-until <time>",               "block until a simulation time (absolute or +relative)", 1, 1, BLK, cmd_wait_until },
-    { "assert",     "assert time|nodes <op> <v> | node <id> active|removed|exists | count \"pat\" <op> N", "check a condition; failure fails the script", 3, 4, 0, cmd_assert },
+    { "assert",     "assert time|nodes <op> <v> | node <id> active|removed|exists|secure|non-secure | count \"pat\" <op> N | mem <node> <addr|sym> <op> <word> | var <name> <op> <value>", "check a condition; failure fails the script", 3, 5, 0, cmd_assert },
     { "pass",       "pass",                            "end the script with a PASS verdict", 0, 0, 0, cmd_pass },
     { "fail",       "fail [message...]",               "end the script with a FAIL verdict (non-zero exit code)", 0, -1, 0, cmd_fail },
     { "fail-on",    "fail-on \"<pattern>\" [nodes|any]", "fail the script as soon as a console line contains pattern", 1, 2, 0, cmd_fail_on },
@@ -886,7 +1366,7 @@ void shell_print_help(shell_service_t *s, const char *name) {
         shell_out(s, "  %s\n      %s\n", c->syntax, c->help);
         return;
     }
-    shell_out(s, "Commands (nodes = id, 1,3, 2-5, all; times = 5s, 250ms, +2s; \"!cmd\" runs at once while a script blocks):\n");
+    shell_out(s, "Commands (nodes = id, 1,3, 2-5, all; times = 5s, 250ms, +2s; $name = variable; \"!cmd\" runs at once while a script blocks):\n");
     for (int i = 0; i < command_count; i++)
         shell_out(s, "  %-44s %s\n", commands[i].syntax, commands[i].help);
 }
@@ -916,6 +1396,15 @@ static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only
     int argpos[SHELL_MAX_ARGS];
     char storage[SHELL_LINE_MAX];
     char err[128];
+    char expanded[SHELL_LINE_MAX];
+    if (strchr(line, '$')) {
+        if (shell_expand_vars(line, expanded, sizeof(expanded), shell_var_get, s,
+                              err, sizeof(err)) < 0) {
+            shell_error(s, "%s", err);
+            return -1;
+        }
+        line = expanded;
+    }
     int argc = shell_tokenize(line, argv, argpos, SHELL_MAX_ARGS, storage,
                               sizeof(storage), err, sizeof(err));
     if (argc < 0) { shell_error(s, "%s", err); return -1; }

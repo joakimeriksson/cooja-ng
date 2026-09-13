@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 #include "shell_parse.h"
+#include "sim_mote.h"
+#include "arm_cpu.h"
 #include "sim_runtime.h"
 #include "sim_control.h"
 #include "../src/services/shell_internal.h"
@@ -147,10 +149,20 @@ static const char *m_fw_for_type(void *u, const char *t, const char **sfw) {
     (void)u; if (sfw) *sfw = NULL; return strcmp(t, "sky") == 0 ? "firmware/sky/x.sky" : NULL;
 }
 
+/* Node 1 is an ARM node with 4 KB of SRAM at 0x20000000; the others have no
+ * CPU interface (like MSP430/native nodes). */
+static arm_cpu_t mock_cpu;
+static uint8_t mock_sram[4096];
+static void *m_get_interface(void *u, int idx, int iface) {
+    (void)u;
+    return (idx == 0 && iface == SIM_MOTE_IFACE_ARM_CPU) ? &mock_cpu : NULL;
+}
+
 static sim_control_ops_t mock_ops = {
     .node_count = m_node_count, .describe = m_describe, .inject_serial = m_inject,
     .set_position = m_set_position, .reboot = m_reboot, .start = m_start,
     .remove = m_remove, .add = m_add, .firmware_for_type = m_fw_for_type,
+    .get_interface = m_get_interface,
 };
 
 static sim_control_t mock_ctl;
@@ -164,6 +176,11 @@ static void mock_reset(void) {
     mock_inject_calls = mock_inject_bytes = mock_reboots = mock_removes = mock_moves = 0;
     mock_ops.inject_serial = m_inject;
     sim_control_init(&mock_ctl, &mock_sim, &mock_ops);
+    memset(&mock_cpu, 0, sizeof(mock_cpu));
+    memset(mock_sram, 0, sizeof(mock_sram));
+    mock_cpu.sram = mock_sram;
+    mock_cpu.sram_base = 0x20000000u;
+    mock_cpu.sram_end = 0x20000000u + sizeof(mock_sram);
     memset(&sh, 0, sizeof(sh));
     sh.sim = &mock_sim; sh.ctl = &mock_ctl; sh.active = true; sh.interactive = false;
     sh.verbose = false; sh.next_at_id = 1; sh.default_expect_timeout_ns = 30000000000LL;
@@ -735,6 +752,170 @@ static void test_cmd(void) {
           "at cmd, node lists, bad options and console without a tty are refused");
 }
 
+static const char *t_lookup(void *u, const char *name) {
+    (void)u;
+    if (!strcmp(name, "x")) return "42";
+    if (!strcmp(name, "sp")) return "a  b";
+    return NULL;
+}
+
+static void test_expand(void) {
+    char out[256]; char err[96];
+    int n = shell_expand_vars("echo $x ${x}y $$x \\$x '$x' \"$x\" $ $1 # $nope", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+    CHECK(n > 0 && !strcmp(out, "echo 42 42y $x \\$x '$x' \"42\" $ $1 # $nope"), "expansion rules ('%s')", out);
+    n = shell_expand_vars("send 1 $sp", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+    CHECK(n > 0 && !strcmp(out, "send 1 a  b"), "value substituted as text");
+    n = shell_expand_vars("echo $missing", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+    CHECK(n == -1 && strstr(err, "undefined variable 'missing'"), "undefined -> error (%s)", err);
+    n = shell_expand_vars("echo ${x", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+    CHECK(n == -1, "unterminated ${ -> error");
+    char *argv[8]; char st[64];
+    int argc = shell_tokenize("echo \\$x", argv, NULL, 8, st, sizeof(st), err, sizeof(err));
+    CHECK(argc == 2 && !strcmp(argv[1], "$x"), "\\$ decodes to a literal $");
+}
+
+static void test_node_commands(void) {
+    const char *p;
+
+    /* var / capture / expect options / expect-not / cmd -c / assert var */
+    mock_reset();
+    sh.verbose = false;
+    p = write_script("v1",
+        "var name hello  there\n"
+        "assert var name == \"hello  there\"\n"
+        "capture num 1 \"value=([0-9]+)\" 1s\n"
+        "assert var num == 17\n"
+        "assert var num > 10\n"
+        "expect -re -n 2 -c last 2 \"^tick ([0-9])$\" 1s\n"
+        "assert var last == 2\n"
+        "sendln 1 $name $$literal\n"
+        "expect-not any \"ERROR\" 100ms\n"
+        "cmd -c ip \"(fe80::[0-9a-f:]+)\" 1 ip-addr\n"
+        "assert var ip == fe80::1\n"
+        "pass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_EXPECT && !sh.failed, "capture blocks (%s)", sh.fail_reason);
+    emit_line(0, "value=abc");
+    emit_line(0, "value=17 more");
+    shell_script_tick(&sh);
+    CHECK(!strcmp(shell_var_get(&sh, "num") ? shell_var_get(&sh, "num") : "", "17"), "capture stored group 1");
+    CHECK(sh.block == SHELL_BLOCK_EXPECT && sh.expect_needed == 2, "-n 2 armed");
+    emit_line(1, "tick 1");
+    emit_line(0, "tick 9");                   /* node 1: not selected */
+    shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_EXPECT, "one of two matches is not enough");
+    emit_line(1, "tick 2");
+    shell_script_tick(&sh);
+    CHECK(strcmp(mock_last_inject, "hello  there $literal\n") == 0, "expanded send ('%s')", mock_last_inject);
+    CHECK(sh.block == SHELL_BLOCK_EXPECT_NOT, "expect-not blocks");
+    emit_line(2, "all fine");
+    advance(100000000LL);
+    shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_CMD, "expect-not passed, cmd blocks (%s)", sh.fail_reason);
+    emit_bytes(0, "IPv6 addresses:\n  fe80::1\n#1> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.passed && !sh.failed, "script passes (%s)", sh.fail_reason);
+    unlink(p);
+
+    mock_reset();
+    p = write_script("v2", "expect-not 1 \"ERROR\" 1s\npass\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    emit_line(0, "fatal ERROR here");
+    shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "expect-not"), "expect-not match fails (%s)", sh.fail_reason);
+    unlink(p);
+    mock_reset();
+    p = write_script("v3", "cmd -c v \"nothing ([0-9]+)\" 1 x\npass\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    emit_bytes(0, "other\n#1> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "nothing to capture"), "cmd -c without a match fails (%s)", sh.fail_reason);
+    unlink(p);
+    mock_reset();
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "expect -re 1 \"(unclosed\"");
+    shell_enqueue_line(&sh, "echo $nope");
+    shell_enqueue_line(&sh, "var 1bad x");
+    shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_NONE && sh.var_count == 0, "bad regex, undefined var, bad name are errors");
+
+    /* sendfile: each line a cmd, in order. */
+    mock_reset();
+    char data[256];
+    snprintf(data, sizeof(data), "/tmp/csim_shell_test_sendfile_%d.txt", (int)getpid());
+    FILE *f = fopen(data, "w"); fputs("first line\n  second  line\n", f); fclose(f);
+    char text[400];
+    snprintf(text, sizeof(text), "sendfile -t 1s 1 %s\necho done\npass\n", data);
+    p = write_script("v4", text);
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_CMD && !strcmp(mock_last_inject, "first line\n"), "first line sent ('%s')", mock_last_inject);
+    emit_bytes(0, "#1> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_CMD && !strcmp(mock_last_inject, "  second  line\n"), "second line sent verbatim ('%s')", mock_last_inject);
+    emit_bytes(0, "#1> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.passed && sh.cmd_pass == 2, "sendfile done, script passes (%s)", sh.fail_reason);
+    unlink(p); unlink(data);
+}
+
+static void test_arm_inspection(void) {
+    const char *p;
+    mock_reset();
+    mock_cpu.reg[ARM_PC] = 0x1234;
+    mock_cpu.tz_enabled = true;
+    mock_sram[0x10] = 0x78; mock_sram[0x11] = 0x56; mock_sram[0x12] = 0x34; mock_sram[0x13] = 0x12;
+    p = write_script("a1",
+        "mem -w -c w 1 0x20000010 1\n"
+        "assert var w == 0x12345678\n"
+        "assert mem 1 0x20000010 == 0x12345678\n"
+        "mem -w 1 0x20000020 = 0xcafebabe 7\n"
+        "assert mem 1 0x20000024 == 7\n"
+        "mem 1 0x20000020 = 0x11\n"
+        "assert mem 1 0x20000020 == 0xcafeba11\n"
+        "reg -c pcv 1 pc\n"
+        "assert var pcv == 0x00001234\n"
+        "reg 1 r3 = 0x55\n"
+        "reg 1 pc = 0x2001\n"
+        "tz 1\n"
+        "faults 1\n"
+        "expect-fault 1 securefault,hardfault 5ms\n"
+        "pass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(!sh.failed, "mem/reg/assert mem on an ARM node (%s)", sh.fail_reason);
+    CHECK(mock_cpu.reg[3] == 0x55 && mock_cpu.reg[ARM_PC] == 0x2000, "register writes (pc Thumb bit dropped)");
+    CHECK(sh.block == SHELL_BLOCK_FAULT, "expect-fault blocks");
+    CHECK(queue_has_pin_at(sim_runtime_now_ns(&mock_sim) + SHELL_MS_TO_NS), "fault poll pinned 1 ms ahead");
+    mock_cpu.exc_entry_count[6]++;          /* a UsageFault: not selected */
+    advance(SHELL_MS_TO_NS); shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_FAULT, "unselected fault kind ignored");
+    mock_cpu.exc_entry_count[7]++;
+    mock_cpu.last_fault_exc = 7;
+    advance(SHELL_MS_TO_NS); shell_script_tick(&sh);
+    CHECK(sh.passed && !sh.failed, "SecureFault releases expect-fault (%s)", sh.fail_reason);
+    unlink(p);
+
+    mock_reset();
+    p = write_script("a2", "expect-fault 1 any 2ms\npass\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    advance(2 * SHELL_MS_TO_NS); shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "took no fault"), "no fault within the timeout fails (%s)", sh.fail_reason);
+    unlink(p);
+
+    mock_reset();
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "mem 2 0x20000000 4");       /* node 2 has no ARM CPU */
+    shell_enqueue_line(&sh, "reg 1 cpsr = 1");
+    shell_enqueue_line(&sh, "expect-fault 1 nosuchfault");
+    shell_enqueue_line(&sh, "sym 1 main");               /* firmware "fw1" does not exist */
+    shell_script_tick(&sh);
+    CHECK(sh.block == SHELL_BLOCK_NONE && !sh.failed, "non-ARM node, bad register, bad fault kind, missing symbol are errors");
+    CHECK(shell_line_blocks("expect-fault 1") && shell_line_blocks("capture v 1 \"x\"") &&
+          shell_line_blocks("sendfile 1 f") && shell_line_blocks("expect-not 1 \"x\" 1s") &&
+          !shell_line_blocks("mem 1 0x0"), "blocking classification");
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -749,6 +930,9 @@ int run_shell_tests(int verbose) {
     test_exit_codes();
     test_glob();
     test_cmd();
+    test_expand();
+    test_node_commands();
+    test_arm_inspection();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }

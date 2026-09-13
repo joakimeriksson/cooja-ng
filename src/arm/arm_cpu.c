@@ -951,6 +951,14 @@ void arm_tz_trace(const arm_cpu_t *cpu, const char *what, uint32_t a, uint32_t b
 }
 
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
+    if (exception_num > 0 && exception_num < 16) {
+        cpu->exc_entry_count[exception_num]++;
+        if (exception_num >= EXC_HARDFAULT && exception_num <= EXC_SECUREFAULT) {
+            cpu->last_fault_exc = exception_num;
+            cpu->last_fault_pc = cpu->reg[ARM_PC];
+            cpu->last_fault_bg_secure = cpu->secure;
+        }
+    }
     /* ARMv8-M: an exception may target Secure or Non-secure. The background
      * frame is stacked on the CURRENT (background) stack; then, if the handler
      * runs in the other security state, we bank across. SecureFault always

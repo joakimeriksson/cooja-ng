@@ -47,6 +47,14 @@ grep -q "cmds:    4 passed, 0 failed" "$TMP/cmd1.out" || fail "cmd results missi
 $BIN test $CFG --script test/scripts/shell-nrf54l15-cmd.cnsh > "$TMP/cmd2.out" 2>&1 || fail "cmd script run 2"
 diff <(strip "$TMP/cmd1.out") <(strip "$TMP/cmd2.out") > /dev/null || fail "cmd script run is not deterministic"
 
+echo "== TrustZone: secure/normal shells, SecureFault injection (deterministic)"
+TZCFG=configs/shell-tz-nrf54l15-xiao.yaml
+TZS=test/scripts/tz-securefault-nrf54l15-xiao.cnsh
+$BIN test $TZCFG --script $TZS > "$TMP/tz1.out" 2>&1 || { tail -5 "$TMP/tz1.out"; fail "TrustZone script exited non-zero"; }
+grep -q "took SecureFault" "$TMP/tz1.out" || fail "SecureFault not observed"
+$BIN test $TZCFG --script $TZS > "$TMP/tz2.out" 2>&1 || fail "TrustZone script run 2"
+diff <(strip "$TMP/tz1.out") <(strip "$TMP/tz2.out") > /dev/null || fail "TrustZone script run is not deterministic"
+
 echo "== determinism"
 $BIN test $CFG --script test/scripts/shell-nrf54l15.cnsh > "$TMP/pass2.out" 2>&1 || fail "second run"
 diff <(strip "$TMP/pass.out") <(strip "$TMP/pass2.out") > /dev/null || fail "script run is not deterministic"
