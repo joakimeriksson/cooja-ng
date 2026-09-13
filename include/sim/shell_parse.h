@@ -59,6 +59,10 @@ int shell_parse_selector(const char *s, const int *ids, int nids,
                          int *out, int max_out, bool allow_any, bool *any,
                          char *err, size_t errlen);
 
+/* Whole-string glob match with '*' (any run, including empty) as the only
+ * wildcard.  Used for shell prompts: "#*> " is the Contiki-NG prompt. */
+bool shell_glob_match(const char *pattern, const char *text);
+
 /* "12.345s" style (three decimals of seconds). */
 const char *shell_format_time(int64_t ns, char *buf, size_t len);
 

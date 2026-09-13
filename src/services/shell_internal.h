@@ -7,6 +7,10 @@
 #include "shell_parse.h"
 
 #define SHELL_MS_TO_NS 1000000LL
+/* A prompt counts only once the console has been quiet this long after it
+ * (about 20 characters at 115200 baud): a prompt followed at once by more
+ * text on the same line is output, not the end of the command. */
+#define SHELL_PROMPT_QUIET_NS (2 * SHELL_MS_TO_NS)
 
 /* --- output (shell_service.c) ------------------------------------------ */
 
@@ -81,6 +85,15 @@ void shell_script_block_expect(shell_service_t *s, const char *pattern,
                                int64_t timeout_ns);
 void shell_script_block_until(shell_service_t *s, shell_block_t kind,
                               int64_t deadline_ns);
+/* `cmd`: arm the prompt wait for slot idx (the line was already sent). */
+void shell_script_block_cmd(shell_service_t *s, int idx, int node_id,
+                            const char *text, const char *expect,
+                            const char *fail_on, int64_t timeout_ns);
+/* A raw console byte (observer context). */
+void shell_script_on_uart_byte(shell_service_t *s, int idx, uint8_t byte,
+                               int64_t ns);
+/* `console`: switch the terminal to talking to one node. */
+int  shell_console_enter(shell_service_t *s, int idx, int node_id);
 int  shell_script_at_add(shell_service_t *s, int64_t at_ns, int64_t period_ns,
                          const char *cmd);
 int  shell_script_at_remove(shell_service_t *s, int id);   /* id < 0 = all */

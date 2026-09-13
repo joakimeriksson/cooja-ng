@@ -168,7 +168,24 @@ static void mock_reset(void) {
     sh.sim = &mock_sim; sh.ctl = &mock_ctl; sh.active = true; sh.interactive = false;
     sh.verbose = false; sh.next_at_id = 1; sh.default_expect_timeout_ns = 30000000000LL;
     sh.stop_when_done = false;
+    snprintf(sh.prompt_glob, sizeof(sh.prompt_glob), "#*> ");
     shell_script_init(&sh);
+}
+
+/* Feed console bytes of node slot idx to the engine (what the service's
+ * UART-byte observer does), emitting a log line at each newline. */
+static void emit_bytes(int idx, const char *text) {
+    char line[256]; int n = 0;
+    for (const char *p = text; *p; p++) {
+        shell_script_on_uart_byte(&sh, idx, (uint8_t)*p, sim_runtime_now_ns(&mock_sim));
+        if (*p == '\n') {
+            line[n] = '\0';
+            shell_script_on_log_line(&sh, idx, mock_nodes[idx].id, line, sim_runtime_now_ns(&mock_sim));
+            n = 0;
+        } else if (n < 255) {
+            line[n++] = *p;
+        }
+    }
 }
 
 static void emit_line(int idx, const char *line) {
@@ -624,6 +641,100 @@ static void test_horizon(void) {
     CHECK(!sim_control_after_pump(&mock_ctl), "one-shot: it does not fire again");
 }
 
+static void test_glob(void) {
+    CHECK(shell_glob_match("#*> ", "#f4ce.3601.f1f4.0001> "), "contiki prompt");
+    CHECK(!shell_glob_match("#*> ", "#f4ce.3601> Command"), "prompt followed by text");
+    CHECK(!shell_glob_match("#*> ", "'> help': Shows this help"), "help line is not a prompt");
+    CHECK(shell_glob_match("> ", "> ") && !shell_glob_match("> ", ">  "), "exact");
+    CHECK(shell_glob_match("uart:~$ ", "uart:~$ "), "zephyr prompt");
+    CHECK(shell_glob_match("*", "") && shell_glob_match("a*b*c", "aXbYYc") && !shell_glob_match("a*b*c", "aXbYY"), "multi-star");
+}
+
+static void test_cmd(void) {
+    const char *p;
+
+    /* Pass: line sent, output checked, released at the prompt. */
+    mock_reset();
+    p = write_script("c1", "cmd -f \"not found\" 1 help me\necho after\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(strcmp(mock_last_inject, "help me\n") == 0, "cmd sends text + newline ('%s')", mock_last_inject);
+    CHECK(sh.block == SHELL_BLOCK_CMD, "blocked on the prompt");
+    emit_bytes(0, "#0001.0001> ");
+    shell_script_tick(&sh);
+    CHECK(!sh.cmd_prompt_seen && sh.block == SHELL_BLOCK_CMD, "a prompt is not confirmed before the quiet window");
+    CHECK(queue_has_pin_at(sim_runtime_now_ns(&mock_sim) + SHELL_PROMPT_QUIET_NS), "quiet window pinned");
+    advance(SHELL_PROMPT_QUIET_NS);
+    shell_script_tick(&sh);
+    CHECK(sh.cmd_prompt_seen && sh.passed, "prompt + quiet window releases the cmd");
+    unlink(p);
+    mock_reset();
+    p = write_script("c1b", "cmd -e \"Shows\" 1 help\npass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    emit_bytes(0, "#0001.0001> Shows this help\n");      /* prompt followed by text */
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(!sh.cmd_prompt_seen && sh.cmd_expect_seen, "prompt followed by output is not the prompt; line matched");
+    emit_bytes(0, "'> reboot': Reboot\n");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(!sh.cmd_prompt_seen, "'> ' inside a help line is not a prompt");
+    emit_bytes(1, "#0002.0002> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(!sh.cmd_prompt_seen, "another node's prompt does not count");
+    emit_bytes(0, "#0001.0001> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.cmd_prompt_seen && sh.cmd_lines == 2, "prompt seen after 2 lines (%d)", sh.cmd_lines);
+    CHECK(sh.passed && !sh.failed && sh.cmd_pass == 1, "script passes");
+    unlink(p);
+
+    /* -e not printed / -f printed / no prompt: each fails. */
+    mock_reset();
+    p = write_script("c2", "cmd -e \"wanted\" 1 x\npass\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    emit_bytes(0, "something else\n#1> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "was not printed"), "-e missing fails (%s)", sh.fail_reason);
+    unlink(p);
+    mock_reset();
+    p = write_script("c3", "cmd -f \"not found\" 1 x\npass\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    emit_bytes(0, "Command not found.\n#1> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "printed \"not found\""), "-f seen fails (%s)", sh.fail_reason);
+    unlink(p);
+    mock_reset();
+    p = write_script("c4", "cmd -t 500ms 1 x\npass\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    CHECK(queue_has_pin_at(500000000LL), "timeout pinned");
+    mock_sim.now_ns = 500000000LL;
+    shell_script_tick(&sh);
+    CHECK(sh.failed && strstr(sh.fail_reason, "no prompt"), "no prompt within the timeout fails (%s)", sh.fail_reason);
+    unlink(p);
+
+    /* set prompt; empty cmd waits for a prompt; refused from at; errors. */
+    mock_reset();
+    p = write_script("c5", "set prompt \"uart:~$ \"\ncmd 1\npass\n");
+    shell_script_source(&sh, p); shell_script_tick(&sh);
+    CHECK(strcmp(mock_last_inject, "\n") == 0, "empty cmd sends a bare newline");
+    emit_bytes(0, "#1> ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(!sh.cmd_prompt_seen, "old glob no longer matches");
+    emit_bytes(0, "\nuart:~$ ");
+    advance(SHELL_PROMPT_QUIET_NS); shell_script_tick(&sh);
+    CHECK(sh.passed, "custom prompt releases the cmd");
+    unlink(p);
+    mock_reset();
+    sh.interactive = true;
+    shell_enqueue_line(&sh, "at +1s cmd 1 help");
+    shell_enqueue_line(&sh, "cmd 1,2 help");
+    shell_enqueue_line(&sh, "cmd -x 1 help");
+    shell_enqueue_line(&sh, "cmd -t");
+    shell_enqueue_line(&sh, "console 1");      /* not a terminal */
+    shell_script_tick(&sh);
+    CHECK(sh.atq_count == 0 && sh.block == SHELL_BLOCK_NONE && mock_inject_calls == 0 && !sh.console_mode,
+          "at cmd, node lists, bad options and console without a tty are refused");
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -636,6 +747,8 @@ int run_shell_tests(int verbose) {
     test_stdin_burst();
     test_horizon();
     test_exit_codes();
+    test_glob();
+    test_cmd();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }

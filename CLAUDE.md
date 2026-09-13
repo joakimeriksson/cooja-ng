@@ -119,6 +119,8 @@ tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 k
 # SECONDS for this one flag (like timeout(1); 500ms / 2m also accepted).
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
+./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15-cmd.cnsh  # `cmd`: send a
+                                            # line, wait for the node's prompt, check its output
 ./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)
 tools/check-shell.sh                        # scripted pass/fail, piped session (sequential, deterministic),
                                             # --paused, speed change, deadlock, determinism diffs

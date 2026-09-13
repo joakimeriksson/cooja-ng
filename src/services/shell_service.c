@@ -14,6 +14,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,6 +36,7 @@ static void build_prompt(shell_service_t *s) {
     else if (s->block == SHELL_BLOCK_SLEEP) state = " [sleep]";
     else if (s->block == SHELL_BLOCK_WAIT_UNTIL) state = " [wait]";
     else if (s->block == SHELL_BLOCK_RUN) state = " [run]";
+    else if (s->block == SHELL_BLOCK_CMD) state = " [cmd]";
     else if (s->depth > 0) state = " [script]";
     snprintf(s->prompt, sizeof(s->prompt), "cooja %.3fs%s> ",
              (double)now / 1e9, state);
@@ -147,7 +149,9 @@ static void console_line(shell_service_t *s, int idx, int node_id,
     const char *type = "?";
     sim_control_node_info_t info;
     if (sim_control_describe(s->ctl, idx, &info) && info.type) type = info.type;
-    if (s->console_mask[idx]) {
+    /* In console mode the terminal shows only the console node's raw
+     * bytes; prefixed lines would duplicate and interleave with them. */
+    if (s->console_mask[idx] && !s->console_mode) {
         shell_hold_output(s);      /* released at the next poll */
         shell_out(s, "  %7.3f [Node %d/%s] %s\n", (double)ns / 1e9, node_id,
                   type, line);
@@ -220,12 +224,113 @@ static void deliver_eof_exit(shell_service_t *s) {
     shell_enqueue_line(s, "exit");
 }
 
+/* --- console mode ------------------------------------------------------------ */
+
+static struct termios g_console_saved;
+
+int shell_console_enter(shell_service_t *s, int idx, int node_id) {
+    if (!s->editor || !s->interactive) return -1;
+    shell_release_output(s);
+    edit_end(s);                         /* linenoise restores cooked mode */
+    struct termios t;
+    if (tcgetattr(STDIN_FILENO, &g_console_saved) != 0) return -1;
+    t = g_console_saved;
+    /* Line mode with local echo, like a serial terminal to a shell that
+     * does not echo (Contiki-NG's does not).  ISIG off: Ctrl-C is a byte
+     * for the node, not a signal that ends the simulation. */
+    t.c_lflag |= (ICANON | ECHO);
+    t.c_lflag &= ~ISIG;
+    t.c_oflag |= OPOST;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+    s->console_mode = true;
+    s->console_idx = idx;
+    s->console_id = node_id;
+    s->inlen = 0;
+    printf("[console to node %d: lines you type go to the node; ~. or Ctrl-D returns to the shell]\n",
+           node_id);
+    if (sim_control_paused(s->ctl))
+        printf("[note: the simulation is paused; the node answers after `run`]\n");
+    fflush(stdout);
+    return 0;
+}
+
+static void console_leave(shell_service_t *s) {
+    if (!s->console_mode) return;
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_console_saved);
+    s->console_mode = false;
+    s->inlen = 0;
+    printf("\n[back in the Cooja-NG shell]\n");
+    fflush(stdout);
+}
+
+static void console_send_line(shell_service_t *s, const char *line, int len) {
+    char buf[SHELL_LINE_MAX + 1];
+    if (len > SHELL_LINE_MAX - 1) len = SHELL_LINE_MAX - 1;
+    memcpy(buf, line, (size_t)len);
+    buf[len++] = '\n';
+    if (!sim_control_node_active(s->ctl, s->console_idx)) {
+        printf("[node %d is not running]\n", s->console_id);
+        return;
+    }
+    int took = sim_control_send(s->ctl, s->console_id, (const uint8_t *)buf, len,
+                                SIM_CONTROL_WAKE | SIM_CONTROL_RETRY);
+    if (took < len)
+        printf("[node %d: input truncated, %d of %d bytes queued]\n",
+               s->console_id, took < 0 ? 0 : took, len);
+}
+
+/* Console mode input: whole lines from the cooked terminal. */
+static void console_read(shell_service_t *s) {
+    while (s->console_mode && stdin_readable(0)) {
+        ssize_t n = read(STDIN_FILENO, s->inbuf + s->inlen,
+                         sizeof(s->inbuf) - 1 - (size_t)s->inlen);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN) break;
+            n = 0;
+        }
+        if (n == 0) {                   /* Ctrl-D */
+            console_leave(s);
+            break;
+        }
+        s->inlen += (int)n;
+        char *start = s->inbuf;
+        char *nl;
+        while (s->console_mode &&
+               (nl = memchr(start, '\n', (size_t)(s->inbuf + s->inlen - start)))) {
+            int len = (int)(nl - start);
+            if ((len == 2 && start[0] == '~' && start[1] == '.') ||
+                (len >= 1 && start[0] == 0x1d)) {
+                console_leave(s);
+                break;
+            }
+            console_send_line(s, start, len);
+            start = nl + 1;
+        }
+        if (!s->console_mode) break;
+        int rest = (int)(s->inbuf + s->inlen - start);
+        if (rest >= (int)sizeof(s->inbuf) - 1) rest = 0;      /* overlong: drop */
+        memmove(s->inbuf, start, (size_t)rest);
+        s->inlen = rest;
+    }
+    if (!s->console_mode) edit_begin(s);
+}
+
+static void console_flush(shell_service_t *s) {
+    if (!s->console_dirty) return;
+    s->console_dirty = false;
+    fflush(stdout);
+}
+
 /* Feed the editor / read the pipe until stdin runs dry. */
 static void read_stdin(shell_service_t *s) {
     if (!s->interactive) return;
     if (s->stdin_eof) {
         split_buffered_lines(s);
         deliver_eof_exit(s);
+        return;
+    }
+    if (s->console_mode) {
+        console_read(s);
         return;
     }
     if (s->editor) {
@@ -438,6 +543,7 @@ static const char *block_name(shell_block_t b) {
     case SHELL_BLOCK_SLEEP:      return "sleep";
     case SHELL_BLOCK_WAIT_UNTIL: return "wait-until";
     case SHELL_BLOCK_RUN:        return "run";
+    case SHELL_BLOCK_CMD:        return "cmd";
     default:                     return "nothing";
     }
 }
@@ -446,6 +552,7 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
     if (!shell_service_active(s)) return;
     if (shell_check_signal(s)) return;
     shell_release_output(s);
+    console_flush(s);
     if (s->interactive && !s->stdin_eof) {
         if (s->editor) edit_begin(s);
         if (stdin_readable(timeout_ms)) read_stdin(s);
@@ -463,7 +570,8 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
         bool can_resume = (s->stdin_tty && !s->stdin_eof) || s->external_resume;
         bool time_block = s->block == SHELL_BLOCK_SLEEP ||
                           s->block == SHELL_BLOCK_WAIT_UNTIL ||
-                          s->block == SHELL_BLOCK_EXPECT;
+                          s->block == SHELL_BLOCK_EXPECT ||
+                          s->block == SHELL_BLOCK_CMD;
         if (time_block && !can_resume) {
             char reason[SHELL_REASON_MAX];
             char cause[SHELL_LINE_MAX + 96] = "";
@@ -531,6 +639,7 @@ static void shell_poll(sim_runtime_t *sim, void *state) {
     if (!s->active) return;
     if (shell_check_signal(s)) return;
     shell_release_output(s);          /* console lines from the last pump */
+    console_flush(s);
     if (!s->started) {
         s->started = true;
         if (s->editor) edit_begin(s);
@@ -544,7 +653,16 @@ static void shell_on_event(sim_runtime_t *sim, void *state,
                            const sim_observer_event_t *ev) {
     (void)sim;
     shell_service_t *s = (shell_service_t *)state;
-    if (!s->active || ev->kind != SIM_OBS_MOTE_LOG_LINE) return;
+    if (!s->active) return;
+    if (ev->kind == SIM_OBS_MOTE_UART_BYTE) {
+        if (s->console_mode && ev->mote_index == s->console_idx && ev->u.uart.byte != '\r') {
+            putchar(ev->u.uart.byte);
+            s->console_dirty = true;
+        }
+        shell_script_on_uart_byte(s, ev->mote_index, ev->u.uart.byte, ev->time_ns);
+        return;
+    }
+    if (ev->kind != SIM_OBS_MOTE_LOG_LINE) return;
     console_line(s, ev->mote_index, ev->u.log_line.node_id,
                  ev->u.log_line.line, ev->time_ns);
     shell_script_on_log_line(s, ev->mote_index, ev->u.log_line.node_id,
@@ -563,6 +681,7 @@ static void shell_destroy(sim_runtime_t *sim, void *state) {
     shell_service_t *s = (shell_service_t *)state;
     if (!s->active) return;
     shell_release_output(s);
+    console_leave(s);
     edit_end(s);
     if (s->history_path[0]) linenoiseHistorySave(s->history_path);
     close_logfiles(s);
@@ -603,6 +722,7 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
     s->next_at_id = 1;
     s->default_expect_timeout_ns = 30LL * 1000 * SHELL_MS_TO_NS;
     s->max_line = 128;   /* Contiki-NG SERIAL_LINE_CONF_BUFSIZE default */
+    snprintf(s->prompt_glob, sizeof(s->prompt_glob), "#*> ");  /* Contiki-NG */
     s->stop_when_done = !interactive;
     memset(s->console_mask, verbose ? 1 : 0, sizeof(s->console_mask));
     shell_script_init(s);
@@ -663,6 +783,10 @@ int shell_service_report(shell_service_t *s, int64_t elapsed_ns) {
             snprintf(s->fail_reason, sizeof(s->fail_reason),
                      "script did not complete: still waiting for \"%s\"",
                      s->expect_pattern);
+        else if (s->block == SHELL_BLOCK_CMD)
+            snprintf(s->fail_reason, sizeof(s->fail_reason),
+                     "script did not complete: cmd %d \"%.60s\" still waiting for the prompt",
+                     s->cmd_id, s->cmd_text);
         else if (s->block != SHELL_BLOCK_NONE)
             snprintf(s->fail_reason, sizeof(s->fail_reason),
                      "script did not complete: blocked at %.3f s",
@@ -673,6 +797,8 @@ int shell_service_report(shell_service_t *s, int64_t elapsed_ns) {
     }
     printf("\n--- Script Results ---\n");
     printf("  expects: %d passed, %d failed\n", s->expect_pass, s->expect_fail);
+    if (s->cmd_pass || s->cmd_fail)
+        printf("  cmds:    %d passed, %d failed\n", s->cmd_pass, s->cmd_fail);
     if (!s->failed) {
         printf("\n  SCRIPT PASSED (%lld ms simulated)\n",
                (long long)(elapsed_ns / SHELL_MS_TO_NS));

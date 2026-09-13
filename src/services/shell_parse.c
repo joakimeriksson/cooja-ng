@@ -302,6 +302,26 @@ int shell_unquote_rest(const char *rest, char *out, size_t outlen,
     return (int)keep;
 }
 
+bool shell_glob_match(const char *p, const char *t) {
+    const char *star = NULL, *resume = NULL;
+    while (*t) {
+        if (*p == '*') {
+            star = p++;
+            resume = t;
+        } else if (*p && *p == *t) {
+            p++;
+            t++;
+        } else if (star) {
+            p = star + 1;
+            t = ++resume;
+        } else {
+            return false;
+        }
+    }
+    while (*p == '*') p++;
+    return *p == '\0';
+}
+
 const char *shell_format_time(int64_t ns, char *buf, size_t len) {
     snprintf(buf, len, "%.3fs", (double)ns / 1e9);
     return buf;

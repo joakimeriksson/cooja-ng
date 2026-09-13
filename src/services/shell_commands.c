@@ -191,6 +191,10 @@ static int cmd_status(shell_service_t *s, int argc, char **argv, const char *lin
     case SHELL_BLOCK_RUN:
         shell_out(s, "  blocked: run/step until the auto-pause\n");
         break;
+    case SHELL_BLOCK_CMD:
+        shell_out(s, "  blocked: cmd %d \"%s\" waiting for a prompt matching \"%s\" until %.3f s\n",
+                  s->cmd_id, s->cmd_text, s->prompt_glob, (double)s->block_deadline_ns / 1e9);
+        break;
     default: break;
     }
     if (s->qcount > 0) shell_out(s, "  queued input lines: %d\n", s->qcount);
@@ -456,6 +460,74 @@ static int cmd_sendln(shell_service_t *s, int argc, char **argv, const char *lin
     return do_send(s, argc, argv, line, argpos, true);
 }
 
+/* cmd [-e "<pat>"] [-f "<pat>"] [-t <timeout>] <node> [text...]
+ * Send one line, then hold the stream until the node prints its shell
+ * prompt again.  -e: the output must contain the pattern; -f: it must not. */
+static int cmd_cmd(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    const char *expect = NULL, *fail_on = NULL;
+    int64_t timeout = s->default_expect_timeout_ns;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        const char *o = argv[i];
+        bool is_e = !strcmp(o, "-e") || !strcmp(o, "--expect");
+        bool is_f = !strcmp(o, "-f") || !strcmp(o, "--fail-on");
+        bool is_t = !strcmp(o, "-t") || !strcmp(o, "--timeout");
+        if (!is_e && !is_f && !is_t) { shell_error(s, "cmd: unknown option '%s'", o); return -1; }
+        if (i + 1 >= argc) { shell_error(s, "cmd: %s needs a value", o); return -1; }
+        i++;
+        if (is_e) expect = argv[i];
+        else if (is_f) fail_on = argv[i];
+        else if (parse_dur(s, argv[i], &timeout) != 0) return -1;
+    }
+    if ((expect && !expect[0]) || (fail_on && !fail_on[0])) {
+        shell_error(s, "cmd: empty pattern"); return -1;
+    }
+    if (i >= argc) { shell_error(s, "usage: cmd [-e \"<pat>\"] [-f \"<pat>\"] [-t <timeout>] <node> [text...]"); return -1; }
+    long id;
+    if (shell_parse_int(argv[i], &id) != 0) { shell_error(s, "cmd: expected one node id, got '%s'", argv[i]); return -1; }
+    int idx = sim_control_index_of_id(s->ctl, (int)id);
+    if (idx < 0) { shell_error(s, "no node with id %ld", id); return -1; }
+    if (!sim_control_node_active(s->ctl, idx)) { shell_error(s, "node %ld is not running", id); return -1; }
+
+    char text[SHELL_LINE_MAX];
+    int len = rest_text(s, line, argpos, argc, i + 1, text, sizeof(text) - 1);
+    if (len < 0) return -1;
+    if (s->max_line > 0 && len >= s->max_line)
+        shell_out(s, "warning: a line of %d bytes reaches max-line %d (the node's "
+                  "serial-line buffer); it may be truncated (set max-line 0 to silence)\n",
+                  len, s->max_line);
+    text[len] = '\n';
+    int took = sim_control_send(s->ctl, (int)id, (const uint8_t *)text, len + 1,
+                                SIM_CONTROL_WAKE | SIM_CONTROL_RETRY);
+    text[len] = '\0';
+    if (took < len + 1) {
+        shell_error(s, "node %ld: console input truncated, %d of %d bytes queued",
+                    id, took < 0 ? 0 : took, len + 1);
+        return -1;
+    }
+    /* Armed in the same tick as the send, before the node runs a single
+     * instruction, so neither its output nor its prompt can be missed. */
+    shell_script_block_cmd(s, idx, (int)id, text, expect, fail_on, timeout);
+    return 0;
+}
+
+static int cmd_console(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
+    (void)argc; (void)line; (void)argpos;
+    if (!s->editor || !s->interactive || s->origin.kind != SHELL_ORIGIN_STDIN) {
+        shell_error(s, "console needs an interactive terminal (--shell on a tty)");
+        return -1;
+    }
+    long id;
+    if (shell_parse_int(argv[1], &id) != 0) { shell_error(s, "console: expected one node id, got '%s'", argv[1]); return -1; }
+    int idx = sim_control_index_of_id(s->ctl, (int)id);
+    if (idx < 0) { shell_error(s, "no node with id %ld", id); return -1; }
+    if (shell_console_enter(s, idx, (int)id) != 0) {
+        shell_error(s, "console: cannot set up the terminal");
+        return -1;
+    }
+    return 0;
+}
+
 /* --- scheduling ------------------------------------------------------------ */
 
 /* Validate a command that at/every/on will run later.  Blocking commands
@@ -669,6 +741,16 @@ static int cmd_set(shell_service_t *s, int argc, char **argv, const char *line, 
     if (argc < 2) {
         shell_out(s, "expect-timeout: %.3f s\n", (double)s->default_expect_timeout_ns / 1e9);
         shell_out(s, "max-line: %d%s\n", s->max_line, s->max_line ? "" : " (off)");
+        shell_out(s, "prompt: \"%s\"\n", s->prompt_glob);
+        return 0;
+    }
+    if (strcmp(argv[1], "prompt") == 0 && argc == 3) {
+        if (!argv[2][0] || strlen(argv[2]) >= sizeof(s->prompt_glob)) {
+            shell_error(s, "prompt: expected a pattern of 1..%d characters",
+                        (int)sizeof(s->prompt_glob) - 1);
+            return -1;
+        }
+        snprintf(s->prompt_glob, sizeof(s->prompt_glob), "%s", argv[2]);
         return 0;
     }
     if (strcmp(argv[1], "expect-timeout") == 0 && argc == 3) {
@@ -685,7 +767,7 @@ static int cmd_set(shell_service_t *s, int argc, char **argv, const char *line, 
         s->max_line = (int)v;
         return 0;
     }
-    shell_error(s, "usage: set [expect-timeout <duration> | max-line <bytes>]");
+    shell_error(s, "usage: set [expect-timeout <duration> | max-line <bytes> | prompt \"<glob>\"]");
     return -1;
 }
 
@@ -766,6 +848,8 @@ static const shell_command_t commands[] = {
     { "log-file",   "log-file [<path> [nodes] | off [path]]", "append console lines of nodes to a file (same format); off closes", 0, 2, IMM, cmd_logfile },
     { "send",       "send <nodes> <text...>",          "console input (escapes like \\n honoured; no newline added)", 2, -1, 0, cmd_send },
     { "sendln",     "sendln <nodes> <text...>",        "send + one \"\\n\" — one Contiki-NG shell command", 2, -1, 0, cmd_sendln },
+    { "cmd",        "cmd [-e \"<pat>\"] [-f \"<pat>\"] [-t <timeout>] <node> [text...]", "sendln, then wait for the node's shell prompt; -e output must contain, -f must not", 1, -1, BLK, cmd_cmd },
+    { "console",    "console <node>",                  "talk to a node's console directly (terminal only); ~. or Ctrl-D returns", 1, 1, IMM, cmd_console },
     { "at",         "at <time> <command...> | at list | at clear <id>|all", "run a command at a simulation time (5s, 1500ms, +2s); list or cancel scheduled commands", 1, -1, IMM, cmd_at },
     { "every",      "every <period> <command...>",     "run a command periodically, first after one period", 2, -1, IMM, cmd_every },
     { "atq",        "atq",                             "list scheduled commands (= at list)", 0, 0, IMM, cmd_atq },
@@ -780,7 +864,7 @@ static const shell_command_t commands[] = {
     { "fail-on",    "fail-on \"<pattern>\" [nodes|any]", "fail the script as soon as a console line contains pattern", 1, 2, 0, cmd_fail_on },
     { "count",      "count \"<pattern>\" [nodes|any]", "count console lines containing pattern (see assert count)", 1, 2, 0, cmd_count },
     { "on",         "on <nodes|any> \"<pattern>\" <command...>", "run a command whenever a console line contains pattern", 3, -1, 0, cmd_on },
-    { "set",        "set [expect-timeout <dur> | max-line <bytes>]", "settings; defaults: expect-timeout 30s, max-line 128", 0, 2, IMM, cmd_set },
+    { "set",        "set [expect-timeout <dur> | max-line <bytes> | prompt \"<glob>\"]", "settings; defaults: expect-timeout 30s, max-line 128, prompt \"#*> \"", 0, 2, IMM, cmd_set },
     { "echo",       "echo <text...>",                  "print text", 0, -1, IMM, cmd_echo },
     { "save-config","save-config <file.yaml>",         "write the live setup (positions, nodes, seed) as a config", 1, 1, IMM, cmd_save_config },
     { "help",       "help [command]",                  "this list, or one command's syntax", 0, 1, IMM, cmd_help },

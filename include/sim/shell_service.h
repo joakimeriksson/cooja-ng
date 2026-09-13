@@ -77,6 +77,7 @@ typedef enum shell_block {
     SHELL_BLOCK_SLEEP,
     SHELL_BLOCK_WAIT_UNTIL,
     SHELL_BLOCK_RUN,        /* `run <dur>` / `step`: until the auto-pause */
+    SHELL_BLOCK_CMD,        /* `cmd`: until the node prints its prompt    */
 } shell_block_t;
 
 typedef struct shell_at_entry {
@@ -222,6 +223,31 @@ typedef struct shell_service {
     int    matched_node;
     int64_t matched_ns;
     int64_t default_expect_timeout_ns;
+
+    /* `cmd`: one command line to one node, then wait for its shell prompt.
+     * The prompt is matched (prompt_glob) against the node's console bytes
+     * since the last newline — a prompt has no newline of its own, so it
+     * never becomes a log line. */
+    char    prompt_glob[64];
+    int     cmd_idx, cmd_id;
+    char    cmd_text[96];
+    char    cmd_expect[SHELL_PATTERN_MAX];
+    char    cmd_fail_on[SHELL_PATTERN_MAX];
+    bool    cmd_expect_seen, cmd_fail_seen, cmd_prompt_seen;
+    char    cmd_fail_line[SHELL_PATTERN_MAX];
+    int     cmd_lines;
+    int64_t cmd_prompt_ns;
+    char    cmd_partial[256];
+    int     cmd_plen;
+    int     cmd_candidate_len;   /* partial length at a prompt match, -1 = none */
+    int64_t cmd_candidate_ns;    /* ... and when it matched                     */
+    int     cmd_pass, cmd_fail;
+
+    /* `console <id>`: the terminal talks to one node directly (lines in,
+     * raw console bytes out) until `~.` or Ctrl-D. */
+    bool    console_mode;
+    int     console_idx, console_id;
+    bool    console_dirty;
     int     max_line;       /* warn when one sent line exceeds it; 0 = off  */
 
     /* Verdict (docs/shell.md "Exit codes"). */

@@ -136,6 +136,52 @@ void shell_script_block_until(shell_service_t *s, shell_block_t kind,
     shell_pin(s, deadline_ns);
 }
 
+void shell_script_block_cmd(shell_service_t *s, int idx, int node_id,
+                            const char *text, const char *expect,
+                            const char *fail_on, int64_t timeout_ns) {
+    int64_t now = sim_runtime_now_ns(s->sim);
+    s->block = SHELL_BLOCK_CMD;
+    s->block_start_ns = now;
+    s->block_deadline_ns = now + timeout_ns;
+    s->cmd_idx = idx;
+    s->cmd_id = node_id;
+    snprintf(s->cmd_text, sizeof(s->cmd_text), "%s", text);
+    snprintf(s->cmd_expect, sizeof(s->cmd_expect), "%s", expect ? expect : "");
+    snprintf(s->cmd_fail_on, sizeof(s->cmd_fail_on), "%s", fail_on ? fail_on : "");
+    s->cmd_expect_seen = s->cmd_fail_seen = s->cmd_prompt_seen = false;
+    s->cmd_fail_line[0] = '\0';
+    s->cmd_lines = 0;
+    /* Bytes already on the node's current line (say, the previous prompt)
+     * are not this command's prompt: match only what arrives from now. */
+    s->cmd_plen = 0;
+    s->cmd_partial[0] = '\0';
+    s->cmd_candidate_len = -1;
+    if ((expect && expect[0]) || (fail_on && fail_on[0])) s->script_used = true;
+    shell_pin(s, s->block_deadline_ns);
+}
+
+void shell_script_on_uart_byte(shell_service_t *s, int idx, uint8_t byte,
+                               int64_t ns) {
+    if (s->block != SHELL_BLOCK_CMD || idx != s->cmd_idx || s->cmd_prompt_seen)
+        return;
+    (void)ns;
+    s->cmd_candidate_len = -1;        /* any new byte cancels a candidate */
+    if (byte == '\n') { s->cmd_plen = 0; s->cmd_partial[0] = '\0'; return; }
+    if (byte == '\r') return;
+    if (s->cmd_plen >= (int)sizeof(s->cmd_partial) - 1) return;  /* long line: no prompt */
+    s->cmd_partial[s->cmd_plen++] = (char)byte;
+    s->cmd_partial[s->cmd_plen] = '\0';
+    if (shell_glob_match(s->prompt_glob, s->cmd_partial)) {
+        /* A candidate: it becomes the prompt if the console stays quiet.
+         * Console bytes carry the mote's own clock, which can trail the
+         * kernel's; use kernel time so the check and the pin are exact. */
+        int64_t now = sim_runtime_now_ns(s->sim);
+        s->cmd_candidate_len = s->cmd_plen;
+        s->cmd_candidate_ns = now;
+        shell_pin(s, now + SHELL_PROMPT_QUIET_NS);
+    }
+}
+
 /* --- at queue ------------------------------------------------------------ */
 
 int shell_script_at_add(shell_service_t *s, int64_t at_ns, int64_t period_ns,
@@ -244,6 +290,15 @@ void shell_script_on_log_line(shell_service_t *s, int idx, int node_id,
             break;
         }
     }
+    if (s->block == SHELL_BLOCK_CMD && idx == s->cmd_idx && !s->cmd_prompt_seen) {
+        s->cmd_lines++;
+        if (s->cmd_expect[0] && strstr(line, s->cmd_expect))
+            s->cmd_expect_seen = true;
+        if (s->cmd_fail_on[0] && !s->cmd_fail_seen && strstr(line, s->cmd_fail_on)) {
+            s->cmd_fail_seen = true;
+            snprintf(s->cmd_fail_line, sizeof(s->cmd_fail_line), "%s", line);
+        }
+    }
     if (s->block == SHELL_BLOCK_EXPECT && !s->matched &&
         sel_hit(s->expect_any, s->expect_ids, s->expect_n, node_id) &&
         strstr(line, s->expect_pattern)) {
@@ -292,6 +347,45 @@ static void resolve_block(shell_service_t *s, int64_t now) {
          * budget, or a `!pause` typed meanwhile. */
         if (sim_control_paused(s->ctl)) s->block = SHELL_BLOCK_NONE;
         return;
+    case SHELL_BLOCK_CMD: {
+        char reason[SHELL_REASON_MAX];
+        if (!s->cmd_prompt_seen && s->cmd_candidate_len >= 0 &&
+            s->cmd_candidate_len == s->cmd_plen &&
+            now >= s->cmd_candidate_ns + SHELL_PROMPT_QUIET_NS) {
+            s->cmd_prompt_seen = true;
+            s->cmd_prompt_ns = s->cmd_candidate_ns;
+        }
+        if (s->cmd_prompt_seen) {
+            s->block = SHELL_BLOCK_NONE;
+            if (s->cmd_expect[0] && !s->cmd_expect_seen) {
+                s->cmd_fail++;
+                snprintf(reason, sizeof(reason),
+                         "cmd %d \"%.60s\": \"%.100s\" was not printed before the prompt",
+                         s->cmd_id, s->cmd_text, s->cmd_expect);
+                shell_script_fail(s, reason);
+            } else if (s->cmd_fail_seen) {
+                s->cmd_fail++;
+                snprintf(reason, sizeof(reason), "cmd %d \"%.60s\" printed \"%.60s\": %.200s",
+                         s->cmd_id, s->cmd_text, s->cmd_fail_on, s->cmd_fail_line);
+                shell_script_fail(s, reason);
+            } else {
+                s->cmd_pass++;
+                if (s->verbose)
+                    shell_out(s, "  cmd %d \"%s\": prompt at %.3f s (%d line%s)\n",
+                              s->cmd_id, s->cmd_text, (double)s->cmd_prompt_ns / 1e9,
+                              s->cmd_lines, s->cmd_lines == 1 ? "" : "s");
+            }
+        } else if (now >= s->block_deadline_ns) {
+            s->block = SHELL_BLOCK_NONE;
+            s->cmd_fail++;
+            snprintf(reason, sizeof(reason),
+                     "cmd %d \"%.60s\": no prompt matching \"%s\" within %.3f s",
+                     s->cmd_id, s->cmd_text, s->prompt_glob,
+                     (double)(s->block_deadline_ns - s->block_start_ns) / 1e9);
+            shell_script_fail(s, reason);
+        }
+        return;
+    }
     }
 }
 

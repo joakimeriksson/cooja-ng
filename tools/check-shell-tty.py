@@ -179,6 +179,35 @@ def main():
     check("piped stdout: the simulation runs between commands (%s)" %
           (m.group(1) if m else "no status"),
           bool(m) and float(m.group(1)) > 1.0)
+    # 6. console: lines go to the node, its raw output comes back unprefixed,
+    #    Ctrl-C is a byte for the node (not a signal), ~. returns.
+    s = Session(["--realtime"], history)
+    s.read_for(1.5)
+    s.send("console 1\r", 0.5)
+    mark = len(s.raw)
+    s.send("help\r", 1.5)
+    console_out = ANSI.sub(b"", s.raw[mark:]).decode("utf-8", "replace")
+    s.send(b"\x03\r", 0.8)            # Ctrl-C inside console mode
+    s.send("~.\r", 0.5)
+    s.send("status\r", 0.6)
+    s.send("exit\r", 0.5)
+    code = s.finish()
+    check("console banner", "[console to node 1:" in s.text)
+    check("console shows the node's raw output", "Shows this help" in console_out)
+    check("console output is unprefixed", "[Node 1/ARM]" not in console_out)
+    check("Ctrl-C in console does not end the run", "SIGINT" not in s.text)
+    check("~. returns to the shell", "[back in the Cooja-NG shell]" in s.text and "state:" in s.text)
+    check("console session exits 0", code == 0)
+
+    # 7. cmd at the prompt: blocks until the node's prompt, output checked.
+    s = Session(["--realtime"], history)
+    s.read_for(1.5)
+    s.send('cmd -e "Shows this help" 1 help\r', 1.5)
+    s.send('cmd -e "no such text" -t 1s 1 help\r', 2.5)
+    s.send("exit\r", 0.5)
+    code = s.finish()
+    check("cmd passes at the prompt", "cmds:    1 passed, 1 failed" in s.text)
+    check("failing cmd sets exit status 1", code == 1)
 
     print("check-shell-tty: %s" % ("OK" if failures == 0 else "%d FAILED" % failures))
     return 1 if failures else 0

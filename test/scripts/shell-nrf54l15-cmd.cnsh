@@ -1,0 +1,10 @@
+# The same Contiki-NG shell smoke test as shell-nrf54l15.cnsh, written with
+# `cmd`: each line waits for the node's prompt, and checks what it printed.
+#   ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15-cmd.cnsh
+wait-until 1s
+cmd -e "Shows this help" 1 help
+cmd -e "Node IPv6 addresses" -f "Command not found" 1 ip-addr
+cmd -e "Command not found" 1 no-such-command
+cmd 1                      # a bare line: just wait for the prompt
+assert time < 2s
+pass
