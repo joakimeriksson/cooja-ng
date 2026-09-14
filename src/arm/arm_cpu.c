@@ -3388,10 +3388,14 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                             case 0: /* APSR */
                                 cpu->xpsr = (cpu->xpsr & 0x0FFFFFFF) | (val & 0xF0000000);
                                 break;
-                            case 8: if (arm_sp_is_psp(cpu)) cpu->msp = val;
-                                    else cpu->reg[ARM_SP] = val; break; /* MSP */
-                            case 9: if (arm_sp_is_psp(cpu)) cpu->reg[ARM_SP] = val;
-                                    else cpu->psp = val; break;         /* PSP */
+                            case 8: /* MSP */
+                                if (arm_sp_is_psp(cpu)) cpu->msp = val;
+                                else                    cpu->reg[ARM_SP] = val;
+                                break;
+                            case 9: /* PSP */
+                                if (arm_sp_is_psp(cpu)) cpu->reg[ARM_SP] = val;
+                                else                    cpu->psp = val;
+                                break;
                             case 16:
                                 cpu->primask = val & 1;
                                 /* Like CPSIE i above — when PRIMASK clears,
@@ -3438,10 +3442,14 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                                 }
                                 break;
                             }
-                            case 0x0A: if (cpu->tz_enabled && cpu->secure) cpu->msplim_s = val & ~7u;
-                                       else cpu->msplim_ns = val & ~7u; break;   /* MSPLIM */
-                            case 0x0B: if (cpu->tz_enabled && cpu->secure) cpu->psplim_s = val & ~7u;
-                                       else cpu->psplim_ns = val & ~7u; break;   /* PSPLIM */
+                            case 0x0A: /* MSPLIM */
+                                if (cpu->tz_enabled && cpu->secure) cpu->msplim_s = val & ~7u;
+                                else                                cpu->msplim_ns = val & ~7u;
+                                break;
+                            case 0x0B: /* PSPLIM */
+                                if (cpu->tz_enabled && cpu->secure) cpu->psplim_s = val & ~7u;
+                                else                                cpu->psplim_ns = val & ~7u;
+                                break;
                             /* ARMv8-M Non-secure banks — the secure world's
                              * TZ_NonSecure_SetMSP/CONTROL idiom before BLXNS to
                              * the NS reset handler. Secure-only (WI otherwise). */
@@ -3457,8 +3465,10 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                                     case 0x91: cpu->basepri_ns = val & 0xFFu; break;
                                     case 0x93: cpu->faultmask_ns = val & 1u; break;
                                     case 0x94: cpu->control_ns = val & 0x7u; break;
-                                    case 0x98: if (cpu->control_ns & 2u) cpu->psp_ns = val & ~3u;
-                                               else cpu->msp_ns = val & ~3u; break;
+                                    case 0x98:
+                                        if (cpu->control_ns & 2u) cpu->psp_ns = val & ~3u;
+                                        else                      cpu->msp_ns = val & ~3u;
+                                        break;
                                 }
                                 break;
                             default: break;
