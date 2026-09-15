@@ -565,8 +565,6 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
     memset(s->console_mask, verbose ? 1 : 0, sizeof(s->console_mask));
     shell_script_init(s);
 
-    /* Pipes: make command echo / prompts visible promptly. */
-    if (!isatty(STDOUT_FILENO)) setvbuf(stdout, NULL, _IOLBF, 0);
 
     if (s->editor) {
         const char *hp = getenv("CSIM_SHELL_HISTORY");
@@ -605,7 +603,7 @@ void shell_service_on_restart(shell_service_t *s) {
     s->triggers_dropped = 0;
 }
 
-int shell_service_report(shell_service_t *s, int64_t now_ns) {
+int shell_service_report(shell_service_t *s, int64_t elapsed_ns) {
     if (!shell_service_active(s)) return 0;
     shell_release_output(s);
     edit_end(s);
@@ -635,7 +633,7 @@ int shell_service_report(shell_service_t *s, int64_t now_ns) {
     printf("  expects: %d passed, %d failed\n", s->expect_pass, s->expect_fail);
     if (!s->failed) {
         printf("\n  SCRIPT PASSED (%lld ms simulated)\n",
-               (long long)(now_ns / SHELL_MS_TO_NS));
+               (long long)(elapsed_ns / SHELL_MS_TO_NS));
         return 0;
     }
     printf("\n  SCRIPT FAILED: %s\n", s->fail_reason);

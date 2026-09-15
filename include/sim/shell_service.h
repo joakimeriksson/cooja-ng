@@ -249,7 +249,9 @@ void shell_service_on_autopause(shell_service_t *s);
 
 /* End-of-run: print "--- Script Results ---" when a script/verdict was
  * used and return the exit code (0/1). */
-int  shell_service_report(shell_service_t *s, int64_t now_ns);
+/* elapsed_ns: simulated time since the run started (the same number
+ * the Performance block reports), not the absolute clock. */
+int  shell_service_report(shell_service_t *s, int64_t elapsed_ns);
 
 /* UI restart: drop the at-queue and abort any script; keep masks/files. */
 void shell_service_on_restart(shell_service_t *s);

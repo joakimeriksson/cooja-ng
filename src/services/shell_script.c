@@ -42,10 +42,7 @@ void shell_script_init(shell_service_t *s) {
 /* --- sources ------------------------------------------------------------- */
 
 int shell_script_source(shell_service_t *s, const char *path) {
-    if (s->depth >= SHELL_SOURCE_DEPTH) {
-        shell_out(s, "error: source nesting too deep (max %d)\n", SHELL_SOURCE_DEPTH);
-        return -1;
-    }
+    if (s->depth >= SHELL_SOURCE_DEPTH) return -1;   /* `source` reports it */
     FILE *f = fopen(path, "r");
     if (!f) return -1;
     shell_source_t *src = &s->stack[s->depth++];

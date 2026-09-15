@@ -541,6 +541,12 @@ static int cmd_atrm(shell_service_t *s, int argc, char **argv, const char *line,
 
 static int cmd_source(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)line; (void)argpos;
+    /* Checked here, not per attempt: the path is tried twice below, and
+     * the depth is the same both times. */
+    if (s->depth >= SHELL_SOURCE_DEPTH) {
+        shell_error(s, "source nesting too deep (max %d)", SHELL_SOURCE_DEPTH);
+        return -1;
+    }
     /* From a script file, a relative path is looked up next to that file
      * first, then in the working directory. */
     if (s->origin.kind == SHELL_ORIGIN_FILE && s->depth > 0 && argv[1][0] != '/') {

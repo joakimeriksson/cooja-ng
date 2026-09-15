@@ -1740,8 +1740,15 @@ static int ctl_save_config(void *u, const char *path) {
     (void)u;
     int64_t now = sim_runtime_now_ns(&sim_rt);
     int ms = g_save_elapsed ? (int)((now - g_sim_start_ns) / MS_TO_NS) : g_save_timeout_ms;
+    if (ms <= 0) ms = g_save_timeout_ms;   /* saved before time advanced */
     return save_live_config(path, ms, now);
 }
+/* sim_control is initialized once per process, by whichever client comes
+ * first (the shell, before the restart label; otherwise the UI block after
+ * it).  A second init on a UI restart would memset the speed ratio, the
+ * pause state and any pending console bytes. */
+static void ctl_init_once(int *node_count_ptr);
+
 static const sim_control_ops_t ctl_ops = {
     .user              = NULL,
     .node_count        = ctl_node_count,
@@ -1756,6 +1763,14 @@ static const sim_control_ops_t ctl_ops = {
     .get_interface     = ctl_get_interface,
     .save_config       = ctl_save_config,
 };
+
+static void ctl_init_once(int *node_count_ptr) {
+    static bool done = false;
+    ctl_node_count_ptr = node_count_ptr;
+    if (done) return;
+    sim_control_init(&sim_ctl, &sim_rt, &ctl_ops);
+    done = true;
+}
 
 /* --- Simulation step for one node ---
  *
@@ -1921,7 +1936,11 @@ static void dispatch_mote_wakeup(const sim_event_t *ev) {
 
 static void mixed_dispatch_event(void *user, const sim_event_t *ev) {
     (void)user;
-    sim_control_note_event(&sim_ctl);   /* `step N` budget (no-op unless armed) */
+    /* `step N` budget (no-op unless armed).  TEST_ACTION events are the
+     * script engines' own time pins, not simulation work: counting them
+     * would make `step 3` mean "three of my own deadlines". */
+    if (ev->kind != SIM_EV_TEST_ACTION)
+        sim_control_note_event(&sim_ctl);
     switch (ev->kind) {
     case SIM_EV_TEST_ACTION:
         /* Timed test-action marker (milestone 8.3b): its sole job was
@@ -2198,6 +2217,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         fprintf(stderr, "--paused: nothing could resume the simulation (add --shell, --script or --ui)\n");
         return 1;
     }
+    /* Shell or script through a pipe: make command echo, prompts and
+     * script output visible promptly.  Here, before anything has been
+     * written to stdout — setvbuf after the first output is undefined. */
+    if ((shell_enabled || script_path) && !isatty(STDOUT_FILENO))
+        setvbuf(stdout, NULL, _IOLBF, 0);
 
     g_live_config = &config;
     g_config_path = config_path;
@@ -2292,8 +2316,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
      * boot so boot-time console lines route through its console mask, and
      * after the json-test service so fail_on/steps see a line first. */
     if (shell_enabled || script_path) {
-        ctl_node_count_ptr = &node_count;
-        sim_control_init(&sim_ctl, &sim_rt, &ctl_ops);
+        ctl_init_once(&node_count);
         if (shell_service_start(&shell_svc, &sim_rt, &sim_ctl, shell_enabled != 0,
                                 script_path, verbose != 0) != 0)
             return 1;
@@ -2524,8 +2547,7 @@ sim_restart:
      * The speed ratio (default 10x, shared with serial-socket pacing) and
      * the pause state live in sim_control, which is initialized here —
      * before the UI service, which is one of its clients. */
-    ctl_node_count_ptr = &node_count;
-    sim_control_init(&sim_ctl, &sim_rt, &ctl_ops);
+    ctl_init_once(&node_count);
     if (ui_enabled && !ui_service_active(&ui_svc)) {
         if (!ui_service_start(&ui_svc, ui_port,
                               node_states, prev_node_states,
@@ -3276,7 +3298,7 @@ sim_restart:
      * (M35: json_test service).  Returns the process exit code. */
     int test_exit_code = json_test_report(&json_test_svc, sim_ns);
     /* Script verdict (shell service): FAIL → exit 1, like the JSON test. */
-    if (shell_service_report(&shell_svc, sim_ns) != 0)
+    if (shell_service_report(&shell_svc, sim_ns - sim_start_ns) != 0)
         test_exit_code = 1;
     /* Under --shell the run length is whatever the user ran, not -t. */
     int simulated_ms = (shell_enabled || script_path)
@@ -3300,7 +3322,8 @@ sim_restart:
 
     /* Snapshot of what ran, not of what was loaded (save_live_config). */
     if (save_config_path &&
-        save_live_config(save_config_path, simulated_ms, sim_ns) != 0)
+        save_live_config(save_config_path,
+                         simulated_ms > 0 ? simulated_ms : sim_ms, sim_ns) != 0)
         test_exit_code = 1;
     pcap_service_close(&pcap_svc);
     extern void msp430_timer_dump_ccr_counts(void);
