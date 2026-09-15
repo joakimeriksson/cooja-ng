@@ -26,6 +26,7 @@ Every simulation mode that takes a config or firmware list (`test`,
 | `--shell` | read commands from stdin.  On a terminal: line editing, history (`~/.cooja-ng_history`, or `$CSIM_SHELL_HISTORY`; empty disables), tab completion of command names.  From a pipe: lines run strictly in order, like a script (see *Pipes*), each echoed as `> cmd`; EOF = `exit`. |
 | `--script FILE` | run FILE at simulation start, with or without `--shell`.  Without `--shell` the run ends when the script passes or fails, or when it reaches its end and every `at`/`every` it scheduled has fired (or the duration ends the run). |
 | `--paused` | start paused (needs `--shell`, `--script` or `--ui` to resume). |
+| `--wall-timeout <dur>` | end the run after that much **wall-clock** time (exit code 6).  Never influences the simulation — it only stops it, through the normal teardown (reports, `--save-config`).  A session waiting for input that never comes stops too. |
 | `--speed N` / `--speed max` / `--realtime` | wall-clock pacing: N simulated seconds per wall second; `max` = unpaced (the headless default; the live UI and the serial bridge default to 10x). |
 
 With `--shell` the run has no duration: it ends at `exit`.  At a terminal an
@@ -152,15 +153,36 @@ resume the run — a pipe, whose lines queue behind the block, or `--script`
 alone, and no web UI — the shell fails the script as a deadlock instead of
 hanging.
 
-**Exit codes.**  A script fails on an `expect` timeout, a false `assert`,
-`fail`, a matched `fail-on`, a deadlock, or any command error on a script's
-own line (unknown node, bad syntax, unreadable `source`); the process then
-exits 1 and prints `--- Script Results ---` like the JSON test runner.
+**Exit codes.**  A failing script prints `--- Script Results ---` like the
+JSON test runner and the process exit code says *what* failed — the same
+table the agent-sim-protocol session spec uses, so a shell test and a session
+report a failure the same way and a broken script is never read as a
+firmware failure:
+
+| code | meaning | in the shell |
+|---|---|---|
+| 0 | pass | the script ended without a failure |
+| 1 | assertion | `expect` timeout, false `assert`, `fail`, matched `fail-on`, "did not complete" |
+| 2 | invalid request | unknown command, bad syntax or selector, unknown node, unreadable `source`, a deadlock |
+| 5 | guest failure | (not used by the shell) |
+| 6 | wall timeout | `--wall-timeout` ended the run |
+| 7 | cancelled | Ctrl-C, SIGINT or SIGTERM while a command or script was in flight |
+
 Reaching the end of the script without `pass`/`fail` is a pass, and `exit`
 inside a script file ends it normally.  A command still blocked, or a script
 file not yet finished, when the run ends — duration reached, `exit` typed at
 the prompt, or a signal — is reported as "did not complete" and fails.
 Without any script or verdict command the shell does not touch the exit code.
+
+**Matchers.**  The verdict vocabulary is the protocol's, under shorter names:
+
+| shell | agent-sim-protocol |
+|---|---|
+| `expect <nodes> "<pat>"` | `log_contains` |
+| `assert count "<pat>" <op> N` | `event_count` |
+| `wait-until <time>`, `sleep <dur>` | `time` |
+| `fail-on "<pat>"`, `on ... fail` | `invariants` |
+| `assert node <id> active\|removed` | node state predicates |
 
 ## Pipes
 

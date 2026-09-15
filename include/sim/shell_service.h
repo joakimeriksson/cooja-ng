@@ -115,6 +115,17 @@ typedef struct shell_trigger {
     shell_origin_t origin;
 } shell_trigger_t;
 
+/* Process exit codes, shared with agent-sim-protocol's table so a shell
+ * test and a session report the same thing:
+ *   0 pass, 1 assertion, 2 invalid request/config, 5 guest failure,
+ *   6 wall-clock timeout, 7 cancelled. */
+#define SHELL_EXIT_PASS       0
+#define SHELL_EXIT_ASSERT     1
+#define SHELL_EXIT_INVALID    2
+#define SHELL_EXIT_GUEST      5
+#define SHELL_EXIT_WALL_TIME  6
+#define SHELL_EXIT_CANCELLED  7
+
 typedef struct shell_service {
     sim_runtime_t *sim;
     sim_control_t *ctl;
@@ -160,6 +171,13 @@ typedef struct shell_service {
     char   queue[SHELL_QUEUE_MAX][SHELL_LINE_MAX];
     int    qhead, qcount;
     bool   queue_warned;
+
+    /* --wall-timeout: absolute monotonic ms after which a sequential
+     * session stops waiting for input and ends the run (0 = none).  The
+     * only wall-clock value the shell acts on; it never reaches the
+     * simulation. */
+    double wall_deadline_ms;
+    bool   wall_timeout_hit;   /* the deadline ended the run */
 
     /* stdin poll gate (wall clock, see shell_service.c). */
     uint32_t iter;
@@ -209,6 +227,7 @@ typedef struct shell_service {
     /* Verdict (docs/shell.md "Exit codes"). */
     bool   script_used;     /* a script ran or a verdict command was used  */
     bool   failed;
+    int    fail_code;       /* SHELL_EXIT_* of the first failure           */
     char   fail_reason[SHELL_REASON_MAX];
     bool   passed;          /* `pass` seen                                 */
     bool   exited;          /* `exit`/`quit` executed                      */
@@ -248,8 +267,8 @@ void shell_service_poll_input(shell_service_t *s);
 void shell_service_on_autopause(shell_service_t *s);
 
 /* End-of-run: print "--- Script Results ---" when a script/verdict was
- * used and return the exit code (0/1). */
-/* elapsed_ns: simulated time since the run started (the same number
+ * used and return the exit code (SHELL_EXIT_*: 0 pass, else what failed).
+ * elapsed_ns: simulated time since the run started (the same number
  * the Performance block reports), not the absolute clock. */
 int  shell_service_report(shell_service_t *s, int64_t elapsed_ns);
 

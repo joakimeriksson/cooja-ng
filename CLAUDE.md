@@ -96,7 +96,10 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # Interactive shell + command scripts (docs/shell.md): --shell reads commands
 # from stdin (line editing/history on a TTY, plain lines from a pipe);
 # --script FILE runs a command script with blocking expect/sleep/wait-until and
-# a pass/fail verdict (exit code), so one shell firmware serves many tests.
+# a pass/fail verdict, so one shell firmware serves many tests. The exit code
+# says WHAT failed (agent-sim-protocol's table): 0 pass, 1 assertion, 2 invalid
+# request, 6 wall timeout, 7 cancelled. --wall-timeout <dur> bounds a run in
+# wall-clock time (exit 6) without touching the simulation.
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
 ./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)
@@ -325,7 +328,10 @@ The command shell (`shell_service.c` + `shell_parse.c` + `shell_commands.c` +
 attached by `--shell` / `--script`: terminal or pipe input, a sequential
 command stream with blocking `expect`/`sleep`/`wait-until`, `at`/`every`/`on`
 queues, per-node console masks and log files, and a script verdict that sets
-the exit code. Line editing is the vendored linenoise (`lib/linenoise/`).
+the exit code (the protocol's table — see docs/shell.md "Exit codes", which
+also maps expect/assert/wait-until/fail-on onto the protocol's matchers). A
+piped session is a script: its errors fail the run. Line editing is the
+vendored linenoise (`lib/linenoise/`).
 
 A later addition is the energy estimator, shipped as a **compiled-in plugin**:
 `energest_engine.c` (host-agnostic core — per-mote radio duty cycle + Energest

@@ -82,15 +82,22 @@ void shell_script_abort(shell_service_t *s) {
     s->block = SHELL_BLOCK_NONE;
 }
 
-void shell_script_fail(shell_service_t *s, const char *reason) {
+void shell_script_fail_code(shell_service_t *s, int code, const char *reason) {
     s->script_used = true;
     if (!s->failed) {
         s->failed = true;
+        s->fail_code = code;
         snprintf(s->fail_reason, sizeof(s->fail_reason), "%s", reason);
     }
     shell_out(s, "SCRIPT FAILED: %s\n", reason);
     shell_script_abort(s);
     root_finished(s, true);
+}
+
+/* An assertion-shaped failure: a false assert, an expect timeout, fail-on,
+ * or the script's own `fail`. */
+void shell_script_fail(shell_service_t *s, const char *reason) {
+    shell_script_fail_code(s, SHELL_EXIT_ASSERT, reason);
 }
 
 void shell_script_pass(shell_service_t *s) {

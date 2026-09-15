@@ -102,21 +102,40 @@ const char *shell_origin(shell_service_t *s, char *buf, size_t len) {
     return buf;
 }
 
+static void shell_error_code(shell_service_t *s, int code, const char *msg);
+
 void shell_error(shell_service_t *s, const char *fmt, ...) {
     char msg[SHELL_REASON_MAX];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    shell_error_code(s, SHELL_EXIT_INVALID, msg);
+}
+
+/* A failed `assert`: reported like an error, but it is an assertion, so it
+ * carries the assertion exit code. */
+void shell_assert_failed(shell_service_t *s, const char *fmt, ...) {
+    char msg[SHELL_REASON_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    shell_error_code(s, SHELL_EXIT_ASSERT, msg);
+}
+
+static void shell_error_code(shell_service_t *s, int code, const char *msg) {
     char origin[sizeof(s->origin.where)];
     shell_origin(s, origin, sizeof(origin));
     shell_out(s, "error: %s (%s)\n", msg, origin);
-    /* Only a script's own lines fail it — never a typo at the prompt. */
+    /* Only a script's own lines fail it — never a typo at the prompt.  A
+     * malformed or impossible request is EXIT_INVALID, not an assertion;
+     * a false assert arrives via shell_assert_failed with EXIT_ASSERT. */
     if (s->origin.script) {
         char reason[SHELL_REASON_MAX];
         snprintf(reason, sizeof(reason), "%s: %.*s", origin,
                  (int)(sizeof(reason) - sizeof(origin) - 3), msg);
-        shell_script_fail(s, reason);
+        shell_script_fail_code(s, code, reason);
     }
 }
 
@@ -156,6 +175,7 @@ static void handle_ctrl_c(shell_service_t *s) {
         shell_script_abort(s);
         if (!s->failed) {
             s->failed = true;
+            s->fail_code = SHELL_EXIT_CANCELLED;
             snprintf(s->fail_reason, sizeof(s->fail_reason),
                      "aborted by user (Ctrl-C)");
         }
@@ -332,6 +352,12 @@ bool shell_check_signal(shell_service_t *s) {
     g_shell_signal = 0;
     shell_out(s, "\n%s: ending the run (reports and --save-config still run)\n",
               sig == SIGINT ? "SIGINT" : "SIGTERM");
+    if ((s->block != SHELL_BLOCK_NONE || s->depth > 0) && !s->failed) {
+        s->failed = true;
+        s->fail_code = SHELL_EXIT_CANCELLED;
+        snprintf(s->fail_reason, sizeof(s->fail_reason),
+                 "cancelled by %s", sig == SIGINT ? "SIGINT" : "SIGTERM");
+    }
     s->exited = true;
     sim_control_request_exit(s->ctl);
     return true;
@@ -347,7 +373,23 @@ void shell_read_stdin_sync(shell_service_t *s) {
         if (s->qcount > 0 || s->stdin_eof) return;
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
         fflush(stdout);
-        int rc = poll(&pfd, 1, -1);
+        /* With a wall-clock bound, wake up often enough to honour it: a
+         * sequential session otherwise waits here forever for a line that
+         * is never coming. */
+        int timeout = -1;
+        if (s->wall_deadline_ms > 0) {
+            double left = s->wall_deadline_ms - wall_ms();
+            if (left <= 0) {
+                shell_out(s, "--wall-timeout reached while waiting for input; "
+                          "ending the run\n");
+                s->wall_timeout_hit = true;
+                s->exited = true;
+                sim_control_request_exit(s->ctl);
+                return;
+            }
+            timeout = left < 200.0 ? (int)left + 1 : 200;
+        }
+        int rc = poll(&pfd, 1, timeout);
         if (rc < 0) {
             if (errno == EINTR) {
                 if (shell_check_signal(s)) return;
@@ -434,7 +476,7 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
                      "%s blocks the command stream while the simulation is "
                      "paused, and nothing can resume it (deadlock)%s",
                      block_name(s->block), cause);
-            shell_script_fail(s, reason);
+            shell_script_fail_code(s, SHELL_EXIT_INVALID, reason);
             if (!s->interactive) sim_control_request_exit(s->ctl);
         } else if (time_block && s->stdin_tty && !s->paused_hint) {
             s->paused_hint = true;
@@ -637,5 +679,5 @@ int shell_service_report(shell_service_t *s, int64_t elapsed_ns) {
         return 0;
     }
     printf("\n  SCRIPT FAILED: %s\n", s->fail_reason);
-    return 1;
+    return s->fail_code ? s->fail_code : SHELL_EXIT_ASSERT;
 }

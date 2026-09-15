@@ -29,6 +29,7 @@
 #include "websocket_ui_service.h"
 #include "sim_control.h"
 #include "shell_service.h"
+#include "shell_parse.h"
 #include "timeline.h"
 #include "timeline_service.h"
 #include "packet_analyzer.h"
@@ -2036,6 +2037,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     int shell_enabled = 0;
     const char *script_path = NULL;
     int start_paused = 0;
+    double wall_timeout_ms = 0;      /* --wall-timeout: 0 = none */
     double cli_speed = -1.0;
     /* Optional pcap output path (--pcap PATH) */
     const char *pcap_path = NULL;
@@ -2162,6 +2164,17 @@ int run_mixed_multinode_test(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--paused") == 0) {
             start_paused = 1;
+        }
+        else if ((strcmp(argv[i], "--wall-timeout") == 0 && i + 1 < argc) ||
+                 strncmp(argv[i], "--wall-timeout=", 15) == 0) {
+            const char *v = argv[i][14] == '=' ? argv[i] + 15 : argv[++i];
+            int64_t ns;
+            if (shell_parse_duration(v, &ns) != 0) {
+                fprintf(stderr, "--wall-timeout: bad duration '%s' "
+                        "(e.g. 30s, 500ms, 2m)\n", v);
+                return 1;
+            }
+            wall_timeout_ms = (double)ns / 1e6;
         }
         else if (strcmp(argv[i], "--realtime") == 0) {
             cli_speed = 1.0;
@@ -2874,11 +2887,19 @@ sim_restart:
     }
 
     double t_start = get_time_ms();
+    if (wall_timeout_ms > 0)
+        shell_svc.wall_deadline_ms = t_start + wall_timeout_ms;
     /* Pacing baseline, separate from t_start (the end-of-run wall time):
      * rebased on every speed change / resume and continuously while paused. */
     double  pace_t0 = t_start;
     int64_t pace_base_ns = sim_ns;
     uint32_t pace_epoch = sim_ctl.speed_epoch;
+
+    /* Wall-clock bound (--wall-timeout): the one thing that turns a hang
+     * — a firmware that never prints, a session waiting on input that
+     * never comes — into a clean exit instead of a stuck process.  It
+     * never influences the simulation: it only ends the run. */
+    bool wall_timeout_hit = false;
 
     int ss_has_command = sim_external_command_launched(&external_cmd);
     int64_t clock_quantum_end = INT64_MIN;   /* end of the master's current quantum */
@@ -2887,6 +2908,16 @@ sim_restart:
            sim_rt.clock_source) {
         /* Check for restart request from UI */
         if (ui_service_restart_requested(&ui_svc)) break;
+        if (wall_timeout_ms > 0 && !wall_timeout_hit &&
+            get_time_ms() - t_start >= wall_timeout_ms) {
+            wall_timeout_hit = true;
+            printf("\n--wall-timeout: %.3f s of wall-clock time reached at "
+                   "%.3f s simulated: ending the run\n",
+                   wall_timeout_ms / 1000.0, (double)sim_ns / 1e9);
+            fflush(stdout);
+            sim_runtime_request_stop(&sim_rt);
+            break;
+        }
         /* A stop requested while paused (shell `exit`) must not run one
          * more slice. */
         if (sim_runtime_stop_requested(&sim_rt)) break;
@@ -3297,9 +3328,14 @@ sim_restart:
     /* End-of-run JSON test resolution + "--- Test Results ---" report
      * (M35: json_test service).  Returns the process exit code. */
     int test_exit_code = json_test_report(&json_test_svc, sim_ns);
-    /* Script verdict (shell service): FAIL → exit 1, like the JSON test. */
-    if (shell_service_report(&shell_svc, sim_ns - sim_start_ns) != 0)
-        test_exit_code = 1;
+    /* Script verdict (shell service): the exit code says what kind of
+     * failure it was (docs/shell.md "Exit codes"). */
+    int shell_code = shell_service_report(&shell_svc, sim_ns - sim_start_ns);
+    if (shell_code != 0)
+        test_exit_code = shell_code;
+    /* A run cut short by the wall clock reports that, whatever the
+     * unfinished script says (SHELL_EXIT_WALL_TIME). */
+    if (wall_timeout_hit || shell_svc.wall_timeout_hit) test_exit_code = 6;
     /* Under --shell the run length is whatever the user ran, not -t. */
     int simulated_ms = (shell_enabled || script_path)
                        ? (int)((sim_ns - sim_start_ns) / MS_TO_NS) : sim_ms;

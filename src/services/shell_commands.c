@@ -604,7 +604,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         if (parse_dur(s, argv[3], &t) != 0) return -1;
         int r = shell_compare((long)(now_ns(s) / 1000), argv[2], (long)(t / 1000));
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[2]); return -1; }
-        if (!r) { shell_error(s, "assertion failed: time (%.6f s) %s %s", (double)now_ns(s) / 1e9, argv[2], argv[3]); return -1; }
+        if (!r) { shell_assert_failed(s, "assertion failed: time (%.6f s) %s %s", (double)now_ns(s) / 1e9, argv[2], argv[3]); return -1; }
         return 0;
     }
     if (strcmp(what, "nodes") == 0 && argc == 4) {
@@ -614,7 +614,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         for (int i = 0; i < n; i++) if (sim_control_node_active(s->ctl, i)) active++;
         int r = shell_compare(active, argv[2], v);
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[2]); return -1; }
-        if (!r) { shell_error(s, "assertion failed: nodes (%d active) %s %ld", active, argv[2], v); return -1; }
+        if (!r) { shell_assert_failed(s, "assertion failed: nodes (%d active) %s %ld", active, argv[2], v); return -1; }
         return 0;
     }
     if (strcmp(what, "node") == 0 && argc == 4) {
@@ -628,7 +628,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         else if (strcmp(argv[3], "active") == 0) ok = exists && info.active;
         else if (strcmp(argv[3], "removed") == 0) ok = !exists || info.removed;
         else { shell_error(s, "assert node: expected active|removed|exists"); return -1; }
-        if (!ok) { shell_error(s, "assertion failed: node %ld %s", id, argv[3]); return -1; }
+        if (!ok) { shell_assert_failed(s, "assertion failed: node %ld %s", id, argv[3]); return -1; }
         return 0;
     }
     if (strcmp(what, "count") == 0 && argc == 5) {
@@ -641,7 +641,7 @@ static int cmd_assert(shell_service_t *s, int argc, char **argv, const char *lin
         if (!w) { shell_error(s, "assert count: no `count \"%s\"` watch", argv[2]); return -1; }
         int r = shell_compare(w->count, argv[3], v);
         if (r < 0) { shell_error(s, "assert: bad operator '%s'", argv[3]); return -1; }
-        if (!r) { shell_error(s, "assertion failed: count \"%s\" (%d) %s %ld", argv[2], w->count, argv[3], v); return -1; }
+        if (!r) { shell_assert_failed(s, "assertion failed: count \"%s\" (%d) %s %ld", argv[2], w->count, argv[3], v); return -1; }
         return 0;
     }
     shell_error(s, "usage: assert time <op> <t> | nodes <op> N | node <id> active|removed|exists | count \"pat\" <op> N");

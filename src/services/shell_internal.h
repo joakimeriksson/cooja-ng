@@ -13,10 +13,14 @@
 /* Print to the terminal, hiding/redrawing the prompt around the text. */
 void shell_out(shell_service_t *s, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
-/* "error: ..." — and, when the line came from a script file, fails it. */
+/* An error in the request itself (unknown command, bad selector, a node
+ * that does not exist): prints, and fails a script with EXIT_INVALID. */
 void shell_error(shell_service_t *s, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 /* Where the current line comes from, for messages ("file:12" or "stdin"). */
+/* A failed `assert` (EXIT_ASSERT, not EXIT_INVALID). */
+void shell_assert_failed(shell_service_t *s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 const char *shell_origin(shell_service_t *s, char *buf, size_t len);
 
 /* --- command execution (shell_commands.c) ------------------------------ */
@@ -68,6 +72,8 @@ int  shell_script_source(shell_service_t *s, const char *path);
 /* Pop every file source and clear the block (Ctrl-C, fail). */
 void shell_script_abort(shell_service_t *s);
 void shell_script_fail(shell_service_t *s, const char *reason);
+/* Fail with an explicit exit code (shell_script_fail = ASSERT). */
+void shell_script_fail_code(shell_service_t *s, int code, const char *reason);
 void shell_script_pass(shell_service_t *s);
 /* Blocking commands arm the block; the tick resolves it. */
 void shell_script_block_expect(shell_service_t *s, const char *pattern,

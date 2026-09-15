@@ -563,6 +563,45 @@ static void test_stdin_burst(void) {
     CHECK(!sh.queue_warned, "no line is dropped");
 }
 
+/* --- exit codes say what kind of failure it was ------------------------- */
+
+static void test_exit_codes(void) {
+    const char *p;
+    mock_reset();
+    sh.stop_when_done = true;
+    p = write_script("x1", "assert nodes == 9\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.failed && sh.fail_code == SHELL_EXIT_ASSERT,
+          "a false assert is an assertion failure (%d)", sh.fail_code);
+    unlink(p);
+
+    mock_reset();
+    sh.stop_when_done = true;
+    p = write_script("x2", "stauts\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.failed && sh.fail_code == SHELL_EXIT_INVALID,
+          "an unknown command is an invalid request (%d)", sh.fail_code);
+    unlink(p);
+
+    mock_reset();
+    sh.stop_when_done = true;
+    p = write_script("x3", "fail no good\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(sh.failed && sh.fail_code == SHELL_EXIT_ASSERT,
+          "`fail` is an assertion failure (%d)", sh.fail_code);
+    unlink(p);
+
+    mock_reset();
+    p = write_script("x4", "pass\n");
+    shell_script_source(&sh, p);
+    shell_script_tick(&sh);
+    CHECK(shell_service_report(&sh, 0) == SHELL_EXIT_PASS, "a pass reports 0");
+    unlink(p);
+}
+
 /* --- the -t horizon is not cleared by pause/run ------------------------- */
 
 static void test_horizon(void) {
@@ -596,6 +635,7 @@ int run_shell_tests(int verbose) {
     test_review_fixes();
     test_stdin_burst();
     test_horizon();
+    test_exit_codes();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }
