@@ -1605,8 +1605,13 @@ static void ctl_start(void *u, int idx) {
     (void)u;
     int64_t now = sim_runtime_now_ns(&sim_rt);
     /* Re-seed the mote clock to current time so stepping resumes
-     * correctly (M15 op), then open the start gate. */
-    mote_store[idx].ops->reset_time(&mote_store[idx], now);
+     * correctly (M15 op), then open the start gate.  Never rewind it: a
+     * node started before its own boot time (an `add` at t=0) keeps its
+     * post-boot clock, like the configured nodes, instead of sleeping
+     * through the events its boot already queued. */
+    int64_t mote_now = mote_store[idx].ops->sim_time_ns
+        ? mote_store[idx].ops->sim_time_ns(&mote_store[idx]) : 0;
+    mote_store[idx].ops->reset_time(&mote_store[idx], now > mote_now ? now : mote_now);
     node_start_ns[idx] = now;
 }
 static void ctl_remove(void *u, int idx) {
@@ -2821,11 +2826,29 @@ sim_restart:
      * what tells you whether an ARM workload is interpreter-bound. */
     double time_step = 0;
 
+    /* The kernel clock starts at the first scheduled wakeup, not at the
+     * latest boot time: the initial wakeups sit at node_start_ns (0 without
+     * a startup delay), and a first slice starting at boot time would show
+     * services and commands a time the pump then steps back from.  Set
+     * now_ns too, so a --paused shell sees the same time the pump will. */
+    if (!sim_rt.clock_source) {
+        int64_t first_ev = sim_eq_peek_time(&sim_eq);
+        if (first_ev < sim_ns) sim_ns = first_ev;
+    }
+    sim_rt.now_ns = sim_ns;
+    /* A shell session starts here, at that time: its elapsed time (the
+     * report, --save-config) counts from it, so `run 100ms` reports
+     * 100 ms.  Headless runs keep end_ns from the boot time, unchanged. */
+    if (shell_enabled) {
+        sim_start_ns = sim_ns;
+        g_sim_start_ns = sim_ns;
+    }
+
     double t_start = get_time_ms();
     /* Pacing baseline, separate from t_start (the end-of-run wall time):
      * rebased on every speed change / resume and continuously while paused. */
     double  pace_t0 = t_start;
-    int64_t pace_base_ns = sim_start_ns;
+    int64_t pace_base_ns = sim_ns;
     uint32_t pace_epoch = sim_ctl.speed_epoch;
 
     int ss_has_command = sim_external_command_launched(&external_cmd);
