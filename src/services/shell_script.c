@@ -307,7 +307,9 @@ static const char *next_line(shell_service_t *s, char *buf, size_t len) {
         pop_source(s);
         if (s->depth == 0 && !s->finished) root_finished(s, false);
     }
-    if (s->qcount == 0 && s->sync_stdin && !s->stdin_eof &&
+    /* Also after EOF: a burst larger than the queue leaves lines buffered,
+     * and the implied `exit` is queued only once they have all run. */
+    if (s->qcount == 0 && s->sync_stdin &&
         !sim_runtime_stop_requested(s->sim))
         shell_read_stdin_sync(s);
     s->origin.kind = SHELL_ORIGIN_STDIN;

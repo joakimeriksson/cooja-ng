@@ -144,7 +144,8 @@ typedef struct shell_service {
     /* Raw stdin (non-tty). */
     char   inbuf[4096];
     int    inlen;
-    bool   stdin_eof;
+    bool   stdin_eof;       /* read(2) reached end of input                 */
+    bool   eof_exit_queued; /* the EOF-implied `exit` has been queued       */
 
     /* Lines typed/piped but not yet executed (a script or block holds the
      * stream).  Ring buffer. */

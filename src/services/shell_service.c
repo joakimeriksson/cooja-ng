@@ -164,13 +164,55 @@ static void handle_ctrl_c(shell_service_t *s) {
     }
 }
 
+/* Move complete lines out of inbuf into the queue, stopping when the queue
+ * is full: what is left stays buffered (and what has not been read stays in
+ * the kernel), so a burst larger than the queue is paced, never dropped. */
+static void split_buffered_lines(shell_service_t *s) {
+    char *start = s->inbuf;
+    char *end = s->inbuf + s->inlen;
+    char *nl;
+    while (s->qcount < SHELL_QUEUE_MAX &&
+           (nl = memchr(start, '\n', (size_t)(end - start)))) {
+        *nl = '\0';
+        if (nl > start && nl[-1] == '\r') nl[-1] = '\0';
+        shell_enqueue_line(s, start);
+        start = nl + 1;
+    }
+    int rest = (int)(end - start);
+    memmove(s->inbuf, start, (size_t)rest);
+    s->inlen = rest;
+}
+
+/* At EOF the input ends with an implied `exit`.  Queue it once there is
+ * room and nothing buffered is still waiting — dropping it would leave a
+ * run with no duration running forever.  Whatever is buffered without a
+ * newline is the last line; run it first, whichever path saw the EOF. */
+static void deliver_eof_exit(shell_service_t *s) {
+    if (!s->stdin_eof || s->eof_exit_queued) return;
+    if (s->inlen > 0) {
+        if (s->qcount >= SHELL_QUEUE_MAX) return;
+        s->inbuf[s->inlen] = '\0';   /* unterminated last line */
+        shell_enqueue_line(s, s->inbuf);
+        s->inlen = 0;
+    }
+    if (s->qcount >= SHELL_QUEUE_MAX) return;
+    s->eof_exit_queued = true;
+    shell_enqueue_line(s, "exit");
+}
+
 /* Feed the editor / read the pipe until stdin runs dry. */
 static void read_stdin(shell_service_t *s) {
-    if (!s->interactive || s->stdin_eof) return;
+    if (!s->interactive) return;
+    if (s->stdin_eof) {
+        split_buffered_lines(s);
+        deliver_eof_exit(s);
+        return;
+    }
     if (s->tty) {
         edit_begin(s);
         int guard = 0;
-        while (s->editing && stdin_readable(0) && guard++ < 4096) {
+        while (s->editing && s->qcount < SHELL_QUEUE_MAX &&
+               stdin_readable(0) && guard++ < 4096) {
             char *r = linenoiseEditFeed(&s->ls);
             if (r == linenoiseEditMore) continue;
             if (r == NULL) {
@@ -183,7 +225,7 @@ static void read_stdin(shell_service_t *s) {
                 }
                 /* Ctrl-D on an empty line, or read error: end of input. */
                 s->stdin_eof = true;
-                shell_enqueue_line(s, "exit");
+                deliver_eof_exit(s);
                 return;
             }
             edit_end(s);
@@ -197,42 +239,32 @@ static void read_stdin(shell_service_t *s) {
         }
         return;
     }
-    /* Pipe / file: plain lines, no prompt. */
-    while (stdin_readable(0)) {
+    /* Pipe / file: plain lines, no prompt.  Buffered lines are split first,
+     * and reading stops while the queue is full — the rest waits in the pipe
+     * until the engine has consumed what it has. */
+    for (;;) {
+        split_buffered_lines(s);
+        if (s->qcount >= SHELL_QUEUE_MAX) return;
+        if (!stdin_readable(0)) return;
         if (s->inlen >= (int)sizeof(s->inbuf) - 1) {
-            /* Overlong line: drop it. */
+            /* A full buffer with no newline left in it: the line is longer
+             * than the buffer and cannot be run. */
             shell_out(s, "error: input line too long, dropped\n");
             s->inlen = 0;
         }
         ssize_t n = read(STDIN_FILENO, s->inbuf + s->inlen,
                          sizeof(s->inbuf) - 1 - (size_t)s->inlen);
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN) break;
+            if (errno == EINTR || errno == EAGAIN) return;
             n = 0;
         }
         if (n == 0) {
             s->stdin_eof = true;
-            if (s->inlen > 0) {           /* unterminated last line */
-                s->inbuf[s->inlen] = '\0';
-                shell_enqueue_line(s, s->inbuf);
-                s->inlen = 0;
-            }
-            shell_enqueue_line(s, "exit");
+            deliver_eof_exit(s);
             return;
         }
         s->inlen += (int)n;
         s->inbuf[s->inlen] = '\0';
-        char *start = s->inbuf;
-        char *nl;
-        while ((nl = memchr(start, '\n', (size_t)(s->inbuf + s->inlen - start)))) {
-            *nl = '\0';
-            if (nl > start && nl[-1] == '\r') nl[-1] = '\0';
-            shell_enqueue_line(s, start);
-            start = nl + 1;
-        }
-        int rest = (int)(s->inbuf + s->inlen - start);
-        memmove(s->inbuf, start, (size_t)rest);
-        s->inlen = rest;
     }
 }
 
@@ -307,7 +339,12 @@ bool shell_check_signal(shell_service_t *s) {
 
 /* sync_stdin: block until piped stdin yields at least one line, or EOF. */
 void shell_read_stdin_sync(shell_service_t *s) {
-    while (s->interactive && !s->stdin_eof && s->qcount == 0) {
+    while (s->interactive && s->qcount == 0) {
+        /* Lines already buffered (a burst larger than the queue) must be
+         * split before blocking, or the poll waits for input that has
+         * already arrived. */
+        read_stdin(s);
+        if (s->qcount > 0 || s->stdin_eof) return;
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
         fflush(stdout);
         int rc = poll(&pfd, 1, -1);
@@ -317,7 +354,7 @@ void shell_read_stdin_sync(shell_service_t *s) {
                 continue;
             }
             s->stdin_eof = true;
-            shell_enqueue_line(s, "exit");
+            deliver_eof_exit(s);
             return;
         }
         read_stdin(s);

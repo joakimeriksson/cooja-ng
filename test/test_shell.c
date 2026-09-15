@@ -518,6 +518,51 @@ static void test_review_fixes(void) {
     CHECK(sh.trigger_count == 0 && sh.triggers_dropped == 0, "reported and reset at the tick");
 }
 
+/* --- piped stdin: a burst larger than the queue is paced, not dropped --- */
+
+const char *shell_dequeue_line(shell_service_t *s, char *buf, size_t len);
+
+static void test_stdin_burst(void) {
+    int fds[2];
+    if (pipe(fds) != 0) { CHECK(0, "pipe()"); return; }
+    int saved = dup(STDIN_FILENO);
+    dup2(fds[0], STDIN_FILENO);
+    close(fds[0]);
+
+    const int N = SHELL_QUEUE_MAX * 4;      /* far more than one queue-full */
+    char line[64];
+    for (int i = 0; i < N; i++) {
+        int n = snprintf(line, sizeof(line), "echo l%d\n", i);
+        if (write(fds[1], line, (size_t)n) != n) break;
+    }
+    close(fds[1]);                          /* EOF, with no explicit `exit` */
+
+    mock_reset();
+    sh.interactive = true;
+    sh.sync_stdin = true;
+
+    char buf[SHELL_LINE_MAX];
+    int got = 0, order_ok = 1, guard = 0;
+    const char *last = NULL;
+    for (;;) {
+        if (sh.qcount == 0) shell_read_stdin_sync(&sh);
+        const char *l = shell_dequeue_line(&sh, buf, sizeof(buf));
+        if (!l) break;
+        if (guard++ > N + 8) break;
+        if (strcmp(l, "exit") == 0) { last = "exit"; break; }
+        int idx = -1;
+        if (sscanf(l, "echo l%d", &idx) != 1 || idx != got) order_ok = 0;
+        got++;
+    }
+    dup2(saved, STDIN_FILENO);
+    close(saved);
+
+    CHECK(got == N, "piped burst of %d lines is fully delivered (%d)", N, got);
+    CHECK(order_ok, "piped burst keeps its order");
+    CHECK(last && strcmp(last, "exit") == 0, "EOF still delivers the implied exit");
+    CHECK(!sh.queue_warned, "no line is dropped");
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -527,6 +572,7 @@ int run_shell_tests(int verbose) {
     test_engine();
     test_unquote_rest();
     test_review_fixes();
+    test_stdin_burst();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }
