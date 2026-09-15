@@ -578,14 +578,17 @@ typedef struct nrf54l_spi_chip {
  *
  * Four instances, one per peripheral domain, each governing the 64 peripheral
  * slots in its 256 KB window. PERIPH[n].PERM.SECATTR says whether slot n is
- * Secure; peripherals reset Non-secure (PERM reset value 0x8000002A), and the
- * TrustZone secure world explicitly secures the handful it keeps for itself.
- * The exceptions are the slots whose SECUREMAPPING is fixed Secure — each
- * instance's own slot and the memory protection controller — which no PERM
- * write can open to the Non-secure world. A Non-secure transaction that
- * reaches a Secure peripheral is refused and reported through
- * EVENTS_PERIPHACCERR and the instance's interrupt, which is how the secure
- * world detects and reboots on a violation.
+ * Secure. The reset values are the ones read from a Seeed XIAO nRF54L15
+ * (nrf54l_spu_perm_reset in nrf54l15_soc.c): every present peripheral
+ * resets SECURE except SPU00 slots 12-15 (VPR00 and the three unnamed slots
+ * after it), the SPU, MPC, KMU, CRACEN,
+ * WDT30, TAMPC and a few others are fixed Secure (SECUREMAPPING = 1, no
+ * PERM write can open them), and the secure world must explicitly hand the
+ * Non-secure world what it may use. A Non-secure transaction that reaches
+ * a Secure peripheral is terminated with a precise BusFault in the core
+ * and latched here as EVENTS_PERIPHACCERR (level-sensitive interrupt, the
+ * first offender's low 16 address bits in PERIPHACCERR.ADDRESS); the MPC
+ * latches MEMACCERR for the same transaction.
  *
  * FEATURE.GRTC sub-divides the clock's compare channels, counter views and
  * interrupt groups between the worlds. Those registers are stored so firmware
@@ -595,20 +598,13 @@ typedef struct nrf54l_spi_chip {
 #define NRF54L_SPU_NUM_PERIPH     64
 #define NRF54L_SPU_NUM_GRTC_CC    24
 #define NRF54L_SPU_NUM_GRTC_INT   16
-#define NRF54L_SPU_PERM_RESET     0x8000002Au   /* PRESENT, user-selectable, SECATTR = Non-secure */
 #define NRF54L_SPU_PERM_SECUREMAPPING_MASK   0x3u
 #define NRF54L_SPU_PERM_SECUREMAPPING_SECURE 0x1u  /* always a Secure peripheral */
+#define NRF54L_SPU_PERM_SECUREMAPPING_SPLIT  0x3u  /* per-feature security (FEATURE regs) */
+#define NRF54L_SPU_PERM_DMA_MASK  (0x3u << 2)  /* DMA capability; 0 = none (DMASEC then read-only) */
 #define NRF54L_SPU_PERM_SECATTR   (1u << 4)
 #define NRF54L_SPU_PERM_DMASEC    (1u << 5)
 #define NRF54L_SPU_PERM_LOCK      (1u << 8)
-/* A fixed-Secure slot: SECUREMAPPING = Secure, SECATTR set, and the same DMA
- * capability bits as the generic reset value. */
-#define NRF54L_SPU_PERM_RESET_SECURE \
-    ((NRF54L_SPU_PERM_RESET & ~(NRF54L_SPU_PERM_SECUREMAPPING_MASK | NRF54L_SPU_PERM_SECATTR)) \
-     | NRF54L_SPU_PERM_SECUREMAPPING_SECURE | NRF54L_SPU_PERM_SECATTR)
-/* The bits software may change: SECATTR and DMASEC on a user-selectable slot,
- * LOCK on any slot (set-only; cleared by reset). */
-#define NRF54L_SPU_PERM_WRITABLE  (NRF54L_SPU_PERM_SECATTR | NRF54L_SPU_PERM_DMASEC | NRF54L_SPU_PERM_LOCK)
 
 typedef struct nrf54l_spu_state {
     arm_platform_t *plat;
