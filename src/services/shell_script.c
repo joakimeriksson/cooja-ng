@@ -313,8 +313,12 @@ static const char *next_line(shell_service_t *s, char *buf, size_t len) {
         !sim_runtime_stop_requested(s->sim))
         shell_read_stdin_sync(s);
     s->origin.kind = SHELL_ORIGIN_STDIN;
-    s->origin.script = false;
+    /* A piped session is a script: its lines run in order, nobody is there
+     * to read an error, and the exit code is the only verdict.  A typo at a
+     * terminal prompt still only prints. */
+    s->origin.script = s->sync_stdin;
     snprintf(s->origin.where, sizeof(s->origin.where), "stdin");
+    if (s->sync_stdin) s->script_used = true;
     return shell_dequeue_line(s, buf, len);
 }
 
