@@ -171,11 +171,18 @@ static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr,
         cpu->io_txn_ns = ns;
         /* The bus check sees the address as issued: which alias was used is
          * what tells the security unit whether this is a Non-secure
-         * transaction. Refused accesses are dropped, not faulted — the
-         * security unit reports them through its own event and interrupt. */
+         * transaction. A refused access is terminated with an error: the
+         * security unit latches its own event, and the core takes a precise
+         * BusFault (measured on an nRF54L15: CFSR 0x8200, BFAR = address).
+         * Only armed here; the interpreter takes it at the end of the
+         * instruction that issued it, and clears it at the start of every
+         * instruction, so a refusal by another bus master between
+         * instructions (FLPR, GDB stub, DMA) is not the core's fault. */
         if (__builtin_expect(cpu->io_access_check != NULL, 0) &&
             !cpu->io_access_check(cpu->io_access_user, a, is_write)) {
             cpu->io_blocked = true;
+            cpu->bus_fault_addr = a;
+            cpu->bus_fault_pending = true;
             return NULL;
         }
         if (ns) { a |= 0x10000000u; *addr = a; }
@@ -723,6 +730,9 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->sfsr = 0;
     cpu->sfar = 0;
     cpu->secure_fault_pending = false;
+    cpu->cfsr = cpu->hfsr = cpu->bfar = cpu->mmfar_ns = 0;
+    cpu->bus_fault_addr = 0;
+    cpu->bus_fault_pending = false;
     cpu->exc_crossed_domain = false;
     cpu->exc_bg_secure = false;
     cpu->fetch_ok_base = cpu->fetch_ok_len = 0;
@@ -951,6 +961,10 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     if (cpu->tz_enabled) {
         if (exception_num == EXC_SECUREFAULT)
             target_secure = true;
+        else if ((exception_num == EXC_BUSFAULT || exception_num == EXC_HARDFAULT) && cpu->nvic)
+            /* BusFault and HardFault target Secure unless AIRCR.BFHFNMINS
+             * hands them to the Non-secure world. */
+            target_secure = !(((arm_nvic_t *)cpu->nvic)->aircr & ARM_AIRCR_BFHFNMINS);
         else if (exception_num >= 16 && cpu->nvic)
             target_secure = arm_nvic_targets_secure(
                 (arm_nvic_t *)cpu->nvic, exception_num);
@@ -1785,6 +1799,19 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         }
 
         uint32_t pc = cpu->reg[ARM_PC];
+
+        /* Precise BusFault support (SoCs with a bus-side permission check):
+         * a refusal is taken at the end of the instruction that issued it,
+         * with the instruction's register writes undone, so capture the
+         * state it starts from. Anything armed between instructions (a
+         * refused access by the FLPR, the GDB stub or an event callback) is
+         * discarded here — it was not this core's transaction. */
+        if (__builtin_expect(cpu->io_access_check != NULL, 0)) {
+            memcpy(cpu->insn_snap.reg, cpu->reg, sizeof(cpu->reg));
+            cpu->insn_snap.xpsr = cpu->xpsr;
+            cpu->insn_snap.it_state = cpu->it_state;
+            cpu->bus_fault_pending = false;
+        }
 
         /* ARMv8-M: Non-secure code may not execute from Secure memory, and
          * may fetch from the non-secure-callable window only what a gateway
@@ -4017,6 +4044,40 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         if (cpu->tz_enabled && cpu->secure_fault_pending) {
             cpu->secure_fault_pending = false;
             arm_exception_entry(cpu, EXC_SECUREFAULT);
+        }
+
+        /* A bus-side permission refusal during this instruction: precise
+         * BusFault. The instruction is undone — registers, flags and ITSTATE
+         * return to what they were before it, so the frame names the
+         * faulting instruction and a refused load leaves its destination
+         * untouched (measured on an nRF54L15). A handler that returns
+         * without patching the stacked PC re-executes it, as on silicon.
+         * Escalates to HardFault (HFSR.FORCED) while SHCSR.BUSFAULTENA is
+         * clear or when the BusFault priority cannot preempt the current
+         * execution priority (an active handler at the same or higher
+         * priority, BASEPRI, PRIMASK, FAULTMASK). AIRCR.PRIS is not
+         * modelled. */
+        if (__builtin_expect(cpu->bus_fault_pending, 0)) {
+            cpu->bus_fault_pending = false;
+            memcpy(cpu->reg, cpu->insn_snap.reg, sizeof(cpu->reg));
+            cpu->xpsr = cpu->insn_snap.xpsr;
+            cpu->it_state = cpu->insn_snap.it_state;
+            cpu->cfsr |= ARM_CFSR_PRECISERR | ARM_CFSR_BFARVALID;
+            cpu->bfar = cpu->bus_fault_addr;
+            arm_nvic_t *nv = (arm_nvic_t *)cpu->nvic;
+            int exc = EXC_BUSFAULT;
+            if (nv && (!(nv->shcsr & ARM_SHCSR_BUSFAULTENA) ||
+                       arm_nvic_get_priority(nv, EXC_BUSFAULT) >=
+                       arm_nvic_execution_priority(nv))) {
+                exc = EXC_HARDFAULT;
+                cpu->hfsr |= ARM_HFSR_FORCED;
+            }
+            arm_exception_entry(cpu, exc);
+            /* The fault handler is active: an interrupt pended by the same
+             * transaction (the security unit's) is taken by the check below
+             * only if it can preempt the handler; at equal priority it waits,
+             * as on hardware. */
+            if (nv) nv->active_exception = exc;
         }
 
         /* System reset requested during this instruction (SYSRESETREQ or a

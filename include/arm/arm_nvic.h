@@ -30,6 +30,16 @@
 #define SCB_SHPR2   0xD1C  /* System Handler Priority Register 2 */
 #define SCB_SHPR3   0xD20  /* System Handler Priority Register 3 */
 #define SCB_SHCSR   0xD24  /* System Handler Control and State Register */
+#define SCB_CFSR    0xD28  /* Configurable Fault Status (MMFSR|BFSR|UFSR), W1C */
+#define SCB_HFSR    0xD2C  /* HardFault Status, W1C */
+#define SCB_MMFAR   0xD34  /* MemManage Fault Address (same register as BFAR here) */
+#define SCB_BFAR    0xD38  /* BusFault Address */
+
+#define ARM_SHCSR_BUSFAULTENA (1u << 17)
+#define ARM_AIRCR_BFHFNMINS   (1u << 13)
+#define ARM_CFSR_PRECISERR    (1u << 9)    /* BFSR.PRECISERR */
+#define ARM_CFSR_BFARVALID    (1u << 15)   /* BFSR.BFARVALID */
+#define ARM_HFSR_FORCED       (1u << 30)
 #define SCB_CPUID   0xD00  /* CPUID Base Register */
 #define SCB_DEMCR   0xDFC  /* Debug Exception and Monitor Control (TRCENA) */
 
@@ -112,6 +122,12 @@ void arm_nvic_reset(arm_nvic_t *nvic);
 
 /* Set an IRQ pending (irq_num = 0-479, maps to exception 16+irq_num) */
 void arm_nvic_set_pending(arm_nvic_t *nvic, int irq_num);
+/* Mark an IRQ pending without dispatching it: the per-instruction check in
+ * the interpreter takes it at the next boundary. For a peripheral whose
+ * interrupt is raised by a transaction that itself faults (a refused bus
+ * access), so the core's synchronous fault is entered first and the IRQ
+ * competes with the fault handler on priority, as on hardware. */
+void arm_nvic_set_pending_deferred(arm_nvic_t *nvic, int irq_num);
 
 /* Clear an IRQ pending */
 void arm_nvic_clear_pending(arm_nvic_t *nvic, int irq_num);
@@ -124,6 +140,11 @@ uint32_t arm_nvic_get_vector(arm_nvic_t *nvic, int exception_num);
 
 /* Get priority for an exception number */
 int arm_nvic_get_priority(arm_nvic_t *nvic, int exception_num);
+/* Current execution priority: the lowest of the active exception's priority,
+ * BASEPRI (when non-zero), 0 under PRIMASK and -1 under FAULTMASK; 256 in
+ * Thread mode with nothing masked. A configurable fault whose priority is not
+ * higher (numerically lower) than this escalates to HardFault. */
+int arm_nvic_execution_priority(arm_nvic_t *nvic);
 
 /* ARMv8-M: does `exception_num` target the Secure state? External IRQs use
  * NVIC_ITNS; SecureFault and (for now) other system exceptions are Secure. */
