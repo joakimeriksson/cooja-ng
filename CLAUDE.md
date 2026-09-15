@@ -158,8 +158,9 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner test configs/test-tz-watchdog-nrf54l15-xiao.yaml  # ~32s sim
 # Peripheral-permission enforcement: a normal world built with the full
 # platform instead of the minimal one reaches for peripherals the secure world
-# has claimed. The SPU refuses the transaction, raises PERIPHACCERR, and the
-# secure world reboots reporting the violation.
+# has claimed. The transaction terminates with a precise BusFault taken by the
+# secure world (its "BF!" report, then a reset) while the SPU latches
+# PERIPHACCERR — the same line a XIAO nRF54L15 prints with these images.
 ./build/test_runner test configs/test-tz-spu-violation-nrf54l15-xiao.yaml  # ~1s sim
 # Two-node RPL-UDP over TrustZone: each node's Non-secure world drives the
 # radio through SG veneers into the Secure world's driver, which acknowledges
