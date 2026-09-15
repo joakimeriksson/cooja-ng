@@ -976,8 +976,12 @@ int64_t msp430_step_micros(msp430_cpu_t *cpu, int64_t jump_us, int64_t execute_u
           cpu->interrupt_max >= 0) &&
         cpu->cpu_freq_hz > 0 &&
         cpu->next_event_cycle > cpu->cycles) {
-        return ((cpu->next_event_cycle - cpu->cycles) * 1000000LL) /
-               cpu->cpu_freq_hz;
+        int64_t lead = cpu->next_event_cycle - cpu->cycles;
+        /* No event queued (next_event_cycle == INT64_MAX): saturate
+         * rather than overflow the µs conversion. */
+        if (lead > INT64_MAX / 1000000LL)
+            return INT64_MAX / 1000000LL / cpu->cpu_freq_hz;
+        return (lead * 1000000LL) / cpu->cpu_freq_hz;
     }
     return 0;
 }

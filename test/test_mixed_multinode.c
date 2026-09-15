@@ -1439,6 +1439,12 @@ static int init_node(int idx, const char *firmware_path,
                      const char *secure_firmware_path, int node_id) {
     mixed_node_t *node = &nodes[idx];
     memset(node, 0, sizeof(*node));
+    /* Clock deviation from config (Cooja MspClock deviation).  Set here, not
+     * by the caller: reboots and added nodes come through init_node too, and
+     * a deviation left at 0 freezes the mote's clock. */
+    node->clock_deviation = (node_cfg_src && idx < node_cfg_src->node_count &&
+                             node_cfg_src->nodes[idx].clock_deviation > 0.0)
+                            ? node_cfg_src->nodes[idx].clock_deviation : 1.0;
     /* Phase 3: one registry lookup owns the board decision — node kind,
      * arch platform name, and banner label all come from the row.
      * M23: the kind row owns boot + radio registration + ops. */
@@ -2305,10 +2311,6 @@ sim_restart:
             fprintf(stderr, "Failed to initialize node %d\n", node_id);
             return 1;
         }
-        /* Clock deviation from config (Cooja MspClock deviation) */
-        nodes[i].clock_deviation = (config_loaded && i < config.node_count &&
-                                    config.nodes[i].clock_deviation > 0.0)
-                                   ? config.nodes[i].clock_deviation : 1.0;
         nodes[i].last_execute_ns = 0;
         if (nodes[i].clock_deviation != 1.0)
             printf("  Node %d: clock deviation=%.10f\n", nodes[i].id, nodes[i].clock_deviation);
