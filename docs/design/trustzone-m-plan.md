@@ -268,22 +268,49 @@ nothing was ever refused. Now:
 
 - **Peripheral permission.** All four security-unit instances are modelled:
   the 64 permission slots each governs, its violation event, address capture
-  and interrupt. Peripherals reset Non-secure, as on silicon, and the secure
-  world secures the handful it keeps; the slots whose mapping is fixed Secure
-  on silicon — each instance's own and the memory protection controller's —
-  cannot be opened by any permission write, so the Non-secure world can never
-  reach the registers that would let it re-attribute everything else.
-  Permission writes touch only the attribute, DMA-attribute and lock bits; the
-  lock holds until reset. A Non-secure transaction reaching a Secure peripheral
-  is refused, recorded (the first offender's low 16 address bits, as the
-  register is defined) and reported through the owning instance's
-  level-sensitive interrupt, which is how the secure world's handler detects
-  it and reboots. `configs/test-tz-spu-violation-nrf54l15-xiao.yaml` drives
-  exactly that with a normal world built on the full platform instead of the
-  minimal one. Known deviation: the refused transaction reads as zero and
-  raises no BusFault (the nRF53/91 units terminate it with an error; the
-  nRF54L15's behaviour is unconfirmed). It is masked in practice because the
-  Secure violation interrupt preempts the next instruction.
+  and interrupt. The permission registers reset to the values read from a
+  Seeed XIAO nRF54L15 (`nrf54l_spu_perm_reset`): every present peripheral is
+  Secure at reset except SPU00 slots 12-15 (VPR00 and the three unnamed slots
+  after it), and the slots whose mapping is
+  fixed Secure (the instance itself, MPC00, KMU, CRACEN, WDT30, TAMPC and a
+  few more) cannot be opened by any permission write. The MDK's generic reset
+  value 0x8000002A (Non-secure) does not describe the part. Permission writes
+  touch only the attribute, the DMA attribute where the slot has DMA, and the
+  lock, which holds until reset. A Non-secure transaction reaching a Secure
+  peripheral is terminated with an error: the core takes a precise BusFault
+  (CFSR 0x8200, BFAR = the alias used, into the Secure world unless
+  `AIRCR.BFHFNMINS`), the security unit latches the event with the first
+  offender's low 16 address bits (cleared with the event) and pends its
+  level-sensitive interrupt, and MPC00 latches MEMACCERR. The fault is
+  precise: the interpreter snapshots the register file, xPSR and ITSTATE at
+  the start of every instruction on a SoC with a bus-side permission check
+  and restores them before entering the fault, so the frame names the
+  faulting instruction, a refused load leaves its destination register
+  untouched, and a handler that returns without patching the frame
+  re-executes it, as on silicon. The refused transaction only *marks* the
+  security unit's and MPC00's lines pending; the core enters the synchronous
+  BusFault first and the lines are then arbitrated by priority, so at equal
+  priority the BusFault handler runs before the security unit's interrupt
+  handler (measured), and a higher-priority line preempts it. The BusFault
+  escalates to HardFault (HFSR.FORCED) while `SHCSR.BUSFAULTENA` is clear or
+  when its priority cannot preempt the current execution priority (an active
+  handler at the same or higher priority, BASEPRI, PRIMASK, FAULTMASK). Only
+  the core's own transactions fault: a refusal issued between instructions
+  by another master (the FLPR co-stepped between slices, the GDB stub, a DMA
+  engine) latches the security unit's event but raises no BusFault. From the
+  Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
+  clear, and MMFAR is banked. What firmware reports on a violation is its
+  BusFault handler's line. Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC) attribute
+  per pin or channel through the FEATURE registers; those are stored, not
+  enforced, so a split slot is open to both worlds — on silicon a GPIOTE30
+  channel that was never handed over does fault, which is why the hardware
+  faults earlier than the emulator on the test below. All of this was measured
+  with a probe firmware; the method and numbers are in
+  `devices/nrf54l15-xiao/HARDWARE-COMPARISON.md`.
+  `configs/test-tz-spu-violation-nrf54l15-xiao.yaml` drives a normal world
+  built on the full platform instead of the minimal one and expects the
+  secure world's BusFault report, which is also what the two images print on
+  the XIAO.
 
 - **Non-secure instruction fetch.** Execution from Secure memory is refused at
   the fetch, before the instruction runs, as an invalid entry point
@@ -304,14 +331,17 @@ Three existing unit tests ran Non-secure code from memory they never
 attributed Non-secure, which the fetch check correctly refuses; their setup is
 now realistic. Four tests were added for the fetch rule.
 
-Still deferred: DMA-master attribution through the memory protection
-controller. The bundled example's RAM-access-error probe cannot exercise it on
+Still deferred: per-feature attribution of the split peripherals (GPIO pins,
+GPIOTE and DPPI channels, GRTC compare channels and interrupt groups: stored,
+not enforced); MPC00's MEMACCERR address registers; DMA-master attribution
+through the memory protection controller. The bundled example's RAM-access-error probe cannot exercise it on
 this chip — it points an `NRF_UARTE2_NS` instance that only the nRF5340 has —
 and the emulator models no Non-secure DMA master on the nRF54L15 at all (the
 console is Secure, the radio is driven by the Secure world), so there is
 nothing to enforce against until one exists. Also deferred: the security
 unit's clock sub-division (stored, not enforced), lazy floating-point state,
-banked priorities and banked SysTick, and `AIRCR.PRIS`.
+banked priorities and banked SysTick, `AIRCR.PRIS`, and the Non-secure
+MMFSR/UFSR banks (no MemManage or UsageFault is ever raised).
 
 The radio's ramp-up and ramp-down are still instantaneous; the disabled-event
 delay stands in for the ordering that gives, with a measured window

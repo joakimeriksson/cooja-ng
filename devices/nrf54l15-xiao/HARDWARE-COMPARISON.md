@@ -89,3 +89,38 @@ timer-and-interconnect path. That path now completes in the emulator, and the
 two-node RPL-UDP test over TrustZone passes. The investigation that got it
 there, including a real double-acknowledgement bug in the older firmware that
 the emulator had been hiding, is in `docs/design/nrf54l15-ack-gap.md`.
+
+## Security unit (SPU) and Non-secure peripheral access
+
+Measured 2026-09-15 with a scratch probe firmware (secure world with shell
+commands that dump and poke the four SPU instances, normal world with raw
+read/write commands reached through the secure shell's `ns`; a hook in the
+secure BusFault handler reports SPU state at the moment of a fault). The
+emulator's model was changed to match every row.
+
+| | Hardware | Emulator (after) |
+|---|---|---|
+| Non-secure read or write of a Secure peripheral alias | precise BusFault into the Secure world: CFSR `0x8200` (PRECISERR, BFARVALID), BFAR = the `0x4...` address; the load or store does not complete | same: the frame names the faulting instruction and the destination register is untouched |
+| Security-unit state at the fault | owning instance `EVENTS_PERIPHACCERR=1`, `PERIPHACCERR.ADDRESS` = low 16 bits of the address; MPC00 `EVENTS_MEMACCERR=1` | same (MPC address registers not modelled) |
+| Order of handlers | BusFault handler runs first; the SPU interrupt stays pending behind it (equal priority) | same: the refused transaction only marks the SPU/MPC line pending, the core enters the synchronous BusFault first, and the line is then taken by priority (a higher-priority line would preempt the handler) |
+| SPU interrupt | level: `INTENSET` after a latched event pends the NVIC line at once | same |
+| Clearing the event | `EVENTS_PERIPHACCERR = 0` also zeroes `PERIPHACCERR.ADDRESS` | same |
+| `PERIPH[n].PERM` at reset | every present slot `SECATTR=1` (Secure) except SPU00 slots 12-15 (`0x8001000a`: slot 12 is VPR00, slots 13-15 have no peripheral in the MDK memory map); fixed-Secure (`SECUREMAPPING=1`): SPU00 0,1,5,8,9,11,23,24; SPU10 0,30; SPU20 0,28,39,63; SPU30 0,8,30,31,63; split (`=3`): SPU00 2,16,17; SPU10 2; SPU20 2,24-26,34; SPU30 2,10-12; bit 16 set on every present slot | table copied verbatim (`nrf54l_spu_perm_reset`) |
+| `PERM` writes | `SECATTR` and `LOCK` writable; `DMASEC` only where the DMA field is non-zero; fixed-Secure slots ignore `SECATTR`; `PRESENT`, `SECUREMAPPING`, DMA field, bit 16 read-only | same |
+| Split peripherals with `SECATTR=1` | GPIO P2 readable from Non-secure (the minimal normal world does it at boot); a GPIOTE30 channel `CONFIG` write faults (`BFAR=4010c51c`) | per-feature attributes stored, not enforced: split slots open to both worlds, so the first fault of the full-platform normal world is the CLOCK/POWER/RESET read (`BFAR=4010e600`) rather than GPIOTE30 |
+
+The checked-in `test-tz-spu-violation-nrf54l15-xiao.yaml` images were flashed
+as well: the board prints `BF! PC=... CF=00008200 HF=00000000 BFAR=4010c51c
+MMFAR=4010c51c` and resets, in a loop, and never reaches the SPU handler's
+"Reboot caused by SPU violation" line. The emulator prints the same line with
+`BFAR=4010e600` for the reason in the last row. The `PC=`/`LR=` fields are not
+comparable on either side: the fault is taken from the Non-secure thread, so
+its frame is on the Non-secure stack, while Contiki's BusFault handler reads
+the Secure MSP and prints whatever stale words are there (the emulator's
+`ARM_EXC_TRACE=1` shows the real stacked PC, the `ldr.w` at `0x909e6`).
+
+Not measured on the board, modelled from the architecture: the Non-secure
+view of CFSR/HFSR/BFAR (RAZ/WI while `AIRCR.BFHFNMINS` is clear; MMFAR banked)
+and escalation of a BusFault to HardFault when its priority cannot preempt
+the current execution priority.
+
