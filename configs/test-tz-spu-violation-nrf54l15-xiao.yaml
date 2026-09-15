@@ -1,0 +1,26 @@
+# nRF54L15 TrustZone-M peripheral-permission enforcement.  The Non-secure
+# world here is built with the full platform, so it touches peripherals the
+# Secure world claimed; the SPU must refuse and the Secure world must reboot.
+
+version: 2
+title: "nRF54L15 TrustZone-M peripheral-permission violation (XIAO nRF54L15)"
+timeout_ms: 20000
+seed: 42          # same seed => byte-identical run
+
+mote_types:
+  - { name: normal-world-fullplat, firmware: firmware/nrf54l15-xiao/normal-world-fullplat.nrf54l15-xiao, secure_firmware: firmware/nrf54l15-xiao/secure-world-example.nrf54l15-xiao }
+
+nodes:
+  - { type: normal-world-fullplat, id: 1 }
+
+test:
+  description: >
+    A normal world built with the full platform instead of the minimal one, so
+    it reaches for peripherals the secure world has claimed. The security unit
+    refuses the transaction, raises a peripheral access error, and the secure
+    world's handler records it and reboots; the next boot reports the
+    violation. This is the failure mode the minimal-platform default exists to
+    prevent, and it is the test that the permission model is enforced rather
+    than merely stored.
+  steps:
+    - { wait: "Reboot caused by SPU violation", node: 1 }

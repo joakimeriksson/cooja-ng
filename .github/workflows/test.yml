@@ -301,6 +301,12 @@ jobs:
           tail -5 tzwd.txt
           grep -aq "TEST PASSED" tzwd.txt
 
+      - name: TrustZone-M peripheral-permission violation (nRF54L15 XIAO)
+        run: |
+          ./build/test_runner test configs/test-tz-spu-violation-nrf54l15-xiao.yaml > tzspu.txt 2>&1
+          tail -5 tzspu.txt
+          grep -aq "TEST PASSED" tzspu.txt
+
       - name: TrustZone-M two-node RPL-UDP through SG veneers (nRF54L15 XIAO)
         run: |
           ./build/test_runner test configs/test-tz-rpl-udp-nrf54l15-xiao.yaml > tzrpl.txt 2>&1
