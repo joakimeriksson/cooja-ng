@@ -24,7 +24,14 @@ bool shell_refuse_external_clock(shell_service_t *s, const char *what) {
 
 /* A run/step typed as "!cmd" runs beside the stream and must not hold it;
  * from the stream itself it holds it until the auto-pause. */
-static void hold_stream_for_run(shell_service_t *s, int64_t deadline_ns) {
+static void hold_stream_for_run(shell_service_t *s, int64_t deadline_ns,
+                                const char *line) {
+    /* Remember what left the simulation paused: the auto-pause at the end of
+     * a `run <d>` is what makes the *next* blocking command a deadlock, and
+     * the message should say so. */
+    snprintf(s->run_pause_cmd, sizeof(s->run_pause_cmd), "%s", line ? line : "run");
+    snprintf(s->run_pause_where, sizeof(s->run_pause_where), "%s",
+             s->origin.where[0] ? s->origin.where : "stdin");
     if (s->exec_immediate) return;
     shell_script_block_until(s, SHELL_BLOCK_RUN, deadline_ns);
 }
@@ -89,7 +96,7 @@ static const char *node_state(const sim_control_node_info_t *info, int64_t now) 
 /* --- simulation control ------------------------------------------------- */
 
 static int cmd_run(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)line; (void)argpos;
+    (void)argpos;
     if (shell_refuse_external_clock(s, "run")) return -1;
     if (argc >= 2) {
         int64_t d;
@@ -98,7 +105,7 @@ static int cmd_run(shell_service_t *s, int argc, char **argv, const char *line, 
         s->run_for_target_ns = now_ns(s) + d;
         /* Hold the command stream until the auto-pause, so `run 500ms`
          * followed by `status` in a script/pipe sees the later time. */
-        hold_stream_for_run(s, s->run_for_target_ns);
+        hold_stream_for_run(s, s->run_for_target_ns, line);
     } else {
         sim_control_resume(s->ctl);
     }
@@ -113,24 +120,24 @@ static int cmd_pause(shell_service_t *s, int argc, char **argv, const char *line
 }
 
 static int cmd_step(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
-    (void)line; (void)argpos;
+    (void)argpos;
     if (shell_refuse_external_clock(s, "step")) return -1;
     if (argc < 2) {
         sim_control_step_events(s->ctl, 1);
-        hold_stream_for_run(s, INT64_MAX);
+        hold_stream_for_run(s, INT64_MAX, line);
         return 0;
     }
     long n;
     if (shell_parse_int(argv[1], &n) == 0) {
         if (n < 1) { shell_error(s, "step count must be >= 1"); return -1; }
         sim_control_step_events(s->ctl, (int)(n > INT_MAX ? INT_MAX : n));
-        hold_stream_for_run(s, INT64_MAX);
+        hold_stream_for_run(s, INT64_MAX, line);
         return 0;
     }
     int64_t d;
     if (parse_dur(s, argv[1], &d) != 0) return -1;
     sim_control_run_for(s->ctl, d);
-    hold_stream_for_run(s, now_ns(s) + d);
+    hold_stream_for_run(s, now_ns(s) + d, line);
     return 0;
 }
 

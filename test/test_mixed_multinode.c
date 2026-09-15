@@ -2667,8 +2667,12 @@ sim_restart:
          * config's test duration is a surprise.  With --paused the user's
          * first `run` already decides, so no auto-pause is armed. */
         if (sim_ms_set && !start_paused) {
-            sim_ctl.pause_at_ns = end_ns;
-            printf("  --shell: -t %d ms pauses the simulation at that time (run to continue)\n", sim_ms);
+            /* The horizon itself is armed once the kernel clock is set
+             * (below), so that it counts from the session's start. */
+            if (shell_svc.stdin_tty || ui_enabled)
+                printf("  --shell: -t %d ms pauses the simulation at that time (run to continue)\n", sim_ms);
+            else
+                printf("  --shell: -t %d ms ends the run at that time (no terminal to type `run` at)\n", sim_ms);
         } else if (!sim_ms_set && config_loaded && config.timeout_ms > 0) {
             printf("  --shell: the config's timeout_ms (%d) is ignored; the run ends at `exit`\n",
                    config.timeout_ms);
@@ -2837,11 +2841,14 @@ sim_restart:
     }
     sim_rt.now_ns = sim_ns;
     /* A shell session starts here, at that time: its elapsed time (the
-     * report, --save-config) counts from it, so `run 100ms` reports
-     * 100 ms.  Headless runs keep end_ns from the boot time, unchanged. */
+     * report, --save-config) and the -t horizon count from it, so `run
+     * 100ms` reports 100 ms and `-t 100` pauses when `status` reads
+     * 0.100 s.  Headless runs keep end_ns from the boot time, unchanged. */
     if (shell_enabled) {
         sim_start_ns = sim_ns;
         g_sim_start_ns = sim_ns;
+        if (sim_ms_set && !start_paused)
+            sim_control_set_horizon(&sim_ctl, sim_ns + total_ns);
     }
 
     double t_start = get_time_ms();

@@ -144,6 +144,42 @@ def main():
     check("!run releases the sleep", "after-sleep" in s.text)
     check("paused session exits 0", code == 0)
 
+    # 5. Terminal stdin, piped stdout ("--shell | tee log"): there is no
+    #    line editor, but a human can still type, so the session must stay
+    #    asynchronous — the simulation runs while nothing is typed.
+    r, w = os.pipe()
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.dup2(w, 1)
+        os.dup2(w, 2)
+        os.close(r)
+        os.close(w)
+        os.chdir(ROOT)
+        os.execve(BIN, [BIN, "test", CFG, "--shell", "-q", "--realtime"],
+                  dict(os.environ, TERM="xterm", CSIM_SHELL_HISTORY=history))
+    os.close(w)
+    time.sleep(2.0)                 # type nothing: the sim should advance
+    os.write(fd, b"status\r")
+    time.sleep(1.0)
+    os.write(fd, b"exit\r")
+    out = b""
+    end = time.time() + 10
+    while time.time() < end:
+        ready, _, _ = select.select([r], [], [], 0.2)
+        if not ready:
+            continue
+        chunk = os.read(r, 65536)
+        if not chunk:
+            break
+        out += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    text = ANSI.sub(b"", out).decode("utf-8", "replace")
+    m = re.search(r"time: ([0-9.]+) s", text)
+    check("piped stdout: the simulation runs between commands (%s)" %
+          (m.group(1) if m else "no status"),
+          bool(m) and float(m.group(1)) > 1.0)
+
     print("check-shell-tty: %s" % ("OK" if failures == 0 else "%d FAILED" % failures))
     return 1 if failures else 0
 

@@ -131,6 +131,12 @@ typedef struct sim_control {
      * clamps its slice to it (sim_control_slice_cap) and after_pump pauses
      * once now_ns reaches it. */
     int64_t            pause_at_ns;
+    /* The run's -t horizon (--shell): pause once, at that time.  Separate
+     * from pause_at_ns because pause/resume/run-for own that one — a `run`
+     * typed before the horizon used to drop it silently.  INT64_MAX = none;
+     * cleared when it fires. */
+    int64_t            horizon_ns;
+    bool               horizon_hit;   /* the last pause was the horizon */
     /* `step N`: dispatched-event budget; > 0 means pause when it hits 0.
      * The loop's dispatcher calls sim_control_note_event() per event. */
     int                step_events_left;
@@ -194,6 +200,12 @@ void sim_control_step_events(sim_control_t *c, int n);
 bool sim_control_paused(const sim_control_t *c);
 static inline int64_t sim_control_pause_at(const sim_control_t *c) {
     return c->pause_at_ns;
+}
+/* Arm the one-shot -t horizon (INT64_MAX = none). */
+void sim_control_set_horizon(sim_control_t *c, int64_t at_ns);
+/* True when the pause after_pump just reported came from that horizon. */
+static inline bool sim_control_horizon_hit(const sim_control_t *c) {
+    return c->horizon_hit;
 }
 /* Request the run to end (sim_runtime_request_stop); sticky. */
 void sim_control_request_exit(sim_control_t *c);

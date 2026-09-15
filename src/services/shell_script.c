@@ -367,7 +367,7 @@ void shell_script_tick(shell_service_t *s) {
         const char *first = l;
         while (*first == ' ' || *first == '\t') first++;
         if (*first && *first != '#') shell_hold_output(s);
-        if (s->verbose && (from_file || !s->tty) && *first && *first != '#')
+        if (s->verbose && (from_file || !s->editor) && *first && *first != '#')
             shell_out(s, "> %s\n", l);
         /* A pipe's "!" lines are queued in order; run them as plain lines. */
         if (!from_file && *first == '!') first++;

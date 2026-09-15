@@ -44,7 +44,7 @@ static void build_prompt(shell_service_t *s) {
 }
 
 static void edit_begin(shell_service_t *s) {
-    if (!s->tty || s->editing) return;
+    if (!s->editor || s->editing) return;
     build_prompt(s);
     if (linenoiseEditStart(&s->ls, -1, -1, s->linebuf, sizeof(s->linebuf),
                            s->prompt) == 0) {
@@ -52,7 +52,7 @@ static void edit_begin(shell_service_t *s) {
         s->prompt_ms = wall_ms();
     } else {
         /* Not a usable terminal after all: fall back to plain lines. */
-        s->tty = false;
+        s->editor = false;
     }
 }
 
@@ -208,7 +208,7 @@ static void read_stdin(shell_service_t *s) {
         deliver_eof_exit(s);
         return;
     }
-    if (s->tty) {
+    if (s->editor) {
         edit_begin(s);
         int guard = 0;
         while (s->editing && s->qcount < SHELL_QUEUE_MAX &&
@@ -405,7 +405,7 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
     if (shell_check_signal(s)) return;
     shell_release_output(s);
     if (s->interactive && !s->stdin_eof) {
-        if (s->tty) edit_begin(s);
+        if (s->editor) edit_begin(s);
         if (stdin_readable(timeout_ms)) read_stdin(s);
     } else if (timeout_ms > 0) {
         usleep((useconds_t)timeout_ms * 1000);
@@ -418,19 +418,25 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
      * its lines queue behind the block), no web UI — that is a deadlock:
      * fail it instead of hanging. */
     if (sim_control_paused(s->ctl) && !sim_runtime_stop_requested(s->sim)) {
-        bool can_resume = (s->tty && !s->stdin_eof) || s->external_resume;
+        bool can_resume = (s->stdin_tty && !s->stdin_eof) || s->external_resume;
         bool time_block = s->block == SHELL_BLOCK_SLEEP ||
                           s->block == SHELL_BLOCK_WAIT_UNTIL ||
                           s->block == SHELL_BLOCK_EXPECT;
         if (time_block && !can_resume) {
             char reason[SHELL_REASON_MAX];
+            char cause[SHELL_LINE_MAX + 96] = "";
+            if (s->run_pause_cmd[0])
+                snprintf(cause, sizeof(cause),
+                         " — the simulation is paused because `%.200s` (%s) "
+                         "ran to its end; put a `run` before this command",
+                         s->run_pause_cmd, s->run_pause_where);
             snprintf(reason, sizeof(reason),
                      "%s blocks the command stream while the simulation is "
-                     "paused, and nothing can resume it (deadlock)",
-                     block_name(s->block));
+                     "paused, and nothing can resume it (deadlock)%s",
+                     block_name(s->block), cause);
             shell_script_fail(s, reason);
             if (!s->interactive) sim_control_request_exit(s->ctl);
-        } else if (time_block && s->tty && !s->paused_hint) {
+        } else if (time_block && s->stdin_tty && !s->paused_hint) {
             s->paused_hint = true;
             shell_out(s, "note: %s is blocked while the simulation is paused; "
                       "type !run to continue\n", block_name(s->block));
@@ -443,6 +449,7 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
         }
     } else {
         s->paused_hint = false;
+        s->run_pause_cmd[0] = '\0';   /* running again: no longer the cause */
     }
 
     shell_release_output(s);
@@ -458,10 +465,20 @@ void shell_service_on_autopause(shell_service_t *s) {
     char t[32];
     shell_format_time(sim_runtime_now_ns(s->sim), t, sizeof(t));
     if (!s->interactive) return;
-    if (s->block == SHELL_BLOCK_RUN)      /* the user's own run/step */
+    if (!sim_control_horizon_hit(s->ctl)) {   /* the user's own run/step */
         shell_out(s, "paused at %s\n", t);
-    else                                  /* the -t horizon */
-        shell_out(s, "-t duration reached: paused at %s (run to continue, exit to quit)\n", t);
+        return;
+    }
+    /* The -t horizon.  A terminal keeps the prompt and can type `run`; a
+     * pipe cannot resume, so -t ends the run there, as it does without
+     * --shell. */
+    if (!s->stdin_tty && !s->external_resume) {
+        shell_out(s, "-t duration reached at %s: ending the run\n", t);
+        s->exited = true;
+        sim_control_request_exit(s->ctl);
+        return;
+    }
+    shell_out(s, "-t duration reached: paused at %s (run to continue, exit to quit)\n", t);
 }
 
 /* --- service ops --------------------------------------------------------- */
@@ -474,7 +491,7 @@ static void shell_poll(sim_runtime_t *sim, void *state) {
     shell_release_output(s);          /* console lines from the last pump */
     if (!s->started) {
         s->started = true;
-        if (s->tty) edit_begin(s);
+        if (s->editor) edit_begin(s);
     }
     gated_read_stdin(s);
     shell_script_tick(s);
@@ -531,8 +548,14 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
     s->active = true;
     s->interactive = interactive;
     s->verbose = verbose;
-    s->tty = interactive && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
-    s->sync_stdin = interactive && !s->tty;
+    /* Three separate questions: can a human type at us (stdin), can we
+     * draw a prompt (both ends), and must input run strictly in order.
+     * `--shell | tee log` has a terminal to type at but no editor, and it
+     * must NOT become a sequential session — that would stop the
+     * simulation between commands. */
+    s->stdin_tty  = interactive && isatty(STDIN_FILENO);
+    s->editor     = s->stdin_tty && isatty(STDOUT_FILENO);
+    s->sync_stdin = interactive && !s->stdin_tty;
     s->origin.kind = SHELL_ORIGIN_STDIN;
     snprintf(s->origin.where, sizeof(s->origin.where), "stdin");
     s->next_at_id = 1;
@@ -543,9 +566,9 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
     shell_script_init(s);
 
     /* Pipes: make command echo / prompts visible promptly. */
-    if (!s->tty) setvbuf(stdout, NULL, _IOLBF, 0);
+    if (!isatty(STDOUT_FILENO)) setvbuf(stdout, NULL, _IOLBF, 0);
 
-    if (s->tty) {
+    if (s->editor) {
         const char *hp = getenv("CSIM_SHELL_HISTORY");
         if (hp) {
             snprintf(s->history_path, sizeof(s->history_path), "%s", hp);
@@ -570,7 +593,7 @@ int shell_service_start(shell_service_t *s, sim_runtime_t *sim,
     install_signals(true);
     if (interactive)
         printf("Cooja-NG shell: type 'help' for commands%s\n",
-               s->tty ? "" : " (no terminal: lines run in order, like a script)");
+               s->stdin_tty ? "" : " (no terminal: lines run in order, like a script)");
     return 0;
 }
 

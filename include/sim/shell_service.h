@@ -120,10 +120,13 @@ typedef struct shell_service {
     sim_control_t *ctl;
     bool active;            /* --shell or --script                         */
     bool interactive;       /* --shell: stdin is a command source          */
-    bool tty;               /* stdin and stdout are a terminal             */
+    bool stdin_tty;         /* a human can type at us (stdin is a terminal) */
+    bool editor;            /* line editing usable (stdin AND stdout a tty) */
     /* Non-terminal stdin is read synchronously: when the command stream is
      * idle the simulation waits for the next line, so a piped session runs
-     * exactly like a script (deterministic).  = interactive && !tty. */
+     * exactly like a script (deterministic).  = interactive && !stdin_tty:
+     * `--shell | tee log` keeps a terminal to type at, so it stays
+     * asynchronous and the simulation runs between commands. */
     bool sync_stdin;
     /* Something outside the shell can resume a paused run (the web UI). */
     bool external_resume;
@@ -137,6 +140,11 @@ typedef struct shell_service {
     char   prompt[96];
     bool   hidden;          /* prompt hidden for a burst of output          */
     bool   paused_hint;     /* "blocked while paused" hint already shown    */
+    /* The `run <d>`/`step` whose auto-pause left the simulation paused —
+     * named in the deadlock message, since the next blocking command then
+     * has nothing to wait for. */
+    char   run_pause_cmd[SHELL_LINE_MAX];
+    char   run_pause_where[64];
     char   history_path[SHELL_PATH_MAX];
     int64_t prompt_ns;      /* sim time the prompt currently shows          */
     double  prompt_ms;      /* wall time of the last prompt refresh         */

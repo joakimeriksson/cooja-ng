@@ -28,11 +28,13 @@ Every simulation mode that takes a config or firmware list (`test`,
 | `--paused` | start paused (needs `--shell`, `--script` or `--ui` to resume). |
 | `--speed N` / `--speed max` / `--realtime` | wall-clock pacing: N simulated seconds per wall second; `max` = unpaced (the headless default; the live UI and the serial bridge default to 10x). |
 
-With `--shell` the run has no duration: it ends at `exit`.  An explicit `-t`
-**pauses** the simulation at that time instead of ending the run (`run`
-continues), and the config's `timeout_ms` is ignored, with a note at start.
-Without `--shell` (including `--script` alone) the duration ends the run as
-before.
+With `--shell` the run has no duration: it ends at `exit`.  At a terminal an
+explicit `-t` **pauses** the simulation at that time instead of ending the run
+(`run` continues); from a pipe, where nothing can type `run`, `-t` ends the run
+as it does without `--shell`.  The config's `timeout_ms` is ignored, with a
+note at start.  The `-t` horizon is independent of `run`/`pause`/`step`: a
+`run 500ms` before it does not cancel it.  Without `--shell` (including
+`--script` alone) the duration ends the run as before.
 
 SIGINT and SIGTERM end the run through the normal teardown (reports,
 `--save-config`); a second signal kills the process.  While an external clock
@@ -47,7 +49,8 @@ Node console lines print between prompts in the same
 
 ## Commands
 
-Node selectors: `1`, `1,3`, `2-5`, `all`, and `any` where a match is meant.
+Node selectors: `1`, `1,3`, `2-5`, `all` (`*`), and `any` where a match is
+meant.
 Times: `5s`, `250ms`, `1500us`, `1.5s`, `2m`; a bare number is milliseconds;
 `+2s` is relative to now.  Words with spaces are quoted (`"..."` decodes
 `\n \t \\ \" \xHH`, `'...'` is literal); `#` starts a comment.
@@ -136,9 +139,9 @@ runs (`tools/check-shell.sh` checks that).
 
 While a script or a blocking command holds the stream, lines typed at a
 terminal prompt queue behind it.  Two escape hatches: a line starting with `!`
-runs immediately if the command is safe to interleave (`status`, `nodes`,
-`log`, `log-file`, `pause`, `run`, `step`, `speed`, `at`, `atq`, `atrm`,
-`echo`, `help`, `exit`) — `!run 500ms` and `!step` run beside the stream
+runs immediately if the command is safe to interleave (`status`, `time`,
+`nodes`, `log`, `log-file`, `pause`, `run`, `step`, `speed`, `at`, `every`,
+`atq`, `atrm`, `set`, `save-config`, `echo`, `help`, `exit`, `quit`) — `!run 500ms` and `!step` run beside the stream
 without holding it — and Ctrl-C aborts the script.  A mistyped `!` command
 prints an error but never fails the running script.
 

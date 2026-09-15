@@ -20,6 +20,7 @@ void sim_control_init(sim_control_t *c, sim_runtime_t *sim,
     c->sim = sim;
     if (ops) c->ops = *ops;
     c->pause_at_ns = INT64_MAX;
+    c->horizon_ns = INT64_MAX;
 }
 
 /* --- node lookup ------------------------------------------------------- */
@@ -218,8 +219,16 @@ void sim_control_set_speed(sim_control_t *c, double ratio) {
 
 /* --- loop hooks -------------------------------------------------------- */
 
+void sim_control_set_horizon(sim_control_t *c, int64_t at_ns) {
+    if (!c) return;
+    c->horizon_ns = at_ns;
+    c->horizon_hit = false;
+}
+
 int64_t sim_control_slice_cap(const sim_control_t *c, int64_t cap_ns) {
-    if (c && c->pause_at_ns < cap_ns) return c->pause_at_ns;
+    if (!c) return cap_ns;
+    if (c->pause_at_ns < cap_ns) cap_ns = c->pause_at_ns;
+    if (c->horizon_ns < cap_ns) cap_ns = c->horizon_ns;
     return cap_ns;
 }
 
@@ -238,11 +247,19 @@ bool sim_control_after_pump(sim_control_t *c) {
     if (!c || !c->sim) return false;
     if (c->sim->run_state == SIM_RUN_STOP_REQUESTED) return false;
     bool pause = false;
+    c->horizon_hit = false;
     if (c->pause_at_ns != INT64_MAX &&
         sim_runtime_now_ns(c->sim) >= c->pause_at_ns)
         pause = true;
     if (c->step_armed && c->step_events_left <= 0)
         pause = true;
+    if (c->horizon_ns != INT64_MAX &&
+        sim_runtime_now_ns(c->sim) >= c->horizon_ns) {
+        /* One-shot: clear it before pausing (pause() does not touch it). */
+        c->horizon_ns = INT64_MAX;
+        c->horizon_hit = true;
+        pause = true;
+    }
     if (pause) sim_control_pause(c);
     return pause;
 }

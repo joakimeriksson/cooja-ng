@@ -361,7 +361,7 @@ static void test_review_fixes(void) {
 
     /* A typo typed at the prompt beside a running script does not fail it. */
     mock_reset();
-    sh.interactive = true; sh.tty = true;          /* "!" runs immediately */
+    sh.interactive = true; sh.editor = true; sh.stdin_tty = true;          /* "!" runs immediately */
     p = write_script("f1", "sleep 1s\npass\n");
     shell_script_source(&sh, p);
     shell_script_tick(&sh);
@@ -428,7 +428,7 @@ static void test_review_fixes(void) {
 
     /* Exit verdict: exit while blocked fails; exit inside a script is a finish. */
     mock_reset();
-    sh.interactive = true; sh.tty = true;
+    sh.interactive = true; sh.editor = true; sh.stdin_tty = true;
     shell_enqueue_line(&sh, "expect 1 \"never\" 10s");
     shell_script_tick(&sh);
     CHECK(sh.block == SHELL_BLOCK_EXPECT, "blocked on expect");
@@ -563,6 +563,28 @@ static void test_stdin_burst(void) {
     CHECK(!sh.queue_warned, "no line is dropped");
 }
 
+/* --- the -t horizon is not cleared by pause/run ------------------------- */
+
+static void test_horizon(void) {
+    mock_reset();
+    sim_control_set_horizon(&mock_ctl, 2000000000LL);   /* -t 2000 */
+    CHECK(sim_control_slice_cap(&mock_ctl, INT64_MAX) == 2000000000LL,
+          "horizon caps the slice");
+    sim_control_run_for(&mock_ctl, 500000000LL);        /* run 500ms */
+    sim_control_pause(&mock_ctl);
+    sim_control_resume(&mock_ctl);
+    CHECK(sim_control_slice_cap(&mock_ctl, INT64_MAX) == 2000000000LL,
+          "pause/run/run-for leave the horizon alone");
+    mock_sim.now_ns = 1999999999LL;
+    CHECK(!sim_control_after_pump(&mock_ctl), "no pause before the horizon");
+    mock_sim.now_ns = 2000000000LL;
+    CHECK(sim_control_after_pump(&mock_ctl) && sim_control_horizon_hit(&mock_ctl),
+          "the horizon pauses once it is reached");
+    sim_control_resume(&mock_ctl);
+    mock_sim.now_ns = 3000000000LL;
+    CHECK(!sim_control_after_pump(&mock_ctl), "one-shot: it does not fire again");
+}
+
 int run_shell_tests(int verbose) {
     g_verbose = verbose;
     printf("=== Shell tests ===\n");
@@ -573,6 +595,7 @@ int run_shell_tests(int verbose) {
     test_unquote_rest();
     test_review_fixes();
     test_stdin_burst();
+    test_horizon();
     printf("  %d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }
