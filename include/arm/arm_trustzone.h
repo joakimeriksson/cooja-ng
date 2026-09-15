@@ -40,7 +40,7 @@ typedef enum {
 #define ARM_SFSR_LSERR     (1u << 7)  /* lazy state error */
 
 /* Result of an IDAU attribution check for one address. */
-typedef struct {
+typedef struct arm_idau_result {
     bool ns;        /* IDAU considers the address non-secure */
     bool nsc;       /* IDAU marks it non-secure-callable */
     bool exempt;    /* address is exempt from security checking (always Secure-ish) */
@@ -59,6 +59,12 @@ void arm_sau_check(const arm_cpu_t *cpu, uint32_t addr, bool *ns, bool *nsc);
 /* Index of the single enabled SAU region containing `addr`, or -1 if none
  * (or if the SAU is disabled / multiple regions overlap). Used by TT. */
 int arm_sau_region(const arm_cpu_t *cpu, uint32_t addr);
+
+/* Largest window [*base, *base + *len) around `addr`, inside its 4 KB page,
+ * over which arm_security_attr() cannot change (clamped to the SAU region
+ * boundaries). Backs the Non-secure fetch cache in arm_cpu_t. */
+void arm_sau_uniform_window(const arm_cpu_t *cpu, uint32_t addr,
+                            uint32_t *base, uint32_t *len);
 
 /* Build the ARMv8-M TT/TTT/TTA/TTAT response word for `addr`. `alt` selects
  * the alternate (Non-secure) domain view (TTA/TTAT), only meaningful from

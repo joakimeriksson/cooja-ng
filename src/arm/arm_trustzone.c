@@ -63,6 +63,35 @@ void arm_sau_check(const arm_cpu_t *cpu, uint32_t addr, bool *ns, bool *nsc)
     }
 }
 
+/* Largest window [*base, *base + *len) around `addr`, within its 4 KB page,
+ * over which the SAU's answer cannot change. Attribution is a function of
+ * which enabled regions contain the address, and that only changes at a
+ * region's base or one past its limit, so the page is clamped to the nearest
+ * such boundary on either side of `addr`. The IDAU's own boundaries on the
+ * nRF54L15 (0x4000_0000, 0x5000_0000, 0x6000_0000) are page-aligned, so the
+ * page clamp covers them. Lets the Non-secure fetch check cache one decision
+ * per window instead of one per instruction. */
+void arm_sau_uniform_window(const arm_cpu_t *cpu, uint32_t addr,
+                            uint32_t *base, uint32_t *len)
+{
+    uint32_t lo = addr & ~0xFFFu;
+    uint64_t hi = (uint64_t)lo + 0x1000u;
+    if (cpu->sau_ctrl & ARM_SAU_CTRL_ENABLE) {
+        for (unsigned r = 0; r < cpu->sau_sregions && r < 8; r++) {
+            if (!(cpu->sau_rlar[r] & ARM_SAU_RLAR_ENABLE))
+                continue;
+            uint32_t b = cpu->sau_rbar[r] & ~0x1fu;
+            uint64_t e = (uint64_t)((cpu->sau_rlar[r] & ~0x1fu) | 0x1fu) + 1;
+            if (b > addr) { if (b < hi) hi = b; }
+            else if (b > lo) lo = b;
+            if (e > addr) { if (e < hi) hi = e; }
+            else if (e > lo) lo = (uint32_t)e;
+        }
+    }
+    *base = lo;
+    *len  = (uint32_t)(hi - lo);
+}
+
 /* Default IDAU: attribute nothing — leave the decision to the SAU. */
 arm_idau_result_t arm_idau_check_default(uint32_t addr)
 {
@@ -85,7 +114,9 @@ arm_sec_attr_t arm_security_attr(const arm_cpu_t *cpu, uint32_t addr)
     bool ns, nsc;
     arm_sau_check(cpu, addr, &ns, &nsc);
 
-    arm_idau_result_t idau = arm_idau_check_default(addr);
+    arm_idau_result_t idau = cpu->idau_check
+        ? cpu->idau_check(cpu->idau_user, addr)
+        : arm_idau_check_default(addr);
 
     if (idau.exempt)
         return ARM_SEC_SECURE;
@@ -114,6 +145,7 @@ bool arm_mem_access_permitted(const arm_cpu_t *cpu, uint32_t addr)
 
 void arm_record_secure_fault(arm_cpu_t *cpu, uint32_t addr)
 {
+    arm_tz_trace(cpu, "auviol", addr, 0);
     cpu->sfsr |= ARM_SFSR_AUVIOL | ARM_SFSR_SFARVALID;
     cpu->sfar = addr;
     cpu->secure_fault_pending = true;
@@ -143,6 +175,8 @@ int arm_sau_region(const arm_cpu_t *cpu, uint32_t addr)
 #define ARM_TT_SRVALID  (1u << 17)
 #define ARM_TT_R        (1u << 18)
 #define ARM_TT_RW       (1u << 19)
+#define ARM_TT_NSR      (1u << 20)
+#define ARM_TT_NSRW     (1u << 21)
 #define ARM_TT_S        (1u << 22)
 
 uint32_t arm_tt_response(const arm_cpu_t *cpu, uint32_t addr, bool alt)
@@ -151,16 +185,26 @@ uint32_t arm_tt_response(const arm_cpu_t *cpu, uint32_t addr, bool alt)
     uint32_t resp = 0;
 
     arm_sec_attr_t attr = arm_security_attr(cpu, addr);
-    if (attr != ARM_SEC_NONSECURE)
-        resp |= ARM_TT_S;   /* Secure or NSC */
+    /* S, SREGION and SRVALID read as zero from Non-secure state: the
+     * Non-secure world is not told where the Secure boundaries lie. */
+    if (cpu->secure) {
+        if (attr != ARM_SEC_NONSECURE)
+            resp |= ARM_TT_S;   /* Secure or NSC */
 
-    int region = arm_sau_region(cpu, addr);
-    if (region >= 0) {
-        resp |= ((uint32_t)region << ARM_TT_SREGION_SHIFT) & 0xFF00u;
-        resp |= ARM_TT_SRVALID;
+        int region = arm_sau_region(cpu, addr);
+        if (region >= 0) {
+            resp |= ((uint32_t)region << ARM_TT_SREGION_SHIFT) & 0xFF00u;
+            resp |= ARM_TT_SRVALID;
+        }
     }
 
     /* Without an MPU model, memory is treated as read/write accessible. */
     resp |= ARM_TT_R | ARM_TT_RW;
+    /* NSR/NSRW: whether the Non-secure state could read / read-write this
+     * address. Only meaningful when executing Secure — which is the only
+     * state that can run TTA/TTAT, and the state cmse_check_address_range()
+     * builds its answer from. */
+    if (cpu->secure && attr == ARM_SEC_NONSECURE)
+        resp |= ARM_TT_NSR | ARM_TT_NSRW;
     return resp;
 }
