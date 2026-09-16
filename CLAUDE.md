@@ -87,6 +87,21 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
                                          # hex, 2nd document, wrong type ...) MUST fail to load — fail loudly
 ./build/test_runner config-convert in.json out.yaml        # canonical v2 YAML
 
+# Determinism gates. check-determinism.sh runs ONE simulation twice and diffs
+# the two runs (is a run reproducible? CI runs it). check-baseline.sh asks
+# whether the simulation MOVED: it builds a reference revision in a worktree
+# (default: the merge-base with main), runs nine workloads with BOTH binaries
+# from this tree — same configs, same firmware, only the engine differs — and
+# diffs everything except the three wall-clock lines (Wall-clock time / Speed
+# ratio / Throughput). Every console line carries a simulated timestamp, so
+# identical output means every mote ran at the same nanosecond. Run it after
+# anything touching the kernel clock, the event pump or a mote tick: TSCH can
+# still associate and RPL can still form a DAG after a timing shift that HAS
+# changed the simulation, so a green test suite is too weak a signal there.
+# Re-run it after a rebase — the baseline moves with main.
+tools/check-determinism.sh test configs/chain-4node-sky.yaml   # same run twice
+tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 keeps the logs
+
 # Cross-platform interoperation (all csim-internal, no co-simulation)
 # Three CPU architectures + three radio models on one DAG. This is the control
 # for any cross-simulator work: if it passes, the emulated side is not the
