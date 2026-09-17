@@ -1,6 +1,7 @@
 # nRF54L15 TrustZone-M peripheral-permission enforcement.  The Non-secure
 # world here is built with the full platform, so it touches peripherals the
-# Secure world claimed; the SPU must refuse and the Secure world must reboot.
+# Secure world claimed; the transaction must terminate with a precise BusFault
+# taken by the Secure world, whose handler reports it and reboots.
 
 version: 2
 title: "nRF54L15 TrustZone-M peripheral-permission violation (XIAO nRF54L15)"
@@ -17,10 +18,26 @@ test:
   description: >
     A normal world built with the full platform instead of the minimal one, so
     it reaches for peripherals the secure world has claimed. The security unit
-    refuses the transaction, raises a peripheral access error, and the secure
-    world's handler records it and reboots; the next boot reports the
-    violation. This is the failure mode the minimal-platform default exists to
-    prevent, and it is the test that the permission model is enforced rather
-    than merely stored.
+    refuses the transaction: the core takes a precise BusFault into the secure
+    world (CFSR 0x8200, BFAR = the Non-secure alias it used) and the security
+    unit latches the violation. The secure world's BusFault handler prints its
+    report and resets, before the security unit's own interrupt handler can
+    run. Verified on a Seeed XIAO nRF54L15 with these two images: the same
+    "BF!" line with CF=00008200. Silicon faults earlier, at a GPIOTE30 channel
+    CONFIG (0x4010c51c) whose per-channel attribute is not modelled; the
+    emulator's first refusal is the reset-reason read on CLOCK/POWER/RESET.
   steps:
-    - { wait: "Reboot caused by SPU violation", node: 1 }
+    # One step, one boot, the whole register part of the line. BFAR pins the
+    # emulator's first refusal, the CLOCK/POWER/RESET read in reset_debug()
+    # (ldr.w at 0x909e6 of the checked-in image; ARM_EXC_TRACE=1 shows the
+    # fault taken there). The board's first refusal is a GPIOTE30 channel
+    # CONFIG write (BFAR=4010c51c): per-channel attribution of the split
+    # peripherals is not modelled, so this value changes the day it is.
+    # PC= and LR= are not matched: the fault comes from the Non-secure
+    # thread, so the frame is on the Non-secure stack, while Contiki's
+    # handler reads the Secure MSP and prints stale words from it.
+    - { wait: "CF=00008200 HF=00000000 BFAR=4010e600 MMFAR=4010e600", node: 1 }
+  # The security unit's handler must never run: the BusFault handler resets
+  # first, as on the board.
+  fail_on:
+    - "Reboot caused by SPU violation"

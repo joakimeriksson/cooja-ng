@@ -118,6 +118,26 @@ static int nvic_read(void *user_data, uint32_t addr) {
             return nvic->shpr[8] | (nvic->shpr[9] << 8) |
                    (nvic->shpr[10] << 16) | (nvic->shpr[11] << 24);
         case SCB_SHCSR: return (int)nvic->shcsr;
+        /* Fault status/address registers in the Non-secure view. MMFSR,
+         * UFSR and MMFAR are banked between the security states; BFSR,
+         * HFSR and BFAR are not, and are RAZ/WI from Non-secure while
+         * AIRCR.BFHFNMINS is clear (BusFault and HardFault are then Secure
+         * exceptions). The model raises neither MemManage nor UsageFault,
+         * so the Non-secure MMFSR/UFSR banks read as zero; MMFAR_NS is
+         * stored so firmware reads back what it wrote. In the Secure view
+         * MMFAR and BFAR are one physical register, as on the board. */
+        case SCB_CFSR:
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) return 0;
+            return (int)nvic->cpu->cfsr;
+        case SCB_HFSR:
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) return 0;
+            return (int)nvic->cpu->hfsr;
+        case SCB_MMFAR:
+            if (ns) return (int)nvic->cpu->mmfar_ns;
+            return (int)nvic->cpu->bfar;
+        case SCB_BFAR:
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) return 0;
+            return (int)nvic->cpu->bfar;
         case SCB_DEMCR: return (int)nvic->cpu->demcr;
 
         /* SAU — Secure-only; reads as zero (RAZ) from Non-secure. */
@@ -303,6 +323,22 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         case SCB_SHCSR:
             nvic->shcsr = value;
             break;
+        case SCB_CFSR:  /* write-1-to-clear; see the read side for the NS view */
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) break;
+            nvic->cpu->cfsr &= ~value;
+            break;
+        case SCB_HFSR:
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) break;
+            nvic->cpu->hfsr &= ~value;
+            break;
+        case SCB_MMFAR:
+            if (ns) nvic->cpu->mmfar_ns = value;
+            else    nvic->cpu->bfar = value;
+            break;
+        case SCB_BFAR:
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) break;
+            nvic->cpu->bfar = value;
+            break;
         case SCB_DEMCR:
             /* TRCENA clocks the trace block (DWT); the debug-monitor and
              * vector-catch bits are stored but have no effect here. */
@@ -396,13 +432,18 @@ void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu) {
         arm_register_io(cpu, NVIC_NS_ALIAS_BASE, NVIC_IO_SIZE, nvic_read, nvic_write, nvic);
 }
 
-void arm_nvic_set_pending(arm_nvic_t *nvic, int irq_num) {
+void arm_nvic_set_pending_deferred(arm_nvic_t *nvic, int irq_num) {
     if (irq_num < 0 || irq_num >= NVIC_MAX_IRQ) return;
     int idx = irq_num / 32;
     int bit = irq_num % 32;
     nvic->ispr[idx] |= (1u << bit);
     nvic->has_pending = true;
     nvic->scan_valid = false;
+}
+
+void arm_nvic_set_pending(arm_nvic_t *nvic, int irq_num) {
+    if (irq_num < 0 || irq_num >= NVIC_MAX_IRQ) return;
+    arm_nvic_set_pending_deferred(nvic, irq_num);
     arm_nvic_check_pending(nvic);
 }
 
@@ -425,6 +466,20 @@ int arm_nvic_get_priority(arm_nvic_t *nvic, int exception_num) {
     if (irq >= 0 && irq < NVIC_MAX_IRQ)
         return nvic->ipr[irq];
     return 255;
+}
+
+int arm_nvic_execution_priority(arm_nvic_t *nvic) {
+    arm_cpu_t *cpu = nvic->cpu;
+    int prio = 256;
+    if (nvic->active_exception > 0) {
+        int p = arm_nvic_get_priority(nvic, nvic->active_exception);
+        if (p < prio) prio = p;
+    }
+    if (cpu->basepri != 0 && (int)(cpu->basepri & 0xFFu) < prio)
+        prio = (int)(cpu->basepri & 0xFFu);
+    if ((cpu->primask & 1) && prio > 0) prio = 0;
+    if ((cpu->faultmask & 1) && prio > -1) prio = -1;
+    return prio;
 }
 
 uint32_t arm_nvic_get_vector(arm_nvic_t *nvic, int exception_num) {
