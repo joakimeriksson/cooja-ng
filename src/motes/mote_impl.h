@@ -91,6 +91,29 @@ typedef struct mixed_node {
     } plat;
 } mixed_node_t;
 
+/* The node's clock deviation, never 0 or negative: a deviation of 0 would
+ * freeze the mote (every jump scaled to nothing) and divide the wakeup
+ * hint by zero. */
+static inline double mote_clock_deviation(const mixed_node_t *node) {
+    return node->clock_deviation > 0.0 ? node->clock_deviation : 1.0;
+}
+
+/* Scale a step_micros wakeup hint back from mote time to scheduler time,
+ * saturating instead of relying on an out-of-range double->int cast. */
+static inline int64_t mote_unscale_hint_us(int64_t returned_us, double deviation) {
+    if (deviation == 1.0 || returned_us <= 0) return returned_us;
+    double d = (double)returned_us / deviation;
+    return d >= 9.0e15 ? (int64_t)9.0e15 : (int64_t)d;
+}
+
+/* Next wakeup from a hint (MspMote.execute(t, 1)): always strictly after
+ * now, and never past the end of the time axis. */
+static inline int64_t mote_next_wakeup_ns(int64_t now_ns, int64_t returned_us) {
+    if (returned_us < 0) returned_us = 0;
+    if (returned_us >= (INT64_MAX - now_ns) / 1000LL - 1) return INT64_MAX;
+    return now_ns + (returned_us + 1) * 1000LL;
+}
+
 /*
  * sim_mote_env_t — runner-owned glue injected into the per-kind boot
  * functions.  src/motes code must never link against runner symbols

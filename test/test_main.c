@@ -66,6 +66,17 @@ extern int run_arm_firmware_tests(int verbose);
 /* Mixed-platform test (handles MSP430, ARM, and native nodes) */
 extern int run_mixed_multinode_test(int argc, char **argv);
 
+/* A simulation run reports *what* failed through its exit code (0 pass,
+ * 1 assertion, 2 invalid request/config, 6 wall timeout, 7 cancelled —
+ * docs/shell.md "Exit codes").  Unit-test modes only count failures, so
+ * keep the first simulation code and return it from main. */
+static int g_sim_exit_code = 0;
+static int run_sim(int argc, char **argv) {
+    int rc = run_mixed_multinode_test(argc, argv);
+    if (rc != 0 && g_sim_exit_code == 0) g_sim_exit_code = rc;
+    return rc != 0 ? 1 : 0;
+}
+
 /* Timeline unit tests */
 extern int run_timeline_tests(int verbose);
 
@@ -92,6 +103,9 @@ extern int run_radio_bus_tests(int verbose);
 
 /* Renode co-simulation unit tests (codec + device window + mock master) */
 extern int run_renode_cosim_tests(int verbose);
+
+/* Shell parser + script-engine unit tests (mock sim_control bundle) */
+extern int run_shell_tests(int verbose);
 
 int main(int argc, char **argv) {
     int verbose = 0;
@@ -123,6 +137,7 @@ int main(int argc, char **argv) {
         printf("Radio medium: radio-medium\n");
         printf("Radio bus:    radio-bus\n");
         printf("Test:         test <config.yaml|json> [-v] [-t ms] [--seed N] [--save-config out.yaml]\n");
+    printf("              ... [--shell] [--script FILE] [--paused] [--speed N|max|realtime]  (docs/shell.md)\n");
         printf("Config:       config-convert <in> <out.yaml> | config-roundtrip <config...> | config-reject <config...>\n");
         printf("Combined:     all\n");
         return 1;
@@ -167,10 +182,10 @@ int main(int argc, char **argv) {
             for (int i = 0; i < extra_argc; i++)
                 new_argv[i + 1] = extra_argv[i];
             new_argv[new_argc] = NULL;
-            failures += run_mixed_multinode_test(new_argc, new_argv);
+            failures += run_sim(new_argc, new_argv);
             free(new_argv);
         } else {
-            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+            failures += run_sim(extra_argc, extra_argv);
         }
     }
 
@@ -197,7 +212,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "arm-multinode") == 0) {
         /* Route to mixed-multinode (ARM firmware auto-detected by extension) */
-        failures += run_mixed_multinode_test(argc - 2, argv + 2);
+        failures += run_sim(argc - 2, argv + 2);
     }
 
     /* Zolertia Firefly multinode wrapper.  Behaves exactly like
@@ -233,10 +248,10 @@ int main(int argc, char **argv) {
             new_argv[extra_argc]     = (char *)"-n";
             new_argv[extra_argc + 1] = (char *)"2";
             new_argv[new_argc] = NULL;
-            failures += run_mixed_multinode_test(new_argc, new_argv);
+            failures += run_sim(new_argc, new_argv);
             free(new_argv);
         } else {
-            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+            failures += run_sim(extra_argc, extra_argv);
         }
     }
 
@@ -266,10 +281,10 @@ int main(int argc, char **argv) {
             new_argv[extra_argc]     = (char *)"-n";
             new_argv[extra_argc + 1] = (char *)"2";
             new_argv[new_argc] = NULL;
-            failures += run_mixed_multinode_test(new_argc, new_argv);
+            failures += run_sim(new_argc, new_argv);
             free(new_argv);
         } else {
-            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+            failures += run_sim(extra_argc, extra_argv);
         }
     }
 
@@ -352,10 +367,10 @@ int main(int argc, char **argv) {
             new_argv[extra_argc]     = (char *)"-n";
             new_argv[extra_argc + 1] = (char *)"2";
             new_argv[new_argc] = NULL;
-            failures += run_mixed_multinode_test(new_argc, new_argv);
+            failures += run_sim(new_argc, new_argv);
             free(new_argv);
         } else {
-            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+            failures += run_sim(extra_argc, extra_argv);
         }
     }
 
@@ -383,21 +398,21 @@ int main(int argc, char **argv) {
             new_argv[extra_argc]     = (char *)"-n";
             new_argv[extra_argc + 1] = (char *)"2";
             new_argv[new_argc] = NULL;
-            failures += run_mixed_multinode_test(new_argc, new_argv);
+            failures += run_sim(new_argc, new_argv);
             free(new_argv);
         } else {
-            failures += run_mixed_multinode_test(extra_argc, extra_argv);
+            failures += run_sim(extra_argc, extra_argv);
         }
     }
 
     /* Mixed-platform mode */
     if (strcmp(mode, "mixed-multinode") == 0) {
-        failures += run_mixed_multinode_test(argc - 2, argv + 2);
+        failures += run_sim(argc - 2, argv + 2);
     }
 
     /* Test scripting mode (alias for mixed-multinode with test assertions) */
     if (strcmp(mode, "test") == 0) {
-        failures += run_mixed_multinode_test(argc - 2, argv + 2);
+        failures += run_sim(argc - 2, argv + 2);
     }
 
     if (strcmp(mode, "config-convert") == 0)
@@ -447,9 +462,15 @@ int main(int argc, char **argv) {
         failures += run_renode_cosim_tests(verbose);
     }
 
+    /* Shell tokenizer / time / selector / script-engine unit tests */
+    if (strcmp(mode, "shell") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_shell_tests(verbose);
+    }
+
     if (strcmp(mode, "timeline") == 0 || strcmp(mode, "all") == 0) {
         failures += run_timeline_tests(verbose);
     }
 
+    if (g_sim_exit_code != 0) return g_sim_exit_code;
     return failures > 0 ? 1 : 0;
 }

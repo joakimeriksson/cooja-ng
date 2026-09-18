@@ -1,0 +1,5 @@
+# Deliberately failing script: the expect can never match -> exit code 1.
+wait-until 1s
+sendln 1 help
+expect 1 "this text is never printed" 500ms
+pass

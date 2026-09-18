@@ -487,7 +487,7 @@ int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns) {
     }
 
     /* Apply clock deviation (Cooja MspClock drift simulation) */
-    double deviation = node->clock_deviation;
+    double deviation = mote_clock_deviation(node);
     if (deviation != 1.0 && jump_us > 0) {
         double exact = (double)jump_us * deviation;
         jump_us = (int64_t)exact;
@@ -515,8 +515,7 @@ int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns) {
     cpu->anchor_sim_time_ns = sim_ns;
     cpu->anchor_cycles = cpu->cycles;
 
-    if (deviation != 1.0 && returned_us > 0)
-        returned_us = (int64_t)((double)returned_us / deviation);
+    returned_us = mote_unscale_hint_us(returned_us, deviation);
 
     cpu->last_execute_us = t_us;
     return returned_us;
@@ -581,7 +580,7 @@ static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
     }
 
     /* Apply clock deviation (same as the execute tick) */
-    double deviation = node->clock_deviation;
+    double deviation = mote_clock_deviation(node);
     if (deviation != 1.0 && jump_us > 0) {
         double exact = (double)jump_us * deviation;
         jump_us = (int64_t)exact;
@@ -598,8 +597,7 @@ static int64_t msp_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
      * zero-duration sync. */
     cpu->sim_time_ns = sim_ns;
     cpu->last_execute_us = t_us;
-    if (deviation != 1.0 && returned_us > 0)
-        returned_us = (int64_t)((double)returned_us / deviation);
+    returned_us = mote_unscale_hint_us(returned_us, deviation);
     return returned_us;
 }
 
@@ -624,7 +622,7 @@ static int64_t msp_mote_execute(sim_mote_t *m, int64_t now_ns) {
         sim_radio_bus_drain_rx(bus, node->env->sim, idx);
     /* Match Cooja's MspMote.execute(t, 1): this slice schedules the
      * mote's next normal wakeup itself. */
-    return now_ns + (returned_us + 1) * 1000LL;
+    return mote_next_wakeup_ns(now_ns, returned_us);
 }
 
 static int64_t msp_mote_sched_hint_ns(const sim_mote_t *m, int64_t base_ns) {
