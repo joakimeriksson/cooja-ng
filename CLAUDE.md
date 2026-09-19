@@ -114,7 +114,8 @@ tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 k
 # a pass/fail verdict, so one shell firmware serves many tests. The exit code
 # says WHAT failed (agent-sim-protocol's table): 0 pass, 1 assertion, 2 invalid
 # request, 6 wall timeout, 7 cancelled. --wall-timeout <dur> bounds a run in
-# wall-clock time (exit 6) without touching the simulation.
+# wall-clock time (exit 6) without touching the simulation; a bare number is
+# SECONDS for this one flag (like timeout(1); 500ms / 2m also accepted).
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
 ./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)

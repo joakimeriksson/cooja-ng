@@ -456,6 +456,28 @@ static double get_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
+/* --wall-timeout VALUE.  A bare number is SECONDS here — a wall-clock
+ * bound like timeout(1)'s, and the form agent-sim-protocol writes
+ * (`--wall-timeout 600`).  Every other duration in the shell keeps the
+ * shell's rule (a bare number is ms); with a unit (500ms, 2m, 1.5s) both
+ * agree.  0 = no bound.  Returns 0, or -1 for anything that is not a
+ * non-negative duration. */
+static int parse_wall_timeout(const char *v, double *out_ms) {
+    if (!v || !*v || *v == '-' || *v == '+') return -1;
+    char *end = NULL;
+    errno = 0;
+    double secs = strtod(v, &end);
+    if (end != v && !*end) {
+        if (errno || isnan(secs) || isinf(secs) || secs < 0) return -1;
+        *out_ms = secs * 1000.0;
+        return 0;
+    }
+    int64_t ns;
+    if (shell_parse_duration(v, &ns) != 0) return -1;
+    *out_ms = (double)ns / 1e6;
+    return 0;
+}
+
 /* CSIM_PHASE_TIMING=1 enables the step-vs-kernel wall-time breakdown at the
  * end of a run.  Off by default: it needs two clock reads per event-pump
  * iteration, which profiled at 7.0% of self time on an ARM workload. */
@@ -2168,13 +2190,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         else if ((strcmp(argv[i], "--wall-timeout") == 0 && i + 1 < argc) ||
                  strncmp(argv[i], "--wall-timeout=", 15) == 0) {
             const char *v = argv[i][14] == '=' ? argv[i] + 15 : argv[++i];
-            int64_t ns;
-            if (shell_parse_duration(v, &ns) != 0) {
-                fprintf(stderr, "--wall-timeout: bad duration '%s' "
-                        "(e.g. 30s, 500ms, 2m)\n", v);
+            if (parse_wall_timeout(v, &wall_timeout_ms) != 0) {
+                fprintf(stderr, "--wall-timeout: bad value '%s' "
+                        "(seconds, or 500ms / 2m / 1.5s)\n", v);
                 return 1;
             }
-            wall_timeout_ms = (double)ns / 1e6;
         }
         else if (strcmp(argv[i], "--realtime") == 0) {
             cli_speed = 1.0;
@@ -3335,7 +3355,8 @@ sim_restart:
         test_exit_code = shell_code;
     /* A run cut short by the wall clock reports that, whatever the
      * unfinished script says (SHELL_EXIT_WALL_TIME). */
-    if (wall_timeout_hit || shell_svc.wall_timeout_hit) test_exit_code = 6;
+    if (wall_timeout_hit || shell_svc.wall_timeout_hit)
+        test_exit_code = SHELL_EXIT_WALL_TIME;
     /* Under --shell the run length is whatever the user ran, not -t. */
     int simulated_ms = (shell_enabled || script_path)
                        ? (int)((sim_ns - sim_start_ns) / MS_TO_NS) : sim_ms;

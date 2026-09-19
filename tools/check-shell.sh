@@ -11,6 +11,12 @@ mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "check-shell: FAIL: $*"; exit 1; }
 strip() { grep -v 'Wall-clock\|Speed ratio\|Throughput' "$1"; }
+# expect_rc N cmd...: the exact exit code matters (docs/shell.md "Exit codes").
+expect_rc() {
+    local want=$1 rc=0; shift
+    "$@" > "$TMP/rc.out" 2>&1 || rc=$?
+    [ "$rc" = "$want" ] || { tail -5 "$TMP/rc.out"; fail "$* -> exit $rc, expected $want"; }
+}
 
 echo "== unit tests"
 $BIN shell > "$TMP/unit.out" || { cat "$TMP/unit.out"; fail "unit tests"; }
@@ -51,6 +57,15 @@ SECONDS=0
 printf 'sleep 30s\nspeed 1\nsleep 1s\nexit\n' \
     | timeout 30 $BIN test $CFG --shell -q > "$TMP/speed.out" 2>&1 || fail "speed session"
 [ "$SECONDS" -lt 5 ] || fail "1 s at speed 1 took ${SECONDS}s wall (pacing not rebased)"
+
+echo "== --wall-timeout: a bare number is seconds, exit 6"
+SECONDS=0
+printf 'speed 1\nsleep 60s\nexit\n' > "$TMP/long.cnsh"
+expect_rc 6 $BIN test $CFG -q --script "$TMP/long.cnsh" --wall-timeout 1
+[ "$SECONDS" -lt 5 ] || fail "--wall-timeout 1 took ${SECONDS}s wall (read as 1 ms or not at all?)"
+grep -q -- "--wall-timeout: 1.000 s" "$TMP/rc.out" || fail "wall-timeout not reported as 1 s"
+expect_rc 6 $BIN test $CFG -q --script "$TMP/long.cnsh" --wall-timeout=500ms
+grep -q -- "--wall-timeout: 0.500 s" "$TMP/rc.out" || fail "500ms not reported as 0.5 s"
 
 echo "== paused + blocked pipe fails instead of hanging"
 if printf 'pause\nsleep 1s\nexit\n' | timeout 20 $BIN test $CFG --shell -q > "$TMP/dead.out" 2>&1; then
