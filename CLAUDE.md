@@ -98,7 +98,8 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # anything touching the kernel clock, the event pump or a mote tick: TSCH can
 # still associate and RPL can still form a DAG after a timing shift that HAS
 # changed the simulation, so a green test suite is too weak a signal there.
-# Re-run it after a rebase — the baseline moves with main.
+# Re-run it after a rebase — the baseline moves with main. CI runs it on
+# pull requests that touch the engine (.github/workflows/baseline.yml).
 tools/check-determinism.sh test configs/chain-4node-sky.yaml   # same run twice
 tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 keeps the logs
 
