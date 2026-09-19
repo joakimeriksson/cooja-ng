@@ -149,6 +149,10 @@ void arm_record_secure_fault(arm_cpu_t *cpu, uint32_t addr)
     cpu->sfsr |= ARM_SFSR_AUVIOL | ARM_SFSR_SFARVALID;
     cpu->sfar = addr;
     cpu->secure_fault_pending = true;
+    /* A refused data access is a precise fault: the interpreter undoes the
+     * instruction before taking it, so the frame names the access and a
+     * refused load leaves its destination register untouched. */
+    cpu->secure_fault_undo = true;
 }
 
 int arm_sau_region(const arm_cpu_t *cpu, uint32_t addr)
