@@ -2085,7 +2085,22 @@ int run_mixed_multinode_test(int argc, char **argv) {
     const char *save_config_path = NULL;
     const char *config_path = NULL;
 
+    /* Argument errors are configuration errors (exit 2, docs/shell.md
+     * "Exit codes"): a flag that needs a value but is given last, and an
+     * option nobody recognises, both used to be silently ignored — a typo
+     * like `--wall-timout 30` ran unbounded. */
+    static const char *const value_flags[] = {
+        "--gdb", "--pcap", "--plugin", "--renode-freq", "--seed",
+        "--save-config", "--script", "--wall-timeout", "--speed",
+        "-n", "-t", "-d", NULL
+    };
     for (int i = 0; i < argc; i++) {
+        for (int k = 0; value_flags[k]; k++) {
+            if (strcmp(argv[i], value_flags[k]) == 0 && i + 1 >= argc) {
+                fprintf(stderr, "%s: missing value\n", argv[i]);
+                return SHELL_EXIT_INVALID;
+            }
+        }
         if (strcmp(argv[i], "--ui") == 0) {
             ui_enabled = 1;
             if (i + 1 < argc && argv[i+1][0] != '-') {
@@ -2139,7 +2154,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
                         ? "--renode: expected ADDR:MAIN:ASYNC, got '%s'\n"
                         : "--renode: CSIM_RENODE is unset or malformed%s\n",
                         spec ? spec : "");
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             renode_requested = 1;
         }
@@ -2148,7 +2163,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (hz <= 0) {
                 fprintf(stderr, "--renode-freq: expected a positive tick "
                                 "frequency in Hz, got '%s'\n", argv[i]);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             renode_freq_override = (uint64_t)hz;
         }
@@ -2156,14 +2171,14 @@ int run_mixed_multinode_test(int argc, char **argv) {
             seed_override = atoi(argv[++i]);
             if (seed_override == 0) {
                 fprintf(stderr, "--seed: expected a non-zero integer, got '%s'\n", argv[i]);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strncmp(argv[i], "--seed=", 7) == 0) {
             seed_override = atoi(argv[i] + 7);
             if (seed_override == 0) {
                 fprintf(stderr, "--seed: expected a non-zero integer, got '%s'\n", argv[i] + 7);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strcmp(argv[i], "--save-config") == 0 && i + 1 < argc) {
@@ -2172,7 +2187,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (!dot || (strcmp(dot, ".yaml") != 0 && strcmp(dot, ".yml") != 0)) {
                 fprintf(stderr, "--save-config: '%s' must end in .yaml or .yml\n",
                         save_config_path);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strcmp(argv[i], "--shell") == 0) {
@@ -2193,7 +2208,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (parse_wall_timeout(v, &wall_timeout_ms) != 0) {
                 fprintf(stderr, "--wall-timeout: bad value '%s' "
                         "(seconds, or 500ms / 2m / 1.5s)\n", v);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strcmp(argv[i], "--realtime") == 0) {
@@ -2209,7 +2224,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 double d = strtod(v, &end);
                 if (!end || *end || d <= 0.0) {
                     fprintf(stderr, "--speed: expected a positive ratio, 'max' or 'realtime', got '%s'\n", v);
-                    return 1;
+                    return SHELL_EXIT_INVALID;
                 }
                 cli_speed = d;
             }
@@ -2234,7 +2249,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (is_json_file(argv[i])) {
                 /* Load JSON config */
                 if (sim_config_load(&config, argv[i]) != 0)
-                    return 1;
+                    return SHELL_EXIT_INVALID;
                 config_loaded = 1;
                 node_cfg_src = &config;
                 config_path = argv[i];
@@ -2243,12 +2258,15 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 if (firmware_count < MAX_NODES)
                     firmware_paths[firmware_count++] = argv[i];
             }
+        } else {
+            fprintf(stderr, "unknown option '%s'\n", argv[i]);
+            return SHELL_EXIT_INVALID;
         }
     }
 
     if (start_paused && !shell_enabled && !script_path && !ui_enabled) {
         fprintf(stderr, "--paused: nothing could resume the simulation (add --shell, --script or --ui)\n");
-        return 1;
+        return SHELL_EXIT_INVALID;
     }
     /* Shell or script through a pipe: make command echo, prompts and
      * script output visible promptly.  Here, before anything has been
@@ -2299,7 +2317,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
         printf("Example:\n");
         printf("  test_runner mixed-multinode firmware/sky/udp-server.sky firmware/cooja/udp-client.cooja -t 60000\n");
         printf("  test_runner mixed-multinode configs/rpl-udp-native.json -v\n");
-        return 1;
+        return SHELL_EXIT_INVALID;
     }
 
     int64_t total_ns = (int64_t)sim_ms * MS_TO_NS;
@@ -2352,7 +2370,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
         ctl_init_once(&node_count);
         if (shell_service_start(&shell_svc, &sim_rt, &sim_ctl, shell_enabled != 0,
                                 script_path, verbose != 0) != 0)
-            return 1;
+            return SHELL_EXIT_INVALID;
         sim_service_attach(&sim_rt,
                            sim_registry_find_service(&g_registry, "shell"),
                            &shell_svc);
@@ -2370,7 +2388,7 @@ sim_restart:
                           ? config.nodes[i].secure_firmware : NULL;
         if (init_node(i, fw, sfw, node_id) != 0) {
             fprintf(stderr, "Failed to initialize node %d\n", node_id);
-            return 1;
+            return SHELL_EXIT_INVALID;
         }
         nodes[i].last_execute_ns = 0;
         if (nodes[i].clock_deviation != 1.0)
@@ -2492,7 +2510,7 @@ sim_restart:
             if (!jf) {
                 fprintf(stderr, "Failed to open JS script: %s\n",
                         config.js_script_path);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             fseek(jf, 0, SEEK_END);
             long jlen = ftell(jf);
@@ -2542,7 +2560,7 @@ sim_restart:
                         js_engine.gen_msgs[g].at_us * 1000LL);
             } else {
                 fprintf(stderr, "Failed to initialize JS test engine\n");
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             if (js_script != config.js_script_inline)
                 free(js_script);
@@ -2761,7 +2779,7 @@ sim_restart:
                                sim_registry_find_service(&g_registry, "renode"),
                                &renode_svc) < 0) {
             fprintf(stderr, "renode: co-simulation could not start\n");
-            return 1;
+            return SHELL_EXIT_INVALID;
         }
     }
 

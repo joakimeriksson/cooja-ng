@@ -163,7 +163,7 @@ firmware failure:
 |---|---|---|
 | 0 | pass | the script ended without a failure |
 | 1 | assertion | `expect` timeout, false `assert`, `fail`, matched `fail-on`, "did not complete" |
-| 2 | invalid request | unknown command, bad syntax or selector, unknown node, unreadable `source`, a deadlock |
+| 2 | invalid request | unknown command, bad syntax or selector, unknown node, unreadable `source`, a deadlock; also a run that never starts — a `--script` file that cannot be opened, a bad flag value, an unknown option, a config that does not load (reported on stderr, before any results block) |
 | 5 | guest failure | (not used by the shell) |
 | 6 | wall timeout | `--wall-timeout` ended the run |
 | 7 | cancelled | Ctrl-C, SIGINT or SIGTERM while a command or script was in flight |

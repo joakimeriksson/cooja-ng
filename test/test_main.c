@@ -68,8 +68,10 @@ extern int run_mixed_multinode_test(int argc, char **argv);
 
 /* A simulation run reports *what* failed through its exit code (0 pass,
  * 1 assertion, 2 invalid request/config, 6 wall timeout, 7 cancelled —
- * docs/shell.md "Exit codes").  Unit-test modes only count failures, so
- * keep the first simulation code and return it from main. */
+ * docs/shell.md "Exit codes"); a run that never starts (a config that
+ * does not load, a bad flag value, an unknown option, a missing --script
+ * file) is 2.  Unit-test modes only count failures, so keep the first
+ * simulation code and return it from main. */
 static int g_sim_exit_code = 0;
 static int run_sim(int argc, char **argv) {
     int rc = run_mixed_multinode_test(argc, argv);
