@@ -105,10 +105,15 @@ char *sim_runtime_ui_panels_json(const sim_runtime_t *sim) {
 static int64_t clamp_to_now(sim_runtime_t *sim, int mote_index, int64_t time_ns) {
     if (time_ns >= sim->now_ns) return time_ns;
     if (sim->past_wakeups_clamped++ == 0) {
+        char who[48];
+        if (mote_index >= 0)
+            snprintf(who, sizeof who, "mote %d requested a wakeup", mote_index);
+        else
+            snprintf(who, sizeof who, "a time pin was requested");
         fprintf(stderr,
-                "WARNING: mote %d requested a wakeup %.6f s in the past "
+                "WARNING: %s %.6f s in the past "
                 "(t=%.6f s, now=%.6f s); clamped to now. Caller bug.\n",
-                mote_index, (double)(sim->now_ns - time_ns) / 1e9,
+                who, (double)(sim->now_ns - time_ns) / 1e9,
                 (double)time_ns / 1e9, (double)sim->now_ns / 1e9);
     }
     return sim->now_ns;
@@ -126,6 +131,11 @@ void sim_schedule_mote_wakeup_if_earlier(sim_runtime_t *sim, int mote_index,
     uint32_t gen = sim_runtime_mote_generation(sim, mote_index);
     time_ns = clamp_to_now(sim, mote_index, time_ns);
     sim_eq_schedule_if_earlier_gen(&sim->event_queue, mote_index, time_ns, gen);
+}
+
+void sim_schedule_test_action(sim_runtime_t *sim, int64_t time_ns) {
+    time_ns = clamp_to_now(sim, -1, time_ns);
+    sim_eq_schedule_test_action(&sim->event_queue, time_ns);
 }
 
 void sim_schedule_radio_byte(sim_runtime_t *sim, int receiver_mote,

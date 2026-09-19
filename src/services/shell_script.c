@@ -26,9 +26,12 @@
 
 const char *shell_dequeue_line(shell_service_t *s, char *buf, size_t len);
 
+/* A pin at or before now has nothing to land on (the block resolves at
+ * the next tick anyway) and INT64_MAX is `step`'s "no deadline"; neither
+ * is a caller bug, so they are skipped here rather than clamped. */
 void shell_pin(shell_service_t *s, int64_t t) {
     if (t <= sim_runtime_now_ns(s->sim) || t == INT64_MAX) return;
-    sim_eq_schedule_test_action(&s->sim->event_queue, t);
+    sim_schedule_test_action(s->sim, t);
 }
 
 void shell_script_init(shell_service_t *s) {

@@ -2550,14 +2550,8 @@ sim_restart:
                 }
                 printf("Test: JavaScript engine (timeout=%lld ms)\n",
                        (long long)(total_ns / MS_TO_NS));
-                /* Milestone 8.3b: pin each GENERATE_MSG firing time on
-                 * the kernel event queue so the sequential loop's time
-                 * advance lands exactly on it — scripted serial input
-                 * is injected at the scripted instant, not the next
-                 * iteration boundary. */
-                for (int g = 0; g < js_engine.gen_msg_count; g++)
-                    sim_eq_schedule_test_action(&sim_eq,
-                        js_engine.gen_msgs[g].at_us * 1000LL);
+                /* The GENERATE_MSG instants are pinned on the kernel
+                 * queue once the clock is set, below. */
             } else {
                 fprintf(stderr, "Failed to initialize JS test engine\n");
                 return SHELL_EXIT_INVALID;
@@ -2922,6 +2916,18 @@ sim_restart:
         g_sim_start_ns = sim_ns;
         if (sim_ms_set && !start_paused)
             sim_control_set_horizon(&sim_ctl, sim_ns + total_ns);
+    }
+    /* Milestone 8.3b: pin each GENERATE_MSG firing time on the kernel
+     * queue so the loop's time advance lands exactly on it — scripted
+     * serial input is injected at the scripted instant, not the next
+     * iteration boundary.  Here, after sim_eq_init and with the clock
+     * set: pinned earlier the pins were wiped with the queue, and an
+     * instant before the first wakeup would have moved the start. */
+    if (use_js_engine) {
+        for (int g = 0; g < js_engine.gen_msg_count; g++) {
+            int64_t t = js_engine.gen_msgs[g].at_us * 1000LL;
+            sim_schedule_test_action(&sim_rt, t > sim_ns ? t : sim_ns);
+        }
     }
 
     double t_start = get_time_ms();
