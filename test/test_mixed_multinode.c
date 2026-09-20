@@ -1810,10 +1810,13 @@ static void ctl_restart(void *u) {
     (void)u;
     g_restart_requested = true;
 }
+/* --ui-bind ADDR; NULL = loopback.  File scope because the shell's "ui"
+ * command starts the UI mid-run and must listen where --ui would have. */
+static const char *g_ui_bind = NULL;
 static int ctl_start_ui(void *u, int port) {
     (void)u;
     if (ui_service_active(&ui_svc)) return -1;
-    if (!ui_service_start(&ui_svc, port, node_states, prev_node_states,
+    if (!ui_service_start(&ui_svc, g_ui_bind, port, node_states, prev_node_states,
                           node_last_tx_ns, prev_last_tx_ns, &radio_medium,
                           &timeline_svc.tl, ctl_node_count_ptr, ui_describe_node,
                           &sim_ctl))
@@ -2186,6 +2189,10 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 if (ui_port <= 0) ui_port = 8080;
             }
         }
+        else if (strcmp(argv[i], "--ui-bind") == 0 && i + 1 < argc) {
+            /* The UI accepts commands: listening beyond loopback is opt-in. */
+            g_ui_bind = argv[++i];
+        }
         else if (strcmp(argv[i], "--gdb") == 0 && i + 1 < argc) {
             /* Forms accepted:
              *   --gdb 3333          attach node 0 (1-indexed: node 1) to port 3333
@@ -2382,8 +2389,8 @@ int run_mixed_multinode_test(int argc, char **argv) {
     }
 
     if (firmware_count < 1) {
-        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port]]\n");
-        printf("       test_runner mixed-multinode <config.yaml|json> [-t ms] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port]]\n");
+        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port] [--ui-bind addr]]\n");
+        printf("       test_runner mixed-multinode <config.yaml|json> [-t ms] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port] [--ui-bind addr]]\n");
         printf("  Firmware types detected by extension:\n");
         printf("    .sky      -> MSP430 (Tmote Sky)\n");
         printf("    .cc2538dk -> ARM (CC2538DK)\n");
@@ -2678,7 +2685,7 @@ sim_restart:
      * before the UI service, which is one of its clients. */
     ctl_init_once(&node_count);
     if (ui_enabled && !ui_service_active(&ui_svc)) {
-        if (!ui_service_start(&ui_svc, ui_port,
+        if (!ui_service_start(&ui_svc, g_ui_bind, ui_port,
                               node_states, prev_node_states,
                               node_last_tx_ns, prev_last_tx_ns,
                               &radio_medium, &timeline_svc.tl,

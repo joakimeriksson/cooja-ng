@@ -3,6 +3,7 @@
  *
  * Single-threaded, POSIX sockets, select()-based polling.
  * Serves embedded HTML on GET / and upgrades GET /ws to WebSocket.
+ * Binds loopback unless told otherwise; see ws_server_init.
  * Supports up to 8 concurrent WebSocket clients.
  */
 #ifndef WS_SERVER_H
@@ -12,8 +13,13 @@
 
 typedef struct ws_server ws_server_t;
 
-/* Create and bind a WebSocket server on the given port. Returns NULL on failure. */
-ws_server_t *ws_server_init(int port);
+/* Create and bind a WebSocket server on bind_addr:port.  bind_addr is an
+ * IPv4 address; NULL (or "localhost") means 127.0.0.1, the default -- the UI
+ * accepts commands, so reaching it from the network is an explicit choice.
+ * A loopback-bound server refuses requests whose Host is not a loopback
+ * name (DNS rebinding), and every server refuses a WebSocket upgrade whose
+ * Origin is not the server itself.  Returns NULL on failure. */
+ws_server_t *ws_server_init(const char *bind_addr, int port);
 
 /* Non-blocking poll: accept new connections, read incoming data, handle close/ping. */
 void ws_server_poll(ws_server_t *srv);
