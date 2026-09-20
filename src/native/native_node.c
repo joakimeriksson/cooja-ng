@@ -44,6 +44,11 @@ static int copy_file_to(const char *src, FILE *out) {
             fclose(in); fclose(out); return -1;
         }
     }
+    /* fread returns 0 on a read error as well as at EOF: a short copy would
+     * be dlopen'ed as a truncated shared object. */
+    if (ferror(in)) {
+        fclose(in); fclose(out); return -1;
+    }
     fclose(in);
     if (fclose(out) != 0) return -1;
     return 0;
