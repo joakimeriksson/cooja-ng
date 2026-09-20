@@ -294,11 +294,11 @@ Without any script or verdict command the shell does not touch the exit code.
 
 | shell | agent-sim-protocol |
 |---|---|
-| `expect <nodes> "<pat>"` | `log_contains` |
-| `assert count "<pat>" <op> N` | `event_count` |
+| `expect <nodes> "<pat>"`, `expect -re`, `expect -n N` | `log_contains`, `log_matches`, `count`; the window starts when `expect` is armed (`since: previous`) |
+| `count "<pat>"` + `assert count "<pat>" <op> N` | `log_contains` with `count`; the window starts at `count`.  (The protocol's `event_count` counts event *types* such as `tx`/`rx`/`exception`, which the shell cannot count yet.) |
 | `wait-until <time>`, `sleep <dur>` | `time` |
-| `fail-on "<pat>"`, `on ... fail` | `invariants` |
-| `assert node <id> active\|removed` | node state predicates |
+| `fail-on "<pat>"`, `expect-not`, `on ... fail` | `invariants` (Cooja-NG's `fail_on`; the protocol's `no_event` is type-based) |
+| `assert node/mem/var`, `expect-halt`, `expect-fault`, `cmd`, `capture`, `on`, `every` | simulator-specific, outside the closed condition set (esp32sim advertises `probe_reached`/`memory_value`; Cooja-NG advertises none yet) |
 
 ## Pipes
 
