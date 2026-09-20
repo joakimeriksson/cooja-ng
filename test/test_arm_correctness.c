@@ -2676,6 +2676,89 @@ static void test_trustzone_bus_fault(void) {
     arm_step(&cpu, 1);                               /* re-executes, re-faults */
     assert_eq("AUVIOL+refusal again: PC = SecureFault handler", BF_SF_HANDLER, cpu.reg[ARM_PC]);
     assert_eq("AUVIOL+refusal again: NS SP = frame", BF_NS_FRAME, cpu.msp_ns);
+
+    /* The snapshot the undo restores is taken at the instruction's first
+     * checked access, not at instruction start. These pin what that must
+     * still guarantee. Refused second beat: LDRD r0,r1,[r2] with beat 1
+     * allowed and beat 2 refused. */
+    bf_setup(&cpu, &nvic);
+    write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0100);  /* LDRD r0,r1,[r2] */
+    cpu.reg[1] = 0xCAFEF00D;
+    cpu.reg[2] = 0x40000FFC;
+    arm_step(&cpu, 1);
+    assert_eq("second beat refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("second beat refused: BFAR = beat 2", 0x40001000, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("second beat refused: stacked PC = the LDRD", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+    assert_eq("second beat refused: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("second beat refused: r1 untouched", 0xCAFEF00D, cpu.reg[1]);
+
+    /* An instruction between two checked accesses gets its own snapshot:
+     * LDR r0,[r2] (allowed); SUBS r0,#0 (sets Z); LDR r3,[r1] (refused).
+     * The SUBS result and its flags survive the undo of the LDR. */
+    bf_setup(&cpu, &nvic);
+    write_thumb16(&cpu, CODE_BASE, 0x6810);          /* LDR r0, [r2] */
+    write_thumb16(&cpu, CODE_BASE + 2, 0x3800);      /* SUBS r0, #0 */
+    write_thumb16(&cpu, CODE_BASE + 4, 0x680B);      /* LDR r3, [r1] */
+    cpu.reg[2] = 0x40000FFC;
+    cpu.reg[3] = 0x33333333;
+    cpu.xpsr &= ~0xF0000000u;
+    arm_step(&cpu, 3);
+    assert_eq("snapshot per instruction: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("snapshot per instruction: stacked PC = the refused LDR", CODE_BASE + 4,
+              arm_read32(&cpu, BF_NS_FRAME + 24));
+    assert_eq("snapshot per instruction: r3 untouched", 0x33333333, cpu.reg[3]);
+    assert_eq("snapshot per instruction: SUBS result stands", 0, cpu.reg[0]);
+    assert_true("snapshot per instruction: stacked xPSR has Z from the SUBS",
+                (arm_read32(&cpu, BF_NS_FRAME + 28) & (1u << 30)) != 0);
+
+    /* A refusal (and the snapshot it takes) from outside the instruction
+     * stream is discarded at the next instruction: the undo that follows
+     * restores that instruction's own state, not the stale copy. */
+    bf_setup(&cpu, &nvic);
+    assert_eq("stale snapshot: refused read returns 0", 0, arm_read32(&cpu, 0x40001504));
+    cpu.reg[0] = 0x11111111;
+    arm_step(&cpu, 1);                               /* LDR r0,[r1]: refused */
+    assert_eq("stale snapshot: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("stale snapshot: r0 = value at the instruction, not before", 0x11111111, cpu.reg[0]);
+    assert_eq("stale snapshot: stacked PC = the LDR", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+
+    /* Writeback forms: the base register must be unchanged when the fault
+     * is taken, which requires the writeback to follow the access. */
+    bf_setup(&cpu, &nvic);
+    write_thumb32(&cpu, CODE_BASE, 0xF851, 0x0F04);  /* LDR r0, [r1, #4]! */
+    cpu.reg[1] = 0x40001500;
+    arm_step(&cpu, 1);
+    assert_eq("LDR pre-index writeback: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("LDR pre-index writeback: BFAR", 0x40001504, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("LDR pre-index writeback: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("LDR pre-index writeback: r1 untouched", 0x40001500, cpu.reg[1]);
+    bf_setup(&cpu, &nvic);
+    write_thumb32(&cpu, CODE_BASE, 0xF851, 0x0B04);  /* LDR r0, [r1], #4 */
+    cpu.reg[1] = 0x40001504;
+    arm_step(&cpu, 1);
+    assert_eq("LDR post-index writeback: BFAR", 0x40001504, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("LDR post-index writeback: r1 untouched", 0x40001504, cpu.reg[1]);
+    /* The same through the attribution unit (Secure target). */
+    sf_setup(&cpu, false, 0xBF00);                   /* placeholder, overwritten below */
+    write_thumb32(&cpu, CODE_BASE, 0xF851, 0x0F04);  /* LDR r0, [r1, #4]! */
+    cpu.reg[1] = SF_TARGET - 4;
+    arm_step(&cpu, 1);
+    assert_eq("LDR! to Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("LDR! to Secure: SFAR", SF_TARGET, cpu.sfar);
+    assert_eq("LDR! to Secure: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("LDR! to Secure: r1 untouched", SF_TARGET - 4, cpu.reg[1]);
+    /* PUSH {r0,r1} with SP in Secure memory: SP unchanged at the fault, so
+     * the frame is pushed below the original SP (the stacking itself is
+     * not attribution-checked, so it may land in Secure memory; it
+     * overwrites the words the PUSH was refused, which is why "not stored"
+     * is read off SFAR and the frame position rather than memory). */
+    sf_setup(&cpu, false, 0xB403);                   /* PUSH {r0, r1} */
+    cpu.reg[ARM_SP] = SF_TARGET + 0x40;
+    arm_step(&cpu, 1);
+    assert_eq("PUSH to Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("PUSH to Secure: SFAR = first store", SF_TARGET + 0x38, cpu.sfar);
+    assert_eq("PUSH to Secure: NS SP restored before the frame", SF_TARGET + 0x40 - 32, cpu.msp_ns);
+    assert_eq("PUSH to Secure: stacked PC = the PUSH", CODE_BASE, arm_read32(&cpu, SF_TARGET + 0x40 - 32 + 24));
 }
 
 /* Step 5: NVIC target-security (NVIC_ITNS) decides an IRQ's security state. */

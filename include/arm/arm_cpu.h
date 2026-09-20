@@ -256,10 +256,18 @@ typedef struct arm_cpu {
     uint32_t  mmfar_ns;              /* MMFAR is banked; the Secure bank is bfar */
     uint32_t  bus_fault_addr;        /* address of the refused transaction */
     bool      bus_fault_pending;
-    /* Pre-instruction register state, captured while a bus-side permission
-     * check is installed (io_access_check) or the security extension is
-     * enabled, so a precise BusFault or an AUVIOL SecureFault can undo the
-     * instruction. */
+    bool      insn_snap_valid;       /* insn_snap holds this instruction's start state */
+    /* Pre-instruction register state, so a precise BusFault or an AUVIOL
+     * SecureFault can undo the instruction. Taken lazily: while a bus-side
+     * permission check is installed (io_access_check) or the security
+     * extension is enabled, the interpreter records the start PC in reg[15]
+     * and invalidates the rest at every instruction; the register file,
+     * xPSR and ITSTATE are copied when a refusal is recorded
+     * (arm_insn_snapshot), so an instruction that is not refused pays two
+     * stores — except a multi-register load (LDM, POP, LDRD, LDREXD),
+     * which copies before its first beat: ~60 bytes on every POP-return.
+     * Sound because no other load/store form writes a register before its
+     * accesses. FP registers are not in the snapshot. */
     struct {
         uint32_t reg[16];
         uint32_t xpsr;

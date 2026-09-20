@@ -162,6 +162,8 @@ static void trace_unmapped_mmio(uint32_t addr, int is_write, uint32_t val) {
  * security the SPU sees on the bus (independent of the core's state), which
  * the GRTC's per-CC/SYSCOUNTER-view FEATURE checks consult. One
  * predicted-false branch for every other SoC; SRAM/flash never come here. */
+static inline void arm_insn_snapshot(arm_cpu_t *cpu);
+
 static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr,
                                          bool is_write) {
     uint32_t a = *addr;
@@ -185,6 +187,7 @@ static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr,
         if (__builtin_expect(cpu->io_access_check != NULL, 0) &&
             !cpu->io_access_check(cpu->io_access_user, a, is_write)) {
             cpu->io_blocked = true;
+            arm_insn_snapshot(cpu);
             if (!cpu->bus_fault_pending)
                 cpu->bus_fault_addr = a;
             cpu->bus_fault_pending = true;
@@ -231,10 +234,47 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * These check SRAM first (most common data target), then flash,
  * then fall back to the public functions for IO/ROM/bitband. */
 
+/* Precise-fault snapshot, taken lazily. The interpreter stores the start
+ * PC in insn_snap.reg[15] and clears insn_snap_valid at every instruction
+ * (two stores); the rest is copied when a refusal is recorded — by the
+ * attribution unit in arm_tz_blocks(), by the bus check in io_lookup().
+ * PC has been advanced by then, hence the eager copy of it; nothing else
+ * has changed, because every load/store form issues its accesses before
+ * writing a register (PUSH, LDR with writeback and VLDM/VSTM were
+ * reordered for this). The exception is a multi-register load, whose
+ * earlier beats write registers before a later beat can be refused: those
+ * forms (LDM, POP, LDRD, LDREXD) snapshot before their first beat, so they
+ * pay the copy on every execution — every POP-return on a part with a bus
+ * check or TrustZone, still far cheaper than the eager copy, which
+ * measured +5–10 % wall on every nRF54L15 run. For every other form an
+ * allowed access costs nothing.
+ *
+ * VFP loads and stores (arm_vfp.c, VLSTM/VLLDM) go through the public
+ * arm_read32/arm_write32: bus-checked, but not SAU-checked, as they never
+ * reach arm_tz_blocks. FP registers are not in the snapshot either, so a
+ * refused VLDR/VPOP/VLDM leaves its destination S-registers at the 0 the
+ * refused read returned (VLLDM: FPSCR too), where silicon leaves them
+ * unchanged; the base-register writeback is undone correctly.
+ *
+ * Out of line: called from arm_tz_blocks, which is inlined into the six
+ * mem_* helpers at hundreds of sites. */
+static void __attribute__((noinline)) arm_insn_snapshot_slow(arm_cpu_t *cpu) {
+    memcpy(cpu->insn_snap.reg, cpu->reg, sizeof(uint32_t) * ARM_PC);
+    cpu->insn_snap.xpsr = cpu->xpsr;
+    cpu->insn_snap.it_state = cpu->it_state;
+    cpu->insn_snap_valid = true;
+}
+
+static inline void arm_insn_snapshot(arm_cpu_t *cpu) {
+    if (!cpu->insn_snap_valid) arm_insn_snapshot_slow(cpu);
+}
+
 /* Undo the instruction being executed: restore the register file, xPSR and
  * ITSTATE captured at its start, so a precise fault stacks the instruction
- * itself and none of its writes survive. Cycles stay charged. */
+ * itself and none of its writes survive. Cycles stay charged. A fault is
+ * only ever armed by a checked access, which snapshots first. */
 static inline void arm_insn_undo(arm_cpu_t *cpu) {
+    if (!cpu->insn_snap_valid) return;
     memcpy(cpu->reg, cpu->insn_snap.reg, sizeof(cpu->reg));
     cpu->xpsr = cpu->insn_snap.xpsr;
     cpu->it_state = cpu->insn_snap.it_state;
@@ -252,6 +292,7 @@ static inline bool arm_tz_blocks(arm_cpu_t *cpu, uint32_t addr) {
         return false;
     if (arm_mem_access_permitted(cpu, addr))
         return false;
+    arm_insn_snapshot(cpu);
     arm_record_secure_fault(cpu, addr);
     return true;
 }
@@ -748,6 +789,7 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->cfsr = cpu->hfsr = cpu->bfar = cpu->mmfar_ns = 0;
     cpu->bus_fault_addr = 0;
     cpu->bus_fault_pending = false;
+    cpu->insn_snap_valid = false;
     cpu->exc_crossed_domain = false;
     cpu->exc_bg_secure = false;
     cpu->fetch_ok_base = cpu->fetch_ok_len = 0;
@@ -1839,14 +1881,15 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         /* Precise fault support (a SoC with a bus-side permission check, or
          * the security extension's attribution unit): a refusal is taken at
          * the end of the instruction that issued it, with the instruction's
-         * register writes undone, so capture the state it starts from.
-         * Anything armed between instructions (a refused access by the
-         * FLPR, the GDB stub or an event callback) is discarded here — it
+         * register writes undone. Record where it starts and invalidate the
+         * last snapshot; the rest is copied at its first checked access
+         * (arm_insn_snapshot), if it has one. Anything armed between
+         * instructions (a refused access by the FLPR, the GDB stub or an
+         * event callback, and the snapshot it took) is discarded here — it
          * was not this core's transaction. */
         if (__builtin_expect(cpu->io_access_check != NULL || cpu->tz_enabled, 0)) {
-            memcpy(cpu->insn_snap.reg, cpu->reg, sizeof(cpu->reg));
-            cpu->insn_snap.xpsr = cpu->xpsr;
-            cpu->insn_snap.it_state = cpu->it_state;
+            cpu->insn_snap.reg[ARM_PC] = pc;
+            cpu->insn_snap_valid = false;
             cpu->bus_fault_pending = false;
         }
 
@@ -2690,6 +2733,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     uint32_t reglist = hw1 & 0xFF;
                     int pop_pc = (hw1 >> 8) & 1;
                     uint32_t addr = cpu->reg[ARM_SP];
+                    arm_insn_snapshot(cpu);   /* multi-register load */
                     for (int i = 0; i < 8; i++) {
                         if (reglist & (1 << i)) {
                             cpu->reg[i] = mem_read32(cpu, addr);
@@ -2767,6 +2811,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
             int rn = (hw1 >> 8) & 7;
             uint32_t reglist = hw1 & 0xFF;
             uint32_t addr = cpu->reg[rn];
+            arm_insn_snapshot(cpu);   /* multi-register load */
             for (int i = 0; i < 8; i++) {
                 if (reglist & (1 << i)) {
                     cpu->reg[i] = mem_read32(cpu, addr);
@@ -2864,6 +2909,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
 
                 if (L) {
                     /* LDM.W — defer exception_return until after writeback */
+                    arm_insn_snapshot(cpu);   /* multi-register load */
                     uint32_t exc_ret = 0;
                     bool do_exc_ret = false;
                     for (int i = 0; i < 16; i++) {
@@ -3002,7 +3048,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         switch (op3) {
                             case 0x4: cpu->reg[rt] = mem_read8(cpu, addr);  break;
                             case 0x5: cpu->reg[rt] = mem_read16(cpu, addr); break;
-                            default:  cpu->reg[rt]  = mem_read32(cpu, addr);
+                            default:  arm_insn_snapshot(cpu);   /* LDREXD: two beats */
+                                      cpu->reg[rt]  = mem_read32(cpu, addr);
                                       cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                                       break;
                         }
@@ -3037,6 +3084,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     uint32_t base = (pc + 4) & ~3u;
                     uint32_t off  = imm8;
                     uint32_t addr = U ? base + off : base - off;
+                    arm_insn_snapshot(cpu);   /* multi-register load */
                     cpu->reg[rt]  = mem_read32(cpu, addr);
                     cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                 } else if (!P && !U && !L && (hw2 & 0x0F00) != 0x0F00) {
@@ -3072,6 +3120,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         addr = cpu->reg[rn];
                     }
                     if (L) {
+                        arm_insn_snapshot(cpu);   /* multi-register load */
                         cpu->reg[rt]  = mem_read32(cpu, addr);
                         cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                     } else {
