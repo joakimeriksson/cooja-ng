@@ -128,7 +128,15 @@ bool ui_service_start(websocket_ui_service_t *svc, int port,
         fseek(hf, 0, SEEK_END);
         long hlen = ftell(hf);
         fseek(hf, 0, SEEK_SET);
-        char *html = malloc((size_t)hlen + 1);
+        /* ftell is -1 on an unseekable stream (a pipe, a FIFO), which would
+         * size the buffer at 0 and let fread write past it. */
+        #define UI_PAGE_MAX (16L * 1024L * 1024L)
+        char *html = NULL;
+        if (hlen < 0 || hlen > UI_PAGE_MAX)
+            fprintf(stderr, "Warning: ui/index.html is not a readable file, "
+                            "serving default page\n");
+        else
+            html = malloc((size_t)hlen + 1);
         if (html) {
             size_t rd = fread(html, 1, (size_t)hlen, hf);
             html[rd] = '\0';
