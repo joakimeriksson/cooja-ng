@@ -264,7 +264,7 @@ int riscv_step(riscv_cpu_t *rv, int n) {
                 (((insn >> 12) & 0xffu) << 12) |
                 (((insn >> 20) & 1u) << 11) |
                 (((insn >> 21) & 0x3ffu) << 1));
-            imm = (imm << 11) >> 11;            /* sign-extend 21-bit */
+            imm = (int32_t)((uint32_t)imm << 11) >> 11;   /* sign-extend 21-bit */
             SET(rd, next);
             next = pc + (uint32_t)imm;
             break;
@@ -282,7 +282,7 @@ int riscv_step(riscv_cpu_t *rv, int n) {
                 (((insn >> 7)  & 1u) << 11) |
                 (((insn >> 25) & 0x3fu) << 5) |
                 (((insn >> 8)  & 0xfu) << 1));
-            imm = (imm << 19) >> 19;            /* sign-extend 13-bit */
+            imm = (int32_t)((uint32_t)imm << 19) >> 19;   /* sign-extend 13-bit */
             uint32_t a = R(rs1), b = R(rs2);
             int take = 0;
             switch (funct3) {
@@ -313,7 +313,8 @@ int riscv_step(riscv_cpu_t *rv, int n) {
             break;
         }
         case 0x23: { /* STORE */
-            int32_t imm = (((int32_t)insn >> 25) << 5) | (int32_t)((insn >> 7) & 0x1fu);
+            int32_t imm = (int32_t)((uint32_t)((int32_t)insn >> 25) << 5) |
+                          (int32_t)((insn >> 7) & 0x1fu);
             uint32_t a = R(rs1) + (uint32_t)imm;
             switch (funct3) {
                 case 0: st8 (rv, a, (uint8_t)R(rs2)); break;   /* SB */

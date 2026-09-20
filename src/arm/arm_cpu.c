@@ -193,18 +193,18 @@ static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr,
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
     if (cpu->rom && addr < cpu->rom_size) {
-        return cpu->rom[addr] | (cpu->rom[addr+1]<<8) |
-               (cpu->rom[addr+2]<<16) | (cpu->rom[addr+3]<<24);
+        return (uint32_t)cpu->rom[addr] | ((uint32_t)cpu->rom[addr+1]<<8) |
+               ((uint32_t)cpu->rom[addr+2]<<16) | ((uint32_t)cpu->rom[addr+3]<<24);
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) {
         uint32_t off = addr - cpu->flash_base;
-        return cpu->flash[off] | (cpu->flash[off+1]<<8) |
-               (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
+        return (uint32_t)cpu->flash[off] | ((uint32_t)cpu->flash[off+1]<<8) |
+               ((uint32_t)cpu->flash[off+2]<<16) | ((uint32_t)cpu->flash[off+3]<<24);
     }
     if (addr >= cpu->sram_base && addr < cpu->sram_end) {
         uint32_t off = addr - cpu->sram_base;
-        return cpu->sram[off] | (cpu->sram[off+1]<<8) |
-               (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
+        return (uint32_t)cpu->sram[off] | ((uint32_t)cpu->sram[off+1]<<8) |
+               ((uint32_t)cpu->sram[off+2]<<16) | ((uint32_t)cpu->sram[off+3]<<24);
     }
     /* Bit-band alias for peripheral region */
     if (addr >= ARM_BITBAND_BASE && addr < ARM_BITBAND_BASE + 0x02000000) {
@@ -247,13 +247,13 @@ static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
     if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
-        return cpu->sram[off] | (cpu->sram[off+1]<<8) |
-               (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
+        return (uint32_t)cpu->sram[off] | ((uint32_t)cpu->sram[off+1]<<8) |
+               ((uint32_t)cpu->sram[off+2]<<16) | ((uint32_t)cpu->sram[off+3]<<24);
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) {
         uint32_t off = addr - cpu->flash_base;
-        return cpu->flash[off] | (cpu->flash[off+1]<<8) |
-               (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
+        return (uint32_t)cpu->flash[off] | ((uint32_t)cpu->flash[off+1]<<8) |
+               ((uint32_t)cpu->flash[off+2]<<16) | ((uint32_t)cpu->flash[off+3]<<24);
     }
     return arm_read32(cpu, addr);
 }
@@ -3088,7 +3088,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                                 /* RRX */
                                 int old_c = (cpu->xpsr & APSR_C) ? 1 : 0;
                                 carry_out = rm_val & 1;
-                                rm_val = (rm_val >> 1) | (old_c << 31);
+                                rm_val = (rm_val >> 1) | ((uint32_t)old_c << 31);
                             } else {
                                 rm_val = ror_c(rm_val, shift_n, &carry_out);
                             }
