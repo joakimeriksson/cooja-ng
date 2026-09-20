@@ -123,13 +123,15 @@ int sim_config_load(sim_normalized_config_t *cfg, const char *json_path) {
         if (!root) return -1;                 /* diagnostic already printed */
     } else if (ext && strcmp(ext, ".json") == 0) {
         root = cJSON_Parse(buf);
-        free(buf);
         if (!root) {
+            /* The error pointer points into buf: report before freeing it. */
             const char *err = cJSON_GetErrorPtr();
             fprintf(stderr, "%s: JSON parse error near: %.40s\n", json_path,
                     err ? err : "(unknown)");
+            free(buf);
             return -1;
         }
+        free(buf);
     } else {
         free(buf);
         fprintf(stderr, "%s: unknown config extension '%s' (use .yaml, .yml or .json)\n",
