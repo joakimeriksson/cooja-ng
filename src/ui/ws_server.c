@@ -336,6 +336,14 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
             header_len = 10;
         }
 
+        /* RFC 6455 5.5: control frames carry at most 125 bytes.  The pong
+         * below echoes a ping in a 7-bit length, so a longer one would get
+         * a header that does not match its body. */
+        if (opcode >= 0x8 && payload_len > 125) {
+            close_client(srv, idx);
+            return;
+        }
+
         if (masked) header_len += 4;
 
         /* Validate the declared length before any arithmetic that could
