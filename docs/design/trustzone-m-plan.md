@@ -301,7 +301,9 @@ nothing was ever refused. Now:
   attribution unit's own refusal (a Non-secure data access to Secure memory,
   SecureFault AUVIOL) is precise the same way, from the same snapshot; the
   INVIS and SG-side INVEP SecureFaults are still taken after the instruction.
-  From the
+  An instruction that records both (one beat to Secure memory, one to a
+  refused alias — no such pair exists on the real memory map) takes the
+  SecureFault only, from one undo. From the
   Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
   clear, and MMFAR is banked. What firmware reports on a violation is its
   BusFault handler's line. Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC) attribute

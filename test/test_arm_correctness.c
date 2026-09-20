@@ -2387,6 +2387,7 @@ static bool refuse_0x40001000(void *user, uint32_t addr, bool is_write) {
 #define BF_HANDLER   (CODE_BASE + 0x40)   /* BusFault: patches the frame, PC += 2 */
 #define HF_HANDLER   (CODE_BASE + 0x60)   /* HardFault: BX LR */
 #define IRQ_HANDLER  (CODE_BASE + 0x80)   /* IRQ 7: BX LR */
+#define BF_SF_HANDLER (CODE_BASE + 0xA0)  /* SecureFault: BX LR */
 #define BF_IRQ       7
 #define BF_NS_SP     0x20007F00u
 #define BF_NS_FRAME  (BF_NS_SP - 32)      /* frame the fault pushes on the NS stack */
@@ -2582,6 +2583,41 @@ static void test_trustzone_bus_fault(void) {
     cpu.secure = true;
     assert_eq("S view: MMFAR is BFAR", 0x40001504, arm_read32(&cpu, 0xE000ED34));
     assert_eq("S view: CFSR", 0x8200, arm_read32(&cpu, 0xE000ED28));
+
+
+    /* One undo per instruction. LDRD r0,r1,[r2] with beat 1 on a refused
+     * Non-secure alias and beat 2 in Secure memory records a bus refusal and
+     * an AUVIOL in the same instruction. The SecureFault is taken, alone:
+     * a second undo after its entry would restore SP, PC and LR from before
+     * it and leave the frame above SP. No such pair of addresses exists on
+     * the real memory map; the SAU is narrowed here to make one. */
+    bf_setup(&cpu, &nvic);
+    cpu.sau_rlar[2] = (0x40001FFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;   /* 0x40002000: Secure */
+    write_flash32(&cpu, ARM_FLASH_BASE + EXC_SECUREFAULT * 4, BF_SF_HANDLER | 1);
+    write_thumb16(&cpu, BF_SF_HANDLER, 0x4770);                       /* BX LR */
+    write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0100);  /* LDRD r0,r1,[r2] */
+    cpu.reg[1] = 0xCAFEF00D;
+    cpu.reg[2] = 0x40001FFC;
+    arm_step(&cpu, 1);
+    assert_true("AUVIOL+refusal: now Secure", cpu.secure);
+    assert_eq("AUVIOL+refusal: PC = SecureFault handler", BF_SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("AUVIOL+refusal: IPSR = 7", EXC_SECUREFAULT, (int)(cpu.xpsr & 0x1FF));
+    assert_eq("AUVIOL+refusal: SFAR = the Secure beat", 0x40002000, cpu.sfar);
+    assert_eq("AUVIOL+refusal: BusFault not taken (CFSR)", 0, cpu.cfsr);
+    assert_eq("AUVIOL+refusal: BusFault not taken (BFAR)", 0, cpu.bfar);
+    assert_true("AUVIOL+refusal: refusal dropped with the take", !cpu.bus_fault_pending);
+    assert_eq("AUVIOL+refusal: one frame, on the NS stack", BF_NS_FRAME, cpu.msp_ns);
+    assert_eq("AUVIOL+refusal: stacked PC = the LDRD", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+    assert_eq("AUVIOL+refusal: Secure SP = MSP_S, nothing stacked there", 0x20007000, cpu.reg[ARM_SP]);
+    assert_eq("AUVIOL+refusal: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("AUVIOL+refusal: r1 untouched", 0xCAFEF00D, cpu.reg[1]);
+    arm_step(&cpu, 1);                               /* BX LR: exception return */
+    assert_true("AUVIOL+refusal return: Non-secure again", !cpu.secure);
+    assert_eq("AUVIOL+refusal return: PC = the LDRD", CODE_BASE, cpu.reg[ARM_PC]);
+    assert_eq("AUVIOL+refusal return: NS SP restored", BF_NS_SP, cpu.reg[ARM_SP]);
+    arm_step(&cpu, 1);                               /* re-executes, re-faults */
+    assert_eq("AUVIOL+refusal again: PC = SecureFault handler", BF_SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("AUVIOL+refusal again: NS SP = frame", BF_NS_FRAME, cpu.msp_ns);
 }
 
 /* Step 5: NVIC target-security (NVIC_ITNS) decides an IRQ's security state. */

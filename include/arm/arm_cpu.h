@@ -316,7 +316,15 @@ typedef struct arm_cpu {
     bool      secure_fault_pending;  /* a SecureFault has been recorded */
     bool      secure_fault_undo;     /* it is a refused data access (AUVIOL):
                                         precise, the instruction is undone
-                                        from insn_snap before entry */
+                                        from insn_snap before entry. Unlike
+                                        bus_fault_pending it needs no clear
+                                        at instruction start: only the
+                                        interpreter's inline mem_* helpers
+                                        reach arm_tz_blocks(), so it is set
+                                        and consumed inside one instruction
+                                        (the public arm_read32/arm_write32
+                                        the FLPR, the GDB stub and exception
+                                        stacking use bypass it) */
 
     /* Secure exception model (Step 4). When a secure exception is taken from
      * Non-secure background, the background security state is stashed here and

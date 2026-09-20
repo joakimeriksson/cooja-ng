@@ -4076,9 +4076,19 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * access (AUVIOL) is precise like the BusFault below: the instruction
          * is undone so the frame names it and its destination is untouched.
          * INVIS (FNC_RETURN) and the SG-side INVEP are still taken after the
-         * instruction; the fetch-side INVEP never runs it. */
+         * instruction; the fetch-side INVEP never runs it.
+         *
+         * One undo per instruction: an instruction that recorded both an
+         * AUVIOL and a bus refusal (two beats, one to Secure memory and one
+         * to a refused alias — no such pair exists on the real memory map)
+         * takes the SecureFault only. The BusFault take below is the else
+         * branch: a second undo after the entry would restore SP, PC and LR
+         * from before it and leave the SecureFault frame above SP. The
+         * refusal is dropped with its arming; the instruction re-executes
+         * after the handler and re-faults. */
         if (cpu->tz_enabled && cpu->secure_fault_pending) {
             cpu->secure_fault_pending = false;
+            cpu->bus_fault_pending = false;
             if (cpu->secure_fault_undo) {
                 cpu->secure_fault_undo = false;
                 arm_insn_undo(cpu);
@@ -4097,7 +4107,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * execution priority (an active handler at the same or higher
          * priority, BASEPRI, PRIMASK, FAULTMASK). AIRCR.PRIS is not
          * modelled. */
-        if (__builtin_expect(cpu->bus_fault_pending, 0)) {
+        else if (__builtin_expect(cpu->bus_fault_pending, 0)) {
             cpu->bus_fault_pending = false;
             arm_insn_undo(cpu);
             cpu->cfsr |= ARM_CFSR_PRECISERR | ARM_CFSR_BFARVALID;
