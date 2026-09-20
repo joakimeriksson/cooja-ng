@@ -97,6 +97,7 @@ typedef struct shell_dbg {           /* one breakpoint or watchpoint */
     uint32_t addr;
     int      len;                    /* watchpoint bytes, 1..4 */
     int      hits;
+    bool     halted;                 /* the node is stopped at this entry */
 } shell_dbg_t;
 
 typedef struct shell_hline {        /* one remembered console line */

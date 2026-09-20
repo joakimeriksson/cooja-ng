@@ -646,6 +646,10 @@ typedef struct node_mem {
     int            word;             /* native word: 4 (ARM) or 2 (MSP430) */
     int            id, idx;
     sim_control_node_info_t info;
+    /* Byte reads of a peripheral register come from one word read of it,
+     * so a dump touches a read-to-clear or FIFO register once per word. */
+    bool           io_cached;
+    uint32_t       io_cache_addr, io_cache_val;
 } node_mem_t;
 
 static int node_mem_open(shell_service_t *s, const char *what, const char *arg, node_mem_t *m) {
@@ -664,21 +668,65 @@ static int node_mem_open(shell_service_t *s, const char *what, const char *arg, 
     return 0;
 }
 
-static bool node_mem_read8(const node_mem_t *m, uint32_t a, uint8_t *v) {
-    if (m->arm) { *v = arm_read8(m->arm, a); return true; }
+/* The debugger's view of an ARM address.  A peripheral reached through its
+ * Non-secure alias would be a Non-secure bus transaction, which the
+ * security unit refuses and latches (PERIPHACCERR) — guest-visible.  A
+ * debugger accesses as Secure, so fold the alias onto the Secure address. */
+static uint32_t node_mem_addr(const node_mem_t *m, uint32_t a) {
+    if (m->arm && m->arm->io_ns_alias && (a >> 28) == 4) a |= 0x10000000u;
+    return a;
+}
+
+/* ROM, flash or SRAM: bytes; anything else is a peripheral register. */
+static bool arm_is_memory(const arm_cpu_t *cpu, uint32_t a) {
+    return (cpu->rom && a < cpu->rom_size) ||
+           (a >= cpu->flash_base && a < cpu->flash_end) ||
+           (a >= cpu->sram_base && a < cpu->sram_end);
+}
+
+static bool node_mem_read8(node_mem_t *m, uint32_t a, uint8_t *v) {
+    if (m->arm) {
+        a = node_mem_addr(m, a);
+        if (arm_is_memory(m->arm, a)) { *v = arm_read8(m->arm, a); return true; }
+        uint32_t w = a & ~3u;
+        if (!m->io_cached || m->io_cache_addr != w) {
+            m->io_cache_val = arm_read32(m->arm, w);
+            m->io_cache_addr = w;
+            m->io_cached = true;
+        }
+        *v = (uint8_t)(m->io_cache_val >> (8 * (a & 3)));
+        return true;
+    }
     if (a >= m->msp->max_mem) return false;
     *v = m->msp->memory[a];
     return true;
 }
 
-static bool node_mem_read_word(const node_mem_t *m, uint32_t a, uint32_t *v) {
+/* A native word.  A peripheral register is read once, as a word: byte-wise
+ * access would replicate the low byte and hit a read-to-clear or FIFO
+ * register once per byte. */
+static bool node_mem_read_word(node_mem_t *m, uint32_t a, uint32_t *v) {
     *v = 0;
+    if (m->arm) {
+        a = node_mem_addr(m, a);
+        if (!arm_is_memory(m->arm, a)) { *v = arm_read32(m->arm, a); return true; }
+    }
     for (int b = 0; b < m->word; b++) {
         uint8_t x;
         if (!node_mem_read8(m, a + (uint32_t)b, &x)) return false;
         *v |= (uint32_t)x << (8 * b);
     }
     return true;
+}
+
+static void node_mem_write(const node_mem_t *m, uint32_t a, uint32_t v, int step) {
+    if (m->arm) {
+        a = node_mem_addr(m, a);
+        if (step == 4 && !arm_is_memory(m->arm, a)) { arm_write32(m->arm, a, v); return; }
+        for (int b = 0; b < step; b++) arm_write8(m->arm, a + (uint32_t)b, (uint8_t)(v >> (8 * b)));
+        return;
+    }
+    for (int b = 0; b < step; b++) m->msp->memory[a + (uint32_t)b] = (uint8_t)(v >> (8 * b));
 }
 
 /* NULL if [first, last] may be written, else why not. */
@@ -718,18 +766,18 @@ static int cmd_mem(shell_service_t *s, int argc, char **argv, const char *line, 
 
     if (argc - i >= 3 && !strcmp(argv[i + 2], "=")) {
         if (argc - i < 4) { shell_error(s, "mem: nothing to write"); return -1; }
-        uint32_t last = addr + (uint32_t)((argc - i - 3) * step) - 1;
+        uint64_t end = (uint64_t)addr + (uint64_t)(argc - i - 3) * (uint64_t)step;   /* 64-bit: no wrap */
+        if (end > 0x100000000ull) {
+            shell_error(s, "mem: 0x%08x + %d bytes runs past the end of the address space", addr, (argc - i - 3) * step);
+            return -1;
+        }
+        uint32_t last = (uint32_t)(end - 1);
         const char *why = node_mem_write_refusal(&m, addr, last);
         if (why) { shell_error(s, "mem: 0x%08x-0x%08x %s", addr, last, why); return -1; }
         for (int k = i + 3; k < argc; k++) {
             long v;
             if (shell_parse_int(argv[k], &v) != 0) { shell_error(s, "mem: bad value '%s'", argv[k]); return -1; }
-            uint32_t at = addr + (uint32_t)((k - i - 3) * step);
-            for (int b = 0; b < step; b++) {
-                uint8_t byte = (uint8_t)((unsigned long)v >> (8 * b));
-                if (m.arm) arm_write8(m.arm, at + (uint32_t)b, byte);
-                else m.msp->memory[at + (uint32_t)b] = byte;
-            }
+            node_mem_write(&m, addr + (uint32_t)((k - i - 3) * step), (uint32_t)v, step);
         }
         if (s->verbose) shell_out(s, "wrote %d %s at 0x%08x\n", argc - i - 3, words ? "word(s)" : "byte(s)", addr);
         return 0;
@@ -739,8 +787,10 @@ static int cmd_mem(shell_service_t *s, int argc, char **argv, const char *line, 
     if (argc - i >= 3 && shell_parse_int(argv[i + 2], &count) != 0) { shell_error(s, "mem: bad count '%s'", argv[i + 2]); return -1; }
     if (count < 1 || count > 4096) { shell_error(s, "mem: count must be 1..4096"); return -1; }
     if (var && count != 1) { shell_error(s, "mem: -c needs a count of 1"); return -1; }
-    if (m.msp && addr + (uint32_t)(count * step) > m.msp->max_mem) {
-        shell_error(s, "mem: 0x%08x+%ld is beyond the 0x%x bytes of address space", addr, count * step, m.msp->max_mem);
+    uint64_t span_end = (uint64_t)addr + (uint64_t)count * (uint64_t)step;
+    if (span_end > (m.msp ? (uint64_t)m.msp->max_mem : 0x100000000ull)) {
+        shell_error(s, "mem: 0x%08x+%ld is beyond the 0x%llx bytes of address space", addr, count * step,
+                    m.msp ? (unsigned long long)m.msp->max_mem : 0x100000000ull);
         return -1;
     }
     char buf[24];
@@ -907,7 +957,7 @@ void shell_debug_tick(shell_service_t *s) {
         if (!cpu->dbg_hit_new) continue;
         cpu->dbg_hit_new = false;
         shell_dbg_t *d = dbg_entry_for_hit(s, node_id, cpu->dbg_hit_kind, cpu->dbg_hit_index);
-        if (d) d->hits++;
+        if (d) { d->hits++; d->halted = true; }
         shell_hold_output(s);
         if (cpu->dbg_hit_kind == 1)
             shell_out(s, "breakpoint #%d: node %d at pc 0x%08x (%.6f s)\n", d ? d->id : 0, node_id,
@@ -938,11 +988,14 @@ static int cmd_break(shell_service_t *s, int argc, char **argv, const char *line
     if (kind == 1) {
         addr &= ~1u;                          /* Thumb bit of a function symbol */
         if (argc > 3) { shell_error(s, "usage: break <node> <addr|symbol>"); return -1; }
+        if (!arm_is_memory(cpu, addr)) {
+            shell_error(s, "break: 0x%08x is not code memory (ROM, flash or SRAM)", addr); return -1;
+        }
     } else {
         if (argc == 4 && (shell_parse_int(argv[3], &len) != 0 || len < 1 || len > 4)) {
             shell_error(s, "watch: length is 1..4 bytes"); return -1;
         }
-        if (addr < cpu->sram_base || addr + (uint32_t)len > cpu->sram_end) {
+        if (addr < cpu->sram_base || (uint64_t)addr + (uint64_t)len > cpu->sram_end) {
             shell_error(s, "watch: 0x%08x is not SRAM (watching peripherals would read their registers every instruction)", addr);
             return -1;
         }
@@ -950,7 +1003,10 @@ static int cmd_break(shell_service_t *s, int argc, char **argv, const char *line
     int per_kind = 0;
     for (int i = 0; i < s->dbg_count; i++)
         per_kind += s->dbg[i].node_id == info.id && s->dbg[i].kind == kind;
-    if (s->dbg_count >= SHELL_DBG_MAX || per_kind >= (kind == 1 ? ARM_DBG_MAX_BP : ARM_DBG_MAX_WP)) {
+    if (s->dbg_count >= SHELL_DBG_MAX) {
+        shell_error(s, "%s: at most %d breakpoints and watchpoints in total", what, SHELL_DBG_MAX); return -1;
+    }
+    if (per_kind >= (kind == 1 ? ARM_DBG_MAX_BP : ARM_DBG_MAX_WP)) {
         shell_error(s, "%s: at most %d per node", what, kind == 1 ? ARM_DBG_MAX_BP : ARM_DBG_MAX_WP); return -1;
     }
     shell_dbg_t *d = &s->dbg[s->dbg_count++];
@@ -993,7 +1049,7 @@ static int cmd_break_list(shell_service_t *s, int argc, char **argv, const char 
     for (int i = 0; i < s->dbg_count; i++) {
         const shell_dbg_t *d = &s->dbg[i];
         arm_cpu_t *cpu = dbg_cpu(s, d->node_id);
-        bool halted_here = cpu && cpu->dbg_halted && dbg_entry_for_hit(s, d->node_id, cpu->dbg_hit_kind, cpu->dbg_hit_index) == d;
+        bool halted_here = d->halted && cpu && cpu->dbg_halted;
         if (d->kind == 1)
             shell_out(s, "  #%d breakpoint node %d 0x%08x  hits %d%s\n", d->id, d->node_id, d->addr, d->hits,
                       halted_here ? "  (halted here)" : "");
@@ -1042,6 +1098,8 @@ static int cmd_continue(shell_service_t *s, int argc, char **argv, const char *l
         if (!cpu || !cpu->dbg_halted) continue;
         if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->reg[ARM_PC] & ~1u;
         cpu->dbg_halted = false;
+        for (int k = 0; k < s->dbg_count; k++)
+            if (s->dbg[k].node_id == info.id) s->dbg[k].halted = false;
         sim_schedule_mote_wakeup_if_earlier(s->sim, i, now_ns(s));
         released++;
     }

@@ -153,6 +153,7 @@ static const char *m_fw_for_type(void *u, const char *t, const char **sfw) {
 /* Node 1 is an ARM node with 4 KB of SRAM at 0x20000000; the others have no
  * CPU interface (like MSP430/native nodes). */
 static arm_cpu_t mock_cpu;
+static uint8_t mock_flash[0x3000];           /* 0x1000..0x4000: code memory for break */
 static uint8_t mock_sram[4096];
 static void *m_get_interface(void *u, int idx, int iface) {
     (void)u;
@@ -202,6 +203,9 @@ static void mock_reset(void) {
     mock_cpu.sram = mock_sram;
     mock_cpu.sram_base = 0x20000000u;
     mock_cpu.sram_end = 0x20000000u + sizeof(mock_sram);
+    mock_cpu.flash = mock_flash;
+    mock_cpu.flash_base = 0x1000u;
+    mock_cpu.flash_end = 0x1000u + sizeof(mock_flash);
     memset(&sh, 0, sizeof(sh));
     sh.sim = &mock_sim; sh.ctl = &mock_ctl; sh.active = true; sh.interactive = false;
     sh.verbose = false; sh.next_at_id = 1; sh.default_expect_timeout_ns = 30000000000LL;
@@ -1132,7 +1136,11 @@ static void test_debug(void) {
     sh.interactive = true;
     shell_enqueue_line(&sh, "watch 1 0x20000100 2");
     shell_enqueue_line(&sh, "watch 1 0x40000000");       /* not SRAM */
+    shell_enqueue_line(&sh, "watch 1 0xfffffffe 4");     /* wraps: not SRAM either */
     shell_enqueue_line(&sh, "break 2 0x100");                 /* node 2: no ARM CPU */
+    shell_enqueue_line(&sh, "break 1 0xFFFFFFFF");            /* not code memory */
+    shell_enqueue_line(&sh, "mem 1 0xFFFFFFFF = 1 2");        /* runs past the address space */
+    shell_enqueue_line(&sh, "mem 1 0xFFFFFFFF 2");
     shell_script_tick(&sh);
     CHECK(sh.dbg_count == 1 && mock_cpu.dbg_wp_n == 1 && mock_cpu.dbg_wp[0].len == 2, "one watchpoint armed, bad ones refused");
     mock_cpu.reg[ARM_PC] = 0x3000;
