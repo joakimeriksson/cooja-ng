@@ -2631,7 +2631,6 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     for (int i = 0; i < 8; i++) if (reglist & (1 << i)) count_regs++;
                     if (push_lr) count_regs++;
                     uint32_t sp = cpu->reg[ARM_SP] - count_regs * 4;
-                    cpu->reg[ARM_SP] = sp;
                     uint32_t addr = sp;
                     for (int i = 0; i < 8; i++) {
                         if (reglist & (1 << i)) {
@@ -2640,6 +2639,12 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         }
                     }
                     if (push_lr) mem_write32(cpu, addr, cpu->reg[ARM_LR]);
+                    /* Write back after the stores: a precise fault on one of
+                     * them snapshots the register file when the refusal is
+                     * recorded (see arm_insn_snapshot), so no register may
+                     * change before the accesses. SP is never in the list,
+                     * so the stored values are the same either way. */
+                    cpu->reg[ARM_SP] = sp;
                     cpu->cycles += count_regs;
                     break;
                 }
@@ -3648,6 +3653,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                 int rt = (hw2 >> 12) & 0xF;
 
                 uint32_t addr;
+                int writeback = 0;
+                uint32_t wb_val = 0;
                 if (rn == 0xF) {
                     /* PC-relative (literal) */
                     uint32_t imm12 = hw2 & 0xFFF;
@@ -3664,7 +3671,12 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     int imm2 = (hw2 >> 4) & 3;
                     addr = cpu->reg[rn] + (cpu->reg[rm] << imm2);
                 } else {
-                    /* 8-bit immediate with P/U/W */
+                    /* 8-bit immediate with P/U/W. The writeback is applied
+                     * after the load (a precise fault on it must find the
+                     * base register unchanged) and before the destination
+                     * write, so Rt == Rn still ends with the loaded value
+                     * and SP is updated before an exception return through
+                     * `LDR pc, [sp], #4`. */
                     int P = (hw2 >> 10) & 1;
                     int U = (hw2 >> 9) & 1;
                     int W = (hw2 >> 8) & 1;
@@ -3675,10 +3687,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         addr = cpu->reg[rn];
                     }
                     if (W) {
-                        if (P)
-                            cpu->reg[rn] = addr;
-                        else
-                            cpu->reg[rn] = U ? addr + imm8 : addr - imm8;
+                        writeback = 1;
+                        wb_val = P ? addr : (U ? addr + imm8 : addr - imm8);
                     }
                 }
 
@@ -3697,6 +3707,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         val = mem_read32_unaligned(cpu, addr);
                         break;
                 }
+                if (writeback) cpu->reg[rn] = wb_val;
                 if (rt == ARM_PC) {
                     if (size != 2) {
                         /* A byte/halfword "load" with Rt=PC is not a load — it's
