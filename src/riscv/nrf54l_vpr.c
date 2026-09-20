@@ -19,6 +19,9 @@
 static void flpr_costep(void *coproc, int64_t delta_cycles) {
     riscv_cpu_t *rv = (riscv_cpu_t *)coproc;
     if (!rv || delta_cycles <= 0) return;
+    /* A refused FLPR access latches the security unit's event but is not an
+     * M33 BusFault: the core only takes refusals raised by its own
+     * instruction (bus_fault_pending is cleared at each instruction start). */
     riscv_step_until(rv, rv->cycles + delta_cycles);
 }
 

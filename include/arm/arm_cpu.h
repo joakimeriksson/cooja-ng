@@ -234,6 +234,36 @@ typedef struct arm_cpu {
      * to Non-secure empties the window. */
     uint32_t  fetch_ok_base;
     uint32_t  fetch_ok_len;
+    /* BusFault state (SCB CFSR/HFSR/BFAR). Raised when the bus-side
+     * permission check refuses a transaction: on the nRF54L15 a Non-secure
+     * access to a Secure peripheral terminates with a precise BusFault
+     * (CFSR.PRECISERR|BFARVALID, BFAR = the address as issued), measured on
+     * silicon — see devices/nrf54l15-xiao/HARDWARE-COMPARISON.md. Precise:
+     * the faulting instruction is stacked and its register writes are
+     * undone (the state below is restored from insn_snap), so a handler that
+     * returns without patching the frame re-executes it. Taken into the
+     * Secure world unless AIRCR.BFHFNMINS routes it Non-secure.
+     *
+     * bus_fault_pending is armed by io_lookup and cleared at the start of
+     * every interpreted instruction, so only a refusal issued by the
+     * instruction itself is taken: a refused access by another bus master
+     * (the FLPR co-stepped between slices, the GDB stub, a DMA engine in an
+     * event callback) still latches the SoC's own error events but is not
+     * the core's BusFault. */
+    uint32_t  cfsr;
+    uint32_t  hfsr;
+    uint32_t  bfar;
+    uint32_t  mmfar_ns;              /* MMFAR is banked; the Secure bank is bfar */
+    uint32_t  bus_fault_addr;        /* address of the refused transaction */
+    bool      bus_fault_pending;
+    /* Pre-instruction register state, captured while a bus-side permission
+     * check is installed (io_access_check), so a precise BusFault can undo
+     * the instruction. */
+    struct {
+        uint32_t reg[16];
+        uint32_t xpsr;
+        uint8_t  it_state;
+    } insn_snap;
     /* SoC attribution unit (the Nordic security unit acts as the IDAU).
      * Consulted by arm_security_attr() alongside the SAU; NULL leaves
      * attribution entirely to the SAU. */

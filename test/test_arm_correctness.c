@@ -2309,6 +2309,225 @@ static void test_trustzone_secure_exception(void) {
               cpu.reg[ARM_PC]);
 }
 
+/* Bus-side permission refusal: the transaction is terminated with a precise
+ * BusFault taken into the Secure world (BFHFNMINS clear). Precise means the
+ * frame names the faulting instruction and the instruction is undone: a
+ * refused load leaves its destination register alone, and a handler that
+ * returns without patching the stacked PC re-executes it. Escalates to
+ * HardFault (HFSR.FORCED) when the BusFault handler is disabled or its
+ * priority cannot preempt the current execution priority. Matches a Seeed
+ * XIAO nRF54L15: CFSR 0x8200, BFAR = the Non-secure alias, load not done. */
+static arm_nvic_t *bf_hook_nvic;      /* set by bf_setup; used by refuse_and_pend */
+static int         bf_hook_irq = -1;  /* IRQ the refusing "security unit" raises */
+static bool refuse_0x40001000(void *user, uint32_t addr, bool is_write) {
+    (void)user; (void)is_write;
+    if ((addr & ~0xFFFu) != 0x40001000u) return true;
+    /* Like the nRF54L15 security unit: the refused transaction also raises
+     * the unit's interrupt, marked pending but not dispatched. */
+    if (bf_hook_irq >= 0 && bf_hook_nvic)
+        arm_nvic_set_pending_deferred(bf_hook_nvic, bf_hook_irq);
+    return false;
+}
+#define BF_HANDLER   (CODE_BASE + 0x40)   /* BusFault: patches the frame, PC += 2 */
+#define HF_HANDLER   (CODE_BASE + 0x60)   /* HardFault: BX LR */
+#define IRQ_HANDLER  (CODE_BASE + 0x80)   /* IRQ 7: BX LR */
+#define BF_IRQ       7
+#define BF_NS_SP     0x20007F00u
+#define BF_NS_FRAME  (BF_NS_SP - 32)      /* frame the fault pushes on the NS stack */
+static void bf_setup(arm_cpu_t *cpu, arm_nvic_t *nvic) {
+    setup_arm(cpu);
+    arm_nvic_init(nvic, cpu);
+    bf_hook_nvic = nvic;
+    bf_hook_irq = -1;
+    cpu->tz_enabled = true;
+    cpu->secure = false;
+    cpu->use_psp = false;
+    cpu->sau_sregions = 8;
+    cpu->sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    cpu->sau_rbar[0] = 0x20000000;
+    cpu->sau_rlar[0] = (0x20007FFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+    cpu->sau_rbar[1] = ARM_FLASH_BASE & ~0x1Fu;
+    cpu->sau_rlar[1] = ((ARM_FLASH_BASE + 0xFFFFu) & ~0x1Fu) | ARM_SAU_RLAR_ENABLE;
+    cpu->sau_rbar[2] = 0x40000000;                     /* peripheral aliases: NS */
+    cpu->sau_rlar[2] = (0x4FFFFFFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+    cpu->io_ns_alias = true;
+    cpu->io_access_check = refuse_0x40001000;
+    nvic->shcsr |= ARM_SHCSR_BUSFAULTENA;
+
+    /* Secure vector table: BusFault (5), HardFault (3), IRQ 7 (23). */
+    cpu->vtor_s = ARM_FLASH_BASE;
+    write_flash32(cpu, ARM_FLASH_BASE + EXC_BUSFAULT * 4, BF_HANDLER | 1);
+    write_flash32(cpu, ARM_FLASH_BASE + EXC_HARDFAULT * 4, HF_HANDLER | 1);
+    write_flash32(cpu, ARM_FLASH_BASE + (16 + BF_IRQ) * 4, IRQ_HANDLER | 1);
+    /* BusFault handler skips the faulting Thumb-16 instruction. The fault
+     * came from the Non-secure thread, so its frame is on the Non-secure
+     * main stack while the Secure handler runs on MSP_S: reach it through
+     * MSP_NS. MRS r2,MSP_NS; LDR r3,[r2,#24]; ADDS r3,#2; STR r3,[r2,#24];
+     * BX LR */
+    write_thumb32(cpu, BF_HANDLER + 0, 0xF3EF, 0x8288);
+    write_thumb16(cpu, BF_HANDLER + 4, 0x6993);
+    write_thumb16(cpu, BF_HANDLER + 6, 0x3302);
+    write_thumb16(cpu, BF_HANDLER + 8, 0x6193);
+    write_thumb16(cpu, BF_HANDLER + 10, 0x4770);
+    write_thumb16(cpu, HF_HANDLER, 0x4770);          /* BX LR */
+    write_thumb16(cpu, IRQ_HANDLER, 0x4770);         /* BX LR */
+
+    write_thumb16(cpu, CODE_BASE, 0x6808);           /* LDR r0, [r1] */
+    write_thumb16(cpu, CODE_BASE + 2, 0x2001);       /* MOVS r0, #1 */
+    cpu->reg[ARM_PC] = CODE_BASE;
+    cpu->reg[0] = 0xDEADBEEF;                        /* must survive the refused load */
+    cpu->reg[1] = 0x40001504;                        /* refused NS alias */
+    cpu->reg[ARM_SP] = BF_NS_SP;
+    cpu->msp_s = 0x20007000;
+}
+static void test_trustzone_bus_fault(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone bus-permission BusFault tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+
+    /* Precise fault: frame names the LDR, r0 untouched, handler patches the
+     * frame and execution resumes Non-secure after the LDR. */
+    bf_setup(&cpu, &nvic);
+    arm_step(&cpu, 1);
+    assert_true("BusFault taken: now Secure", cpu.secure);
+    assert_eq("BusFault: PC = Secure BusFault handler", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("BusFault: IPSR = 5", EXC_BUSFAULT, (int)(cpu.xpsr & 0x1FF));
+    assert_eq("BusFault: CFSR = PRECISERR|BFARVALID", 0x8200, (int)arm_read32(&cpu, 0xE000ED28));
+    assert_eq("BusFault: BFAR = address as issued", 0x40001504, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("BusFault: no SecureFault recorded", 0, (int)cpu.sfsr);
+    assert_eq("BusFault: stacked PC = the faulting LDR", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+    assert_eq("BusFault: refused load did not complete", 0xDEADBEEF, cpu.reg[0]);
+    arm_write32(&cpu, 0xE000ED28, 0x8200);       /* W1C */
+    assert_eq("BusFault: CFSR write-1-to-clear", 0, (int)arm_read32(&cpu, 0xE000ED28));
+    arm_step(&cpu, 5);                           /* patch frame, BX LR */
+    assert_true("BusFault return: back to Non-secure", !cpu.secure);
+    assert_eq("BusFault return: PC = instr after the skipped LDR", CODE_BASE + 2, cpu.reg[ARM_PC]);
+    assert_eq("BusFault return: r0 restored from the frame", 0xDEADBEEF, cpu.reg[0]);
+    arm_step(&cpu, 1);
+    assert_eq("BusFault return: execution continues", 1, cpu.reg[0]);
+
+    /* The Secure alias of the same peripheral is not a Non-secure
+     * transaction: the check passes and nothing faults. */
+    cpu.secure = true;
+    cpu.cfsr = 0;
+    cpu.reg[1] = 0x50001504;
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.xpsr &= ~0x1FFu;
+    arm_step(&cpu, 1);
+    assert_eq("Secure alias: no BusFault", 0, (int)cpu.cfsr);
+
+    /* Unpatched return re-executes the LDR, which faults again. */
+    bf_setup(&cpu, &nvic);
+    write_thumb16(&cpu, BF_HANDLER, 0x4770);     /* BX LR only */
+    arm_step(&cpu, 1);
+    assert_eq("re-exec: first fault", BF_HANDLER, cpu.reg[ARM_PC]);
+    arm_step(&cpu, 1);
+    assert_true("re-exec: returned Non-secure to the LDR",
+                !cpu.secure && cpu.reg[ARM_PC] == CODE_BASE);
+    cpu.cfsr = 0;
+    arm_step(&cpu, 1);
+    assert_eq("re-exec: LDR faults again", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("re-exec: CFSR set again", 0x8200, cpu.cfsr);
+
+    /* A refusal outside the instruction stream (another bus master: the
+     * GDB stub, the FLPR, DMA) is not the core's BusFault. */
+    bf_setup(&cpu, &nvic);
+    cpu.reg[ARM_PC] = CODE_BASE + 2;             /* MOVS r0, #1 */
+    assert_eq("external master: refused read returns 0", 0, arm_read32(&cpu, 0x40001504));
+    arm_step(&cpu, 1);
+    assert_true("external master: no BusFault on the next instruction",
+                !cpu.secure && (cpu.xpsr & 0x1FF) == 0);
+    assert_eq("external master: CFSR clear", 0, cpu.cfsr);
+    assert_eq("external master: instruction ran", 1, cpu.reg[0]);
+
+    /* Escalation to HardFault (HFSR.FORCED): handler disabled; PRIMASK;
+     * an active handler at the BusFault's own priority. */
+    for (int why = 0; why < 3; why++) {
+        bf_setup(&cpu, &nvic);
+        switch (why) {
+            case 0: nvic.shcsr &= ~ARM_SHCSR_BUSFAULTENA; break;
+            case 1: cpu.primask = 1; break;
+            case 2: /* running in the IRQ 7 handler at priority 0, on MSP */
+                cpu.xpsr |= 16 + BF_IRQ;
+                nvic.active_exception = 16 + BF_IRQ;
+                nvic.ipr[BF_IRQ] = 0;
+                nvic.shpr[EXC_BUSFAULT - 4] = 0;
+                break;
+        }
+        arm_step(&cpu, 1);
+        assert_eq(why == 0 ? "BusFault disabled: HardFault handler" :
+                  why == 1 ? "BusFault under PRIMASK: HardFault handler" :
+                             "BusFault cannot preempt: HardFault handler",
+                  HF_HANDLER, cpu.reg[ARM_PC]);
+        assert_eq("escalated: HFSR.FORCED", (int)ARM_HFSR_FORCED,
+                  (int)(arm_read32(&cpu, 0xE000ED2C) & ARM_HFSR_FORCED));
+        assert_true("escalated: taken Secure", cpu.secure);
+        assert_eq("escalated: refused load did not complete", 0xDEADBEEF, cpu.reg[0]);
+    }
+    /* Not escalated when the BusFault priority is higher than the active one. */
+    bf_setup(&cpu, &nvic);
+    cpu.xpsr |= 16 + BF_IRQ;
+    nvic.active_exception = 16 + BF_IRQ;
+    nvic.ipr[BF_IRQ] = 0x40;
+    nvic.shpr[EXC_BUSFAULT - 4] = 0;
+    arm_step(&cpu, 1);
+    assert_eq("BusFault preempts a lower-priority handler", BF_HANDLER, cpu.reg[ARM_PC]);
+
+    /* The interrupt the refused transaction raises (the security unit's) is
+     * pended, not dispatched: the synchronous BusFault is entered first. At
+     * equal priority the IRQ waits for the handler (measured on the board);
+     * at higher priority it preempts the handler. */
+    bf_setup(&cpu, &nvic);
+    bf_hook_irq = BF_IRQ;
+    nvic.iser[0] |= 1u << BF_IRQ;
+    nvic.ipr[BF_IRQ] = 0;
+    nvic.shpr[EXC_BUSFAULT - 4] = 0;
+    arm_step(&cpu, 1);
+    assert_eq("IRQ from the refusal: BusFault handler first", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_true("IRQ from the refusal: IRQ still pending", (nvic.ispr[0] >> BF_IRQ) & 1);
+    arm_step(&cpu, 5);                           /* handler returns */
+    assert_eq("IRQ from the refusal: IRQ taken after the handler", IRQ_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("IRQ from the refusal: IPSR = 16+7", 16 + BF_IRQ, (int)(cpu.xpsr & 0x1FF));
+    arm_step(&cpu, 1);
+    assert_true("IRQ from the refusal: back to NS after the LDR",
+                !cpu.secure && cpu.reg[ARM_PC] == CODE_BASE + 2);
+
+    bf_setup(&cpu, &nvic);
+    bf_hook_irq = BF_IRQ;
+    nvic.iser[0] |= 1u << BF_IRQ;
+    nvic.ipr[BF_IRQ] = 0;
+    nvic.shpr[EXC_BUSFAULT - 4] = 0x40;
+    arm_step(&cpu, 1);
+    assert_eq("higher-priority IRQ: preempts the BusFault handler", IRQ_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("higher-priority IRQ: CFSR latched all the same", 0x8200, cpu.cfsr);
+    arm_step(&cpu, 1);
+    assert_eq("higher-priority IRQ: returns into the BusFault handler", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("higher-priority IRQ: IPSR = 5", EXC_BUSFAULT, (int)(cpu.xpsr & 0x1FF));
+    bf_hook_irq = -1;
+
+    /* Non-secure view of the fault registers: BFSR/HFSR/BFAR are Secure-only
+     * while AIRCR.BFHFNMINS is clear (RAZ/WI); MMFAR is banked. */
+    bf_setup(&cpu, &nvic);
+    cpu.cfsr = 0x8200; cpu.hfsr = ARM_HFSR_FORCED; cpu.bfar = 0x40001504;
+    assert_eq("NS view: CFSR RAZ", 0, arm_read32(&cpu, 0xE000ED28));
+    assert_eq("NS view: HFSR RAZ", 0, arm_read32(&cpu, 0xE000ED2C));
+    assert_eq("NS view: BFAR RAZ", 0, arm_read32(&cpu, 0xE000ED38));
+    arm_write32(&cpu, 0xE000ED28, 0xFFFFFFFF);
+    arm_write32(&cpu, 0xE000ED38, 0);
+    assert_eq("NS view: CFSR WI", 0x8200, cpu.cfsr);
+    assert_eq("NS view: BFAR WI", 0x40001504, cpu.bfar);
+    arm_write32(&cpu, 0xE000ED34, 0x12345678);
+    assert_eq("NS view: MMFAR_NS written", 0x12345678, arm_read32(&cpu, 0xE000ED34));
+    assert_eq("NS view: Secure BFAR untouched by MMFAR_NS", 0x40001504, cpu.bfar);
+    nvic.aircr |= ARM_AIRCR_BFHFNMINS;
+    assert_eq("NS view, BFHFNMINS: CFSR visible", 0x8200, arm_read32(&cpu, 0xE000ED28));
+    assert_eq("NS view, BFHFNMINS: BFAR visible", 0x40001504, arm_read32(&cpu, 0xE000ED38));
+    nvic.aircr &= ~ARM_AIRCR_BFHFNMINS;
+    cpu.secure = true;
+    assert_eq("S view: MMFAR is BFAR", 0x40001504, arm_read32(&cpu, 0xE000ED34));
+    assert_eq("S view: CFSR", 0x8200, arm_read32(&cpu, 0xE000ED28));
+}
+
 /* Step 5: NVIC target-security (NVIC_ITNS) decides an IRQ's security state. */
 static void test_trustzone_nvic_itns(void) {
     if (verbose) printf("--- ARMv8-M TrustZone NVIC target-security tests ---\n");
@@ -2637,6 +2856,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_instrumentation();
     test_trustzone_blxns();
     test_trustzone_ns_fetch();
+    test_trustzone_bus_fault();
     test_io_lookup();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);

@@ -2714,12 +2714,15 @@ static void nrf54l_icache_write(void *user_data, uint32_t addr, uint32_t value) 
  *   this peripheral?". Non-secure code using the Non-secure alias of a
  *   peripheral the secure world has claimed is refused here, and reported
  *   through EVENTS_PERIPHACCERR and the owning instance's interrupt rather
- *   than as a CPU fault — which is exactly how the secure world's handler
- *   records the violation and reboots. Known deviation: the refused
- *   transaction reads as 0 (a write is dropped) and raises no BusFault. The
- *   nRF53/nRF91 security units terminate the transaction with an error; the
- *   nRF54L15's behaviour is unconfirmed. It is masked in practice because
- *   the Secure violation interrupt preempts the very next instruction.
+ *   and, because the transaction is terminated with an error, as a precise
+ *   BusFault in the core (arm_cpu.c io_lookup). Measured on a XIAO nRF54L15:
+ *   CFSR 0x8200 with BFAR = the Non-secure alias, the SPU event latched
+ *   with the address's low 16 bits, MPC00 MEMACCERR latched too, and the
+ *   BusFault handler running before the SPU interrupt handler (same
+ *   priority, lower exception number) — so what firmware prints on a
+ *   violation is its BusFault handler's report, not the SPU handler's.
+ *   The fault is precise: the frame names the faulting instruction and a
+ *   refused load leaves its destination register untouched.
  *
  * Register map (NRF_SPU_Type): EVENTS_PERIPHACCERR 0x100, INTEN 0x300,
  * INTENSET 0x304, INTENCLR 0x308, INTPEND 0x30C, PERIPHACCERR.ADDRESS 0x404,
@@ -2748,6 +2751,59 @@ static const uint32_t nrf54l_spu_bases[NRF54L_SPU_COUNT] = {
 };
 static const int nrf54l_spu_irqs[NRF54L_SPU_COUNT] = { 64, 128, 192, 256 };
 
+/* PERIPH[n].PERM reset values read from a Seeed XIAO nRF54L15 (probe firmware,
+ * snapshot at process start before the secure world configured anything;
+ * identical after soft and debugger resets). SECUREMAPPING in bits 1:0 is
+ * read-only: 1 = always Secure, 2 = user-selectable, 3 = split; 0 with the
+ * whole word zero = no peripheral at that slot. Bit 16 is set on every present
+ * slot (undocumented in the MDK). Note SECATTR (bit 4) resets to 1 - Secure -
+ * on every present slot except SPU00 slots 12-15: slot 12 is VPR00
+ * (0x5004C000); slots 13-15 (0x5004D000-0x5004F000) have no peripheral in
+ * the MDK memory map but read present with the same word on the board. The
+ * MDK's generic reset value 0x8000002A describes none of this. */
+static const uint32_t nrf54l_spu_perm_reset[NRF54L_SPU_COUNT][NRF54L_SPU_NUM_PERIPH] = {
+    { /* SPU00 */
+        0x80010031u, 0x80010031u, 0x80010033u, 0x80010032u, 0x80010032u, 0x80010035u, 0x8001003au, 0x8001003au,
+        0x80000035u, 0x80000035u, 0x8001003au, 0x80010035u, 0x8001000au, 0x8001000au, 0x8001000au, 0x8001000au,
+        0x80010033u, 0x80010033u, 0x80010036u, 0x80010032u, 0x00000000u, 0x80010032u, 0x80010032u, 0x80010031u,
+        0x80010031u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    },
+    { /* SPU10 */
+        0x80010031u, 0x00000000u, 0x80010033u, 0x80010032u, 0x80010032u, 0x80010032u, 0x80010032u, 0x80010032u,
+        0x8001003au, 0x8001003au, 0x8001003au, 0x8001003au, 0x80010032u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x80010031u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    },
+    { /* SPU20 */
+        0x80010031u, 0x00000000u, 0x80010033u, 0x80010032u, 0x80010032u, 0x80010032u, 0x8001003au, 0x8001003au,
+        0x8001003au, 0x80010032u, 0x80010032u, 0x80010032u, 0x80010032u, 0x80010032u, 0x80010032u, 0x80010032u,
+        0x8001003au, 0x8001003au, 0x8001003au, 0x8001003au, 0x8001003au, 0x8001003au, 0x8001003au, 0x80010032u,
+        0x80010033u, 0x80010033u, 0x80010033u, 0x00000000u, 0x80010031u, 0x8001003au, 0x00000000u, 0x00000000u,
+        0x80010032u, 0x80010032u, 0x80010033u, 0x00000000u, 0x00000000u, 0x00000000u, 0x80010032u, 0x80010031u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x80010031u,
+    },
+    { /* SPU30 */
+        0x80010031u, 0x00000000u, 0x80010033u, 0x80010032u, 0x8001003au, 0x80010032u, 0x80010032u, 0x00000000u,
+        0x80010031u, 0x80010032u, 0x80010033u, 0x80010033u, 0x80010033u, 0x00000000u, 0x80010032u, 0x80010032u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x80010031u, 0x80010031u,
+        0x80010032u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x80010031u,
+    },
+};
+
 static int trc54_spu = -1;   /* NRF54L_SPU_TRACE: permission violations */
 
 /* Peripheral slot within its instance: both are 4 KB-indexed, so the slot is
@@ -2768,10 +2824,15 @@ static nrf54l_spu_state_t *nrf54l_spu_for(nrf54l15_soc_t *soc, uint32_t secure_a
 }
 
 /* The interrupt is level-sensitive: a latched event pends the line as soon
- * as INTEN covers it, whether the event or the enable came first. */
-static void nrf54l_spu_update_irq(nrf54l_spu_state_t *spu) {
-    if (spu->events_periphaccerr & spu->inten & 1u)
-        arm_nvic_set_pending(&spu->plat->nvic, spu->irq_num);
+ * as INTEN covers it, whether the event or the enable came first. From the
+ * bus check the line is only marked pending: the transaction that raised it
+ * is the one the core is about to fault on, and the synchronous BusFault is
+ * entered first; the interrupt then competes with the fault handler on
+ * priority (measured: equal priority, the BusFault handler runs first). */
+static void nrf54l_spu_update_irq(nrf54l_spu_state_t *spu, bool dispatch) {
+    if (!(spu->events_periphaccerr & spu->inten & 1u)) return;
+    if (dispatch) arm_nvic_set_pending(&spu->plat->nvic, spu->irq_num);
+    else          arm_nvic_set_pending_deferred(&spu->plat->nvic, spu->irq_num);
 }
 
 /* Bus-side permission check — see the block comment above. */
@@ -2786,19 +2847,34 @@ static bool nrf54l_spu_bus_check(void *user, uint32_t addr, bool is_write) {
     int slot = nrf54l_spu_slot(spu->base, secure_addr);
     if (slot < 0) return true;
     if (!(spu->perm[slot] & NRF54L_SPU_PERM_SECATTR)) return true;  /* Non-secure */
+    /* Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC: SECUREMAPPING = 3)
+     * attribute per pin / channel through the FEATURE registers, not per
+     * slot: the minimal Non-secure world reads GPIO P2 through its alias on
+     * silicon without a fault while the slot's SECATTR is set. Those
+     * per-feature attributes are stored, not enforced, so a split slot is
+     * open to both worlds here. (On silicon a Non-secure write to a
+     * GPIOTE30 channel CONFIG that was never handed over does fault.) */
+    if ((spu->perm[slot] & NRF54L_SPU_PERM_SECUREMAPPING_MASK) == NRF54L_SPU_PERM_SECUREMAPPING_SPLIT)
+        return true;
 
     /* PERIPHACCERR.ADDRESS holds the low 16 bits of the transaction that
      * caused the FIRST error (MDK: ADDRESS @Bits 0..15); later violations
-     * leave it alone until the event is cleared. */
+     * leave it alone until the event is cleared, which zeroes it. */
     if (!spu->events_periphaccerr)
         spu->periphaccerr_addr = addr & 0xFFFFu;
     spu->events_periphaccerr = 1;
+    /* The memory protection controller sees the same terminated transaction
+     * and latches its own event (measured); its address registers are not
+     * modelled. */
+    soc->mpc00.events_memaccerr = 1;
+    if (soc->mpc00.inten & 1u)
+        arm_nvic_set_pending_deferred(&soc->mpc00.plat->nvic, soc->mpc00.irq_num);
     if (nrf54l_trace_flag(&trc54_spu, "NRF54L_SPU_TRACE"))
         fprintf(stderr, "[spu cpu=0x%04x] PERIPHACCERR: non-secure %s of 0x%08x "
                         "(instance 0x%08x slot %d)\n",
                 (unsigned)((uintptr_t)&spu->plat->cpu & 0xFFFF),
                 is_write ? "write" : "read", addr, spu->base, slot);
-    nrf54l_spu_update_irq(spu);
+    nrf54l_spu_update_irq(spu, false);
     return false;
 }
 
@@ -2859,11 +2935,16 @@ static void nrf54l_spu_write(void *user, uint32_t addr, uint32_t value) {
         int slot = (int)(off - S_PERIPH_BASE) / 4;
         uint32_t cur = spu->perm[slot];
         if (cur & NRF54L_SPU_PERM_LOCK) return;  /* locked until reset */
-        /* PRESENT, SECUREMAPPING and the DMA capability bits are read-only;
-         * a fixed-Secure slot also ignores SECATTR and DMASEC. */
-        uint32_t writable = NRF54L_SPU_PERM_WRITABLE;
-        if (spu->fixed_secure & (1ull << slot))
-            writable = NRF54L_SPU_PERM_LOCK;
+        if (!cur) return;                        /* no peripheral at this slot: RAZ/WI */
+        /* Measured: SECATTR and LOCK are writable; DMASEC only on a slot
+         * whose DMA field is non-zero; a fixed-Secure slot (SECUREMAPPING =
+         * 1) takes only LOCK. PRESENT, SECUREMAPPING, DMA and bit 16 are
+         * read-only. */
+        uint32_t writable = NRF54L_SPU_PERM_LOCK;
+        if (!(spu->fixed_secure & (1ull << slot))) {
+            writable |= NRF54L_SPU_PERM_SECATTR;
+            if (cur & NRF54L_SPU_PERM_DMA_MASK) writable |= NRF54L_SPU_PERM_DMASEC;
+        }
         value = (cur & ~writable) | (value & writable);
         spu->perm[slot] = value;
         /* The FLPR launch gate is this same register on SPU00 slot 12; keep
@@ -2883,9 +2964,12 @@ static void nrf54l_spu_write(void *user, uint32_t addr, uint32_t value) {
         return;
     }
     switch (off) {
-        case S_EVENTS_PERIPHACCERR:     spu->events_periphaccerr = value & 1; break;
-        case S_INTEN:                   spu->inten  = value;  nrf54l_spu_update_irq(spu); break;
-        case S_INTENSET:                spu->inten |= value;  nrf54l_spu_update_irq(spu); break;
+        case S_EVENTS_PERIPHACCERR:
+            spu->events_periphaccerr = value & 1;
+            if (!spu->events_periphaccerr) spu->periphaccerr_addr = 0;  /* measured */
+            break;
+        case S_INTEN:                   spu->inten  = value;  nrf54l_spu_update_irq(spu, true); break;
+        case S_INTENSET:                spu->inten |= value;  nrf54l_spu_update_irq(spu, true); break;
         case S_INTENCLR:                spu->inten &= ~value; break;
         case S_FEATURE_GRTC_PWMCONFIG:  spu->feat_grtc_pwmconfig  = value; break;
         case S_FEATURE_GRTC_CLK:        spu->feat_grtc_clk        = value; break;
@@ -2967,17 +3051,16 @@ static void nrf54l_spu_mpc_reset(nrf54l15_soc_t *soc, arm_platform_t *plat) {
         spu->plat    = plat;
         spu->base    = nrf54l_spu_bases[i];
         spu->irq_num = nrf54l_spu_irqs[i];
-        for (int n = 0; n < NRF54L_SPU_NUM_PERIPH; n++)
-            spu->perm[n] = NRF54L_SPU_PERM_RESET;
-        /* Slot 0 is the instance itself; on SPU00 slot 1 is the memory
-         * protection controller. Both are SECUREMAPPING = Secure on silicon,
-         * so the Non-secure world can never reach the permission registers
-         * that would let it re-attribute everything else. */
-        spu->fixed_secure = 1ull << 0;
-        if (i == 0) spu->fixed_secure |= 1ull << 1;
-        for (int n = 0; n < NRF54L_SPU_NUM_PERIPH; n++)
-            if (spu->fixed_secure & (1ull << n))
-                spu->perm[n] = NRF54L_SPU_PERM_RESET_SECURE;
+        /* Silicon reset values; the slots whose SECUREMAPPING reads Secure
+         * (the instance itself, MPC00, KMU, CRACEN, WDT30, TAMPC, ...) can
+         * never be opened to the Non-secure world. */
+        spu->fixed_secure = 0;
+        for (int n = 0; n < NRF54L_SPU_NUM_PERIPH; n++) {
+            spu->perm[n] = nrf54l_spu_perm_reset[i][n];
+            if (spu->perm[n] && (spu->perm[n] & NRF54L_SPU_PERM_SECUREMAPPING_MASK)
+                                 == NRF54L_SPU_PERM_SECUREMAPPING_SECURE)
+                spu->fixed_secure |= 1ull << n;
+        }
         for (int n = 0; n < NRF54L_SPU_NUM_GRTC_CC; n++)
             spu->feat_grtc_cc[n] = 0x00100010u;      /* reset: Secure */
         for (int n = 0; n < NRF54L_SPU_NUM_GRTC_INT; n++)
@@ -2985,10 +3068,8 @@ static void nrf54l_spu_mpc_reset(nrf54l15_soc_t *soc, arm_platform_t *plat) {
         spu->feat_grtc_syscounter = 0x00100010u;
         spu->feat_grtc_clk        = 0x00100010u;
     }
-    /* The VPR slot's reset value differs from the generic one; keep it exact
-     * so the FLPR host's "PERIPH[12] before/after" log is unchanged. */
-    soc->spu[0].perm[12] = 0x8001000au;
-    soc->vpr.spu_periph12 = 0x8001000au;
+    /* The FLPR launch gate mirrors SPU00 slot 12, VPR00 (0x8001000a at reset). */
+    soc->vpr.spu_periph12 = soc->spu[0].perm[12];
 
     memset(&soc->mpc00, 0, sizeof(soc->mpc00));
     soc->mpc00.plat    = plat;
