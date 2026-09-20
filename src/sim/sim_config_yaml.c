@@ -48,6 +48,7 @@ typedef struct {
     yaml_parser_t parser;
     const char   *path;
     int           failed;
+    int           depth;    /* open mappings + sequences, for the nesting cap */
 } yctx_t;
 
 static void yerr(yctx_t *c, const yaml_mark_t *m, const char *fmt, ...)
@@ -217,6 +218,20 @@ fail:
     return NULL;
 }
 
+/* build_node recurses once per nesting level while libyaml emits its events
+ * iteratively, so without a cap the document's depth becomes the stack's.
+ * cJSON's own limit, applied the same way (the root container is depth 0),
+ * so the two front ends reject the same shape. */
+static int enter_container(yctx_t *c, const yaml_event_t *ev) {
+    if (c->depth >= CJSON_NESTING_LIMIT) {
+        yerr(c, &ev->start_mark, "nested deeper than %d levels",
+             CJSON_NESTING_LIMIT);
+        return -1;
+    }
+    c->depth++;
+    return 0;
+}
+
 /* Consumes (and deletes) `ev`. */
 static cJSON *build_node(yctx_t *c, yaml_event_t *ev) {
     cJSON *out = NULL;
@@ -230,14 +245,20 @@ static cJSON *build_node(yctx_t *c, yaml_event_t *ev) {
     case YAML_SEQUENCE_START_EVENT:
         if (reject_anchor_tag(c, ev, ev->data.sequence_start.anchor,
                               ev->data.sequence_start.tag,
-                              ev->data.sequence_start.implicit) == 0)
+                              ev->data.sequence_start.implicit) == 0 &&
+            enter_container(c, ev) == 0) {
             out = build_sequence(c);
+            c->depth--;
+        }
         break;
     case YAML_MAPPING_START_EVENT:
         if (reject_anchor_tag(c, ev, ev->data.mapping_start.anchor,
                               ev->data.mapping_start.tag,
-                              ev->data.mapping_start.implicit) == 0)
+                              ev->data.mapping_start.implicit) == 0 &&
+            enter_container(c, ev) == 0) {
             out = build_mapping(c);
+            c->depth--;
+        }
         break;
     case YAML_ALIAS_EVENT:
         yerr(c, &ev->start_mark, "aliases (*%s) are not supported",
