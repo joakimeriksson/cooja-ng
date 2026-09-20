@@ -37,6 +37,19 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
         return -1;
     }
 
+    /* e_phentsize drives the header offsets below: anything but the ELF32
+     * size makes them read the wrong bytes (0 re-reads one header e_phnum
+     * times). */
+    if (ehdr.e_phnum > 0 && ehdr.e_phentsize != sizeof(Elf32_Phdr)) {
+        fprintf(stderr, "Unexpected program header size %u in %s\n",
+                ehdr.e_phentsize, path);
+        fclose(f);
+        return -1;
+    }
+
+    /* Bytes actually placed in memory: an image that places none would
+     * boot a zero-filled address space and look like it ran. */
+    uint64_t loaded = 0;
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf32_Phdr phdr;
         fseek(f, ehdr.e_phoff + i * ehdr.e_phentsize, SEEK_SET);
@@ -67,6 +80,7 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
                 fclose(f);
                 return -1;
             }
+            loaded += read_size;
         }
 
         /* Zero BSS (memsz > filesz) */
@@ -80,6 +94,10 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
     }
 
     fclose(f);
+    if (loaded == 0) {
+        fprintf(stderr, "No loadable segment maps to memory: %s\n", path);
+        return -1;
+    }
     return 0;
 }
 

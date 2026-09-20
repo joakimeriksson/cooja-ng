@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Build the malformed MSP430 ELF inputs for tools/check-elf-malformed.sh.
 
-Each image is hostile in one way (docs/design/adversarial-input-review.md,
-X1-X3 and X5).  The X1-X3 images carry a real, minimal program -- a
-`jmp $` at 0x4000 and a reset vector pointing at it -- so they keep reaching
-the symbol-patching code once the loader rejects images that load nothing.
+Each image is malformed in one way: a symbol value far outside memory,
+straddling its end or wrapping a naive bound; a string table with no
+terminator; a diagnostic table at the top of memory; a header that places
+nothing in memory.  The symbol cases carry a real, minimal program -- a
+`jmp $` at 0x4000 and a reset vector pointing at it -- so they get past the
+loader and reach the symbol-patching code.
 
 Usage: tools/mk-malformed-elf.py OUTDIR
-Prints one line per image: <file> <expectation> <review id>.
+Prints one line per image: <file> <expectation>.
 """
 import os
 import struct
@@ -24,8 +26,9 @@ def ehdr(phoff=0, phnum=0, phentsize=PHDR_SIZE, shoff=0, shnum=0):
                         SHDR_SIZE, shnum, 0))
 
 
-def phdr(paddr, off, size):
-    return struct.pack('<IIIIIIII', 1, off, paddr, paddr, size, size, 7, 2)
+def phdr(paddr, off, size, memsz=None):
+    memsz = size if memsz is None else memsz
+    return struct.pack('<IIIIIIII', 1, off, paddr, paddr, size, memsz, 7, 2)
 
 
 def shdr(typ=0, off=0, size=0, link=0, entsize=0):
@@ -82,6 +85,7 @@ TOP_OF_MEMORY = [(0x4000, b'\xff\x3f'),
 # (file, expectation, bytes).  Expectations:
 #   patch-skipped  runs to completion and says a symbol was not patched
 #   no-crash       runs to completion (exit < 128, no sanitizer report)
+#   rejected       fails to boot: non-zero exit and "Failed to initialize node"
 CASES = [
     ('ds2411-id-wild.sky', 'patch-skipped',
      image([('ds2411_id', WILD)])),
@@ -118,12 +122,18 @@ CASES = [
             ('tsch_is_started', WILD),
             ('tsch_current_asn', WRAP),
             ('count', TOP16 + 2)])),
-    # X5: a valid header and nothing to load.  Should be rejected; until the
-    # loader does, the check only holds these to not crashing.
-    ('empty.sky', 'no-crash', ehdr()),
-    ('phentsize0.sky', 'no-crash',
+    # A valid header and nothing placed in memory.
+    ('no-program-headers.sky', 'rejected', ehdr()),
+    # e_phentsize 0 re-reads one (valid) header 0xffff times.
+    ('phentsize-zero.sky', 'rejected',
      (ehdr(phoff=EHDR_SIZE, phnum=0xffff, phentsize=0) +
       phdr(0x4000, 0x100, 4)).ljust(0x200, b'\xcc')),
+    # The only segment is at an ARM address: nothing routes to MSP430 memory.
+    ('unmapped-segment.sky', 'rejected',
+     image([], segments=[(0x20000000, b'\xff\x3f')])),
+    # The only segment is BSS: memory is zeroed, no code is placed.
+    ('bss-only.sky', 'rejected',
+     ehdr(phoff=EHDR_SIZE, phnum=1) + phdr(0x4000, 0, 0, memsz=0x100)),
 ]
 
 

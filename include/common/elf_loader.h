@@ -85,7 +85,8 @@ int elf_check_magic(const Elf32_Ehdr *ehdr);
 
 /* Load PT_LOAD segments from an ELF file using the given routing callback.
  * The callback maps physical/virtual addresses to destination pointers.
- * Returns 0 on success, -1 on error. */
+ * Returns 0 on success, -1 on error -- including an image that places no
+ * bytes in memory (no PT_LOAD, or none that routes). */
 int elf_load_segments(const char *path, elf_route_fn route, void *ctx);
 
 /* Look up a symbol by name in an ELF file. Returns address, or 0 on failure. */
