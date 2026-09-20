@@ -179,6 +179,13 @@ jobs:
         # build to be seen.
         run: tools/check-elf-malformed.sh
 
+      - name: External-node peer that never advances, or sends an infinite time
+        # A peer that answers every step with a wake at (or before) where
+        # it stands would exchange steps forever, and a 1e400 time cannot be
+        # converted to an integer.  Both must fail the node, and the run must
+        # still finish.
+        run: tools/check-ext-peer.sh
+
       - name: GDB stub (a stalled client cannot freeze the run)
         # The stub reads on the simulation's thread: a client that stops
         # mid-packet or never acks must be dropped, and a malformed Z0
