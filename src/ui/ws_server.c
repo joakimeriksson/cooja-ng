@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -506,17 +507,25 @@ void ws_server_poll(ws_server_t *srv) {
     }
 }
 
-/* Send all bytes, retrying on partial writes.  Returns 0 on success, -1 on error. */
+/* How long a client may make no progress draining a broadcast before it is
+ * dropped.  Broadcasts run on the simulation's own thread, so this bounds
+ * how long one stalled viewer can hold up the run. */
+#define SEND_STALL_MS 200
+
+/* Send all bytes, retrying on partial writes.  Returns 0 on success, -1 on
+ * error or when the client stops reading (the caller drops it). */
 static int send_all(int fd, const void *buf, int len) {
     const uint8_t *p = (const uint8_t *)buf;
     int remaining = len;
     while (remaining > 0) {
         ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
         if (n < 0) {
+            if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Brief spin for non-blocking socket — data should drain quickly */
-                usleep(100);
-                continue;
+                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+                int r = poll(&pfd, 1, SEND_STALL_MS);
+                if (r > 0 || (r < 0 && errno == EINTR)) continue;
+                return -1;              /* no room for SEND_STALL_MS: give up */
             }
             return -1;
         }
