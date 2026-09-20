@@ -1434,7 +1434,7 @@ static inline void arm_sp_audit_push(arm_cpu_t *cpu, uint32_t return_pc,
             uint32_t want_callee = (uint32_t)strtoul(e, NULL, 0) & ~1u;
             uint32_t addr = (uint32_t)strtoul(colon + 1, NULL, 0);
             if ((callee_pc & ~1u) == want_callee &&
-                addr >= cpu->sram_base && addr + 1 <= cpu->sram_end) {
+                addr >= cpu->sram_base && addr < cpu->sram_end) {
                 static int n = 0;
                 if (n++ < 30) {
                     uint8_t v = cpu->sram[addr - cpu->sram_base];
