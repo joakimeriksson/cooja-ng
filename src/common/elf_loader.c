@@ -118,12 +118,15 @@ uint32_t elf_find_symbol(const char *path, const char *symbol_name) {
     if (strtab_hdr.sh_size == 0 || strtab_hdr.sh_size > ELF_STRTAB_MAX) {
         fclose(f); return 0;
     }
-    char *strtab = (char *)malloc(strtab_hdr.sh_size);
+    /* One extra byte for a terminator: a real strtab ends in NUL, a crafted
+     * one need not, and strcmp below would then run off the allocation. */
+    char *strtab = (char *)malloc(strtab_hdr.sh_size + 1);
     if (!strtab) { fclose(f); return 0; }
     fseek(f, strtab_hdr.sh_offset, SEEK_SET);
     if (fread(strtab, 1, strtab_hdr.sh_size, f) != strtab_hdr.sh_size) {
         free(strtab); fclose(f); return 0;
     }
+    strtab[strtab_hdr.sh_size] = '\0';
 
     /* Iterate symbols */
     int num_syms = symtab_hdr.sh_size / sizeof(Elf32_Sym);
