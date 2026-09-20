@@ -33,14 +33,35 @@ static const char *find_close_paren(const char *start, const char **comma_out) {
         if (*c == '(') depth++;
         else if (*c == ')') { depth--; if (depth == 0) return c; }
         else if (*c == ',' && depth == 1 && comma_out && !*comma_out) *comma_out = c;
-        /* Skip string literals */
+        /* Skip string literals.  Never step past the terminating NUL: a
+         * script can end inside a string, or on a backslash. */
         else if (*c == '"' || *c == '\'') {
             char q = *c++;
-            while (*c && *c != q) { if (*c == '\\') c++; c++; }
+            while (*c && *c != q) {
+                if (*c == '\\' && c[1]) c++;
+                c++;
+            }
+            if (!*c) return NULL;
         }
         c++;
     }
     return NULL;
+}
+
+/* Make room for `more` bytes plus a terminator after `len`.  On failure
+ * the buffer is freed and false returned; the caller returns NULL. */
+static bool reserve(char **out, size_t *cap, size_t len, size_t more) {
+    if (len + more < *cap) return true;
+    size_t ncap = (len + more + 1) * 2;
+    char *grown = realloc(*out, ncap);
+    if (!grown) {
+        free(*out);
+        *out = NULL;
+        return false;
+    }
+    *out = grown;
+    *cap = ncap;
+    return true;
 }
 
 static char *preprocess_script(const char *script) {
@@ -73,7 +94,7 @@ static char *preprocess_script(const char *script) {
         if (!match) {
             /* No more macros — copy rest */
             size_t rest = strlen(pos);
-            if (out_len + rest >= cap) { cap = out_len + rest + 1; out = realloc(out, cap); }
+            if (!reserve(&out, &cap, out_len, rest)) return NULL;
             memcpy(out + out_len, pos, rest);
             out_len += rest;
             out[out_len] = '\0';
@@ -82,7 +103,7 @@ static char *preprocess_script(const char *script) {
 
         /* Copy text before the match */
         size_t prefix = (size_t)(match - pos);
-        if (out_len + prefix >= cap) { cap = (out_len + prefix) * 2; out = realloc(out, cap); }
+        if (!reserve(&out, &cap, out_len, prefix)) return NULL;
         memcpy(out + out_len, pos, prefix);
         out_len += prefix;
 
@@ -91,6 +112,7 @@ static char *preprocess_script(const char *script) {
             const char *comma = NULL;
             const char *close = find_close_paren(args, &comma);
             if (!close) { /* malformed — copy as-is */
+                if (!reserve(&out, &cap, out_len, 8)) return NULL;
                 memcpy(out + out_len, match, 8); out_len += 8;
                 pos = match + 8; continue;
             }
@@ -102,14 +124,14 @@ static char *preprocess_script(const char *script) {
                 while (*cb == ' ') cb++;
                 size_t cb_len = (size_t)(close - cb);
                 size_t need = 60 + ms_len + cb_len;
-                if (out_len + need >= cap) { cap = (out_len + need) * 2; out = realloc(out, cap); }
+                if (!reserve(&out, &cap, out_len, need)) return NULL;
                 out_len += (size_t)snprintf(out + out_len, cap - out_len,
                     "TIMEOUT(%.*s);\nvar __timeout_cb = function() { %.*s };",
                     (int)ms_len, args, (int)cb_len, cb);
             } else {
                 /* TIMEOUT(ms) — copy as-is */
                 size_t span = (size_t)(close - match + 1);
-                if (out_len + span >= cap) { cap = (out_len + span) * 2; out = realloc(out, cap); }
+                if (!reserve(&out, &cap, out_len, span)) return NULL;
                 memcpy(out + out_len, match, span);
                 out_len += span;
             }
@@ -119,6 +141,7 @@ static char *preprocess_script(const char *script) {
             const char *args = match + 11; /* after "WAIT_UNTIL(" */
             const char *close = find_close_paren(args, NULL);
             if (!close) {
+                if (!reserve(&out, &cap, out_len, 11)) return NULL;
                 memcpy(out + out_len, match, 11); out_len += 11;
                 pos = match + 11; continue;
             }
@@ -127,7 +150,7 @@ static char *preprocess_script(const char *script) {
             size_t expr_len = (size_t)(close - args);
             /* Escape any quotes in the expression */
             size_t need = 20 + expr_len * 2;
-            if (out_len + need >= cap) { cap = (out_len + need) * 2; out = realloc(out, cap); }
+            if (!reserve(&out, &cap, out_len, need)) return NULL;
             out_len += (size_t)snprintf(out + out_len, cap - out_len, "WAIT_UNTIL(\"");
             for (const char *e = args; e < close; e++) {
                 if (*e == '"') { out[out_len++] = '\\'; out[out_len++] = '"'; }
