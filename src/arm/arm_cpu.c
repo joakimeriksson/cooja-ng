@@ -1194,7 +1194,13 @@ int condition_passed(arm_cpu_t *cpu, int cond) {
     return result;
 }
 
-/* --- Barrel shifter helpers --- */
+/* --- Barrel shifter helpers ---
+ *
+ * A shift of 0 returns the value and leaves *carry as the caller set it --
+ * the architectural "carry unchanged".  The encodings where an immediate 0
+ * means 32 (LSR/ASR) are converted by every caller before it gets here, but
+ * the helpers must not depend on that for defined behavior: lsr_c/asr_c
+ * would otherwise shift by -1. */
 
 static inline uint32_t lsl_c(uint32_t val, int shift, int *carry) {
     if (shift == 0) return val;
@@ -1204,6 +1210,7 @@ static inline uint32_t lsl_c(uint32_t val, int shift, int *carry) {
 }
 
 static inline uint32_t lsr_c(uint32_t val, int shift, int *carry) {
+    if (shift == 0) return val;
     if (shift >= 32) { *carry = (shift == 32) ? ((val >> 31) & 1) : 0; return 0; }
     *carry = (val >> (shift - 1)) & 1;
     return val >> shift;
@@ -1211,6 +1218,7 @@ static inline uint32_t lsr_c(uint32_t val, int shift, int *carry) {
 
 static inline uint32_t asr_c(uint32_t val, int shift, int *carry) {
     int32_t sval = (int32_t)val;
+    if (shift == 0) return val;
     if (shift >= 32) {
         *carry = (val >> 31) & 1;
         return (sval < 0) ? 0xFFFFFFFF : 0;
@@ -1238,7 +1246,12 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
 
     switch (di->klass) {
     case ARM_DEC_SHIFT_IMM: {
-        int carry;
+        /* Seeded from C so the helpers' "shift 0 = carry unchanged" holds
+         * here too.  The decoder never produces a 0 shift for this class
+         * (arm_decode.c turns LSL #0 into MOV and rejects LSR/ASR #0), but
+         * this is the reference model the differential suites trust, so it
+         * does not lean on that for defined behavior. */
+        int carry = (cpu->xpsr & APSR_C) ? 1 : 0;
         uint32_t v = reg[di->rm];
         int sh = (int)di->imm;
         switch (di->shift) {
