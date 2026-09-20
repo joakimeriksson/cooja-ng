@@ -89,11 +89,12 @@ typedef struct websocket_ui_service {
     struct sim_runtime *rt;
 } websocket_ui_service_t;
 
-/* Start the UI: open the ws_server on `port`, load ui/index.html, wire the
+/* Start the UI: open the ws_server on `bind_addr`:`port` (NULL = loopback,
+ * see ws_server_init), load ui/index.html, wire the
  * message handler, and store the shared-state pointers/callbacks.  Returns
  * true if the server came up (the service is then "active").  A failure
  * leaves the service inactive and is non-fatal (headless run continues). */
-bool ui_service_start(websocket_ui_service_t *svc, int port,
+bool ui_service_start(websocket_ui_service_t *svc, const char *bind_addr, int port,
                       const sim_node_state_t *node_states,
                       sim_node_state_t *prev_node_states,
                       const int64_t *node_last_tx_ns,

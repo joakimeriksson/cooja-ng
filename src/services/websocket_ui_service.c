@@ -100,7 +100,7 @@ void ui_service_add_console_line(websocket_ui_service_t *svc, int idx,
     }
 }
 
-bool ui_service_start(websocket_ui_service_t *svc, int port,
+bool ui_service_start(websocket_ui_service_t *svc, const char *bind_addr, int port,
                       const sim_node_state_t *node_states,
                       sim_node_state_t *prev_node_states,
                       const int64_t *node_last_tx_ns,
@@ -118,7 +118,7 @@ bool ui_service_start(websocket_ui_service_t *svc, int port,
     svc->describe = describe;
     svc->ctl = ctl;
 
-    svc->server = ws_server_init(port);
+    svc->server = ws_server_init(bind_addr, port);
     if (!svc->server)
         return false;
     ws_server_set_message_callback(svc->server, ui_message_handler, svc);

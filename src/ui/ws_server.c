@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -41,6 +42,7 @@ typedef struct {
 
 struct ws_server {
     int listen_fd;
+    int loopback_only;      /* bound to 127.0.0.0/8: refuse non-loopback Host */
     ws_client_t clients[MAX_CLIENTS];
     int client_count;
     char *html;
@@ -149,6 +151,86 @@ static void close_client(ws_server_t *srv, int idx) {
     srv->clients[idx] = srv->clients[--srv->client_count];
 }
 
+/* ---- Request vetting ----
+ *
+ * The UI accepts commands (pause, speed, restart, move), and WebSocket is
+ * exempt from the same-origin policy, so any page the operator has open
+ * could otherwise connect to it.  Two checks:
+ *
+ *  - Origin: a browser always sends it on the upgrade.  It must name this
+ *    server, i.e. equal the Host the browser addressed (the page we serve
+ *    connects to ws://<location.host>/ws, so our own page always passes).
+ *    Non-browser clients send no Origin and are not the threat.
+ *  - Host: on a loopback-bound server it must be a loopback name.  This is
+ *    what stops DNS rebinding, where evil.example resolves to 127.0.0.1 and
+ *    Origin and Host then agree with each other.
+ */
+
+/* Copy the value of header `name` (case-insensitive, per HTTP) into out.
+ * Returns 1 if found, 0 if absent, -1 if present but longer than out. */
+static int http_header(const char *req, const char *name, char *out, size_t outsz) {
+    size_t nlen = strlen(name);
+    const char *line = strstr(req, "\r\n");
+    while (line) {
+        line += 2;
+        if (line[0] == '\r') break;                 /* blank line: end of headers */
+        if (strncasecmp(line, name, nlen) == 0 && line[nlen] == ':') {
+            const char *v = line + nlen + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            const char *end = strstr(v, "\r\n");
+            if (!end) return 0;
+            while (end > v && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            size_t vlen = (size_t)(end - v);
+            if (vlen >= outsz) return -1;
+            memcpy(out, v, vlen);
+            out[vlen] = '\0';
+            return 1;
+        }
+        line = strstr(line, "\r\n");
+    }
+    return 0;
+}
+
+/* A Host value ("name[:port]", "[v6]:port") that names this machine. */
+static int host_is_loopback(const char *host) {
+    char name[64];
+    size_t n;
+    if (host[0] == '[') {
+        const char *close = strchr(host, ']');
+        if (!close) return 0;
+        n = (size_t)(close - host - 1);
+        host++;
+    } else {
+        const char *colon = strchr(host, ':');
+        n = colon ? (size_t)(colon - host) : strlen(host);
+    }
+    if (n == 0 || n >= sizeof(name)) return 0;
+    memcpy(name, host, n);
+    name[n] = '\0';
+    if (strcasecmp(name, "localhost") == 0 || strcmp(name, "::1") == 0)
+        return 1;
+    struct in_addr a;
+    return inet_pton(AF_INET, name, &a) == 1 &&
+           (ntohl(a.s_addr) >> 24) == 127;
+}
+
+/* Origin is "scheme://host[:port]"; it names this server if that host[:port]
+ * is exactly the Host the request was sent to. */
+static int origin_matches_host(const char *origin, const char *host) {
+    const char *p = strstr(origin, "://");
+    if (!p) return 0;                               /* includes "null" */
+    return strcasecmp(p + 3, host) == 0;
+}
+
+static void refuse(ws_server_t *srv, int idx, const char *why, const char *what) {
+    ws_client_t *c = &srv->clients[idx];
+    fprintf(stderr, "ws_server: refused request: %s %s\n", why, what);
+    const char *resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
+                       "Connection: close\r\n\r\n";
+    send(c->fd, resp, (int)strlen(resp), MSG_NOSIGNAL);
+    close_client(srv, idx);
+}
+
 /* ---- HTTP / WebSocket handling ---- */
 
 static const char *WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -161,8 +243,24 @@ static void handle_http_request(ws_server_t *srv, int idx) {
     if (!strstr(c->recv_buf, "\r\n\r\n"))
         return;
 
+    char host[256] = "", origin[256] = "";
+    int has_host = http_header(c->recv_buf, "Host", host, sizeof(host));
+    int has_origin = http_header(c->recv_buf, "Origin", origin, sizeof(origin));
+    if (has_host < 0 || has_origin < 0) {
+        refuse(srv, idx, "oversized", has_host < 0 ? "Host" : "Origin");
+        return;
+    }
+    if (srv->loopback_only && has_host && !host_is_loopback(host)) {
+        refuse(srv, idx, "non-loopback Host", host);
+        return;
+    }
+
     /* WebSocket upgrade: GET /ws */
     if (strstr(c->recv_buf, "GET /ws") && strstr(c->recv_buf, "Upgrade: websocket")) {
+        if (has_origin && !(has_host && origin_matches_host(origin, host))) {
+            refuse(srv, idx, "cross-origin WebSocket from", origin);
+            return;
+        }
         /* Extract Sec-WebSocket-Key */
         const char *key_hdr = strstr(c->recv_buf, "Sec-WebSocket-Key: ");
         if (!key_hdr) { close_client(srv, idx); return; }
@@ -287,9 +385,18 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
 
 /* ---- Public API ---- */
 
-ws_server_t *ws_server_init(int port) {
+ws_server_t *ws_server_init(const char *bind_addr, int port) {
+    struct in_addr bind_in;
+    if (!bind_addr || strcmp(bind_addr, "localhost") == 0)
+        bind_addr = "127.0.0.1";
+    if (inet_pton(AF_INET, bind_addr, &bind_in) != 1) {
+        fprintf(stderr, "ws_server: '%s' is not an IPv4 address\n", bind_addr);
+        return NULL;
+    }
+
     ws_server_t *srv = calloc(1, sizeof(ws_server_t));
     if (!srv) return NULL;
+    srv->loopback_only = (ntohl(bind_in.s_addr) >> 24) == 127;
 
     /* Ignore SIGPIPE globally — broken WebSocket connections must not kill the process */
     signal(SIGPIPE, SIG_IGN);
@@ -304,11 +411,12 @@ ws_server_t *ws_server_init(int port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr = bind_in;
     addr.sin_port = htons((uint16_t)port);
 
     if (bind(srv->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "ws_server: bind port %d failed: %s\n", port, strerror(errno));
+        fprintf(stderr, "ws_server: bind %s:%d failed: %s\n", bind_addr, port,
+                strerror(errno));
         close(srv->listen_fd);
         free(srv);
         return NULL;
@@ -320,7 +428,11 @@ ws_server_t *ws_server_init(int port) {
         return NULL;
     }
 
-    printf("WebSocket UI server listening on http://localhost:%d\n", port);
+    if (srv->loopback_only)
+        printf("WebSocket UI server listening on http://localhost:%d\n", port);
+    else
+        printf("WebSocket UI server listening on %s:%d (NOT loopback-only: "
+               "reachable from the network)\n", bind_addr, port);
     return srv;
 }
 
