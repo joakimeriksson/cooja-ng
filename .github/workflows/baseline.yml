@@ -1,0 +1,73 @@
+name: baseline
+
+# Did this pull request move the simulation?  tools/check-baseline.sh builds
+# the merge-base with main in a worktree, runs nine workloads with both
+# binaries from this tree and diffs everything but the wall-clock lines:
+# identical output means every mote ran at the same nanosecond.  A red job
+# here is not a broken test but a changed simulation — sometimes intended (a
+# peripheral model fixed), in which case the PR should say so.  It runs only
+# when engine sources change; docs and configs alone cannot move a run.
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'lib/**'
+      - 'test/test_mixed_multinode.c'
+      - 'Makefile'
+      - 'tools/check-baseline.sh'
+      - '.github/workflows/baseline.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'reference revision (default: the merge-base with main)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    name: byte-identity vs main
+    # Linux only: the script paces each workload with timeout(1), which the
+    # macOS runners do not have.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The script resolves origin/main and checks the merge-base out
+          # into a worktree; a shallow clone has neither.
+          fetch-depth: 0
+
+      # Same GNU Lightning as test.yml, so both builds have the JIT — a
+      # JIT-presence difference would read as a moved simulation.
+      - name: Install GNU Lightning (source build)
+        run: |
+          .github/scripts/fetch-lightning.sh
+          cd lightning-2.2.3
+          ./configure --prefix=/usr/local > /dev/null
+          make -j"$(nproc)" > /dev/null
+          sudo make install > /dev/null
+          sudo ldconfig
+
+      - name: Assert Lightning is visible to the build
+        run: pkg-config --exists lightning && pkg-config --modversion lightning
+
+      - name: Build both revisions and diff nine workloads
+        env:
+          TMPDIR: ${{ runner.temp }}/baseline
+        run: |
+          mkdir -p "$TMPDIR"
+          tools/check-baseline.sh ${{ github.event.inputs.ref }}
+
+      # The script keeps its logs (KEEP=1) when a workload differs.
+      - name: Keep the logs of a moved simulation
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-logs
+          path: ${{ runner.temp }}/baseline
+          if-no-files-found: ignore

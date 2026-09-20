@@ -98,7 +98,8 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # anything touching the kernel clock, the event pump or a mote tick: TSCH can
 # still associate and RPL can still form a DAG after a timing shift that HAS
 # changed the simulation, so a green test suite is too weak a signal there.
-# Re-run it after a rebase — the baseline moves with main.
+# Re-run it after a rebase — the baseline moves with main. CI runs it on
+# pull requests that touch the engine (.github/workflows/baseline.yml).
 tools/check-determinism.sh test configs/chain-4node-sky.yaml   # same run twice
 tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 keeps the logs
 
@@ -114,7 +115,8 @@ tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 k
 # a pass/fail verdict, so one shell firmware serves many tests. The exit code
 # says WHAT failed (agent-sim-protocol's table): 0 pass, 1 assertion, 2 invalid
 # request, 6 wall timeout, 7 cancelled. --wall-timeout <dur> bounds a run in
-# wall-clock time (exit 6) without touching the simulation.
+# wall-clock time (exit 6) without touching the simulation; a bare number is
+# SECONDS for this one flag (like timeout(1); 500ms / 2m also accepted).
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
 ./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)

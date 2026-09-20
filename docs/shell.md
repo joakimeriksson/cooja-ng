@@ -26,7 +26,7 @@ Every simulation mode that takes a config or firmware list (`test`,
 | `--shell` | read commands from stdin.  On a terminal: line editing, history (`~/.cooja-ng_history`, or `$CSIM_SHELL_HISTORY`; empty disables), tab completion of command names.  From a pipe: lines run strictly in order, like a script (see *Pipes*), each echoed as `> cmd`; EOF = `exit`. |
 | `--script FILE` | run FILE at simulation start, with or without `--shell`.  Without `--shell` the run ends when the script passes or fails, or when it reaches its end and every `at`/`every` it scheduled has fired (or the duration ends the run). |
 | `--paused` | start paused (needs `--shell`, `--script` or `--ui` to resume). |
-| `--wall-timeout <dur>` | end the run after that much **wall-clock** time (exit code 6).  Never influences the simulation — it only stops it, through the normal teardown (reports, `--save-config`).  A session waiting for input that never comes stops too. |
+| `--wall-timeout <dur>` | end the run after that much **wall-clock** time (exit code 6).  A bare number is **seconds** here — a wall-clock bound like `timeout(1)`'s, and the form the agent-sim-protocol spec writes (`--wall-timeout 600`); `500ms`, `2m`, `1.5s` are accepted too.  Never influences the simulation — it only stops it, through the normal teardown (reports, `--save-config`).  A session waiting for input that never comes stops too. |
 | `--speed N` / `--speed max` / `--realtime` | wall-clock pacing: N simulated seconds per wall second; `max` = unpaced (the headless default; the live UI and the serial bridge default to 10x). |
 
 With `--shell` the run has no duration: it ends at `exit`.  At a terminal an
@@ -163,7 +163,7 @@ firmware failure:
 |---|---|---|
 | 0 | pass | the script ended without a failure |
 | 1 | assertion | `expect` timeout, false `assert`, `fail`, matched `fail-on`, "did not complete" |
-| 2 | invalid request | unknown command, bad syntax or selector, unknown node, unreadable `source`, a deadlock |
+| 2 | invalid request | unknown command, bad syntax or selector, unknown node, unreadable `source`, a deadlock; also a run that never starts — a `--script` file that cannot be opened, a bad flag value, an unknown option, a config that does not load (reported on stderr, before any results block) |
 | 5 | guest failure | (not used by the shell) |
 | 6 | wall timeout | `--wall-timeout` ended the run |
 | 7 | cancelled | Ctrl-C, SIGINT or SIGTERM while a command or script was in flight |

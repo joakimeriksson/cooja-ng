@@ -11,6 +11,12 @@ mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "check-shell: FAIL: $*"; exit 1; }
 strip() { grep -v 'Wall-clock\|Speed ratio\|Throughput' "$1"; }
+# expect_rc N cmd...: the exact exit code matters (docs/shell.md "Exit codes").
+expect_rc() {
+    local want=$1 rc=0; shift
+    "$@" > "$TMP/rc.out" 2>&1 || rc=$?
+    [ "$rc" = "$want" ] || { tail -5 "$TMP/rc.out"; fail "$* -> exit $rc, expected $want"; }
+}
 
 echo "== unit tests"
 $BIN shell > "$TMP/unit.out" || { cat "$TMP/unit.out"; fail "unit tests"; }
@@ -20,11 +26,20 @@ echo "== scripted test (pass)"
 $BIN test $CFG --script test/scripts/shell-nrf54l15.cnsh > "$TMP/pass.out" 2>&1 || fail "pass script exited non-zero"
 grep -q "SCRIPT PASSED" "$TMP/pass.out" || fail "no SCRIPT PASSED"
 
-echo "== scripted test (fail)"
-if $BIN test $CFG --script test/scripts/shell-nrf54l15-fail.cnsh > "$TMP/fail.out" 2>&1; then
-    fail "fail script exited 0"
-fi
-grep -q "SCRIPT FAILED: expect" "$TMP/fail.out" || fail "no SCRIPT FAILED"
+echo "== scripted test (fail): assertion, exit 1"
+expect_rc 1 $BIN test $CFG --script test/scripts/shell-nrf54l15-fail.cnsh
+grep -q "SCRIPT FAILED: expect" "$TMP/rc.out" || fail "no SCRIPT FAILED"
+
+echo "== a run that never starts is a configuration error, exit 2"
+expect_rc 2 $BIN test $CFG -q --script /nonexistent/missing.cnsh
+grep -q "cannot open" "$TMP/rc.out" || fail "missing --script not reported"
+expect_rc 2 $BIN test $CFG -q --wall-timeout abc
+grep -q "bad value" "$TMP/rc.out" || fail "bad --wall-timeout not reported"
+expect_rc 2 $BIN test $CFG -q --wall-timeout
+grep -q "missing value" "$TMP/rc.out" || fail "flag without a value not reported"
+expect_rc 2 $BIN test $CFG -q --wall-timout 5
+grep -q "unknown option" "$TMP/rc.out" || fail "unknown option not reported"
+expect_rc 2 $BIN test configs/does-not-exist.yaml -q
 
 echo "== determinism"
 $BIN test $CFG --script test/scripts/shell-nrf54l15.cnsh > "$TMP/pass2.out" 2>&1 || fail "second run"
@@ -52,11 +67,18 @@ printf 'sleep 30s\nspeed 1\nsleep 1s\nexit\n' \
     | timeout 30 $BIN test $CFG --shell -q > "$TMP/speed.out" 2>&1 || fail "speed session"
 [ "$SECONDS" -lt 5 ] || fail "1 s at speed 1 took ${SECONDS}s wall (pacing not rebased)"
 
-echo "== paused + blocked pipe fails instead of hanging"
-if printf 'pause\nsleep 1s\nexit\n' | timeout 20 $BIN test $CFG --shell -q > "$TMP/dead.out" 2>&1; then
-    fail "deadlocked session exited 0"
-fi
-grep -q "deadlock" "$TMP/dead.out" || fail "deadlock not reported (hang or wrong failure)"
+echo "== --wall-timeout: a bare number is seconds, exit 6"
+SECONDS=0
+printf 'speed 1\nsleep 60s\nexit\n' > "$TMP/long.cnsh"
+expect_rc 6 $BIN test $CFG -q --script "$TMP/long.cnsh" --wall-timeout 1
+[ "$SECONDS" -lt 5 ] || fail "--wall-timeout 1 took ${SECONDS}s wall (read as 1 ms or not at all?)"
+grep -q -- "--wall-timeout: 1.000 s" "$TMP/rc.out" || fail "wall-timeout not reported as 1 s"
+expect_rc 6 $BIN test $CFG -q --script "$TMP/long.cnsh" --wall-timeout=500ms
+grep -q -- "--wall-timeout: 0.500 s" "$TMP/rc.out" || fail "500ms not reported as 0.5 s"
+
+echo "== paused + blocked pipe fails instead of hanging (a deadlock is exit 2)"
+expect_rc 2 bash -c "printf 'pause\nsleep 1s\nexit\n' | timeout 20 $BIN test $CFG --shell -q"
+grep -q "deadlock" "$TMP/rc.out" || fail "deadlock not reported (hang or wrong failure)"
 
 echo "== piped session is deterministic"
 PIPED='sendln 1 help\nexpect 1 "Shows this help" 5s\nstatus\nsleep 250ms\nsendln 1 ip-addr\nexpect 1 "Node IPv6" 5s\nnodes\nexit\n'

@@ -456,6 +456,28 @@ static double get_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
+/* --wall-timeout VALUE.  A bare number is SECONDS here — a wall-clock
+ * bound like timeout(1)'s, and the form agent-sim-protocol writes
+ * (`--wall-timeout 600`).  Every other duration in the shell keeps the
+ * shell's rule (a bare number is ms); with a unit (500ms, 2m, 1.5s) both
+ * agree.  0 = no bound.  Returns 0, or -1 for anything that is not a
+ * non-negative duration. */
+static int parse_wall_timeout(const char *v, double *out_ms) {
+    if (!v || !*v || *v == '-' || *v == '+') return -1;
+    char *end = NULL;
+    errno = 0;
+    double secs = strtod(v, &end);
+    if (end != v && !*end) {
+        if (errno || isnan(secs) || isinf(secs) || secs < 0) return -1;
+        *out_ms = secs * 1000.0;
+        return 0;
+    }
+    int64_t ns;
+    if (shell_parse_duration(v, &ns) != 0) return -1;
+    *out_ms = (double)ns / 1e6;
+    return 0;
+}
+
 /* CSIM_PHASE_TIMING=1 enables the step-vs-kernel wall-time breakdown at the
  * end of a run.  Off by default: it needs two clock reads per event-pump
  * iteration, which profiled at 7.0% of self time on an ARM workload. */
@@ -2063,7 +2085,22 @@ int run_mixed_multinode_test(int argc, char **argv) {
     const char *save_config_path = NULL;
     const char *config_path = NULL;
 
+    /* Argument errors are configuration errors (exit 2, docs/shell.md
+     * "Exit codes"): a flag that needs a value but is given last, and an
+     * option nobody recognises, both used to be silently ignored — a typo
+     * like `--wall-timout 30` ran unbounded. */
+    static const char *const value_flags[] = {
+        "--gdb", "--pcap", "--plugin", "--renode-freq", "--seed",
+        "--save-config", "--script", "--wall-timeout", "--speed",
+        "-n", "-t", "-d", NULL
+    };
     for (int i = 0; i < argc; i++) {
+        for (int k = 0; value_flags[k]; k++) {
+            if (strcmp(argv[i], value_flags[k]) == 0 && i + 1 >= argc) {
+                fprintf(stderr, "%s: missing value\n", argv[i]);
+                return SHELL_EXIT_INVALID;
+            }
+        }
         if (strcmp(argv[i], "--ui") == 0) {
             ui_enabled = 1;
             if (i + 1 < argc && argv[i+1][0] != '-') {
@@ -2117,7 +2154,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
                         ? "--renode: expected ADDR:MAIN:ASYNC, got '%s'\n"
                         : "--renode: CSIM_RENODE is unset or malformed%s\n",
                         spec ? spec : "");
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             renode_requested = 1;
         }
@@ -2126,7 +2163,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (hz <= 0) {
                 fprintf(stderr, "--renode-freq: expected a positive tick "
                                 "frequency in Hz, got '%s'\n", argv[i]);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             renode_freq_override = (uint64_t)hz;
         }
@@ -2134,14 +2171,14 @@ int run_mixed_multinode_test(int argc, char **argv) {
             seed_override = atoi(argv[++i]);
             if (seed_override == 0) {
                 fprintf(stderr, "--seed: expected a non-zero integer, got '%s'\n", argv[i]);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strncmp(argv[i], "--seed=", 7) == 0) {
             seed_override = atoi(argv[i] + 7);
             if (seed_override == 0) {
                 fprintf(stderr, "--seed: expected a non-zero integer, got '%s'\n", argv[i] + 7);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strcmp(argv[i], "--save-config") == 0 && i + 1 < argc) {
@@ -2150,7 +2187,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (!dot || (strcmp(dot, ".yaml") != 0 && strcmp(dot, ".yml") != 0)) {
                 fprintf(stderr, "--save-config: '%s' must end in .yaml or .yml\n",
                         save_config_path);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strcmp(argv[i], "--shell") == 0) {
@@ -2168,13 +2205,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         else if ((strcmp(argv[i], "--wall-timeout") == 0 && i + 1 < argc) ||
                  strncmp(argv[i], "--wall-timeout=", 15) == 0) {
             const char *v = argv[i][14] == '=' ? argv[i] + 15 : argv[++i];
-            int64_t ns;
-            if (shell_parse_duration(v, &ns) != 0) {
-                fprintf(stderr, "--wall-timeout: bad duration '%s' "
-                        "(e.g. 30s, 500ms, 2m)\n", v);
-                return 1;
+            if (parse_wall_timeout(v, &wall_timeout_ms) != 0) {
+                fprintf(stderr, "--wall-timeout: bad value '%s' "
+                        "(seconds, or 500ms / 2m / 1.5s)\n", v);
+                return SHELL_EXIT_INVALID;
             }
-            wall_timeout_ms = (double)ns / 1e6;
         }
         else if (strcmp(argv[i], "--realtime") == 0) {
             cli_speed = 1.0;
@@ -2189,7 +2224,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 double d = strtod(v, &end);
                 if (!end || *end || d <= 0.0) {
                     fprintf(stderr, "--speed: expected a positive ratio, 'max' or 'realtime', got '%s'\n", v);
-                    return 1;
+                    return SHELL_EXIT_INVALID;
                 }
                 cli_speed = d;
             }
@@ -2214,7 +2249,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (is_json_file(argv[i])) {
                 /* Load JSON config */
                 if (sim_config_load(&config, argv[i]) != 0)
-                    return 1;
+                    return SHELL_EXIT_INVALID;
                 config_loaded = 1;
                 node_cfg_src = &config;
                 config_path = argv[i];
@@ -2223,12 +2258,15 @@ int run_mixed_multinode_test(int argc, char **argv) {
                 if (firmware_count < MAX_NODES)
                     firmware_paths[firmware_count++] = argv[i];
             }
+        } else {
+            fprintf(stderr, "unknown option '%s'\n", argv[i]);
+            return SHELL_EXIT_INVALID;
         }
     }
 
     if (start_paused && !shell_enabled && !script_path && !ui_enabled) {
         fprintf(stderr, "--paused: nothing could resume the simulation (add --shell, --script or --ui)\n");
-        return 1;
+        return SHELL_EXIT_INVALID;
     }
     /* Shell or script through a pipe: make command echo, prompts and
      * script output visible promptly.  Here, before anything has been
@@ -2279,7 +2317,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
         printf("Example:\n");
         printf("  test_runner mixed-multinode firmware/sky/udp-server.sky firmware/cooja/udp-client.cooja -t 60000\n");
         printf("  test_runner mixed-multinode configs/rpl-udp-native.json -v\n");
-        return 1;
+        return SHELL_EXIT_INVALID;
     }
 
     int64_t total_ns = (int64_t)sim_ms * MS_TO_NS;
@@ -2332,7 +2370,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
         ctl_init_once(&node_count);
         if (shell_service_start(&shell_svc, &sim_rt, &sim_ctl, shell_enabled != 0,
                                 script_path, verbose != 0) != 0)
-            return 1;
+            return SHELL_EXIT_INVALID;
         sim_service_attach(&sim_rt,
                            sim_registry_find_service(&g_registry, "shell"),
                            &shell_svc);
@@ -2350,7 +2388,7 @@ sim_restart:
                           ? config.nodes[i].secure_firmware : NULL;
         if (init_node(i, fw, sfw, node_id) != 0) {
             fprintf(stderr, "Failed to initialize node %d\n", node_id);
-            return 1;
+            return SHELL_EXIT_INVALID;
         }
         nodes[i].last_execute_ns = 0;
         if (nodes[i].clock_deviation != 1.0)
@@ -2472,7 +2510,7 @@ sim_restart:
             if (!jf) {
                 fprintf(stderr, "Failed to open JS script: %s\n",
                         config.js_script_path);
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             fseek(jf, 0, SEEK_END);
             long jlen = ftell(jf);
@@ -2512,17 +2550,11 @@ sim_restart:
                 }
                 printf("Test: JavaScript engine (timeout=%lld ms)\n",
                        (long long)(total_ns / MS_TO_NS));
-                /* Milestone 8.3b: pin each GENERATE_MSG firing time on
-                 * the kernel event queue so the sequential loop's time
-                 * advance lands exactly on it — scripted serial input
-                 * is injected at the scripted instant, not the next
-                 * iteration boundary. */
-                for (int g = 0; g < js_engine.gen_msg_count; g++)
-                    sim_eq_schedule_test_action(&sim_eq,
-                        js_engine.gen_msgs[g].at_us * 1000LL);
+                /* The GENERATE_MSG instants are pinned on the kernel
+                 * queue once the clock is set, below. */
             } else {
                 fprintf(stderr, "Failed to initialize JS test engine\n");
-                return 1;
+                return SHELL_EXIT_INVALID;
             }
             if (js_script != config.js_script_inline)
                 free(js_script);
@@ -2741,7 +2773,7 @@ sim_restart:
                                sim_registry_find_service(&g_registry, "renode"),
                                &renode_svc) < 0) {
             fprintf(stderr, "renode: co-simulation could not start\n");
-            return 1;
+            return SHELL_EXIT_INVALID;
         }
     }
 
@@ -2884,6 +2916,18 @@ sim_restart:
         g_sim_start_ns = sim_ns;
         if (sim_ms_set && !start_paused)
             sim_control_set_horizon(&sim_ctl, sim_ns + total_ns);
+    }
+    /* Milestone 8.3b: pin each GENERATE_MSG firing time on the kernel
+     * queue so the loop's time advance lands exactly on it — scripted
+     * serial input is injected at the scripted instant, not the next
+     * iteration boundary.  Here, after sim_eq_init and with the clock
+     * set: pinned earlier the pins were wiped with the queue, and an
+     * instant before the first wakeup would have moved the start. */
+    if (use_js_engine) {
+        for (int g = 0; g < js_engine.gen_msg_count; g++) {
+            int64_t t = js_engine.gen_msgs[g].at_us * 1000LL;
+            sim_schedule_test_action(&sim_rt, t > sim_ns ? t : sim_ns);
+        }
     }
 
     double t_start = get_time_ms();
@@ -3335,7 +3379,8 @@ sim_restart:
         test_exit_code = shell_code;
     /* A run cut short by the wall clock reports that, whatever the
      * unfinished script says (SHELL_EXIT_WALL_TIME). */
-    if (wall_timeout_hit || shell_svc.wall_timeout_hit) test_exit_code = 6;
+    if (wall_timeout_hit || shell_svc.wall_timeout_hit)
+        test_exit_code = SHELL_EXIT_WALL_TIME;
     /* Under --shell the run length is whatever the user ran, not -t. */
     int simulated_ms = (shell_enabled || script_path)
                        ? (int)((sim_ns - sim_start_ns) / MS_TO_NS) : sim_ms;

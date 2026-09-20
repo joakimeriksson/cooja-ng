@@ -196,6 +196,13 @@ void sim_schedule_mote_wakeup(sim_runtime_t *sim, int mote_index,
 void sim_schedule_mote_wakeup_if_earlier(sim_runtime_t *sim, int mote_index,
                                           int64_t time_ns);
 
+/* A payload-free time pin for the script engines (the shell's deadlines
+ * and `at` queue, the JS engine's GENERATE_MSG instants): the pump lands
+ * exactly on it and dispatch is a no-op.  Never coalesced, tied to no
+ * mote slot, and clamped to now like a wakeup, so no engine can run the
+ * clock backwards by pinning the past. */
+void sim_schedule_test_action(sim_runtime_t *sim, int64_t time_ns);
+
 void sim_schedule_radio_byte(sim_runtime_t *sim, int receiver_mote,
                              int sender_mote, uint8_t byte, int8_t rssi,
                              int64_t time_ns);
