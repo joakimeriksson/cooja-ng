@@ -593,7 +593,12 @@ void shell_service_pump_paused(shell_service_t *s, int timeout_ms) {
         if (time_block && !can_resume) {
             char reason[SHELL_REASON_MAX];
             char cause[SHELL_LINE_MAX + 96] = "";
-            if (s->run_pause_cmd[0])
+            int halted = shell_dbg_halted_node(s);
+            if (halted >= 0)
+                snprintf(cause, sizeof(cause),
+                         " — node %d is halted at a breakpoint; `continue` "
+                         "releases it (from a terminal, `!continue`)", halted);
+            else if (s->run_pause_cmd[0])
                 snprintf(cause, sizeof(cause),
                          " — the simulation is paused because `%.200s` (%s) "
                          "ran to its end; put a `run` before this command",

@@ -128,6 +128,7 @@ void shell_script_block_fault(shell_service_t *s, int idx, int node_id,
 /* Breakpoints/watchpoints: re-arm CPUs that lost them (reboot), report
  * hits (pausing the simulation), release expect-halt.  Called every tick. */
 void shell_debug_tick(shell_service_t *s);
+int  shell_dbg_halted_node(shell_service_t *s);
 
 /* `sendfile`: push a file whose lines are sent to a node as `cmd`s. */
 int  shell_script_sendfile(shell_service_t *s, const char *path, int idx,

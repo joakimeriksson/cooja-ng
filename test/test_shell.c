@@ -771,6 +771,7 @@ static void test_cmd(void) {
     shell_enqueue_line(&sh, "cmd 1,2 help");
     shell_enqueue_line(&sh, "cmd -x 1 help");
     shell_enqueue_line(&sh, "cmd -t");
+    shell_enqueue_line(&sh, "cmd -c v \"(\" 1 help");   /* bad regex: nothing is sent */
     shell_enqueue_line(&sh, "console 1");      /* not a terminal */
     shell_script_tick(&sh);
     CHECK(sh.atq_count == 0 && sh.block == SHELL_BLOCK_NONE && mock_inject_calls == 0 && !sh.console_mode,
@@ -1093,6 +1094,9 @@ static void test_environment(void) {
     shell_enqueue_line(&sh, "radio range 10");       /* medium none */
     shell_enqueue_line(&sh, "link 1 1 off");
     shell_enqueue_line(&sh, "clock 1 3");
+    shell_enqueue_line(&sh, "clock 1 nan");
+    shell_enqueue_line(&sh, "radio success nan");
+    shell_enqueue_line(&sh, "radio range inf");
     shell_script_tick(&sh);
     CHECK(!sh.failed && sh.atq_count == 0, "unsupported pins, bad pin, none medium, self link, bad deviation are errors");
     shell_enqueue_line(&sh, "restart");

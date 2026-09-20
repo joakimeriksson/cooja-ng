@@ -1785,10 +1785,20 @@ static void ctl_init_once(int *node_count_ptr);
 static char g_pcap_path[512];
 static int ctl_pcap(void *u, const char *path) {
     (void)u;
+    if (!path) { pcap_service_close(&pcap_svc); return 0; }
+    /* Open the new file first, so a path that cannot be written leaves the
+     * running capture alone; say when an existing file is replaced. */
+    if (access(path, F_OK) == 0) printf("  PCAP: replacing %s\n", path);
+    char next[sizeof(g_pcap_path)];
+    snprintf(next, sizeof(next), "%s", path);
+    pcap_service_t fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    if (pcap_service_open(&fresh, next) != 0) return -1;
     pcap_service_close(&pcap_svc);
-    if (!path) return 0;
-    snprintf(g_pcap_path, sizeof(g_pcap_path), "%s", path);
-    return pcap_service_open(&pcap_svc, g_pcap_path);
+    snprintf(g_pcap_path, sizeof(g_pcap_path), "%s", next);
+    pcap_svc.writer = fresh.writer;
+    pcap_svc.path = g_pcap_path;
+    return 0;
 }
 static void ctl_set_clock_deviation(void *u, int idx, double deviation) {
     (void)u;

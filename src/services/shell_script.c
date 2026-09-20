@@ -27,6 +27,7 @@
 #include <regex.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 const char *shell_dequeue_line(shell_service_t *s, char *buf, size_t len);
 
@@ -52,6 +53,8 @@ int shell_script_source(shell_service_t *s, const char *path) {
     if (s->depth >= SHELL_SOURCE_DEPTH) return -1;   /* `source` reports it */
     FILE *f = fopen(path, "r");
     if (!f) return -1;
+    struct stat st;                       /* /dev/zero never ends: regular files only */
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) { fclose(f); return -1; }
     shell_source_t *src = &s->stack[s->depth++];
     src->f = f;
     src->lineno = 0;

@@ -152,7 +152,7 @@ int shell_parse_double(const char *s, double *out) {
     char *end = NULL;
     errno = 0;
     double v = strtod(s, &end);
-    if (end == s || *end || errno) return -1;
+    if (end == s || *end || errno || !isfinite(v)) return -1;   /* no nan, no inf */
     *out = v;
     return 0;
 }

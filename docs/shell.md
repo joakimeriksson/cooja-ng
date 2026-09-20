@@ -81,14 +81,14 @@ Times: `5s`, `250ms`, `1500us`, `1.5s`, `2m`; a bare number is milliseconds;
 | command | |
 |---|---|
 | `radio`, `radio range <tx> [interference]`, `radio success <tx> [rx]` | show the medium; change UDGM range (metres) or success ratios (0-1); neighbour lists are recomputed |
-| `link <a> <b> off\|on`, `link <a> -> <b> off\|on`, `links` | cut or restore a radio link both ways or one way, whatever the distance; list cut links |
+| `link <a> <b> off\|on`, `link <a> -> <b> off\|on`, `links` | cut or restore a radio link both ways or one way, whatever the distance; list cut links.  A cut filters delivery only: the cut sender still occupies the air at the receiver, so its frames collide there as before |
 | `neighbors [node]` | who each node hears |
 | `pcap <file>\|off` | start or stop an 802.15.4 capture |
 | `clock <node> [deviation]` | show or set a node's clock deviation (1.0 exact; 1.00002 runs 20 ppm fast) |
 | `leds [nodes]` | LED states |
 | `gpio <node> <port>.<pin> high\|low\|pulse [duration]` | drive an input pin: MSP430 `P1.0`-`P10.7`, CC2538 `A.0`-`D.7` (raises the pin interrupt the firmware configured), nRF54L15 `P0`-`P2` (the IN register only; no GPIOTE interrupt is modelled); nRF52840 has no GPIO model |
 | `button <node> press\|release\|click [duration]` | the board's user button, respecting active-low wiring (Sky P2.7, Z1 P2.5, CC2538DK PA3, nRF boards per board file); `click` releases after 100 ms |
-| `restart` | restart from the configuration: configured nodes only, links restored, `at` queue cleared, scripts aborted; lines after it run against the new simulation |
+| `restart` | restart from the configuration: configured nodes only, links restored, `at` queue cleared, scripts aborted; lines after it run against the new simulation.  Inside a script file it is the script's end, like `exit` |
 | `ui <port>` | start the live web UI now |
 
 **Console**
@@ -99,7 +99,7 @@ Times: `5s`, `250ms`, `1500us`, `1.5s`, `2m`; a bare number is milliseconds;
 | `log-file <path> [nodes]`, `log-file off [path]`, `log-file` | append nodes' console lines to a file (same line format, flushed per line); close; list |
 | `send <nodes> <text...>` | console input, escapes honoured, spacing kept as typed, no newline added |
 | `sendln <nodes> <text...>` | `send` + one `\n`, i.e. one Contiki-NG shell command (the Contiki shell ends a line on `\n` *or* `\r`, so `\r\n` would be two commands) |
-| `cmd [-e "<pat>"] [-f "<pat>"] [-t <timeout>] <node> [text...]` | `sendln`, then **block until the node prints its shell prompt** again. `-e`: the output before the prompt must contain the pattern; `-f`: it must not; either failing, or no prompt within the timeout (default `expect-timeout`), fails the script. A bare `cmd <node>` just waits for a prompt. |
+| `cmd [-e "<pat>"] [-f "<pat>"] [-c <var> "<re>"] [-t <timeout>] <node> [text...]` | `sendln`, then **block until the node prints its shell prompt** again. `-e`: the output before the prompt must contain the pattern; `-f`: it must not; `-c`: the first output line matching the regex sets `$var`; either failing, or no prompt within the timeout (default `expect-timeout`), fails the script. A bare `cmd <node>` just waits for a prompt. |
 | `console <node>` | talk to one node directly (terminal only): lines you type go to the node, its console bytes come back unprefixed, other nodes' lines are hidden. Ctrl-C is sent to the node rather than ending the run. `~.` on its own line, or Ctrl-D, returns to the shell. The simulation keeps running at its current speed meanwhile. |
 
 **Prompts.**  A shell prompt has no newline, so it never becomes a log line
@@ -169,7 +169,7 @@ expect 2 "Received ping reply" 5s
 
 `at`, `every` and `on` run one command beside the command stream, so they
 refuse the commands that would hold it: `cmd`, `expect`, `expect-not`,
-`capture`, `expect-fault`, `sendfile`, `sleep`, `wait-until`, `step`, `source`,
+`capture`, `expect-fault`, `expect-halt`, `sendfile`, `sleep`, `wait-until`, `step`, `source`,
 and `run` with a duration.  Put such sequences in a script.
 An error in a scheduled command fails the script only if a script file
 scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
@@ -212,14 +212,19 @@ scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 
 A hit halts that node where it is and pauses the simulation at the next slice
 boundary (other nodes may finish the slice they are in).  `run` resumes the
-others with the node still halted; `continue` releases it.  An armed node runs
+others with the node still halted; `continue` releases it.  The time the
+others ran on is not replayed: the node resumes at the current instant with
+its clock — timers and radio included — that much behind.  An armed node runs
 in the interpreter, never the JIT, and costs one out-of-line check per
 instruction; nodes without breakpoints are unaffected.  Breakpoints survive a
 reboot of the node.  MSP430 nodes have `mem`/`reg` but no breakpoints.
 
 Memory access bypasses TrustZone (it is the debugger's view, like a probe on
-the SWD port); reads of peripheral registers go through the peripheral model
-and can have its read side effects.  CFSR/HFSR are not modelled; the fault
+the SWD port); on ARM, reads of peripheral registers go through the
+peripheral model, once per register (a word), and can have its read side
+effects; on an nRF54L15 the debugger accesses as Secure, so a Non-secure alias
+does not latch a permission error in the guest.  An MSP430 node's `mem` reads
+the memory image, not its peripheral models.  CFSR/HFSR are not modelled; the fault
 counters are, and they survive a SoC reset.
 
 Example, `test/scripts/tz-securefault-nrf54l15-xiao.cnsh` on
@@ -240,7 +245,8 @@ pass
 A script is one command per line.  Commands run **sequentially in
 simulation time**: non-blocking commands run back to back at the same
 instant, a blocking command (`cmd`, `expect`, `expect-not`, `capture`,
-`expect-fault`, `sendfile`, `sleep`, `wait-until`, `run <dur>`, `step`) holds
+`expect-fault`, `expect-halt`, `sendfile`, `sleep`, `wait-until`, `run <dur>`,
+`step`) holds
 the stream until it is satisfied, and then the next line runs at exactly that
 instant.  So
 
@@ -256,10 +262,11 @@ runs (`tools/check-shell.sh` checks that).
 
 While a script or a blocking command holds the stream, lines typed at a
 terminal prompt queue behind it.  Two escape hatches: a line starting with `!`
-runs immediately if the command is safe to interleave (`status`, `time`,
-`nodes`, `log`, `log-file`, `pause`, `run`, `step`, `speed`, `at`, `every`,
-`atq`, `atrm`, `set`, `save-config`, `echo`, `help`, `exit`, `quit`) — `!run 500ms` and `!step` run beside the stream
-without holding it — and Ctrl-C aborts the script.  A mistyped `!` command
+runs immediately if the command is safe to interleave — the commands `help`
+marks with `!`: state and settings, `run`/`pause`/`step`/`speed`, the
+environment (`radio`, `link`, `gpio`, `button`, ...), `continue`, `exit` —
+so `!run 500ms` and `!step` run beside the stream without holding it — and
+Ctrl-C aborts the script.  A mistyped `!` command
 prints an error but never fails the running script.
 
 **Paused while blocked.**  Simulated time does not advance while paused, so a
@@ -314,7 +321,9 @@ time should use `run <duration>` / `sleep` to move the simulation between
 them.
 
 `repeat`, `if`, `else` and `end` work in script files (not at the prompt) and
-nest up to 8 deep; blocking commands inside a loop resume the loop:
+nest up to 8 deep; blocking commands inside a loop resume the loop.  A run of
+non-blocking lines yields to the simulation every 10 000 lines, so a very long
+loop spreads over a few scheduler slices rather than one instant:
 
 ```
 repeat 5 i

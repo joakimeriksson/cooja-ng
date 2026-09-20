@@ -506,6 +506,11 @@ static int cmd_cmd(shell_service_t *s, int argc, char **argv, const char *line, 
         shell_out(s, "warning: a line of %d bytes reaches max-line %d (the node's "
                   "serial-line buffer); it may be truncated (set max-line 0 to silence)\n",
                   len, s->max_line);
+    void *re = NULL;                     /* compiled before the send: a bad regex sends nothing */
+    if (cap_re) {
+        char err[160];
+        if (!(re = shell_regex_compile(cap_re, err, sizeof(err)))) { shell_error(s, "%s", err); return -1; }
+    }
     text[len] = '\n';
     int took = sim_control_send(s->ctl, (int)id, (const uint8_t *)text, len + 1,
                                 SIM_CONTROL_WAKE | SIM_CONTROL_RETRY);
@@ -513,12 +518,8 @@ static int cmd_cmd(shell_service_t *s, int argc, char **argv, const char *line, 
     if (took < len + 1) {
         shell_error(s, "node %ld: console input truncated, %d of %d bytes queued",
                     id, took < 0 ? 0 : took, len + 1);
+        if (re) shell_regex_free(&re);
         return -1;
-    }
-    void *re = NULL;
-    if (cap_re) {
-        char err[160];
-        if (!(re = shell_regex_compile(cap_re, err, sizeof(err)))) { shell_error(s, "%s", err); return -1; }
     }
     /* Armed in the same tick as the send, before the node runs a single
      * instruction, so neither its output nor its prompt can be missed. */
@@ -905,6 +906,21 @@ static arm_cpu_t *dbg_cpu(shell_service_t *s, int node_id) {
     return s->ctl->ops.get_interface(s->ctl->ops.user, idx, SIM_MOTE_IFACE_ARM_CPU);
 }
 
+/* Release a halted node.  A breakpoint is not hit again on the way out.
+ * Re-anchor: the time the others ran on while this node stood still is not
+ * replayed as one burst of CPU, timers and radio at the release; the node
+ * resumes at the current instant with its clock that much behind.  A halted
+ * node is parked (no wakeup of its own), so schedule one. */
+static void dbg_release(shell_service_t *s, int node_id, arm_cpu_t *cpu) {
+    if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->reg[ARM_PC] & ~1u;
+    cpu->dbg_halted = false;
+    cpu->last_execute_us = now_ns(s) / 1000LL;
+    for (int k = 0; k < s->dbg_count; k++)
+        if (s->dbg[k].node_id == node_id) s->dbg[k].halted = false;
+    int idx = sim_control_index_of_id(s->ctl, node_id);
+    if (idx >= 0) sim_schedule_mote_wakeup_if_earlier(s->sim, idx, now_ns(s));
+}
+
 /* Write a node's breakpoint/watchpoint tables from the shell's list, in list
  * order (so cpu->dbg_hit_index maps back to it).  Watch shadows restart from
  * the current memory. */
@@ -927,7 +943,17 @@ static void dbg_arm_node(shell_service_t *s, int node_id) {
         }
     }
     cpu->dbg_count = cpu->dbg_bp_n + cpu->dbg_wp_n;
-    if (cpu->dbg_count == 0) cpu->dbg_halted = cpu->dbg_hit_new = false;
+    if (cpu->dbg_count == 0) {                 /* nothing left: a halted node runs on */
+        cpu->dbg_hit_new = false;
+        if (cpu->dbg_halted) dbg_release(s, node_id, cpu);
+    }
+}
+
+/* A node stopped at a breakpoint or watchpoint, or -1. */
+int shell_dbg_halted_node(shell_service_t *s) {
+    for (int i = 0; i < s->dbg_count; i++)
+        if (s->dbg[i].halted) return s->dbg[i].node_id;
+    return -1;
 }
 
 /* The shell entry behind a CPU's hit (kind, index into that kind's table). */
@@ -1096,11 +1122,7 @@ static int cmd_continue(shell_service_t *s, int argc, char **argv, const char *l
         if (!sim_control_describe(s->ctl, i, &info) || (only >= 0 && info.id != only)) continue;
         arm_cpu_t *cpu = dbg_cpu(s, info.id);
         if (!cpu || !cpu->dbg_halted) continue;
-        if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->reg[ARM_PC] & ~1u;
-        cpu->dbg_halted = false;
-        for (int k = 0; k < s->dbg_count; k++)
-            if (s->dbg[k].node_id == info.id) s->dbg[k].halted = false;
-        sim_schedule_mote_wakeup_if_earlier(s->sim, i, now_ns(s));
+        dbg_release(s, info.id, cpu);
         released++;
     }
     if (only >= 0 && !released) { shell_error(s, "continue: node %d is not halted", only); return -1; }
@@ -1774,7 +1796,7 @@ static int cmd_neighbors(shell_service_t *s, int argc, char **argv, const char *
         for (int k = 0; k < nl->count; k++) {
             int j = nl->neighbors[k];
             snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%d%s", k ? " " : "",
-                     slot_id(s, j), radio_medium_link_blocked(rm, i, j) ? "(cut)" : "");
+                     slot_id(s, j), radio_medium_link_blocked(rm, j, i) ? "(cut)" : "");
         }
         shell_out(s, "  node %d hears: %s\n", slot_id(s, i), buf[0] ? buf : "(nobody)");
     }
@@ -1918,6 +1940,12 @@ static int cmd_restart(shell_service_t *s, int argc, char **argv, const char *li
     if (!s->ctl->ops.restart) { shell_error(s, "restart is not available in this mode"); return -1; }
     if (shell_refuse_external_clock(s, "restart")) return -1;
     s->ctl->ops.restart(s->ctl->ops.user);
+    /* Inside a script file the restart is the script's end, like `exit`:
+     * it is aborted, not "did not complete". */
+    if (s->origin.kind == SHELL_ORIGIN_FILE) {
+        shell_script_abort(s);
+        s->finished = true;
+    }
     s->restart_pending = true;      /* the next line runs after the restart */
     return 0;
 }
@@ -2295,9 +2323,10 @@ void shell_print_help(shell_service_t *s, const char *name) {
         shell_out(s, "  %s\n      %s\n", c->syntax, c->help);
         return;
     }
-    shell_out(s, "Commands (nodes = id, 1,3, 2-5, all; times = 5s, 250ms, +2s; $name = variable; \"!cmd\" runs at once while a script blocks):\n");
+    shell_out(s, "Commands (nodes = id, 1,3, 2-5, all; times = 5s, 250ms, +2s; $name = variable; \"!cmd\" runs a command marked ! at once while a script blocks):\n");
     for (int i = 0; i < command_count; i++)
-        shell_out(s, "  %-44s %s\n", commands[i].syntax, commands[i].help);
+        shell_out(s, "%s %-44s %s\n", (commands[i].flags & SHELL_CMD_IMMEDIATE) ? "!" : " ",
+                  commands[i].syntax, commands[i].help);
 }
 
 void shell_complete(const char *prefix, linenoiseCompletions *lc) {
