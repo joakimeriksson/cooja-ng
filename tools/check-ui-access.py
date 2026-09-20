@@ -15,12 +15,16 @@ sends raw requests shaped like the ones a browser would send, asserting:
     what stops DNS rebinding (evil.example resolving to 127.0.0.1, where
     Origin and Host agree with each other);
   - with --ui-bind 0.0.0.0 the Host rule is off (it cannot hold for a
-    server meant to be reached by name) but the Origin rule still applies.
+    server meant to be reached by name) but the Origin rule still applies;
+  - a ping is answered with a pong that echoes it, and a control frame
+    longer than RFC 6455's 125 bytes closes the connection instead of
+    drawing a pong whose header does not match its body.
 
 Usage: tools/check-ui-access.py        (RUNNER=... to override the binary)
 """
 import os
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -66,6 +70,74 @@ def status(addr, port, path='/ws', host=None, origin=None, upgrade=True):
         return f'error: {e.__class__.__name__}'
     parts = line.split()
     return parts[1] if len(parts) > 1 else f'error: bad reply {line!r}'
+
+
+def ws_open(port):
+    s = socket.create_connection(('127.0.0.1', port), timeout=3)
+    s.sendall(b'GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n'
+              b'Connection: Upgrade\r\n'
+              b'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+              b'Sec-WebSocket-Version: 13\r\n\r\n')
+    reply = b''
+    while b'\r\n\r\n' not in reply:
+        chunk = s.recv(1)
+        if not chunk:
+            raise OSError('closed during handshake')
+        reply += chunk
+    return s
+
+
+def ws_send(s, opcode, payload):
+    """One masked client frame (clients must mask, RFC 6455 5.3)."""
+    mask = os.urandom(4)
+    n = len(payload)
+    head = bytes([0x80 | opcode])
+    head += bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack('>H', n)
+    s.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+
+def recv_exact(s, n):
+    data = b''
+    while len(data) < n:
+        chunk = s.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def ws_next(s):
+    """(opcode, payload) of the server's next frame, or None at EOF."""
+    head = recv_exact(s, 2)
+    if head is None:
+        return None
+    n = head[1] & 0x7f
+    if n == 126:
+        n = struct.unpack('>H', recv_exact(s, 2))[0]
+    elif n == 127:
+        n = struct.unpack('>Q', recv_exact(s, 8))[0]
+    payload = recv_exact(s, n)
+    return None if payload is None else (head[0] & 0x0f, payload)
+
+
+def pong_for(port, size):
+    """'echo' if a size-byte ping draws a matching pong, 'closed' if the
+    server hangs up, else what arrived instead.  Broadcast frames that
+    arrive first are skipped."""
+    ping = bytes(range(256))[:size] if size <= 256 else os.urandom(size)
+    try:
+        with ws_open(port) as s:
+            ws_send(s, 0x9, ping)
+            while True:
+                frame = ws_next(s)
+                if frame is None:
+                    return 'closed'
+                if frame[0] == 0xA:
+                    return 'echo' if frame[1] == ping else f'pong of {len(frame[1])} bytes'
+    except socket.timeout:
+        return 'no reply'
+    except OSError as e:
+        return f'error: {e}'
 
 
 class Runner:
@@ -131,6 +203,8 @@ def main():
                                                 origin=f'http://{rebind}'), '403')
         expect('DNS rebinding, GET /', status(a, port, path='/', upgrade=False, host=rebind), '403')
         expect('oversized Origin', status(a, port, host=here, origin='http://' + 'a' * 400), '403')
+        expect('125-byte ping', pong_for(port, 125), 'echo')
+        expect('200-byte ping (over the control-frame cap)', pong_for(port, 200), 'closed')
     finally:
         r.close()
 
