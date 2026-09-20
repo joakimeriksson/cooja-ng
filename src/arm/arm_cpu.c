@@ -177,11 +177,16 @@ static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr,
          * Only armed here; the interpreter takes it at the end of the
          * instruction that issued it, and clears it at the start of every
          * instruction, so a refusal by another bus master between
-         * instructions (FLPR, GDB stub, DMA) is not the core's fault. */
+         * instructions (FLPR, GDB stub, DMA) is not the core's fault.
+         * A multi-word access (LDRD, STM, ...) keeps issuing beats after a
+         * refusal; BFAR names the first one, where silicon aborts the
+         * instruction, which is also the beat the security unit latches in
+         * PERIPHACCERR.ADDRESS. */
         if (__builtin_expect(cpu->io_access_check != NULL, 0) &&
             !cpu->io_access_check(cpu->io_access_user, a, is_write)) {
             cpu->io_blocked = true;
-            cpu->bus_fault_addr = a;
+            if (!cpu->bus_fault_pending)
+                cpu->bus_fault_addr = a;
             cpu->bus_fault_pending = true;
             return NULL;
         }

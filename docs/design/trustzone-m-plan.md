@@ -278,8 +278,9 @@ nothing was ever refused. Now:
   touch only the attribute, the DMA attribute where the slot has DMA, and the
   lock, which holds until reset. A Non-secure transaction reaching a Secure
   peripheral is terminated with an error: the core takes a precise BusFault
-  (CFSR 0x8200, BFAR = the alias used, into the Secure world unless
-  `AIRCR.BFHFNMINS`), the security unit latches the event with the first
+  (CFSR 0x8200, BFAR = the alias used — the first refused beat of a
+  multi-word access, where silicon aborts it, into the Secure world unless
+  `AIRCR.BFHFNMINS`), the security unit latches the event with the same first
   offender's low 16 address bits (cleared with the event) and pends its
   level-sensitive interrupt, and MPC00 latches MEMACCERR. The fault is
   precise: the interpreter snapshots the register file, xPSR and ITSTATE at

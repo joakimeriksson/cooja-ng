@@ -2585,6 +2585,26 @@ static void test_trustzone_bus_fault(void) {
     assert_eq("S view: CFSR", 0x8200, arm_read32(&cpu, 0xE000ED28));
 
 
+    /* BFAR names the first refused beat. STRD r0,r1,[r2] issues two words;
+     * both are refused, the register keeps the first (silicon aborts on it,
+     * and the security unit's PERIPHACCERR.ADDRESS latches the same one). */
+    bf_setup(&cpu, &nvic);
+    write_thumb32(&cpu, CODE_BASE, 0xE9C2, 0x0100);  /* STRD r0,r1,[r2] */
+    cpu.reg[2] = 0x40001500;
+    arm_step(&cpu, 1);
+    assert_eq("two-beat STRD: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("two-beat STRD: CFSR = PRECISERR|BFARVALID", 0x8200, (int)arm_read32(&cpu, 0xE000ED28));
+    assert_eq("two-beat STRD: BFAR = first refused beat", 0x40001500, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("two-beat STRD: stacked PC = the STRD", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+    /* SFAR the same way: LDRD r0,r1,[r2] with both beats in Secure memory. */
+    sf_setup(&cpu, false, 0xBF00);                   /* placeholder, overwritten below */
+    write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0100);  /* LDRD r0,r1,[r2] */
+    cpu.reg[2] = SF_TARGET;
+    arm_step(&cpu, 1);
+    assert_eq("two-beat LDRD to Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("two-beat LDRD to Secure: SFAR = first beat", SF_TARGET, cpu.sfar);
+    assert_eq("two-beat LDRD to Secure: stacked PC = the LDRD", CODE_BASE, arm_read32(&cpu, SF_NS_FRAME + 24));
+
     /* One undo per instruction. LDRD r0,r1,[r2] with beat 1 on a refused
      * Non-secure alias and beat 2 in Secure memory records a bus refusal and
      * an AUVIOL in the same instruction. The SecureFault is taken, alone:
