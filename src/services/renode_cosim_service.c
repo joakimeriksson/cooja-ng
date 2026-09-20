@@ -289,6 +289,17 @@ static int64_t horizon_for(const renode_cosim_service_t *s) {
            (int64_t)((rem * 1000000000ULL) / f);
 }
 
+/* Whether `total` ticks still give a horizon inside int64_t ns.  The count
+ * comes off the wire, and horizon_for's sum would otherwise overflow a
+ * signed integer -- undefined, and in practice a clock that stalls or jumps
+ * ahead depending on where it wraps. */
+static bool ticks_in_range(const renode_cosim_service_t *s, uint64_t total) {
+    uint64_t f = s->cfg.freq_hz ? s->cfg.freq_hz : 1;
+    uint64_t room = (uint64_t)(INT64_MAX - s->base_ns);   /* base_ns >= 0 */
+    /* whole seconds, plus one for the sub-second remainder */
+    return total / f < room / 1000000000ULL;
+}
+
 /* ============================================================
  * Protocol loop
  * ============================================================ */
@@ -307,6 +318,15 @@ static int handle_request(renode_cosim_service_t *s, const renode_msg_t *m) {
     int width = renode_action_width(m->action);
 
     if (m->action == RENODE_TICK_CLOCK) {
+        if (m->value > UINT64_MAX - s->total_ticks ||
+            !ticks_in_range(s, s->total_ticks + m->value)) {
+            char why[128];
+            snprintf(why, sizeof(why), "tickClock of %llu ticks takes the "
+                     "clock past the representable range; ending the run",
+                     (unsigned long long)m->value);
+            mark_dead(s, why);
+            return -1;
+        }
         s->total_ticks += m->value;
         s->stats.ticks++;
         return 1;
