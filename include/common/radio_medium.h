@@ -183,11 +183,15 @@ typedef struct {
     const sim_medium_ops_t *ops;
     /* Links cut by hand (the shell's `link a b off`): bit r of
      * link_blocked[s][r / 64] set = nothing sender slot s transmits reaches
-     * receiver slot r.  any_link_blocked keeps the filters' cost at one
-     * predicted-false branch while no link is cut.  Appended, so plugin
-     * field offsets are unchanged. */
-    bool                any_link_blocked;
-    uint64_t            link_blocked[RADIO_MEDIUM_MAX_NODES][2];
+     * receiver slot r.  NULL while no link is cut, which keeps the filters'
+     * cost at one predicted-false branch; allocated on the first cut and
+     * freed when the last is restored (radio_medium_destroy frees it too).
+     * A pointer rather than the 2 KB table itself: this struct is embedded
+     * in sim_runtime_t, and growing it moved a hot field onto a worse
+     * cache-set alignment (+20-25 % wall time on nRF54L15 workloads on
+     * Apple Silicon, output identical).  Appended, so plugin field offsets
+     * are unchanged. */
+    uint64_t          (*link_blocked)[2];
 } radio_medium_t;
 
 /* Pluggable medium policy (Phase 11 §3.24).  A medium overrides only the
@@ -222,6 +226,9 @@ typedef struct sim_medium_type {
 
 /* Initialize radio medium (defaults to NONE type) */
 void radio_medium_init(radio_medium_t *rm, int node_count);
+/* Free what the medium allocated (the cut-link table).  Safe on a zeroed or
+ * initialized medium; call before re-initializing one that was used. */
+void radio_medium_destroy(radio_medium_t *rm);
 
 /* Configure as UDGM with given parameters */
 void radio_medium_configure_udgm(radio_medium_t *rm, double tx_range,

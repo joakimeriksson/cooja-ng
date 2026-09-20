@@ -1047,6 +1047,7 @@ static void test_workflow(void) {
 
 static void test_environment(void) {
     const char *p;
+    radio_medium_destroy(&mock_sim.radio_medium);   /* before the reset re-inits it */
     mock_reset();
     radio_medium_init(&mock_sim.radio_medium, 3);
     radio_medium_configure_udgm(&mock_sim.radio_medium, 50.0, 100.0, 1.0, 1.0);
@@ -1082,6 +1083,7 @@ static void test_environment(void) {
     CHECK(m_pin_port == 1 && m_pin_pin == 13 && m_pin_level == 1, "button release drives the active-low pin high");
     unlink(p);
 
+    radio_medium_destroy(&mock_sim.radio_medium);   /* before the reset re-inits it */
     mock_reset();
     radio_medium_init(&mock_sim.radio_medium, 3);
     sh.interactive = true;
@@ -1100,6 +1102,7 @@ static void test_environment(void) {
     shell_service_on_restart(&sh);
     shell_script_tick(&sh);
     CHECK(!sh.restart_pending && sh.qcount == 0, "the stream resumes after the restart");
+    radio_medium_destroy(&mock_sim.radio_medium);
 }
 
 static void test_debug(void) {

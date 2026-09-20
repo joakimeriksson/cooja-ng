@@ -2480,12 +2480,15 @@ sim_restart:
      * delivery path.  All frame transmissions will be captured at the
      * sender's on-air timestamp until the writer is closed at end. */
     /* M33: open the capture (prints the status line here, preserving its
-     * position) and register the service for teardown safety. */
+     * position) and register the service for teardown safety.  A restart
+     * closes whatever capture the shell left open first. */
+    pcap_service_close(&pcap_svc);
     pcap_service_open(&pcap_svc, pcap_path);
     sim_service_attach(&sim_rt, sim_registry_find_service(&g_registry, "pcap"),
                        &pcap_svc);
 
-    /* Initialize radio medium */
+    /* Initialize radio medium (a restart re-initializes a used one) */
+    radio_medium_destroy(&radio_medium);
     radio_medium_init(&radio_medium, node_count);
 
     /* Assign default positions in a circle for visualization */

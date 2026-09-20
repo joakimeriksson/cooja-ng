@@ -1698,7 +1698,7 @@ static int cmd_radio(shell_service_t *s, int argc, char **argv, const char *line
             shell_out(s, "  tx range %.1f m  interference range %.1f m  success tx %.2f rx %.2f\n",
                       rm->udgm.tx_range, rm->udgm.interference_range,
                       rm->udgm.success_ratio_tx, rm->udgm.success_ratio_rx);
-        if (rm->any_link_blocked) shell_out(s, "  some links are cut (see links)\n");
+        if (rm->link_blocked) shell_out(s, "  some links are cut (see links)\n");
         return 0;
     }
     if (rm->type == RADIO_MEDIUM_NONE) {

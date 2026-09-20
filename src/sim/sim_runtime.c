@@ -35,9 +35,9 @@ void sim_runtime_init(sim_runtime_t *sim) {
 
 void sim_runtime_destroy(sim_runtime_t *sim) {
     if (!sim) return;
-    /* sim_event_queue_t and radio_medium_t do not own dynamically
-     * allocated memory in the current implementation, so destroy is a
-     * no-op beyond resetting state. */
+    /* sim_event_queue_t owns no dynamically allocated memory; the radio
+     * medium owns its cut-link table. */
+    radio_medium_destroy(&sim->radio_medium);
     for (int i = 0; i < sim->ui_panel_count; i++) {
         free(sim->ui_panels[i].json);
         sim->ui_panels[i].json = NULL;
