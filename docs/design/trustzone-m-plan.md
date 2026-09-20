@@ -306,7 +306,8 @@ nothing was ever refused. Now:
   refused alias — no such pair exists on the real memory map) takes the
   SecureFault only, from one undo. From the
   Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
-  clear, and MMFAR is banked. What firmware reports on a violation is its
+  clear, as are SHCSR's BusFault bits (ACT/PENDED/ENA) and the BusFault
+  priority byte SHPR1.PRI_5, and MMFAR is banked. What firmware reports on a violation is its
   BusFault handler's line. Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC) attribute
   per pin or channel through the FEATURE registers; those are stored, not
   enforced, so a split slot is open to both worlds — on silicon a GPIOTE30

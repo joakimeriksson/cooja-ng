@@ -109,7 +109,9 @@ static int nvic_read(void *user_data, uint32_t addr) {
         case SCB_SCR:   return (int)nvic->scr;
         case SCB_CCR:   return (int)nvic->ccr;
         case SCB_SHPR1:
-            return (int)((uint32_t)nvic->shpr[0] | ((uint32_t)nvic->shpr[1] << 8) |
+            /* PRI_5 (BusFault) is Secure-only while BFHFNMINS is clear. */
+            return (int)((uint32_t)nvic->shpr[0] |
+                   ((ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) ? 0u : (uint32_t)nvic->shpr[1] << 8) |
                    ((uint32_t)nvic->shpr[2] << 16) | ((uint32_t)nvic->shpr[3] << 24));
         case SCB_SHPR2:
             return (int)((uint32_t)nvic->shpr[4] | ((uint32_t)nvic->shpr[5] << 8) |
@@ -117,7 +119,11 @@ static int nvic_read(void *user_data, uint32_t addr) {
         case SCB_SHPR3:
             return (int)((uint32_t)nvic->shpr[8] | ((uint32_t)nvic->shpr[9] << 8) |
                    ((uint32_t)nvic->shpr[10] << 16) | ((uint32_t)nvic->shpr[11] << 24));
-        case SCB_SHCSR: return (int)nvic->shcsr;
+        case SCB_SHCSR:
+            /* The BusFault bits are Secure-only while BFHFNMINS is clear. */
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS))
+                return (int)(nvic->shcsr & ~ARM_SHCSR_BF_BITS);
+            return (int)nvic->shcsr;
         /* Fault status/address registers in the Non-secure view. MMFSR,
          * UFSR and MMFAR are banked between the security states; BFSR,
          * HFSR and BFAR are not, and are RAZ/WI from Non-secure while
@@ -236,10 +242,15 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
      * active ISRs (corrupting the stack on an ISR-triggered context switch). */
     if (offset >= 0xD18 && offset <= 0xD23) {
         int idx = offset - 0xD18;
+        /* SHPR1.PRI_5 (BusFault, byte 1) is Secure-only while BFHFNMINS is
+         * clear: WI from the Non-secure view, like SHCSR's BusFault bits. */
+        bool bf_secure_only = ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS);
         if ((offset & 3u) == 0 && value > 0xFFu) {
-            for (int b = 0; b < 4 && idx + b < 12; b++)
+            for (int b = 0; b < 4 && idx + b < 12; b++) {
+                if (bf_secure_only && idx + b == 1) continue;
                 nvic->shpr[idx + b] = (value >> (8 * b)) & 0xFF;
-        } else {
+            }
+        } else if (!(bf_secure_only && idx == 1)) {
             nvic->shpr[idx] = value & 0xFF;
         }
         nvic->scan_valid = false;
@@ -299,10 +310,13 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
         case SCB_CCR:
             nvic->ccr = value;
             break;
+        /* SHPR1-3: unreachable, the byte-addressable block above returns
+         * first for 0xD18-0xD23. */
         case SCB_SHPR1:
             nvic->scan_valid = false;
             nvic->shpr[0] = value & 0xFF;
-            nvic->shpr[1] = (value >> 8) & 0xFF;
+            if (!(ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)))
+                nvic->shpr[1] = (value >> 8) & 0xFF;
             nvic->shpr[2] = (value >> 16) & 0xFF;
             nvic->shpr[3] = (value >> 24) & 0xFF;
             break;
@@ -321,6 +335,12 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             nvic->shpr[11] = (value >> 24) & 0xFF;
             break;
         case SCB_SHCSR:
+            /* Non-secure view: the BusFault bits are Secure-only while
+             * BFHFNMINS is clear — since the precise BusFault, BUSFAULTENA
+             * decides BusFault vs HardFault, and Non-secure code must not
+             * take that from the Secure world. */
+            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS))
+                value = (value & ~ARM_SHCSR_BF_BITS) | (nvic->shcsr & ARM_SHCSR_BF_BITS);
             nvic->shcsr = value;
             break;
         case SCB_CFSR:  /* write-1-to-clear; see the read side for the NS view */

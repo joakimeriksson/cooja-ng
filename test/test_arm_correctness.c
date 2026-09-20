@@ -2584,6 +2584,44 @@ static void test_trustzone_bus_fault(void) {
     assert_eq("S view: MMFAR is BFAR", 0x40001504, arm_read32(&cpu, 0xE000ED34));
     assert_eq("S view: CFSR", 0x8200, arm_read32(&cpu, 0xE000ED28));
 
+    /* SHCSR's BusFault bits and SHPR1.PRI_5 are Secure-only the same way:
+     * a Non-secure write cannot clear the Secure world's BUSFAULTENA (which
+     * decides BusFault vs HardFault) or reprioritise the BusFault.
+     * NB the "clears the rest" and "PRI_4 taken" / "PRI_6 taken" checks pin
+     * this model, not the architecture: v8-M banks the other SHCSR enable
+     * bits and PRI_4/PRI_6 between the security states, and here they are
+     * one copy that both views write. */
+    cpu.secure = false;
+    nvic.shcsr = ARM_SHCSR_BUSFAULTENA | ARM_SHCSR_BUSFAULTPENDED | (1u << 16);   /* +MEMFAULTENA */
+    nvic.shpr[0] = 0x20; nvic.shpr[1] = 0x40; nvic.shpr[2] = 0x60; nvic.shpr[3] = 0x80;
+    assert_eq("NS view: SHCSR BusFault bits RAZ", 1u << 16, arm_read32(&cpu, 0xE000ED24));
+    arm_write32(&cpu, 0xE000ED24, 1u << 18);                    /* USGFAULTENA, clears the rest */
+    assert_eq("NS view: SHCSR BusFault bits WI", ARM_SHCSR_BUSFAULTENA | ARM_SHCSR_BUSFAULTPENDED | (1u << 18),
+              nvic.shcsr);
+    assert_eq("NS view: SHPR1.PRI_5 RAZ", 0x80600020, arm_read32(&cpu, 0xE000ED18));
+    arm_write32(&cpu, 0xE000ED18, 0xF0F0F0F0);
+    assert_eq("NS view: SHPR1 word write, PRI_5 WI", 0x40, nvic.shpr[1]);
+    assert_eq("NS view: SHPR1 word write, PRI_4 taken", 0xF0, nvic.shpr[0]);
+    assert_eq("NS view: SHPR1 word write, PRI_6 taken", 0xF0, nvic.shpr[2]);
+    arm_write8(&cpu, 0xE000ED19, 0xA0);
+    assert_eq("NS view: SHPR1.PRI_5 byte write WI", 0x40, nvic.shpr[1]);
+    arm_write8(&cpu, 0xE000ED1A, 0xA0);
+    assert_eq("NS view: SHPR1.PRI_6 byte write taken", 0xA0, nvic.shpr[2]);
+    nvic.aircr |= ARM_AIRCR_BFHFNMINS;
+    assert_eq("NS view, BFHFNMINS: SHCSR BusFault bits visible",
+              ARM_SHCSR_BUSFAULTENA | ARM_SHCSR_BUSFAULTPENDED | (1u << 18), arm_read32(&cpu, 0xE000ED24));
+    arm_write32(&cpu, 0xE000ED24, 0);
+    assert_eq("NS view, BFHFNMINS: SHCSR BUSFAULTENA cleared", 0, nvic.shcsr);
+    assert_eq("NS view, BFHFNMINS: SHPR1.PRI_5 visible", 0x40, (arm_read32(&cpu, 0xE000ED18) >> 8) & 0xFF);
+    arm_write8(&cpu, 0xE000ED19, 0xA0);
+    assert_eq("NS view, BFHFNMINS: SHPR1.PRI_5 written", 0xA0, nvic.shpr[1]);
+    nvic.aircr &= ~ARM_AIRCR_BFHFNMINS;
+    cpu.secure = true;
+    nvic.shcsr = ARM_SHCSR_BUSFAULTENA;
+    arm_write32(&cpu, 0xE000ED24, 0);
+    assert_eq("S view: SHCSR BUSFAULTENA cleared", 0, nvic.shcsr);
+    arm_write8(&cpu, 0xE000ED19, 0x40);
+    assert_eq("S view: SHPR1.PRI_5 written", 0x40, nvic.shpr[1]);
 
     /* BFAR names the first refused beat. STRD r0,r1,[r2] issues two words;
      * both are refused, the register keeps the first (silicon aborts on it,

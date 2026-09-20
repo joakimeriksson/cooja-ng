@@ -35,7 +35,14 @@
 #define SCB_MMFAR   0xD34  /* MemManage Fault Address (same register as BFAR here) */
 #define SCB_BFAR    0xD38  /* BusFault Address */
 
-#define ARM_SHCSR_BUSFAULTENA (1u << 17)
+#define ARM_SHCSR_BUSFAULTACT    (1u << 1)
+#define ARM_SHCSR_BUSFAULTPENDED (1u << 14)
+#define ARM_SHCSR_BUSFAULTENA    (1u << 17)
+/* BusFault is a Secure exception while AIRCR.BFHFNMINS is clear: its
+ * state, enable and priority (SHPR1.PRI_5) are Secure-only, RAZ/WI from
+ * the Non-secure view like BFSR/HFSR/BFAR. */
+#define ARM_SHCSR_BF_BITS (ARM_SHCSR_BUSFAULTACT | ARM_SHCSR_BUSFAULTPENDED | \
+                           ARM_SHCSR_BUSFAULTENA)
 #define ARM_AIRCR_BFHFNMINS   (1u << 13)
 #define ARM_CFSR_PRECISERR    (1u << 9)    /* BFSR.PRECISERR */
 #define ARM_CFSR_BFARVALID    (1u << 15)   /* BFSR.BFARVALID */
