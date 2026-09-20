@@ -297,7 +297,11 @@ nothing was ever refused. Now:
   handler at the same or higher priority, BASEPRI, PRIMASK, FAULTMASK). Only
   the core's own transactions fault: a refusal issued between instructions
   by another master (the FLPR co-stepped between slices, the GDB stub, a DMA
-  engine) latches the security unit's event but raises no BusFault. From the
+  engine) latches the security unit's event but raises no BusFault. The
+  attribution unit's own refusal (a Non-secure data access to Secure memory,
+  SecureFault AUVIOL) is precise the same way, from the same snapshot; the
+  INVIS and SG-side INVEP SecureFaults are still taken after the instruction.
+  From the
   Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
   clear, and MMFAR is banked. What firmware reports on a violation is its
   BusFault handler's line. Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC) attribute

@@ -257,8 +257,9 @@ typedef struct arm_cpu {
     uint32_t  bus_fault_addr;        /* address of the refused transaction */
     bool      bus_fault_pending;
     /* Pre-instruction register state, captured while a bus-side permission
-     * check is installed (io_access_check), so a precise BusFault can undo
-     * the instruction. */
+     * check is installed (io_access_check) or the security extension is
+     * enabled, so a precise BusFault or an AUVIOL SecureFault can undo the
+     * instruction. */
     struct {
         uint32_t reg[16];
         uint32_t xpsr;
@@ -313,6 +314,9 @@ typedef struct arm_cpu {
     uint32_t  sfsr;                  /* SecureFault Status Register */
     uint32_t  sfar;                  /* SecureFault Address Register */
     bool      secure_fault_pending;  /* a SecureFault has been recorded */
+    bool      secure_fault_undo;     /* it is a refused data access (AUVIOL):
+                                        precise, the instruction is undone
+                                        from insn_snap before entry */
 
     /* Secure exception model (Step 4). When a secure exception is taken from
      * Non-secure background, the background security state is stashed here and

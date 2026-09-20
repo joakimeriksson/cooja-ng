@@ -226,6 +226,15 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * These check SRAM first (most common data target), then flash,
  * then fall back to the public functions for IO/ROM/bitband. */
 
+/* Undo the instruction being executed: restore the register file, xPSR and
+ * ITSTATE captured at its start, so a precise fault stacks the instruction
+ * itself and none of its writes survive. Cycles stay charged. */
+static inline void arm_insn_undo(arm_cpu_t *cpu) {
+    memcpy(cpu->reg, cpu->insn_snap.reg, sizeof(cpu->reg));
+    cpu->xpsr = cpu->insn_snap.xpsr;
+    cpu->it_state = cpu->insn_snap.it_state;
+}
+
 /* TrustZone-M data-access enforcement gate. The common case — no security
  * extension, or executing Secure — is a single predicted-true branch with no
  * added cost. When a Non-secure access is refused by the attribution unit it
@@ -730,6 +739,7 @@ void arm_cpu_reset(arm_cpu_t *cpu) {
     cpu->sfsr = 0;
     cpu->sfar = 0;
     cpu->secure_fault_pending = false;
+    cpu->secure_fault_undo = false;
     cpu->cfsr = cpu->hfsr = cpu->bfar = cpu->mmfar_ns = 0;
     cpu->bus_fault_addr = 0;
     cpu->bus_fault_pending = false;
@@ -1800,13 +1810,14 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
 
         uint32_t pc = cpu->reg[ARM_PC];
 
-        /* Precise BusFault support (SoCs with a bus-side permission check):
-         * a refusal is taken at the end of the instruction that issued it,
-         * with the instruction's register writes undone, so capture the
-         * state it starts from. Anything armed between instructions (a
-         * refused access by the FLPR, the GDB stub or an event callback) is
-         * discarded here — it was not this core's transaction. */
-        if (__builtin_expect(cpu->io_access_check != NULL, 0)) {
+        /* Precise fault support (a SoC with a bus-side permission check, or
+         * the security extension's attribution unit): a refusal is taken at
+         * the end of the instruction that issued it, with the instruction's
+         * register writes undone, so capture the state it starts from.
+         * Anything armed between instructions (a refused access by the
+         * FLPR, the GDB stub or an event callback) is discarded here — it
+         * was not this core's transaction. */
+        if (__builtin_expect(cpu->io_access_check != NULL || cpu->tz_enabled, 0)) {
             memcpy(cpu->insn_snap.reg, cpu->reg, sizeof(cpu->reg));
             cpu->insn_snap.xpsr = cpu->xpsr;
             cpu->insn_snap.it_state = cpu->it_state;
@@ -4040,9 +4051,17 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
 
         /* ARMv8-M: take a recorded SecureFault (Step 2/4). It is the
          * highest-priority configurable fault; escalation to secure HardFault
-         * when masked is not modelled. Gated on tz_enabled. */
+         * when masked is not modelled. Gated on tz_enabled. A refused data
+         * access (AUVIOL) is precise like the BusFault below: the instruction
+         * is undone so the frame names it and its destination is untouched.
+         * INVIS (FNC_RETURN) and the SG-side INVEP are still taken after the
+         * instruction; the fetch-side INVEP never runs it. */
         if (cpu->tz_enabled && cpu->secure_fault_pending) {
             cpu->secure_fault_pending = false;
+            if (cpu->secure_fault_undo) {
+                cpu->secure_fault_undo = false;
+                arm_insn_undo(cpu);
+            }
             arm_exception_entry(cpu, EXC_SECUREFAULT);
         }
 
@@ -4059,9 +4078,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * modelled. */
         if (__builtin_expect(cpu->bus_fault_pending, 0)) {
             cpu->bus_fault_pending = false;
-            memcpy(cpu->reg, cpu->insn_snap.reg, sizeof(cpu->reg));
-            cpu->xpsr = cpu->insn_snap.xpsr;
-            cpu->it_state = cpu->insn_snap.it_state;
+            arm_insn_undo(cpu);
             cpu->cfsr |= ARM_CFSR_PRECISERR | ARM_CFSR_BFARVALID;
             cpu->bfar = cpu->bus_fault_addr;
             arm_nvic_t *nv = (arm_nvic_t *)cpu->nvic;

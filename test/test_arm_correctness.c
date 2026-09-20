@@ -2267,46 +2267,102 @@ static void test_trustzone_instrumentation(void) {
 
 /* Step 4: a Non-secure illegal access faults, the SecureFault is taken into
  * the Secure handler (via VTOR_S), and exception-return restores Non-secure. */
+/* AUVIOL SecureFault: a Non-secure data access refused by the attribution
+ * unit. Precise, like the BusFault below: the frame names the faulting
+ * instruction, a refused load leaves its destination register alone, a
+ * refused store leaves memory alone, and a handler that returns without
+ * patching the frame re-executes it. */
+#define SF_HANDLER   (CODE_BASE + 0x40)
+#define SF_TARGET    0x20004000u          /* Secure SRAM (above the NS region) */
+#define SF_NS_SP     0x20003F00u
+#define SF_NS_FRAME  (SF_NS_SP - 32)      /* frame the fault pushes on the NS stack */
+static void sf_setup(arm_cpu_t *cpu, bool patch_frame, uint16_t insn) {
+    setup_arm(cpu);
+    cpu->tz_enabled = true;
+    cpu->secure = false;               /* Non-secure background */
+    cpu->use_psp = false;
+    cpu->sau_sregions = 8;
+    cpu->sau_ctrl = ARM_SAU_CTRL_ENABLE;
+    /* The lower half of SRAM and the code area are Non-secure; the upper
+     * half stays Secure and holds the access target. */
+    cpu->sau_rbar[0] = 0x20000000;
+    cpu->sau_rlar[0] = (0x20003FFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
+    cpu->sau_rbar[1] = ARM_FLASH_BASE & ~0x1Fu;
+    cpu->sau_rlar[1] = ((ARM_FLASH_BASE + 0xFFFFu) & ~0x1Fu) | ARM_SAU_RLAR_ENABLE;
+
+    /* Secure vector table at flash base; SecureFault (exc 7) handler. */
+    cpu->vtor_s = ARM_FLASH_BASE;
+    write_flash32(cpu, ARM_FLASH_BASE + EXC_SECUREFAULT * 4, SF_HANDLER | 1);
+    if (patch_frame) {
+        /* Skip the faulting Thumb-16 instruction. The frame is on the
+         * Non-secure main stack while the Secure handler runs on MSP_S:
+         * MRS r2,MSP_NS; LDR r3,[r2,#24]; ADDS r3,#2; STR r3,[r2,#24]; BX LR */
+        write_thumb32(cpu, SF_HANDLER + 0, 0xF3EF, 0x8288);
+        write_thumb16(cpu, SF_HANDLER + 4, 0x6993);
+        write_thumb16(cpu, SF_HANDLER + 6, 0x3302);
+        write_thumb16(cpu, SF_HANDLER + 8, 0x6193);
+        write_thumb16(cpu, SF_HANDLER + 10, 0x4770);
+    } else {
+        write_thumb16(cpu, SF_HANDLER, 0x4770);      /* BX LR */
+    }
+
+    write_thumb16(cpu, CODE_BASE, insn);             /* the refused access */
+    write_thumb16(cpu, CODE_BASE + 2, 0x2001);       /* MOVS r0, #1 */
+    cpu->reg[ARM_PC] = CODE_BASE;
+    cpu->reg[0] = 0xDEADBEEF;                        /* must survive a refused load */
+    cpu->reg[1] = SF_TARGET;
+    arm_write32(cpu, SF_TARGET, 0x12345678);         /* must survive a refused store */
+    cpu->reg[ARM_SP] = SF_NS_SP;
+    cpu->msp_s = 0x20007000;                         /* Secure stack */
+}
+
 static void test_trustzone_secure_exception(void) {
     if (verbose) printf("--- ARMv8-M TrustZone SecureFault exception tests ---\n");
     arm_cpu_t cpu;
-    setup_arm(&cpu);
-    cpu.tz_enabled = true;
-    cpu.secure = false;               /* Non-secure background */
-    cpu.use_psp = false;
-    cpu.sau_sregions = 8;
-    cpu.sau_ctrl = ARM_SAU_CTRL_ENABLE;
-    /* Mark all of SRAM Non-secure, and the code area too — Non-secure code
-     * has to be fetched from Non-secure memory. The load target below stays
-     * outside both regions, so it remains Secure and is what faults. */
-    cpu.sau_rbar[0] = 0x20000000;
-    cpu.sau_rlar[0] = (0x20007FFF & ~0x1fu) | ARM_SAU_RLAR_ENABLE;
-    cpu.sau_rbar[1] = ARM_FLASH_BASE & ~0x1Fu;
-    cpu.sau_rlar[1] = ((ARM_FLASH_BASE + 0xFFFFu) & ~0x1Fu) | ARM_SAU_RLAR_ENABLE;
 
-    /* Secure vector table at flash base; SecureFault (exc 7) handler. */
-    cpu.vtor_s = ARM_FLASH_BASE;
-    write_flash32(&cpu, ARM_FLASH_BASE + 7 * 4, (CODE_BASE + 0x40) | 1);
-    write_thumb16(&cpu, CODE_BASE + 0x40, 0x4770);   /* BX LR at handler */
-
-    /* Non-secure code: LDR r0, [r1] where r1 points at Secure memory. */
-    write_thumb16(&cpu, CODE_BASE, 0x6808);          /* LDR r0, [r1, #0] */
-    cpu.reg[ARM_PC] = CODE_BASE;
-    cpu.reg[1] = 0x00001000;          /* Secure address */
-    cpu.reg[ARM_SP] = 0x20007F00;     /* NS stack (in SRAM) */
-    cpu.msp_s = 0x20007000;           /* Secure stack */
-
+    /* LDR r0,[r1] from Secure memory: precise fault, load not done. */
+    sf_setup(&cpu, true, 0x6808);
     arm_step(&cpu, 1);   /* executes LDR, records + takes SecureFault */
     assert_true("SecureFault taken: now Secure", cpu.secure);
-    assert_eq("SecureFault: PC = secure handler", CODE_BASE + 0x40,
-              cpu.reg[ARM_PC]);
+    assert_eq("SecureFault: PC = secure handler", SF_HANDLER, cpu.reg[ARM_PC]);
     assert_true("SecureFault: SFSR.AUVIOL set", (cpu.sfsr & ARM_SFSR_AUVIOL) != 0);
-    assert_eq("SecureFault: SFAR = faulting address", 0x00001000, cpu.sfar);
+    assert_eq("SecureFault: SFAR = faulting address", SF_TARGET, cpu.sfar);
+    assert_eq("SecureFault: stacked PC = the faulting LDR", CODE_BASE,
+              arm_read32(&cpu, SF_NS_FRAME + 24));
+    assert_eq("SecureFault: refused load left r0 alone", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("SecureFault: NS SP = frame", SF_NS_FRAME, cpu.msp_ns);
 
-    arm_step(&cpu, 1);   /* BX LR — exception return */
+    arm_step(&cpu, 5);   /* handler patches the frame, exception return */
     assert_true("SecureFault return: back to Non-secure", !cpu.secure);
-    assert_eq("SecureFault return: PC = instr after LDR", CODE_BASE + 2,
+    assert_eq("SecureFault return: PC = instr after the skipped LDR", CODE_BASE + 2,
               cpu.reg[ARM_PC]);
+    arm_step(&cpu, 1);
+    assert_eq("SecureFault return: MOVS ran", 1, cpu.reg[0]);
+
+    /* A handler that does not patch the frame returns to the LDR, which
+     * faults again. */
+    sf_setup(&cpu, false, 0x6808);
+    arm_step(&cpu, 1);
+    assert_eq("unpatched: handler entered", SF_HANDLER, cpu.reg[ARM_PC]);
+    cpu.sfsr = 0;
+    arm_step(&cpu, 1);   /* BX LR */
+    assert_true("unpatched: back to NS at the LDR",
+                !cpu.secure && cpu.reg[ARM_PC] == CODE_BASE);
+    arm_step(&cpu, 1);
+    assert_eq("unpatched: re-executed LDR faults again", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_true("unpatched: SFSR.AUVIOL set again", (cpu.sfsr & ARM_SFSR_AUVIOL) != 0);
+    assert_eq("unpatched: r0 still untouched", 0xDEADBEEF, cpu.reg[0]);
+
+    /* STR r0,[r1] to Secure memory: the store is refused, memory unchanged,
+     * the STR is stacked. */
+    sf_setup(&cpu, true, 0x6008);
+    arm_step(&cpu, 1);
+    assert_eq("STR: handler entered", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("STR: stacked PC = the STR", CODE_BASE, arm_read32(&cpu, SF_NS_FRAME + 24));
+    assert_eq("STR: SFAR = target", SF_TARGET, cpu.sfar);
+    assert_eq("STR: Secure memory unchanged", 0x12345678, arm_read32(&cpu, SF_TARGET));
+    arm_step(&cpu, 5);
+    assert_true("STR: skipped, back to NS", !cpu.secure && cpu.reg[ARM_PC] == CODE_BASE + 2);
 }
 
 /* Bus-side permission refusal: the transaction is terminated with a precise
