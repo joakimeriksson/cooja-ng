@@ -109,14 +109,14 @@ static int nvic_read(void *user_data, uint32_t addr) {
         case SCB_SCR:   return (int)nvic->scr;
         case SCB_CCR:   return (int)nvic->ccr;
         case SCB_SHPR1:
-            return nvic->shpr[0] | (nvic->shpr[1] << 8) |
-                   (nvic->shpr[2] << 16) | (nvic->shpr[3] << 24);
+            return (int)((uint32_t)nvic->shpr[0] | ((uint32_t)nvic->shpr[1] << 8) |
+                   ((uint32_t)nvic->shpr[2] << 16) | ((uint32_t)nvic->shpr[3] << 24));
         case SCB_SHPR2:
-            return nvic->shpr[4] | (nvic->shpr[5] << 8) |
-                   (nvic->shpr[6] << 16) | (nvic->shpr[7] << 24);
+            return (int)((uint32_t)nvic->shpr[4] | ((uint32_t)nvic->shpr[5] << 8) |
+                   ((uint32_t)nvic->shpr[6] << 16) | ((uint32_t)nvic->shpr[7] << 24));
         case SCB_SHPR3:
-            return nvic->shpr[8] | (nvic->shpr[9] << 8) |
-                   (nvic->shpr[10] << 16) | (nvic->shpr[11] << 24);
+            return (int)((uint32_t)nvic->shpr[8] | ((uint32_t)nvic->shpr[9] << 8) |
+                   ((uint32_t)nvic->shpr[10] << 16) | ((uint32_t)nvic->shpr[11] << 24));
         case SCB_SHCSR: return (int)nvic->shcsr;
         /* Fault status/address registers in the Non-secure view. MMFSR,
          * UFSR and MMFAR are banked between the security states; BFSR,
