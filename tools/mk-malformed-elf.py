@@ -134,6 +134,14 @@ CASES = [
     # The only segment is BSS: memory is zeroed, no code is placed.
     ('bss-only.sky', 'rejected',
      ehdr(phoff=EHDR_SIZE, phnum=1) + phdr(0x4000, 0, 0, memsz=0x100)),
+    # Partially loaded: one good segment, one that routes nowhere.  Counting
+    # only the bytes placed would boot this -- with the hole where the second
+    # segment belonged, here the reset vector, so it starts at PC=0.
+    ('partial-load-unroutable.sky', 'rejected',
+     image([], segments=[(0x4000, b'\xff\x3f'), (0xffffffff, b'\x00\x40')])),
+    # The same, with the unroutable segment straddling the end of memory.
+    ('partial-load-straddle.sky', 'rejected',
+     image([], segments=[(0x4000, b'\xff\x3f'), (0xfffe, b'\x00\x40\x00\x40')])),
 ]
 
 

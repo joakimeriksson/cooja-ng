@@ -64,9 +64,14 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
 
         elf_segment_route_t seg = route(ctx, phdr.p_paddr, phdr.p_vaddr, phdr.p_filesz);
         if (!seg.dest) {
+            /* Bytes that route nowhere leave a hole the firmware expects
+             * filled -- often the reset vector, which boots the image at
+             * PC=0. Placing the other segments would run half an image. */
             if (phdr.p_filesz > 0) {
-                fprintf(stderr, "ELF segment at 0x%x (size 0x%x) doesn't map to memory\n",
-                        phdr.p_paddr, phdr.p_filesz);
+                fprintf(stderr, "ELF segment at 0x%x (size 0x%x) doesn't map to "
+                        "memory: %s\n", phdr.p_paddr, phdr.p_filesz, path);
+                fclose(f);
+                return -1;
             }
             continue;
         }
