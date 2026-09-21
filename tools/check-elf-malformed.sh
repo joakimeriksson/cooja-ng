@@ -7,9 +7,9 @@
 #
 # No image may crash: exit below 128 (no signal) and no sanitizer report.
 # An image whose expectation is "patch-skipped" must also say that a symbol
-# lay outside memory -- proof that the bound, not luck, kept the write out.
-# A "rejected" image must fail to boot with a non-zero exit, not run a
-# zero-filled address space and report success.
+# lay outside memory -- proof that the bound, not luck, kept the write out --
+# and, like a "rejected" one, fail to boot with a non-zero exit rather than
+# run a zero-filled or half-patched address space and report success.
 #
 # The stock build only catches wild writes that land on unmapped memory; a
 # straddling write needs a sanitizer build to be seen.  Point RUNNER at one
@@ -43,10 +43,10 @@ while read -r name expect; do
     elif [ "$expect" = patch-skipped ] &&
          ! grep -q 'lies outside memory, not patched' "$log"; then
         why="no 'not patched' warning"
-    elif [ "$expect" = rejected ] &&
+    elif { [ "$expect" = rejected ] || [ "$expect" = patch-skipped ]; } &&
          { [ "$rc" -eq 0 ] || ! grep -q 'Failed to initialize node' "$log"; }; then
         why="booted instead of being rejected"
-    elif [ "$expect" != rejected ] && [ "$rc" -ne 0 ]; then
+    elif [ "$expect" = no-crash ] && [ "$rc" -ne 0 ]; then
         why="did not run to completion"
     fi
     if [ -n "$why" ]; then

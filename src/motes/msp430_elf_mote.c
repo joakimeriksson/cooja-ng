@@ -55,13 +55,18 @@ static uint32_t mem_le32(const msp430_cpu_t *cpu, uint32_t addr) {
                 ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24)) : 0;
 }
 
-/* Boot patches: the target, or NULL after saying which symbol was skipped. */
+/* Boot patches: the target, or NULL after saying which symbol was skipped
+ * and counting it in *skipped. A symbol the image exports but places
+ * outside the address space cannot occur in a valid firmware, so the
+ * count fails the boot rather than leaving the node half-patched. */
 static uint8_t *patch_at(const msp430_cpu_t *cpu, const char *sym,
-                         uint32_t addr, size_t len) {
+                         uint32_t addr, size_t len, int *skipped) {
     uint8_t *p = mem_at(cpu, addr, len);
-    if (!p)
+    if (!p) {
         fprintf(stderr, "  Warning: symbol %s at 0x%x (+%zu) lies outside "
                         "memory, not patched\n", sym, addr, len);
+        (*skipped)++;
+    }
     return p;
 }
 
@@ -284,6 +289,9 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
                          const sim_mote_env_t *env) {
     int idx = slot;
     msp430_platform_t *plat = &node->plat.msp;
+    /* Patches skipped because their symbol lies outside chip memory;
+     * checked once below, after the last of them. */
+    int patch_skipped = 0;
 
     /* Platform name comes from the board registry row (Phase 3). */
     const char *plat_name = node->board->name;
@@ -311,7 +319,8 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
     /* Patch ds2411_init() to RET immediately */
     uint32_t ds2411_init_addr = msp430_elf_find_symbol(firmware_path, "ds2411_init");
     uint8_t *ds2411_init_fn = ds2411_init_addr
-        ? patch_at(&plat->cpu, "ds2411_init", ds2411_init_addr, 2) : NULL;
+        ? patch_at(&plat->cpu, "ds2411_init", ds2411_init_addr, 2,
+                   &patch_skipped) : NULL;
     if (ds2411_init_fn) {
         ds2411_init_fn[0] = 0x30;
         ds2411_init_fn[1] = 0x41;
@@ -327,7 +336,8 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
                                    NULL};
         for (int p = 0; patch_fns[p]; p++) {
             uint32_t addr = msp430_elf_find_symbol(firmware_path, patch_fns[p]);
-            uint8_t *fn = addr ? patch_at(&plat->cpu, patch_fns[p], addr, 2) : NULL;
+            uint8_t *fn = addr ? patch_at(&plat->cpu, patch_fns[p], addr, 2,
+                                          &patch_skipped) : NULL;
             if (fn) {
                 fn[0] = 0x10;  /* RETA */
                 fn[1] = 0x01;
@@ -374,7 +384,8 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
      * This matches Cooja's test CSC ping targets (e.g. fd00::0212:7404:0004:0404). */
     uint32_t ds2411_addr = msp430_elf_find_symbol(firmware_path, "ds2411_id");
     uint8_t *id = ds2411_addr
-        ? patch_at(&plat->cpu, "ds2411_id", ds2411_addr, 8) : NULL;
+        ? patch_at(&plat->cpu, "ds2411_id", ds2411_addr, 8,
+                   &patch_skipped) : NULL;
     if (id) {
         id[0] = 0x00; id[1] = 0x12; id[2] = 0x74;
         id[3] = (uint8_t)(node_id & 0xff);
@@ -408,7 +419,8 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
      * Must be written AFTER crt0 clears BSS but BEFORE platform_init. */
     {
         uint32_t nid = msp430_elf_find_symbol(firmware_path, "node_id");
-        uint8_t *p = nid ? patch_at(&plat->cpu, "node_id", nid, 2) : NULL;
+        uint8_t *p = nid ? patch_at(&plat->cpu, "node_id", nid, 2,
+                                    &patch_skipped) : NULL;
         if (p) {
             p[0] = (uint8_t)(node_id & 0xFF);
             p[1] = (uint8_t)((node_id >> 8) & 0xFF);
@@ -423,7 +435,8 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
         const char *addr_syms[] = {"linkaddr_node_addr", "node_mac", "uip_lladdr", NULL};
         for (int a = 0; addr_syms[a]; a++) {
             uint32_t sym = msp430_elf_find_symbol(firmware_path, addr_syms[a]);
-            uint8_t *p = sym ? patch_at(&plat->cpu, addr_syms[a], sym, 8) : NULL;
+            uint8_t *p = sym ? patch_at(&plat->cpu, addr_syms[a], sym, 8,
+                                        &patch_skipped) : NULL;
             if (p) {
                 /* Use same IEEE format as Cooja MspMote: c1:0c:00:00:00:00:00:id
                  * First byte must be non-zero or Z1 platform overwrites it */
@@ -434,14 +447,31 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
             }
         }
         uint32_t nid_addr = msp430_elf_find_symbol(firmware_path, "node_id");
-        uint8_t *nid = nid_addr ? patch_at(&plat->cpu, "node_id", nid_addr, 2) : NULL;
+        uint8_t *nid = nid_addr ? patch_at(&plat->cpu, "node_id", nid_addr, 2,
+                                           &patch_skipped) : NULL;
         if (nid) {
             nid[0] = (uint8_t)node_id;
             nid[1] = 0;
         }
-        printf("  Patched node_id=%d, linkaddr, node_mac for Z1\n", node_id);
+        /* Only claim the patch when every one of them landed; a valid
+         * image never skips one, so this line is unchanged for real
+         * firmware. */
+        if (patch_skipped == 0)
+            printf("  Patched node_id=%d, linkaddr, node_mac for Z1\n", node_id);
     }
 
+    /* Last of the symbol-addressed patches. A skipped one leaves the node
+     * with an unpatched identity -- two nodes answering to the same
+     * node_id, a run that looks healthy and exits 0. No valid image
+     * exports a symbol outside its own address space, so refuse to boot
+     * rather than simulate the wrong network. */
+    if (patch_skipped > 0) {
+        fprintf(stderr, "Node %d [MSP430]: %d identity patch%s skipped, "
+                "refusing to boot: %s\n", node_id, patch_skipped,
+                patch_skipped == 1 ? "" : "es", firmware_path);
+        msp430_platform_destroy(plat);
+        return -1;
+    }
 
     /* Run past main() entry through DCO calibration and platform init.
      * Must stop AFTER TimerA is running with events scheduled AND

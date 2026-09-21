@@ -83,7 +83,8 @@ TOP_OF_MEMORY = [(0x4000, b'\xff\x3f'),
                  (0xfff0, b'\x01' * 14 + b'\x00\x40')]
 
 # (file, expectation, bytes).  Expectations:
-#   patch-skipped  runs to completion and says a symbol was not patched
+#   patch-skipped  says a symbol was not patched, then fails to boot: an
+#                  unpatched identity is a wrong simulation, not a warning
 #   no-crash       runs to completion (exit < 128, no sanitizer report)
 #   rejected       fails to boot: non-zero exit and "Failed to initialize node"
 CASES = [
