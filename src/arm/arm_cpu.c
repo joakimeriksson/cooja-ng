@@ -4758,8 +4758,8 @@ void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
      * pending event at exactly cycle_limit stays queued until the next
      * arm_step call, introducing one tick of latency per boundary event.
      * Matches msp430_step_until's drain loop. */
-    while (cpu->cycles >= cpu->next_event_cycle)
-        execute_events(cpu);
+    while (!cpu->dbg_halted && cpu->cycles >= cpu->next_event_cycle)
+        execute_events(cpu);      /* not on a halted core: its events wait too */
 
     cpu->cycle_limit = INT64_MAX;
     if (cpu->cpu_freq_hz > 0)
@@ -4769,6 +4769,10 @@ void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
 int64_t arm_step_micros(arm_cpu_t *cpu, int64_t jump_us, int64_t execute_us) {
     if (jump_us < 0) jump_us = 0;
     if (execute_us < 0) execute_us = 0;
+    /* A halted core does not move: a radio byte delivered to a parked node
+     * (arm_mote_rx_byte_sync) must not step it, drain its events or count
+     * the jump.  The release re-anchors last_execute_us. */
+    if (cpu->dbg_halted) return 0;
 
     /* Direct port of msp430_step_micros — exact MSPSim stepMicros replication:
      * - last_micros_delta accumulates ALL jump values (never reset)

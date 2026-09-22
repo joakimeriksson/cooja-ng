@@ -912,7 +912,7 @@ static arm_cpu_t *dbg_cpu(shell_service_t *s, int node_id) {
  * resumes at the current instant with its clock that much behind.  A halted
  * node is parked (no wakeup of its own), so schedule one. */
 static void dbg_release(shell_service_t *s, int node_id, arm_cpu_t *cpu) {
-    if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->reg[ARM_PC] & ~1u;
+    if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->dbg_hit_pc;   /* the hit, not the live pc */
     cpu->dbg_halted = false;
     cpu->last_execute_us = now_ns(s) / 1000LL;
     for (int k = 0; k < s->dbg_count; k++)

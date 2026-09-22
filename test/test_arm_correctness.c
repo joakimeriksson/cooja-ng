@@ -3110,6 +3110,39 @@ static void test_trustzone_vfp(void) {
     assert_eq("VLDR from Non-secure: s2 loaded", 0x3F800000, cpu.vfp_s[2]);
 }
 
+/* A core in debug halt (a shell breakpoint) dispatches nothing: an IRQ a
+ * peripheral pends stays pending, with PC and SP untouched, and is taken at
+ * the release. */
+static void test_debug_halt_holds_irqs(void) {
+    if (verbose) printf("--- debug halt holds pending IRQs ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    arm_nvic_t nvic;
+    arm_nvic_init(&nvic, &cpu);
+    nvic.vtor = ARM_FLASH_BASE;
+    write_flash32(&cpu, ARM_FLASH_BASE + (16 + BF_IRQ) * 4, IRQ_HANDLER | 1);
+    write_thumb16(&cpu, IRQ_HANDLER, 0x4770);        /* BX LR */
+    nvic.iser[0] |= 1u << BF_IRQ;
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[ARM_SP] = 0x20007F00;
+    int64_t cycles = cpu.cycles;
+
+    cpu.dbg_halted = true;
+    arm_nvic_set_pending(&nvic, BF_IRQ);
+    assert_eq("halted: PC untouched", CODE_BASE, cpu.reg[ARM_PC]);
+    assert_eq("halted: SP untouched", 0x20007F00, cpu.reg[ARM_SP]);
+    assert_true("halted: IRQ still pending", (nvic.ispr[0] >> BF_IRQ) & 1);
+    assert_true("halted: no entry latency charged", cpu.cycles == cycles);
+    arm_step_micros(&cpu, 1000, 0);                  /* a radio byte's sync step */
+    assert_true("halted: step_micros does not move the core", cpu.cycles == cycles);
+
+    cpu.dbg_halted = false;
+    arm_nvic_check_pending(&nvic);
+    assert_eq("released: IRQ taken", IRQ_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("released: stacked PC = the halt site", CODE_BASE, arm_read32(&cpu, cpu.reg[ARM_SP] + 24));
+    arm_cpu_destroy(&cpu);
+}
+
 /* Step 5: NVIC target-security (NVIC_ITNS) decides an IRQ's security state. */
 static void test_trustzone_nvic_itns(void) {
     if (verbose) printf("--- ARMv8-M TrustZone NVIC target-security tests ---\n");
@@ -3518,6 +3551,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_transitions();
     test_trustzone_secure_exception();
     test_trustzone_nvic_itns();
+    test_debug_halt_holds_irqs();
     test_trustzone_instrumentation();
     test_trustzone_blxns();
     test_trustzone_fnc_return_refused();

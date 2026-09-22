@@ -1,0 +1,22 @@
+# A halted node stays where it stopped while the others run on: radio
+# traffic reaching it pends its IRQ instead of vectoring it (pc and sp keep
+# the breakpoint site), and the release does not re-hit the breakpoint from
+# the ISR return (the bug re-hit 1 us after `continue`; a genuine re-entry
+# of process_run by the main loop takes milliseconds).  Two-node RPL-UDP.
+run 3s
+break 1 process_run
+run 100ms
+expect-halt 1 1s
+reg -c hit 1 pc
+reg -c sp0 1 sp
+run 5s
+reg -c later 1 pc
+reg -c sp1 1 sp
+assert var later == $hit
+assert var sp1 == $sp0
+continue
+run 100us
+reg -c after 1 pc
+assert var after != $hit
+assert node 1 active
+pass
