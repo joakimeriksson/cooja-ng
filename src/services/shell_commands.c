@@ -1309,6 +1309,11 @@ static int check_command_text(shell_service_t *s, const char *what, const char *
                     "(put the sequence in a script instead)", what, argv[0]);
         return -1;
     }
+    if (!strcmp(argv[0], "restart")) {      /* the mirror image: it discards the stream */
+        shell_error(s, "%s cannot run 'restart': it would discard the pending command "
+                    "stream (type it, or put it in a script)", what);
+        return -1;
+    }
     return 0;
 }
 
@@ -2408,9 +2413,9 @@ static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only
     /* Scheduled commands were validated when scheduled; this is the
      * backstop for anything that slipped through. */
     if ((s->origin.kind == SHELL_ORIGIN_AT || s->origin.kind == SHELL_ORIGIN_ON) &&
-        shell_line_blocks(line)) {
-        shell_error(s, "'%s' cannot run from at/every/on: it would block the command stream",
-                    c->name);
+        (shell_line_blocks(line) || !strcmp(c->name, "restart"))) {
+        shell_error(s, "'%s' cannot run from at/every/on: it would %s the command stream",
+                    c->name, shell_line_blocks(line) ? "block" : "discard");
         return -1;
     }
     int nargs = argc - 1;

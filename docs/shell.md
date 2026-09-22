@@ -88,7 +88,7 @@ Times: `5s`, `250ms`, `1500us`, `1.5s`, `2m`; a bare number is milliseconds;
 | `leds [nodes]` | LED states |
 | `gpio <node> <port>.<pin> high\|low\|pulse [duration]\|release` | drive an input pin: MSP430 `P1.0`-`P10.7`, CC2538 `A.0`-`D.7` (raises the pin interrupt the firmware configured), nRF54L15 `P0`-`P2` (the IN register only; no GPIOTE interrupt is modelled); nRF52840 has no GPIO model.  `release` stops forcing the pin: on the nRF54L15 IN follows OUT again (loopback); MSP430 and CC2538 keep the last level (nothing to release).  Not `button release`, which drives the button's inactive level |
 | `button <node> press\|release\|click [duration]` | the board's user button, respecting active-low wiring (Sky P2.7, Z1 P2.5, CC2538DK PA3, nRF boards per board file); `click` releases after 100 ms |
-| `restart` | restart from the configuration: configured nodes only, links restored, `at` queue cleared, scripts aborted; lines after it run against the new simulation.  Inside a script file it is the script's end, like `exit` |
+| `restart` | restart from the configuration: configured nodes only, links restored, `at` queue cleared, scripts aborted; lines after it run against the new simulation.  Inside a script file it is the script's end, like `exit`; refused from `at`/`every`/`on` |
 | `ui <port>` | start the live web UI now |
 
 **Console**
@@ -172,7 +172,9 @@ expect 2 "Received ping reply" 5s
 `at`, `every` and `on` run one command beside the command stream, so they
 refuse the commands that would hold it: `cmd`, `expect`, `expect-not`,
 `capture`, `expect-fault`, `expect-halt`, `sendfile`, `sleep`, `wait-until`, `step`, `source`,
-and `run` with a duration.  Put such sequences in a script.
+and `run` with a duration — and `restart`, which would discard whatever the
+stream is waiting on (a pending `run 2s` included).  Put such sequences in a
+script.
 An error in a scheduled command fails the script only if a script file
 scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 
