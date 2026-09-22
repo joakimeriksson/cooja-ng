@@ -784,6 +784,7 @@ static const char *t_lookup(void *u, const char *name) {
     (void)u;
     if (!strcmp(name, "x")) return "42";
     if (!strcmp(name, "sp")) return "a  b";
+    if (!strcmp(name, "q")) return "a\"b'c #d\\e\n";     /* a captured console line can hold anything */
     return NULL;
 }
 
@@ -792,7 +793,19 @@ static void test_expand(void) {
     int n = shell_expand_vars("echo $x ${x}y $$x \\$x '$x' \"$x\" $ $1 # $nope", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
     CHECK(n > 0 && !strcmp(out, "echo 42 42y $x \\$x '$x' \"42\" $ $1 # $nope"), "expansion rules ('%s')", out);
     n = shell_expand_vars("send 1 $sp", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
-    CHECK(n > 0 && !strcmp(out, "send 1 a  b"), "value substituted as text");
+    CHECK(n > 0 && !strcmp(out, "send 1 a\\ \\ b"), "a value is one word: its spaces are escaped ('%s')", out);
+    /* Quotes, a comment marker, a backslash and a newline in a value stay
+     * literal and do not change how the rest of the line is read. */
+    n = shell_expand_vars("sendln 1 $q tail", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+    {
+        char *av[8]; char stg[128];
+        int ac = shell_tokenize(out, av, NULL, 8, stg, sizeof(stg), err, sizeof(err));
+        CHECK(n > 0 && ac == 4 && !strcmp(av[2], "a\"b'c #d\\e\n") && !strcmp(av[3], "tail"),
+              "hostile value tokenizes back to itself, the line goes on ('%s' -> %d args, %s)", out, ac, ac > 0 ? "" : err);
+        n = shell_expand_vars("echo \"$q\"", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+        ac = shell_tokenize(out, av, NULL, 8, stg, sizeof(stg), err, sizeof(err));
+        CHECK(n > 0 && ac == 2 && !strcmp(av[1], "a\"b'c #d\\e\n"), "the same inside double quotes ('%s')", out);
+    }
     n = shell_expand_vars("echo $missing", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
     CHECK(n == -1 && strstr(err, "undefined variable 'missing'"), "undefined -> error (%s)", err);
     n = shell_expand_vars("echo ${x", out, sizeof(out), t_lookup, NULL, err, sizeof(err));

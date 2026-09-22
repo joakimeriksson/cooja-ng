@@ -147,7 +147,9 @@ serial-line buffer) prints a warning, since the node would truncate it;
 
 `$name` and `${name}` expand in every command line before it is parsed —
 also inside double quotes, never inside single quotes, after `\`, or in a
-comment.  `$$` is a literal `$`, so `at +5s echo $$x` expands `$x` when the
+comment.  A value is always one word with every byte literal: quotes, `#`,
+spaces and control characters in a captured line cannot break the command
+(`sendln 2 ping $addr` sends exactly what was captured).  `$$` is a literal `$`, so `at +5s echo $$x` expands `$x` when the
 `at` fires rather than when it is scheduled.  An undefined variable is an
 error.  `cmd -c <var> "<regex>"`, `expect -c <var>`, `sym -c`, `reg -c` and
 `mem -c` store into variables too; `assert var <name> <op> <value>` compares
