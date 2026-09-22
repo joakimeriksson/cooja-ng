@@ -53,6 +53,7 @@ typedef enum sim_mote_iface {
                                     * window; how a co-simulation service
                                     * reaches it without including the
                                     * private mote header */
+    SIM_MOTE_IFACE_MSP430_CPU = 4, /* msp430_cpu_t* — shell mem/reg     */
 } sim_mote_iface_t;
 
 typedef struct sim_mote_ops {
@@ -157,6 +158,14 @@ typedef struct sim_mote_ops {
      * The escape hatch for genuinely chip-specific code (GDB attach,
      * CC2420 debug traces) so it can stay type-blind at the call site. */
     void *(*get_interface)(sim_mote_t *m, int iface);
+
+    /* Drive a GPIO input pin from outside (a button, a jumper).  Port and
+     * pin use the SoC's own numbering.  Returns 0, or -1 when the platform
+     * models no GPIO input.  NULL = no input pins at all. */
+    int (*set_input_pin)(sim_mote_t *m, int port, int pin, int level);
+    /* The board's user button: its pin and whether pressing drives it low.
+     * Returns 0, or -1 when the board describes no button. */
+    int (*button_pin)(const sim_mote_t *m, int *port, int *pin, bool *active_low);
 
     /* ---- M17: frame-level RX --------------------------------------- */
 

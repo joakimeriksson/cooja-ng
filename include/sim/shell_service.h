@@ -48,6 +48,12 @@ extern "C" {
 #define SHELL_PATTERN_MAX   256
 #define SHELL_PATH_MAX      512
 #define SHELL_REASON_MAX    512
+#define SHELL_VARS_MAX      32
+#define SHELL_VAR_NAME_MAX  32
+#define SHELL_FRAMES_MAX    8
+#define SHELL_HISTORY_LINES 2000
+#define SHELL_HISTORY_LEN   200
+#define SHELL_DBG_MAX       16
 
 /* Where a command line came from.  Errors fail the script only for lines
  * a script owns: FILE lines, and at/every/on commands a script file
@@ -69,7 +75,41 @@ typedef struct shell_source {
     FILE *f;
     char  path[SHELL_PATH_MAX];
     int   lineno;
+    /* sendfile: each line goes to a node as a `cmd` instead of running as
+     * a shell command.  send_idx < 0 for a script. */
+    int     send_idx, send_id;
+    int64_t send_timeout_ns;
+    /* repeat / if blocks open in this file. */
+    struct {
+        int  kind;                  /* 1 = repeat, 2 = if                  */
+        long pos;                   /* repeat: file offset of the body      */
+        int  lineno;                /* repeat: line number before the body  */
+        long count, total;          /* repeat: current pass, passes         */
+        char var[SHELL_VAR_NAME_MAX];
+    } frames[SHELL_FRAMES_MAX];
+    int     nframes;
 } shell_source_t;
+
+typedef struct shell_dbg {           /* one breakpoint or watchpoint */
+    int      id;
+    int      node_id;
+    int      kind;                   /* 1 = breakpoint, 2 = watchpoint */
+    uint32_t addr;
+    int      len;                    /* watchpoint bytes, 1..4 */
+    int      hits;
+    bool     halted;                 /* the node is stopped at this entry */
+} shell_dbg_t;
+
+typedef struct shell_hline {        /* one remembered console line */
+    int     node_id;
+    int64_t ns;
+    char    text[SHELL_HISTORY_LEN];
+} shell_hline_t;
+
+typedef struct shell_var {
+    char name[SHELL_VAR_NAME_MAX];
+    char value[SHELL_LINE_MAX];
+} shell_var_t;
 
 typedef enum shell_block {
     SHELL_BLOCK_NONE = 0,
@@ -77,6 +117,10 @@ typedef enum shell_block {
     SHELL_BLOCK_SLEEP,
     SHELL_BLOCK_WAIT_UNTIL,
     SHELL_BLOCK_RUN,        /* `run <dur>` / `step`: until the auto-pause */
+    SHELL_BLOCK_CMD,        /* `cmd`: until the node prints its prompt    */
+    SHELL_BLOCK_EXPECT_NOT, /* `expect-not`: fail on a match, pass at time */
+    SHELL_BLOCK_FAULT,      /* `expect-fault`: until a node takes a fault */
+    SHELL_BLOCK_HALT,       /* `expect-halt`: until a breakpoint/watchpoint hits */
 } shell_block_t;
 
 typedef struct shell_at_entry {
@@ -108,6 +152,8 @@ typedef struct shell_watch {
     int     count;
     char    cmd[SHELL_LINE_MAX];
     shell_origin_t origin; /* where the `on`/`fail-on`/`count` line was typed */
+    bool    once;          /* `on --once`: removed after it fires            */
+    bool    dead;          /* fired once; compacted at the next tick         */
 } shell_watch_t;
 
 typedef struct shell_trigger {
@@ -218,10 +264,77 @@ typedef struct shell_service {
     int    expect_ids[SIM_EQ_MAX_NODES];
     int    expect_n;
     bool   matched;
+    /* expect options: -re (POSIX ERE, compiled into expect_re), -n count,
+     * -c var (capture group 1, or the whole match / line). */
+    void  *expect_re;               /* regex_t * or NULL (substring)       */
+    int    expect_needed, expect_seen;
+    char   expect_var[SHELL_VAR_NAME_MAX];
+    char   matched_capture[SHELL_LINE_MAX];
     char   matched_line[SHELL_PATTERN_MAX];
     int    matched_node;
     int64_t matched_ns;
     int64_t default_expect_timeout_ns;
+
+    /* `cmd`: one command line to one node, then wait for its shell prompt.
+     * The prompt is matched (prompt_glob) against the node's console bytes
+     * since the last newline — a prompt has no newline of its own, so it
+     * never becomes a log line. */
+    char    prompt_glob[64];
+    int     cmd_idx, cmd_id;
+    char    cmd_text[96];
+    char    cmd_expect[SHELL_PATTERN_MAX];
+    char    cmd_fail_on[SHELL_PATTERN_MAX];
+    bool    cmd_expect_seen, cmd_fail_seen, cmd_prompt_seen;
+    char    cmd_fail_line[SHELL_PATTERN_MAX];
+    void   *cmd_re;                 /* -c: regex_t *                        */
+    char    cmd_var[SHELL_VAR_NAME_MAX];
+    bool    cmd_captured;
+    char    cmd_capture[SHELL_LINE_MAX];
+    int     cmd_lines;
+    int64_t cmd_prompt_ns;
+    char    cmd_partial[256];
+    int     cmd_plen;
+    int     cmd_candidate_len;   /* partial length at a prompt match, -1 = none */
+    int64_t cmd_candidate_ns;    /* ... and when it matched                     */
+    int     cmd_pass, cmd_fail;
+
+    /* `expect-fault`: exception-entry counters of one ARM node at arm time. */
+    int      fault_idx, fault_id;
+    unsigned fault_mask;            /* bit n = exception number n (3..7)    */
+    uint64_t fault_base[16];
+    char     fault_what[64];
+
+    /* Line currently read from a sendfile source (see shell_source_t). */
+    bool     line_is_send;
+    int      line_send_idx, line_send_id;
+    int64_t  line_send_timeout_ns;
+
+    /* Console history for tail/grep: a ring of the last lines (heap). */
+    shell_hline_t *hist;
+    int      hist_head, hist_count;
+
+    /* `transcript <file>`: every command line typed or piped is appended. */
+    FILE    *transcript;
+    char     transcript_path[SHELL_PATH_MAX];
+
+    /* Breakpoints and watchpoints (ARM nodes). */
+    shell_dbg_t dbg[SHELL_DBG_MAX];
+    int      dbg_count;
+    int      next_dbg_id;
+    int      halt_node_id;           /* expect-halt target                  */
+
+    /* `restart` asked for; lines wait until the runner has restarted. */
+    bool     restart_pending;
+
+    /* Variables ($name). */
+    shell_var_t vars[SHELL_VARS_MAX];
+    int      var_count;
+
+    /* `console <id>`: the terminal talks to one node directly (lines in,
+     * raw console bytes out) until `~.` or Ctrl-D. */
+    bool    console_mode;
+    int     console_idx, console_id;
+    bool    console_dirty;
     int     max_line;       /* warn when one sent line exceeds it; 0 = off  */
 
     /* Verdict (docs/shell.md "Exit codes"). */

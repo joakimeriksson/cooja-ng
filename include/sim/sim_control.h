@@ -51,8 +51,19 @@ typedef struct sim_control_node_info {
     bool        removed;
     int64_t     sim_time_ns;  /* the mote's own clock                       */
     int64_t     cycles;
+    int64_t     instructions;
+    double      clock_deviation;  /* 1.0 = exact                          */
     uint32_t    freq_hz;
 } sim_control_node_info_t;
+
+/* Simulation-wide counters for `stats`. */
+typedef struct sim_control_stats {
+    long rf_bytes;           /* bytes put on the air                         */
+    long uart_bytes;         /* console bytes from all motes                 */
+    long frames;             /* frames sent                                  */
+    long frames_collided;    /* frames lost to collisions                    */
+    long rx_dropped;         /* received bytes a radio could not take        */
+} sim_control_stats_t;
 
 /* Runner-populated primitives.  Each wraps ONE runner static; none of them
  * carries policy.  `user` is passed back verbatim.  A NULL member means the
@@ -91,6 +102,20 @@ typedef struct sim_control_ops {
     void *(*get_interface)(void *u, int idx, int iface);
     /* Write the LIVE configuration (the --save-config writer).  0 on ok. */
     int   (*save_config)(void *u, const char *path);
+    /* Simulation-wide counters (NULL = unavailable). */
+    void  (*stats)(void *u, sim_control_stats_t *out);
+    /* Start (path) or stop (NULL) the 802.15.4 PCAP capture.  0 on success. */
+    int   (*pcap)(void *u, const char *path);
+    /* Set a slot's clock deviation (1.0 = exact, Cooja's MspClock). */
+    void  (*set_clock_deviation)(void *u, int idx, double deviation);
+    /* Restart the run from its configuration at the next loop turn. */
+    void  (*restart)(void *u);
+    /* Start the live web UI on a port.  0 on success. */
+    int   (*start_ui)(void *u, int port);
+    /* sim_mote_ops_t pass-throughs; -1 / false = unsupported. */
+    int   (*set_input_pin)(void *u, int idx, int port, int pin, int level);
+    int   (*button_pin)(void *u, int idx, int *port, int *pin, bool *active_low);
+    bool  (*leds)(void *u, int idx, uint8_t leds[3]);
 } sim_control_ops_t;
 
 /* Flags for the mutation calls. */

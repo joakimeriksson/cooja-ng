@@ -1608,6 +1608,8 @@ static bool ctl_describe(void *u, int idx, sim_control_node_info_t *o) {
     o->active      = node_active(idx) != 0;
     o->sim_time_ns = node_sim_time_ns(idx);
     o->cycles      = node_cycles(idx);
+    o->instructions = node_instructions(idx);
+    o->clock_deviation = nodes[idx].clock_deviation;
     o->freq_hz     = node_freq(idx);
     return true;
 }
@@ -1759,6 +1761,14 @@ static int save_live_config(const char *path, int timeout_ms, int64_t sim_ns) {
     }
     return save_rc;
 }
+static void ctl_stats(void *u, sim_control_stats_t *o) {
+    (void)u;
+    o->rf_bytes        = rf_byte_count;
+    o->uart_bytes      = uart_byte_count;
+    o->frames          = (long)radio_medium.next_frame_id + stat_rf_frames;
+    o->frames_collided = radio_bus.stats.frame_collided;
+    o->rx_dropped      = radio_bus.stats.rx_dropped;
+}
 static int ctl_save_config(void *u, const char *path) {
     (void)u;
     int64_t now = sim_runtime_now_ns(&sim_rt);
@@ -1772,6 +1782,66 @@ static int ctl_save_config(void *u, const char *path) {
  * pause state and any pending console bytes. */
 static void ctl_init_once(int *node_count_ptr);
 
+static char g_pcap_path[512];
+static int ctl_pcap(void *u, const char *path) {
+    (void)u;
+    if (!path) { pcap_service_close(&pcap_svc); return 0; }
+    /* Open the new file first, so a path that cannot be written leaves the
+     * running capture alone; say when an existing file is replaced. */
+    if (access(path, F_OK) == 0) printf("  PCAP: replacing %s\n", path);
+    char next[sizeof(g_pcap_path)];
+    snprintf(next, sizeof(next), "%s", path);
+    pcap_service_t fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    if (pcap_service_open(&fresh, next) != 0) return -1;
+    pcap_service_close(&pcap_svc);
+    snprintf(g_pcap_path, sizeof(g_pcap_path), "%s", next);
+    pcap_svc.writer = fresh.writer;
+    pcap_svc.path = g_pcap_path;
+    return 0;
+}
+static void ctl_set_clock_deviation(void *u, int idx, double deviation) {
+    (void)u;
+    if (idx >= 0 && idx < ctl_node_count(NULL)) nodes[idx].clock_deviation = deviation;
+}
+/* Restart requested by the shell (the UI has its own flag). */
+static bool g_restart_requested = false;
+static void ctl_restart(void *u) {
+    (void)u;
+    g_restart_requested = true;
+}
+static int ctl_start_ui(void *u, int port) {
+    (void)u;
+    if (ui_service_active(&ui_svc)) return -1;
+    if (!ui_service_start(&ui_svc, port, node_states, prev_node_states,
+                          node_last_tx_ns, prev_last_tx_ns, &radio_medium,
+                          &timeline_svc.tl, ctl_node_count_ptr, ui_describe_node,
+                          &sim_ctl))
+        return -1;
+    ui_svc.rt = &sim_rt;
+    shell_svc.external_resume = true;
+    return 0;
+}
+static int ctl_set_input_pin(void *u, int idx, int port, int pin, int level) {
+    (void)u;
+    if (idx < 0 || idx >= ctl_node_count(NULL)) return -1;
+    sim_mote_t *m = &mote_store[idx];
+    return m->ops->set_input_pin ? m->ops->set_input_pin(m, port, pin, level) : -1;
+}
+static int ctl_button_pin(void *u, int idx, int *port, int *pin, bool *active_low) {
+    (void)u;
+    if (idx < 0 || idx >= ctl_node_count(NULL)) return -1;
+    const sim_mote_t *m = &mote_store[idx];
+    return m->ops->button_pin ? m->ops->button_pin(m, port, pin, active_low) : -1;
+}
+static bool ctl_leds(void *u, int idx, uint8_t leds[3]) {
+    (void)u;
+    if (idx < 0 || idx >= ctl_node_count(NULL)) return false;
+    const sim_mote_t *m = &mote_store[idx];
+    if (!m->ops->ui_leds) return false;
+    m->ops->ui_leds(m, leds);
+    return true;
+}
 static const sim_control_ops_t ctl_ops = {
     .user              = NULL,
     .node_count        = ctl_node_count,
@@ -1785,6 +1855,14 @@ static const sim_control_ops_t ctl_ops = {
     .firmware_for_type = ctl_firmware_for_type,
     .get_interface     = ctl_get_interface,
     .save_config       = ctl_save_config,
+    .stats             = ctl_stats,
+    .pcap              = ctl_pcap,
+    .set_clock_deviation = ctl_set_clock_deviation,
+    .restart           = ctl_restart,
+    .start_ui          = ctl_start_ui,
+    .set_input_pin     = ctl_set_input_pin,
+    .button_pin        = ctl_button_pin,
+    .leds              = ctl_leds,
 };
 
 static void ctl_init_once(int *node_count_ptr) {
@@ -2378,6 +2456,9 @@ int run_mixed_multinode_test(int argc, char **argv) {
          * paused is not a deadlock when it is up. */
         shell_svc.external_resume = ui_enabled != 0;
     }
+    /* A restart re-creates the configured nodes only; nodes added since
+     * (shell `add`, JS addMote) are destroyed with the rest. */
+    int base_node_count = node_count;
 
 sim_restart:
     for (int i = 0; i < node_count; i++) {
@@ -2409,12 +2490,15 @@ sim_restart:
      * delivery path.  All frame transmissions will be captured at the
      * sender's on-air timestamp until the writer is closed at end. */
     /* M33: open the capture (prints the status line here, preserving its
-     * position) and register the service for teardown safety. */
+     * position) and register the service for teardown safety.  A restart
+     * closes whatever capture the shell left open first. */
+    pcap_service_close(&pcap_svc);
     pcap_service_open(&pcap_svc, pcap_path);
     sim_service_attach(&sim_rt, sim_registry_find_service(&g_registry, "pcap"),
                        &pcap_svc);
 
-    /* Initialize radio medium */
+    /* Initialize radio medium (a restart re-initializes a used one) */
+    radio_medium_destroy(&radio_medium);
     radio_medium_init(&radio_medium, node_count);
 
     /* Assign default positions in a circle for visualization */
@@ -2951,7 +3035,7 @@ sim_restart:
            (sim_serial_bridge_active(&serial_bridge) && ss_has_command) ||
            sim_rt.clock_source) {
         /* Check for restart request from UI */
-        if (ui_service_restart_requested(&ui_svc)) break;
+        if (ui_service_restart_requested(&ui_svc) || g_restart_requested) break;
         if (wall_timeout_ms > 0 && !wall_timeout_hit &&
             get_time_ms() - t_start >= wall_timeout_ms) {
             wall_timeout_hit = true;
@@ -3326,13 +3410,18 @@ sim_restart:
     }
 
     /* Handle restart request from UI */
-    if (ui_service_restart_requested(&ui_svc) && ui_service_active(&ui_svc)) {
-        printf("\n--- Restarting simulation (requested from UI) ---\n\n");
+    if ((ui_service_restart_requested(&ui_svc) && ui_service_active(&ui_svc)) ||
+        g_restart_requested) {
+        printf("\n--- Restarting simulation (requested from %s) ---\n\n",
+               g_restart_requested ? "the shell" : "UI");
         ui_service_clear_restart(&ui_svc);
+        g_restart_requested = false;
 
         /* Destroy all nodes */
         for (int i = 0; i < node_count; i++)
             destroy_node(i);
+        node_count = base_node_count;
+        num_nodes = node_count;
 
         /* Reset all global state */
         rf_byte_count = 0;

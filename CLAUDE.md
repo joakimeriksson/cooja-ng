@@ -119,6 +119,11 @@ tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 k
 # SECONDS for this one flag (like timeout(1); 500ms / 2m also accepted).
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --shell
 ./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15.cnsh
+./build/test_runner test configs/shell-nrf54l15-dk.yaml --script test/scripts/shell-nrf54l15-cmd.cnsh  # `cmd`: send a
+                                            # line, wait for the node's prompt, check its output
+./build/test_runner test configs/shell-tz-nrf54l15-xiao.yaml --script test/scripts/tz-securefault-nrf54l15-xiao.cnsh
+                                            # TrustZone from the shell: secure + `ns` shells, tz/faults,
+                                            # SecureFault injected with `reg pc =`, caught by expect-fault
 ./build/test_runner shell                   # parser + script-engine unit tests (mock control bundle)
 tools/check-shell.sh                        # scripted pass/fail, piped session (sequential, deterministic),
                                             # --paused, speed change, deadlock, determinism diffs
@@ -412,6 +417,7 @@ scheduling policy is the one documented deferral. **The staged refactor
 | File | Purpose |
 |------|---------|
 | `arm_cpu.c` | Core Cortex-M3 CPU: Thumb/Thumb-2 interpreter, IT blocks, exception handling, step/step_until, JIT dispatcher + lockstep verifier. On ARMv8-M also the **TrustZone-M** security state: banked SP/CONTROL, SG/BXNS/BLXNS/FNC_RETURN, TT/TTT/TTA/TTAT, secure exception entry/return with the integrity signature, and per-node transition counters. The JIT never runs Non-secure code — `arm_tz_blocks()` lives in the interpreter's memory path, so the dispatcher hands NS execution back |
+| `arm_debug.c` | Out-of-line debugger checks for the interpreter loop: the GDB stub's breakpoints/halt and the shell's breakpoints and watchpoints (`arm_debug_stop`, `arm_dbg_check`). The loop tests one hoisted pointer per instruction, so unattached runs pay nothing (an inline two-condition test measured 5-8% slower on arm-bench) |
 | `arm_trustzone.c` | **TrustZone-M attribution engine** (ARMv8-M security extension): SAU regions combined with a per-SoC attribution hook (the nRF54L15 security unit), `arm_security_attr()`, memory-mapped SAU registers at `0xE000EDD0` (Secure-only, RAZ/WI from Non-secure), and `arm_tz_blocks()` hot-path access enforcement feeding SecureFault/SFSR. Non-secure instruction fetch is refused from Secure memory and, in the callable window, for anything but `SG` (SecureFault INVEP); the lookup is cached per window over which attribution cannot change (the page clamped to the SAU region boundaries). Gated per MCU by `has_trustzone` (nRF54L15 only) |
 | `arm_decode.c` | Stateless Thumb-16 decoder for the JIT-compilable subset -> `arm_decoded_insn_t`, basic-block decoder. Deliberately a *second* implementation of the semantics, differential-tested by `arm-decode` |
 | `arm_jit.c` | GNU Lightning code generator: compiles hot basic blocks (ALU, shifts, branches, guarded SRAM loads/stores, native self-loops under an iteration budget) to ARM64/x86-64 |

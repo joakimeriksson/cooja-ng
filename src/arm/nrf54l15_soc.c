@@ -2520,10 +2520,20 @@ static int nrf54l_gpio_read(void *user, uint32_t addr) {
         return (int)g->pin_cnf[(off - 0x80) / 4];
     switch (off) {
         case 0x00: case 0x04: case 0x08: return (int)g->out;  /* OUT/SET/CLR */
-        case 0x0c: return (int)g->out;                        /* IN (loopback) */
+        case 0x0c: return (int)((g->out & ~g->in_forced) |    /* IN: OUT loopback, */
+                                (g->in_level & g->in_forced)); /* or a driven pin  */
         case 0x10: case 0x14: case 0x18: return (int)g->dir;  /* DIR/SET/CLR */
         default:   return 0;
     }
+}
+
+int nrf54l15_soc_set_input_pin(struct nrf54l15_soc *soc, int port, int pin, int level) {
+    if (!soc || port < 0 || port > 2 || pin < 0 || pin > 31) return -1;
+    nrf54l_gpio_state_t *g = &soc->gpio[port];
+    g->in_forced |= 1u << pin;
+    if (level) g->in_level |= 1u << pin;
+    else       g->in_level &= ~(1u << pin);
+    return 0;
 }
 
 static void nrf54l_gpio_write(void *user, uint32_t addr, uint32_t value) {

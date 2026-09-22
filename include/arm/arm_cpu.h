@@ -413,6 +413,38 @@ typedef struct arm_cpu {
     uint64_t  jit_blocks_run;    /* diagnostics: compiled-block entries    */
     uint64_t  jit_side_exits;    /* diagnostics: guard misses              */
     uint64_t  jit_insns_run;     /* diagnostics: instructions via the JIT  */
+
+    /* --- Shell instrumentation, kept at the end so it shifts no hot field --- */
+    /* Exception entries per system exception number (1..15) and the most
+     * recent fault (HardFault..SecureFault).  Instrumentation for the shell's
+     * `faults` / `expect-fault`: written only at exception entry, never read
+     * by the core, and — like the counters above — not cleared by
+     * arm_cpu_reset, so a fault handler that resets the SoC keeps them. */
+    uint64_t  exc_entry_count[16];
+    int       last_fault_exc;        /* 3..7, 0 = none yet                  */
+    uint32_t  last_fault_pc;         /* PC when the fault was taken         */
+    bool      last_fault_bg_secure;  /* security state it was taken from    */
+
+    /* Shell breakpoints and watchpoints (arm_dbg_check).  The step loop
+     * tests dbg_count once per slice (hoisted, like gdb_stub) and only calls
+     * the checker while something is armed; armed nodes run interpreted.  A
+     * hit sets dbg_halted: the node stops mid-slice and its execute is
+     * skipped until the shell clears the flag. */
+#define ARM_DBG_MAX_BP 8
+#define ARM_DBG_MAX_WP 4
+    int       dbg_count;             /* armed breakpoints + watchpoints     */
+    uint32_t  dbg_bp[ARM_DBG_MAX_BP];
+    int       dbg_bp_n;
+    struct { uint32_t addr; int len; uint32_t shadow; } dbg_wp[ARM_DBG_MAX_WP];
+    int       dbg_wp_n;
+    bool      dbg_halted;
+    bool      dbg_hit_new;           /* a hit not yet reported              */
+    int       dbg_hit_kind;          /* 1 = breakpoint, 2 = watchpoint      */
+    int       dbg_hit_index;
+    uint32_t  dbg_hit_pc;            /* bp: its address; wp: the writer's pc */
+    uint32_t  dbg_hit_old, dbg_hit_value;
+    uint32_t  dbg_prev_pc;
+    uint32_t  dbg_skip_pc;           /* continue from a bp without re-hitting it */
 } arm_cpu_t;
 
 /* --- Public API --- */
@@ -487,6 +519,13 @@ void arm_cpu_set_frequency(arm_cpu_t *cpu, uint32_t freq_hz);
 /* Nanosecond <-> cycle conversion: provided by cpu_time.h as macros
  * arm_ns_to_cycles -> cpu_ns_to_cycles
  * arm_cycles_to_ns -> cpu_cycles_to_ns */
+
+/* Shell breakpoints/watchpoints: true (and dbg_halted set) on a hit at the
+ * current instruction boundary.  Only called while cpu->dbg_count > 0. */
+bool arm_dbg_check(arm_cpu_t *cpu);
+/* The interpreter loop's debugger check (GDB stub + shell), called only while
+ * one is attached.  True = stop the slice here. */
+bool arm_debug_stop(arm_cpu_t *cpu);
 
 /* Exception/interrupt triggering (called by NVIC) */
 void arm_exception_entry(arm_cpu_t *cpu, int exception_num);

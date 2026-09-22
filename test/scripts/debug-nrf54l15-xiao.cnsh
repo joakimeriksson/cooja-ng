@@ -1,0 +1,25 @@
+# Breakpoints and watchpoints on the Normal world of the TrustZone split image.
+#   ./build/test_runner test configs/shell-tz-nrf54l15-xiao.yaml -t 30000 --script test/scripts/debug-nrf54l15-xiao.cnsh
+log off all
+wait-until 2s
+
+# Stop at process_run twice.
+break 1 process_run
+expect-halt 1 1s
+reg -c pc 1 pc
+sym -c pr 1 process_run
+echo halted at $pc, process_run is $pr (the Thumb bit is not part of pc)
+break list
+continue
+expect-halt 1 1s
+break clear all
+continue
+
+# The Normal world counts its 10 s iterations in a static: catch the write.
+sym -c it 1 iteration.0
+watch 1 $it
+expect-halt 1 25s
+assert mem 1 $it == 1
+break clear all
+continue
+pass

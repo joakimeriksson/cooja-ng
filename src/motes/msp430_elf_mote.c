@@ -21,6 +21,7 @@
 #include "sim_state.h"      /* SIM_RADIO_* for msp_mote_ui_radio_state (M38) */
 
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 /* ============================================================
@@ -697,6 +698,25 @@ static int msp_mote_ui_radio_state(const sim_mote_t *m) {
     return SIM_RADIO_OFF;           /* VREG_OFF, POWER_DOWN, IDLE */
 }
 
+/* GPIO input from outside: ports P1..P10, 1-based as in the datasheet;
+ * msp430_gpio_set_input_pin raises the pin interrupt the firmware enabled. */
+static int msp_mote_set_input_pin(sim_mote_t *m, int port, int pin, int level) {
+    msp430_gpio_t *gpio = &MOTE_IMPL(m)->plat.msp.gpio;
+    if (port < 1 || port > gpio->num_ports || pin < 0 || pin > 7) return -1;
+    msp430_gpio_set_input_pin(gpio, port, pin, level != 0);
+    return 0;
+}
+
+/* User buttons of the MSP430 boards Contiki-NG drives with a button sensor:
+ * Tmote Sky P2.7 and Zolertia Z1 P2.5, both active-low with a pull-up. */
+static int msp_mote_button_pin(const sim_mote_t *m, int *port, int *pin, bool *active_low) {
+    const char *name = MOTE_IMPL(m)->board ? MOTE_IMPL(m)->board->name : NULL;
+    if (!name) return -1;
+    if (!strcmp(name, "sky")) { *port = 2; *pin = 7; *active_low = true; return 0; }
+    if (!strcmp(name, "z1"))  { *port = 2; *pin = 5; *active_low = true; return 0; }
+    return -1;
+}
+
 static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
     uint8_t p5out = MOTE_IMPL(m)->plat.msp.gpio.ports[4].out;
     leds[0] = (p5out >> 4) & 1;  /* green  = P5.4 */
@@ -707,6 +727,8 @@ static void msp_mote_ui_leds(const sim_mote_t *m, uint8_t leds[3]) {
 static void *msp_mote_get_interface(sim_mote_t *m, int iface) {
     if (iface == SIM_MOTE_IFACE_CC2420)
         return &MOTE_IMPL(m)->plat.msp.cc2420;
+    if (iface == SIM_MOTE_IFACE_MSP430_CPU)
+        return &MOTE_IMPL(m)->plat.msp.cpu;
     return NULL;
 }
 
@@ -725,6 +747,8 @@ const sim_mote_ops_t msp430_elf_mote_ops = {
     .reset_time      = msp_mote_reset_time,
     .ui_radio_state  = msp_mote_ui_radio_state,
     .ui_leds         = msp_mote_ui_leds,
+    .set_input_pin   = msp_mote_set_input_pin,
+    .button_pin      = msp_mote_button_pin,
     .get_interface   = msp_mote_get_interface,
     .receive_frame   = NULL, /* per-byte / staged delivery */
     .rx_byte_sync    = msp_mote_rx_byte_sync,

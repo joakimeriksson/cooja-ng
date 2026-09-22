@@ -2,6 +2,7 @@
  * UDGM (Unit Disk Graph Medium) radio medium implementation
  */
 #include "radio_medium.h"
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -506,8 +507,40 @@ static bool radio_pair_match(radio_medium_t *rm,
 
 /* --- Frame-level filter --- */
 
+void radio_medium_destroy(radio_medium_t *rm) {
+    free(rm->link_blocked);
+    rm->link_blocked = NULL;
+}
+
+void radio_medium_set_link_blocked(radio_medium_t *rm, int sender, int receiver,
+                                   bool blocked) {
+    if (sender < 0 || sender >= RADIO_MEDIUM_MAX_NODES ||
+        receiver < 0 || receiver >= RADIO_MEDIUM_MAX_NODES) return;
+    if (!rm->link_blocked) {
+        if (!blocked) return;
+        rm->link_blocked = calloc(RADIO_MEDIUM_MAX_NODES, sizeof(rm->link_blocked[0]));
+        if (!rm->link_blocked) return;
+    }
+    uint64_t bit = 1ull << (receiver % 64);
+    if (blocked) rm->link_blocked[sender][receiver / 64] |= bit;
+    else         rm->link_blocked[sender][receiver / 64] &= ~bit;
+    bool any = false;
+    for (int i = 0; i < RADIO_MEDIUM_MAX_NODES && !any; i++)
+        any = rm->link_blocked[i][0] || rm->link_blocked[i][1];
+    if (!any) radio_medium_destroy(rm);          /* back to the one-branch fast path */
+}
+
+bool radio_medium_link_blocked(const radio_medium_t *rm, int sender, int receiver) {
+    if (!rm->link_blocked || sender < 0 || sender >= RADIO_MEDIUM_MAX_NODES ||
+        receiver < 0 || receiver >= RADIO_MEDIUM_MAX_NODES) return false;
+    return (rm->link_blocked[sender][receiver / 64] >> (receiver % 64)) & 1u;
+}
+
 bool radio_medium_filter_frame_radio(radio_medium_t *rm,
     int sender, int sender_radio, int receiver, int receiver_radio) {
+    if (__builtin_expect(rm->link_blocked != NULL, 0) &&
+        radio_medium_link_blocked(rm, sender, receiver))
+        return false;
     if (rm->type == RADIO_MEDIUM_NONE)
         return true;
     if (!valid_node(rm, sender) || !valid_node(rm, receiver)) return true;
@@ -567,7 +600,8 @@ bool radio_medium_filter_byte_radio(radio_medium_t *rm,
     int sender, int sender_radio, int receiver, int receiver_radio, uint8_t byte) {
     /* NONE type: pass everything through */
     if (rm->type == RADIO_MEDIUM_NONE)
-        return true;
+        return !(__builtin_expect(rm->link_blocked != NULL, 0) &&
+                 radio_medium_link_blocked(rm, sender, receiver));
     if (!valid_node(rm, sender) || !valid_node(rm, receiver)) return true;
     if (!valid_radio(sender_radio) || !valid_radio(receiver_radio)) return true;
 
@@ -575,6 +609,10 @@ bool radio_medium_filter_byte_radio(radio_medium_t *rm,
      * happen even on dropped bytes so the tracker stays in sync with the
      * sender's byte stream. */
     track_byte(rm, sender, sender_radio, byte);
+
+    if (__builtin_expect(rm->link_blocked != NULL, 0) &&
+        radio_medium_link_blocked(rm, sender, receiver))
+        return false;
 
     if (!radio_pair_match(rm, sender, sender_radio, receiver, receiver_radio))
         return false;
