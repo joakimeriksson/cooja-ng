@@ -193,18 +193,18 @@ static inline arm_io_region_t *io_lookup(arm_cpu_t *cpu, uint32_t *addr,
 uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
     addr &= ~3u;
     if (cpu->rom && addr < cpu->rom_size) {
-        return cpu->rom[addr] | (cpu->rom[addr+1]<<8) |
-               (cpu->rom[addr+2]<<16) | (cpu->rom[addr+3]<<24);
+        return (uint32_t)cpu->rom[addr] | ((uint32_t)cpu->rom[addr+1]<<8) |
+               ((uint32_t)cpu->rom[addr+2]<<16) | ((uint32_t)cpu->rom[addr+3]<<24);
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) {
         uint32_t off = addr - cpu->flash_base;
-        return cpu->flash[off] | (cpu->flash[off+1]<<8) |
-               (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
+        return (uint32_t)cpu->flash[off] | ((uint32_t)cpu->flash[off+1]<<8) |
+               ((uint32_t)cpu->flash[off+2]<<16) | ((uint32_t)cpu->flash[off+3]<<24);
     }
     if (addr >= cpu->sram_base && addr < cpu->sram_end) {
         uint32_t off = addr - cpu->sram_base;
-        return cpu->sram[off] | (cpu->sram[off+1]<<8) |
-               (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
+        return (uint32_t)cpu->sram[off] | ((uint32_t)cpu->sram[off+1]<<8) |
+               ((uint32_t)cpu->sram[off+2]<<16) | ((uint32_t)cpu->sram[off+3]<<24);
     }
     /* Bit-band alias for peripheral region */
     if (addr >= ARM_BITBAND_BASE && addr < ARM_BITBAND_BASE + 0x02000000) {
@@ -256,13 +256,13 @@ static inline uint32_t mem_read32(arm_cpu_t *cpu, uint32_t addr) {
     if (arm_tz_blocks(cpu, addr)) return 0;
     if (__builtin_expect(addr >= cpu->sram_base && addr < cpu->sram_end, 1)) {
         uint32_t off = addr - cpu->sram_base;
-        return cpu->sram[off] | (cpu->sram[off+1]<<8) |
-               (cpu->sram[off+2]<<16) | (cpu->sram[off+3]<<24);
+        return (uint32_t)cpu->sram[off] | ((uint32_t)cpu->sram[off+1]<<8) |
+               ((uint32_t)cpu->sram[off+2]<<16) | ((uint32_t)cpu->sram[off+3]<<24);
     }
     if (addr >= cpu->flash_base && addr < cpu->flash_end) {
         uint32_t off = addr - cpu->flash_base;
-        return cpu->flash[off] | (cpu->flash[off+1]<<8) |
-               (cpu->flash[off+2]<<16) | (cpu->flash[off+3]<<24);
+        return (uint32_t)cpu->flash[off] | ((uint32_t)cpu->flash[off+1]<<8) |
+               ((uint32_t)cpu->flash[off+2]<<16) | ((uint32_t)cpu->flash[off+3]<<24);
     }
     return arm_read32(cpu, addr);
 }
@@ -1212,7 +1212,13 @@ int condition_passed(arm_cpu_t *cpu, int cond) {
     return result;
 }
 
-/* --- Barrel shifter helpers --- */
+/* --- Barrel shifter helpers ---
+ *
+ * A shift of 0 returns the value and leaves *carry as the caller set it --
+ * the architectural "carry unchanged".  The encodings where an immediate 0
+ * means 32 (LSR/ASR) are converted by every caller before it gets here, but
+ * the helpers must not depend on that for defined behavior: lsr_c/asr_c
+ * would otherwise shift by -1. */
 
 static inline uint32_t lsl_c(uint32_t val, int shift, int *carry) {
     if (shift == 0) return val;
@@ -1222,6 +1228,7 @@ static inline uint32_t lsl_c(uint32_t val, int shift, int *carry) {
 }
 
 static inline uint32_t lsr_c(uint32_t val, int shift, int *carry) {
+    if (shift == 0) return val;
     if (shift >= 32) { *carry = (shift == 32) ? ((val >> 31) & 1) : 0; return 0; }
     *carry = (val >> (shift - 1)) & 1;
     return val >> shift;
@@ -1229,6 +1236,7 @@ static inline uint32_t lsr_c(uint32_t val, int shift, int *carry) {
 
 static inline uint32_t asr_c(uint32_t val, int shift, int *carry) {
     int32_t sval = (int32_t)val;
+    if (shift == 0) return val;
     if (shift >= 32) {
         *carry = (val >> 31) & 1;
         return (sval < 0) ? 0xFFFFFFFF : 0;
@@ -1256,7 +1264,12 @@ int arm_execute_decoded(arm_cpu_t *cpu, const arm_decoded_insn_t *di) {
 
     switch (di->klass) {
     case ARM_DEC_SHIFT_IMM: {
-        int carry;
+        /* Seeded from C so the helpers' "shift 0 = carry unchanged" holds
+         * here too.  The decoder never produces a 0 shift for this class
+         * (arm_decode.c turns LSL #0 into MOV and rejects LSR/ASR #0), but
+         * this is the reference model the differential suites trust, so it
+         * does not lean on that for defined behavior. */
+        int carry = (cpu->xpsr & APSR_C) ? 1 : 0;
         uint32_t v = reg[di->rm];
         int sh = (int)di->imm;
         switch (di->shift) {
@@ -1452,7 +1465,7 @@ static inline void arm_sp_audit_push(arm_cpu_t *cpu, uint32_t return_pc,
             uint32_t want_callee = (uint32_t)strtoul(e, NULL, 0) & ~1u;
             uint32_t addr = (uint32_t)strtoul(colon + 1, NULL, 0);
             if ((callee_pc & ~1u) == want_callee &&
-                addr >= cpu->sram_base && addr + 1 <= cpu->sram_end) {
+                addr >= cpu->sram_base && addr < cpu->sram_end) {
                 static int n = 0;
                 if (n++ < 30) {
                     uint8_t v = cpu->sram[addr - cpu->sram_base];
@@ -3094,7 +3107,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                                 /* RRX */
                                 int old_c = (cpu->xpsr & APSR_C) ? 1 : 0;
                                 carry_out = rm_val & 1;
-                                rm_val = (rm_val >> 1) | (old_c << 31);
+                                rm_val = (rm_val >> 1) | ((uint32_t)old_c << 31);
                             } else {
                                 rm_val = ror_c(rm_val, shift_n, &carry_out);
                             }

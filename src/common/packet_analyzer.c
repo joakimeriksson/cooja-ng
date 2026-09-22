@@ -483,6 +483,17 @@ int pkt_analyze(const uint8_t *data, int len, pkt_info_t *info) {
     return 0;
 }
 
+/* Advance past what snprintf actually wrote.  Its return value is what it
+ * WOULD have written, so a truncated field would otherwise move p past the
+ * buffer and drive remain negative -- and the next snprintf would get a
+ * huge size_t. */
+static void advance(char **p, int *remain, int n) {
+    if (n < 0) n = 0;
+    if (n >= *remain) n = *remain > 0 ? *remain - 1 : 0;
+    *p += n;
+    *remain -= n;
+}
+
 const char *pkt_summary(const uint8_t *data, int len, pkt_info_t *info) {
     char *p = info->summary;
     int remain = PKT_SUMMARY_LEN;
@@ -491,7 +502,7 @@ const char *pkt_summary(const uint8_t *data, int len, pkt_info_t *info) {
     /* Frame type + seq */
     n = snprintf(p, remain, "%s #%d %dB",
                  frame_type_str(info->frame_type), info->seq_num, len - 1);
-    p += n; remain -= n;
+    advance(&p, &remain, n);
 
     /* Addressing — show short addr as node ID (Contiki: 0x00NN or 0xNN00) */
     if (info->frame_type != PKT_802154_ACK) {
@@ -505,11 +516,11 @@ const char *pkt_summary(const uint8_t *data, int len, pkt_info_t *info) {
                 n = snprintf(p, remain, " N%d", sid);
             else
                 n = snprintf(p, remain, " %04X", info->src_short);
-            p += n; remain -= n;
+            advance(&p, &remain, n);
         } else if (info->src_mode == 3) {
             n = snprintf(p, remain, " %02X%02X",
                          info->src_ext[6], info->src_ext[7]);
-            p += n; remain -= n;
+            advance(&p, &remain, n);
         }
         if (info->dst_mode == 2) {
             if (info->dst_short == 0xFFFF) {
@@ -525,11 +536,11 @@ const char *pkt_summary(const uint8_t *data, int len, pkt_info_t *info) {
                 else
                     n = snprintf(p, remain, "->%04X", info->dst_short);
             }
-            p += n; remain -= n;
+            advance(&p, &remain, n);
         } else if (info->dst_mode == 3) {
             n = snprintf(p, remain, "->%02X%02X",
                          info->dst_ext[6], info->dst_ext[7]);
-            p += n; remain -= n;
+            advance(&p, &remain, n);
         }
     }
 
@@ -540,11 +551,11 @@ const char *pkt_summary(const uint8_t *data, int len, pkt_info_t *info) {
         } else {
             n = snprintf(p, remain, " %s", icmpv6_type_str(info->icmpv6_type));
         }
-        p += n; remain -= n;
+        advance(&p, &remain, n);
     } else if (info->has_udp) {
         n = snprintf(p, remain, " UDP %d->%d",
                      info->udp_src_port, info->udp_dst_port);
-        p += n; remain -= n;
+        advance(&p, &remain, n);
     } else if (info->has_lowpan) {
         if ((info->lowpan_dispatch & 0xE0) == 0x60)
             n = snprintf(p, remain, " 6LoWPAN");
@@ -552,7 +563,7 @@ const char *pkt_summary(const uint8_t *data, int len, pkt_info_t *info) {
             n = snprintf(p, remain, " IPv6");
         else
             n = snprintf(p, remain, " disp=0x%02X", info->lowpan_dispatch);
-        p += n; remain -= n;
+        advance(&p, &remain, n);
     }
 
     /* IPv6 addresses (abbreviated) if available */
@@ -561,7 +572,7 @@ const char *pkt_summary(const uint8_t *data, int len, pkt_info_t *info) {
         pkt_fmt_ipv6(info->ipv6_src, src_str, sizeof(src_str));
         pkt_fmt_ipv6(info->ipv6_dst, dst_str, sizeof(dst_str));
         n = snprintf(p, remain, " [%s -> %s]", src_str, dst_str);
-        p += n; remain -= n;
+        advance(&p, &remain, n);
     }
 
     (void)remain;

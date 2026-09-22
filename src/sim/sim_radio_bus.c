@@ -720,13 +720,14 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
         if (bus->ops[i]->rxfifo_available(bus->mote[i]) < fifo_needed) {
             /* RXFIFO full — mini-step the receiver to read the previous
              * frame; keep it short to avoid cascade TX. */
-            mi->ops->step_until(mi, mi->ops->cycles(mi) + 5000);
+            if (mi)
+                mi->ops->step_until(mi, mi->ops->cycles(mi) + 5000);
         }
         if (bus->ops[i]->rxfifo_available(bus->mote[i]) >= fifo_needed) {
             /* Sub-GHz delivery anchors to now (first_byte_ns unarmed). */
             int64_t delivery_start = a->subghz ? now : accurate_tx_start;
             /* MSP430-only full-slice pre-sync before delivery. */
-            if (mi->ops->rx_pre_sync && i != bus->executing_node)
+            if (mi && mi->ops->rx_pre_sync && i != bus->executing_node)
                 mi->ops->rx_pre_sync(mi, delivery_start);
             sim_radio_bus_deliver_bytes(bus, sim, i, frame_snap[i],
                                         frame_snap_len[i], frame_snap_rssi[i],
