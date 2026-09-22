@@ -664,6 +664,7 @@ static int arm_mote_set_input_pin(sim_mote_t *m, int port, int pin, int level) {
     nrf54l15_soc_t *nrfl = arm_platform_nrf54l15(plat);
     if (cc) {
         if (port < 0 || port >= CC2538_GPIO_NUM_PORTS || pin < 0 || pin > 7) return -1;
+        if (level < 0) return 0;           /* release: no forced state to drop, the level stays */
         bool old = (cc->gpio.ports[port].data >> pin) & 1u;
         cc2538_gpio_set_input(&cc->gpio, port, pin, level != 0);
         if (old != (level != 0))

@@ -1127,6 +1127,9 @@ static void test_environment(void) {
     CHECK(m_pin_level == 0 && m_pin_pin == 3, "pulse released after 5 ms");
     advance(15 * SHELL_MS_TO_NS); shell_script_tick(&sh);
     CHECK(m_pin_port == 1 && m_pin_pin == 13 && m_pin_level == 1, "button release drives the active-low pin high");
+    shell_enqueue_line(&sh, "gpio 1 P1.6 release");
+    shell_script_tick(&sh);
+    CHECK(m_pin_port == 1 && m_pin_pin == 6 && m_pin_level == -1, "gpio release passes level -1 (%d)", m_pin_level);
     unlink(p);
 
     radio_medium_destroy(&mock_sim.radio_medium);   /* before the reset re-inits it */
