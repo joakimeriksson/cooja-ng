@@ -1,0 +1,21 @@
+version: 2
+title: "2-node nRF54L15-DK RPL-UDP, driven from the Cooja-NG shell"
+description: >
+  The single-hop RPL-UDP pair of test-2node-nrf54l15-dk.json without its
+  test section: a shell script (--script test/scripts/*.cnsh) drives it and
+  gives the verdict — see docs/shell.md.  Used for the breakpoint tests that
+  need radio traffic reaching a halted node.
+timeout_ms: 60000
+seed: 42
+medium:
+  type: udgm
+  tx_range: 50.0
+  interference_range: 100.0
+  success_ratio_tx: 1.0
+  success_ratio_rx: 1.0
+mote_types:
+  - { name: server, firmware: firmware/nrf54l15-dk/udp-server.nrf54l15-dk }
+  - { name: client, firmware: firmware/nrf54l15-dk/udp-client.nrf54l15-dk }
+nodes:
+  - { type: server, id: 1, x: 0.0, y: 0.0 }
+  - { type: client, id: 2, x: 20.0, y: 0.0 }

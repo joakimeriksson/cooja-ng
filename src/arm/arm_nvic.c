@@ -512,6 +512,13 @@ void arm_nvic_check_pending(arm_nvic_t *nvic) {
 
     /* Check PRIMASK */
     if (cpu->primask & 1) return;
+    /* A core stopped at a shell breakpoint/watchpoint is in debug halt: it
+     * dispatches nothing.  Peripherals still pend (a radio byte, console
+     * input, a timer), and the IRQ is taken at the release — like PRIMASK.
+     * Without this a parked node was vectored from under the debugger,
+     * so `reg`/`mem` showed the ISR entry and the breakpoint fired again
+     * when the handler returned. */
+    if (cpu->dbg_halted) return;
 
     int best_exc, best_prio;
     if (nvic->scan_valid) {

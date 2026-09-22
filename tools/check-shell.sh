@@ -55,6 +55,10 @@ grep -q "took SecureFault" "$TMP/tz1.out" || fail "SecureFault not observed"
 $BIN test $TZCFG --script $TZS > "$TMP/tz2.out" 2>&1 || fail "TrustZone script run 2"
 diff <(strip "$TMP/tz1.out") <(strip "$TMP/tz2.out") > /dev/null || fail "TrustZone script run is not deterministic"
 
+echo "== a halted node holds its IRQs and is not re-hit at the release"
+expect_rc 0 $BIN test configs/shell-2node-nrf54l15-dk.yaml -q --script test/scripts/debug-halt-nrf54l15-dk.cnsh
+grep -q "SCRIPT PASSED" "$TMP/rc.out" || fail "halt script did not pass"
+
 echo "== breakpoints and watchpoints (TrustZone Normal world)"
 $BIN test $TZCFG -t 30000 --script test/scripts/debug-nrf54l15-xiao.cnsh > "$TMP/dbg.out" 2>&1 || { tail -5 "$TMP/dbg.out"; fail "debug script exited non-zero"; }
 grep -q "^watchpoint #2: node 1" "$TMP/dbg.out" || fail "watchpoint hit not reported"
