@@ -106,12 +106,12 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
     return 0;
 }
 
-uint32_t elf_find_symbol(const char *path, const char *symbol_name) {
+bool elf_lookup_symbol(const char *path, const char *symbol_name, uint32_t *addr) {
     FILE *f = fopen(path, "rb");
-    if (!f) return 0;
+    if (!f) return false;
 
     Elf32_Ehdr ehdr;
-    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) { fclose(f); return 0; }
+    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) { fclose(f); return false; }
 
     /* Find symtab and its linked strtab */
     Elf32_Shdr symtab_hdr = {0};
@@ -120,54 +120,65 @@ uint32_t elf_find_symbol(const char *path, const char *symbol_name) {
     for (int i = 0; i < ehdr.e_shnum; i++) {
         Elf32_Shdr shdr;
         fseek(f, ehdr.e_shoff + i * ehdr.e_shentsize, SEEK_SET);
-        if (fread(&shdr, sizeof(shdr), 1, f) != 1) { fclose(f); return 0; }
+        if (fread(&shdr, sizeof(shdr), 1, f) != 1) { fclose(f); return false; }
         if (shdr.sh_type == SHT_SYMTAB) {
             symtab_hdr = shdr;
             found_symtab = true;
             break;
         }
     }
-    if (!found_symtab) { fclose(f); return 0; }
+    if (!found_symtab) { fclose(f); return false; }
 
     /* Read strtab.  sh_link/sh_size come from the file; validate the section
      * index against e_shnum and cap the allocation so a malformed symtab
      * can't drive an out-of-range fseek or a multi-GB malloc (DoS). */
-    if (symtab_hdr.sh_link >= ehdr.e_shnum) { fclose(f); return 0; }
+    if (symtab_hdr.sh_link >= ehdr.e_shnum) { fclose(f); return false; }
     Elf32_Shdr strtab_hdr;
     fseek(f, ehdr.e_shoff + symtab_hdr.sh_link * ehdr.e_shentsize, SEEK_SET);
-    if (fread(&strtab_hdr, sizeof(strtab_hdr), 1, f) != 1) { fclose(f); return 0; }
+    if (fread(&strtab_hdr, sizeof(strtab_hdr), 1, f) != 1) { fclose(f); return false; }
 
     #define ELF_STRTAB_MAX (16u * 1024u * 1024u)   /* 16 MB — far above any real firmware */
     if (strtab_hdr.sh_size == 0 || strtab_hdr.sh_size > ELF_STRTAB_MAX) {
-        fclose(f); return 0;
+        fclose(f); return false;
     }
     /* One extra byte for a terminator: a real strtab ends in NUL, a crafted
      * one need not, and strcmp below would then run off the allocation. */
     char *strtab = (char *)malloc(strtab_hdr.sh_size + 1);
-    if (!strtab) { fclose(f); return 0; }
+    if (!strtab) { fclose(f); return false; }
     fseek(f, strtab_hdr.sh_offset, SEEK_SET);
     if (fread(strtab, 1, strtab_hdr.sh_size, f) != strtab_hdr.sh_size) {
-        free(strtab); fclose(f); return 0;
+        free(strtab); fclose(f); return false;
     }
     strtab[strtab_hdr.sh_size] = '\0';
 
-    /* Iterate symbols */
-    int num_syms = symtab_hdr.sh_size / sizeof(Elf32_Sym);
-    uint32_t result = 0;
-    for (int i = 0; i < num_syms; i++) {
-        Elf32_Sym sym;
-        fseek(f, symtab_hdr.sh_offset + i * sizeof(Elf32_Sym), SEEK_SET);
-        if (fread(&sym, sizeof(sym), 1, f) != 1) break;
-        if (sym.st_name < strtab_hdr.sh_size &&
-            strcmp(strtab + sym.st_name, symbol_name) == 0) {
-            result = sym.st_value;
+    /* Read the symbol table in one go (a seek per symbol made a lookup
+     * cost thousands of syscalls) and scan it. */
+    #define ELF_SYMTAB_MAX (16u * 1024u * 1024u)
+    if (symtab_hdr.sh_size > ELF_SYMTAB_MAX) { free(strtab); fclose(f); return false; }
+    size_t num_syms = symtab_hdr.sh_size / sizeof(Elf32_Sym);
+    Elf32_Sym *syms = (Elf32_Sym *)malloc(num_syms * sizeof(Elf32_Sym));
+    if (!syms) { free(strtab); fclose(f); return false; }
+    fseek(f, symtab_hdr.sh_offset, SEEK_SET);
+    size_t got = fread(syms, sizeof(Elf32_Sym), num_syms, f);
+    bool found = false;
+    for (size_t i = 0; i < got; i++) {
+        if (syms[i].st_name < strtab_hdr.sh_size &&
+            strcmp(strtab + syms[i].st_name, symbol_name) == 0) {
+            *addr = syms[i].st_value;
+            found = true;
             break;
         }
     }
 
+    free(syms);
     free(strtab);
     fclose(f);
-    return result;
+    return found;
+}
+
+uint32_t elf_find_symbol(const char *path, const char *symbol_name) {
+    uint32_t a = 0;
+    return elf_lookup_symbol(path, symbol_name, &a) ? a : 0;
 }
 
 uint32_t elf_get_entry(const char *path) {

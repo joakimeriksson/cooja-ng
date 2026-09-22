@@ -4,6 +4,7 @@
 #ifndef ELF_LOADER_H
 #define ELF_LOADER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* ELF32 header structures */
@@ -89,7 +90,12 @@ int elf_check_magic(const Elf32_Ehdr *ehdr);
  * bytes in memory (no PT_LOAD, or none that routes). */
 int elf_load_segments(const char *path, elf_route_fn route, void *ctx);
 
-/* Look up a symbol by name in an ELF file. Returns address, or 0 on failure. */
+/* Look up a symbol by name in an ELF file.  True and *addr set when found
+ * (a symbol at address 0 is found); false when not, or on a bad file. */
+bool elf_lookup_symbol(const char *path, const char *symbol_name, uint32_t *addr);
+
+/* The same, returning the address or 0 on failure — for callers that treat
+ * 0 as absent (boot-time patches of well-known symbols). */
 uint32_t elf_find_symbol(const char *path, const char *symbol_name);
 
 /* Get the entry point from an ELF file. Returns 0 on failure. */
