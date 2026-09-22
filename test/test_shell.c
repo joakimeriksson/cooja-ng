@@ -15,6 +15,7 @@
 #include "sim_runtime.h"
 #include "sim_control.h"
 #include "../src/services/shell_internal.h"
+#include "elf_loader.h"
 
 static int g_fail = 0, g_pass = 0, g_verbose = 0;
 #define CHECK(cond, ...) do { if (cond) { g_pass++; if (g_verbose) { printf("  ok: "); printf(__VA_ARGS__); printf("\n"); } } \
@@ -206,6 +207,7 @@ static void mock_reset(void) {
     mock_cpu.flash = mock_flash;
     mock_cpu.flash_base = 0x1000u;
     mock_cpu.flash_end = 0x1000u + sizeof(mock_flash);
+    for (int i = 0; i < SIM_EQ_MAX_NODES; i++) { free(sh.sym_cache[i]); sh.sym_cache[i] = NULL; }
     memset(&sh, 0, sizeof(sh));
     sh.sim = &mock_sim; sh.ctl = &mock_ctl; sh.active = true; sh.interactive = false;
     sh.verbose = false; sh.next_at_id = 1; sh.default_expect_timeout_ns = 30000000000LL;
@@ -885,6 +887,36 @@ static void test_node_commands(void) {
     unlink(p); unlink(data);
 }
 
+/* Symbols: one file read per miss, a per-node cache keyed on the image, and
+ * a symbol at address 0 is found (the loader's 0-means-absent idiom is not
+ * the shell's).  Needs a checked-in image; skipped without it. */
+static void test_symbols(void) {
+    const char *img = "firmware/nrf54l15-dk/shell.nrf54l15-dk";
+    FILE *f = fopen(img, "rb");
+    if (!f) return;
+    fclose(f);
+    mock_reset();
+    sh.interactive = true;
+    snprintf(mock_nodes[0].fw, sizeof(mock_nodes[0].fw), "%s", img);
+    shell_enqueue_line(&sh, "sym -c a 1 process_run");
+    shell_enqueue_line(&sh, "sym -c b 1 process_run");
+    shell_enqueue_line(&sh, "sym -c z 1 __ctors_size");     /* an absolute symbol, value 0 */
+    shell_enqueue_line(&sh, "sym 1 no_such_symbol_here");
+    shell_script_tick(&sh);
+    const char *a = shell_var_get(&sh, "a"), *b = shell_var_get(&sh, "b"), *z = shell_var_get(&sh, "z");
+    CHECK(a && b && !strcmp(a, b) && strcmp(a, "0x00000000") != 0, "symbol resolved twice to the same address");
+    CHECK(sh.sym_cache[0] && sh.sym_cache[0]->count == 2 && !strcmp(sh.sym_cache[0]->firmware, img),
+          "two entries cached for the image (%d)", sh.sym_cache[0] ? sh.sym_cache[0]->count : -1);
+    CHECK(z && !strcmp(z, "0x00000000"), "a symbol at address 0 is found ('%s')", z ? z : "");
+    snprintf(mock_nodes[0].fw, sizeof(mock_nodes[0].fw), "other.elf");   /* the slot rebooted into another image */
+    shell_enqueue_line(&sh, "sym 1 process_run");
+    shell_script_tick(&sh);
+    CHECK(sh.sym_cache[0]->count == 0 && !strcmp(sh.sym_cache[0]->firmware, "other.elf"), "another image empties the cache");
+    uint32_t addr = 1;
+    CHECK(elf_lookup_symbol(img, "__ctors_size", &addr) && addr == 0, "elf_lookup_symbol: found at 0");
+    CHECK(!elf_lookup_symbol(img, "no_such_symbol_here", &addr), "elf_lookup_symbol: absent is false");
+}
+
 static void test_arm_inspection(void) {
     const char *p;
     mock_reset();
@@ -1180,6 +1212,7 @@ int run_shell_tests(int verbose) {
     test_cmd();
     test_expand();
     test_node_commands();
+    test_symbols();
     test_arm_inspection();
     test_workflow();
     test_environment();

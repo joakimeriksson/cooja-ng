@@ -720,6 +720,7 @@ static void shell_destroy(sim_runtime_t *sim, void *state) {
     if (s->transcript) { fclose(s->transcript); s->transcript = NULL; }
     free(s->hist);
     s->hist = NULL;
+    for (int i = 0; i < SIM_EQ_MAX_NODES; i++) { free(s->sym_cache[i]); s->sym_cache[i] = NULL; }
     shell_script_abort(s);
     install_signals(false);
     s->active = false;

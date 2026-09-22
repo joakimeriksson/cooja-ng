@@ -582,6 +582,39 @@ static arm_cpu_t *node_arm_cpu(shell_service_t *s, const char *what, const char 
 
 /* "0x2000", "main", "main+0x10": a number, or a symbol of the node's
  * firmware (then its Secure-world image) plus an optional offset. */
+/* A node's symbol, through its per-slot cache.  The cache is keyed on the
+ * image paths, so a reboot into another firmware or a reused slot starts
+ * empty; misses are not cached.  A symbol at address 0 is found. */
+static bool node_symbol(shell_service_t *s, const sim_control_node_info_t *info,
+                        const char *name, uint32_t *addr) {
+    const char *fw = info->firmware ? info->firmware : "";
+    const char *sfw = info->secure_firmware ? info->secure_firmware : "";
+    int idx = sim_control_index_of_id(s->ctl, info->id);
+    shell_sym_cache_t *c = NULL;
+    if (idx >= 0 && idx < SIM_EQ_MAX_NODES) {
+        if (!s->sym_cache[idx]) s->sym_cache[idx] = calloc(1, sizeof(*c));
+        c = s->sym_cache[idx];
+        if (c && (strcmp(c->firmware, fw) != 0 || strcmp(c->secure_firmware, sfw) != 0)) {
+            memset(c, 0, sizeof(*c));
+            snprintf(c->firmware, sizeof(c->firmware), "%s", fw);
+            snprintf(c->secure_firmware, sizeof(c->secure_firmware), "%s", sfw);
+        }
+        if (c)
+            for (int i = 0; i < c->count; i++)
+                if (strcmp(c->e[i].name, name) == 0) { *addr = c->e[i].addr; return true; }
+    }
+    bool found = (fw[0] && elf_lookup_symbol(fw, name, addr)) ||
+                 (sfw[0] && elf_lookup_symbol(sfw, name, addr));
+    if (found && c && strlen(name) < sizeof(c->e[0].name)) {
+        int k = c->next;
+        snprintf(c->e[k].name, sizeof(c->e[k].name), "%s", name);
+        c->e[k].addr = *addr;
+        c->next = (k + 1) % SHELL_SYM_CACHE;
+        if (c->count < SHELL_SYM_CACHE) c->count++;
+    }
+    return found;
+}
+
 static int resolve_addr(shell_service_t *s, const sim_control_node_info_t *info,
                         const char *spec, uint32_t *out) {
     long v;
@@ -595,10 +628,7 @@ static int resolve_addr(shell_service_t *s, const sim_control_node_info_t *info,
         if (shell_parse_int(plus + 1, &off) != 0) { shell_error(s, "bad offset in '%s'", spec); return -1; }
     }
     uint32_t a = 0;
-    if (info->firmware && info->firmware[0]) a = elf_find_symbol(info->firmware, name);
-    if (!a && info->secure_firmware && info->secure_firmware[0])
-        a = elf_find_symbol(info->secure_firmware, name);
-    if (!a) { shell_error(s, "no symbol '%s' in node %d's firmware", name, info->id); return -1; }
+    if (!node_symbol(s, info, name, &a)) { shell_error(s, "no symbol '%s' in node %d's firmware", name, info->id); return -1; }
     *out = a + (uint32_t)off;
     return 0;
 }
