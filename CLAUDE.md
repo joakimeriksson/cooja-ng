@@ -85,6 +85,8 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 ./build/test_runner config-roundtrip configs/*.json configs/*.yaml   # load -> YAML -> load: lossless + idempotent
 ./build/test_runner config-reject test/configs/invalid/*   # every fixture (typo'd key, anchor, "Norway" boolean,
                                          # hex, 2nd document, wrong type ...) MUST fail to load — fail loudly
+./build/test_runner config-depth           # nesting cap: YAML and JSON both parse 999 nested lists, refuse
+                                         # 1000, and refuse 200000 without exhausting the stack
 ./build/test_runner config-convert in.json out.yaml        # canonical v2 YAML
 
 # Determinism gates. check-determinism.sh runs ONE simulation twice and diffs

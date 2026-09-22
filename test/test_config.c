@@ -3,6 +3,8 @@
  *
  *   config-convert   <in.{json,yaml}> <out.yaml>
  *   config-roundtrip <config...>
+ *   config-reject    <config...>
+ *   config-depth
  *
  * The round-trip is the writer's correctness proof: for each file, load ->
  * write YAML -> load again must give the same normalized config, and writing
@@ -11,6 +13,7 @@
  * simulation later.
  */
 #include "sim_config.h"
+#include "../src/sim/sim_config_internal.h"   /* the two parse front ends */
 #include "csim_version.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,6 +164,68 @@ int run_config_reject(int argc, char **argv) {
         int rc = sim_config_load(&cfg, argv[i]);
         if (rc == 0) { sim_config_free(&cfg); printf("  FAIL %s: loaded, but must be rejected\n", argv[i]); failed++; }
         else { printf("  PASS %s (rejected)\n", argv[i]); passed++; }
+    }
+    printf("\n--- Results: %d passed, %d failed ---\n", passed, failed);
+    return failed;
+}
+
+/* config-depth: the nesting cap, at its boundary and far past it.  Both front
+ * ends must accept a document whose root container holds 999 nested lists
+ * (1000 containers: cJSON's CJSON_NESTING_LIMIT) and refuse one more -- the
+ * same shape in both formats -- and must refuse a 200000-deep document
+ * without running out of stack.  Parse level only: none of these would pass
+ * the schema, so config-reject cannot tell the cap from the schema, and a
+ * fixture deep enough to crash an uncapped parser depends on the host's stack
+ * size.  (adversarial-input-review X7) */
+static char *nested(int depth, int json) {
+    const char *pre = json ? "{\"nodes\": " : "nodes: ";
+    const char *post = json ? "}\n" : "\n";
+    size_t len = strlen(pre) + 2 * (size_t)depth + strlen(post);
+    char *buf = malloc(len + 1);
+    if (!buf) return NULL;
+    char *p = buf;
+    p += sprintf(p, "%s", pre);
+    memset(p, '[', (size_t)depth); p += depth;
+    memset(p, ']', (size_t)depth); p += depth;
+    sprintf(p, "%s", post);
+    return buf;
+}
+
+static int parses(int depth, int json) {
+    char *text = nested(depth, json);
+    if (!text) return -1;
+    cJSON *root = json ? cJSON_Parse(text)
+                       : sim_config_yaml_to_cjson(text, strlen(text), "depth.yaml");
+    int ok = root != NULL;
+    cJSON_Delete(root);
+    free(text);
+    return ok;
+}
+
+int run_config_depth(int argc, char **argv);
+int run_config_depth(int argc, char **argv) {
+    (void)argc; (void)argv;
+    static const struct { int depth, accept; } cases[] = {
+        { 999, 1 }, { 1000, 0 }, { 200000, 0 },
+    };
+    int failed = 0, passed = 0;
+    printf("=== Config nesting cap: YAML and JSON agree at the boundary ===\n");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (int json = 0; json <= 1; json++) {
+            int got = parses(cases[i].depth, json);
+            const char *fmt = json ? "JSON" : "YAML";
+            if (got == cases[i].accept) {
+                printf("  PASS %s depth %d %s\n", fmt, cases[i].depth,
+                       got ? "parsed" : "refused");
+                passed++;
+            } else {
+                printf("  FAIL %s depth %d: %s\n", fmt, cases[i].depth,
+                       got < 0 ? "out of memory"
+                               : got ? "parsed, must be refused"
+                                     : "refused, must parse");
+                failed++;
+            }
+        }
     }
     printf("\n--- Results: %d passed, %d failed ---\n", passed, failed);
     return failed;

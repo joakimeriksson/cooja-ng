@@ -337,6 +337,8 @@ jobs:
         run: ./build/test_runner config-roundtrip configs/*.json configs/*.yaml test/configs/yaml-features.yaml
       - name: Config rejection (every invalid fixture must fail to load)
         run: ./build/test_runner config-reject test/configs/invalid/*
+      - name: Config nesting cap (YAML and JSON agree at 1000 levels; 200000 refused, not a crash)
+        run: ./build/test_runner config-depth
       - name: Config JSON <-> YAML equivalence (chain-4node-sky, JS hello)
         run: |
           tools/check-config-equivalence.sh configs/chain-4node-sky-v2.json configs/chain-4node-sky.yaml

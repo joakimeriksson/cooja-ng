@@ -61,6 +61,7 @@ extern int run_arm_jit_tests(int verbose);
 extern int run_config_convert(int argc, char **argv);
 extern int run_config_roundtrip(int argc, char **argv);
 extern int run_config_reject(int argc, char **argv);
+extern int run_config_depth(int argc, char **argv);
 extern int run_arm_firmware_tests(int verbose);
 
 /* Mixed-platform test (handles MSP430, ARM, and native nodes) */
@@ -140,7 +141,7 @@ int main(int argc, char **argv) {
         printf("Radio bus:    radio-bus\n");
         printf("Test:         test <config.yaml|json> [-v] [-t ms] [--seed N] [--save-config out.yaml]\n");
     printf("              ... [--shell] [--script FILE] [--paused] [--speed N|max|realtime]  (docs/shell.md)\n");
-        printf("Config:       config-convert <in> <out.yaml> | config-roundtrip <config...> | config-reject <config...>\n");
+        printf("Config:       config-convert <in> <out.yaml> | config-roundtrip <config...> | config-reject <config...> | config-depth\n");
         printf("Combined:     all\n");
         return 1;
     }
@@ -423,6 +424,8 @@ int main(int argc, char **argv) {
         return run_config_roundtrip(argc - 2, argv + 2) ? 1 : 0;
     if (strcmp(mode, "config-reject") == 0)
         return run_config_reject(argc - 2, argv + 2) ? 1 : 0;
+    if (strcmp(mode, "config-depth") == 0)
+        return run_config_depth(argc - 2, argv + 2) ? 1 : 0;
 
     /* Timeline unit tests */
     if (strcmp(mode, "mock-host") == 0 || strcmp(mode, "all") == 0) {
