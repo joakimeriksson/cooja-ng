@@ -1130,6 +1130,12 @@ static void test_environment(void) {
     shell_enqueue_line(&sh, "gpio 1 P1.6 release");
     shell_script_tick(&sh);
     CHECK(m_pin_port == 1 && m_pin_pin == 6 && m_pin_level == -1, "gpio release passes level -1 (%d)", m_pin_level);
+    int atq = sh.atq_count, restarts = m_restarts;
+    shell_enqueue_line(&sh, "at +1s restart");
+    shell_enqueue_line(&sh, "every 1s restart");
+    shell_enqueue_line(&sh, "on 1 \"x\" restart");
+    shell_script_tick(&sh);
+    CHECK(sh.atq_count == atq && sh.trigger_count == 0 && m_restarts == restarts, "restart is refused from at/every/on");
     unlink(p);
 
     radio_medium_destroy(&mock_sim.radio_medium);   /* before the reset re-inits it */
