@@ -350,7 +350,22 @@ int shell_expand_vars(const char *in, char *out, size_t outlen,
                 if (err) snprintf(err, errlen, "undefined variable '%s'", name);
                 return -1;
             }
-            for (const char *v = val; *v; v++) EMIT(*v);
+            /* The value is one word with every byte literal: what the
+             * tokenizer would read as a quote, a comment, a separator or
+             * an escape is escaped, control bytes as \xHH (a captured
+             * console line can hold anything).  Inside '...' nothing
+             * expands, so only the unquoted and "..." cases get here. */
+            for (const char *v = val; *v; v++) {
+                unsigned char b = (unsigned char)*v;
+                if (b < 0x20 || b == 0x7f) {
+                    static const char hex[] = "0123456789abcdef";
+                    EMIT('\\'); EMIT('x'); EMIT(hex[b >> 4]); EMIT(hex[b & 15]);
+                    continue;
+                }
+                if (b == '\\' || b == '"' || b == '\'' || b == '#' || b == '$' || b == ' ' || b == '\t')
+                    EMIT('\\');
+                EMIT(*v);
+            }
             p = e - 1;
             word_start = false;
             continue;
