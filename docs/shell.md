@@ -86,7 +86,7 @@ Times: `5s`, `250ms`, `1500us`, `1.5s`, `2m`; a bare number is milliseconds;
 | `pcap <file>\|off` | start or stop an 802.15.4 capture |
 | `clock <node> [deviation]` | show or set a node's clock deviation (1.0 exact; 1.00002 runs 20 ppm fast) |
 | `leds [nodes]` | LED states |
-| `gpio <node> <port>.<pin> high\|low\|pulse [duration]` | drive an input pin: MSP430 `P1.0`-`P10.7`, CC2538 `A.0`-`D.7` (raises the pin interrupt the firmware configured), nRF54L15 `P0`-`P2` (the IN register only; no GPIOTE interrupt is modelled); nRF52840 has no GPIO model |
+| `gpio <node> <port>.<pin> high\|low\|pulse [duration]\|release` | drive an input pin: MSP430 `P1.0`-`P10.7`, CC2538 `A.0`-`D.7` (raises the pin interrupt the firmware configured), nRF54L15 `P0`-`P2` (the IN register only; no GPIOTE interrupt is modelled); nRF52840 has no GPIO model.  `release` stops forcing the pin: on the nRF54L15 IN follows OUT again (loopback); MSP430 and CC2538 keep the last level (nothing to release).  Not `button release`, which drives the button's inactive level |
 | `button <node> press\|release\|click [duration]` | the board's user button, respecting active-low wiring (Sky P2.7, Z1 P2.5, CC2538DK PA3, nRF boards per board file); `click` releases after 100 ms |
 | `restart` | restart from the configuration: configured nodes only, links restored, `at` queue cleared, scripts aborted; lines after it run against the new simulation.  Inside a script file it is the script's end, like `exit` |
 | `ui <port>` | start the live web UI now |

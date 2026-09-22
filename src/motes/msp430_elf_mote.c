@@ -782,6 +782,7 @@ static int msp_mote_ui_radio_state(const sim_mote_t *m) {
 static int msp_mote_set_input_pin(sim_mote_t *m, int port, int pin, int level) {
     msp430_gpio_t *gpio = &MOTE_IMPL(m)->plat.msp.gpio;
     if (port < 1 || port > gpio->num_ports || pin < 0 || pin > 7) return -1;
+    if (level < 0) return 0;               /* release: no forced state to drop, the level stays */
     msp430_gpio_set_input_pin(gpio, port, pin, level != 0);
     return 0;
 }

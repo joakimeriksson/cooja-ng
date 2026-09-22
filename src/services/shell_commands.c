@@ -1915,7 +1915,7 @@ static int schedule_release(shell_service_t *s, int64_t dur, const char *cmd) {
     return 0;
 }
 
-/* gpio <node> <port.pin> high|low|pulse [duration] */
+/* gpio <node> <port.pin> high|low|pulse [duration]|release */
 static int cmd_gpio(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)line; (void)argpos;
     int idx;
@@ -1926,6 +1926,8 @@ static int cmd_gpio(shell_service_t *s, int argc, char **argv, const char *line,
     const char *op = argv[3];
     if (!strcmp(op, "high") || !strcmp(op, "low"))
         return drive_pin(s, "gpio", idx, port, pin, op[0] == 'h');
+    if (!strcmp(op, "release"))                 /* stop forcing: the pin is the firmware's again */
+        return drive_pin(s, "gpio", idx, port, pin, -1);
     if (!strcmp(op, "pulse")) {
         int64_t dur = 100 * SHELL_MS_TO_NS;
         if (argc == 5 && parse_dur(s, argv[4], &dur) != 0) return -1;
@@ -1934,7 +1936,7 @@ static int cmd_gpio(shell_service_t *s, int argc, char **argv, const char *line,
         snprintf(cmd, sizeof(cmd), "gpio %d %d.%d low", id, port, pin);
         return schedule_release(s, dur, cmd);
     }
-    shell_error(s, "gpio: expected high, low or pulse, got '%s'", op);
+    shell_error(s, "gpio: expected high, low, pulse or release, got '%s'", op);
     return -1;
 }
 
@@ -2279,7 +2281,7 @@ static const shell_command_t commands[] = {
     { "pcap",       "pcap <file>|off",                 "start or stop an 802.15.4 capture", 1, 1, IMM, cmd_pcap },
     { "clock",      "clock <node> [deviation]",        "show or set a node's clock deviation (1.0 exact, e.g. 1.00002 = 20 ppm fast)", 1, 2, IMM, cmd_clock },
     { "leds",       "leds [nodes]",                    "LED states", 0, 1, IMM, cmd_leds },
-    { "gpio",       "gpio <node> <port>.<pin> high|low|pulse [duration]", "drive a GPIO input pin (MSP430 P1-P10, CC2538 A-D, nRF54L15 P0-P2 without GPIOTE)", 3, 4, IMM, cmd_gpio },
+    { "gpio",       "gpio <node> <port>.<pin> high|low|pulse [duration]|release", "drive a GPIO input pin (MSP430 P1-P10, CC2538 A-D, nRF54L15 P0-P2 without GPIOTE)", 3, 4, IMM, cmd_gpio },
     { "button",     "button <node> press|release|click [duration]", "the board's user button (click = press, release after 100ms)", 2, 3, IMM, cmd_button },
     { "restart",    "restart",                         "restart the simulation from its configuration (aborts scripts, clears at)", 0, 0, IMM, cmd_restart },
     { "ui",         "ui <port>",                       "start the live web UI now", 1, 1, IMM, cmd_ui },
