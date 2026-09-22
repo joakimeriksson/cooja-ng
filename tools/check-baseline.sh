@@ -22,6 +22,14 @@
 #   tools/check-baseline.sh main            # or any ref
 #   tools/check-baseline.sh HEAD~3
 #   KEEP=1 tools/check-baseline.sh          # keep the logs for inspection
+#   TIMING=1 tools/check-baseline.sh        # run the workloads one at a time
+#
+# Each line also carries both binaries' wall time and the change.  The
+# workloads run concurrently by default, so those numbers are contended and
+# only indicative (tens of percent): a regression signal to follow up with
+# a real measurement, not a benchmark.  TIMING=1 serialises the runs for
+# numbers worth quoting, at about one workload's worth of time per workload.
+# The simulation output is compared the same way either way.
 #
 # Exit code 0 = identical, 1 = a workload differs (or would not run).
 #
@@ -87,9 +95,25 @@ build() {  # build <srcdir> <label>
 run_all() {  # run_all <binary> <outdir>
     mkdir -p "$2"
     for w in "${WORKLOADS[@]}"; do
-        ( timeout 900 "$1" ${w#*|} >"$2/${w%%|*}.log" 2>&1; echo "rc=$?" >>"$2/${w%%|*}.log" ) &
+        if [ -n "${TIMING:-}" ]; then
+            ( timeout 900 "$1" ${w#*|} >"$2/${w%%|*}.log" 2>&1; echo "rc=$?" >>"$2/${w%%|*}.log" )
+        else
+            ( timeout 900 "$1" ${w#*|} >"$2/${w%%|*}.log" 2>&1; echo "rc=$?" >>"$2/${w%%|*}.log" ) &
+        fi
     done
     wait
+}
+
+# The runner's own "Wall-clock time: N ms" line, last one in the log (a
+# restart prints more than one).  Empty when the run did not get that far.
+wall_ms() { sed -n 's/^ *Wall-clock time: *\([0-9.]*\) ms.*/\1/p' "$1" | tail -1; }
+
+# "ref 437.7 ms  head 548.7 ms  +25.4 %" for the two logs, or a note.
+timing() {
+    local a b
+    a=$(wall_ms "$1"); b=$(wall_ms "$2")
+    if [ -z "$a" ] || [ -z "$b" ]; then echo "(no wall time)"; return; fi
+    awk -v a="$a" -v b="$b" 'BEGIN { printf "ref %8.1f ms  head %8.1f ms  %+6.1f %%", a, b, (b - a) * 100 / a }'
 }
 
 echo "=== baseline: this tree vs $REF_SHA${REF_NAME:+ ($REF_NAME)}"
@@ -101,7 +125,7 @@ build "$ROOT" head || exit 1
 # Both binaries run from THIS tree, so configs and firmware are identical and
 # only the engine differs.  (A config that changed since the reference may not
 # load in the older binary — that shows up as a diff in its log.)
-echo "  running ${#WORKLOADS[@]} workloads with each binary ..."
+echo "  running ${#WORKLOADS[@]} workloads with each binary${TIMING:+, one at a time (TIMING)} ..."
 run_all "$WORK/ref/build/test_runner" "$WORK/out-ref"
 run_all "$ROOT/build/test_runner"     "$WORK/out-head"
 
@@ -112,15 +136,16 @@ for w in "${WORKLOADS[@]}"; do
     b="$WORK/out-head/$name.log"
     n=$(diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | wc -l)
     if [ "$n" -eq 0 ]; then
-        echo "  ok    $name"
+        printf "  ok    %-8s %s\n" "$name" "$(timing "$a" "$b")"
     else
-        echo "  DIFF  $name ($n lines)"
+        printf "  DIFF  %-8s (%d lines)  %s\n" "$name" "$n" "$(timing "$a" "$b")"
         diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | head -20
         rc=1
         KEEP=1
     fi
 done
 
+[ -n "${TIMING:-}" ] || echo "  (wall times from concurrent runs: indicative only; TIMING=1 serialises them)"
 if [ $rc -eq 0 ]; then
     echo "check-baseline: OK (identical to $REF_SHA)"
 else
