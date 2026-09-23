@@ -7,6 +7,8 @@
 #                  it stands must be failed, and the run must still finish;
 #   inf            a non-finite time from the peer must fail the node, not
 #                  be converted to an integer (undefined behavior);
+#   tx-inf, tx-ninf  the same for an output event's stamp, which must be
+#                  refused as a time, not reported as before the slice;
 #   ok             the fault-free control must not be failed.
 #
 # A livelock never returns to the runner's loop, where --wall-timeout is
@@ -76,6 +78,8 @@ check() {   # mode, expected stderr pattern ("" = the node must NOT fail)
 check stuck  "steps in a row without its clock moving"
 check rewind "steps in a row without its clock moving"
 check inf    "is not a time in ns"
+check tx-inf  "tx.t. is not a time in ns"
+check tx-ninf "tx.t. is not a time in ns"
 check ok     ""
 
 if [ "$failed" -ne 0 ]; then

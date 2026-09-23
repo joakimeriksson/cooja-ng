@@ -236,10 +236,15 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
      * radio output.  Only a stamp before the slice is a protocol error.
      * Deferring a future-stamped event needs the pending queue that
      * arrives with M1. */
+    char what[48];
+    snprintf(what, sizeof(what), "%.40s.t", type->valuestring);
     const cJSON *t = cJSON_GetObjectItemCaseSensitive(ev, "t");
-    if (cJSON_IsNumber(t) && (int64_t)t->valuedouble < slice_start) {
+    int64_t t_ns = 0;
+    int has_t = json_ns(node, t, what, &t_ns);
+    if (has_t < 0) return;
+    if (has_t && t_ns < slice_start) {
         ext_fail(node, "output event stamped t=%lld before the slice start t=%lld",
-                 (long long)t->valuedouble, (long long)slice_start);
+                 (long long)t_ns, (long long)slice_start);
         return;
     }
 
@@ -262,32 +267,22 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
          * CSMA window: the peer computed it from the frame's true end on
          * the air, and the bus puts it on the air there rather than at the
          * end of this catch-up slice. */
-        int64_t at_ns = 0;
-        if (json_ns(node, t, "tx.t", &at_ns) < 0) return;
         if (node->rf_frame_callback)
             node->rf_frame_callback(node->rf_frame_callback_data, buf, len,
-                                    at_ns);
+                                    t_ns);
 
     } else if (strcmp(type->valuestring, "log") == 0) {
         const cJSON *line = cJSON_GetObjectItemCaseSensitive(ev, "line");
         /* The console line carries the node's clock (timeline, log
          * timestamps): stamp it with the event's own time inside the
          * slice, as an emulated mote's line would be, not the slice end. */
-        int64_t at;
-        int has_t = json_ns(node, t, "log.t", &at);
-        if (has_t < 0) return;
-        if (has_t) {
-            if (at > step_t) at = step_t;
-            node->sim_time_ns = at;
-        }
+        if (has_t)
+            node->sim_time_ns = t_ns > step_t ? step_t : t_ns;
         if (cJSON_IsString(line))
             emit_log_line(node, line->valuestring);
 
     } else if (strcmp(type->valuestring, "wake") == 0) {
-        int64_t when;
-        int has_t = json_ns(node, t, "wake.t", &when);
-        if (has_t < 0) return;
-        if (has_t && when < node->next_wakeup_ns) node->next_wakeup_ns = when;
+        if (has_t && t_ns < node->next_wakeup_ns) node->next_wakeup_ns = t_ns;
 
     } else {
         /* Unknown types are ignored on purpose: the protocol only ever gains
