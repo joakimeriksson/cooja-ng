@@ -1955,6 +1955,36 @@ static void test_exception_return_align(void) {
     arm_cpu_destroy(&cpu);
 }
 
+/* T32 LDMDB: loads upwards from Rn - 4*n; with W, Rn = that lowest address. */
+static void test_ldmdb(void) {
+    if (verbose) printf("--- LDMDB tests ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    uint32_t base = cpu.sram_base + 0x108;
+    arm_write32(&cpu, base - 8, 0x11111111);
+    arm_write32(&cpu, base - 4, 0x22222222);
+    arm_write32(&cpu, base,     0x33333333);
+    arm_write32(&cpu, base + 4, 0x44444444);
+    write_thumb32(&cpu, CODE_BASE,     0xE931, 0x0005);   /* LDMDB r1!, {r0, r2} */
+    write_thumb32(&cpu, CODE_BASE + 4, 0xE911, 0x0028);   /* LDMDB r1, {r3, r5} */
+    write_thumb32(&cpu, CODE_BASE + 8, 0xE914, 0x0012);   /* LDMDB r4, {r1, r4} */
+    cpu.reg[1] = base;
+    arm_step(&cpu, 1);
+    assert_eq("LDMDB r1!: r0 = [Rn-8]", 0x11111111, cpu.reg[0]);
+    assert_eq("LDMDB r1!: r2 = [Rn-4]", 0x22222222, cpu.reg[2]);
+    assert_eq("LDMDB r1!: r1 = Rn-8", base - 8, cpu.reg[1]);
+    cpu.reg[1] = base + 8;
+    arm_step(&cpu, 1);
+    assert_eq("LDMDB r1: r3 = [Rn-8]", 0x33333333, cpu.reg[3]);
+    assert_eq("LDMDB r1: r5 = [Rn-4]", 0x44444444, cpu.reg[5]);
+    assert_eq("LDMDB r1: no writeback", base + 8, cpu.reg[1]);
+    cpu.reg[4] = base + 8;
+    arm_step(&cpu, 1);
+    assert_eq("LDMDB Rn in list: r1 = [Rn-8]", 0x33333333, cpu.reg[1]);
+    assert_eq("LDMDB Rn in list: r4 loaded", 0x44444444, cpu.reg[4]);
+    arm_cpu_destroy(&cpu);
+}
+
 /* ===================================================================
  * ARMv8-M TrustZone-M: SAU + IDAU security attribution (Phase 1)
  * =================================================================== */
@@ -3103,6 +3133,7 @@ int run_arm_correctness_tests(int v) {
     test_vfp_double();
     test_ldrd_strd();
     test_exception_return_align();
+    test_ldmdb();
     test_bit_field_ops();
     test_ldaex_stlex();
     test_ldrex_strex_byte_halfword();

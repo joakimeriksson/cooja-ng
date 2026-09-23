@@ -2910,7 +2910,15 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                 uint32_t addr = cpu->reg[rn];
 
                 if (L) {
-                    /* LDM.W — defer exception_return until after writeback */
+                    /* LDM.W / LDMDB — defer exception_return until after
+                     * writeback. LDMDB loads upwards from Rn - 4*n and
+                     * writes that lowest address back. */
+                    int U = (hw1 >> 7) & 1; /* 1=increment, 0=decrement */
+                    uint32_t wb_db = 0;
+                    if (!U) {
+                        addr -= 4u * (uint32_t)__builtin_popcount(reglist);
+                        wb_db = addr;
+                    }
                     arm_insn_snapshot(cpu);   /* multi-register load */
                     uint32_t exc_ret = 0;
                     bool do_exc_ret = false;
@@ -2931,7 +2939,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         }
                     }
                     if (W && !(reglist & (1 << rn)))
-                        cpu->reg[rn] = addr;
+                        cpu->reg[rn] = U ? addr : wb_db;
                     if (do_exc_ret)
                         arm_load_pc(cpu, exc_ret);
                 } else {
