@@ -37,6 +37,19 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
         return -1;
     }
 
+    /* e_phentsize drives the header offsets below: anything but the ELF32
+     * size makes them read the wrong bytes (0 re-reads one header e_phnum
+     * times). */
+    if (ehdr.e_phnum > 0 && ehdr.e_phentsize != sizeof(Elf32_Phdr)) {
+        fprintf(stderr, "Unexpected program header size %u in %s\n",
+                ehdr.e_phentsize, path);
+        fclose(f);
+        return -1;
+    }
+
+    /* Bytes actually placed in memory: an image that places none would
+     * boot a zero-filled address space and look like it ran. */
+    uint64_t loaded = 0;
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf32_Phdr phdr;
         fseek(f, ehdr.e_phoff + i * ehdr.e_phentsize, SEEK_SET);
@@ -51,9 +64,14 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
 
         elf_segment_route_t seg = route(ctx, phdr.p_paddr, phdr.p_vaddr, phdr.p_filesz);
         if (!seg.dest) {
+            /* Bytes that route nowhere leave a hole the firmware expects
+             * filled -- often the reset vector, which boots the image at
+             * PC=0. Placing the other segments would run half an image. */
             if (phdr.p_filesz > 0) {
-                fprintf(stderr, "ELF segment at 0x%x (size 0x%x) doesn't map to memory\n",
-                        phdr.p_paddr, phdr.p_filesz);
+                fprintf(stderr, "ELF segment at 0x%x (size 0x%x) doesn't map to "
+                        "memory: %s\n", phdr.p_paddr, phdr.p_filesz, path);
+                fclose(f);
+                return -1;
             }
             continue;
         }
@@ -67,6 +85,7 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
                 fclose(f);
                 return -1;
             }
+            loaded += read_size;
         }
 
         /* Zero BSS (memsz > filesz) */
@@ -80,6 +99,10 @@ int elf_load_segments(const char *path, elf_route_fn route, void *ctx) {
     }
 
     fclose(f);
+    if (loaded == 0) {
+        fprintf(stderr, "No loadable segment maps to memory: %s\n", path);
+        return -1;
+    }
     return 0;
 }
 
@@ -118,12 +141,15 @@ uint32_t elf_find_symbol(const char *path, const char *symbol_name) {
     if (strtab_hdr.sh_size == 0 || strtab_hdr.sh_size > ELF_STRTAB_MAX) {
         fclose(f); return 0;
     }
-    char *strtab = (char *)malloc(strtab_hdr.sh_size);
+    /* One extra byte for a terminator: a real strtab ends in NUL, a crafted
+     * one need not, and strcmp below would then run off the allocation. */
+    char *strtab = (char *)malloc(strtab_hdr.sh_size + 1);
     if (!strtab) { fclose(f); return 0; }
     fseek(f, strtab_hdr.sh_offset, SEEK_SET);
     if (fread(strtab, 1, strtab_hdr.sh_size, f) != strtab_hdr.sh_size) {
         free(strtab); fclose(f); return 0;
     }
+    strtab[strtab_hdr.sh_size] = '\0';
 
     /* Iterate symbols */
     int num_syms = symtab_hdr.sh_size / sizeof(Elf32_Sym);

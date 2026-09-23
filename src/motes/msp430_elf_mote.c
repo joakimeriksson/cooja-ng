@@ -25,6 +25,53 @@
 #include <stdlib.h>
 
 /* ============================================================
+ * Symbol-addressed chip memory
+ *
+ * Firmware symbol values come straight from the ELF, so every patch and
+ * diagnostic that uses one as an offset into cpu->memory goes through
+ * mem_at: NULL unless [addr, addr + len) lies inside the address space.
+ * Written without adding to addr, so a value near UINT32_MAX cannot wrap.
+ * ============================================================ */
+
+static uint8_t *mem_at(const msp430_cpu_t *cpu, uint32_t addr, size_t len) {
+    if (addr >= cpu->max_mem || len > cpu->max_mem - addr)
+        return NULL;
+    return cpu->memory + addr;
+}
+
+/* Diagnostic reads: -1 / 0 for an address outside the address space. */
+static int mem_u8(const msp430_cpu_t *cpu, uint32_t addr) {
+    const uint8_t *p = mem_at(cpu, addr, 1);
+    return p ? p[0] : -1;
+}
+
+static int mem_le16(const msp430_cpu_t *cpu, uint32_t addr) {
+    const uint8_t *p = mem_at(cpu, addr, 2);
+    return p ? p[0] | (p[1] << 8) : 0;
+}
+
+static uint32_t mem_le32(const msp430_cpu_t *cpu, uint32_t addr) {
+    const uint8_t *p = mem_at(cpu, addr, 4);
+    return p ? ((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24)) : 0;
+}
+
+/* Boot patches: the target, or NULL after saying which symbol was skipped
+ * and counting it in *skipped. A symbol the image exports but places
+ * outside the address space cannot occur in a valid firmware, so the
+ * count fails the boot rather than leaving the node half-patched. */
+static uint8_t *patch_at(const msp430_cpu_t *cpu, const char *sym,
+                         uint32_t addr, size_t len, int *skipped) {
+    uint8_t *p = mem_at(cpu, addr, len);
+    if (!p) {
+        fprintf(stderr, "  Warning: symbol %s at 0x%x (+%zu) lies outside "
+                        "memory, not patched\n", sym, addr, len);
+        (*skipped)++;
+    }
+    return p;
+}
+
+/* ============================================================
  * MSP430 PC-trace debug instrumentation (Phase 10 M55)
  *
  * Firmware-level cc2420_transmit / TSCH EB-process / queue-add counters,
@@ -91,8 +138,9 @@ void msp430_elf_mote_dump_uip(const mixed_node_t *node) {
         return;
     uint32_t uip_buf_sym =
         msp430_elf_find_symbol(node->firmware_path, "uip_aligned_buf");
-    if (uip_buf_sym && uip_buf_sym + 40 < node->plat.msp.cpu.max_mem) {
-        const uint8_t *ip6 = node->plat.msp.cpu.memory + uip_buf_sym;
+    const uint8_t *ip6 = uip_buf_sym
+                       ? mem_at(&node->plat.msp.cpu, uip_buf_sym, 64) : NULL;
+    if (ip6) {
         uint16_t ulen = (ip6[4] << 8) | ip6[5];
         const uint8_t *cpumem = node->plat.msp.cpu.memory;
         uint8_t pfx_len = cpumem[0x2964];
@@ -132,36 +180,31 @@ void msp430_elf_mote_dump_diagnostics(const sim_mote_t *m, int section) {
         uint32_t tsch_init = msp430_elf_find_symbol(firmware_path, "tsch_is_initialized");
         uint32_t tsch_start = msp430_elf_find_symbol(firmware_path, "tsch_is_started");
         if (tsch_coord && tsch_init && tsch_start) {
-            uint8_t *mem = node->plat.msp.cpu.memory;
+            const msp430_cpu_t *cpu = &node->plat.msp.cpu;
             uint32_t asn_addr = msp430_elf_find_symbol(firmware_path, "tsch_current_asn");
             uint32_t in_slot = msp430_elf_find_symbol(firmware_path, "tsch_in_slot_operation");
-            uint32_t asn_lo = asn_addr ? (mem[asn_addr] | (mem[asn_addr+1]<<8) | (mem[asn_addr+2]<<16) | (mem[asn_addr+3]<<24)) : 0;
+            uint32_t asn_lo = asn_addr ? mem_le32(cpu, asn_addr) : 0;
             uint32_t tsch_assoc = msp430_elf_find_symbol(firmware_path, "tsch_is_associated");
             uint32_t tsch_secured = msp430_elf_find_symbol(firmware_path, "tsch_is_pan_secured");
             uint32_t eb_period_addr = msp430_elf_find_symbol(firmware_path, "tsch_current_eb_period");
-            uint32_t eb_period = eb_period_addr ? (mem[eb_period_addr] | (mem[eb_period_addr+1]<<8) |
-                (mem[eb_period_addr+2]<<16) | (mem[eb_period_addr+3]<<24)) : 0;
+            uint32_t eb_period = eb_period_addr ? mem_le32(cpu, eb_period_addr) : 0;
             uint32_t leaf_only_addr = msp430_elf_find_symbol(firmware_path, "rpl_leaf_only");
             uint32_t used_addr = 0x2568;  /* curr_instance.used */
             uint32_t rank1 = 0x2572, rank2 = 0x25a6;
             uint32_t clock_count_addr = msp430_elf_find_symbol(firmware_path, "count");
             uint32_t clock_seconds_addr = msp430_elf_find_symbol(firmware_path, "seconds");
-            uint32_t clock_count_val = clock_count_addr ?
-                (mem[clock_count_addr] | (mem[clock_count_addr+1]<<8) |
-                 (mem[clock_count_addr+2]<<16) | (mem[clock_count_addr+3]<<24)) : 0;
-            uint32_t clock_seconds_val = clock_seconds_addr ?
-                (mem[clock_seconds_addr] | (mem[clock_seconds_addr+1]<<8) |
-                 (mem[clock_seconds_addr+2]<<16) | (mem[clock_seconds_addr+3]<<24)) : 0;
+            uint32_t clock_count_val = clock_count_addr ? mem_le32(cpu, clock_count_addr) : 0;
+            uint32_t clock_seconds_val = clock_seconds_addr ? mem_le32(cpu, clock_seconds_addr) : 0;
             printf("  Node %d TSCH: coord=%d init=%d started=%d assoc=%d secured=%d in_slot=%d asn=%u eb_period=%u "
                    "leaf_only=%d rpl_used=%d rank=%d/%d clock=%u/%us\n",
-                node->id, mem[tsch_coord], mem[tsch_init], mem[tsch_start],
-                tsch_assoc ? mem[tsch_assoc] : -1,
-                tsch_secured ? mem[tsch_secured] : -1,
-                in_slot ? mem[in_slot] : -1, asn_lo, eb_period,
-                leaf_only_addr ? mem[leaf_only_addr] : -1,
-                mem[used_addr],
-                mem[rank1] | (mem[rank1+1]<<8),
-                mem[rank2] | (mem[rank2+1]<<8),
+                node->id, mem_u8(cpu, tsch_coord), mem_u8(cpu, tsch_init),
+                mem_u8(cpu, tsch_start),
+                tsch_assoc ? mem_u8(cpu, tsch_assoc) : -1,
+                tsch_secured ? mem_u8(cpu, tsch_secured) : -1,
+                in_slot ? mem_u8(cpu, in_slot) : -1, asn_lo, eb_period,
+                leaf_only_addr ? mem_u8(cpu, leaf_only_addr) : -1,
+                mem_u8(cpu, used_addr),
+                mem_le16(cpu, rank1), mem_le16(cpu, rank2),
                 clock_count_val, clock_seconds_val);
         }
         break;
@@ -188,14 +231,16 @@ void msp430_elf_mote_dump_diagnostics(const sim_mote_t *m, int section) {
             "neighbor_addr_mem_memb_mem");
         uint32_t nbr_used = msp430_elf_find_symbol(firmware_path,
             "neighbor_addr_mem_memb_used");
-        if (nbr_addr && nbr_used && nbr_addr < cpu->max_mem) {
-            /* neighbor_addr_mem_memb: 16 entries × 10 bytes (2-byte list ptr + 8-byte lladdr) */
-            int num_entries = 16;
-            int entry_size = 10;
+        /* neighbor_addr_mem_memb: 16 entries × 10 bytes (2-byte list ptr + 8-byte lladdr) */
+        enum { num_entries = 16, entry_size = 10 };
+        const uint8_t *table = nbr_addr
+                             ? mem_at(cpu, nbr_addr, num_entries * entry_size) : NULL;
+        const uint8_t *used = nbr_used ? mem_at(cpu, nbr_used, num_entries) : NULL;
+        if (table && used) {
             printf("  Node %d neighbor table (addr_mem at 0x%04x):\n", node->id, nbr_addr);
             for (int n = 0; n < num_entries; n++) {
-                if (nbr_used + n < cpu->max_mem && cpu->memory[nbr_used + n]) {
-                    uint8_t *ll = cpu->memory + nbr_addr + n * entry_size + 2;
+                if (used[n]) {
+                    const uint8_t *ll = table + n * entry_size + 2;
                     printf("    [%d] lladdr=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
                            n, ll[0],ll[1],ll[2],ll[3],ll[4],ll[5],ll[6],ll[7]);
                 }
@@ -210,12 +255,14 @@ void msp430_elf_mote_dump_diagnostics(const sim_mote_t *m, int section) {
             "nodememb_memb_mem");
         uint32_t sr_used = msp430_elf_find_symbol(firmware_path,
             "nodememb_memb_used");
-        if (sr_mem && sr_used && sr_mem < cpu->max_mem) {
+        /* uip_sr_node_t: list ptr(2) + ipaddr suffix(2) + parent ptr(2) + ... = 18 bytes */
+        const uint8_t *table = sr_mem ? mem_at(cpu, sr_mem, 16 * 18) : NULL;
+        const uint8_t *used = sr_used ? mem_at(cpu, sr_used, 16) : NULL;
+        if (table && used) {
             printf("  Node 1 SR table (nodememb at 0x%04x):\n", sr_mem);
-            /* uip_sr_node_t: list ptr(2) + ipaddr suffix(2) + parent ptr(2) + ... = 18 bytes */
             for (int n = 0; n < 16; n++) {
-                if (sr_used < cpu->max_mem && cpu->memory[sr_used + n]) {
-                    uint8_t *entry = cpu->memory + sr_mem + n * 18;
+                if (used[n]) {
+                    const uint8_t *entry = table + n * 18;
                     /* Dump raw bytes to understand layout */
                     printf("    [%d] raw:", n);
                     for (int b = 0; b < 18; b++)
@@ -243,6 +290,9 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
                          const sim_mote_env_t *env) {
     int idx = slot;
     msp430_platform_t *plat = &node->plat.msp;
+    /* Patches skipped because their symbol lies outside chip memory;
+     * checked once below, after the last of them. */
+    int patch_skipped = 0;
 
     /* Platform name comes from the board registry row (Phase 3). */
     const char *plat_name = node->board->name;
@@ -269,9 +319,12 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
 
     /* Patch ds2411_init() to RET immediately */
     uint32_t ds2411_init_addr = msp430_elf_find_symbol(firmware_path, "ds2411_init");
-    if (ds2411_init_addr != 0) {
-        plat->cpu.memory[ds2411_init_addr]     = 0x30;
-        plat->cpu.memory[ds2411_init_addr + 1] = 0x41;
+    uint8_t *ds2411_init_fn = ds2411_init_addr
+        ? patch_at(&plat->cpu, "ds2411_init", ds2411_init_addr, 2,
+                   &patch_skipped) : NULL;
+    if (ds2411_init_fn) {
+        ds2411_init_fn[0] = 0x30;
+        ds2411_init_fn[1] = 0x41;
         printf("  Patched ds2411_init at 0x%04x to RET\n", ds2411_init_addr);
     }
 
@@ -284,9 +337,11 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
                                    NULL};
         for (int p = 0; patch_fns[p]; p++) {
             uint32_t addr = msp430_elf_find_symbol(firmware_path, patch_fns[p]);
-            if (addr != 0) {
-                plat->cpu.memory[addr]     = 0x10;  /* RETA */
-                plat->cpu.memory[addr + 1] = 0x01;
+            uint8_t *fn = addr ? patch_at(&plat->cpu, patch_fns[p], addr, 2,
+                                          &patch_skipped) : NULL;
+            if (fn) {
+                fn[0] = 0x10;  /* RETA */
+                fn[1] = 0x01;
                 printf("  Patched %s at 0x%04x to RETA\n", patch_fns[p], addr);
             }
         }
@@ -329,8 +384,10 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
      * IPv6 IID = 0212:74id:00id:idid → fd00::0212:74id:00id:idid
      * This matches Cooja's test CSC ping targets (e.g. fd00::0212:7404:0004:0404). */
     uint32_t ds2411_addr = msp430_elf_find_symbol(firmware_path, "ds2411_id");
-    if (ds2411_addr != 0) {
-        uint8_t *id = plat->cpu.memory + ds2411_addr;
+    uint8_t *id = ds2411_addr
+        ? patch_at(&plat->cpu, "ds2411_id", ds2411_addr, 8,
+                   &patch_skipped) : NULL;
+    if (id) {
         id[0] = 0x00; id[1] = 0x12; id[2] = 0x74;
         id[3] = (uint8_t)(node_id & 0xff);
         id[4] = (uint8_t)((node_id >> 8) & 0xff);
@@ -363,9 +420,11 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
      * Must be written AFTER crt0 clears BSS but BEFORE platform_init. */
     {
         uint32_t nid = msp430_elf_find_symbol(firmware_path, "node_id");
-        if (nid != 0 && nid + 2 <= plat->cpu.max_mem) {
-            plat->cpu.memory[nid] = (uint8_t)(node_id & 0xFF);
-            plat->cpu.memory[nid + 1] = (uint8_t)((node_id >> 8) & 0xFF);
+        uint8_t *p = nid ? patch_at(&plat->cpu, "node_id", nid, 2,
+                                    &patch_skipped) : NULL;
+        if (p) {
+            p[0] = (uint8_t)(node_id & 0xFF);
+            p[1] = (uint8_t)((node_id >> 8) & 0xFF);
             printf("  Patched node_id at 0x%04x = %d\n", nid, node_id);
         }
     }
@@ -377,8 +436,9 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
         const char *addr_syms[] = {"linkaddr_node_addr", "node_mac", "uip_lladdr", NULL};
         for (int a = 0; addr_syms[a]; a++) {
             uint32_t sym = msp430_elf_find_symbol(firmware_path, addr_syms[a]);
-            if (sym != 0) {
-                uint8_t *p = plat->cpu.memory + sym;
+            uint8_t *p = sym ? patch_at(&plat->cpu, addr_syms[a], sym, 8,
+                                        &patch_skipped) : NULL;
+            if (p) {
                 /* Use same IEEE format as Cooja MspMote: c1:0c:00:00:00:00:00:id
                  * First byte must be non-zero or Z1 platform overwrites it */
                 p[0] = 0xc1; p[1] = 0x0c;
@@ -388,13 +448,31 @@ int msp430_elf_mote_boot(mixed_node_t *node, int slot,
             }
         }
         uint32_t nid_addr = msp430_elf_find_symbol(firmware_path, "node_id");
-        if (nid_addr != 0) {
-            plat->cpu.memory[nid_addr] = (uint8_t)node_id;
-            plat->cpu.memory[nid_addr + 1] = 0;
+        uint8_t *nid = nid_addr ? patch_at(&plat->cpu, "node_id", nid_addr, 2,
+                                           &patch_skipped) : NULL;
+        if (nid) {
+            nid[0] = (uint8_t)node_id;
+            nid[1] = 0;
         }
-        printf("  Patched node_id=%d, linkaddr, node_mac for Z1\n", node_id);
+        /* Only claim the patch when every one of them landed; a valid
+         * image never skips one, so this line is unchanged for real
+         * firmware. */
+        if (patch_skipped == 0)
+            printf("  Patched node_id=%d, linkaddr, node_mac for Z1\n", node_id);
     }
 
+    /* Last of the symbol-addressed patches. A skipped one leaves the node
+     * with an unpatched identity -- two nodes answering to the same
+     * node_id, a run that looks healthy and exits 0. No valid image
+     * exports a symbol outside its own address space, so refuse to boot
+     * rather than simulate the wrong network. */
+    if (patch_skipped > 0) {
+        fprintf(stderr, "Node %d [MSP430]: %d identity patch%s skipped, "
+                "refusing to boot: %s\n", node_id, patch_skipped,
+                patch_skipped == 1 ? "" : "es", firmware_path);
+        msp430_platform_destroy(plat);
+        return -1;
+    }
 
     /* Run past main() entry through DCO calibration and platform init.
      * Must stop AFTER TimerA is running with events scheduled AND

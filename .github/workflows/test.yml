@@ -170,6 +170,15 @@ jobs:
       - name: Version smoke
         run: ./build/test_runner --version
 
+      - name: Malformed firmware (MSP430 ELF images)
+        # Firmware symbol values index chip memory, so each image points
+        # one at or past the end of the address space.  Each boots in its own
+        # process and must exit without a signal; the patch cases must also
+        # report the symbol they skipped.  A wild write crashes here, but a
+        # write straddling the end of memory needs RUNNER set to a sanitizer
+        # build to be seen.
+        run: tools/check-elf-malformed.sh
+
       - name: "Plugin system (build + smoke: service, medium, energy, UI)"
         run: |
           make plugins
