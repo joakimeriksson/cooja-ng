@@ -35,14 +35,27 @@
 #define SCB_MMFAR   0xD34  /* MemManage Fault Address (same register as BFAR here) */
 #define SCB_BFAR    0xD38  /* BusFault Address */
 
-#define ARM_SHCSR_BUSFAULTACT    (1u << 1)
-#define ARM_SHCSR_BUSFAULTPENDED (1u << 14)
-#define ARM_SHCSR_BUSFAULTENA    (1u << 17)
+#define ARM_SHCSR_BUSFAULTACT      (1u << 1)
+#define ARM_SHCSR_HARDFAULTACT     (1u << 2)
+#define ARM_SHCSR_SECUREFAULTACT   (1u << 4)
+#define ARM_SHCSR_NMIACT           (1u << 5)
+#define ARM_SHCSR_BUSFAULTPENDED   (1u << 14)
+#define ARM_SHCSR_BUSFAULTENA      (1u << 17)
+#define ARM_SHCSR_SECUREFAULTENA   (1u << 19)
+#define ARM_SHCSR_SECUREFAULTPENDED (1u << 20)
+#define ARM_SHCSR_HARDFAULTPENDED  (1u << 21)
 /* BusFault is a Secure exception while AIRCR.BFHFNMINS is clear: its
  * state, enable and priority (SHPR1.PRI_5) are Secure-only, RAZ/WI from
- * the Non-secure view like BFSR/HFSR/BFAR. */
+ * the Non-secure view like BFSR/HFSR/BFAR. HardFault's and NMI's state
+ * bits the same way. */
 #define ARM_SHCSR_BF_BITS (ARM_SHCSR_BUSFAULTACT | ARM_SHCSR_BUSFAULTPENDED | \
                            ARM_SHCSR_BUSFAULTENA)
+#define ARM_SHCSR_BFHFNMI_BITS (ARM_SHCSR_BF_BITS | ARM_SHCSR_HARDFAULTACT | \
+                                ARM_SHCSR_HARDFAULTPENDED | ARM_SHCSR_NMIACT)
+/* SecureFault is always a Secure exception: its SHCSR bits and priority
+ * (SHPR1.PRI_7) are RAZ/WI from the Non-secure view whatever BFHFNMINS. */
+#define ARM_SHCSR_SF_BITS (ARM_SHCSR_SECUREFAULTACT | ARM_SHCSR_SECUREFAULTENA | \
+                           ARM_SHCSR_SECUREFAULTPENDED)
 #define ARM_AIRCR_BFHFNMINS   (1u << 13)
 #define ARM_CFSR_PRECISERR    (1u << 9)    /* BFSR.PRECISERR */
 #define ARM_CFSR_BFARVALID    (1u << 15)   /* BFSR.BFARVALID */

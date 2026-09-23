@@ -2645,11 +2645,13 @@ static void test_trustzone_bus_fault(void) {
 
     /* SHCSR's BusFault bits and SHPR1.PRI_5 are Secure-only the same way:
      * a Non-secure write cannot clear the Secure world's BUSFAULTENA (which
-     * decides BusFault vs HardFault) or reprioritise the BusFault.
+     * decides BusFault vs HardFault) or reprioritise the BusFault. PRI_7
+     * (SecureFault) is Secure-only whatever BFHFNMINS.
      * NB the "clears the rest" and "PRI_4 taken" / "PRI_6 taken" checks pin
      * this model, not the architecture: v8-M banks the other SHCSR enable
      * bits and PRI_4/PRI_6 between the security states, and here they are
-     * one copy that both views write. */
+     * one copy that both views write — a documented limitation
+     * (docs/design/trustzone-m-plan.md). */
     cpu.secure = false;
     nvic.shcsr = ARM_SHCSR_BUSFAULTENA | ARM_SHCSR_BUSFAULTPENDED | (1u << 16);   /* +MEMFAULTENA */
     nvic.shpr[0] = 0x20; nvic.shpr[1] = 0x40; nvic.shpr[2] = 0x60; nvic.shpr[3] = 0x80;
@@ -2657,9 +2659,10 @@ static void test_trustzone_bus_fault(void) {
     arm_write32(&cpu, 0xE000ED24, 1u << 18);                    /* USGFAULTENA, clears the rest */
     assert_eq("NS view: SHCSR BusFault bits WI", ARM_SHCSR_BUSFAULTENA | ARM_SHCSR_BUSFAULTPENDED | (1u << 18),
               nvic.shcsr);
-    assert_eq("NS view: SHPR1.PRI_5 RAZ", 0x80600020, arm_read32(&cpu, 0xE000ED18));
+    assert_eq("NS view: SHPR1.PRI_5 and PRI_7 RAZ", 0x00600020, arm_read32(&cpu, 0xE000ED18));
     arm_write32(&cpu, 0xE000ED18, 0xF0F0F0F0);
     assert_eq("NS view: SHPR1 word write, PRI_5 WI", 0x40, nvic.shpr[1]);
+    assert_eq("NS view: SHPR1 word write, PRI_7 WI", 0x80, nvic.shpr[3]);
     assert_eq("NS view: SHPR1 word write, PRI_4 taken", 0xF0, nvic.shpr[0]);
     assert_eq("NS view: SHPR1 word write, PRI_6 taken", 0xF0, nvic.shpr[2]);
     arm_write8(&cpu, 0xE000ED19, 0xA0);
@@ -2674,6 +2677,9 @@ static void test_trustzone_bus_fault(void) {
     assert_eq("NS view, BFHFNMINS: SHPR1.PRI_5 visible", 0x40, (arm_read32(&cpu, 0xE000ED18) >> 8) & 0xFF);
     arm_write8(&cpu, 0xE000ED19, 0xA0);
     assert_eq("NS view, BFHFNMINS: SHPR1.PRI_5 written", 0xA0, nvic.shpr[1]);
+    assert_eq("NS view, BFHFNMINS: SHPR1.PRI_7 still RAZ", 0, arm_read32(&cpu, 0xE000ED18) >> 24);
+    arm_write8(&cpu, 0xE000ED1B, 0xA0);
+    assert_eq("NS view, BFHFNMINS: SHPR1.PRI_7 byte write WI", 0x80, nvic.shpr[3]);
     nvic.aircr &= ~ARM_AIRCR_BFHFNMINS;
     cpu.secure = true;
     nvic.shcsr = ARM_SHCSR_BUSFAULTENA;
@@ -2681,6 +2687,26 @@ static void test_trustzone_bus_fault(void) {
     assert_eq("S view: SHCSR BUSFAULTENA cleared", 0, nvic.shcsr);
     arm_write8(&cpu, 0xE000ED19, 0x40);
     assert_eq("S view: SHPR1.PRI_5 written", 0x40, nvic.shpr[1]);
+    arm_write8(&cpu, 0xE000ED1B, 0x60);
+    assert_eq("S view: SHPR1.PRI_7 written", 0x60, nvic.shpr[3]);
+
+    /* HardFault's and NMI's SHCSR state bits follow BusFault's (Secure-only
+     * while BFHFNMINS is clear); SecureFault's are Secure-only always. */
+    const uint32_t hfnmi = ARM_SHCSR_HARDFAULTACT | ARM_SHCSR_HARDFAULTPENDED | ARM_SHCSR_NMIACT;
+    const uint32_t sf = ARM_SHCSR_SECUREFAULTACT | ARM_SHCSR_SECUREFAULTENA | ARM_SHCSR_SECUREFAULTPENDED;
+    nvic.shcsr = hfnmi | sf | (1u << 16);                        /* +MEMFAULTENA */
+    cpu.secure = false;
+    assert_eq("NS view: SHCSR HardFault/NMI/SecureFault bits RAZ", 1u << 16, arm_read32(&cpu, 0xE000ED24));
+    arm_write32(&cpu, 0xE000ED24, 0);
+    assert_eq("NS view: SHCSR HardFault/NMI/SecureFault bits WI", hfnmi | sf, nvic.shcsr);
+    nvic.aircr |= ARM_AIRCR_BFHFNMINS;
+    assert_eq("NS view, BFHFNMINS: HardFault/NMI bits visible, SecureFault not",
+              hfnmi, arm_read32(&cpu, 0xE000ED24));
+    arm_write32(&cpu, 0xE000ED24, 0);
+    assert_eq("NS view, BFHFNMINS: HardFault/NMI bits written, SecureFault kept", sf, nvic.shcsr);
+    nvic.aircr &= ~ARM_AIRCR_BFHFNMINS;
+    cpu.secure = true;
+    assert_eq("S view: SecureFault bits visible", sf, arm_read32(&cpu, 0xE000ED24));
 
     /* BFAR names the first refused beat. STRD r0,r1,[r2] issues two words;
      * both are refused, the register keeps the first (silicon aborts on it,

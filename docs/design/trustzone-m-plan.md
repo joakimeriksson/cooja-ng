@@ -323,8 +323,10 @@ nothing was ever refused. Now:
   refused alias — no such pair exists on the real memory map) takes the
   SecureFault only, from one undo. From the
   Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
-  clear, as are SHCSR's BusFault bits (ACT/PENDED/ENA) and the BusFault
-  priority byte SHPR1.PRI_5, and MMFAR is banked. What firmware reports on a violation is its
+  clear, as are SHCSR's BusFault, HardFault and NMI state bits
+  (BUSFAULTACT/PENDED/ENA, HARDFAULTACT/PENDED, NMIACT) and the BusFault
+  priority byte SHPR1.PRI_5; SecureFault's SHCSR bits and SHPR1.PRI_7 are
+  RAZ/WI from there whatever BFHFNMINS, and MMFAR is banked. What firmware reports on a violation is its
   BusFault handler's line. Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC) attribute
   per pin or channel through the FEATURE registers; those are stored, not
   enforced, so a split slot is open to both worlds — on silicon a GPIOTE30
@@ -367,6 +369,19 @@ nothing to enforce against until one exists. Also deferred: the security
 unit's clock sub-division (stored, not enforced), lazy floating-point state,
 banked priorities and banked SysTick, `AIRCR.PRIS`, and the Non-secure
 MMFSR/UFSR banks (no MemManage or UsageFault is ever raised).
+
+Banking is a known limitation of the system-handler registers. ARMv8-M
+banks the rest of SHCSR (MemManage, UsageFault, SVCall, PendSV and SysTick
+state and enables) and the priorities PRI_4, PRI_6, PRI_11, PRI_14 and
+PRI_15 between the security states, because each state has its own
+SVCall, PendSV, SysTick, MemManage and UsageFault. Here there is one of
+each, so those bits and bytes are one copy that both views read and write:
+a Non-secure write to them changes what the Secure world sees. Only the
+Secure-only parts above are filtered. No firmware in the tree depends on
+the banking (no TrustZone image under `firmware/nrf54l15-xiao/`, Secure or
+Non-secure, defines an SVCall, PendSV or SysTick handler; they are the weak
+defaults), and doing it properly means a second set of those exceptions, not a
+register mask.
 
 The radio's ramp-up and ramp-down are still instantaneous; the disabled-event
 delay stands in for the ordering that gives, with a measured window
