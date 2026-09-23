@@ -2844,6 +2844,36 @@ static void test_trustzone_bus_fault(void) {
     assert_eq("PUSH to Secure: SFAR = first store", SF_TARGET + 0x38, cpu.sfar);
     assert_eq("PUSH to Secure: NS SP restored before the frame", SF_TARGET + 0x40 - 32, cpu.msp_ns);
     assert_eq("PUSH to Secure: stacked PC = the PUSH", CODE_BASE, arm_read32(&cpu, SF_TARGET + 0x40 - 32 + 24));
+
+    /* A refused beat stops the loaded PC from acting: POP {r0, pc} with the
+     * r0 beat in Secure memory and an EXC_RETURN in the (allowed) PC beat
+     * must not unstack anything before the fault — the undo restores the
+     * registers only, so the return's other effects (PSP rebanked from the
+     * frame it popped) would survive it. SAU region 0 moved up so the word
+     * below 0x20001000 is Secure. */
+    for (int wide = 0; wide < 2; wide++) {
+        const char *what = wide ? "POP.W {r0,pc} refused beat" : "POP {r0,pc} refused beat";
+        char name[96];
+        sf_setup(&cpu, false, 0xBD01);               /* POP {r0, pc} */
+        if (wide) write_thumb32(&cpu, CODE_BASE, 0xE8BD, 0x8001);  /* POP.W {r0, pc} */
+        cpu.sau_rbar[0] = 0x20001000;
+        cpu.reg[ARM_SP] = 0x20000FFC;                /* r0 beat Secure, pc beat not */
+        arm_write32(&cpu, 0x20001000, 0xFFFFFFBC);   /* EXC_RETURN: NS, thread, PSP */
+        cpu.psp = 0x20002000;
+        arm_step(&cpu, 1);
+        snprintf(name, sizeof name, "%s: SecureFault taken", what);
+        assert_eq(name, SF_HANDLER, cpu.reg[ARM_PC]);
+        snprintf(name, sizeof name, "%s: SFAR = the r0 beat", what);
+        assert_eq(name, 0x20000FFC, cpu.sfar);
+        snprintf(name, sizeof name, "%s: no exception return (PSP untouched)", what);
+        assert_eq(name, 0x20002000, cpu.psp_ns);     /* banked away by the Secure entry */
+        snprintf(name, sizeof name, "%s: frame below the original SP", what);
+        assert_eq(name, 0x20000FF8 - 32, cpu.msp_ns);
+        snprintf(name, sizeof name, "%s: stacked PC = the POP", what);
+        assert_eq(name, CODE_BASE, arm_read32(&cpu, 0x20000FF8 - 32 + 24));
+        snprintf(name, sizeof name, "%s: r0 untouched", what);
+        assert_eq(name, 0xDEADBEEF, cpu.reg[0]);
+    }
 }
 
 /* VFP loads and stores are the core's own accesses like any other: the

@@ -1203,8 +1203,14 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
  * an EXC_RETURN (0xFxxxxxxx) unstacks an exception frame; on ARMv8-M a
  * FNC_RETURN (0xFExxxxxx) seen in Non-secure state returns to the Secure
  * caller of BLXNS — the Non-secure callee's `pop {.., pc}` is the usual way
- * that value reaches PC, so it must be recognised here, not only on BX. */
+ * that value reaches PC, so it must be recognised here, not only on BX.
+ * Nothing happens once a beat of the load has been refused: the
+ * instruction is undone and faulted at its end, and that undo restores
+ * the registers only — an exception or function return taken first would
+ * leave the frame unstacked, the handler deactivated or the security state
+ * switched under it. */
 static inline void arm_load_pc(arm_cpu_t *cpu, uint32_t v) {
+    if (__builtin_expect(arm_insn_refused(cpu), 0)) return;
     if ((v & 0xF0000000u) == 0xF0000000u) {
         if (cpu->tz_enabled && !cpu->secure && (v & 0xFF000000u) == 0xFE000000u)
             arm_fnc_return(cpu, v);

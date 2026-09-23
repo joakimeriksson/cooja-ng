@@ -321,7 +321,18 @@ nothing was ever refused. Now:
   INVIS and SG-side INVEP SecureFaults are still taken after the instruction.
   An instruction that records both (one beat to Secure memory, one to a
   refused alias — no such pair exists on the real memory map) takes the
-  SecureFault only, from one undo. From the
+  SecureFault only, from one undo. A PC loaded by an instruction with a
+  refused beat does not act: an EXC_RETURN or FNC_RETURN in the last beat of
+  `POP {…, pc}` / `LDM` would otherwise unstack a frame, deactivate the
+  handler or switch security state before the undo, which restores
+  registers only. One effect inside an instruction the undo cannot cover:
+  a peripheral write handler that pends an interrupt enters it at once
+  (`arm_nvic_set_pending` → `arm_nvic_check_pending`), so a multi-beat
+  Non-secure store whose early beat raises an interrupt and whose later
+  beat is refused has the undo restore registers over the handler's entry.
+  No firmware issues such a store; deferring those pends to the
+  instruction boundary would move interrupt timing on every ARM platform,
+  so it is left as a known limit. From the
   Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
   clear, as are SHCSR's BusFault, HardFault and NMI state bits
   (BUSFAULTACT/PENDED/ENA, HARDFAULTACT/PENDED, NMIACT) and the BusFault
