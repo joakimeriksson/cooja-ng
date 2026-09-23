@@ -300,13 +300,12 @@ nothing was ever refused. Now:
   every other load/store form keeps: all of an instruction's accesses are
   issued before it writes any register (PUSH, LDR with writeback and
   VLDM/VSTM were reordered for it); a new form must keep it, or snapshot
-  first, or its fault is imprecise. Two gaps remain on the VFP side:
-  VFP loads and stores go through `arm_read32`/`arm_write32`, so they are
-  bus-checked but not SAU-checked (a Non-secure VLDR/VSTR/VPUSH/VLLDM to
-  Secure memory succeeds), and FP registers are not in the snapshot, so a
-  refused VLDR/VPOP/VLDM leaves its destination S-registers zeroed (VLLDM
-  also FPSCR) where silicon leaves them unchanged; the base-register
-  writeback is undone correctly. The refused transaction only *marks* the
+  first, or its fault is imprecise. FP registers are not in the snapshot:
+  VFP loads and stores take the same checked path (`arm_vfp.c` through
+  `arm_insn_read32`/`arm_insn_write32`, VLSTM/VLLDM directly), and a load commits to
+  the FP registers only once every beat has been accepted, so a refused
+  VLDR/VPOP/VLDM/VLLDM leaves them (and FPSCR) unchanged, as on silicon.
+  The refused transaction only *marks* the
   security unit's and MPC00's lines pending; the core enters the synchronous
   BusFault first and the lines are then arbitrated by priority, so at equal
   priority the BusFault handler runs before the security unit's interrupt

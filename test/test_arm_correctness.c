@@ -2820,6 +2820,112 @@ static void test_trustzone_bus_fault(void) {
     assert_eq("PUSH to Secure: stacked PC = the PUSH", CODE_BASE, arm_read32(&cpu, SF_TARGET + 0x40 - 32 + 24));
 }
 
+/* VFP loads and stores are the core's own accesses like any other: the
+ * attribution unit refuses a Non-secure one to Secure memory (AUVIOL), the
+ * bus check refuses one to a claimed peripheral (BusFault), and either way
+ * the instruction is undone. The undo restores the core registers; the FP
+ * registers are protected by committing a load only once all its beats
+ * were accepted. */
+static void test_trustzone_vfp(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone VFP load/store tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+
+    /* VSTR s0, [r1] to Secure memory: refused, memory unchanged. */
+    sf_setup(&cpu, false, 0xBF00);                   /* placeholder, overwritten below */
+    write_thumb32(&cpu, CODE_BASE, 0xED81, 0x0A00);  /* VSTR s0, [r1] */
+    cpu.vfp_s[0] = 0xCAFEF00D;
+    arm_step(&cpu, 1);
+    assert_eq("VSTR to Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_true("VSTR to Secure: SFSR.AUVIOL", (cpu.sfsr & ARM_SFSR_AUVIOL) != 0);
+    assert_eq("VSTR to Secure: SFAR", SF_TARGET, cpu.sfar);
+    assert_eq("VSTR to Secure: Secure memory unchanged", 0x12345678, arm_read32(&cpu, SF_TARGET));
+    assert_eq("VSTR to Secure: stacked PC = the VSTR", CODE_BASE, arm_read32(&cpu, SF_NS_FRAME + 24));
+
+    /* VLDR s0, [r1] and the double-precision VLDR d0, [r1] from Secure
+     * memory: refused, the destination keeps its value. */
+    sf_setup(&cpu, false, 0xBF00);
+    write_thumb32(&cpu, CODE_BASE, 0xED91, 0x0A00);  /* VLDR s0, [r1] */
+    cpu.vfp_s[0] = 0xCAFEF00D;
+    arm_step(&cpu, 1);
+    assert_eq("VLDR from Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("VLDR from Secure: SFAR", SF_TARGET, cpu.sfar);
+    assert_eq("VLDR from Secure: s0 unchanged", 0xCAFEF00D, cpu.vfp_s[0]);
+    sf_setup(&cpu, false, 0xBF00);
+    write_thumb32(&cpu, CODE_BASE, 0xED91, 0x0B00);  /* VLDR d0, [r1] */
+    cpu.vfp_s[0] = 0xCAFEF00D; cpu.vfp_s[1] = 0x0DDBA11;
+    arm_step(&cpu, 1);
+    assert_eq("VLDR.64 from Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("VLDR.64 from Secure: s0 unchanged", 0xCAFEF00D, cpu.vfp_s[0]);
+    assert_eq("VLDR.64 from Secure: s1 unchanged", 0x0DDBA11, cpu.vfp_s[1]);
+
+    /* VPUSH {s0, s1} with SP in Secure memory: SP unchanged at the fault,
+     * so the frame is pushed below the original SP (see PUSH above). */
+    sf_setup(&cpu, false, 0xBF00);
+    write_thumb32(&cpu, CODE_BASE, 0xED2D, 0x0A02);  /* VPUSH {s0, s1} */
+    cpu.reg[ARM_SP] = SF_TARGET + 0x40;
+    arm_step(&cpu, 1);
+    assert_eq("VPUSH to Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("VPUSH to Secure: SFAR = first store", SF_TARGET + 0x38, cpu.sfar);
+    assert_eq("VPUSH to Secure: NS SP restored before the frame", SF_TARGET + 0x40 - 32, cpu.msp_ns);
+    assert_eq("VPUSH to Secure: stacked PC = the VPUSH", CODE_BASE,
+              arm_read32(&cpu, SF_TARGET + 0x40 - 32 + 24));
+
+    /* VPOP {s0, s1} with SP in Secure memory: registers and SP unchanged. */
+    sf_setup(&cpu, false, 0xBF00);
+    write_thumb32(&cpu, CODE_BASE, 0xECBD, 0x0A02);  /* VPOP {s0, s1} */
+    cpu.reg[ARM_SP] = SF_TARGET;
+    cpu.vfp_s[0] = 0xCAFEF00D; cpu.vfp_s[1] = 0x0DDBA11;
+    arm_step(&cpu, 1);
+    assert_eq("VPOP from Secure: SecureFault taken", SF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("VPOP from Secure: s0 unchanged", 0xCAFEF00D, cpu.vfp_s[0]);
+    assert_eq("VPOP from Secure: s1 unchanged", 0x0DDBA11, cpu.vfp_s[1]);
+    assert_eq("VPOP from Secure: NS SP restored before the frame", SF_TARGET - 32, cpu.msp_ns);
+
+    /* VLDM r1!, {s0-s3} through the bus check, the last two beats refused:
+     * BusFault, BFAR = the first refused beat, none of s0-s3 written (the
+     * accepted beats included), base not written back. */
+    bf_setup(&cpu, &nvic);
+    write_thumb32(&cpu, CODE_BASE, 0xECB1, 0x0A04);  /* VLDM r1!, {s0-s3} */
+    cpu.reg[1] = 0x40000FF8;
+    for (int i = 0; i < 4; i++) cpu.vfp_s[i] = 0xF0 + (uint32_t)i;
+    arm_step(&cpu, 1);
+    assert_eq("VLDM! refused beat 3: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("VLDM! refused beat 3: BFAR = beat 3", 0x40001000, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("VLDM! refused beat 3: stacked PC = the VLDM", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+    assert_eq("VLDM! refused beat 3: r1 not written back", 0x40000FF8, cpu.reg[1]);
+    assert_true("VLDM! refused beat 3: s0-s3 unchanged",
+                cpu.vfp_s[0] == 0xF0 && cpu.vfp_s[1] == 0xF1 &&
+                cpu.vfp_s[2] == 0xF2 && cpu.vfp_s[3] == 0xF3);
+
+    /* VLLDM r1 with only the FPSCR beat refused: S0-S15 and FPSCR all keep
+     * their values (it restores a Secure context, so run it Secure; the
+     * bus check here refuses by address). */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.reg[ARM_SP] = 0x20007000;
+    write_thumb32(&cpu, CODE_BASE, 0xEC31, 0x0A00);  /* VLLDM r1 */
+    cpu.reg[1] = 0x40000FC0;                         /* word 16 (FPSCR) = 0x40001000 */
+    for (int i = 0; i < 16; i++) cpu.vfp_s[i] = 0xA0 + (uint32_t)i;
+    cpu.fpscr = 0x03000000;
+    arm_step(&cpu, 1);
+    assert_eq("VLLDM refused FPSCR beat: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("VLLDM refused FPSCR beat: BFAR", 0x40001000, arm_read32(&cpu, 0xE000ED38));
+    bool s_kept = true;
+    for (int i = 0; i < 16; i++) s_kept &= cpu.vfp_s[i] == 0xA0 + (uint32_t)i;
+    assert_true("VLLDM refused FPSCR beat: S0-S15 unchanged", s_kept);
+    assert_eq("VLLDM refused FPSCR beat: FPSCR unchanged", 0x03000000, cpu.fpscr);
+
+    /* Accepted: VLDR s2, [r2] from Non-secure memory loads as before. */
+    sf_setup(&cpu, false, 0xBF00);
+    write_thumb32(&cpu, CODE_BASE, 0xED92, 0x1A00);  /* VLDR s2, [r2] */
+    cpu.reg[2] = 0x20001000;
+    arm_write32(&cpu, 0x20001000, 0x3F800000);
+    arm_step(&cpu, 1);
+    assert_eq("VLDR from Non-secure: no fault", CODE_BASE + 4, cpu.reg[ARM_PC]);
+    assert_eq("VLDR from Non-secure: s2 loaded", 0x3F800000, cpu.vfp_s[2]);
+}
+
 /* Step 5: NVIC target-security (NVIC_ITNS) decides an IRQ's security state. */
 static void test_trustzone_nvic_itns(void) {
     if (verbose) printf("--- ARMv8-M TrustZone NVIC target-security tests ---\n");
@@ -3151,6 +3257,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_blxns();
     test_trustzone_ns_fetch();
     test_trustzone_bus_fault();
+    test_trustzone_vfp();
     test_io_lookup();
 
     printf("\n--- Results: %d passed, %d failed ---\n\n", passed, failed);

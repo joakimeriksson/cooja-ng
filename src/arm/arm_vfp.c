@@ -40,6 +40,26 @@ static inline int sreg_m(uint16_t hw1, uint16_t hw2) {
     (void)hw1; return ((hw2 & 0xF) << 1) | ((hw2 >> 5) & 1);
 }
 
+/* Loads and stores go through the interpreter's checked path
+ * (arm_insn_read32/arm_insn_write32), so the attribution unit and the bus
+ * check both see them. A refused beat undoes the instruction's core
+ * registers (the base writeback included) at its end, but the undo does
+ * not cover the FP registers: a load therefore commits to s[] only once
+ * every beat has been accepted, and a refused one leaves them as they
+ * were, as on silicon. */
+static void vfp_load(arm_cpu_t *cpu, int sd, uint32_t addr, int n) {
+    uint32_t buf[32];
+    for (int i = 0; i < n; i++)
+        buf[i] = arm_insn_read32(cpu, addr + (uint32_t)(i * 4));
+    if (!arm_insn_refused(cpu))
+        memcpy(&cpu->vfp_s[sd], buf, sizeof(uint32_t) * (size_t)n);
+}
+
+static void vfp_store(arm_cpu_t *cpu, int sd, uint32_t addr, int n) {
+    for (int i = 0; i < n; i++)
+        arm_insn_write32(cpu, addr + (uint32_t)(i * 4), cpu->vfp_s[sd + i]);
+}
+
 bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
     /* Coprocessor field hw2[11:8]: 0xA=SP, 0xB=DP-encoding (alias). */
     uint32_t coproc = (hw2 >> 8) & 0xF;
@@ -95,8 +115,7 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t sp = cpu->reg[13];
         uint32_t newsp = sp - (uint32_t)(regs * 4);
-        for (int i = 0; i < regs; i++)
-            arm_write32(cpu, newsp + (uint32_t)(i * 4), cpu->vfp_s[sd + i]);
+        vfp_store(cpu, sd, newsp, regs);
         cpu->reg[13] = newsp;
         return true;
     }
@@ -114,8 +133,7 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         if (dp_alias) sd &= ~1;
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t sp = cpu->reg[13];
-        for (int i = 0; i < regs; i++)
-            cpu->vfp_s[sd + i] = arm_read32(cpu, sp + (uint32_t)(i * 4));
+        vfp_load(cpu, sd, sp, regs);
         cpu->reg[13] = sp + (uint32_t)(regs * 4);
         return true;
     }
@@ -140,20 +158,11 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
          * so Align(PC,4) = cpu->reg[15] & ~3u — no further subtraction. */
         uint32_t base = (rn == 15) ? (cpu->reg[15] & ~3u) : cpu->reg[rn];
         uint32_t addr = U ? base + imm32 : base - imm32;
-        if (coproc == 0xB) {
-            /* Double-precision: 8-byte transfer spanning vfp_s[sd] and vfp_s[sd+1] */
-            if (L) {
-                cpu->vfp_s[sd]     = arm_read32(cpu, addr);
-                cpu->vfp_s[sd + 1] = arm_read32(cpu, addr + 4);
-            } else {
-                arm_write32(cpu, addr,     cpu->vfp_s[sd]);
-                arm_write32(cpu, addr + 4, cpu->vfp_s[sd + 1]);
-            }
-        } else {
-            /* Single-precision: 4-byte transfer */
-            if (L) cpu->vfp_s[sd] = arm_read32(cpu, addr);
-            else   arm_write32(cpu, addr, cpu->vfp_s[sd]);
-        }
+        /* Double-precision: an 8-byte transfer spanning vfp_s[sd] and
+         * vfp_s[sd+1]; single-precision: 4 bytes. */
+        int words = (coproc == 0xB) ? 2 : 1;
+        if (L) vfp_load(cpu, sd, addr, words);
+        else   vfp_store(cpu, sd, addr, words);
         return true;
     }
 
@@ -193,10 +202,8 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         } else {
             return false;         /* Other PU combos not encoded for VFP LD/ST-multiple */
         }
-        for (int i = 0; i < regs; i++) {
-            if (L) cpu->vfp_s[sd + i] = arm_read32(cpu, addr + (uint32_t)(i * 4));
-            else   arm_write32(cpu, addr + (uint32_t)(i * 4), cpu->vfp_s[sd + i]);
-        }
+        if (L) vfp_load(cpu, sd, addr, regs);
+        else   vfp_store(cpu, sd, addr, regs);
         /* Write back after the accesses: a precise fault on one of them
          * snapshots the register file when the refusal is recorded, so the
          * base must still be unchanged there. */
