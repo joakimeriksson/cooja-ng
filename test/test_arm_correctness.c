@@ -1926,6 +1926,35 @@ static void test_ldrd_strd(void) {
     }
 }
 
+/* Exception entry from an SP that is 4- but not 8-byte aligned pads the
+ * frame and marks it in the stacked xPSR bit 9; the return pops the pad.
+ * The bit belongs to the frame: the live xPSR after the return has it
+ * clear, as MRS xPSR on silicon shows. */
+static void test_exception_return_align(void) {
+    if (verbose) printf("--- Exception return: stack-align bit ---\n");
+    arm_cpu_t cpu;
+    setup_arm(&cpu);
+    const uint32_t handler = CODE_BASE + 0x40;
+    write_flash32(&cpu, ARM_FLASH_BASE + 14 * 4, handler | 1);    /* PendSV */
+    write_thumb16(&cpu, handler, 0x4770);                          /* BX LR */
+    write_thumb32(&cpu, CODE_BASE, 0xF3EF, 0x8003);                /* MRS r0, xPSR */
+    uint32_t sp = cpu.reg[ARM_SP] - 12;                            /* SP = 4 (mod 8) */
+    cpu.reg[ARM_SP] = sp;
+    cpu.msp = sp;
+    cpu.reg[ARM_PC] = CODE_BASE;
+    arm_exception_entry(&cpu, 14);
+    assert_eq("align: frame padded", sp - 4 - 32, cpu.reg[ARM_SP]);
+    assert_true("align: stacked xPSR bit 9 set",
+                (arm_read32(&cpu, cpu.reg[ARM_SP] + 28) & (1u << 9)) != 0);
+    arm_step(&cpu, 1);                                             /* BX LR */
+    assert_eq("align: returned to the thread", CODE_BASE, cpu.reg[ARM_PC]);
+    assert_eq("align: SP restored, pad popped", sp, cpu.reg[ARM_SP]);
+    assert_eq("align: live xPSR bit 9 clear", 0, cpu.xpsr & (1u << 9));
+    arm_step(&cpu, 1);                                             /* MRS r0, xPSR */
+    assert_eq("align: MRS xPSR bit 9 clear", 0, cpu.reg[0] & (1u << 9));
+    arm_cpu_destroy(&cpu);
+}
+
 /* ===================================================================
  * ARMv8-M TrustZone-M: SAU + IDAU security attribution (Phase 1)
  * =================================================================== */
@@ -3073,6 +3102,7 @@ int run_arm_correctness_tests(int v) {
     test_subs_rd_eq_rn();
     test_vfp_double();
     test_ldrd_strd();
+    test_exception_return_align();
     test_bit_field_ops();
     test_ldaex_stlex();
     test_ldrex_strex_byte_halfword();

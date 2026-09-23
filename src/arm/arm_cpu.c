@@ -1159,8 +1159,10 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     cpu->it_state = (uint8_t)(((cpu->xpsr >> 25) & 0x3) |
                               (((cpu->xpsr >> 10) & 0x3F) << 2));
 
-    /* Unstacked SP (account for the alignment padding in xPSR bit 9). */
+    /* Unstacked SP (account for the alignment padding in xPSR bit 9). The
+     * bit belongs to the frame only; it is not part of the live xPSR. */
     uint32_t newsp = sp + 32 + ((cpu->xpsr & (1u << 9)) ? 4 : 0);
+    cpu->xpsr &= ~(1u << 9);
 
     /* Restore execution mode + re-bank the active SP from EXC_RETURN. */
     if ((exc_return & 0x8u) == 0) {
