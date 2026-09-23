@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <poll.h>
+#include <time.h>
 #include <arpa/inet.h>
 
 /* ============================================================
@@ -72,7 +73,7 @@ static uint32_t parse_hex(const char **pp) {
  * ============================================================ */
 
 /* Once a packet has started (or a reply awaits its ack), the rest must
- * arrive within this long.  GDB sends a packet whole and acks at once, so
+ * arrive within this long -- the whole rest, not each byte of it.  GDB sends a packet whole and acks at once, so
  * only a stalled or broken peer waits this out -- and the stub reads on the
  * simulation's thread, so without a bound that peer would freeze the run. */
 #define GDB_IO_TIMEOUT_MS 5000
@@ -96,11 +97,26 @@ static int read_byte(gdb_stub_t *stub, char *c, int timeout_ms) {
     }
 }
 
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Milliseconds left before `deadline` (a now_ms() value), never negative. */
+static int ms_until(int64_t deadline) {
+    int64_t left = deadline - now_ms();
+    return left > 0 ? (int)left : 0;
+}
+
+/* Forget the client and everything it set up: the next one to connect
+ * starts clean, as after a detach. */
 static void drop_client(gdb_stub_t *stub) {
     if (stub->client_fd >= 0) close(stub->client_fd);
     stub->client_fd = -1;
     stub->connected = false;
     stub->halted = false;
+    stub->num_breakpoints = 0;
 }
 
 /* Send a fully formed reply packet. data is the payload (no $ or #). */
@@ -188,11 +204,13 @@ static int recv_packet(gdb_stub_t *stub) {
         /* Anything else: framing error, drop it */
     }
 
-    /* Read body until '#', then 2 hex chars */
+    /* Read body until '#', then 2 hex chars, all before one deadline: a
+     * client dripping a byte at a time must not hold the run either. */
+    int64_t deadline = now_ms() + GDB_IO_TIMEOUT_MS;
     int len = 0;
     uint8_t sum = 0;
     for (;;) {
-        int r = read_byte(stub, &c, GDB_IO_TIMEOUT_MS);
+        int r = read_byte(stub, &c, ms_until(deadline));
         if (r <= 0) {
             if (r == 0)
                 fprintf(stderr, "gdb_stub: client stalled mid-packet, disconnecting\n");
@@ -211,7 +229,7 @@ static int recv_packet(gdb_stub_t *stub) {
     /* Read 2 checksum chars */
     char ck[2];
     for (int got = 0; got < 2; got++) {
-        int r = read_byte(stub, &ck[got], GDB_IO_TIMEOUT_MS);
+        int r = read_byte(stub, &ck[got], ms_until(deadline));
         if (r <= 0) {
             if (r == 0)
                 fprintf(stderr, "gdb_stub: client stalled mid-packet, disconnecting\n");
@@ -410,20 +428,12 @@ static void handle_clear_bp(gdb_stub_t *stub) {
 /* D — detach */
 static void handle_detach(gdb_stub_t *stub) {
     send_ok(stub);
-    close(stub->client_fd);
-    stub->client_fd = -1;
-    stub->connected = false;
-    stub->halted = false;
-    stub->num_breakpoints = 0;
+    drop_client(stub);
 }
 
 /* k — kill (we treat as detach + leave the simulator running) */
 static void handle_kill(gdb_stub_t *stub) {
-    close(stub->client_fd);
-    stub->client_fd = -1;
-    stub->connected = false;
-    stub->halted = false;
-    stub->num_breakpoints = 0;
+    drop_client(stub);
 }
 
 /* Main command dispatcher: called for each received packet. */

@@ -189,7 +189,7 @@ jobs:
       - name: GDB stub (a stalled client cannot freeze the run)
         # The stub reads on the simulation's thread: a client that stops
         # mid-packet or never acks must be dropped, and a malformed Z0
-        # refused.  ~13 s, because two cases wait out the stub's 5 s
+        # refused.  ~25 s, because four cases wait out the stub's 5 s
         # timeout.
         run: python3 tools/check-gdb-stub.py
 
