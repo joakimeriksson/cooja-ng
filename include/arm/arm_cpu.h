@@ -275,6 +275,15 @@ typedef struct arm_cpu {
         uint32_t xpsr;
         uint8_t  it_state;
     } insn_snap;
+#ifdef DEBUG
+    /* Debug builds also copy at every instruction start and check the
+     * lazy snapshot against it when a fault undoes the instruction. */
+    struct {
+        uint32_t reg[15];
+        uint32_t xpsr;
+        uint8_t  it_state;
+    } insn_snap_eager;
+#endif
     /* SoC attribution unit (the Nordic security unit acts as the IDAU).
      * Consulted by arm_security_attr() alongside the SAU; NULL leaves
      * attribution entirely to the SAU. */

@@ -301,6 +301,30 @@ static inline void arm_insn_snapshot_multi(arm_cpu_t *cpu, uint32_t addr,
  * itself and none of its writes survive. Cycles stay charged. A fault is
  * only ever armed by a checked access, which snapshots first. */
 static inline void arm_insn_undo(arm_cpu_t *cpu) {
+#ifdef DEBUG
+    /* The lazy snapshot is only right if nothing was written before it:
+     * a load/store form that writes a register before a beat that can be
+     * refused breaks the ordering invariant above, and its fault would be
+     * imprecise without anyone noticing. Debug builds compare it with the
+     * eager copy of the instruction start. */
+    if (!cpu->insn_snap_valid ||
+        memcmp(cpu->insn_snap.reg, cpu->insn_snap_eager.reg,
+               sizeof(cpu->insn_snap_eager.reg)) != 0 ||
+        cpu->insn_snap.xpsr != cpu->insn_snap_eager.xpsr ||
+        cpu->insn_snap.it_state != cpu->insn_snap_eager.it_state) {
+        uint32_t pc = cpu->insn_snap.reg[ARM_PC];
+        fprintf(stderr, "ARM precise-fault snapshot %s at PC=0x%08x "
+                "(%04x %04x)\n",
+                cpu->insn_snap_valid ? "taken after a register write"
+                                     : "missing",
+                pc, arm_read16(cpu, pc), arm_read16(cpu, pc + 2));
+        for (int i = 0; i < 15; i++)
+            if (cpu->insn_snap.reg[i] != cpu->insn_snap_eager.reg[i])
+                fprintf(stderr, "  r%d: start 0x%08x, snapshot 0x%08x\n", i,
+                        cpu->insn_snap_eager.reg[i], cpu->insn_snap.reg[i]);
+        abort();
+    }
+#endif
     if (!cpu->insn_snap_valid) return;
     memcpy(cpu->reg, cpu->insn_snap.reg, sizeof(cpu->reg));
     cpu->xpsr = cpu->insn_snap.xpsr;
@@ -1937,6 +1961,12 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
             cpu->insn_snap.reg[ARM_PC] = pc;
             cpu->insn_snap_valid = false;
             cpu->bus_fault_pending = false;
+#ifdef DEBUG
+            memcpy(cpu->insn_snap_eager.reg, cpu->reg,
+                   sizeof(cpu->insn_snap_eager.reg));
+            cpu->insn_snap_eager.xpsr = cpu->xpsr;
+            cpu->insn_snap_eager.it_state = cpu->it_state;
+#endif
         }
 
         /* ARMv8-M: Non-secure code may not execute from Secure memory, and
