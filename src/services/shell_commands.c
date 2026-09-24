@@ -920,7 +920,10 @@ static int cmd_reg(shell_service_t *s, int argc, char **argv, const char *line, 
             return -1;
         }
         uint32_t val = (uint32_t)v;
-        if (m.arm && target == &m.arm->reg[ARM_PC]) val &= ~1u;      /* Thumb bit is not PC */
+        if (m.arm && target == &m.arm->reg[ARM_PC]) {
+            val &= ~1u;                                             /* Thumb bit is not PC */
+            m.arm->dbg_skip_pc = UINT32_MAX;                        /* the halt site is left behind */
+        }
         if (m.msp) val &= m.msp->is_msp430x ? 0xfffffu : 0xffffu;
         *target = val;
         if (s->verbose) shell_out(s, "%s = 0x%08x\n", n, val);
@@ -962,9 +965,7 @@ static arm_cpu_t *dbg_cpu(shell_service_t *s, int node_id) {
  * resumes at the current instant with its clock that much behind.  A halted
  * node is parked (no wakeup of its own), so schedule one. */
 static void dbg_release(shell_service_t *s, int node_id, arm_cpu_t *cpu) {
-    if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->dbg_hit_pc;   /* the hit, not the live pc */
-    cpu->dbg_halted = false;
-    cpu->last_execute_us = now_ns(s) / 1000LL;
+    arm_dbg_release(cpu, now_ns(s));
     for (int k = 0; k < s->dbg_count; k++)
         if (s->dbg[k].node_id == node_id) s->dbg[k].halted = false;
     int idx = sim_control_index_of_id(s->ctl, node_id);
@@ -978,6 +979,7 @@ static void dbg_arm_node(shell_service_t *s, int node_id) {
     arm_cpu_t *cpu = dbg_cpu(s, node_id);
     if (!cpu) return;
     cpu->dbg_bp_n = cpu->dbg_wp_n = 0;
+    cpu->dbg_skip_pc = UINT32_MAX;         /* a stale skip would miss the first hit */
     for (int i = 0; i < s->dbg_count; i++) {
         const shell_dbg_t *d = &s->dbg[i];
         if (d->node_id != node_id) continue;

@@ -1208,7 +1208,6 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     /* Load vector */
     uint32_t vector = arm_read32(cpu, vtor + exception_num * 4);
     cpu->reg[ARM_PC] = vector & ~1u;
-    cpu->dbg_prev_pc = cpu->reg[ARM_PC];   /* the interrupted instruction did not run */
 
     cpu->cpu_off = false; /* Wake from WFI */
     cpu->cycles += 12; /* Exception entry latency */
@@ -4356,6 +4355,12 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * for the entire spin.  A per-instruction check is what real
          * Cortex-M does between every instruction; gate on has_pending so
          * the common no-IRQ-pending path stays O(1). */
+        /* The release's skip is spent once the instruction at its pc has
+         * retired: the fault paths above `continue` before this point and
+         * keep it, so a retried instruction is skipped again. */
+        if (__builtin_expect(dbg_hook != NULL, 0) && pc == cpu->dbg_skip_pc)
+            cpu->dbg_skip_pc = UINT32_MAX;
+
         if (cpu->nvic) {
             arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
             if (nvic->has_pending && (cpu->primask & 1) == 0)

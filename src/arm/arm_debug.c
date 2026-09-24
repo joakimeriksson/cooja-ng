@@ -21,6 +21,20 @@ bool arm_debug_stop(arm_cpu_t *cpu) {
  * watchpoint is armed, and kept out of the interpreter's hot text so arming
  * support does not move the loop's code layout. */
 __attribute__((cold, noinline))
+/* Release a node halted at a breakpoint or watchpoint at simulation time
+ * now_ns.  The breakpoint is not hit again on the way out (the skip); the
+ * halt counted as time the core was not running (LPM in the energy view);
+ * and the execute anchor moves to now, so the missed time is not replayed
+ * as one burst — the node resumes with its clock that much behind, while
+ * its peripherals' time jumps forward at the release, as on a real debug
+ * halt where the counters keep running. */
+void arm_dbg_release(arm_cpu_t *cpu, int64_t now_ns) {
+    if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->dbg_hit_pc;
+    cpu->dbg_halted = false;
+    if (now_ns > cpu->sim_time_ns) cpu->lpm_ns += now_ns - cpu->sim_time_ns;
+    cpu->last_execute_us = now_ns / 1000LL;
+}
+
 bool arm_dbg_check(arm_cpu_t *cpu) {
     if (cpu->dbg_halted) return true;
     uint32_t pc = cpu->reg[ARM_PC] & ~1u;
@@ -43,13 +57,11 @@ bool arm_dbg_check(arm_cpu_t *cpu) {
         return true;
     }
     /* The release's skip stays armed until the instruction at that pc has
-     * executed: an exception taken in between (a due event, a pending IRQ,
-     * a WFI fast-forward) returns to the same pc with the instruction still
-     * to run, and must not re-hit.  dbg_prev_pc is the pc of the previous
-     * check; exception entry rewrites it so a vectored entry does not count
-     * as the instruction having run. */
+     * retired — the interpreter clears it after executing it — so an
+     * exception taken in between (a due event, a pending IRQ, a WFI
+     * fast-forward) that returns to the same pc with the instruction still
+     * to run does not re-hit, and the next visit after it ran does. */
     bool skip = pc == cpu->dbg_skip_pc;
-    if (!skip && cpu->dbg_prev_pc == cpu->dbg_skip_pc) cpu->dbg_skip_pc = UINT32_MAX;
     for (int i = 0; !skip && i < cpu->dbg_bp_n; i++) {
         if (cpu->dbg_bp[i] != pc) continue;
         cpu->dbg_hit_kind = 1;
