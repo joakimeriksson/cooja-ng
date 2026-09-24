@@ -3140,6 +3140,23 @@ static void test_debug_halt_holds_irqs(void) {
     arm_nvic_check_pending(&nvic);
     assert_eq("released: IRQ taken", IRQ_HANDLER, cpu.reg[ARM_PC]);
     assert_eq("released: stacked PC = the halt site", CODE_BASE, arm_read32(&cpu, cpu.reg[ARM_SP] + 24));
+
+    /* The release's skip must survive the ISR: the handler returns to the
+     * breakpoint with its instruction still to run (no re-hit), the
+     * instruction then runs once, and the next visit hits again. */
+    write_thumb16(&cpu, CODE_BASE, 0x2001);          /* MOVS r0, #1 */
+    write_thumb16(&cpu, CODE_BASE + 2, 0xE7FD);      /* B CODE_BASE */
+    cpu.dbg_bp[0] = CODE_BASE; cpu.dbg_bp_n = 1; cpu.dbg_count = 1;
+    cpu.dbg_skip_pc = CODE_BASE;                     /* as dbg_release arms it */
+    cpu.dbg_prev_pc = 0;
+    cpu.reg[0] = 0;
+    arm_step(&cpu, 1);                               /* BX LR: exception return */
+    assert_eq("ISR returned to the breakpoint", CODE_BASE, cpu.reg[ARM_PC]);
+    assert_true("skip survived the ISR: no re-hit at the return", !arm_dbg_check(&cpu) && !cpu.dbg_halted);
+    arm_step(&cpu, 1);                               /* MOVS runs (skipped check at its pc) */
+    assert_eq("the instruction at the breakpoint ran", 1, cpu.reg[0]);
+    arm_step(&cpu, 1);                               /* B back: the skip is spent */
+    assert_true("next visit to the breakpoint hits", arm_dbg_check(&cpu) && cpu.dbg_halted && cpu.dbg_hit_pc == CODE_BASE);
     arm_cpu_destroy(&cpu);
 }
 

@@ -1208,6 +1208,7 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     /* Load vector */
     uint32_t vector = arm_read32(cpu, vtor + exception_num * 4);
     cpu->reg[ARM_PC] = vector & ~1u;
+    cpu->dbg_prev_pc = cpu->reg[ARM_PC];   /* the interrupted instruction did not run */
 
     cpu->cpu_off = false; /* Wake from WFI */
     cpu->cycles += 12; /* Exception entry latency */
