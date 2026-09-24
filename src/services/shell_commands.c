@@ -583,11 +583,17 @@ static arm_cpu_t *node_arm_cpu(shell_service_t *s, const char *what, const char 
 
 /* "0x2000", "main", "main+0x10": a number, or a symbol of the node's
  * firmware (then its Secure-world image) plus an optional offset. */
-/* The file behind an image path: mtime, size and inode, or zeros. */
+/* The file behind an image path: mtime (ns, so a rebuild within the same
+ * second is seen), size and inode, or zeros. */
 static void image_stamp(const char *path, int64_t stamp[3]) {
     struct stat st;
     if (path[0] && stat(path, &st) == 0) {
-        stamp[0] = (int64_t)st.st_mtime; stamp[1] = (int64_t)st.st_size; stamp[2] = (int64_t)st.st_ino;
+#ifdef __APPLE__
+        stamp[0] = (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+        stamp[0] = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+        stamp[1] = (int64_t)st.st_size; stamp[2] = (int64_t)st.st_ino;
     } else {
         stamp[0] = stamp[1] = stamp[2] = 0;
     }
@@ -1323,10 +1329,9 @@ static int cmd_console(shell_service_t *s, int argc, char **argv, const char *li
 static bool cmd_blocks(const shell_command_t *c, int argc);
 
 static int check_command_text(shell_service_t *s, const char *what, const char *cmd) {
-    /* The text is stored as given (expanded, escaped) in a SHELL_LINE_MAX
-     * entry: refuse what would not fit rather than truncate it mid-escape. */
-    if (strlen(cmd) >= SHELL_LINE_MAX) { shell_error(s, "%s: command too long to schedule", what); return -1; }
-    char *argv[SHELL_MAX_ARGS]; char storage[SHELL_LINE_MAX]; char err[128];
+    /* The text is kept as given (expanded, escaped); like exec_tokens it
+     * can hold escaped values, so the token storage matches. */
+    char *argv[SHELL_MAX_ARGS]; char storage[4 * SHELL_LINE_MAX]; char err[128];
     int argc = shell_tokenize(cmd, argv, NULL, SHELL_MAX_ARGS, storage, sizeof(storage), err, sizeof(err));
     if (argc < 0) { shell_error(s, "%s", err); return -1; }
     if (argc == 0) { shell_error(s, "missing command"); return -1; }
@@ -2105,18 +2110,23 @@ static int cmd_on_list(shell_service_t *s, int argc, char **argv, const char *li
         }
         const char *kind = w->kind == SHELL_WATCH_COUNT ? "count" : w->kind == SHELL_WATCH_FAIL ? "fail-on" : w->once ? "on --once" : "on";
         shell_out(s, "  #%d %-9s %-8s \"%s\"%s%s  (%d matches)\n", i + 1, kind, nodes, w->pattern,
-                  w->kind == SHELL_WATCH_RUN ? " -> " : "", w->kind == SHELL_WATCH_RUN ? w->cmd : "", w->count);
+                  w->kind == SHELL_WATCH_RUN ? " -> " : "", w->kind == SHELL_WATCH_RUN && w->cmd ? w->cmd : "", w->count);
     }
     return 0;
 }
 
 static int cmd_on_clear(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)line; (void)argpos;
-    if (!strcmp(argv[1], "all")) { s->watch_count = 0; return 0; }
+    if (!strcmp(argv[1], "all")) {
+        for (int i = 0; i < s->watch_count; i++) { free(s->watches[i].cmd); s->watches[i].cmd = NULL; }
+        s->watch_count = 0;
+        return 0;
+    }
     long n;
     if (shell_parse_int(argv[1], &n) != 0 || n < 1 || n > s->watch_count) {
         shell_error(s, "on clear: no watch #%s (see on list)", argv[1]); return -1;
     }
+    free(s->watches[n - 1].cmd);
     memmove(&s->watches[n - 1], &s->watches[n], (size_t)(s->watch_count - n) * sizeof(s->watches[0]));
     s->watch_count--;
     return 0;

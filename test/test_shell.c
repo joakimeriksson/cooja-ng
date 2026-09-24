@@ -210,6 +210,7 @@ static void mock_reset(void) {
     mock_cpu.flash_base = 0x1000u;
     mock_cpu.flash_end = 0x1000u + sizeof(mock_flash);
     for (int i = 0; i < SIM_EQ_MAX_NODES; i++) { free(sh.sym_cache[i]); sh.sym_cache[i] = NULL; }
+    shell_script_free_all(&sh);
     memset(&sh, 0, sizeof(sh));
     sh.sim = &mock_sim; sh.ctl = &mock_ctl; sh.active = true; sh.interactive = false;
     sh.verbose = false; sh.next_at_id = 1; sh.default_expect_timeout_ns = 30000000000LL;
@@ -818,9 +819,11 @@ static void test_expand(void) {
         sh.interactive = true;
         shell_var_set(&sh, "big", big);
         shell_enqueue_line(&sh, "echo $big");
-        shell_enqueue_line(&sh, "at +1s echo $big");     /* too long to store as scheduled */
+        shell_enqueue_line(&sh, "at +1s echo $big");     /* 1050 bytes escaped: the entry is heap-allocated */
         shell_script_tick(&sh);
-        CHECK(!sh.failed && sh.atq_count == 0, "a 700-byte value expands; scheduling it is refused (%d)", sh.atq_count);
+        CHECK(!sh.failed && sh.atq_count == 1, "a 700-byte value expands and can be scheduled (%d)", sh.atq_count);
+        advance(1000000000LL); shell_script_tick(&sh);
+        CHECK(!sh.failed && sh.atq_count == 0, "the scheduled long command ran");
     }
     n = shell_expand_vars("echo $missing", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
     CHECK(n == -1 && strstr(err, "undefined variable 'missing'"), "undefined -> error (%s)", err);
@@ -958,7 +961,7 @@ static void test_symbols(void) {
         utime(copy, &ub);                                /* "rebuilt": a new mtime, same path */
         shell_enqueue_line(&sh, "sym -c again 1 process_run");
         shell_script_tick(&sh);
-        CHECK(sh.sym_cache[0]->count == 1 && sh.sym_cache[0]->fw_stamp[0] == (int64_t)ub.modtime,
+        CHECK(sh.sym_cache[0]->count == 1 && sh.sym_cache[0]->fw_stamp[0] == (int64_t)ub.modtime * 1000000000LL,
               "a rebuilt image empties the cache and is re-read (%d)", sh.sym_cache[0]->count);
         unlink(copy);
     }
