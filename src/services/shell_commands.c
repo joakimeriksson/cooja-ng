@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* --- helpers --------------------------------------------------------------- */
 
@@ -582,9 +583,21 @@ static arm_cpu_t *node_arm_cpu(shell_service_t *s, const char *what, const char 
 
 /* "0x2000", "main", "main+0x10": a number, or a symbol of the node's
  * firmware (then its Secure-world image) plus an optional offset. */
+/* The file behind an image path: mtime, size and inode, or zeros. */
+static void image_stamp(const char *path, int64_t stamp[3]) {
+    struct stat st;
+    if (path[0] && stat(path, &st) == 0) {
+        stamp[0] = (int64_t)st.st_mtime; stamp[1] = (int64_t)st.st_size; stamp[2] = (int64_t)st.st_ino;
+    } else {
+        stamp[0] = stamp[1] = stamp[2] = 0;
+    }
+}
+
 /* A node's symbol, through its per-slot cache.  The cache is keyed on the
- * image paths, so a reboot into another firmware or a reused slot starts
- * empty; misses are not cached.  A symbol at address 0 is found. */
+ * image paths and the files behind them (one stat per lookup — what the
+ * old read-the-ELF-every-time did, minus the read), so a reboot into
+ * another firmware, a reused slot and a rebuild at the same path all start
+ * the slot empty; misses are not cached.  A symbol at address 0 is found. */
 static bool node_symbol(shell_service_t *s, const sim_control_node_info_t *info,
                         const char *name, uint32_t *addr) {
     const char *fw = info->firmware ? info->firmware : "";
@@ -594,10 +607,17 @@ static bool node_symbol(shell_service_t *s, const sim_control_node_info_t *info,
     if (idx >= 0 && idx < SIM_EQ_MAX_NODES) {
         if (!s->sym_cache[idx]) s->sym_cache[idx] = calloc(1, sizeof(*c));
         c = s->sym_cache[idx];
-        if (c && (strcmp(c->firmware, fw) != 0 || strcmp(c->secure_firmware, sfw) != 0)) {
+        int64_t fs[3], ss[3];
+        image_stamp(fw, fs);
+        image_stamp(sfw, ss);
+        if (c && (strncmp(c->firmware, fw, sizeof(c->firmware) - 1) != 0 ||
+                  strncmp(c->secure_firmware, sfw, sizeof(c->secure_firmware) - 1) != 0 ||
+                  memcmp(c->fw_stamp, fs, sizeof(fs)) != 0 || memcmp(c->sfw_stamp, ss, sizeof(ss)) != 0)) {
             memset(c, 0, sizeof(*c));
             snprintf(c->firmware, sizeof(c->firmware), "%s", fw);
             snprintf(c->secure_firmware, sizeof(c->secure_firmware), "%s", sfw);
+            memcpy(c->fw_stamp, fs, sizeof(fs));
+            memcpy(c->sfw_stamp, ss, sizeof(ss));
         }
         if (c)
             for (int i = 0; i < c->count; i++)

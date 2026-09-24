@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <utime.h>
+#include <time.h>
 
 #include "shell_parse.h"
 #include "sim_mote.h"
@@ -925,6 +927,27 @@ static void test_symbols(void) {
     shell_enqueue_line(&sh, "sym 1 process_run");
     shell_script_tick(&sh);
     CHECK(sh.sym_cache[0]->count == 0 && !strcmp(sh.sym_cache[0]->firmware, "other.elf"), "another image empties the cache");
+    /* A rebuild at the same path (new mtime) empties it too. */
+    {
+        char copy[256];
+        snprintf(copy, sizeof(copy), "/tmp/csim_shell_test_img_%d.elf", (int)getpid());
+        FILE *in = fopen(img, "rb"), *out = fopen(copy, "wb");
+        char buf[65536]; size_t n;
+        while (in && out && (n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
+        if (in) fclose(in);
+        if (out) fclose(out);
+        snprintf(mock_nodes[0].fw, sizeof(mock_nodes[0].fw), "%s", copy);
+        shell_enqueue_line(&sh, "sym 1 process_run");
+        shell_script_tick(&sh);
+        CHECK(sh.sym_cache[0]->count == 1, "resolved from the copy");
+        struct utimbuf ub = { .actime = time(NULL), .modtime = time(NULL) + 100 };
+        utime(copy, &ub);                                /* "rebuilt": a new mtime, same path */
+        shell_enqueue_line(&sh, "sym -c again 1 process_run");
+        shell_script_tick(&sh);
+        CHECK(sh.sym_cache[0]->count == 1 && sh.sym_cache[0]->fw_stamp[0] == (int64_t)ub.modtime,
+              "a rebuilt image empties the cache and is re-read (%d)", sh.sym_cache[0]->count);
+        unlink(copy);
+    }
     uint32_t addr = 1;
     CHECK(elf_lookup_symbol(img, "__ctors_size", &addr) && addr == 0, "elf_lookup_symbol: found at 0");
     CHECK(!elf_lookup_symbol(img, "no_such_symbol_here", &addr), "elf_lookup_symbol: absent is false");

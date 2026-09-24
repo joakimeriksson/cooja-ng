@@ -92,9 +92,10 @@ typedef struct shell_source {
 
 #define SHELL_SYM_CACHE     64           /* entries per node, replaced round-robin */
 typedef struct shell_sym_cache {
-    char     firmware[SHELL_PATH_MAX];
+    char     firmware[SHELL_PATH_MAX];       /* the images the entries came from: */
     char     secure_firmware[SHELL_PATH_MAX];
-    int      count, next;
+    int64_t  fw_stamp[3], sfw_stamp[3];      /* their mtime, size and inode, so a rebuild */
+    int      count, next;                    /* at the same path starts the slot afresh */
     struct { char name[64]; uint32_t addr; } e[SHELL_SYM_CACHE];
 } shell_sym_cache_t;
 
