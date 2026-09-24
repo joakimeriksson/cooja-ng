@@ -326,20 +326,28 @@ void shell_script_on_uart_byte(shell_service_t *s, int idx, uint8_t byte,
 int shell_script_at_add(shell_service_t *s, int64_t at_ns, int64_t period_ns,
                         const char *cmd) {
     if (s->atq_count >= SHELL_ATQ_MAX) return -1;
-    shell_at_entry_t *e = &s->atq[s->atq_count++];
+    shell_at_entry_t *e = &s->atq[s->atq_count];
+    e->cmd = strdup(cmd);
+    if (!e->cmd) return -1;
+    s->atq_count++;
     e->id = s->next_at_id++;
     e->at_ns = at_ns;
     e->period_ns = period_ns;
-    snprintf(e->cmd, sizeof(e->cmd), "%s", cmd);
     e->origin = s->origin;
     shell_pin(s, at_ns);
     return e->id;
 }
 
 int shell_script_at_remove(shell_service_t *s, int id) {
-    if (id < 0) { int n = s->atq_count; s->atq_count = 0; return n; }
+    if (id < 0) {
+        int n = s->atq_count;
+        for (int i = 0; i < n; i++) { free(s->atq[i].cmd); s->atq[i].cmd = NULL; }
+        s->atq_count = 0;
+        return n;
+    }
     for (int i = 0; i < s->atq_count; i++) {
         if (s->atq[i].id != id) continue;
+        free(s->atq[i].cmd);
         memmove(&s->atq[i], &s->atq[i + 1],
                 (size_t)(s->atq_count - i - 1) * sizeof(s->atq[0]));
         s->atq_count--;
@@ -358,8 +366,12 @@ static bool at_pop_due(shell_service_t *s, int64_t now, shell_at_entry_t *out) {
             best = i;
     }
     if (best < 0) return false;
+    /* The caller owns out->cmd: a one-shot's text moves out with the entry;
+     * an `every` keeps its own and hands out a copy, so a command that
+     * clears its own entry does not free the text it is running from. */
     *out = s->atq[best];
     if (out->period_ns > 0) {
+        out->cmd = strdup(out->cmd);
         s->atq[best].at_ns += out->period_ns;
         shell_pin(s, s->atq[best].at_ns);
     } else {
@@ -383,9 +395,26 @@ int shell_script_watch_add(shell_service_t *s, shell_watch_kind_t kind,
     w->any = any;
     w->nids = nids < SIM_EQ_MAX_NODES ? nids : SIM_EQ_MAX_NODES;
     memcpy(w->ids, ids, (size_t)w->nids * sizeof(int));
-    if (cmd) snprintf(w->cmd, sizeof(w->cmd), "%s", cmd);
+    if (cmd) {
+        w->cmd = strdup(cmd);
+        if (!w->cmd) { s->watch_count--; return -1; }
+    }
     w->origin = s->origin;
     return s->watch_count - 1;
+}
+
+/* Drop the fired-but-not-yet-run `on` commands. */
+void shell_script_clear_triggers(shell_service_t *s) {
+    for (int i = 0; i < s->trigger_count; i++) { free(s->triggers[i].cmd); s->triggers[i].cmd = NULL; }
+    s->trigger_count = 0;
+}
+
+/* Free everything the queues own: at/every entries, watches, triggers. */
+void shell_script_free_all(shell_service_t *s) {
+    shell_script_at_remove(s, -1);
+    for (int i = 0; i < s->watch_count; i++) { free(s->watches[i].cmd); s->watches[i].cmd = NULL; }
+    s->watch_count = 0;
+    shell_script_clear_triggers(s);
 }
 
 static bool sel_hit(bool any, const int *ids, int nids, int node_id) {
@@ -417,9 +446,10 @@ void shell_script_on_log_line(shell_service_t *s, int idx, int node_id,
         case SHELL_WATCH_RUN:
             if (w->dead) break;
             if (w->once) w->dead = true;
-            if (s->trigger_count < SHELL_TRIGGER_MAX) {
+            char *copy = s->trigger_count < SHELL_TRIGGER_MAX ? strdup(w->cmd ? w->cmd : "") : NULL;
+            if (copy) {
                 shell_trigger_t *t = &s->triggers[s->trigger_count++];
-                snprintf(t->cmd, sizeof(t->cmd), "%s", w->cmd);
+                t->cmd = copy;
                 t->origin.kind = SHELL_ORIGIN_ON;
                 t->origin.script = w->origin.script;
                 snprintf(t->origin.where, sizeof(t->origin.where), "on \"%.40s\" (%.60s)",
@@ -702,16 +732,21 @@ void shell_script_tick(shell_service_t *s) {
         if (s->verbose) shell_out(s, "at #%d> %s\n", e.id, e.cmd);
         shell_origin_t o = { .kind = SHELL_ORIGIN_AT, .script = e.origin.script };
         snprintf(o.where, sizeof(o.where), "at #%d (%.100s)", e.id, e.origin.where);
-        shell_exec_line(s, e.cmd, false, &o);
+        if (e.cmd) shell_exec_line(s, e.cmd, false, &o);
+        free(e.cmd);
     }
     for (int i = 0; i < s->trigger_count; i++) {
+        char *cmd = s->triggers[i].cmd;            /* the command may clear the queue */
+        s->triggers[i].cmd = NULL;
         shell_hold_output(s);
-        if (s->verbose) shell_out(s, "on> %s\n", s->triggers[i].cmd);
-        shell_exec_line(s, s->triggers[i].cmd, false, &s->triggers[i].origin);
+        if (s->verbose) shell_out(s, "on> %s\n", cmd);
+        shell_exec_line(s, cmd, false, &s->triggers[i].origin);
+        free(cmd);
     }
-    s->trigger_count = 0;
+    shell_script_clear_triggers(s);
     for (int i = 0; i < s->watch_count; i++) {       /* drop fired --once watches */
         if (!s->watches[i].dead) continue;
+        free(s->watches[i].cmd);
         memmove(&s->watches[i], &s->watches[i + 1],
                 (size_t)(s->watch_count - i - 1) * sizeof(s->watches[0]));
         s->watch_count--;

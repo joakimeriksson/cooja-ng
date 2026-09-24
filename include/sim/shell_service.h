@@ -136,7 +136,8 @@ typedef struct shell_at_entry {
     int     id;
     int64_t at_ns;
     int64_t period_ns;     /* > 0: `every` — re-armed after each run */
-    char    cmd[SHELL_LINE_MAX];
+    char   *cmd;           /* owned (heap): the expanded, escaped text can
+                            * outgrow a line; freed on remove/fire/restart  */
     shell_origin_t origin; /* where the `at`/`every` line was typed         */
 } shell_at_entry_t;
 
@@ -159,14 +160,14 @@ typedef struct shell_watch {
     int     ids[SIM_EQ_MAX_NODES];
     int     nids;
     int     count;
-    char    cmd[SHELL_LINE_MAX];
+    char   *cmd;           /* owned (heap); NULL for count/fail-on watches   */
     shell_origin_t origin; /* where the `on`/`fail-on`/`count` line was typed */
     bool    once;          /* `on --once`: removed after it fires            */
     bool    dead;          /* fired once; compacted at the next tick         */
 } shell_watch_t;
 
 typedef struct shell_trigger {
-    char cmd[SHELL_LINE_MAX];
+    char *cmd;             /* owned (heap): a copy of the watch's text       */
     shell_origin_t origin;
 } shell_trigger_t;
 
