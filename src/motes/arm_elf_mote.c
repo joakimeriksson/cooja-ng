@@ -524,6 +524,7 @@ static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
     if (sim_ns > sim_runtime_now_ns(node->env->sim))
         sim_ns = sim_runtime_now_ns(node->env->sim);
     arm_cpu_t *cpu = &node->plat.arm.cpu;
+    if (cpu->dbg_halted) return 0;      /* a halted node's clock stands still */
     int64_t t_us = sim_ns / 1000LL;
     int64_t jump_us = 0;
     if (cpu->last_execute_us >= 0) {
@@ -551,6 +552,10 @@ static int64_t arm_mote_sync_to_time(sim_mote_t *m, int64_t sim_ns) {
  * differs from the MSP430 clamped sync on purpose — do not unify). */
 static void arm_mote_rx_byte_sync(sim_mote_t *m, int64_t byte_time_ns) {
     arm_cpu_t *cpu = &MOTE_IMPL(m)->plat.arm.cpu;
+    /* A halted node's clock stands still: neither sim_time_ns (energest
+     * charges its advance as active CPU) nor the execute anchor move; the
+     * release re-anchors.  The byte still lands in the radio model. */
+    if (cpu->dbg_halted) return;
     int64_t t_us = byte_time_ns / 1000LL;
     int64_t jump_us = 0;
     if (cpu->last_execute_us >= 0) {
