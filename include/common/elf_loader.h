@@ -60,6 +60,11 @@ typedef struct {
     uint16_t st_shndx;
 } Elf32_Sym;
 
+/* Symbol table entries a name lookup must not match. */
+#define ELF_SHN_UNDEF     0            /* st_shndx: an undefined (imported) reference */
+#define ELF_STT_SECTION   3            /* st_info & 0xf: a section's own symbol */
+#define ELF_STT_FILE      4            /* st_info & 0xf: a source file name */
+
 #pragma pack(pop)
 
 /* ELF constants */
