@@ -3157,6 +3157,35 @@ static void test_debug_halt_holds_irqs(void) {
     assert_eq("the instruction at the breakpoint ran", 1, cpu.reg[0]);
     arm_step(&cpu, 1);                               /* B back: the skip is spent */
     assert_true("next visit to the breakpoint hits", arm_dbg_check(&cpu) && cpu.dbg_halted && cpu.dbg_hit_pc == CODE_BASE);
+
+    /* An IRQ taken at the boundary right after the breakpoint instruction:
+     * CPSIE i with the IRQ held pending by PRIMASK, in CPSIE; CPSID; B.
+     * The instruction retired, so the very next visit must halt. */
+    write_thumb16(&cpu, CODE_BASE, 0xB662);          /* CPSIE i */
+    write_thumb16(&cpu, CODE_BASE + 2, 0xB672);      /* CPSID i */
+    write_thumb16(&cpu, CODE_BASE + 4, 0xE7FC);      /* B CODE_BASE */
+    cpu.dbg_halted = false; cpu.dbg_hit_new = false;
+    cpu.dbg_skip_pc = CODE_BASE;                     /* released at the breakpoint */
+    cpu.reg[ARM_PC] = CODE_BASE;
+    cpu.reg[ARM_SP] = 0x20007F00;
+    cpu.primask = 1;
+    arm_nvic_set_pending(&nvic, BF_IRQ);             /* held by PRIMASK */
+    assert_eq("IRQ held: no entry yet", CODE_BASE, cpu.reg[ARM_PC]);
+    int steps = 0;
+    while (!cpu.dbg_halted && steps++ < 8) arm_step(&cpu, 1);
+    assert_true("CPSIE retired, IRQ taken, handler returned", steps > 1);
+    assert_true("the second visit after an IRQ at the boundary halts", cpu.dbg_halted && cpu.dbg_hit_pc == CODE_BASE);
+    assert_true("halted on the second visit, not the third", steps <= 5);
+
+    /* The release books the halt as time the core was not running (the
+     * energy view's LPM), arms the skip at the hit and re-anchors the
+     * execute clock, so the halt is neither replayed nor charged as active. */
+    cpu.dbg_halted = true; cpu.dbg_hit_kind = 1; cpu.dbg_hit_pc = CODE_BASE + 2;
+    cpu.sim_time_ns = 3000000000LL; cpu.lpm_ns = 1000000000LL; cpu.dbg_skip_pc = UINT32_MAX;
+    arm_dbg_release(&cpu, 8000000000LL);
+    assert_true("release: not halted, skip at the hit", !cpu.dbg_halted && cpu.dbg_skip_pc == CODE_BASE + 2);
+    assert_true("release: the 5 s halt is LPM, not active", cpu.lpm_ns == 6000000000LL);
+    assert_true("release: execute anchor at the release time", cpu.last_execute_us == 8000000LL);
     arm_cpu_destroy(&cpu);
 }
 

@@ -1223,6 +1223,7 @@ static void test_debug(void) {
     CHECK(!strcmp(shell_var_get(&sh, "pc") ? shell_var_get(&sh, "pc") : "", "0x00002000"), "script continued at the hit");
     CHECK(!mock_cpu.dbg_halted && !sim_control_paused(&mock_ctl), "continue releases and resumes");
     CHECK(!arm_dbg_check(&mock_cpu), "not hit again on the way out");
+    mock_cpu.dbg_skip_pc = UINT32_MAX;       /* the interpreter spends the skip once the instruction retires */
     mock_cpu.reg[ARM_PC] = 0x2002; arm_dbg_check(&mock_cpu);
     mock_cpu.reg[ARM_PC] = 0x2000;
     CHECK(arm_dbg_check(&mock_cpu), "hit again on the next pass");
@@ -1231,6 +1232,29 @@ static void test_debug(void) {
     unlink(p);
 
     /* Watchpoint: a changed SRAM value is reported with the writer's pc. */
+    mock_reset();
+    mock_cpu.dbg_skip_pc = UINT32_MAX;
+    sh.interactive = true;
+    /* A stale skip: hit, `break clear all` (no check runs while nothing is
+     * armed), release, re-arm at the same address — the first hit after the
+     * re-arm must not be skipped; nor after `reg pc =` while halted. */
+    mock_reset();
+    sh.interactive = true;
+    mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000; mock_cpu.dbg_halted = true;
+    shell_enqueue_line(&sh, "break 1 0x2001");
+    shell_script_tick(&sh);
+    mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000; mock_cpu.dbg_halted = true;
+    shell_enqueue_line(&sh, "break clear all");
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.dbg_count == 0 && !mock_cpu.dbg_halted, "break clear all released the node");
+    shell_enqueue_line(&sh, "break 1 0x2001");
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.dbg_count == 1 && mock_cpu.dbg_skip_pc == UINT32_MAX, "re-arming resets a stale skip (0x%x)", mock_cpu.dbg_skip_pc);
+    mock_cpu.dbg_skip_pc = 0x2000;
+    shell_enqueue_line(&sh, "reg 1 pc = 0x3000");
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.reg[ARM_PC] == 0x3000 && mock_cpu.dbg_skip_pc == UINT32_MAX, "a pc write resets the skip");
+
     mock_reset();
     mock_cpu.dbg_skip_pc = UINT32_MAX;
     sh.interactive = true;
