@@ -27,11 +27,13 @@
 # Each line also carries both binaries' wall time and the change.  The
 # workloads run concurrently by default, so those numbers are contended and
 # only indicative (tens of percent): a regression signal to follow up with
-# a real measurement, not a benchmark.  TIMING=1 serialises the runs for
-# numbers worth quoting, at about one workload's worth of time per workload.
+# a real measurement, not a benchmark.  TIMING=1 serialises the runs, ref and
+# head back to back per workload, for numbers worth quoting, at about one
+# workload's worth of time per workload.
 # The simulation output is compared the same way either way.
 #
-# Exit code 0 = identical, 1 = a workload differs (or would not run).
+# Exit code 0 = identical, 1 = a workload differs, or did not complete under
+# this tree's binary (non-zero exit, timeout, no Wall-clock line).
 #
 set -u
 
@@ -92,28 +94,28 @@ build() {  # build <srcdir> <label>
     fi
 }
 
-run_all() {  # run_all <binary> <outdir>
-    mkdir -p "$2"
-    for w in "${WORKLOADS[@]}"; do
-        if [ -n "${TIMING:-}" ]; then
-            ( timeout 900 "$1" ${w#*|} >"$2/${w%%|*}.log" 2>&1; echo "rc=$?" >>"$2/${w%%|*}.log" )
-        else
-            ( timeout 900 "$1" ${w#*|} >"$2/${w%%|*}.log" 2>&1; echo "rc=$?" >>"$2/${w%%|*}.log" ) &
-        fi
-    done
-    wait
+run_one() {  # run_one <binary> <outdir> <workload>
+    ( timeout 900 "$1" ${3#*|} >"$2/${3%%|*}.log" 2>&1; echo "rc=$?" >>"$2/${3%%|*}.log" ) &
+    if [ -n "${TIMING:-}" ]; then wait; fi
 }
 
-# The runner's own "Wall-clock time: N ms" line, last one in the log (a
-# restart prints more than one).  Empty when the run did not get that far.
+# The runner's own "Wall-clock time: N ms" line.  It prints exactly one, and
+# after a restart it covers only the segment since the restart (the start
+# time is reset), so a whole-run total is not recoverable from the log.
+# Empty when the run did not get that far.
 wall_ms() { sed -n 's/^ *Wall-clock time: *\([0-9.]*\) ms.*/\1/p' "$1" | tail -1; }
+
+# The exit code the run appended to its log.
+run_rc() { sed -n 's/^rc=//p' "$1" | tail -1; }
 
 # "ref 437.7 ms  head 548.7 ms  +25.4 %" for the two logs, or a note.
 timing() {
     local a b
     a=$(wall_ms "$1"); b=$(wall_ms "$2")
     if [ -z "$a" ] || [ -z "$b" ]; then echo "(no wall time)"; return; fi
-    awk -v a="$a" -v b="$b" 'BEGIN { printf "ref %8.1f ms  head %8.1f ms  %+6.1f %%", a, b, (b - a) * 100 / a }'
+    awk -v a="$a" -v b="$b" 'BEGIN {
+        if (a + 0 <= 0) print "(no wall time)"
+        else printf "ref %8.1f ms  head %8.1f ms  %+6.1f %%", a, b, (b - a) * 100 / a }'
 }
 
 echo "=== baseline: this tree vs $REF_SHA${REF_NAME:+ ($REF_NAME)}"
@@ -126,19 +128,38 @@ build "$ROOT" head || exit 1
 # only the engine differs.  (A config that changed since the reference may not
 # load in the older binary — that shows up as a diff in its log.)
 echo "  running ${#WORKLOADS[@]} workloads with each binary${TIMING:+, one at a time (TIMING)} ..."
-run_all "$WORK/ref/build/test_runner" "$WORK/out-ref"
-run_all "$ROOT/build/test_runner"     "$WORK/out-head"
+# Interleaved per workload, so with TIMING=1 each pair runs back to back under
+# the same machine state (thermal, turbo) rather than all of head minutes later.
+mkdir -p "$WORK/out-ref" "$WORK/out-head"
+for w in "${WORKLOADS[@]}"; do
+    run_one "$WORK/ref/build/test_runner" "$WORK/out-ref"  "$w"
+    run_one "$ROOT/build/test_runner"     "$WORK/out-head" "$w"
+done
+wait
 
 rc=0
 for w in "${WORKLOADS[@]}"; do
     name=${w%%|*}
     a="$WORK/out-ref/$name.log"
     b="$WORK/out-head/$name.log"
+    # A workload that fails the same way under both binaries diffs clean, so
+    # it must not complete: a non-zero exit or no Wall-clock line fails it.
+    brc=$(run_rc "$b")
+    bwall=$(wall_ms "$b")
+    if [ "$brc" != 0 ] || [ -z "$bwall" ]; then
+        note="rc=${brc:-?}"
+        [ -n "$bwall" ] || note="$note, no wall time"
+        printf "  FAIL  %-9s (%s)\n" "$name" "$note"
+        tail -10 "$b"
+        rc=1
+        KEEP=1
+        continue
+    fi
     n=$(diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | wc -l)
     if [ "$n" -eq 0 ]; then
-        printf "  ok    %-8s %s\n" "$name" "$(timing "$a" "$b")"
+        printf "  ok    %-9s %s\n" "$name" "$(timing "$a" "$b")"
     else
-        printf "  DIFF  %-8s (%d lines)  %s\n" "$name" "$n" "$(timing "$a" "$b")"
+        printf "  DIFF  %-9s (%d lines)  %s\n" "$name" "$n" "$(timing "$a" "$b")"
         diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | head -20
         rc=1
         KEEP=1
@@ -149,6 +170,6 @@ done
 if [ $rc -eq 0 ]; then
     echo "check-baseline: OK (identical to $REF_SHA)"
 else
-    echo "check-baseline: FAILED — the simulation moved" >&2
+    echo "check-baseline: FAILED — the simulation moved or a workload did not complete" >&2
 fi
 exit $rc
