@@ -103,7 +103,10 @@ GNU Lightning is optional (auto-detected via pkg-config). Without it, the interp
 # Re-run it after a rebase — the baseline moves with main. CI runs it on
 # pull requests that touch the engine (.github/workflows/baseline.yml).
 tools/check-determinism.sh test configs/chain-4node-sky.yaml   # same run twice
-tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 keeps the logs
+tools/check-baseline.sh [ref]                   # vs a reference build; KEEP=1 keeps the logs. Each line also
+                                                # shows both binaries' wall time and the change — indicative
+                                                # only, the workloads run concurrently; TIMING=1 runs them one
+                                                # at a time for numbers worth quoting (~9x longer)
 
 # Cross-platform interoperation (all csim-internal, no co-simulation)
 # Three CPU architectures + three radio models on one DAG. This is the control
