@@ -805,6 +805,7 @@ void shell_service_on_restart(shell_service_t *s) {
     s->trigger_count = 0;
     s->triggers_dropped = 0;
     s->restart_pending = false;
+    for (int i = 0; i < SIM_EQ_MAX_NODES; i++) { free(s->sym_cache[i]); s->sym_cache[i] = NULL; }
 }
 
 int shell_service_report(shell_service_t *s, int64_t elapsed_ns) {
