@@ -146,13 +146,30 @@ if [ "$CLEAN" -eq 1 ]; then
     # Wipe every Cooja-suite firmware target so nothing is reused across the
     # rebuild.  cc2538dk is left alone — it belongs to the standalone ARM
     # test_runner suite, not to the Cooja suite.
-    for sub in cooja sky z1; do
-        d="$CSIM_DIR/firmware/$sub"
-        [ -d "$d" ] || continue
-        wiped=$(find "$d" -maxdepth 1 -type f -name "*.$sub" | wc -l | tr -d ' ')
-        find "$d" -maxdepth 1 -type f -name "*.$sub" -delete
-        echo "  CLEAN $d (removed $wiped firmware artifacts)"
-    done
+    #
+    # Only local builds are removed.  firmware/sky and firmware/z1 also hold
+    # shipped prebuilt images that cannot be rebuilt without msp430-gcc, and
+    # deleting those broke every test that needs them.  In a git checkout the
+    # shipped images are the tracked ones; outside one they cannot be told
+    # apart from local builds, so nothing is removed.
+    if git -C "$CSIM_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        for sub in cooja sky z1; do
+            d="$CSIM_DIR/firmware/$sub"
+            [ -d "$d" ] || continue
+            wiped=0
+            # --others without --exclude-standard lists ignored files too.
+            while IFS= read -r f; do
+                case "$f" in
+                    */*) continue ;;   # top level of the directory only
+                    *."$sub") rm -f "$d/$f"; wiped=$((wiped + 1)) ;;
+                esac
+            done < <(git -C "$d" ls-files --others -- .)
+            echo "  CLEAN $d (removed $wiped local firmware builds)"
+        done
+    else
+        echo "  CLEAN skipped: not a git checkout, so shipped firmware cannot be"
+        echo "        told apart from local builds; remove stale ones by hand"
+    fi
 fi
 
 if [ ! -f "$TEST_RUNNER" ]; then
