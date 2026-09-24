@@ -9,7 +9,9 @@ run 100ms
 expect-halt 1 1s
 reg -c hit 1 pc
 reg -c sp0 1 sp
+nodes
 run 5s
+nodes
 reg -c later 1 pc
 reg -c sp1 1 sp
 assert var later == $hit
