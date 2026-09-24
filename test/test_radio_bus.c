@@ -67,6 +67,7 @@ typedef struct {
     int      on_air_count;          /* on_air windows announced to it */
     int64_t  on_air_start;          /* earliest start announced */
     int64_t  on_air_end;            /* latest end announced */
+    int      collision_marks;       /* mark_collisions calls */
 } mock_rx_t;
 
 static void mock_receive_byte(void *m, uint8_t byte, int8_t rssi) {
@@ -85,7 +86,7 @@ static bool mock_rx_busy(void *m) { return ((mock_rx_t *)m)->busy; }
 static void mock_rx_stall(void *m) { ((mock_rx_t *)m)->stall_count++; }
 
 static const mote_radio_ops_t mock_ops = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL, NULL,
 };
 static void mock_on_air(void *m, int64_t start, int64_t end) {
     mock_rx_t *r = (mock_rx_t *)m;
@@ -99,8 +100,19 @@ static const mote_radio_ops_t mock_ops_on_air = {
     .rx_busy          = mock_rx_busy,
     .on_air           = mock_on_air,
 };
+static int mock_mark_collisions(void *m, int64_t start, int64_t end) {
+    (void)start; (void)end;
+    ((mock_rx_t *)m)->collision_marks++;
+    return 0;
+}
+static const mote_radio_ops_t mock_ops_collisions = {
+    .receive_byte     = mock_receive_byte,
+    .rxfifo_available = mock_rxfifo_available,
+    .rx_busy          = mock_rx_busy,
+    .mark_collisions  = mock_mark_collisions,
+};
 static const mote_radio_ops_t mock_ops_stall = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL, NULL,
 };
 
 /* ============================================================
@@ -760,10 +772,10 @@ static void test_on_air_reach_and_channel(void) {
 
     uint8_t mac[30] = {0};
     sim_radio_bus_tx_frame(&f.bus, &f.sim, 0, mac, (int)sizeof(mac));
-    int64_t end = f.sim.now_ns + (30 + 6) * IEEE802154_BYTE_NS;
+    int64_t end = f.sim.now_ns + 30 * IEEE802154_BYTE_NS;
     ASSERT_EQ(f.rx[0].on_air_count, 0, "on_air: not announced to the sender");
     ASSERT_EQ(f.rx[1].on_air_count, 1, "on_air: reception neighbour, radio off");
-    ASSERT_EQ(f.rx[1].on_air_end, end, "on_air: reception window = PHY header + frame");
+    ASSERT_EQ(f.rx[1].on_air_end, end, "on_air: reception window = the frame's air time");
     ASSERT_EQ(f.rx[2].on_air_count, 1, "on_air: interference neighbour on the channel");
     ASSERT_EQ(f.rx[2].on_air_end, end, "on_air: interference window = reception window");
     ASSERT_EQ(f.rx[3].on_air_count, 0, "on_air: interference neighbour on another channel");
@@ -789,6 +801,25 @@ static void test_on_air_emulated_interference(void) {
     ASSERT_EQ(f.rx[1].on_air_end, f.sim.now_ns + (6 + 10) * IEEE802154_BYTE_NS,
               "on_air: busy for the frame in the interference ring");
     ASSERT_EQ(f.rx[2].on_air_count, 0, "on_air: not on another channel");
+}
+
+static void test_interference_marks_same_channel(void) {
+    /* A frame-level sender's frame collides with frames queued in its
+     * interference ring on its own channel only: a frame on another
+     * channel cannot corrupt them. */
+    fixture_t f; fx_init(&f, 3);
+    const double x[3] = { 0, 80, 80 };
+    const int ch[3]   = { 26, 26, 15 };
+    on_air_udgm(&f, 3, x, ch);
+    for (int i = 0; i < 3; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_collisions, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 2000000;
+
+    uint8_t mac[20] = {0};
+    sim_radio_bus_tx_frame(&f.bus, &f.sim, 0, mac, (int)sizeof(mac));
+    ASSERT_EQ(f.rx[1].collision_marks, 1, "interference: marked on the sender's channel");
+    ASSERT_EQ(f.rx[2].collision_marks, 0, "interference: not marked on another channel");
 }
 
 static void test_deliver_native_noop(void) {
@@ -984,6 +1015,7 @@ int run_radio_bus_tests(int verbose) {
     test_on_air_emulated_sender();
     test_on_air_reach_and_channel();
     test_on_air_emulated_interference();
+    test_interference_marks_same_channel();
     test_frame_collision_window();
     test_frame_no_collision_when_clear();
     test_frame_backpressure_queue();

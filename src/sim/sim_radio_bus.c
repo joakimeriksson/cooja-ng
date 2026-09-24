@@ -253,6 +253,19 @@ static int frame_air_bytes(const tx_frame_asm_t *a) {
         : (IEEE802154_PHY_HEADER_BYTES + a->expected_len);
 }
 
+/* Whether a transmission from sender_idx occupies receiver i's channel
+ * (range aside: callers walk the neighbour lists).  Pulls a native
+ * receiver's channel into the medium first. */
+static bool bus_shares_channel(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                               int sender_idx, int sender_radio, int i) {
+    radio_medium_t *medium = &sim->radio_medium;
+    bus_sync_channel(bus, sim, i);
+    int rr = sim_radio_bus_pick_receiver_radio(medium, sender_idx,
+                                               sender_radio, i);
+    return rr >= 0 &&
+           radio_medium_shares_channel(medium, sender_idx, sender_radio, i, rr);
+}
+
 /* Tell every mote a transmission reaches that it occupies the channel
  * over [start_ns, end_ns): the sender's reception and interference
  * neighbours, on the sender's channel.  One window per transmission, from
@@ -276,12 +289,7 @@ static void bus_on_air(sim_radio_bus_t *bus, sim_runtime_t *sim,
             if (i == sender_idx || i >= bus->node_count) continue;
             if (!bus->ops[i] || !bus->ops[i]->on_air) continue;
             if (h->node_active && !h->node_active(h->user, i)) continue;
-            bus_sync_channel(bus, sim, i);
-            int rr = sim_radio_bus_pick_receiver_radio(medium, sender_idx,
-                                                       sender_radio, i);
-            if (rr < 0 ||
-                !radio_medium_shares_channel(medium, sender_idx, sender_radio,
-                                             i, rr))
+            if (!bus_shares_channel(bus, sim, sender_idx, sender_radio, i))
                 continue;
             bus->ops[i]->on_air(bus->mote[i], start_ns, end_ns);
         }
@@ -434,10 +442,9 @@ void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
         /* Re-entrant byte (a receiver's auto-ACK emitted while the outer
          * frame_complete delivers): dispatched above, but never fed to
          * the assembler — the outer frame_complete flushes staged ACK
-         * bytes per receiver. */
-        if (on_air)
-            bus_on_air(bus, sim, sender_idx, sender_radio, byte_time_ns,
-                       byte_time_ns + sender_byte_ns);
+         * bytes per receiver.  Only BATCH receivers are delivered to
+         * there, so these never come from a PER_BYTE sender: an emulated
+         * chip sends its auto-ACK later, as a frame of its own. */
         return;
     }
 
@@ -922,10 +929,11 @@ void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, sim_runtime_t *sim,
     bus_sync_channel(bus, sim, sender_idx);
     bus->frame_start_ns = now;   /* a frame-level sender's frame starts now */
 
-    /* The frame occupies the air for its PHY header and MAC frame. */
+    /* The frame occupies the air for 8 * len bits at 250 kbit/s, as
+     * Cooja's ContikiRadio computes it, and as the native model's own TX
+     * end and RX end (native_node.c) do: no PHY header. */
     int64_t tx_start = now;
-    int64_t tx_end = tx_start +
-        (int64_t)(len + IEEE802154_PHY_HEADER_BYTES) * IEEE802154_BYTE_NS;
+    int64_t tx_end = tx_start + (int64_t)len * IEEE802154_BYTE_NS;
     bus_on_air(bus, sim, sender_idx, 0, tx_start, tx_end);
 
     if (medium->type != RADIO_MEDIUM_NONE) {
@@ -948,10 +956,13 @@ void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, sim_runtime_t *sim,
         }
 
         /* Interference-range neighbours: mark overlapping queued frames
-         * as collided. */
+         * as collided -- on the sender's channel only, since a frame on
+         * another channel cannot corrupt them. */
         neighbor_list_t *inl = &medium->interference_neighbors[sender_idx];
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
+            if (!bus_shares_channel(bus, sim, sender_idx, 0, i))
+                continue;
             if (bus->ops[i] && bus->ops[i]->mark_collisions) {
                 bus->stats.frame_collided +=
                     bus->ops[i]->mark_collisions(bus->mote[i], tx_start, tx_end);
