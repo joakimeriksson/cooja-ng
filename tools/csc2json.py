@@ -12,9 +12,11 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from html import unescape
@@ -307,6 +309,73 @@ def source_to_firmware_name(source_path):
     return basename
 
 
+def firmware_variant(fw_name, source, make_args):
+    """The cache name for firmware built from `source` with `make_args`.
+
+    Every build gets a hash of its source directory and make arguments, so
+    two tests that build a file of the same name from different directories,
+    each with its own project-conf.h, never share a cached build.  Before
+    this only the make arguments were hashed, and a test could silently run
+    another test's firmware."""
+    src_dir = os.path.realpath(os.path.dirname(source)) if source else ""
+    key = src_dir + "\n" + " ".join(sorted(make_args))
+    return f"{fw_name}-{hashlib.md5(key.encode()).hexdigest()[:6]}"
+
+
+def legacy_firmware_variant(fw_name, source, make_args):
+    """The name the previous scheme gave the same build.  Shipped prebuilt
+    firmware, which some platforms cannot rebuild without their toolchain,
+    was committed under these names."""
+    if make_args:
+        h = hashlib.md5(" ".join(sorted(make_args)).encode()).hexdigest()[:6]
+        return f"{fw_name}-{h}"
+    if "rpl-classic" in (source or ""):
+        return f"{fw_name}-classic"
+    return fw_name
+
+
+_shipped_cache = {}
+
+
+def is_shipped_firmware(path):
+    """True if `path` is firmware the repository ships, not a local build.
+
+    In a git checkout that means tracked.  Outside one, as in a release
+    archive, every file present came with the archive."""
+    if path in _shipped_cache:
+        return _shipped_cache[path]
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        inside = subprocess.run(
+            ["git", "-C", directory, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, check=False)
+        if inside.returncode != 0:
+            shipped = True
+        else:
+            tracked = subprocess.run(
+                ["git", "-C", directory, "ls-files", "--error-unmatch", "--",
+                 os.path.basename(path)],
+                capture_output=True, check=False)
+            shipped = tracked.returncode == 0
+    except OSError:
+        shipped = True
+    _shipped_cache[path] = shipped
+    return shipped
+
+
+def find_firmware(target_firmware_dir, name, build_target):
+    """The existing firmware file for `name`, or None."""
+    exts = []
+    if build_target:
+        exts.append("." + build_target)
+    exts += [".cooja", ".cc2538dk", ".sky"]
+    for ext in exts:
+        candidate = os.path.join(target_firmware_dir, name + ext)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def extract_nodes(sim_elem, csc_dir, firmware_dir):
     """Extract all nodes with positions, IDs, firmware paths, and build info."""
     mote_types = extract_mote_types(sim_elem, csc_dir)
@@ -330,21 +399,8 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
 
         fw_name = source_to_firmware_name(source)
         if fw_name and firmware_dir:
-            # Generate a unique variant name from all build flags.
-            # Any difference in make_args or source path produces a different name.
-            fw_variant = fw_name
-            if build:
-                make_args = build.get("make_args", [])
-                if make_args:
-                    # Build a short hash suffix from all make args
-                    import hashlib
-                    args_str = " ".join(sorted(make_args))
-                    h = hashlib.md5(args_str.encode()).hexdigest()[:6]
-                    fw_variant = f"{fw_name}-{h}"
-                # Check source path for routing variant (rpl-classic vs rpl-lite)
-                src_path = source or ""
-                if "rpl-classic" in src_path and not make_args:
-                    fw_variant = f"{fw_name}-classic"
+            make_args = build.get("make_args", []) if build else []
+            fw_variant = firmware_variant(fw_name, source, make_args)
 
             # If the per-mote build.target differs from firmware_dir's leaf
             # (e.g. firmware-dir=firmware/cooja but target=sky), route to the
@@ -354,25 +410,18 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
                 parent = os.path.dirname(firmware_dir.rstrip(os.sep)) or "."
                 target_firmware_dir = os.path.join(parent, build_target)
 
-            # When make_args produce a variant name, use ONLY the variant.
-            # Don't fall back to the base name — it's a different build.
-            # When no variant (no make_args), try the base name as usual.
-            fw_path = None
-            search_names = [fw_variant] if fw_variant != fw_name else [fw_name]
-            for name_candidate in search_names:
-                if build_target:
-                    ext = "." + build_target
-                    candidate = os.path.join(target_firmware_dir, name_candidate + ext)
-                    if os.path.exists(candidate):
-                        fw_path = candidate
-                        break
-                for ext in (".cooja", ".cc2538dk", ".sky"):
-                    candidate = os.path.join(target_firmware_dir, name_candidate + ext)
-                    if os.path.exists(candidate):
-                        fw_path = candidate
-                        break
-                if fw_path:
-                    break
+            # This build's own cache entry first.  Failing that, firmware the
+            # repository ships under the previous scheme's name, which may not
+            # be rebuildable here; a local build left under that name is
+            # ignored, since it may have come from another directory.
+            fw_path = find_firmware(target_firmware_dir, fw_variant, build_target)
+            if fw_path is None:
+                legacy = find_firmware(
+                    target_firmware_dir,
+                    legacy_firmware_variant(fw_name, source, make_args),
+                    build_target)
+                if legacy is not None and is_shipped_firmware(legacy):
+                    fw_path = legacy
             if fw_path is None:
                 fallback_ext = "." + build_target if build_target else ".cc2538dk"
                 fw_path = os.path.join(target_firmware_dir, fw_variant + fallback_ext)
