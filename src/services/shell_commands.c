@@ -1318,20 +1318,26 @@ static int cmd_console(shell_service_t *s, int argc, char **argv, const char *li
 
 /* Validate a command that at/every/on will run later.  Blocking commands
  * are refused: they would take over the command stream's own wait. */
+static bool cmd_blocks(const shell_command_t *c, int argc);
+
 static int check_command_text(shell_service_t *s, const char *what, const char *cmd) {
+    /* The text is stored as given (expanded, escaped) in a SHELL_LINE_MAX
+     * entry: refuse what would not fit rather than truncate it mid-escape. */
+    if (strlen(cmd) >= SHELL_LINE_MAX) { shell_error(s, "%s: command too long to schedule", what); return -1; }
     char *argv[SHELL_MAX_ARGS]; char storage[SHELL_LINE_MAX]; char err[128];
     int argc = shell_tokenize(cmd, argv, NULL, SHELL_MAX_ARGS, storage, sizeof(storage), err, sizeof(err));
     if (argc < 0) { shell_error(s, "%s", err); return -1; }
     if (argc == 0) { shell_error(s, "missing command"); return -1; }
-    if (!shell_find_command(argv[0])) { shell_error(s, "unknown command '%s'", argv[0]); return -1; }
-    if (shell_line_blocks(cmd)) {
+    const shell_command_t *c = shell_find_command(argv[0]);
+    if (!c) { shell_error(s, "unknown command '%s'", argv[0]); return -1; }
+    if (cmd_blocks(c, argc)) {
         shell_error(s, "%s cannot run '%s': it would block the command stream "
-                    "(put the sequence in a script instead)", what, argv[0]);
+                    "(put the sequence in a script instead)", what, c->name);
         return -1;
     }
-    if (!strcmp(argv[0], "restart")) {      /* the mirror image: it discards the stream */
-        shell_error(s, "%s cannot run 'restart': it would discard the pending command "
-                    "stream (type it, or put it in a script)", what);
+    if (c->flags & SHELL_CMD_NO_SCHEDULE) {  /* the mirror image: it discards the stream */
+        shell_error(s, "%s cannot run '%s': it would discard the pending command "
+                    "stream (type it, or put it in a script)", what, c->name);
         return -1;
     }
     return 0;
@@ -2290,6 +2296,7 @@ static int cmd_help(shell_service_t *s, int argc, char **argv, const char *line,
 
 #define IMM SHELL_CMD_IMMEDIATE
 #define BLK SHELL_CMD_BLOCKING
+#define NOSCHED SHELL_CMD_NO_SCHEDULE
 static const shell_command_t commands[] = {
     { "run",        "run [duration]",                  "resume; with a duration, pause again after it (run 500ms)", 0, 1, IMM, cmd_run },
     { "pause",      "pause",                           "stop dispatching events (services keep polling)", 0, 0, IMM, cmd_pause },
@@ -2308,7 +2315,7 @@ static const shell_command_t commands[] = {
     { "leds",       "leds [nodes]",                    "LED states", 0, 1, IMM, cmd_leds },
     { "gpio",       "gpio <node> <port>.<pin> high|low|pulse [duration]|release", "drive a GPIO input pin (MSP430 P1-P10, CC2538 A-D, nRF54L15 P0-P2 without GPIOTE)", 3, 4, IMM, cmd_gpio },
     { "button",     "button <node> press|release|click [duration]", "the board's user button (click = press, release after 100ms)", 2, 3, IMM, cmd_button },
-    { "restart",    "restart",                         "restart the simulation from its configuration (aborts scripts, clears at)", 0, 0, IMM, cmd_restart },
+    { "restart",    "restart",                         "restart the simulation from its configuration (aborts scripts, clears at)", 0, 0, IMM | NOSCHED, cmd_restart },
     { "ui",         "ui <port>",                       "start the live web UI now", 1, 1, IMM, cmd_ui },
     { "stats",      "stats",                           "RF bytes, frames, collisions, console bytes; per-node cycles and instructions", 0, 0, IMM, cmd_stats },
     { "tail",       "tail [-n N] [nodes]",             "the last N console lines (default 20) from the remembered 2000", 0, 3, IMM, cmd_tail },
@@ -2364,6 +2371,7 @@ static const shell_command_t commands[] = {
     { "help",       "help [command]",                  "this list, or one command's syntax", 0, 1, IMM, cmd_help },
 };
 #undef IMM
+#undef NOSCHED
 #undef BLK
 static const int command_count = (int)(sizeof(commands) / sizeof(commands[0]));
 
@@ -2395,23 +2403,29 @@ void shell_complete(const char *prefix, linenoiseCompletions *lc) {
             linenoiseAddCompletion(lc, commands[i].name);
 }
 
+/* Does this command, with these arguments, hold the command stream? */
+static bool cmd_blocks(const shell_command_t *c, int argc) {
+    if (c->flags & SHELL_CMD_BLOCKING) return true;
+    return strcmp(c->name, "run") == 0 && argc >= 2;   /* run <duration> */
+}
+
 bool shell_line_blocks(const char *line) {
-    char *argv[SHELL_MAX_ARGS]; char storage[SHELL_LINE_MAX];
+    char *argv[SHELL_MAX_ARGS]; char storage[4 * SHELL_LINE_MAX];
     int argc = shell_tokenize(line, argv, NULL, SHELL_MAX_ARGS, storage,
                               sizeof(storage), NULL, 0);
     if (argc <= 0) return false;
     const shell_command_t *c = shell_find_command(argv[0]);
-    if (!c) return false;
-    if (c->flags & SHELL_CMD_BLOCKING) return true;
-    return strcmp(c->name, "run") == 0 && argc >= 2;   /* run <duration> */
+    return c && cmd_blocks(c, argc);
 }
 
 static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only) {
     char *argv[SHELL_MAX_ARGS];
     int argpos[SHELL_MAX_ARGS];
-    char storage[SHELL_LINE_MAX];
+    /* A substituted value is escaped (up to 4 bytes per byte), so the
+     * expanded line and its decoded tokens can outgrow one line's worth. */
+    char storage[4 * SHELL_LINE_MAX];
     char err[128];
-    char expanded[SHELL_LINE_MAX];
+    char expanded[4 * SHELL_LINE_MAX];
     if (strchr(line, '$')) {
         if (shell_expand_vars(line, expanded, sizeof(expanded), shell_var_get, s,
                               err, sizeof(err)) < 0) {
@@ -2433,9 +2447,9 @@ static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only
     /* Scheduled commands were validated when scheduled; this is the
      * backstop for anything that slipped through. */
     if ((s->origin.kind == SHELL_ORIGIN_AT || s->origin.kind == SHELL_ORIGIN_ON) &&
-        (shell_line_blocks(line) || !strcmp(c->name, "restart"))) {
+        (cmd_blocks(c, argc) || (c->flags & SHELL_CMD_NO_SCHEDULE))) {
         shell_error(s, "'%s' cannot run from at/every/on: it would %s the command stream",
-                    c->name, shell_line_blocks(line) ? "block" : "discard");
+                    c->name, cmd_blocks(c, argc) ? "block" : "discard");
         return -1;
     }
     int nargs = argc - 1;

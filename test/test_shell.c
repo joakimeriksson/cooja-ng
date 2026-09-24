@@ -808,6 +808,20 @@ static void test_expand(void) {
         ac = shell_tokenize(out, av, NULL, 8, stg, sizeof(stg), err, sizeof(err));
         CHECK(n > 0 && ac == 2 && !strcmp(av[1], "a\"b'c #d\\e\n"), "the same inside double quotes ('%s')", out);
     }
+    /* A captured console line of 700 bytes, half of them spaces, still expands
+     * (escaping doubles the spaces) and tokenizes back to one argument. */
+    {
+        char big[701];
+        for (int i = 0; i < 700; i++) big[i] = (i % 2) ? ' ' : 'a' + (i % 26);   /* 350 spaces: 1050 bytes escaped */
+        big[700] = '\0';
+        mock_reset();
+        sh.interactive = true;
+        shell_var_set(&sh, "big", big);
+        shell_enqueue_line(&sh, "echo $big");
+        shell_enqueue_line(&sh, "at +1s echo $big");     /* too long to store as scheduled */
+        shell_script_tick(&sh);
+        CHECK(!sh.failed && sh.atq_count == 0, "a 700-byte value expands; scheduling it is refused (%d)", sh.atq_count);
+    }
     n = shell_expand_vars("echo $missing", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
     CHECK(n == -1 && strstr(err, "undefined variable 'missing'"), "undefined -> error (%s)", err);
     n = shell_expand_vars("echo ${x", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
