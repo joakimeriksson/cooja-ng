@@ -21,6 +21,7 @@
 #include "sim_runtime.h"
 #include "radio_medium.h"
 #include "sim_event_queue.h"
+#include "native_node.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -651,6 +652,38 @@ static void test_drain_max_arrival(void) {
     ASSERT_EQ(mm.sync_times[0], future, "drain: delivered at max(arrival, now)");
 }
 
+/* A native mote's CCA reads the channel from on-air time alone: busy while
+ * any transmission reaches the node, clear once the last one ends.  It used
+ * to be raised on reception and lowered only when a frame was read, so a
+ * collided frame, or one dropped because the radio turned off, left the
+ * channel reading busy. */
+static void test_native_signal_strength_follows_air(void) {
+    native_node_t n;
+    int in_size = 0;
+    char receiving = 0;
+    memset(&n, 0, sizeof(n));
+    /* The receive path writes these through the firmware's symbols. */
+    n.simInSize = &in_size;
+    n.simReceiving = &receiving;
+
+    ASSERT_EQ(native_radio_signal_strength(&n, 0), -100, "native: quiet channel reads clear");
+
+    native_radio_mark_busy(&n, 5000);
+    ASSERT_EQ(native_radio_signal_strength(&n, 4999), -60, "native: busy while a frame is on the air");
+    ASSERT_EQ(native_radio_signal_strength(&n, 5000), -100, "native: clear once it ends, unread or not");
+
+    native_radio_mark_busy(&n, 9000);
+    native_radio_mark_busy(&n, 7000);
+    ASSERT_EQ(native_radio_signal_strength(&n, 8000), -60, "native: a shorter frame does not end a longer one");
+    ASSERT_EQ(native_radio_signal_strength(&n, 9000), -100, "native: clear when the last frame ends");
+
+    /* Nothing in the receive path holds the channel busy past the air. */
+    uint8_t frame[20] = {0};
+    native_deliver_frame(&n, frame, (int)sizeof(frame), 10000, -1);
+    native_radio_flush_rx(&n);
+    ASSERT_EQ(native_radio_signal_strength(&n, 10000), -100, "native: queueing and flushing leave it alone");
+}
+
 static void test_deliver_native_noop(void) {
     /* A receiver whose sim_mote has no rx_byte_sync (native/JS) gets no
      * byte delivery — only the on_rx timeline notification. */
@@ -840,6 +873,7 @@ int run_radio_bus_tests(int verbose) {
     test_drain_collided_skip();
     test_drain_max_arrival();
     test_deliver_native_noop();
+    test_native_signal_strength_follows_air();
     test_frame_collision_window();
     test_frame_no_collision_when_clear();
     test_frame_backpressure_queue();

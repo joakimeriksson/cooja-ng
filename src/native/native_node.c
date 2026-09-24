@@ -292,6 +292,16 @@ bool native_dequeue_rx_frame(native_node_t *node) {
     return delivered;
 }
 
+void native_radio_mark_busy(native_node_t *node, int64_t end_ns) {
+    if (end_ns > node->rf_busy_until_ns)
+        node->rf_busy_until_ns = end_ns;
+}
+
+int native_radio_signal_strength(const native_node_t *node, int64_t now_ns) {
+    /* Any value above cooja-radio.c's CCA_SS_THRESHOLD (-95) reads busy. */
+    return now_ns < node->rf_busy_until_ns ? -60 : -100;
+}
+
 /* Drop everything in the air and in the buffer (ContikiRadio.doActionsAfterTick
  * when simRadioHWOn goes to 0). */
 void native_radio_flush_rx(native_node_t *node) {

@@ -83,6 +83,9 @@ static int native_radio_current_channel(void *m) {
 static int native_radio_mark_collisions(void *m, int64_t start, int64_t end) {
     native_rx_queue_t *q = &((mixed_node_t *)m)->plat.native.rx_queue;
     int marked = 0;
+    /* A transmission within interference range but out of reception range
+     * still occupies the channel, so it makes the channel busy too. */
+    native_radio_mark_busy(&((mixed_node_t *)m)->plat.native, end);
     for (int f = 0; f < q->count; f++) {
         int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
         native_pending_frame_t *existing = &q->frames[idx];
@@ -143,6 +146,14 @@ static void tick_one_native(mixed_node_t *mnode, int64_t sim_ns) {
         native_radio_flush_rx(nat);
     else
         native_dequeue_rx_frame(nat);
+    /* Signal strength follows the air: raised while a transmission reaches
+     * this node, at the floor otherwise.  It used to be raised on reception
+     * and lowered only when a frame was read, so a frame lost to a collision,
+     * or dropped because the radio turned off, left the channel reading busy
+     * until the next frame was read, and clear channel assessments kept
+     * failing meanwhile. */
+    if (nat->simSignalStrength)
+        *nat->simSignalStrength = native_radio_signal_strength(nat, sim_ns);
     int pre_insize = *nat->simInSize;
     nat->cooja_tick();
     mnode->native_had_tx = (*nat->simOutSize > 0);
@@ -152,10 +163,7 @@ static void tick_one_native(mixed_node_t *mnode, int64_t sim_ns) {
      * in the buffer (ContikiRadio.doActionsAfterTick, HW_OFF). */
     if (nat->simRadioHWOn && !*nat->simRadioHWOn)
         native_radio_flush_rx(nat);
-    /* Reset signal strength when frame is consumed (signalReceptionEnd) */
     if (pre_insize > 0 && *nat->simInSize == 0) {
-        if (nat->simSignalStrength)
-            *nat->simSignalStrength = -100;
         if (*mnode->env->verbose)
             fprintf(stderr, "  [CONSUMED] node %d consumed %d-byte frame at %lld ms\n",
                     mnode->id, pre_insize, (long long)(nat->sim_time_ns / 1000000LL));
@@ -368,6 +376,8 @@ static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
                                      int sender_idx) {
     mixed_node_t *mnode = MOTE_IMPL(m);
     native_node_t *nat = &mnode->plat.native;
+    /* The channel is busy whether or not the radio is on to hear it. */
+    native_radio_mark_busy(nat, now_ns + (int64_t)len * 32000LL);
     if (nat->simRadioHWOn && !*nat->simRadioHWOn)
         return 0;
     bool busy = nat->radio_is_transmitting || *nat->simOutSize > 0 ||
