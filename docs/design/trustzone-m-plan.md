@@ -300,13 +300,12 @@ nothing was ever refused. Now:
   every other load/store form keeps: all of an instruction's accesses are
   issued before it writes any register (PUSH, LDR with writeback and
   VLDM/VSTM were reordered for it); a new form must keep it, or snapshot
-  first, or its fault is imprecise. Two gaps remain on the VFP side:
-  VFP loads and stores go through `arm_read32`/`arm_write32`, so they are
-  bus-checked but not SAU-checked (a Non-secure VLDR/VSTR/VPUSH/VLLDM to
-  Secure memory succeeds), and FP registers are not in the snapshot, so a
-  refused VLDR/VPOP/VLDM leaves its destination S-registers zeroed (VLLDM
-  also FPSCR) where silicon leaves them unchanged; the base-register
-  writeback is undone correctly. The refused transaction only *marks* the
+  first, or its fault is imprecise. FP registers are not in the snapshot:
+  VFP loads and stores take the same checked path (`arm_vfp.c` through
+  `arm_insn_read32`/`arm_insn_write32`, VLSTM/VLLDM directly), and a load commits to
+  the FP registers only once every beat has been accepted, so a refused
+  VLDR/VPOP/VLDM/VLLDM leaves them (and FPSCR) unchanged, as on silicon.
+  The refused transaction only *marks* the
   security unit's and MPC00's lines pending; the core enters the synchronous
   BusFault first and the lines are then arbitrated by priority, so at equal
   priority the BusFault handler runs before the security unit's interrupt
@@ -322,10 +321,23 @@ nothing was ever refused. Now:
   INVIS and SG-side INVEP SecureFaults are still taken after the instruction.
   An instruction that records both (one beat to Secure memory, one to a
   refused alias — no such pair exists on the real memory map) takes the
-  SecureFault only, from one undo. From the
+  SecureFault only, from one undo. A PC loaded by an instruction with a
+  refused beat does not act: an EXC_RETURN or FNC_RETURN in the last beat of
+  `POP {…, pc}` / `LDM` would otherwise unstack a frame, deactivate the
+  handler or switch security state before the undo, which restores
+  registers only. One effect inside an instruction the undo cannot cover:
+  a peripheral write handler that pends an interrupt enters it at once
+  (`arm_nvic_set_pending` → `arm_nvic_check_pending`), so a multi-beat
+  Non-secure store whose early beat raises an interrupt and whose later
+  beat is refused has the undo restore registers over the handler's entry.
+  No firmware issues such a store; deferring those pends to the
+  instruction boundary would move interrupt timing on every ARM platform,
+  so it is left as a known limit. From the
   Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
-  clear, as are SHCSR's BusFault bits (ACT/PENDED/ENA) and the BusFault
-  priority byte SHPR1.PRI_5, and MMFAR is banked. What firmware reports on a violation is its
+  clear, as are SHCSR's BusFault, HardFault and NMI state bits
+  (BUSFAULTACT/PENDED/ENA, HARDFAULTACT/PENDED, NMIACT) and the BusFault
+  priority byte SHPR1.PRI_5; SecureFault's SHCSR bits and SHPR1.PRI_7 are
+  RAZ/WI from there whatever BFHFNMINS, and MMFAR is banked. What firmware reports on a violation is its
   BusFault handler's line. Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC) attribute
   per pin or channel through the FEATURE registers; those are stored, not
   enforced, so a split slot is open to both worlds — on silicon a GPIOTE30
@@ -368,6 +380,19 @@ nothing to enforce against until one exists. Also deferred: the security
 unit's clock sub-division (stored, not enforced), lazy floating-point state,
 banked priorities and banked SysTick, `AIRCR.PRIS`, and the Non-secure
 MMFSR/UFSR banks (no MemManage or UsageFault is ever raised).
+
+Banking is a known limitation of the system-handler registers. ARMv8-M
+banks the rest of SHCSR (MemManage, UsageFault, SVCall, PendSV and SysTick
+state and enables) and the priorities PRI_4, PRI_6, PRI_11, PRI_14 and
+PRI_15 between the security states, because each state has its own
+SVCall, PendSV, SysTick, MemManage and UsageFault. Here there is one of
+each, so those bits and bytes are one copy that both views read and write:
+a Non-secure write to them changes what the Secure world sees. Only the
+Secure-only parts above are filtered. No firmware in the tree depends on
+the banking (no TrustZone image under `firmware/nrf54l15-xiao/`, Secure or
+Non-secure, defines an SVCall, PendSV or SysTick handler; they are the weak
+defaults), and doing it properly means a second set of those exceptions, not a
+register mask.
 
 The radio's ramp-up and ramp-down are still instantaneous; the disabled-event
 delay stands in for the ordering that gives, with a measured window

@@ -267,7 +267,8 @@ typedef struct arm_cpu {
      * stores — except a multi-register load (LDM, POP, LDRD, LDREXD),
      * which copies before its first beat: ~60 bytes on every POP-return.
      * Sound because no other load/store form writes a register before its
-     * accesses. FP registers are not in the snapshot. */
+     * accesses. FP registers are not in the snapshot: an FP load commits
+     * only once every beat was accepted (arm_insn_refused). */
     struct {
         uint32_t reg[16];
         uint32_t xpsr;
@@ -480,6 +481,18 @@ void arm_stop(arm_cpu_t *cpu);
 /* Cortex-M4F VFP step — defined in arm_vfp.c. Returns true if hw1/hw2
  * was handled, false otherwise (caller should fault loudly). */
 bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2);
+
+/* Data accesses issued by an instruction handler outside arm_cpu.c: the
+ * interpreter's checked path (attribution unit + bus check, precise-fault
+ * snapshot on a refusal). arm_insn_refused() is true once an access of
+ * the current instruction has been refused; the instruction is then undone
+ * and faulted at its end, so a handler must not commit state the snapshot
+ * does not cover (the FP registers) while it is. */
+uint32_t arm_insn_read32(arm_cpu_t *cpu, uint32_t addr);
+void     arm_insn_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val);
+static inline bool arm_insn_refused(const arm_cpu_t *cpu) {
+    return cpu->bus_fault_pending || cpu->secure_fault_pending;
+}
 
 void arm_register_io(arm_cpu_t *cpu, uint32_t base, uint32_t size,
                      arm_io_read_fn read, arm_io_write_fn write, void *data);

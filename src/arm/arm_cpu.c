@@ -249,12 +249,10 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * measured +5–10 % wall on every nRF54L15 run. For every other form an
  * allowed access costs nothing.
  *
- * VFP loads and stores (arm_vfp.c, VLSTM/VLLDM) go through the public
- * arm_read32/arm_write32: bus-checked, but not SAU-checked, as they never
- * reach arm_tz_blocks. FP registers are not in the snapshot either, so a
- * refused VLDR/VPOP/VLDM leaves its destination S-registers at the 0 the
- * refused read returned (VLLDM: FPSCR too), where silicon leaves them
- * unchanged; the base-register writeback is undone correctly.
+ * FP registers are not in the snapshot. VFP loads and stores take the same
+ * checked path (VLSTM/VLLDM here, arm_vfp.c through arm_insn_read32/write32)
+ * and commit a load to the FP registers only once every beat has been
+ * accepted, so a refused one leaves them as they were.
  *
  * Out of line: called from arm_tz_blocks, which is inlined into the six
  * mem_* helpers at hundreds of sites. */
@@ -402,6 +400,19 @@ static inline void mem_write16_unaligned(arm_cpu_t *cpu, uint32_t addr, uint16_t
     }
     mem_write8(cpu, addr, val & 0xFF);
     mem_write8(cpu, addr+1, (val >> 8) & 0xFF);
+}
+
+/* The core's own data accesses for instruction handlers outside this file
+ * (the VFP): the mem_* path, so the attribution unit sees them as well as
+ * the bus check, and a refusal records the precise-fault snapshot.
+ * arm_read32/arm_write32 are the bus side only — right for another master,
+ * wrong for an instruction. */
+uint32_t arm_insn_read32(arm_cpu_t *cpu, uint32_t addr) {
+    return mem_read32(cpu, addr);
+}
+
+void arm_insn_write32(arm_cpu_t *cpu, uint32_t addr, uint32_t val) {
+    mem_write32(cpu, addr, val);
 }
 
 uint16_t arm_read16(arm_cpu_t *cpu, uint32_t addr) {
@@ -1159,8 +1170,10 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
     cpu->it_state = (uint8_t)(((cpu->xpsr >> 25) & 0x3) |
                               (((cpu->xpsr >> 10) & 0x3F) << 2));
 
-    /* Unstacked SP (account for the alignment padding in xPSR bit 9). */
+    /* Unstacked SP (account for the alignment padding in xPSR bit 9). The
+     * bit belongs to the frame only; it is not part of the live xPSR. */
     uint32_t newsp = sp + 32 + ((cpu->xpsr & (1u << 9)) ? 4 : 0);
+    cpu->xpsr &= ~(1u << 9);
 
     /* Restore execution mode + re-bank the active SP from EXC_RETURN. */
     if ((exc_return & 0x8u) == 0) {
@@ -1190,8 +1203,14 @@ static void exception_return(arm_cpu_t *cpu, uint32_t exc_return) {
  * an EXC_RETURN (0xFxxxxxxx) unstacks an exception frame; on ARMv8-M a
  * FNC_RETURN (0xFExxxxxx) seen in Non-secure state returns to the Secure
  * caller of BLXNS — the Non-secure callee's `pop {.., pc}` is the usual way
- * that value reaches PC, so it must be recognised here, not only on BX. */
+ * that value reaches PC, so it must be recognised here, not only on BX.
+ * Nothing happens once a beat of the load has been refused: the
+ * instruction is undone and faulted at its end, and that undo restores
+ * the registers only — an exception or function return taken first would
+ * leave the frame unstacked, the handler deactivated or the security state
+ * switched under it. */
 static inline void arm_load_pc(arm_cpu_t *cpu, uint32_t v) {
+    if (__builtin_expect(arm_insn_refused(cpu), 0)) return;
     if ((v & 0xF0000000u) == 0xF0000000u) {
         if (cpu->tz_enabled && !cpu->secure && (v & 0xFF000000u) == 0xFE000000u)
             arm_fnc_return(cpu, v);
@@ -2908,7 +2927,15 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                 uint32_t addr = cpu->reg[rn];
 
                 if (L) {
-                    /* LDM.W — defer exception_return until after writeback */
+                    /* LDM.W / LDMDB — defer exception_return until after
+                     * writeback. LDMDB loads upwards from Rn - 4*n and
+                     * writes that lowest address back. */
+                    int U = (hw1 >> 7) & 1; /* 1=increment, 0=decrement */
+                    uint32_t wb_db = 0;
+                    if (!U) {
+                        addr -= 4u * (uint32_t)__builtin_popcount(reglist);
+                        wb_db = addr;
+                    }
                     arm_insn_snapshot(cpu);   /* multi-register load */
                     uint32_t exc_ret = 0;
                     bool do_exc_ret = false;
@@ -2929,7 +2956,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         }
                     }
                     if (W && !(reglist & (1 << rn)))
-                        cpu->reg[rn] = addr;
+                        cpu->reg[rn] = U ? addr : wb_db;
                     if (do_exc_ret)
                         arm_load_pc(cpu, exc_ret);
                 } else {
@@ -4089,16 +4116,26 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                  * preserves the FP context across a world switch. Modelled
                  * eagerly (no lazy state preservation): VLSTM stores
                  * S0-S15 + FPSCR at [Rn], VLLDM restores them. The 0x48-byte
-                 * slot is reserved by the caller; nothing else touches it. */
+                 * slot is reserved by the caller; nothing else touches it.
+                 * Checked accesses like every other load/store; VLLDM
+                 * commits only once all 17 words are accepted, since the
+                 * precise-fault undo does not cover the FP registers. */
                 int rn = hw1 & 0xF;
                 uint32_t base = cpu->reg[rn];
                 bool store = (hw1 & 0x0010) == 0;
-                for (int i = 0; i < 16; i++) {
-                    if (store) arm_write32(cpu, base + 4 * i, cpu->vfp_s[i]);
-                    else       cpu->vfp_s[i] = arm_read32(cpu, base + 4 * i);
+                if (store) {
+                    for (int i = 0; i < 16; i++)
+                        mem_write32(cpu, base + 4 * i, cpu->vfp_s[i]);
+                    mem_write32(cpu, base + 0x40, cpu->fpscr);
+                } else {
+                    uint32_t buf[17];
+                    for (int i = 0; i < 17; i++)
+                        buf[i] = mem_read32(cpu, base + 4 * i);
+                    if (!arm_insn_refused(cpu)) {
+                        memcpy(cpu->vfp_s, buf, sizeof(uint32_t) * 16);
+                        cpu->fpscr = buf[16];
+                    }
                 }
-                if (store) arm_write32(cpu, base + 0x40, cpu->fpscr);
-                else       cpu->fpscr = arm_read32(cpu, base + 0x40);
                 (void)insn32;
             } else if ((hw1 & 0xEC00) == 0xEC00) {
                 /* Cortex-M4F single-precision VFP. Real implementations
