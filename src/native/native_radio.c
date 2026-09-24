@@ -122,10 +122,6 @@ void native_rx_assembler_feed(native_node_t *node, uint8_t byte) {
         }
         a->state = RX_ASM_PAYLOAD;
         a->count = 0;
-        /* The frame's length is known from here, and with it when the
-         * channel falls quiet again. */
-        native_radio_mark_busy(node, node->sim_time_ns +
-                                     (int64_t)a->expected_len * 32000LL);
         break;
 
     case RX_ASM_PAYLOAD:

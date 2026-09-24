@@ -312,6 +312,18 @@ bool radio_medium_filter_frame_radio(radio_medium_t *rm,
     int sender, int sender_radio, int receiver, int receiver_radio);
 
 /*
+ * Whether a transmission from (sender, sender_radio) occupies the channel
+ * (receiver, receiver_radio) listens on: the link is not cut, the bands
+ * match and the live channels match.  Unlike the filters there is no range
+ * check (callers walk the neighbour lists), no dice roll and no rx_enabled
+ * gate: a receiver that is off, or loses the frame, still has a busy
+ * channel (Cooja's UDGM raises the signal strength on every radio a
+ * transmission reaches, the interference range included).
+ */
+bool radio_medium_shares_channel(const radio_medium_t *rm,
+    int sender, int sender_radio, int receiver, int receiver_radio);
+
+/*
  * Recompute neighbor lists from current positions and tx_range.
  * Call after setting positions or changing tx_range.
  */

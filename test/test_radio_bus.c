@@ -64,6 +64,9 @@ typedef struct {
     sim_radio_bus_t *bus;
     sim_runtime_t   *sim;
     int64_t  now_at_recv;           /* the pump stamps this before calling */
+    int      on_air_count;          /* on_air windows announced to it */
+    int64_t  on_air_start;          /* earliest start announced */
+    int64_t  on_air_end;            /* latest end announced */
 } mock_rx_t;
 
 static void mock_receive_byte(void *m, uint8_t byte, int8_t rssi) {
@@ -83,6 +86,18 @@ static void mock_rx_stall(void *m) { ((mock_rx_t *)m)->stall_count++; }
 
 static const mote_radio_ops_t mock_ops = {
     mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL,
+};
+static void mock_on_air(void *m, int64_t start, int64_t end) {
+    mock_rx_t *r = (mock_rx_t *)m;
+    if (r->on_air_count == 0 || start < r->on_air_start) r->on_air_start = start;
+    if (r->on_air_count == 0 || end > r->on_air_end) r->on_air_end = end;
+    r->on_air_count++;
+}
+static const mote_radio_ops_t mock_ops_on_air = {
+    .receive_byte     = mock_receive_byte,
+    .rxfifo_available = mock_rxfifo_available,
+    .rx_busy          = mock_rx_busy,
+    .on_air           = mock_on_air,
 };
 static const mote_radio_ops_t mock_ops_stall = {
     mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL,
@@ -684,6 +699,98 @@ static void test_native_signal_strength_follows_air(void) {
     ASSERT_EQ(native_radio_signal_strength(&n, 10000), -100, "native: queueing and flushing leave it alone");
 }
 
+static void tx_frame(fixture_t *f, int sender, const uint8_t *frame, int n);
+
+/* ============================================================
+ * On-air windows: the one busy window the bus announces to every mote a
+ * transmission reaches (what a native mote's CCA reads).
+ * ============================================================ */
+
+/* Sender 0 at the origin on channel 26; nodes placed on the x axis.
+ * UDGM with a 50 m reception range and a 100 m interference range. */
+static void on_air_udgm(fixture_t *f, int nodes, const double *x,
+                        const int *channel) {
+    radio_medium_configure_udgm(&f->sim.radio_medium, 50.0, 100.0, 1.0, 1.0);
+    for (int i = 0; i < nodes; i++) {
+        radio_medium_set_position(&f->sim.radio_medium, i, x[i], 0.0);
+        radio_medium_set_channel(&f->sim.radio_medium, i, channel[i]);
+    }
+    radio_medium_compute_neighbors(&f->sim.radio_medium);
+}
+
+static void test_on_air_emulated_sender(void) {
+    /* An emulated sender's frame occupies the channel from its first
+     * preamble byte, on the bus's byte clock -- not on the receiver's own
+     * clock, which for a native mote is the time of its last tick. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops_on_air, &f.rx[1],
+                           SIM_RADIO_DELIVERY_SYNC, 0);
+    const int64_t t0 = 10000000;          /* 10 ms: long after any tick */
+    f.sim.now_ns = t0;
+
+    uint8_t frame[64]; int n = build_802154(frame, 20);
+    sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[0]);
+    ASSERT_EQ(f.rx[1].on_air_count, 1, "on_air: announced at the first preamble byte");
+    ASSERT_EQ(f.rx[1].on_air_start, t0, "on_air: starts at the first byte's air time");
+    ASSERT_EQ(f.rx[1].on_air_end, t0 + 6 * IEEE802154_BYTE_NS,
+              "on_air: covers the PHY header before the length is known");
+
+    for (int i = 1; i < n; i++)
+        sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[i]);
+    ASSERT_EQ(f.rx[1].on_air_start, t0, "on_air: one window start for the frame");
+    ASSERT_EQ(f.rx[1].on_air_end, t0 + (6 + 20) * IEEE802154_BYTE_NS,
+              "on_air: ends with the frame's last byte");
+}
+
+static void test_on_air_reach_and_channel(void) {
+    /* A native sender's frame: the reception and the interference
+     * neighbours on the sender's channel get the same window; a neighbour
+     * on another channel and a node out of range get none.  A receiver
+     * that is not listening still has a busy channel. */
+    fixture_t f; fx_init(&f, 5);
+    const double x[5] = { 0, 30, 80, 80, 150 };
+    const int ch[5]   = { 26, 26, 26, 15, 26 };
+    on_air_udgm(&f, 5, x, ch);
+    radio_medium_set_radio_rx_enabled(&f.sim.radio_medium, 1, 0, false);
+    for (int i = 0; i < 5; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_on_air, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 3000000;
+
+    uint8_t mac[30] = {0};
+    sim_radio_bus_tx_frame(&f.bus, &f.sim, 0, mac, (int)sizeof(mac));
+    int64_t end = f.sim.now_ns + (30 + 6) * IEEE802154_BYTE_NS;
+    ASSERT_EQ(f.rx[0].on_air_count, 0, "on_air: not announced to the sender");
+    ASSERT_EQ(f.rx[1].on_air_count, 1, "on_air: reception neighbour, radio off");
+    ASSERT_EQ(f.rx[1].on_air_end, end, "on_air: reception window = PHY header + frame");
+    ASSERT_EQ(f.rx[2].on_air_count, 1, "on_air: interference neighbour on the channel");
+    ASSERT_EQ(f.rx[2].on_air_end, end, "on_air: interference window = reception window");
+    ASSERT_EQ(f.rx[3].on_air_count, 0, "on_air: interference neighbour on another channel");
+    ASSERT_EQ(f.rx[4].on_air_count, 0, "on_air: out of range");
+}
+
+static void test_on_air_emulated_interference(void) {
+    /* An emulated sender reaches a native mote in its interference ring:
+     * no bytes are delivered, but the channel is busy for the frame. */
+    fixture_t f; fx_init(&f, 3);
+    const double x[3] = { 0, 80, 80 };
+    const int ch[3]   = { 26, 26, 15 };
+    on_air_udgm(&f, 3, x, ch);
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+    for (int i = 1; i < 3; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_on_air, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 1000000;
+
+    uint8_t frame[64]; int n = build_802154(frame, 10);
+    tx_frame(&f, 0, frame, n);
+    ASSERT_EQ(f.rx[1].recv_count, 0, "on_air: nothing received in the interference ring");
+    ASSERT_EQ(f.rx[1].on_air_end, f.sim.now_ns + (6 + 10) * IEEE802154_BYTE_NS,
+              "on_air: busy for the frame in the interference ring");
+    ASSERT_EQ(f.rx[2].on_air_count, 0, "on_air: not on another channel");
+}
+
 static void test_deliver_native_noop(void) {
     /* A receiver whose sim_mote has no rx_byte_sync (native/JS) gets no
      * byte delivery — only the on_rx timeline notification. */
@@ -874,6 +981,9 @@ int run_radio_bus_tests(int verbose) {
     test_drain_max_arrival();
     test_deliver_native_noop();
     test_native_signal_strength_follows_air();
+    test_on_air_emulated_sender();
+    test_on_air_reach_and_channel();
+    test_on_air_emulated_interference();
     test_frame_collision_window();
     test_frame_no_collision_when_clear();
     test_frame_backpressure_queue();

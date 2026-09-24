@@ -126,6 +126,13 @@ typedef struct mote_radio_ops {
      * Only motes that keep their RX queue mote-side (native Cooja) set
      * this; the bus marks its own emu_rx_queue directly for others. */
     int (*mark_collisions)(void *mote, int64_t start_ns, int64_t end_ns);
+    /* Optional: a transmission occupies this mote's channel over
+     * [start_ns, end_ns).  The bus calls it for every mote a transmission
+     * reaches -- reception and interference range alike, on the same
+     * channel, whether or not the mote's radio is on or gets the frame --
+     * with the one on-air window the bus computes for that transmission.
+     * Motes that model CCA from the air (native Cooja) set it. */
+    void (*on_air)(void *mote, int64_t start_ns, int64_t end_ns);
 } mote_radio_ops_t;
 
 /* How TX bytes reach a registered receiver (M9.4).  Chosen by the runner
@@ -260,6 +267,7 @@ typedef struct sim_radio_bus {
     sim_radio_delivery_mode_t delivery[SIM_RADIO_BUS_MAX_NODES];
     uint32_t                caps[SIM_RADIO_BUS_MAX_NODES];   /* SIM_RADIO_CAP_* */
     int                node_count;   /* registration high-water mark + 1   */
+    bool               any_on_air;   /* some registered mote sets on_air   */
     int                tx_depth;     /* >0: inside frame_complete delivery */
     sim_radio_bus_host_t host;       /* runner hooks (M9.4)                */
     rf_buffer_t        rf_pending[SIM_RADIO_BUS_MAX_NODES];   /* per-receiver byte staging   */
@@ -438,6 +446,8 @@ void sim_radio_bus_push_channel(sim_radio_bus_t *bus, struct sim_runtime *sim,
  * devices/zoul-firefly/SPEC.md L6. */
 #define IEEE802154_BYTE_NS    32000LL
 #define CC1200_50KBPS_BYTE_NS 160000LL
+/* 802.15.4 PHY header on the air: 4 preamble + SFD + length byte. */
+#define IEEE802154_PHY_HEADER_BYTES 6
 
 /* RX-stall window (M9.5): sim-time after a receiver's last delivered RF
  * byte before ops->rx_stall fires.  Must exceed the inter-byte air gap

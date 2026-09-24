@@ -83,9 +83,6 @@ static int native_radio_current_channel(void *m) {
 static int native_radio_mark_collisions(void *m, int64_t start, int64_t end) {
     native_rx_queue_t *q = &((mixed_node_t *)m)->plat.native.rx_queue;
     int marked = 0;
-    /* A transmission within interference range but out of reception range
-     * still occupies the channel, so it makes the channel busy too. */
-    native_radio_mark_busy(&((mixed_node_t *)m)->plat.native, end);
     for (int f = 0; f < q->count; f++) {
         int idx = (q->head + f) % NATIVE_RX_QUEUE_SIZE;
         native_pending_frame_t *existing = &q->frames[idx];
@@ -96,6 +93,12 @@ static int native_radio_mark_collisions(void *m, int64_t start, int64_t end) {
     }
     return marked;
 }
+/* CCA reads the air: the channel is busy until the last transmission that
+ * reaches this mote ends, radio on or off, frame received or not. */
+static void native_radio_on_air(void *m, int64_t start, int64_t end) {
+    (void)start;  /* the bus never announces a window that starts later */
+    native_radio_mark_busy(&((mixed_node_t *)m)->plat.native, end);
+}
 static const mote_radio_ops_t native_radio_ops = {
     .receive_byte     = native_radio_receive_byte,
     .rxfifo_available = native_radio_rxfifo_available,
@@ -103,6 +106,7 @@ static const mote_radio_ops_t native_radio_ops = {
     .rx_stall         = NULL,
     .current_channel  = native_radio_current_channel,
     .mark_collisions  = native_radio_mark_collisions,
+    .on_air           = native_radio_on_air,
 };
 
 void native_cooja_mote_register_radio(mixed_node_t *node, int slot,
@@ -376,8 +380,6 @@ static int native_mote_receive_frame(sim_mote_t *m, const uint8_t *frame,
                                      int sender_idx) {
     mixed_node_t *mnode = MOTE_IMPL(m);
     native_node_t *nat = &mnode->plat.native;
-    /* The channel is busy whether or not the radio is on to hear it. */
-    native_radio_mark_busy(nat, now_ns + (int64_t)len * 32000LL);
     if (nat->simRadioHWOn && !*nat->simRadioHWOn)
         return 0;
     bool busy = nat->radio_is_transmitting || *nat->simOutSize > 0 ||

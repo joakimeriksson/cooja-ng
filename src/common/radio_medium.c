@@ -405,11 +405,8 @@ void radio_medium_compute_neighbors(radio_medium_t *rm) {
  * match, receiver is in RX). The legacy "either channel is -1 -> allow"
  * semantic is preserved so platforms that never push channel state still
  * communicate. */
-static bool radio_pair_match(radio_medium_t *rm,
-                              int sender, int sender_radio,
-                              int receiver, int receiver_radio) {
-    const radio_t *s = &rm->nodes[sender].radios[sender_radio];
-    const radio_t *r = &rm->nodes[receiver].radios[receiver_radio];
+static bool spectrum_match(const radio_t *s, int sender_radio,
+                           const radio_t *r, int receiver_radio) {
     /* Spectrum gate.
      *
      * Both registered: must match — otherwise different bands.
@@ -447,6 +444,16 @@ static bool radio_pair_match(radio_medium_t *rm,
             if (s_sub != r_sub) return false;
         }
     }
+    return true;
+}
+
+static bool radio_pair_match(radio_medium_t *rm,
+                              int sender, int sender_radio,
+                              int receiver, int receiver_radio) {
+    const radio_t *s = &rm->nodes[sender].radios[sender_radio];
+    const radio_t *r = &rm->nodes[receiver].radios[receiver_radio];
+    if (!spectrum_match(s, sender_radio, r, receiver_radio))
+        return false;
     /* Channel match: per-frame, snapshotted at frame start. This mirrors
      * Cooja's UDGM.createConnections() (called once at TX-start) and
      * real-radio physics: once the sender's chip has strobed into TX
@@ -562,6 +569,22 @@ bool radio_medium_filter_frame_radio(radio_medium_t *rm,
 
 bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
     return radio_medium_filter_frame_radio(rm, sender, 0, receiver, 0);
+}
+
+bool radio_medium_shares_channel(const radio_medium_t *rm,
+    int sender, int sender_radio, int receiver, int receiver_radio) {
+    if (__builtin_expect(rm->link_blocked != NULL, 0) &&
+        radio_medium_link_blocked(rm, sender, receiver))
+        return false;
+    if (rm->type == RADIO_MEDIUM_NONE)
+        return true;
+    if (!valid_node(rm, sender) || !valid_node(rm, receiver)) return true;
+    if (!valid_radio(sender_radio) || !valid_radio(receiver_radio)) return true;
+    const radio_t *s = &rm->nodes[sender].radios[sender_radio];
+    const radio_t *r = &rm->nodes[receiver].radios[receiver_radio];
+    if (!spectrum_match(s, sender_radio, r, receiver_radio))
+        return false;
+    return s->channel < 0 || r->channel < 0 || s->channel == r->channel;
 }
 
 /* --- RSSI --- */
