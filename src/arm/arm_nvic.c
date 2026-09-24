@@ -18,13 +18,19 @@
  * limitation, docs/design/trustzone-m-plan.md). */
 static inline uint32_t shcsr_secure_only(const arm_nvic_t *nvic) {
     return ARM_SHCSR_SF_BITS |
-           ((nvic->aircr & ARM_AIRCR_BFHFNMINS) ? 0u : ARM_SHCSR_BFHFNMI_BITS);
+           (arm_nvic_bfhfnmi_secure(nvic) ? ARM_SHCSR_BFHFNMI_BITS : 0u);
+}
+
+/* BFSR, HFSR and BFAR are not banked: the Non-secure view reads them as
+ * zero and cannot write them while BusFault and HardFault are Secure. */
+static inline bool nvic_bf_secure_only(const arm_nvic_t *nvic, bool ns) {
+    return ns && arm_nvic_bfhfnmi_secure(nvic);
 }
 
 /* SHPR bytes (index into shpr[]) the Non-secure view cannot see or set:
  * PRI_7 (SecureFault) always, PRI_5 (BusFault) while BFHFNMINS is clear. */
 static inline bool shpr_secure_only(const arm_nvic_t *nvic, int idx) {
-    return idx == 3 || (idx == 1 && !(nvic->aircr & ARM_AIRCR_BFHFNMINS));
+    return idx == 3 || (idx == 1 && arm_nvic_bfhfnmi_secure(nvic));
 }
 
 /* ARMv8-M: which view of the SCS is this access? The Non-secure view applies
@@ -149,16 +155,16 @@ static int nvic_read(void *user_data, uint32_t addr) {
          * stored so firmware reads back what it wrote. In the Secure view
          * MMFAR and BFAR are one physical register, as on the board. */
         case SCB_CFSR:
-            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) return 0;
+            if (nvic_bf_secure_only(nvic, ns)) return 0;
             return (int)nvic->cpu->cfsr;
         case SCB_HFSR:
-            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) return 0;
+            if (nvic_bf_secure_only(nvic, ns)) return 0;
             return (int)nvic->cpu->hfsr;
         case SCB_MMFAR:
             if (ns) return (int)nvic->cpu->mmfar_ns;
             return (int)nvic->cpu->bfar;
         case SCB_BFAR:
-            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) return 0;
+            if (nvic_bf_secure_only(nvic, ns)) return 0;
             return (int)nvic->cpu->bfar;
         case SCB_DEMCR: return (int)nvic->cpu->demcr;
 
@@ -339,11 +345,11 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             nvic->shcsr = value;
             break;
         case SCB_CFSR:  /* write-1-to-clear; see the read side for the NS view */
-            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) break;
+            if (nvic_bf_secure_only(nvic, ns)) break;
             nvic->cpu->cfsr &= ~value;
             break;
         case SCB_HFSR:
-            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) break;
+            if (nvic_bf_secure_only(nvic, ns)) break;
             nvic->cpu->hfsr &= ~value;
             break;
         case SCB_MMFAR:
@@ -351,7 +357,7 @@ static void nvic_write(void *user_data, uint32_t addr, uint32_t value) {
             else    nvic->cpu->bfar = value;
             break;
         case SCB_BFAR:
-            if (ns && !(nvic->aircr & ARM_AIRCR_BFHFNMINS)) break;
+            if (nvic_bf_secure_only(nvic, ns)) break;
             nvic->cpu->bfar = value;
             break;
         case SCB_DEMCR:
