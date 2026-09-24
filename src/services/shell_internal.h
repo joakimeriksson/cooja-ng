@@ -31,6 +31,7 @@ const char *shell_origin(shell_service_t *s, char *buf, size_t len);
 
 #define SHELL_CMD_IMMEDIATE 1u   /* allowed via "!" while the stream is blocked */
 #define SHELL_CMD_BLOCKING  2u   /* holds the command stream: not from at/every/on */
+#define SHELL_CMD_NO_SCHEDULE 4u /* discards the command stream: not from at/every/on either */
 
 typedef int (*shell_cmd_fn)(shell_service_t *s, int argc, char **argv,
                             const char *line, const int *argpos);
