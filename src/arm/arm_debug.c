@@ -42,8 +42,14 @@ bool arm_dbg_check(arm_cpu_t *cpu) {
         cpu->dbg_prev_pc = pc;
         return true;
     }
+    /* The release's skip stays armed until the instruction at that pc has
+     * executed: an exception taken in between (a due event, a pending IRQ,
+     * a WFI fast-forward) returns to the same pc with the instruction still
+     * to run, and must not re-hit.  dbg_prev_pc is the pc of the previous
+     * check; exception entry rewrites it so a vectored entry does not count
+     * as the instruction having run. */
     bool skip = pc == cpu->dbg_skip_pc;
-    cpu->dbg_skip_pc = UINT32_MAX;
+    if (!skip && cpu->dbg_prev_pc == cpu->dbg_skip_pc) cpu->dbg_skip_pc = UINT32_MAX;
     for (int i = 0; !skip && i < cpu->dbg_bp_n; i++) {
         if (cpu->dbg_bp[i] != pc) continue;
         cpu->dbg_hit_kind = 1;
