@@ -243,11 +243,11 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * writing a register (PUSH, LDR with writeback and VLDM/VSTM were
  * reordered for this). The exception is a multi-register load, whose
  * earlier beats write registers before a later beat can be refused: those
- * forms (LDM, POP, LDRD, LDREXD) snapshot before their first beat, so they
- * pay the copy on every execution — every POP-return on a part with a bus
- * check or TrustZone, still far cheaper than the eager copy, which
- * measured +5–10 % wall on every nRF54L15 run. For every other form an
- * allowed access costs nothing.
+ * forms (LDM, POP, LDRD, LDREXD) snapshot before their first beat
+ * (arm_insn_snapshot_multi) unless no beat can be refused, so the copy is
+ * paid by Non-secure multi-register loads and by those reaching beyond
+ * SRAM and flash. The eager copy measured +5–10 % wall on every nRF54L15
+ * run. For every other form an allowed access costs nothing.
  *
  * FP registers are not in the snapshot. VFP loads and stores take the same
  * checked path (VLSTM/VLLDM here, arm_vfp.c through arm_insn_read32/write32)
@@ -265,6 +265,35 @@ static void __attribute__((noinline)) arm_insn_snapshot_slow(arm_cpu_t *cpu) {
 
 static inline void arm_insn_snapshot(arm_cpu_t *cpu) {
     if (!cpu->insn_snap_valid) arm_insn_snapshot_slow(cpu);
+}
+
+/* Can an access by this core be refused at all: a bus-side permission
+ * check installed, or the security extension's attribution unit? The
+ * interpreter keeps the snapshot state only then. A macro: as an inline
+ * function inside __builtin_expect in the prologue, gcc laid the unlikely
+ * block out in the hot path (-20 % on arm-bench alu-reg, x86-64). */
+#define ARM_PRECISE_FAULTS(cpu) \
+    ((cpu)->io_access_check != NULL || (cpu)->tz_enabled)
+
+/* [addr, addr + len) lies within [base, end), without wrapping. */
+static inline bool arm_span_in(uint32_t addr, uint32_t len,
+                               uint32_t base, uint32_t end) {
+    return end - base >= len && addr - base <= end - base - len;
+}
+
+/* The explicit snapshot of a multi-register load, whose beats span
+ * [addr, addr + len). Skipped where no beat can be refused: the core is
+ * not Non-secure (so the attribution unit passes everything) and every
+ * beat is in SRAM or flash (which the bus check never sees) — every
+ * Secure-world or non-TrustZone POP-return from the stack. */
+static inline void arm_insn_snapshot_multi(arm_cpu_t *cpu, uint32_t addr,
+                                           uint32_t len) {
+    if (__builtin_expect(!ARM_PRECISE_FAULTS(cpu), 1)) return;
+    if (!(cpu->tz_enabled && !cpu->secure) &&
+        (arm_span_in(addr, len, cpu->sram_base, cpu->sram_end) ||
+         arm_span_in(addr, len, cpu->flash_base, cpu->flash_end)))
+        return;
+    arm_insn_snapshot(cpu);
 }
 
 /* Undo the instruction being executed: restore the register file, xPSR and
@@ -1904,7 +1933,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * instructions (a refused access by the FLPR, the GDB stub or an
          * event callback, and the snapshot it took) is discarded here — it
          * was not this core's transaction. */
-        if (__builtin_expect(cpu->io_access_check != NULL || cpu->tz_enabled, 0)) {
+        if (__builtin_expect(ARM_PRECISE_FAULTS(cpu), 0)) {
             cpu->insn_snap.reg[ARM_PC] = pc;
             cpu->insn_snap_valid = false;
             cpu->bus_fault_pending = false;
@@ -2750,7 +2779,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     uint32_t reglist = hw1 & 0xFF;
                     int pop_pc = (hw1 >> 8) & 1;
                     uint32_t addr = cpu->reg[ARM_SP];
-                    arm_insn_snapshot(cpu);   /* multi-register load */
+                    arm_insn_snapshot_multi(cpu, addr,
+                        4u * (uint32_t)(__builtin_popcount(reglist) + pop_pc));
                     for (int i = 0; i < 8; i++) {
                         if (reglist & (1 << i)) {
                             cpu->reg[i] = mem_read32(cpu, addr);
@@ -2828,7 +2858,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
             int rn = (hw1 >> 8) & 7;
             uint32_t reglist = hw1 & 0xFF;
             uint32_t addr = cpu->reg[rn];
-            arm_insn_snapshot(cpu);   /* multi-register load */
+            arm_insn_snapshot_multi(cpu, addr,
+                                    4u * (uint32_t)__builtin_popcount(reglist));
             for (int i = 0; i < 8; i++) {
                 if (reglist & (1 << i)) {
                     cpu->reg[i] = mem_read32(cpu, addr);
@@ -2934,7 +2965,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         addr -= 4u * (uint32_t)__builtin_popcount(reglist);
                         wb_db = addr;
                     }
-                    arm_insn_snapshot(cpu);   /* multi-register load */
+                    arm_insn_snapshot_multi(cpu, addr,
+                        4u * (uint32_t)__builtin_popcount(reglist));
                     uint32_t exc_ret = 0;
                     bool do_exc_ret = false;
                     for (int i = 0; i < 16; i++) {
@@ -3073,7 +3105,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         switch (op3) {
                             case 0x4: cpu->reg[rt] = mem_read8(cpu, addr);  break;
                             case 0x5: cpu->reg[rt] = mem_read16(cpu, addr); break;
-                            default:  arm_insn_snapshot(cpu);   /* LDREXD: two beats */
+                            default:  arm_insn_snapshot_multi(cpu, addr, 8);   /* LDREXD */
                                       cpu->reg[rt]  = mem_read32(cpu, addr);
                                       cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                                       break;
@@ -3109,7 +3141,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     uint32_t base = (pc + 4) & ~3u;
                     uint32_t off  = imm8;
                     uint32_t addr = U ? base + off : base - off;
-                    arm_insn_snapshot(cpu);   /* multi-register load */
+                    arm_insn_snapshot_multi(cpu, addr, 8);   /* LDRD */
                     cpu->reg[rt]  = mem_read32(cpu, addr);
                     cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                 } else if (!P && !U && !L && (hw2 & 0x0F00) != 0x0F00) {
@@ -3145,7 +3177,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         addr = cpu->reg[rn];
                     }
                     if (L) {
-                        arm_insn_snapshot(cpu);   /* multi-register load */
+                        arm_insn_snapshot_multi(cpu, addr, 8);   /* LDRD */
                         cpu->reg[rt]  = mem_read32(cpu, addr);
                         cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                     } else {

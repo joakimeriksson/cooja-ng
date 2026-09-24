@@ -293,10 +293,12 @@ nothing was ever refused. Now:
   stores; the copy is made when a refusal is recorded — by the attribution
   unit in `arm_tz_blocks()`, by the bus check in `io_lookup()` — or before
   the first beat of a multi-register load (LDM, POP, LDRD, LDREXD), whose
-  earlier beats write registers, so those pay the copy on every execution
-  (every POP-return), still far cheaper than the eager copy, which
-  measured +5–10 % wall on every nRF54L15 run. Any other instruction that
-  is not refused pays nothing more. This relies on an ordering invariant
+  earlier beats write registers — unless none of its beats can be refused
+  (the core is not Non-secure and every beat is in SRAM or flash), so the
+  copy is paid by Non-secure POP-returns and not by Secure or
+  non-TrustZone ones. The eager copy measured +5–10 % wall on every
+  nRF54L15 run. Any other instruction that is not refused pays nothing
+  more. This relies on an ordering invariant
   every other load/store form keeps: all of an instruction's accesses are
   issued before it writes any register (PUSH, LDR with writeback and
   VLDM/VSTM were reordered for it); a new form must keep it, or snapshot

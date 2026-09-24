@@ -265,7 +265,8 @@ typedef struct arm_cpu {
      * xPSR and ITSTATE are copied when a refusal is recorded
      * (arm_insn_snapshot), so an instruction that is not refused pays two
      * stores — except a multi-register load (LDM, POP, LDRD, LDREXD),
-     * which copies before its first beat: ~60 bytes on every POP-return.
+     * which copies before its first beat (~60 bytes) unless none of its
+     * beats can be refused: Secure or non-TrustZone, all in SRAM/flash.
      * Sound because no other load/store form writes a register before its
      * accesses. FP registers are not in the snapshot: an FP load commits
      * only once every beat was accepted (arm_insn_refused). */
