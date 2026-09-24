@@ -928,6 +928,8 @@ static void test_symbols(void) {
     uint32_t addr = 1;
     CHECK(elf_lookup_symbol(img, "__ctors_size", &addr) && addr == 0, "elf_lookup_symbol: found at 0");
     CHECK(!elf_lookup_symbol(img, "no_such_symbol_here", &addr), "elf_lookup_symbol: absent is false");
+    CHECK(!elf_lookup_symbol(img, "crtstuff.c", &addr), "elf_lookup_symbol: a file symbol (value 0) is not a match");
+    CHECK(!elf_lookup_symbol(img, ".data", &addr), "elf_lookup_symbol: a section symbol is not a match");
 }
 
 static void test_arm_inspection(void) {

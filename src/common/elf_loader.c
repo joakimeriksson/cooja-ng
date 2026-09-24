@@ -160,8 +160,15 @@ bool elf_lookup_symbol(const char *path, const char *symbol_name, uint32_t *addr
     if (!syms) { free(strtab); fclose(f); return false; }
     fseek(f, symtab_hdr.sh_offset, SEEK_SET);
     size_t got = fread(syms, sizeof(Elf32_Sym), num_syms, f);
+    /* An undefined reference (a Non-secure image's view of a Secure
+     * gateway), a section symbol and a file name carry no address the name
+     * stands for: skip them, so address 0 means a symbol at 0 and the
+     * caller's next image gets its turn. */
     bool found = false;
     for (size_t i = 0; i < got; i++) {
+        unsigned type = syms[i].st_info & 0xfu;
+        if (syms[i].st_shndx == ELF_SHN_UNDEF || type == ELF_STT_SECTION || type == ELF_STT_FILE)
+            continue;
         if (syms[i].st_name < strtab_hdr.sh_size &&
             strcmp(strtab + syms[i].st_name, symbol_name) == 0) {
             *addr = syms[i].st_value;
