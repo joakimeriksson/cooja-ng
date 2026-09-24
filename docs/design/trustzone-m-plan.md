@@ -278,16 +278,35 @@ nothing was ever refused. Now:
   touch only the attribute, the DMA attribute where the slot has DMA, and the
   lock, which holds until reset. A Non-secure transaction reaching a Secure
   peripheral is terminated with an error: the core takes a precise BusFault
-  (CFSR 0x8200, BFAR = the alias used, into the Secure world unless
-  `AIRCR.BFHFNMINS`), the security unit latches the event with the first
+  (CFSR 0x8200, BFAR = the alias used — the first refused beat of a
+  multi-word access, where silicon aborts it, into the Secure world unless
+  `AIRCR.BFHFNMINS`), the security unit latches the event with the same first
   offender's low 16 address bits (cleared with the event) and pends its
   level-sensitive interrupt, and MPC00 latches MEMACCERR. The fault is
-  precise: the interpreter snapshots the register file, xPSR and ITSTATE at
-  the start of every instruction on a SoC with a bus-side permission check
-  and restores them before entering the fault, so the frame names the
-  faulting instruction, a refused load leaves its destination register
+  precise: the interpreter restores the register file, xPSR and ITSTATE
+  from before the instruction and then enters the fault, so the frame names
+  the faulting instruction, a refused load leaves its destination register
   untouched, and a handler that returns without patching the frame
-  re-executes it, as on silicon. The refused transaction only *marks* the
+  re-executes it, as on silicon. The snapshot is lazy: on a SoC with a
+  bus-side permission check (or with the security extension enabled) each
+  instruction records its start PC and invalidates the last snapshot, two
+  stores; the copy is made when a refusal is recorded — by the attribution
+  unit in `arm_tz_blocks()`, by the bus check in `io_lookup()` — or before
+  the first beat of a multi-register load (LDM, POP, LDRD, LDREXD), whose
+  earlier beats write registers, so those pay the copy on every execution
+  (every POP-return), still far cheaper than the eager copy, which
+  measured +5–10 % wall on every nRF54L15 run. Any other instruction that
+  is not refused pays nothing more. This relies on an ordering invariant
+  every other load/store form keeps: all of an instruction's accesses are
+  issued before it writes any register (PUSH, LDR with writeback and
+  VLDM/VSTM were reordered for it); a new form must keep it, or snapshot
+  first, or its fault is imprecise. Two gaps remain on the VFP side:
+  VFP loads and stores go through `arm_read32`/`arm_write32`, so they are
+  bus-checked but not SAU-checked (a Non-secure VLDR/VSTR/VPUSH/VLLDM to
+  Secure memory succeeds), and FP registers are not in the snapshot, so a
+  refused VLDR/VPOP/VLDM leaves its destination S-registers zeroed (VLLDM
+  also FPSCR) where silicon leaves them unchanged; the base-register
+  writeback is undone correctly. The refused transaction only *marks* the
   security unit's and MPC00's lines pending; the core enters the synchronous
   BusFault first and the lines are then arbitrated by priority, so at equal
   priority the BusFault handler runs before the security unit's interrupt
@@ -301,9 +320,12 @@ nothing was ever refused. Now:
   attribution unit's own refusal (a Non-secure data access to Secure memory,
   SecureFault AUVIOL) is precise the same way, from the same snapshot; the
   INVIS and SG-side INVEP SecureFaults are still taken after the instruction.
-  From the
+  An instruction that records both (one beat to Secure memory, one to a
+  refused alias — no such pair exists on the real memory map) takes the
+  SecureFault only, from one undo. From the
   Non-secure view CFSR, HFSR and BFAR are RAZ/WI while `AIRCR.BFHFNMINS` is
-  clear, and MMFAR is banked. What firmware reports on a violation is its
+  clear, as are SHCSR's BusFault bits (ACT/PENDED/ENA) and the BusFault
+  priority byte SHPR1.PRI_5, and MMFAR is banked. What firmware reports on a violation is its
   BusFault handler's line. Split peripherals (GPIO, GPIOTE, DPPIC, PPIB, GRTC) attribute
   per pin or channel through the FEATURE registers; those are stored, not
   enforced, so a split slot is open to both worlds — on silicon a GPIOTE30

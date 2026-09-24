@@ -183,13 +183,13 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         if (dp_alias) sd &= ~1;
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t base = cpu->reg[rn];
-        uint32_t addr;
+        uint32_t addr, wb_val;
         if (P && !U) {            /* DB */
             addr = base - (uint32_t)(regs * 4);
-            if (W) cpu->reg[rn] = addr;
+            wb_val = addr;
         } else if (!P && U) {     /* IA */
             addr = base;
-            if (W) cpu->reg[rn] = base + (uint32_t)(regs * 4);
+            wb_val = base + (uint32_t)(regs * 4);
         } else {
             return false;         /* Other PU combos not encoded for VFP LD/ST-multiple */
         }
@@ -197,6 +197,10 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
             if (L) cpu->vfp_s[sd + i] = arm_read32(cpu, addr + (uint32_t)(i * 4));
             else   arm_write32(cpu, addr + (uint32_t)(i * 4), cpu->vfp_s[sd + i]);
         }
+        /* Write back after the accesses: a precise fault on one of them
+         * snapshots the register file when the refusal is recorded, so the
+         * base must still be unchanged there. */
+        if (W) cpu->reg[rn] = wb_val;
         return true;
     }
 

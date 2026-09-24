@@ -147,7 +147,10 @@ void arm_record_secure_fault(arm_cpu_t *cpu, uint32_t addr)
 {
     arm_tz_trace(cpu, "auviol", addr, 0);
     cpu->sfsr |= ARM_SFSR_AUVIOL | ARM_SFSR_SFARVALID;
-    cpu->sfar = addr;
+    /* A multi-word access keeps issuing beats after a refusal; SFAR names
+     * the first, where silicon aborts the instruction (as BFAR does). */
+    if (!cpu->secure_fault_pending)
+        cpu->sfar = addr;
     cpu->secure_fault_pending = true;
     /* A refused data access is a precise fault: the interpreter undoes the
      * instruction before taking it, so the frame names the access and a
