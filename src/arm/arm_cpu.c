@@ -4247,9 +4247,25 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * branch: a second undo after the entry would restore SP, PC and LR
          * from before it and leave the SecureFault frame above SP. The
          * refusal is dropped with its arming; the instruction re-executes
-         * after the handler and re-faults. */
+         * after the handler and re-faults.
+         *
+         * INVIS and INVEP undo nothing, so a refusal dropped with one of
+         * them would be lost, the instruction's writes standing. None can
+         * be recorded: SG makes no data access, a POP/LDM whose earlier
+         * beat was refused never performs its FNC_RETURN (arm_load_pc),
+         * and FNC_RETURN's own stack reads are Secure (the attribution
+         * unit passes them) and in SRAM (the bus check never sees them)
+         * unless the Secure SP points into peripheral space. */
         if (cpu->tz_enabled && cpu->secure_fault_pending) {
             cpu->secure_fault_pending = false;
+#ifdef DEBUG
+            if (!cpu->secure_fault_undo && cpu->bus_fault_pending) {
+                fprintf(stderr, "ARM bus refusal at 0x%08x lost to an "
+                        "INVIS/INVEP SecureFault, PC=0x%08x\n",
+                        cpu->bus_fault_addr, cpu->insn_snap.reg[ARM_PC]);
+                abort();
+            }
+#endif
             cpu->bus_fault_pending = false;
             if (cpu->secure_fault_undo) {
                 cpu->secure_fault_undo = false;
