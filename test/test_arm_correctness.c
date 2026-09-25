@@ -3263,6 +3263,21 @@ static void test_trustzone_fnc_return_refused(void) {
         snprintf(name, sizeof name, "%s: NS SP back", what);
         assert_eq(name, BF_NS_SP, cpu.reg[ARM_SP]);
     }
+
+    /* BXNS LR in Secure state with LR = FNC_RETURN also returns through
+     * FNC_RETURN, from a core already Secure: a refused pop must leave it
+     * Secure, and the BusFault is stacked on the Secure stack. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.msp_ns = BF_NS_SP;
+    cpu.reg[ARM_SP] = 0x40001000;                          /* MSP_S in the refused page */
+    write_thumb16(&cpu, CODE_BASE, 0x4774);                /* BXNS LR */
+    cpu.reg[ARM_LR] = 0xFEFFFFFFu;
+    arm_step(&cpu, 1);
+    assert_eq("Secure BXNS FNC_RETURN refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_true("Secure BXNS FNC_RETURN refused: still Secure", cpu.secure);
+    assert_eq("Secure BXNS FNC_RETURN refused: frame on the Secure stack", 0x40001000 - 32, cpu.reg[ARM_SP]);
+    assert_eq("Secure BXNS FNC_RETURN refused: NS SP bank untouched", BF_NS_SP, cpu.msp_ns);
 }
 
 /* Non-secure code must not execute from Secure memory, and may fetch from

@@ -1050,13 +1050,14 @@ static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
  * nothing, and INVIS can only follow accepted reads. */
 static void arm_fnc_return(arm_cpu_t *cpu, uint32_t magic) {
     (void)magic;
+    bool was_secure = cpu->secure;
     arm_insn_snapshot(cpu);
     arm_switch_security_state(cpu, true);
     uint32_t sp = cpu->reg[ARM_SP];
     uint32_t ret = mem_read32(cpu, sp + 0);
     uint32_t sig = mem_read32(cpu, sp + 4);
     if (__builtin_expect(arm_insn_refused(cpu), 0)) {
-        arm_switch_security_state(cpu, false);
+        arm_switch_security_state(cpu, was_secure);
         return;
     }
     arm_tz_trace(cpu, "fnc-return", ret, sig);
