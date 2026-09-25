@@ -32,12 +32,18 @@
 
 #define MAX_CLIENTS  8
 #define RECV_BUF     4096
+/* A client must finish its HTTP request within this long of connecting.
+ * Without it, eight connections that never do (idle, or a request the
+ * parser never sees end: an embedded NUL, LF-only line endings) hold every
+ * slot and the UI turns everyone else away for the rest of the run. */
+#define HTTP_REQUEST_MS 5000
 
 typedef enum { CLIENT_HTTP, CLIENT_WS } client_state_t;
 
 typedef struct {
     int fd;
     client_state_t state;
+    int64_t accepted_ms;    /* CLOCK_MONOTONIC; bounds the HTTP request */
     char recv_buf[RECV_BUF];
     int recv_len;
 } ws_client_t;
@@ -148,6 +154,12 @@ static int base64_encode(const uint8_t *in, int len, char *out) {
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static void close_client(ws_server_t *srv, int idx) {
@@ -590,6 +602,14 @@ ws_server_t *ws_server_init(const char *bind_addr, int port) {
 void ws_server_poll(ws_server_t *srv) {
     if (!srv) return;
 
+    int64_t now_ms = monotonic_ms();
+    for (int i = 0; i < srv->client_count; i++) {
+        if (srv->clients[i].state == CLIENT_HTTP &&
+            now_ms - srv->clients[i].accepted_ms > HTTP_REQUEST_MS) {
+            close_client(srv, i); i--;
+        }
+    }
+
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(srv->listen_fd, &read_fds);
@@ -619,7 +639,12 @@ void ws_server_poll(ws_server_t *srv) {
                 c->fd = client_fd;
                 c->state = CLIENT_HTTP;
                 c->recv_len = 0;
+                c->accepted_ms = now_ms;
             } else {
+                /* Full: say so rather than hang up without a word. */
+                const char *busy = "HTTP/1.1 503 Service Unavailable\r\n"
+                                   "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                send(client_fd, busy, strlen(busy), MSG_NOSIGNAL);
                 close(client_fd);
             }
         }
