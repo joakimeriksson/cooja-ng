@@ -54,19 +54,34 @@ int native_cooja_mote_boot(mixed_node_t *node, int slot,
  * ============================================================ */
 
 /* Native (Cooja-protocol) motes: SYNC delivery — the bus feeds each
- * accepted on-air byte to the mote's RX frame assembler.  rxfifo 0 / not
- * busy preserve the pre-M9.4 behaviour of the frame paths, which skip
- * natives explicitly. */
-static void native_radio_receive_byte(void *m, uint8_t byte, int8_t rssi) {
+ * accepted on-air byte, with its air time, to the mote's RX frame
+ * assembler.  rxfifo 0 / not busy preserve the pre-M9.4 behaviour of the
+ * frame paths, which skip natives explicitly. */
+static void native_radio_receive_byte_at(void *m, uint8_t byte, int8_t rssi,
+                                         int64_t air_ns) {
     (void)rssi;
     mixed_node_t *node = (mixed_node_t *)m;
     native_node_t *nat = &node->plat.native;
-    /* Radio off: COOJA's medium never delivers to it (UDGM addInterfered). */
+    /* Radio off: nothing is delivered to it.  The channel still reads
+     * busy: the bus announces on_air separately. */
     if (nat->simRadioHWOn && !*nat->simRadioHWOn) {
         native_rx_assembler_reset(&nat->rx_asm);
         return;
     }
-    native_rx_assembler_feed(nat, byte);
+    /* A completed frame ends on the bus clock, which may be later than
+     * this node's last tick: wake it then, as receive_frame does, so the
+     * completion happens on time.  The bus
+     * stamps a sender's bytes from the slice its first byte was observed
+     * in, so a frame emitted across several slices can end a little before
+     * the kernel's now; the kernel never schedules into the past. */
+    if (native_rx_assembler_feed(nat, byte, air_ns) &&
+        node->env && node->env->sim) {
+        int64_t wake_ns = native_rx_next_end_ns(nat);
+        int64_t now_ns = sim_runtime_now_ns(node->env->sim);
+        if (wake_ns < now_ns) wake_ns = now_ns;
+        sim_schedule_mote_wakeup_if_earlier(node->env->sim, node->slot,
+                                            wake_ns);
+    }
 }
 static int native_radio_rxfifo_available(void *m) { (void)m; return 0; }
 static bool native_radio_rx_busy(void *m) { (void)m; return false; }
@@ -95,12 +110,12 @@ static int native_radio_mark_collisions(void *m, int64_t start, int64_t end) {
 }
 /* CCA reads the air: the channel is busy until the last transmission that
  * reaches this mote ends, radio on or off, frame received or not. */
-static void native_radio_on_air(void *m, int64_t start, int64_t end) {
-    (void)start;  /* the bus never announces a window that starts later */
+static void native_radio_on_air(void *m, int64_t end) {
     native_radio_mark_busy(&((mixed_node_t *)m)->plat.native, end);
 }
 static const mote_radio_ops_t native_radio_ops = {
-    .receive_byte     = native_radio_receive_byte,
+    .receive_byte     = NULL,   /* SYNC delivery comes with its air time */
+    .receive_byte_at  = native_radio_receive_byte_at,
     .rxfifo_available = native_radio_rxfifo_available,
     .rx_busy          = native_radio_rx_busy,
     .rx_stall         = NULL,

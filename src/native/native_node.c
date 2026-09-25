@@ -9,6 +9,7 @@
  * per-node temp file before loading.
  */
 #include "native_node.h"
+#include "ieee_802154.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -421,7 +422,8 @@ void native_check_radio_tx(native_node_t *node) {
      * simOutSize is only cleared when transmission finishes. */
     node->radio_is_transmitting = true;
     node->radio_tx_finished = false;
-    node->radio_tx_end_ns = node->sim_time_ns + ((int64_t)frame_len * 32000LL);
+    node->radio_tx_end_ns = node->sim_time_ns +
+                            (int64_t)frame_len * IEEE802154_BYTE_NS;
     if (node->radio_tx_end_ns <= node->sim_time_ns) {
         node->radio_tx_end_ns = node->sim_time_ns + 1000LL;
     }
@@ -449,7 +451,7 @@ void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
     /* On-air time as COOJA computes it for ContikiRadio: 8*len bits at
      * 250 kbit/s = 32 µs per payload byte, ending exactly when the
      * sender's simOutSize is cleared (radio_tx_end_ns uses the same rule). */
-    slot->end_ns = arrival_ns + (int64_t)len * 32000LL;
+    slot->end_ns = arrival_ns + (int64_t)len * IEEE802154_BYTE_NS;
     slot->sender_idx = sender_idx;
     slot->collided = false;
 

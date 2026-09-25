@@ -11,6 +11,7 @@
  * CRC is CCITT-16 with bit reversal, matching CC2420 hardware.
  */
 #include "native_node.h"
+#include "ieee_802154.h"
 #include <string.h>
 
 /* --- CRC-CCITT-16 with bit reversal (matches CC2420) --- */
@@ -48,23 +49,21 @@ uint16_t native_crc16(const uint8_t *data, int len) {
 
 int native_frame_to_bytes(const uint8_t *frame, int frame_len,
                           uint8_t *out, int out_max) {
-    /* Output: 4x preamble + SFD + length + frame + CRC(2) */
-    int total = 4 + 1 + 1 + frame_len + 2;
+    /* Output: PHY header (4x preamble + SFD + length) + frame + FCS */
+    int total = IEEE802154_PHY_HEADER_BYTES + frame_len + IEEE802154_FCS_LEN;
     if (total > out_max) return 0;
 
     int pos = 0;
 
-    /* Preamble: 4 zero bytes */
-    out[pos++] = 0x00;
-    out[pos++] = 0x00;
-    out[pos++] = 0x00;
-    out[pos++] = 0x00;
+    /* Preamble */
+    for (int i = 0; i < IEEE802154_PREAMBLE_LEN; i++)
+        out[pos++] = IEEE802154_PREAMBLE_BYTE;
 
     /* SFD */
-    out[pos++] = 0x7A;
+    out[pos++] = IEEE802154_SFD;
 
-    /* PHY length byte: frame_len + 2 (for FCS) */
-    out[pos++] = (uint8_t)(frame_len + 2);
+    /* PHY length byte: frame_len + FCS */
+    out[pos++] = (uint8_t)(frame_len + IEEE802154_FCS_LEN);
 
     /* Frame payload */
     memcpy(out + pos, frame, (size_t)frame_len);
@@ -87,21 +86,25 @@ void native_rx_assembler_reset(native_rx_assembler_t *a) {
     a->expected_len = 0;
 }
 
-void native_rx_assembler_feed(native_node_t *node, uint8_t byte) {
+bool native_rx_assembler_feed(native_node_t *node, uint8_t byte,
+                              int64_t air_ns) {
     native_rx_assembler_t *a = &node->rx_asm;
+    bool delivered = false;
 
     switch (a->state) {
     case RX_ASM_PREAMBLE:
-        if (byte == 0x00) {
+        if (byte == IEEE802154_PREAMBLE_BYTE) {
             a->zero_count++;
-        } else if (byte == 0x7A && a->zero_count >= 4) {
+        } else if (byte == IEEE802154_SFD &&
+                   a->zero_count >= IEEE802154_PREAMBLE_LEN) {
             /* Got SFD after preamble: reception start (ContikiRadio.
-             * signalReceptionStart) — mark receiving and stamp the frame. */
+             * signalReceptionStart) — mark receiving and stamp the frame
+             * with the SFD's air time. */
             a->state = RX_ASM_LENGTH;
             a->count = 0;
             if (node->simReceiving) *node->simReceiving = 1;
             if (node->simLastPacketTimestamp)
-                *node->simLastPacketTimestamp = (uint64_t)(node->sim_time_ns / 1000LL);
+                *node->simLastPacketTimestamp = (uint64_t)(air_ns / 1000LL);
         } else {
             /* Reset on unexpected byte */
             a->zero_count = 0;
@@ -129,17 +132,25 @@ void native_rx_assembler_feed(native_node_t *node, uint8_t byte) {
             a->buf[a->count++] = byte;
 
         if (a->count >= a->expected_len) {
-            /* Frame complete: strip FCS (last 2 bytes), deliver to native node */
-            int frame_len = a->expected_len - 2;
+            /* Frame complete: strip the FCS, deliver to the native node */
+            int frame_len = a->expected_len - IEEE802154_FCS_LEN;
             if (frame_len > 0 && frame_len <= 128) {
-                /* Byte-stream reassembly: the frame has fully arrived, so
-                 * queue it as already-ended (arrival = now - on-air time);
-                 * it is completed on the node's next tick. */
+                /* Byte-stream reassembly: the frame ends when its last
+                 * byte leaves the air, on the bus's clock -- the same
+                 * instant the bus's on-air window (this node's CCA) ends,
+                 * so the frame is never read while the channel it came
+                 * on still reads busy.  Queue it with the arrival that
+                 * puts its end there; it is completed on the tick at that
+                 * time (the caller wakes the node for it). */
+                int64_t end_ns = air_ns + IEEE802154_BYTE_NS;
                 native_deliver_frame(node, a->buf, frame_len,
-                                     node->sim_time_ns - (int64_t)frame_len * 32000LL, -1);
+                                     end_ns - (int64_t)frame_len * IEEE802154_BYTE_NS,
+                                     -1);
+                delivered = true;
             }
             native_rx_assembler_reset(a);
         }
         break;
     }
+    return delivered;
 }

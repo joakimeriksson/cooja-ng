@@ -190,8 +190,13 @@ int64_t native_rx_next_end_ns(const native_node_t *node);
 /* Return the next time the node needs to wake up (ns), INT64_MAX if idle */
 int64_t native_next_wakeup_ns(const native_node_t *node);
 
-/* Feed a byte from emulated radio byte-stream into the reassembler */
-void native_rx_assembler_feed(native_node_t *node, uint8_t byte);
+/* Feed a byte from an emulated radio's byte stream into the reassembler.
+ * air_ns is the byte's air time on the bus's clock: the SFD stamps the
+ * frame's reception start, and a completed frame is queued to end when its
+ * last byte leaves the air.  Returns true when a frame was queued -- the
+ * caller then wakes the node at native_rx_next_end_ns(). */
+bool native_rx_assembler_feed(native_node_t *node, uint8_t byte,
+                              int64_t air_ns);
 
 /* --- Radio bridging helpers (in native_radio.c) --- */
 

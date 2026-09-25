@@ -65,8 +65,9 @@ typedef struct {
     sim_runtime_t   *sim;
     int64_t  now_at_recv;           /* the pump stamps this before calling */
     int      on_air_count;          /* on_air windows announced to it */
-    int64_t  on_air_start;          /* earliest start announced */
     int64_t  on_air_end;            /* latest end announced */
+    int      recv_at_count;         /* bytes via receive_byte_at */
+    int64_t  recv_air_ns;           /* air time of the last one */
     int      collision_marks;       /* mark_collisions calls */
 } mock_rx_t;
 
@@ -86,16 +87,25 @@ static bool mock_rx_busy(void *m) { return ((mock_rx_t *)m)->busy; }
 static void mock_rx_stall(void *m) { ((mock_rx_t *)m)->stall_count++; }
 
 static const mote_radio_ops_t mock_ops = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL, NULL, NULL,
 };
-static void mock_on_air(void *m, int64_t start, int64_t end) {
+static void mock_on_air(void *m, int64_t end) {
     mock_rx_t *r = (mock_rx_t *)m;
-    if (r->on_air_count == 0 || start < r->on_air_start) r->on_air_start = start;
     if (r->on_air_count == 0 || end > r->on_air_end) r->on_air_end = end;
     r->on_air_count++;
 }
+/* A SYNC receiver that takes each byte with its air time, as the native
+ * mote does. */
+static void mock_receive_byte_at(void *m, uint8_t byte, int8_t rssi,
+                                 int64_t air_ns) {
+    mock_rx_t *r = (mock_rx_t *)m;
+    r->recv_at_count++;
+    r->recv_air_ns = air_ns;
+    mock_receive_byte(m, byte, rssi);
+}
 static const mote_radio_ops_t mock_ops_on_air = {
     .receive_byte     = mock_receive_byte,
+    .receive_byte_at  = mock_receive_byte_at,
     .rxfifo_available = mock_rxfifo_available,
     .rx_busy          = mock_rx_busy,
     .on_air           = mock_on_air,
@@ -112,7 +122,7 @@ static const mote_radio_ops_t mock_ops_collisions = {
     .mark_collisions  = mock_mark_collisions,
 };
 static const mote_radio_ops_t mock_ops_stall = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL, NULL, NULL,
 };
 
 /* ============================================================
@@ -744,15 +754,83 @@ static void test_on_air_emulated_sender(void) {
     uint8_t frame[64]; int n = build_802154(frame, 20);
     sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[0]);
     ASSERT_EQ(f.rx[1].on_air_count, 1, "on_air: announced at the first preamble byte");
-    ASSERT_EQ(f.rx[1].on_air_start, t0, "on_air: starts at the first byte's air time");
     ASSERT_EQ(f.rx[1].on_air_end, t0 + 6 * IEEE802154_BYTE_NS,
               "on_air: covers the PHY header before the length is known");
+    ASSERT_EQ(f.rx[1].recv_at_count, 1, "sync: the byte came with its air time");
+    ASSERT_EQ(f.rx[1].recv_air_ns, t0, "sync: the first byte's air time is the bus clock");
 
     for (int i = 1; i < n; i++)
         sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[i]);
-    ASSERT_EQ(f.rx[1].on_air_start, t0, "on_air: one window start for the frame");
     ASSERT_EQ(f.rx[1].on_air_end, t0 + (6 + 20) * IEEE802154_BYTE_NS,
               "on_air: ends with the frame's last byte");
+    ASSERT_EQ(f.rx[1].on_air_count, 2,
+              "on_air: announced once for the header, once for the frame -- not per byte");
+    ASSERT_EQ(f.rx[1].recv_at_count, n, "sync: every byte came with its air time");
+    ASSERT_EQ(f.rx[1].recv_air_ns, t0 + (n - 1) * IEEE802154_BYTE_NS,
+              "sync: the last byte's air time is one byte before the window ends");
+}
+
+static void test_on_air_byte_path_radio_off(void) {
+    /* A native mote whose radio is off gets no bytes from an emulated
+     * sender (the medium's RX gate), but the channel is busy for the
+     * frame all the same: the window does not depend on a byte having
+     * been accepted.  A duty-cycled native that wakes mid-frame must not
+     * read the channel clear and transmit over it. */
+    fixture_t f; fx_init(&f, 2);
+    const double x[2] = { 0, 30 };
+    const int ch[2]   = { 26, 26 };
+    on_air_udgm(&f, 2, x, ch);
+    radio_medium_set_radio_rx_enabled(&f.sim.radio_medium, 1, 0, false);
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops_on_air, &f.rx[1],
+                           SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 7000000;
+
+    uint8_t frame[64]; int n = build_802154(frame, 10);
+    tx_frame(&f, 0, frame, n);
+    ASSERT_EQ(f.rx[1].recv_count + f.rx[1].recv_at_count, 0,
+              "radio off: no byte delivered");
+    ASSERT_EQ(f.rx[1].on_air_count, 2, "radio off: the window is still announced");
+    ASSERT_EQ(f.rx[1].on_air_end, f.sim.now_ns + (6 + 10) * IEEE802154_BYTE_NS,
+              "radio off: busy until the emulated sender's frame ends");
+}
+
+static void test_native_byte_frame_ends_on_bus_clock(void) {
+    /* A frame assembled from an emulated sender's bytes is stamped on the
+     * bus clock: reception starts at the SFD's air time and the frame ends
+     * when its last byte leaves the air -- the instant the bus's on-air
+     * window (this node's CCA) ends.  Before, the arrival was derived from
+     * the node's last tick, so the frame was read while the channel it
+     * came on still read busy. */
+    native_node_t n;
+    uint64_t last_ts = 0;
+    char receiving = 0;
+    memset(&n, 0, sizeof(n));
+    n.simLastPacketTimestamp = &last_ts;
+    n.simReceiving = &receiving;
+    n.sim_time_ns = 1000000;              /* last tick: 1 ms */
+
+    const int64_t t0 = 20000000;          /* first byte on the air: 20 ms */
+    const int payload = 10;
+    /* The PHY length counts the two FCS bytes: 6 header + 10 + 2 on the air. */
+    uint8_t frame[64]; int len = build_802154(frame, payload + 2);
+    int completed = 0;
+    for (int i = 0; i < len; i++) {
+        int64_t air = t0 + i * IEEE802154_BYTE_NS;
+        if (native_rx_assembler_feed(&n, frame[i], air)) completed++;
+    }
+    ASSERT_EQ(completed, 1, "native byte path: one frame queued, on the last byte");
+    ASSERT_EQ(receiving, 1, "native byte path: receiving from the SFD on");
+    ASSERT_EQ(last_ts, (t0 + 4 * IEEE802154_BYTE_NS) / 1000, "native byte path: reception start = the SFD's air time");
+    ASSERT_EQ(n.rx_queue.count, 1, "native byte path: frame queued");
+    const native_pending_frame_t *q = &n.rx_queue.frames[n.rx_queue.head];
+    ASSERT_EQ(q->len, payload, "native byte path: FCS stripped");
+    ASSERT_EQ(q->end_ns, t0 + len * IEEE802154_BYTE_NS,
+              "native byte path: the frame ends when its last byte leaves the air");
+    ASSERT_EQ(q->end_ns, t0 + (6 + payload + 2) * IEEE802154_BYTE_NS,
+              "native byte path: ... which is where the bus's on-air window ends");
+    ASSERT_EQ(native_rx_next_end_ns(&n), q->end_ns, "native byte path: the node wakes at that end");
+    ASSERT(q->end_ns > n.sim_time_ns, "native byte path: not completed on a stale tick");
 }
 
 static void test_on_air_reach_and_channel(void) {
@@ -1013,6 +1091,8 @@ int run_radio_bus_tests(int verbose) {
     test_deliver_native_noop();
     test_native_signal_strength_follows_air();
     test_on_air_emulated_sender();
+    test_on_air_byte_path_radio_off();
+    test_native_byte_frame_ends_on_bus_clock();
     test_on_air_reach_and_channel();
     test_on_air_emulated_interference();
     test_interference_marks_same_channel();

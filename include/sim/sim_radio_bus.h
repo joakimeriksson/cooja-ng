@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ieee_802154.h"
 #include "radio_medium.h"
 
 #ifdef __cplusplus
@@ -126,13 +127,24 @@ typedef struct mote_radio_ops {
      * Only motes that keep their RX queue mote-side (native Cooja) set
      * this; the bus marks its own emu_rx_queue directly for others. */
     int (*mark_collisions)(void *mote, int64_t start_ns, int64_t end_ns);
-    /* Optional: a transmission occupies this mote's channel over
-     * [start_ns, end_ns).  The bus calls it for every mote a transmission
+    /* Optional: a transmission occupies this mote's channel from now
+     * until end_ns.  The bus calls it for every mote a transmission
      * reaches -- reception and interference range alike, on the same
      * channel, whether or not the mote's radio is on or gets the frame --
-     * with the one on-air window the bus computes for that transmission.
-     * Motes that model CCA from the air (native Cooja) set it. */
-    void (*on_air)(void *mote, int64_t start_ns, int64_t end_ns);
+     * with the one on-air end the bus computes for that transmission, at
+     * the time the transmission starts (it never announces ahead of the
+     * kernel's now, so the window has no start of its own).  Ends
+     * only grow within one transmission; a mote keeps the latest end over
+     * everything reaching it.  Motes that model CCA from the air (native
+     * Cooja) set it. */
+    void (*on_air)(void *mote, int64_t end_ns);
+    /* Optional: synchronous (SYNC) delivery with the byte's air time on
+     * the bus's clock, so a mote that assembles frames itself stamps them
+     * on the same clock as the on_air window it was given -- a frame
+     * completes at the instant the channel clears.  When
+     * set, the bus calls it instead of receive_byte for SYNC delivery. */
+    void (*receive_byte_at)(void *mote, uint8_t byte, int8_t rssi,
+                            int64_t air_ns);
 } mote_radio_ops_t;
 
 /* How TX bytes reach a registered receiver (M9.4).  Chosen by the runner
@@ -268,6 +280,10 @@ typedef struct sim_radio_bus {
     uint32_t                caps[SIM_RADIO_BUS_MAX_NODES];   /* SIM_RADIO_CAP_* */
     int                node_count;   /* registration high-water mark + 1   */
     bool               any_on_air;   /* some registered mote sets on_air   */
+    /* Per sender: the on-air end last announced for the frame in
+     * progress.  The byte path only walks the neighbour lists when the
+     * end grows -- at the first preamble byte and at the length byte. */
+    int64_t            on_air_end_ns[SIM_RADIO_BUS_MAX_NODES];
     int                tx_depth;     /* >0: inside frame_complete delivery */
     sim_radio_bus_host_t host;       /* runner hooks (M9.4)                */
     rf_buffer_t        rf_pending[SIM_RADIO_BUS_MAX_NODES];   /* per-receiver byte staging   */
@@ -439,15 +455,12 @@ void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, struct sim_runtime *sim,
 void sim_radio_bus_push_channel(sim_radio_bus_t *bus, struct sim_runtime *sim,
                                 int idx, int radio_idx, int channel);
 
-/* 802.15.4 byte duration at 250 kbps (2.4 GHz CC2420 / CC2538 RFCore) =
- * 32 µs/byte. 802.15.4g over CC1200 at 50 kbps = 160 µs/byte. Using the
- * 2.4 GHz value for CC1200 frames (5× too fast) made hidden-terminal
+/* 802.15.4g over CC1200 at 50 kbps = 160 µs/byte (the 2.4 GHz
+ * IEEE802154_BYTE_NS and PHY header sizes come from ieee_802154.h). Using
+ * the 2.4 GHz value for CC1200 frames (5× too fast) made hidden-terminal
  * collisions look real and starved RPL convergence — see
  * devices/zoul-firefly/SPEC.md L6. */
-#define IEEE802154_BYTE_NS    32000LL
 #define CC1200_50KBPS_BYTE_NS 160000LL
-/* 802.15.4 PHY header on the air: 4 preamble + SFD + length byte. */
-#define IEEE802154_PHY_HEADER_BYTES 6
 
 /* RX-stall window (M9.5): sim-time after a receiver's last delivered RF
  * byte before ops->rx_stall fires.  Must exceed the inter-byte air gap
