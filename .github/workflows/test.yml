@@ -120,6 +120,9 @@ jobs:
       - name: Radio bus unit tests
         run: ./build/test_runner radio-bus
 
+      - name: Event queue unit tests
+        run: ./build/test_runner event-queue
+
       - name: External mote — Python sniffer receives + decodes 802.15.4
         # Gates the whole RX path for external motes: the peer must actually
         # receive frames from the emulated Sky pair and decode their MAC

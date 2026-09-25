@@ -104,6 +104,9 @@ extern int run_radio_medium_tests(int verbose);
 /* sim_radio_bus unit tests (Phase 5 guardrail, no CPU) */
 extern int run_radio_bus_tests(int verbose);
 
+/* sim_event_queue_t unit tests (the kernel heap, no CPU) */
+extern int run_event_queue_tests(int verbose);
+
 /* Renode co-simulation unit tests (codec + device window + mock master) */
 extern int run_renode_cosim_tests(int verbose);
 
@@ -139,6 +142,7 @@ int main(int argc, char **argv) {
         printf("Chip drivers: cc1200-mock-host\n");
         printf("Radio medium: radio-medium\n");
         printf("Radio bus:    radio-bus\n");
+        printf("Event queue:  event-queue\n");
         printf("Test:         test <config.yaml|json> [-v] [-t ms] [--seed N] [--save-config out.yaml]\n");
     printf("              ... [--shell] [--script FILE] [--paused] [--speed N|max|realtime]  (docs/shell.md)\n");
         printf("Config:       config-convert <in> <out.yaml> | config-roundtrip <config...> | config-reject <config...> | config-depth\n");
@@ -460,6 +464,11 @@ int main(int argc, char **argv) {
     /* sim_radio_bus unit tests (Phase 5 guardrail) */
     if (strcmp(mode, "radio-bus") == 0 || strcmp(mode, "all") == 0) {
         failures += run_radio_bus_tests(verbose);
+    }
+
+    /* sim_event_queue_t unit tests (kernel heap ordering + reschedule) */
+    if (strcmp(mode, "event-queue") == 0 || strcmp(mode, "all") == 0) {
+        failures += run_event_queue_tests(verbose);
     }
 
     /* Renode co-simulation (csim as clock slave) unit tests */
