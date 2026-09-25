@@ -168,59 +168,60 @@ static void close_client(ws_server_t *srv, int idx) {
  */
 
 /* Copy the value of header `name` (case-insensitive, per HTTP) into out.
- * Returns 1 if found, 0 if absent, -1 if present but longer than out. */
+ * Returns 1 if found, 0 if absent, -1 if it cannot be trusted: longer than
+ * out, sent twice, or with whitespace before the colon.  RFC 9112 5.1 says
+ * to reject that last spelling; skipping it instead would let "Host :"
+ * through as a request with no Host at all. */
 static int http_header(const char *req, const char *name, char *out, size_t outsz) {
     size_t nlen = strlen(name);
+    int found = 0;
     const char *line = strstr(req, "\r\n");
     while (line) {
         line += 2;
         if (line[0] == '\r') break;                 /* blank line: end of headers */
-        if (strncasecmp(line, name, nlen) == 0 && line[nlen] == ':') {
-            const char *v = line + nlen + 1;
-            while (*v == ' ' || *v == '\t') v++;
-            const char *end = strstr(v, "\r\n");
-            if (!end) return 0;
-            while (end > v && (end[-1] == ' ' || end[-1] == '\t')) end--;
-            size_t vlen = (size_t)(end - v);
-            if (vlen >= outsz) return -1;
-            memcpy(out, v, vlen);
-            out[vlen] = '\0';
-            return 1;
+        if (strncasecmp(line, name, nlen) == 0) {
+            const char *colon = line + nlen;
+            while (*colon == ' ' || *colon == '\t') colon++;
+            if (*colon == ':') {
+                if (colon != line + nlen || found) return -1;
+                const char *v = colon + 1;
+                while (*v == ' ' || *v == '\t') v++;
+                const char *end = strstr(v, "\r\n");
+                if (!end) return 0;
+                while (end > v && (end[-1] == ' ' || end[-1] == '\t')) end--;
+                size_t vlen = (size_t)(end - v);
+                if (vlen >= outsz) return -1;
+                memcpy(out, v, vlen);
+                out[vlen] = '\0';
+                found = 1;
+            }
         }
         line = strstr(line, "\r\n");
     }
-    return 0;
+    return found;
 }
 
-/* A Host value ("name[:port]", "[v6]:port") that names this machine. */
+/* A Host value ("name[:port]") that names this machine's IPv4 loopback,
+ * the only place a loopback-bound server listens (so not "[::1]"). */
 static int host_is_loopback(const char *host) {
     char name[64];
-    size_t n;
-    if (host[0] == '[') {
-        const char *close = strchr(host, ']');
-        if (!close) return 0;
-        n = (size_t)(close - host - 1);
-        host++;
-    } else {
-        const char *colon = strchr(host, ':');
-        n = colon ? (size_t)(colon - host) : strlen(host);
-    }
+    const char *colon = strchr(host, ':');
+    size_t n = colon ? (size_t)(colon - host) : strlen(host);
     if (n == 0 || n >= sizeof(name)) return 0;
     memcpy(name, host, n);
     name[n] = '\0';
-    if (strcasecmp(name, "localhost") == 0 || strcmp(name, "::1") == 0)
+    if (strcasecmp(name, "localhost") == 0)
         return 1;
     struct in_addr a;
     return inet_pton(AF_INET, name, &a) == 1 &&
            (ntohl(a.s_addr) >> 24) == 127;
 }
 
-/* Origin is "scheme://host[:port]"; it names this server if that host[:port]
- * is exactly the Host the request was sent to. */
+/* Origin is "scheme://host[:port]"; it names this server if it is exactly
+ * "http://" + the Host the request was sent to.  "null" never matches. */
 static int origin_matches_host(const char *origin, const char *host) {
-    const char *p = strstr(origin, "://");
-    if (!p) return 0;                               /* includes "null" */
-    return strcasecmp(p + 3, host) == 0;
+    return strncasecmp(origin, "http://", 7) == 0 &&
+           strcasecmp(origin + 7, host) == 0;
 }
 
 static void refuse(ws_server_t *srv, int idx, const char *why, const char *what) {
@@ -236,6 +237,19 @@ static void refuse(ws_server_t *srv, int idx, const char *why, const char *what)
 
 static const char *WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/* The path of a "GET <path> HTTP/..." request line, copied into out.
+ * Returns 0 for any other method, or a path longer than out. */
+static int request_path(const char *req, char *out, size_t outsz) {
+    if (strncmp(req, "GET ", 4) != 0) return 0;
+    const char *p = req + 4;
+    const char *sp = strchr(p, ' ');
+    const char *eol = strstr(p, "\r\n");
+    if (!sp || !eol || sp > eol || (size_t)(sp - p) >= outsz) return 0;
+    memcpy(out, p, (size_t)(sp - p));
+    out[sp - p] = '\0';
+    return 1;
+}
+
 static void handle_http_request(ws_server_t *srv, int idx) {
     ws_client_t *c = &srv->clients[idx];
     c->recv_buf[c->recv_len] = '\0';
@@ -248,7 +262,8 @@ static void handle_http_request(ws_server_t *srv, int idx) {
     int has_host = http_header(c->recv_buf, "Host", host, sizeof(host));
     int has_origin = http_header(c->recv_buf, "Origin", origin, sizeof(origin));
     if (has_host < 0 || has_origin < 0) {
-        refuse(srv, idx, "oversized", has_host < 0 ? "Host" : "Origin");
+        refuse(srv, idx, "oversized, repeated or malformed header",
+               has_host < 0 ? "Host" : "Origin");
         return;
     }
     if (srv->loopback_only && has_host && !host_is_loopback(host)) {
@@ -256,24 +271,30 @@ static void handle_http_request(ws_server_t *srv, int idx) {
         return;
     }
 
+    /* The method and path come from the request line and the headers from
+     * http_header, which matches names case-insensitively as HTTP requires
+     * -- not strstr over the whole request, which took "GET /wsx" for
+     * "/ws" and missed a lowercase "upgrade:". */
+    char path[64] = "", upgrade[32] = "", key[64] = "";
+    int is_get = request_path(c->recv_buf, path, sizeof(path));
+
     /* WebSocket upgrade: GET /ws */
-    if (strstr(c->recv_buf, "GET /ws") && strstr(c->recv_buf, "Upgrade: websocket")) {
+    if (is_get && strcmp(path, "/ws") == 0 &&
+        http_header(c->recv_buf, "Upgrade", upgrade, sizeof(upgrade)) == 1 &&
+        strcasecmp(upgrade, "websocket") == 0) {
         if (has_origin && !(has_host && origin_matches_host(origin, host))) {
             refuse(srv, idx, "cross-origin WebSocket from", origin);
             return;
         }
-        /* Extract Sec-WebSocket-Key */
-        const char *key_hdr = strstr(c->recv_buf, "Sec-WebSocket-Key: ");
-        if (!key_hdr) { close_client(srv, idx); return; }
-        key_hdr += 19;
-        const char *key_end = strstr(key_hdr, "\r\n");
-        if (!key_end) { close_client(srv, idx); return; }
-        int key_len = (int)(key_end - key_hdr);
+        if (http_header(c->recv_buf, "Sec-WebSocket-Key", key, sizeof(key)) != 1) {
+            close_client(srv, idx);
+            return;
+        }
 
         /* SHA-1(key + magic) */
         sha1_ctx sha;
         sha1_init(&sha);
-        sha1_update(&sha, (const uint8_t *)key_hdr, (uint32_t)key_len);
+        sha1_update(&sha, (const uint8_t *)key, (uint32_t)strlen(key));
         sha1_update(&sha, (const uint8_t *)WS_MAGIC, 36);
         uint8_t digest[20];
         sha1_final(&sha, digest);
@@ -294,7 +315,7 @@ static void handle_http_request(ws_server_t *srv, int idx) {
     }
 
     /* Serve HTML on GET / */
-    if (strstr(c->recv_buf, "GET / ") || strstr(c->recv_buf, "GET /index.html")) {
+    if (is_get && (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0)) {
         const char *body = srv->html ? srv->html : "<html><body>No UI loaded</body></html>";
         int blen = srv->html ? srv->html_len : (int)strlen(body);
         char hdr[256];
