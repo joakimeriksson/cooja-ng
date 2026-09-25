@@ -244,7 +244,8 @@ tools/check-plugin.sh                           # plugin smoke check (service + 
 tools/check-ext-peer.sh                         # external-node peer that never advances / sends 1e400: node failed
 python3 tools/check-gdb-stub.py                 # GDB stub: stalled / non-acking client dropped, bad Z0 refused
 python3 tools/check-ui-access.py                # web UI: loopback-only by default (--ui-bind ADDR to opt out),
-                                                # cross-origin WebSocket + DNS-rebinding Host refused
+                                                # cross-origin WebSocket + DNS-rebinding Host refused,
+                                                # bad --ui-bind refused at parse time, FIFO/dir page
 ```
 
 ```sh
