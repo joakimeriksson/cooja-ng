@@ -1042,12 +1042,15 @@ static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
  * stack), then pop the return address + integrity signature BLXNS pushed. A
  * corrupted signature raises a SecureFault (INVIS).
  *
- * The pops are this instruction's own accesses, checked like any other
- * (the bus check can refuse them: a Secure SP in peripheral space). The
- * snapshot is taken before the world switch so the precise BusFault
- * undoes the Non-secure registers, and the switch itself is reverted
- * here, since the undo restores registers only; the return then does
- * nothing, and INVIS can only follow accepted reads. */
+ * The pops are the returning instruction's own accesses, checked like any
+ * other (the bus check can refuse them: a Secure SP in peripheral space).
+ * Four instructions get here: BX and POP/LDM from Non-secure code, LDR pc
+ * with writeback, and BXNS from Secure code. Each has its register file
+ * snapshotted before any write of its own (POP/LDM before the first beat,
+ * the LDR before its writeback, BX and BXNS here, before the switch), so
+ * the precise BusFault undoes it. The undo restores registers only, so a
+ * refusal restores the security state the instruction started in; the
+ * return then does nothing, and INVIS can only follow accepted reads. */
 static void arm_fnc_return(arm_cpu_t *cpu, uint32_t magic) {
     (void)magic;
     bool was_secure = cpu->secure;
@@ -3876,6 +3879,11 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         val = mem_read32_unaligned(cpu, addr);
                         break;
                 }
+                /* A PC load can return through FNC_RETURN, whose own pops
+                 * can be refused after this writeback: snapshot first. */
+                if (writeback && rt == ARM_PC &&
+                    __builtin_expect(ARM_PRECISE_FAULTS(cpu), 0))
+                    arm_insn_snapshot(cpu);
                 if (writeback) cpu->reg[rn] = wb_val;
                 if (rt == ARM_PC) {
                     if (size != 2) {

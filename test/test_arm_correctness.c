@@ -3264,6 +3264,25 @@ static void test_trustzone_fnc_return_refused(void) {
         assert_eq(name, BF_NS_SP, cpu.reg[ARM_SP]);
     }
 
+    /* LDR.W pc, [sp], #4: the base writeback happens before the PC load
+     * reaches FNC_RETURN, so the snapshot must be taken ahead of it — the
+     * frame is pushed from the original SP, and the undo restores SP. */
+    bf_setup(&cpu, &nvic);
+    cpu.msp_s = 0x40001000;
+    write_thumb32(&cpu, CODE_BASE, 0xF85D, 0xFB04);        /* LDR.W pc, [sp], #4 */
+    arm_write32(&cpu, BF_NS_SP, 0xFEFFFFFFu);
+    arm_step(&cpu, 1);
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: BFAR = the first pop", 0x40001000, arm_read32(&cpu, 0xE000ED38));
+    assert_true("LDR pc,[sp],#4 FNC_RETURN refused: Secure handler", cpu.secure);
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: frame from the original SP", BF_NS_FRAME, cpu.msp_ns);
+    /* The frame position alone cannot tell: SP + 4 aligns down to the same
+     * frame. The stacked alignment bit can — set only for an SP that was
+     * not 8-byte aligned, which BF_NS_SP is. */
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: SP stacked unadvanced (xPSR bit 9 clear)",
+              0, (int)(arm_read32(&cpu, BF_NS_FRAME + 28) & (1u << 9)));
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: stacked PC = the LDR", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+
     /* BXNS LR in Secure state with LR = FNC_RETURN also returns through
      * FNC_RETURN, from a core already Secure: a refused pop must leave it
      * Secure, and the BusFault is stacked on the Secure stack. */

@@ -329,8 +329,12 @@ nothing was ever refused. Now:
   handler or switch security state before the undo, which restores
   registers only. FNC_RETURN's own pops from the Secure stack are checked
   accesses of the returning instruction too: a refused one (the Secure SP
-  in a claimed peripheral) reverts the world switch and abandons the
-  return, so the BusFault stacks the `BX` / `POP` on the Non-secure stack.
+  in a claimed peripheral) abandons the return and restores the security
+  state the instruction started in, so the BusFault stacks the
+  instruction on the stack it ran on. That holds for all four ways in —
+  `BX` / `POP` / `LDM` / `LDR pc` with writeback from Non-secure, and
+  `BXNS` from Secure — because each snapshots before its first register
+  write.
   One effect inside an instruction the undo cannot cover:
   a peripheral write handler that pends an interrupt enters it at once
   (`arm_nvic_set_pending` → `arm_nvic_check_pending`), so a multi-beat
