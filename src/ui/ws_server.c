@@ -1,7 +1,8 @@
 /*
  * Minimal non-blocking WebSocket server
  *
- * - POSIX sockets, select() with timeout=0
+ * - POSIX sockets, select() with timeout=0; output is queued per client
+ *   and drained from the poll, so the caller never waits on a socket
  * - HTTP: serve embedded HTML on GET /, upgrade to WebSocket on GET /ws
  * - WebSocket: text frames (opcode 0x81), handles close/ping
  * - Up to 8 concurrent WebSocket clients
@@ -18,7 +19,6 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
-#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -35,17 +35,37 @@
 /* A client must finish its HTTP request within this long of connecting.
  * Without it, eight connections that never do (idle, or a request the
  * parser never sees end: an embedded NUL, LF-only line endings) hold every
- * slot and the UI turns everyone else away for the rest of the run. */
-#define HTTP_REQUEST_MS 5000
+ * slot and the UI turns everyone else away for the rest of the run.  The
+ * reply gets longer: the page is 60-odd KB and a slow link is not a
+ * fault, but a client that reads it a byte at a time is holding a slot,
+ * and 30 s is a 2 KB/s floor that no browser goes under. */
+#define HTTP_REQUEST_MS   5000
+#define HTTP_RESPONSE_MS 30000
+
+/* When a client that has bytes waiting is given up on (see client_write):
+ * more than this queued -- the full state of a large simulation is a few
+ * hundred KB, so a viewer this far behind is not slow, it has stopped
+ * reading -- or its socket taking nothing at all for this long, which
+ * with small messages comes first.  A live link, however slow, takes
+ * *something* in 10 s; the browser, not the operator's JavaScript, reads
+ * the socket, so a page busy parsing does not go quiet for that long. */
+#define OUT_QUEUE_MAX  (4 * 1024 * 1024)
+#define OUT_STALL_MS   10000
 
 typedef enum { CLIENT_HTTP, CLIENT_WS } client_state_t;
 
 typedef struct {
     int fd;
     client_state_t state;
-    int64_t accepted_ms;    /* CLOCK_MONOTONIC; bounds the HTTP request */
+    int64_t accepted_ms;    /* CLOCK_MONOTONIC; bounds the HTTP exchange */
     char recv_buf[RECV_BUF];
     int recv_len;
+    /* Bytes the socket has not taken yet: out[out_head .. out_head+out_len).
+     * ws_server_poll sends them as the socket becomes writable. */
+    uint8_t *out;
+    size_t out_head, out_len, out_cap;
+    int64_t out_progress_ms; /* the socket last took some of the queue */
+    int close_when_sent;    /* the reply is queued; close after it */
 } ws_client_t;
 
 struct ws_server {
@@ -164,54 +184,96 @@ static int64_t monotonic_ms(void) {
 
 static void close_client(ws_server_t *srv, int idx) {
     close(srv->clients[idx].fd);
+    free(srv->clients[idx].out);
     srv->clients[idx] = srv->clients[--srv->client_count];
 }
 
-/* How long a client may make no progress draining a broadcast before it is
- * dropped.  Broadcasts run on the simulation's own thread, so this bounds
- * how long one stalled viewer can hold up the run.  The allowance grows with
- * the message: a reconnecting viewer's first message is the full state, the
- * largest one, and a browser still parsing the previous message may not
- * read for a while.  A flat budget small enough for deltas dropped such a
- * viewer on every reconnect, forever.  Clients are served one after
- * another, so a round can cost this once per stalled client.  The limit is
- * on *no progress*, not on the whole message: a client that keeps taking a
- * few bytes at a time is slow, not gone, and is kept -- a deliberate
- * trickle can slow the run that way, but only from where the server can
- * be reached, which is loopback unless --ui-bind says otherwise. */
-#define SEND_STALL_MS      200
-#define SEND_STALL_MAX_MS  2000
+/* Everything sent to a client goes through client_write: what the socket
+ * takes at once goes straight out and the rest waits in the client's queue,
+ * which ws_server_poll drains as the socket becomes writable.  The
+ * simulation thread therefore never waits on a socket -- no send loop, no
+ * poll(), no wall-clock allowance to tune.  A viewer that keeps up on
+ * average never queues anything; a slow link queues a little and drains it;
+ * a viewer that has stopped reading falls further and further behind until
+ * its queue passes OUT_QUEUE_MAX, or its socket has taken nothing for
+ * OUT_STALL_MS, and it is dropped (the latter in ws_server_poll).  Neither
+ * is a speed: a slow link is never mistaken for a dead one.  Returns 0 on
+ * success, CLIENT_BEHIND when the queue is over the limit, and -1 when
+ * the client has gone. */
+#define CLIENT_BEHIND (-2)
 
-static int send_stall_ms(int len) {
-    int ms = SEND_STALL_MS + len / 1024;            /* + 1 ms per KB */
-    return ms < SEND_STALL_MAX_MS ? ms : SEND_STALL_MAX_MS;
+static int client_write(ws_client_t *c, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    if (c->out_len == 0) {
+        while (len > 0) {
+            ssize_t n = send(c->fd, p, len, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                return -1;
+            }
+            p += n;
+            len -= (size_t)n;
+        }
+        if (len == 0) return 0;
+    }
+    if (c->out_len + len > OUT_QUEUE_MAX) return CLIENT_BEHIND;
+    if (c->out_len == 0) c->out_progress_ms = monotonic_ms();
+    if (c->out_head) {
+        memmove(c->out, c->out + c->out_head, c->out_len);
+        c->out_head = 0;
+    }
+    if (c->out_len + len > c->out_cap) {
+        size_t cap = c->out_cap ? c->out_cap : 16384;
+        while (cap < c->out_len + len) cap *= 2;
+        uint8_t *grown = realloc(c->out, cap);
+        if (!grown) return -1;
+        c->out = grown;
+        c->out_cap = cap;
+    }
+    memcpy(c->out + c->out_len, p, len);
+    c->out_len += len;
+    return 0;
 }
 
-/* Send all bytes, retrying on partial writes.  Returns 0 on success,
- * SEND_STALLED when the client makes no progress for stall_ms, and -1 on
- * any other error (typically: the client has gone).  The caller drops the
- * client on either. */
-#define SEND_STALLED (-2)
-
-static int send_all(int fd, const void *buf, int len, int stall_ms) {
-    const uint8_t *p = (const uint8_t *)buf;
-    int remaining = len;
-    while (remaining > 0) {
-        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
+/* Send what the socket will take of the queue.  -1 if the client has gone. */
+static int client_flush(ws_client_t *c) {
+    while (c->out_len > 0) {
+        ssize_t n = send(c->fd, c->out + c->out_head, c->out_len, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-                int r = poll(&pfd, 1, stall_ms);
-                if (r > 0 || (r < 0 && errno == EINTR)) continue;
-                return r == 0 ? SEND_STALLED : -1;
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
-        p += n;
-        remaining -= (int)n;
+        c->out_head += (size_t)n;
+        c->out_len -= (size_t)n;
+        c->out_progress_ms = monotonic_ms();
     }
+    c->out_head = 0;
     return 0;
+}
+
+/* Drop a client that has stopped reading, and say so: a viewer that keeps
+ * reconnecting and being dropped is otherwise just a UI that never
+ * updates.  A client that has simply gone (closed tab) is not news. */
+static void drop_behind(ws_server_t *srv, int idx, const char *how) {
+    ws_client_t *c = &srv->clients[idx];
+    if (c->state == CLIENT_WS) {
+        fflush(stdout);
+        fprintf(stderr, "ws_server: dropped a WebSocket client that stopped "
+                "reading (%s, %zu bytes unsent)\n", how, c->out_len);
+    }
+    close_client(srv, idx);
+}
+
+/* The client's reply is queued: close it now if it has all gone out, else
+ * once ws_server_poll has sent the rest. */
+static void finish_client(ws_server_t *srv, int idx) {
+    ws_client_t *c = &srv->clients[idx];
+    if (c->out_len == 0)
+        close_client(srv, idx);
+    else
+        c->close_when_sent = 1;
 }
 
 /* ---- Request vetting ----
@@ -317,13 +379,20 @@ static void log_refusal(ws_server_t *srv, const char *why, const char *what) {
     srv->refused_unlogged = 0;
 }
 
+/* Answer a short status-only reply and close. */
+static void reply_and_close(ws_server_t *srv, int idx, const char *status) {
+    char resp[128];
+    int n = snprintf(resp, sizeof(resp), "HTTP/1.1 %s\r\nContent-Length: 0\r\n"
+                     "Connection: close\r\n\r\n", status);
+    if (client_write(&srv->clients[idx], resp, (size_t)n) != 0)
+        close_client(srv, idx);
+    else
+        finish_client(srv, idx);
+}
+
 static void refuse(ws_server_t *srv, int idx, const char *why, const char *what) {
-    ws_client_t *c = &srv->clients[idx];
     log_refusal(srv, why, what);
-    const char *resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
-                       "Connection: close\r\n\r\n";
-    send(c->fd, resp, (int)strlen(resp), MSG_NOSIGNAL);
-    close_client(srv, idx);
+    reply_and_close(srv, idx, "403 Forbidden");
 }
 
 /* ---- HTTP / WebSocket handling ---- */
@@ -401,7 +470,10 @@ static void handle_http_request(ws_server_t *srv, int idx) {
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Accept: %s\r\n\r\n", accept);
-        send(c->fd, resp, rlen, 0);
+        if (client_write(c, resp, (size_t)rlen) != 0) {
+            close_client(srv, idx);
+            return;
+        }
         c->state = CLIENT_WS;
         c->recv_len = 0;
         return;
@@ -418,19 +490,18 @@ static void handle_http_request(ws_server_t *srv, int idx) {
             "Cache-Control: no-cache, no-store\r\n"
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n", blen);
-        /* send_all: a single send() on this non-blocking socket delivers
-         * what fits the socket buffer and silently drops the rest. */
-        int stall_ms = send_stall_ms(hlen + blen);
-        if (send_all(c->fd, hdr, hlen, stall_ms) == 0)
-            send_all(c->fd, body, blen, stall_ms);
-        close_client(srv, idx);
+        /* One send() delivers what fits the socket buffer; the rest of the
+         * page waits in the queue and the slot closes once it has gone. */
+        if (client_write(c, hdr, (size_t)hlen) != 0 ||
+            client_write(c, body, (size_t)blen) != 0)
+            close_client(srv, idx);
+        else
+            finish_client(srv, idx);
         return;
     }
 
     /* 404 for everything else */
-    const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    send(c->fd, resp, (int)strlen(resp), 0);
-    close_client(srv, idx);
+    reply_and_close(srv, idx, "404 Not Found");
 }
 
 static void handle_ws_frame(ws_server_t *srv, int idx) {
@@ -501,15 +572,14 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
         if (opcode == 0x8) {
             /* Close frame — send close back */
             uint8_t close_frame[2] = { 0x88, 0x00 };
-            send_all(c->fd, close_frame, 2, SEND_STALL_MS);
+            client_write(c, close_frame, 2);
             close_client(srv, idx);
             return;
         } else if (opcode == 0x9) {
             /* Ping — respond with pong */
             uint8_t pong[2] = { 0x8A, (uint8_t)(payload_len & 0x7F) };
-            if (send_all(c->fd, pong, 2, SEND_STALL_MS) != 0 ||
-                send_all(c->fd, buf + header_len, (int)payload_len,
-                         SEND_STALL_MS) != 0) {
+            if (client_write(c, pong, 2) != 0 ||
+                client_write(c, buf + header_len, (size_t)payload_len) != 0) {
                 close_client(srv, idx);
                 return;
             }
@@ -604,25 +674,34 @@ void ws_server_poll(ws_server_t *srv) {
 
     int64_t now_ms = monotonic_ms();
     for (int i = 0; i < srv->client_count; i++) {
-        if (srv->clients[i].state == CLIENT_HTTP &&
-            now_ms - srv->clients[i].accepted_ms > HTTP_REQUEST_MS) {
+        ws_client_t *c = &srv->clients[i];
+        if (c->state == CLIENT_HTTP &&
+            now_ms - c->accepted_ms >
+                (c->close_when_sent ? HTTP_RESPONSE_MS : HTTP_REQUEST_MS)) {
             close_client(srv, i); i--;
+        } else if (c->out_len > 0 && now_ms - c->out_progress_ms > OUT_STALL_MS) {
+            char how[48];
+            snprintf(how, sizeof(how), "took nothing for %d s", OUT_STALL_MS / 1000);
+            drop_behind(srv, i, how); i--;
         }
     }
 
-    fd_set read_fds;
+    fd_set read_fds, write_fds;
     FD_ZERO(&read_fds);
+    FD_ZERO(&write_fds);
     FD_SET(srv->listen_fd, &read_fds);
     int max_fd = srv->listen_fd;
 
     for (int i = 0; i < srv->client_count; i++) {
-        FD_SET(srv->clients[i].fd, &read_fds);
-        if (srv->clients[i].fd > max_fd)
-            max_fd = srv->clients[i].fd;
+        ws_client_t *c = &srv->clients[i];
+        FD_SET(c->fd, &read_fds);
+        if (c->out_len > 0) FD_SET(c->fd, &write_fds);
+        if (c->fd > max_fd)
+            max_fd = c->fd;
     }
 
     struct timeval tv = { 0, 0 }; /* non-blocking */
-    int ready = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+    int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, &tv);
     if (ready <= 0) return;
 
     /* Accept new connections */
@@ -635,10 +714,18 @@ void ws_server_poll(ws_server_t *srv) {
                 set_nonblocking(client_fd);
                 int flag = 1;
                 setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+                /* The client's queue is the buffer, so the kernel's is kept
+                 * small and fixed (Linux would otherwise grow it to
+                 * megabytes): OUT_QUEUE_MAX and OUT_STALL_MS are then the
+                 * bounds on a client that stopped reading, not the kernel's
+                 * buffer plus them.  64 KB is 25 Mbit/s at a 20 ms RTT,
+                 * more than the UI needs. */
+                int sndbuf = 64 * 1024;
+                setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
                 ws_client_t *c = &srv->clients[srv->client_count++];
+                memset(c, 0, sizeof(*c));
                 c->fd = client_fd;
                 c->state = CLIENT_HTTP;
-                c->recv_len = 0;
                 c->accepted_ms = now_ms;
             } else {
                 /* Full: say so rather than hang up without a word. */
@@ -650,10 +737,35 @@ void ws_server_poll(ws_server_t *srv) {
         }
     }
 
+    /* Send what the writable clients will take */
+    for (int i = 0; i < srv->client_count; i++) {
+        ws_client_t *c = &srv->clients[i];
+        if (c->out_len == 0 || !FD_ISSET(c->fd, &write_fds))
+            continue;
+        if (client_flush(c) < 0 || (c->out_len == 0 && c->close_when_sent)) {
+            close_client(srv, i); i--;
+        }
+    }
+
     /* Read from existing clients */
     for (int i = 0; i < srv->client_count; i++) {
         if (!FD_ISSET(srv->clients[i].fd, &read_fds))
             continue;
+
+        /* A client whose reply is queued has nothing more to say: its
+         * input is read and dropped, which notices it hanging up and,
+         * for a request that did not fit, takes the rest of it off the
+         * socket so closing does not reset the connection under the
+         * reply. */
+        if (srv->clients[i].close_when_sent) {
+            char sink[1024];
+            ssize_t n = recv(srv->clients[i].fd, sink, sizeof(sink), 0);
+            if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN &&
+                           errno != EWOULDBLOCK)) {
+                close_client(srv, i); i--;
+            }
+            continue;
+        }
 
         ws_client_t *c = &srv->clients[i];
         int space = RECV_BUF - c->recv_len - 1;
@@ -697,23 +809,16 @@ static int ws_build_header(uint8_t *header, uint8_t opcode, int len) {
 
 static void broadcast_frame(ws_server_t *srv, const uint8_t *header, int hlen,
                             const void *data, int len) {
-    int stall_ms = send_stall_ms(hlen + len);
     for (int i = 0; i < srv->client_count; i++) {
-        if (srv->clients[i].state != CLIENT_WS)
+        ws_client_t *c = &srv->clients[i];
+        if (c->state != CLIENT_WS)
             continue;
-        int r = send_all(srv->clients[i].fd, header, hlen, stall_ms);
+        int r = client_write(c, header, (size_t)hlen);
         if (r == 0)
-            r = send_all(srv->clients[i].fd, data, len, stall_ms);
-        if (r < 0) {
-            /* A stall is said out loud: a viewer that keeps reconnecting
-             * and being dropped is otherwise just a UI that never updates.
-             * A client that has simply gone (closed tab) is not news. */
-            if (r == SEND_STALLED) {
-                fflush(stdout);
-                fprintf(stderr, "ws_server: dropped a WebSocket client that "
-                        "took no data for %d ms (a %d-byte message)\n",
-                        stall_ms, hlen + len);
-            }
+            r = client_write(c, data, (size_t)len);
+        if (r == CLIENT_BEHIND) {
+            drop_behind(srv, i, "over the queue limit"); i--;
+        } else if (r < 0) {
             close_client(srv, i); i--;
         }
     }
@@ -763,8 +868,10 @@ void ws_server_destroy(ws_server_t *srv) {
         fprintf(stderr, "ws_server: %u more request(s) refused since the last "
                 "report\n", srv->refused_unlogged);
     }
-    for (int i = 0; i < srv->client_count; i++)
+    for (int i = 0; i < srv->client_count; i++) {
         close(srv->clients[i].fd);
+        free(srv->clients[i].out);
+    }
     close(srv->listen_fd);
     free(srv->html);
     free(srv);
