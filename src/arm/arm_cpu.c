@@ -270,9 +270,17 @@ static inline void arm_insn_snapshot(arm_cpu_t *cpu) {
 
 /* Can an access by this core be refused at all: a bus-side permission
  * check installed, or the security extension's attribution unit? The
- * interpreter keeps the snapshot state only then. A macro: as an inline
- * function inside __builtin_expect in the prologue, gcc laid the unlikely
- * block out in the hot path (-20 % on arm-bench alu-reg, x86-64). */
+ * interpreter keeps the snapshot state only then.
+ *
+ * Code layout. arm_step_interpreter is one large function, and the
+ * compiler's placement of its cold fault paths moves the hot dispatch
+ * measurably. Three constructs here are shaped by that, not by
+ * semantics: this predicate is a macro (as an inline function inside
+ * __builtin_expect the unlikely block landed in the hot path), and
+ * arm_insn_snapshot_slow (reached from hundreds of mem_* sites) and
+ * arm_vlstm_vlldm are noinline. Nothing checks
+ * layout automatically: vet any edit of the interpreter loop with
+ * arm-bench against the base, per compiler and host. */
 #define ARM_PRECISE_FAULTS(cpu) \
     ((cpu)->io_access_check != NULL || (cpu)->tz_enabled)
 
@@ -1840,9 +1848,8 @@ static inline void arm_trace_step(arm_cpu_t *cpu) {
 }
 
 /* ARMv8-M VLSTM (store S0-S15 + FPSCR at [Rn]) / VLLDM (restore them):
- * one CMSE world switch each, so cold. Out of line because inlined in the
- * interpreter it moved the IT-block hot path (-7 % on arm-bench it-block,
- * gcc x86-64); out of line the layout is +5 %. */
+ * one CMSE world switch each, so cold. Out of line for code layout (see
+ * ARM_PRECISE_FAULTS). */
 static void __attribute__((noinline)) arm_vlstm_vlldm(arm_cpu_t *cpu, uint16_t hw1) {
     uint32_t base = cpu->reg[hw1 & 0xF];
     if ((hw1 & 0x0010) == 0)
@@ -4223,7 +4230,6 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                  * only once all 17 words are accepted, since the
                  * precise-fault undo does not cover the FP registers. */
                 arm_vlstm_vlldm(cpu, hw1);
-                (void)insn32;
             } else if ((hw1 & 0xEC00) == 0xEC00) {
                 /* Cortex-M4F single-precision VFP. Real implementations
                  * live in arm_vfp.c — `arm_vfp_step` returns true if it
