@@ -3132,6 +3132,53 @@ static void test_trustzone_blxns(void) {
     }
 }
 
+/* FNC_RETURN pops the return address and signature from the Secure stack
+ * as accesses of the returning instruction: a refused pop (the Secure SP
+ * in a claimed peripheral) is a precise BusFault on the BX or POP that
+ * carried it, with the world switch reverted — the frame is on the
+ * Non-secure stack, the Non-secure registers are as they were. Reached
+ * through BX LR and through POP {pc}, the two ways a callee returns. */
+static void test_trustzone_fnc_return_refused(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone FNC_RETURN refused-pop tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+
+    for (int pop = 0; pop < 2; pop++) {
+        const char *what = pop ? "POP {pc} FNC_RETURN refused" : "BX FNC_RETURN refused";
+        char name[96];
+        bf_setup(&cpu, &nvic);                   /* Non-secure thread, MSP */
+        cpu.msp_s = 0x40001000;                  /* Secure stack in the refused page */
+        if (pop) {
+            write_thumb16(&cpu, CODE_BASE, 0xBD00);            /* POP {pc} */
+            arm_write32(&cpu, BF_NS_SP, 0xFEFFFFFFu);
+            cpu.reg[ARM_LR] = 0x12345678;
+        } else {
+            write_thumb16(&cpu, CODE_BASE, 0x4770);            /* BX LR */
+            cpu.reg[ARM_LR] = 0xFEFFFFFFu;
+        }
+        arm_step(&cpu, 1);
+        snprintf(name, sizeof name, "%s: BusFault taken", what);
+        assert_eq(name, BF_HANDLER, cpu.reg[ARM_PC]);
+        snprintf(name, sizeof name, "%s: BFAR = the first pop", what);
+        assert_eq(name, 0x40001000, arm_read32(&cpu, 0xE000ED38));
+        snprintf(name, sizeof name, "%s: no SecureFault recorded", what);
+        assert_eq(name, 0, (int)cpu.sfsr);
+        snprintf(name, sizeof name, "%s: frame on the NS stack", what);
+        assert_eq(name, BF_NS_FRAME, cpu.msp_ns);
+        snprintf(name, sizeof name, "%s: stacked PC = the return", what);
+        assert_eq(name, CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+        snprintf(name, sizeof name, "%s: stacked LR", what);
+        assert_eq(name, pop ? 0x12345678 : 0xFEFFFFFFu, arm_read32(&cpu, BF_NS_FRAME + 20));
+        snprintf(name, sizeof name, "%s: Secure SP untouched", what);
+        assert_eq(name, 0x40001000, cpu.reg[ARM_SP]);
+        snprintf(name, sizeof name, "%s: handler patches the frame, back Non-secure", what);
+        arm_step(&cpu, 5);                       /* MRS, LDR, ADDS, STR, BX LR */
+        assert_true(name, !cpu.secure && cpu.reg[ARM_PC] == CODE_BASE + 2);
+        snprintf(name, sizeof name, "%s: NS SP back", what);
+        assert_eq(name, BF_NS_SP, cpu.reg[ARM_SP]);
+    }
+}
+
 /* Non-secure code must not execute from Secure memory, and may fetch from
  * the non-secure-callable window only what a gateway entry is: SG. The check
  * is cached per uniformly-attributed window, so a page holding both
@@ -3353,6 +3400,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_nvic_itns();
     test_trustzone_instrumentation();
     test_trustzone_blxns();
+    test_trustzone_fnc_return_refused();
     test_trustzone_ns_fetch();
     test_trustzone_bus_fault();
     test_trustzone_nmi_target();

@@ -1039,13 +1039,25 @@ static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
 /* ARMv8-M FNC_RETURN (0xFExxxxxx): return from a Non-secure callee to the
  * Secure caller that invoked it via BLXNS. Restore Secure state (and its
  * stack), then pop the return address + integrity signature BLXNS pushed. A
- * corrupted signature raises a SecureFault (INVIS). */
+ * corrupted signature raises a SecureFault (INVIS).
+ *
+ * The pops are this instruction's own accesses, checked like any other
+ * (the bus check can refuse them: a Secure SP in peripheral space). The
+ * snapshot is taken before the world switch so the precise BusFault
+ * undoes the Non-secure registers, and the switch itself is reverted
+ * here, since the undo restores registers only; the return then does
+ * nothing, and INVIS can only follow accepted reads. */
 static void arm_fnc_return(arm_cpu_t *cpu, uint32_t magic) {
     (void)magic;
+    arm_insn_snapshot(cpu);
     arm_switch_security_state(cpu, true);
     uint32_t sp = cpu->reg[ARM_SP];
-    uint32_t ret = arm_read32(cpu, sp + 0);
-    uint32_t sig = arm_read32(cpu, sp + 4);
+    uint32_t ret = mem_read32(cpu, sp + 0);
+    uint32_t sig = mem_read32(cpu, sp + 4);
+    if (__builtin_expect(arm_insn_refused(cpu), 0)) {
+        arm_switch_security_state(cpu, false);
+        return;
+    }
     arm_tz_trace(cpu, "fnc-return", ret, sig);
     if (sig != 0xFEFA125Au) {
         cpu->sfsr |= ARM_SFSR_INVIS;
@@ -4260,9 +4272,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * them would be lost, the instruction's writes standing. None can
          * be recorded: SG makes no data access, a POP/LDM whose earlier
          * beat was refused never performs its FNC_RETURN (arm_load_pc),
-         * and FNC_RETURN's own stack reads are Secure (the attribution
-         * unit passes them) and in SRAM (the bus check never sees them)
-         * unless the Secure SP points into peripheral space. */
+         * and FNC_RETURN gives up before its signature check when one of
+         * its own stack pops is refused (arm_fnc_return). */
         if (cpu->tz_enabled && cpu->secure_fault_pending) {
             cpu->secure_fault_pending = false;
 #ifdef DEBUG
