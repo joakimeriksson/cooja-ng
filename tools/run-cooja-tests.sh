@@ -73,7 +73,8 @@ while [ $# -gt 0 ]; do
             echo "  -v, --verbose: show test output"
             echo "  --no-build: skip auto-building missing firmware"
             echo "  --with-tun: include border-router tests (requires sudo for TUN)"
-            echo "  --clean: wipe firmware/<target>/* before running (forces full rebuild)"
+            echo "  --clean: remove local firmware builds from firmware/{cooja,sky,z1} before"
+            echo "           running (forces a rebuild); shipped firmware is kept"
             echo "  --seed N: run with random seed N instead of each .csc's own (Cooja --random-seed)"
             echo "  --logdir DIR: write DIR/<category>/<csc-name>.testlog per test (Contiki-NG tests/ layout)"
             echo ""
@@ -143,16 +144,19 @@ esac
 FIRMWARE_DIR="$CSIM_DIR/firmware/$FIRMWARE_TARGET"
 
 if [ "$CLEAN" -eq 1 ]; then
-    # Wipe every Cooja-suite firmware target so nothing is reused across the
-    # rebuild.  cc2538dk is left alone — it belongs to the standalone ARM
-    # test_runner suite, not to the Cooja suite.
+    # Remove the local firmware builds of every Cooja-suite target, so none is
+    # reused across the rebuild.  cc2538dk is left alone — it belongs to the
+    # standalone ARM test_runner suite, not to the Cooja suite.
     #
     # Only local builds are removed.  firmware/sky and firmware/z1 also hold
     # shipped prebuilt images that cannot be rebuilt without msp430-gcc, and
-    # deleting those broke every test that needs them.  In a git checkout the
-    # shipped images are the tracked ones; outside one they cannot be told
-    # apart from local builds, so nothing is removed.
-    if git -C "$CSIM_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # deleting those broke every test that needs them.  In a git checkout of
+    # this tree the shipped images are the tracked ones.  Otherwise they cannot
+    # be told apart from local builds, so nothing is removed — and being
+    # *inside* some other repository (a dotfiles-managed $HOME, a monorepo)
+    # does not count: none of this tree's files is tracked there.
+    csim_top=$(git -C "$CSIM_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -n "$csim_top" ] && [ "$csim_top" -ef "$CSIM_DIR" ]; then
         for sub in cooja sky z1; do
             d="$CSIM_DIR/firmware/$sub"
             [ -d "$d" ] || continue
@@ -167,7 +171,7 @@ if [ "$CLEAN" -eq 1 ]; then
             echo "  CLEAN $d (removed $wiped local firmware builds)"
         done
     else
-        echo "  CLEAN skipped: not a git checkout, so shipped firmware cannot be"
+        echo "  CLEAN skipped: $CSIM_DIR is not a git checkout, so shipped firmware cannot be"
         echo "        told apart from local builds; remove stale ones by hand"
     fi
 fi
@@ -312,6 +316,9 @@ for csc_file in $csc_files; do
         errors=$((errors + 1))
         continue
     fi
+    # csc2json warns when a test falls back to shipped firmware named by the
+    # old scheme, which may have been built from another directory.
+    grep '^WARNING: ' "$conv_log" | sed "s|^WARNING: |  WARN  $test_name: |" || true
 
     # Check if test has any meaningful test criteria
     has_test=$(python3 -c "

@@ -71,7 +71,7 @@ for csc in "$CONTIKI_DIR"/tests/$PATTERN/*.csc; do
     # Skip z1-only and drift tests (no z1 platform support)
     echo "$csc" | grep -qiE "drift|z1" && continue
 
-    python3 "$CSC2JSON" "$csc" --firmware-dir "$FW_DIR" --js-native 2>/dev/null | \
+    python3 "$CSC2JSON" "$csc" --contiki "$CONTIKI_DIR" --firmware-dir "$FW_DIR" --js-native 2>/dev/null | \
     python3 -c "
 import json, sys, os, re
 d = json.load(sys.stdin)
