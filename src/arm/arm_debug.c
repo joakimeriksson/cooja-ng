@@ -28,11 +28,17 @@ bool arm_debug_stop(arm_cpu_t *cpu) {
 void arm_dbg_release(arm_cpu_t *cpu, int64_t now_ns) {
     if (cpu->dbg_hit_kind == 1 && (cpu->reg[ARM_PC] & ~1u) == cpu->dbg_hit_pc)
         cpu->dbg_skip_pc = cpu->dbg_hit_pc;
+    cpu->dbg_skip_started = false;
     cpu->dbg_halted = false;
     if (now_ns > cpu->sim_time_ns) {
         cpu->lpm_ns += now_ns - cpu->sim_time_ns;
         cpu->sim_time_ns = now_ns;
     }
+    /* Anchor as the tick does: an event drain on a sync path before the
+     * first tick derives sim_time_ns from the anchor, and a stale one would
+     * set it back to the halt instant while peripheral callbacks run. */
+    cpu->anchor_sim_time_ns = now_ns;
+    cpu->anchor_cycles = cpu->cycles;
     cpu->last_execute_us = now_ns / 1000LL;
 }
 

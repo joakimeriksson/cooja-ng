@@ -1329,9 +1329,8 @@ static int cmd_console(shell_service_t *s, int argc, char **argv, const char *li
 /* --- scheduling ------------------------------------------------------------ */
 
 /* Validate a command that at/every/on will run later.  Blocking commands
- * are refused: they would take over the command stream's own wait. */
-
-
+ * are refused (they would take over the command stream's own wait), and so
+ * is one that discards the stream (restart). */
 static int check_command_text(shell_service_t *s, const char *what, const char *cmd) {
     /* The text is kept as given (expanded, escaped); like exec_tokens it
      * can hold escaped values, so the token storage matches. */

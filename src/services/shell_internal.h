@@ -53,9 +53,10 @@ void shell_complete(const char *prefix, linenoiseCompletions *lc);
  * or -1 after printing an error. */
 int  shell_exec_line(shell_service_t *s, const char *line, bool immediate_only,
                      const shell_origin_t *origin);
-/* Would this command line block the stream?  (expect, sleep, wait-until,
- * step, source, and run with a duration.) */
-bool shell_cmd_blocks(const shell_command_t *c, int argc);   /* holds the command stream? */
+/* Would this command, with these arguments, hold the command stream?
+ * (SHELL_CMD_BLOCKING: expect, sleep, wait-until, step, source, ...; and
+ * run with a duration.) */
+bool shell_cmd_blocks(const shell_command_t *c, int argc);
 /* Refuse a command that needs the simulation's own clock while an external
  * clock source (Renode) drives it.  Returns true (and prints) if refused. */
 bool shell_refuse_external_clock(shell_service_t *s, const char *what);
