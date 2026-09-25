@@ -33,21 +33,36 @@ sends raw requests shaped like the ones a browser would send, asserting:
     is refused when the options are parsed, and a --ui that cannot start
     (port in use) ends the run -- neither is ignored for the whole run;
   - a ui/index.html that is a FIFO with no writer, or a directory, does not
-    hang startup or serve an empty page: the built-in page is served.
+    hang startup or serve an empty page: the built-in page is served; an
+    empty one is served as it is, without a warning;
+  - a request that does not fit the input buffer is answered 431, not
+    dropped, and 6 KB of cookies (localhost cookies are shared across
+    ports) still gets the page;
+  - a client that stops reading, or reads the page a byte at a time,
+    never holds the simulation thread: a healthy viewer keeps its cadence
+    meanwhile, and the one that stopped reading is dropped with a line on
+    stderr;
+  - the refusal log is kept per reason, and the refusals held back by its
+    once-a-second limit are counted as soon as their second is over;
+  - with --gdb-wait, a --ui that cannot start ends the run before it
+    blocks for a debugger.
 
 Usage: tools/check-ui-access.py        (RUNNER=... to override the binary)
 """
 import os
+import re
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 RUNNER = os.environ.get('RUNNER', os.path.join(ROOT, 'build', 'test_runner'))
 FIRMWARE = os.path.join(ROOT, 'firmware', 'sky', 'hello-world.sky')
+ARM_FIRMWARE = os.path.join(ROOT, 'firmware', 'cc2538dk', 'hello-world.cc2538dk')  # --gdb is ARM-only
 
 
 def free_port():
@@ -166,11 +181,11 @@ def pong_for(port, size, fin=True):
         return f'error: {e}'
 
 
-def exit_code(*args):
+def exit_code(*args, firmware=FIRMWARE):
     """The runner's exit code for these options (they should be refused at
     once, so a run that is still going after a few seconds is a failure)."""
     try:
-        return subprocess.run([RUNNER, 'mixed-multinode', FIRMWARE, '-t', '1000',
+        return subprocess.run([RUNNER, 'mixed-multinode', firmware, '-t', '1000',
                                '-q', *args], stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=10).returncode
     except subprocess.TimeoutExpired:
@@ -209,6 +224,41 @@ class Runner:
 
 
 failed = 0
+
+
+def largest_gap(s, seconds, until=None):
+    """The longest wait between two frames from the server on s over
+    `seconds` (or until `until`() holds, checked a few times a second), as
+    'under 500 ms' when it is, else the figure; 'closed' if s is hung up on."""
+    t0 = last = checked = time.time()
+    worst = 0.0
+    while time.time() - t0 < seconds:
+        if ws_next(s) is None:
+            return 'closed'
+        now = time.time()
+        worst = max(worst, now - last)
+        last = now
+        if until and now - checked > 0.2:
+            checked = now
+            if until():
+                break
+    return 'under 500 ms' if worst < 0.5 else f'{worst * 1000:.0f} ms'
+
+
+def refusals(err, reason):
+    """How many refusals for `reason` the stderr bytes `err` account for:
+    the lines logged, each with the count it says were held back, plus the
+    counts reported on their own once a second was over."""
+    n = 0
+    for line in err.decode(errors='replace').splitlines():
+        if f'refused request: {reason} ' in line:
+            m = re.search(r'\((\d+) more since', line)
+            n += 1 + (int(m.group(1)) if m else 0)
+        else:
+            m = re.fullmatch(r'ws_server: (\d+) more request\(s\) refused: ' + re.escape(reason), line)
+            if m:
+                n += int(m.group(1))
+    return n
 
 
 def expect(name, got, want):
@@ -260,6 +310,10 @@ def main():
                        'sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n'), '101')
         expect('Origin twice', status(a, port, host=here, origin=f'http://{here}',
                                       headers='Origin: http://evil.example\r\n'), '403')
+        expect('6 KB of cookies, page served', status(a, port, path='/', upgrade=False, host=here,
+               headers='Cookie: a=' + 'x' * 6000 + '\r\n'), '200')
+        expect('20 KB of cookies (does not fit)', status(a, port, path='/', upgrade=False,
+               host=here, headers='Cookie: a=' + 'x' * 20000 + '\r\n'), '431')
         expect('125-byte ping', pong_for(port, 125), 'echo')
         expect('200-byte ping (over the control-frame cap)', pong_for(port, 200), 'closed')
         expect('fragmented ping (FIN=0)', pong_for(port, 4, fin=False), 'closed')
@@ -270,6 +324,18 @@ def main():
         err = r.errors()
         expect('refused Host logged escaped',
                (b'\x1b' not in err, b'\\x1b]0;x\\x07' in err), (True, True))
+
+        time.sleep(1.1)             # let the log's second turn over first
+        seen = len(r.errors())
+        for _ in range(10):         # a burst of two reasons, interleaved
+            status(a, port, path='/', upgrade=False, host=rebind)
+            status(a, port, host=here, origin='http://evil.example')
+        time.sleep(1.3)             # the held-back counts come out when their second is over
+        err = r.errors()[seen:]
+        expect('refusal burst: every non-loopback Host accounted for within the second',
+               refusals(err, 'non-loopback Host'), 10)
+        expect('refusal burst: every cross-origin upgrade accounted for, on its own line',
+               refusals(err, 'cross-origin WebSocket from'), 10)
 
         idle = [socket.create_connection((a, port)) for _ in range(8)]
         try:
@@ -292,23 +358,82 @@ def main():
         taken.listen()
         expect('--ui on a port already in use',
                exit_code('--ui', str(taken.getsockname()[1])), 2)
+        expect('... with --gdb-wait: exits before waiting for the debugger',
+               exit_code('--ui', str(taken.getsockname()[1]), '--gdb', f'1:{free_port()}',
+                         '--gdb-wait', firmware=ARM_FIRMWARE), 2)
 
-    for kind in ('FIFO', 'directory'):
+    for kind in ('a FIFO', 'a directory', 'an empty file'):
         port = free_port()
-        print(f'== ui/index.html is a {kind} (port {port})')
+        print(f'== ui/index.html is {kind} (port {port})')
         with tempfile.TemporaryDirectory() as tmp:
             os.mkdir(os.path.join(tmp, 'ui'))
             page = os.path.join(tmp, 'ui', 'index.html')
-            if kind == 'FIFO':
+            if kind == 'a FIFO':
                 os.mkfifo(page)
-            else:
+            elif kind == 'a directory':
                 os.mkdir(page)
+            else:
+                open(page, 'w').close()
             r = Runner(port, cwd=tmp)     # exits the check if it never listens
             try:
-                expect('built-in page served', status('127.0.0.1', port, path='/',
+                expect('page served', status('127.0.0.1', port, path='/',
                        upgrade=False, host=f'localhost:{port}'), '200')
+                expect('warned about it', b'Warning:' in r.errors(), kind != 'an empty file')
             finally:
                 r.close()
+
+    port = free_port()
+    here = f'localhost:{port}'
+    print(f'== a client that stops reading (--speed max, 1 MB page, port {port})')
+    # A page larger than the kernel's socket buffers, so that a client that
+    # does not read leaves the server holding some of it.
+    tmp = tempfile.TemporaryDirectory()
+    os.mkdir(os.path.join(tmp.name, 'ui'))
+    with open(os.path.join(tmp.name, 'ui', 'index.html'), 'w') as page:
+        page.write('<!-- ' + 'x' * (1024 * 1024) + ' -->')
+    r = Runner(port, '--speed', 'max', cwd=tmp.name)
+    try:
+        a = '127.0.0.1'
+        healthy = ws_open(port)
+        trickler = socket.socket()
+        trickler.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)  # or the page fits
+        trickler.connect((a, port))
+        trickler.sendall(f'GET / HTTP/1.1\r\nHost: {here}\r\n\r\n'.encode())
+        stop = threading.Event()
+
+        def trickle():              # the page, one byte every 190 ms
+            while not stop.is_set():
+                try:
+                    if not trickler.recv(1):
+                        return
+                except OSError:
+                    return
+                time.sleep(0.19)
+        t = threading.Thread(target=trickle, daemon=True)
+        t.start()
+        expect('healthy viewer while GET / is read a byte at a time', largest_gap(healthy, 3),
+               'under 500 ms')
+        stop.set()
+        trickler.close()
+        t.join()
+
+        stalled = socket.socket()
+        stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)   # fills sooner
+        stalled.connect((a, port))
+        stalled.sendall(b'GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n'
+                        b'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+                        b'Sec-WebSocket-Version: 13\r\n\r\n')
+        # ... and never reads.  Dropped once the socket has taken nothing
+        # for 10 s; the healthy viewer must not notice.
+        dropped = lambda: b'stopped reading' in r.errors()
+        expect('healthy viewer while another stops reading', largest_gap(healthy, 30, dropped),
+               'under 500 ms')
+        expect('the one that stopped reading is dropped, and logged', dropped(), True)
+        stalled.close()
+        healthy.close()
+    finally:
+        r.close()
+        tmp.cleanup()
 
     port = free_port()
     here = f'localhost:{port}'
