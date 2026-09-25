@@ -13,9 +13,53 @@
 
 #include "cJSON.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define UI_PAGE_PATH "ui/index.html"
+#define UI_PAGE_MAX  (16L * 1024L * 1024L)
+
+/* Serve ui/index.html if it is a regular file of at most UI_PAGE_MAX bytes;
+ * otherwise say why and leave the server's built-in page.  The file is
+ * opened non-blocking and checked with fstat before it is read: a FIFO with
+ * no writer would block a plain fopen() before the simulation starts, an
+ * unseekable stream has no length to size the buffer with, and a directory
+ * opens and reads as an empty page. */
+static void load_page(ws_server_t *server) {
+    int fd = open(UI_PAGE_PATH, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "Warning: cannot open " UI_PAGE_PATH " (%s), serving "
+                        "default page\n", strerror(errno));
+        return;
+    }
+    struct stat st;
+    char *html = NULL;
+    ssize_t rd = -1;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size <= UI_PAGE_MAX &&
+        (html = malloc((size_t)st.st_size + 1)) != NULL) {
+        size_t got = 0;
+        ssize_t n = 1;
+        while (got < (size_t)st.st_size &&
+               ((n = read(fd, html + got, (size_t)st.st_size - got)) > 0 ||
+                (n < 0 && errno == EINTR)))
+            if (n > 0) got += (size_t)n;
+        rd = n < 0 ? -1 : (ssize_t)got;
+    }
+    if (rd >= 0) {
+        html[rd] = '\0';
+        ws_server_set_html(server, html, (int)rd);
+    } else {
+        fprintf(stderr, "Warning: " UI_PAGE_PATH " is not a readable file of "
+                        "at most %ld bytes, serving default page\n", UI_PAGE_MAX);
+    }
+    free(html);
+    close(fd);
+}
 
 void ui_service_poll(websocket_ui_service_t *svc) {
     if (svc->server) ws_server_poll(svc->server);
@@ -122,31 +166,7 @@ bool ui_service_start(websocket_ui_service_t *svc, const char *bind_addr, int po
     if (!svc->server)
         return false;
     ws_server_set_message_callback(svc->server, ui_message_handler, svc);
-    /* Load HTML from ui/index.html */
-    FILE *hf = fopen("ui/index.html", "r");
-    if (hf) {
-        fseek(hf, 0, SEEK_END);
-        long hlen = ftell(hf);
-        fseek(hf, 0, SEEK_SET);
-        /* ftell is -1 on an unseekable stream (a pipe, a FIFO), which would
-         * size the buffer at 0 and let fread write past it. */
-        #define UI_PAGE_MAX (16L * 1024L * 1024L)
-        char *html = NULL;
-        if (hlen < 0 || hlen > UI_PAGE_MAX)
-            fprintf(stderr, "Warning: ui/index.html is not a readable file, "
-                            "serving default page\n");
-        else
-            html = malloc((size_t)hlen + 1);
-        if (html) {
-            size_t rd = fread(html, 1, (size_t)hlen, hf);
-            html[rd] = '\0';
-            ws_server_set_html(svc->server, html, (int)rd);
-            free(html);
-        }
-        fclose(hf);
-    } else {
-        fprintf(stderr, "Warning: ui/index.html not found, serving default page\n");
-    }
+    load_page(svc->server);
     svc->full_state_requested = 1;
     return true;
 }
