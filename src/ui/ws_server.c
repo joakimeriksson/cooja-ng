@@ -155,6 +155,53 @@ static void close_client(ws_server_t *srv, int idx) {
     srv->clients[idx] = srv->clients[--srv->client_count];
 }
 
+/* How long a client may make no progress draining a broadcast before it is
+ * dropped.  Broadcasts run on the simulation's own thread, so this bounds
+ * how long one stalled viewer can hold up the run.  The allowance grows with
+ * the message: a reconnecting viewer's first message is the full state, the
+ * largest one, and a browser still parsing the previous message may not
+ * read for a while.  A flat budget small enough for deltas dropped such a
+ * viewer on every reconnect, forever.  Clients are served one after
+ * another, so a round can cost this once per stalled client.  The limit is
+ * on *no progress*, not on the whole message: a client that keeps taking a
+ * few bytes at a time is slow, not gone, and is kept -- a deliberate
+ * trickle can slow the run that way, but only from where the server can
+ * be reached, which is loopback unless --ui-bind says otherwise. */
+#define SEND_STALL_MS      200
+#define SEND_STALL_MAX_MS  2000
+
+static int send_stall_ms(int len) {
+    int ms = SEND_STALL_MS + len / 1024;            /* + 1 ms per KB */
+    return ms < SEND_STALL_MAX_MS ? ms : SEND_STALL_MAX_MS;
+}
+
+/* Send all bytes, retrying on partial writes.  Returns 0 on success,
+ * SEND_STALLED when the client makes no progress for stall_ms, and -1 on
+ * any other error (typically: the client has gone).  The caller drops the
+ * client on either. */
+#define SEND_STALLED (-2)
+
+static int send_all(int fd, const void *buf, int len, int stall_ms) {
+    const uint8_t *p = (const uint8_t *)buf;
+    int remaining = len;
+    while (remaining > 0) {
+        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+                int r = poll(&pfd, 1, stall_ms);
+                if (r > 0 || (r < 0 && errno == EINTR)) continue;
+                return r == 0 ? SEND_STALLED : -1;
+            }
+            return -1;
+        }
+        p += n;
+        remaining -= (int)n;
+    }
+    return 0;
+}
+
 /* ---- Request vetting ----
  *
  * The UI accepts commands (pause, speed, restart, move), and WebSocket is
@@ -359,8 +406,11 @@ static void handle_http_request(ws_server_t *srv, int idx) {
             "Cache-Control: no-cache, no-store\r\n"
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n", blen);
-        send(c->fd, hdr, hlen, 0);
-        send(c->fd, body, blen, 0);
+        /* send_all: a single send() on this non-blocking socket delivers
+         * what fits the socket buffer and silently drops the rest. */
+        int stall_ms = send_stall_ms(hlen + blen);
+        if (send_all(c->fd, hdr, hlen, stall_ms) == 0)
+            send_all(c->fd, body, blen, stall_ms);
         close_client(srv, idx);
         return;
     }
@@ -583,34 +633,6 @@ void ws_server_poll(ws_server_t *srv) {
     }
 }
 
-/* How long a client may make no progress draining a broadcast before it is
- * dropped.  Broadcasts run on the simulation's own thread, so this bounds
- * how long one stalled viewer can hold up the run. */
-#define SEND_STALL_MS 200
-
-/* Send all bytes, retrying on partial writes.  Returns 0 on success, -1 on
- * error or when the client stops reading (the caller drops it). */
-static int send_all(int fd, const void *buf, int len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    int remaining = len;
-    while (remaining > 0) {
-        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-                int r = poll(&pfd, 1, SEND_STALL_MS);
-                if (r > 0 || (r < 0 && errno == EINTR)) continue;
-                return -1;              /* no room for SEND_STALL_MS: give up */
-            }
-            return -1;
-        }
-        p += n;
-        remaining -= (int)n;
-    }
-    return 0;
-}
-
 static int ws_build_header(uint8_t *header, uint8_t opcode, int len) {
     header[0] = 0x80 | opcode; /* FIN + opcode */
     if (len < 126) {
@@ -632,20 +654,36 @@ static int ws_build_header(uint8_t *header, uint8_t opcode, int len) {
     }
 }
 
+static void broadcast_frame(ws_server_t *srv, const uint8_t *header, int hlen,
+                            const void *data, int len) {
+    int stall_ms = send_stall_ms(hlen + len);
+    for (int i = 0; i < srv->client_count; i++) {
+        if (srv->clients[i].state != CLIENT_WS)
+            continue;
+        int r = send_all(srv->clients[i].fd, header, hlen, stall_ms);
+        if (r == 0)
+            r = send_all(srv->clients[i].fd, data, len, stall_ms);
+        if (r < 0) {
+            /* A stall is said out loud: a viewer that keeps reconnecting
+             * and being dropped is otherwise just a UI that never updates.
+             * A client that has simply gone (closed tab) is not news. */
+            if (r == SEND_STALLED) {
+                fflush(stdout);
+                fprintf(stderr, "ws_server: dropped a WebSocket client that "
+                        "took no data for %d ms (a %d-byte message)\n",
+                        stall_ms, hlen + len);
+            }
+            close_client(srv, i); i--;
+        }
+    }
+}
+
 void ws_server_broadcast(ws_server_t *srv, const char *data, int len) {
     if (!srv || len <= 0) return;
 
     uint8_t header[10];
     int hlen = ws_build_header(header, 0x01, len); /* text */
-
-    for (int i = 0; i < srv->client_count; i++) {
-        if (srv->clients[i].state != CLIENT_WS)
-            continue;
-        if (send_all(srv->clients[i].fd, header, hlen) < 0 ||
-            send_all(srv->clients[i].fd, data, len) < 0) {
-            close_client(srv, i); i--;
-        }
-    }
+    broadcast_frame(srv, header, hlen, data, len);
 }
 
 void ws_server_broadcast_binary(ws_server_t *srv, const uint8_t *data, int len) {
@@ -653,15 +691,7 @@ void ws_server_broadcast_binary(ws_server_t *srv, const uint8_t *data, int len) 
 
     uint8_t header[10];
     int hlen = ws_build_header(header, 0x02, len); /* binary */
-
-    for (int i = 0; i < srv->client_count; i++) {
-        if (srv->clients[i].state != CLIENT_WS)
-            continue;
-        if (send_all(srv->clients[i].fd, header, hlen) < 0 ||
-            send_all(srv->clients[i].fd, data, len) < 0) {
-            close_client(srv, i); i--;
-        }
-    }
+    broadcast_frame(srv, header, hlen, data, len);
 }
 
 void ws_server_set_message_callback(ws_server_t *srv, ws_message_cb_t cb, void *userdata) {
