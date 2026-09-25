@@ -426,6 +426,19 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
     while (c->recv_len >= 2) {
         uint8_t *buf = (uint8_t *)c->recv_buf;
         uint8_t opcode = buf[0] & 0x0F;
+
+        /* Each message must arrive in one frame.  Control frames may never
+         * be fragmented (RFC 6455 5.5) and this server does not reassemble
+         * data messages, which it would otherwise dispatch piece by piece,
+         * each as if whole.  RSV bits need a negotiated extension and the
+         * other opcodes are reserved (5.2): fail the connection on all. */
+        if ((buf[0] & 0x70) || !(buf[0] & 0x80) ||
+            !(opcode == 0x1 || opcode == 0x2 || opcode == 0x8 ||
+              opcode == 0x9 || opcode == 0xA)) {
+            close_client(srv, idx);
+            return;
+        }
+
         int masked = (buf[1] >> 7) & 1;
         uint64_t payload_len = buf[1] & 0x7F;
         int header_len = 2;
@@ -476,15 +489,18 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
         if (opcode == 0x8) {
             /* Close frame — send close back */
             uint8_t close_frame[2] = { 0x88, 0x00 };
-            send(c->fd, close_frame, 2, 0);
+            send_all(c->fd, close_frame, 2, SEND_STALL_MS);
             close_client(srv, idx);
             return;
         } else if (opcode == 0x9) {
             /* Ping — respond with pong */
             uint8_t pong[2] = { 0x8A, (uint8_t)(payload_len & 0x7F) };
-            send(c->fd, pong, 2, 0);
-            if (payload_len > 0)
-                send(c->fd, buf + header_len, (int)payload_len, 0);
+            if (send_all(c->fd, pong, 2, SEND_STALL_MS) != 0 ||
+                send_all(c->fd, buf + header_len, (int)payload_len,
+                         SEND_STALL_MS) != 0) {
+                close_client(srv, idx);
+                return;
+            }
         }
         /* Dispatch text/binary data frames to callback */
         if ((opcode == 0x1 || opcode == 0x2) && srv->msg_cb) {
