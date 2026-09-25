@@ -266,6 +266,18 @@ static bool bus_shares_channel(sim_radio_bus_t *bus, sim_runtime_t *sim,
            radio_medium_shares_channel(medium, sender_idx, sender_radio, i, rr);
 }
 
+/* Whether a transmission from sender_idx reaches mote i: within the
+ * sender's live range and on its channel.  Callers take their candidates
+ * from the neighbour lists, which hold the reach at the last recompute;
+ * a sender that has since lowered its output power reaches fewer of
+ * them, as the byte and frame filters already see it. */
+static bool bus_reaches(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                        int sender_idx, int sender_radio, int i) {
+    return radio_medium_in_reach(&sim->radio_medium, sender_idx,
+                                 sender_radio, i) &&
+           bus_shares_channel(bus, sim, sender_idx, sender_radio, i);
+}
+
 /* Tell every mote a transmission reaches that it occupies the channel
  * until end_ns: the sender's reception and interference neighbours, on
  * the sender's channel.  One window per transmission, from the bus's own
@@ -288,7 +300,7 @@ static void bus_on_air(sim_radio_bus_t *bus, sim_runtime_t *sim,
             if (i == sender_idx || i >= bus->node_count) continue;
             if (!bus->ops[i] || !bus->ops[i]->on_air) continue;
             if (h->node_active && !h->node_active(h->user, i)) continue;
-            if (!bus_shares_channel(bus, sim, sender_idx, sender_radio, i))
+            if (!bus_reaches(bus, sim, sender_idx, sender_radio, i))
                 continue;
             bus->ops[i]->on_air(bus->mote[i], end_ns);
         }
@@ -873,14 +885,23 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
         }
     }
 
-    /* Interference: mark queued frames on the sender's interference-range
-     * neighbours as collided if they overlap this transmission. */
+    /* Interference: this transmission corrupts every frame that overlaps
+     * it at an interference-range neighbour on its channel -- a native's
+     * queue through its mark_collisions op, an emulated queue bus-side.  The
+     * window is the frame's own, the one the reception path used above. */
     if (sim->radio_medium.type != RADIO_MEDIUM_NONE) {
         neighbor_list_t *inl = &sim->radio_medium.interference_neighbors[sender_idx];
-        int64_t int_start = now;
-        int64_t int_end = now + SIM_RADIO_INTERFERENCE_WINDOW_NS;
+        int64_t int_start = a->subghz ? now : accurate_tx_start;
+        int64_t int_end = a->subghz ? now + frame_air_dur : accurate_tx_end;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
+            if (!bus_reaches(bus, sim, sender_idx, sender_radio, i))
+                continue;
+            if (bus->ops[i] && bus->ops[i]->mark_collisions) {
+                bus->stats.frame_collided +=
+                    bus->ops[i]->mark_collisions(bus->mote[i], int_start, int_end);
+                continue;
+            }
             if (bus->delivery[i] == SIM_RADIO_DELIVERY_SYNC) continue;
             emu_rx_queue_t *q = &bus->emu_rx_queue[i];
             for (int f = 0; f < q->count; f++) {
@@ -971,12 +992,13 @@ void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, sim_runtime_t *sim,
         }
 
         /* Interference-range neighbours: mark overlapping queued frames
-         * as collided -- on the sender's channel only, since a frame on
-         * another channel cannot corrupt them. */
+         * as collided -- within the sender's live range and on its
+         * channel only, since a frame on another channel cannot corrupt
+         * them. */
         neighbor_list_t *inl = &medium->interference_neighbors[sender_idx];
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
-            if (!bus_shares_channel(bus, sim, sender_idx, 0, i))
+            if (!bus_reaches(bus, sim, sender_idx, 0, i))
                 continue;
             if (bus->ops[i] && bus->ops[i]->mark_collisions) {
                 bus->stats.frame_collided +=

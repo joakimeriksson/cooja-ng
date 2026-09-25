@@ -357,10 +357,23 @@ static void test_power_scales_range(void) {
     ASSERT(radio_medium_get_rssi(&rm, 0, 1) < rssi_full,
            "low power: weaker RSSI");
 
+    /* Live reach, what the bus's on-air and interference walks ask over
+     * the (stale) neighbour lists: the interference range scaled by the
+     * sender's current power.  15/31 leaves ~48m: 40m is still reached;
+     * 8/31 leaves ~26m: it is not. */
+    ASSERT(radio_medium_in_reach(&rm, 0, 0, 1),
+           "low power: 40m within the ~48m scaled interference range");
+    radio_medium_set_radio_power(&rm, 0, 0, 8, 31);
+    ASSERT(!radio_medium_in_reach(&rm, 0, 0, 1),
+           "lower power: 40m beyond the ~26m scaled interference range");
+    ASSERT(rm.interference_neighbors[0].count == 1,
+           "lower power: the list, computed at 15/31, still holds it");
+
     /* max==0 sentinel restores full range. */
     radio_medium_set_radio_power(&rm, 0, 0, 0, 0);
     ASSERT(radio_medium_filter_frame(&rm, 0, 1),
            "power reset (sentinel): in range again");
+    ASSERT(radio_medium_in_reach(&rm, 0, 0, 1), "power reset: reached again");
 }
 
 /* radio_medium_compute_neighbors populates neighbor lists from

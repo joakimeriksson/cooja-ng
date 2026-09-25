@@ -571,6 +571,23 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver) {
     return radio_medium_filter_frame_radio(rm, sender, 0, receiver, 0);
 }
 
+bool radio_medium_in_reach(const radio_medium_t *rm, int sender,
+                           int sender_radio, int receiver) {
+    if (rm->type == RADIO_MEDIUM_NONE)
+        return true;
+    if (!valid_node(rm, sender) || !valid_node(rm, receiver)) return true;
+    if (!valid_radio(sender_radio)) return true;
+    /* The outer of the two discs udgm_compute_neighbors draws, at the
+     * sender's live power (the lists are drawn at the power of the last
+     * recompute). */
+    double range = rm->udgm.interference_range;
+    if (rm->udgm.tx_range > range) range = rm->udgm.tx_range;
+    range *= sender_power_ratio(rm, sender, sender_radio);
+    double dx = rm->nodes[sender].x - rm->nodes[receiver].x;
+    double dy = rm->nodes[sender].y - rm->nodes[receiver].y;
+    return dx * dx + dy * dy <= range * range;
+}
+
 bool radio_medium_shares_channel(const radio_medium_t *rm,
     int sender, int sender_radio, int receiver, int receiver_radio) {
     if (__builtin_expect(rm->link_blocked != NULL, 0) &&

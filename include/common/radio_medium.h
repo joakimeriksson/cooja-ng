@@ -311,6 +311,15 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver);
 bool radio_medium_filter_frame_radio(radio_medium_t *rm,
     int sender, int sender_radio, int receiver, int receiver_radio);
 
+/* Whether receiver lies within sender's LIVE reach: its interference
+ * range (or reception range, if larger) scaled by the sender radio's
+ * current output power, as the byte and frame filters scale it.  The
+ * neighbour lists hold the reach at the last recompute; a walk over them
+ * asks this so a sender that has since lowered its power does not busy,
+ * or corrupt, nodes it no longer reaches.  NONE reaches everyone. */
+bool radio_medium_in_reach(const radio_medium_t *rm, int sender,
+                           int sender_radio, int receiver);
+
 /*
  * Whether a transmission from (sender, sender_radio) occupies the channel
  * (receiver, receiver_radio) listens on: the link is not cut, the bands

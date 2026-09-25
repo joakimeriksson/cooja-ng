@@ -124,8 +124,11 @@ typedef struct mote_radio_ops {
     int (*current_channel)(void *mote);
     /* Optional (M28): mark this mote's own queued RX frames that overlap
      * [start_ns, end_ns) as collided; returns the number newly marked.
-     * Only motes that keep their RX queue mote-side (native Cooja) set
-     * this; the bus marks its own emu_rx_queue directly for others. */
+     * The bus calls it with the window of every transmission on the
+     * mote's channel from a sender in whose interference range it lies,
+     * emulated and frame-level senders alike.  Only motes that keep their
+     * RX queue mote-side (native Cooja) set this; the bus marks its own
+     * emu_rx_queue directly for others. */
     int (*mark_collisions)(void *mote, int64_t start_ns, int64_t end_ns);
     /* Optional: a transmission occupies this mote's channel from now
      * until end_ns.  The bus calls it for every mote a transmission
@@ -476,11 +479,6 @@ void sim_radio_bus_push_channel(sim_radio_bus_t *bus, struct sim_runtime *sim,
 static inline int64_t byte_period_ns(bool subghz) {
     return subghz ? CC1200_50KBPS_BYTE_NS : IEEE802154_BYTE_NS;
 }
-
-/* Window (sim ns) over which a completing frame can collide with queued
- * frames on interference-range neighbours (M27 — the runner's 1 ms
- * TIME_STEP_NS, kept as the interference overlap span). */
-#define SIM_RADIO_INTERFERENCE_WINDOW_NS 1000000LL
 
 /* FIFO bytes a receiving chip needs free to accept a buffered on-air
  * frame; sentinel > any FIFO size when the buffer is too short to read
