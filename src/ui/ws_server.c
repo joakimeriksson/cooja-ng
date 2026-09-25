@@ -23,6 +23,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <time.h>
 
 /* macOS uses SO_NOSIGPIPE instead of MSG_NOSIGNAL */
 #ifndef MSG_NOSIGNAL
@@ -50,6 +51,8 @@ struct ws_server {
     int html_len;
     ws_message_cb_t msg_cb;
     void *msg_userdata;
+    time_t refused_logged_at;   /* refusal log: one line per second ... */
+    unsigned refused_unlogged;  /* ... and a count of the ones held back */
 };
 
 /* ---- SHA-1 (public domain, from RFC 3174 / Steve Reid) ---- */
@@ -224,9 +227,40 @@ static int origin_matches_host(const char *origin, const char *host) {
            strcasecmp(origin + 7, host) == 0;
 }
 
+/* One stderr line per refusal, at most one a second: a page that loops
+ * `new WebSocket()` would otherwise flood it.  The value is the client's,
+ * so it is quoted, capped and escaped -- raw, it could carry terminal
+ * control sequences that retitle or clear the operator's terminal. */
+static void log_refusal(ws_server_t *srv, const char *why, const char *what) {
+    time_t now = time(NULL);
+    if (now == srv->refused_logged_at) {
+        srv->refused_unlogged++;
+        return;
+    }
+    char safe[64 * 4 + 1];
+    size_t o = 0, i;
+    for (i = 0; what[i] && i < 64; i++) {
+        unsigned char ch = (unsigned char)what[i];
+        if (ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\')
+            safe[o++] = (char)ch;
+        else
+            o += (size_t)snprintf(safe + o, sizeof(safe) - o, "\\x%02x", ch);
+    }
+    safe[o] = '\0';
+    fflush(stdout);         /* keep the line off a half-written stdout line */
+    fprintf(stderr, "ws_server: refused request: %s \"%s\"%s", why, safe,
+            what[i] ? "..." : "");
+    if (srv->refused_unlogged)
+        fprintf(stderr, " (%u more refused since the last report)",
+                srv->refused_unlogged);
+    fputc('\n', stderr);
+    srv->refused_logged_at = now;
+    srv->refused_unlogged = 0;
+}
+
 static void refuse(ws_server_t *srv, int idx, const char *why, const char *what) {
     ws_client_t *c = &srv->clients[idx];
-    fprintf(stderr, "ws_server: refused request: %s %s\n", why, what);
+    log_refusal(srv, why, what);
     const char *resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
                        "Connection: close\r\n\r\n";
     send(c->fd, resp, (int)strlen(resp), MSG_NOSIGNAL);
@@ -653,6 +687,11 @@ int ws_server_client_count(ws_server_t *srv) {
 
 void ws_server_destroy(ws_server_t *srv) {
     if (!srv) return;
+    if (srv->refused_unlogged) {
+        fflush(stdout);
+        fprintf(stderr, "ws_server: %u more request(s) refused since the last "
+                "report\n", srv->refused_unlogged);
+    }
     for (int i = 0; i < srv->client_count; i++)
         close(srv->clients[i].fd);
     close(srv->listen_fd);
