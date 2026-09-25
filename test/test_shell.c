@@ -1024,9 +1024,10 @@ static void test_arm_inspection(void) {
     shell_enqueue_line(&sh, "sym 1 main");               /* firmware "fw1" does not exist */
     shell_script_tick(&sh);
     CHECK(sh.block == SHELL_BLOCK_NONE && !sh.failed, "non-ARM node, bad register, bad fault kind, missing symbol are errors");
-    CHECK(shell_line_blocks("expect-fault 1") && shell_line_blocks("capture v 1 \"x\"") &&
-          shell_line_blocks("sendfile 1 f") && shell_line_blocks("expect-not 1 \"x\" 1s") &&
-          !shell_line_blocks("mem 1 0x0"), "blocking classification");
+    CHECK(shell_cmd_blocks(shell_find_command("expect-fault"), 2) && shell_cmd_blocks(shell_find_command("capture"), 4) &&
+          shell_cmd_blocks(shell_find_command("sendfile"), 3) && shell_cmd_blocks(shell_find_command("expect-not"), 4) &&
+          shell_cmd_blocks(shell_find_command("run"), 2) && !shell_cmd_blocks(shell_find_command("run"), 1) &&
+          !shell_cmd_blocks(shell_find_command("mem"), 3), "blocking classification");
 }
 
 static void test_workflow(void) {
@@ -1257,6 +1258,18 @@ static void test_debug(void) {
     shell_enqueue_line(&sh, "reg 1 pc = 0x3000");
     shell_script_tick(&sh);
     CHECK(mock_cpu.reg[ARM_PC] == 0x3000 && mock_cpu.dbg_skip_pc == UINT32_MAX, "a pc write resets the skip");
+    /* ... and the following release does not arm it again: the pc left the hit site. */
+    mock_cpu.dbg_halted = true; mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000;
+    shell_enqueue_line(&sh, "continue");
+    shell_script_tick(&sh);
+    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_skip_pc == UINT32_MAX, "release after a pc write arms no skip (0x%x)", mock_cpu.dbg_skip_pc);
+    /* A node released by `continue` (not halted, still armed) keeps its skip
+     * when another breakpoint is added: it must not re-hit the one it left. */
+    mock_cpu.reg[ARM_PC] = 0x2000; mock_cpu.dbg_halted = true; mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000;
+    shell_enqueue_line(&sh, "continue");
+    shell_enqueue_line(&sh, "break 1 0x2401");
+    shell_script_tick(&sh);
+    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_count == 2 && mock_cpu.dbg_skip_pc == 0x2000, "adding a breakpoint keeps a released node's skip (0x%x)", mock_cpu.dbg_skip_pc);
 
     mock_reset();
     mock_cpu.dbg_skip_pc = UINT32_MAX;

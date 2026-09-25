@@ -55,7 +55,7 @@ int  shell_exec_line(shell_service_t *s, const char *line, bool immediate_only,
                      const shell_origin_t *origin);
 /* Would this command line block the stream?  (expect, sleep, wait-until,
  * step, source, and run with a duration.) */
-bool shell_line_blocks(const char *line);
+bool shell_cmd_blocks(const shell_command_t *c, int argc);   /* holds the command stream? */
 /* Refuse a command that needs the simulation's own clock while an external
  * clock source (Renode) drives it.  Returns true (and prints) if refused. */
 bool shell_refuse_external_clock(shell_service_t *s, const char *what);

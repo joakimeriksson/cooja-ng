@@ -984,8 +984,12 @@ static void dbg_release(shell_service_t *s, int node_id, arm_cpu_t *cpu) {
 static void dbg_arm_node(shell_service_t *s, int node_id) {
     arm_cpu_t *cpu = dbg_cpu(s, node_id);
     if (!cpu) return;
+    /* A stale skip would miss the first hit — but only a node that is
+     * halted, or had nothing armed (the interpreter's clear is gated on an
+     * armed node), can hold one; a node just released by `continue` keeps
+     * its skip, or adding a breakpoint would re-hit the one it left. */
+    if (cpu->dbg_halted || cpu->dbg_count == 0) cpu->dbg_skip_pc = UINT32_MAX;
     cpu->dbg_bp_n = cpu->dbg_wp_n = 0;
-    cpu->dbg_skip_pc = UINT32_MAX;         /* a stale skip would miss the first hit */
     for (int i = 0; i < s->dbg_count; i++) {
         const shell_dbg_t *d = &s->dbg[i];
         if (d->node_id != node_id) continue;
@@ -1326,7 +1330,7 @@ static int cmd_console(shell_service_t *s, int argc, char **argv, const char *li
 
 /* Validate a command that at/every/on will run later.  Blocking commands
  * are refused: they would take over the command stream's own wait. */
-static bool cmd_blocks(const shell_command_t *c, int argc);
+
 
 static int check_command_text(shell_service_t *s, const char *what, const char *cmd) {
     /* The text is kept as given (expanded, escaped); like exec_tokens it
@@ -1337,7 +1341,7 @@ static int check_command_text(shell_service_t *s, const char *what, const char *
     if (argc == 0) { shell_error(s, "missing command"); return -1; }
     const shell_command_t *c = shell_find_command(argv[0]);
     if (!c) { shell_error(s, "unknown command '%s'", argv[0]); return -1; }
-    if (cmd_blocks(c, argc)) {
+    if (shell_cmd_blocks(c, argc)) {
         shell_error(s, "%s cannot run '%s': it would block the command stream "
                     "(put the sequence in a script instead)", what, c->name);
         return -1;
@@ -2416,18 +2420,9 @@ void shell_complete(const char *prefix, linenoiseCompletions *lc) {
 }
 
 /* Does this command, with these arguments, hold the command stream? */
-static bool cmd_blocks(const shell_command_t *c, int argc) {
+bool shell_cmd_blocks(const shell_command_t *c, int argc) {
     if (c->flags & SHELL_CMD_BLOCKING) return true;
     return strcmp(c->name, "run") == 0 && argc >= 2;   /* run <duration> */
-}
-
-bool shell_line_blocks(const char *line) {
-    char *argv[SHELL_MAX_ARGS]; char storage[4 * SHELL_LINE_MAX];
-    int argc = shell_tokenize(line, argv, NULL, SHELL_MAX_ARGS, storage,
-                              sizeof(storage), NULL, 0);
-    if (argc <= 0) return false;
-    const shell_command_t *c = shell_find_command(argv[0]);
-    return c && cmd_blocks(c, argc);
 }
 
 static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only) {
@@ -2459,9 +2454,9 @@ static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only
     /* Scheduled commands were validated when scheduled; this is the
      * backstop for anything that slipped through. */
     if ((s->origin.kind == SHELL_ORIGIN_AT || s->origin.kind == SHELL_ORIGIN_ON) &&
-        (cmd_blocks(c, argc) || (c->flags & SHELL_CMD_NO_SCHEDULE))) {
+        (shell_cmd_blocks(c, argc) || (c->flags & SHELL_CMD_NO_SCHEDULE))) {
         shell_error(s, "'%s' cannot run from at/every/on: it would %s the command stream",
-                    c->name, cmd_blocks(c, argc) ? "block" : "discard");
+                    c->name, shell_cmd_blocks(c, argc) ? "block" : "discard");
         return -1;
     }
     int nargs = argc - 1;
