@@ -39,20 +39,22 @@ static void load_page(ws_server_t *server) {
     }
     struct stat st;
     char *html = NULL;
-    ssize_t rd = -1;
+    size_t got = 0;
+    int ok = 0;
     if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size <= UI_PAGE_MAX &&
         (html = malloc((size_t)st.st_size + 1)) != NULL) {
-        size_t got = 0;
-        ssize_t n = 1;
-        while (got < (size_t)st.st_size &&
-               ((n = read(fd, html + got, (size_t)st.st_size - got)) > 0 ||
-                (n < 0 && errno == EINTR)))
-            if (n > 0) got += (size_t)n;
-        rd = n < 0 ? -1 : (ssize_t)got;
+        ok = 1;
+        while (got < (size_t)st.st_size) {
+            ssize_t n = read(fd, html + got, (size_t)st.st_size - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) { ok = 0; break; }
+            if (n == 0) break;      /* shorter than fstat said: serve that */
+            got += (size_t)n;
+        }
     }
-    if (rd >= 0) {
-        html[rd] = '\0';
-        ws_server_set_html(server, html, (int)rd);
+    if (ok) {
+        html[got] = '\0';
+        ws_server_set_html(server, html, (int)got);
     } else {
         fprintf(stderr, "Warning: " UI_PAGE_PATH " is not a readable file of "
                         "at most %ld bytes, serving default page\n", UI_PAGE_MAX);
