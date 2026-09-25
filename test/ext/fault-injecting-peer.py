@@ -5,6 +5,8 @@ PEER_MODE picks the fault:
 
   stuck   answer every step with a wake at the step's own time, forever
   rewind  answer every step with a wake 1 ms before the step's time
+  chatty  like stuck, but with a console line in every reply, so each
+          exchange has output and only the idle-step bound catches it
   inf     answer the first step with done.t = 1e400 (infinite once parsed)
   tx-inf  answer the first step with a tx event stamped t = 1e400
   tx-ninf answer the first step with a tx event stamped t = -1e400
@@ -35,6 +37,9 @@ for line in sys.stdin:
         t = msg["t"]
         if MODE == "stuck":
             done(t, t)
+        elif MODE == "chatty":
+            reply(json.dumps({"type": "done", "t": t, "wake": t, "out": [
+                {"type": "log", "t": t, "line": "still here"}]}))
         elif MODE == "rewind":
             done(t, max(0, t - 1000000))
         elif MODE == "inf":

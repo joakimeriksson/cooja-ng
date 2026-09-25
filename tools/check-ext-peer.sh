@@ -4,7 +4,10 @@
 # test/ext/fault-injecting-peer.py in each of its modes:
 #
 #   stuck, rewind  a peer that keeps asking to be woken at (or before) where
-#                  it stands must be failed, and the run must still finish;
+#                  it stands, with no output, must be failed at once, and
+#                  the run must still finish;
+#   chatty         the same with a console line in every reply: the idle-step
+#                  bound must fail it;
 #   inf            a non-finite time from the peer must fail the node, not
 #                  be converted to an integer (undefined behavior);
 #   tx-inf, tx-ninf  the same for an output event's stamp, which must be
@@ -46,6 +49,8 @@ bounded() {
     local watcher=$!
     wait "$pid"
     local rc=$?
+    # The sleep first: killing only the subshell would orphan it.
+    pkill -P "$watcher" sleep 2>/dev/null
     kill "$watcher" 2>/dev/null
     wait "$watcher" 2>/dev/null
     [ "$rc" -eq 137 ] && rc=124
@@ -62,10 +67,11 @@ check() {   # mode, expected stderr pattern ("" = the node must NOT fail)
         why="run did not finish (livelock)"
     elif [ "$rc" -ge 128 ]; then
         why="killed by signal $((rc - 128))"
-    elif [ -n "$want" ] && ! grep -q "ext_node\[2\].*$want" "$log"; then
+    elif [ -n "$want" ] && ! grep -q "ext_node\[2\] (.*$want" "$log"; then
         why="node not failed with '$want'"
-    elif [ -z "$want" ] && grep -q "ext_node\[2\]" "$log"; then
-        why="fault-free peer failed: $(grep -m1 'ext_node\[2\]' "$log")"
+    elif [ -z "$want" ] && grep -q "ext_node\[2\] (" "$log"; then
+        # ext_fail's prefix: "ext_node[2]: N RX frame(s) dropped" is not one
+        why="fault-free peer failed: $(grep -m1 'ext_node\[2\] (' "$log")"
     fi
     if [ -n "$why" ]; then
         echo "  FAIL $mode: $why (exit $rc)"
@@ -75,8 +81,9 @@ check() {   # mode, expected stderr pattern ("" = the node must NOT fail)
     fi
 }
 
-check stuck  "steps in a row without its clock moving"
-check rewind "steps in a row without its clock moving"
+check stuck  "where it already stands, with no input or output"
+check rewind "where it already stands, with no input or output"
+check chatty "steps in a row without its clock moving"
 check inf    "is not a time in ns"
 check tx-inf  "tx.t. is not a time in ns"
 check tx-ninf "tx.t. is not a time in ns"
