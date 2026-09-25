@@ -9,6 +9,7 @@
 #ifndef WS_SERVER_H
 #define WS_SERVER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct ws_server ws_server_t;
@@ -20,6 +21,13 @@ typedef struct ws_server ws_server_t;
  * name (DNS rebinding), and every server refuses a WebSocket upgrade whose
  * Origin is not the server itself.  Returns NULL on failure. */
 ws_server_t *ws_server_init(const char *bind_addr, int port);
+
+/* Nonzero if ws_server_init would accept bind_addr (NULL included), so a
+ * bad --ui-bind can be refused when the options are parsed. */
+int ws_server_bind_addr_valid(const char *bind_addr);
+
+/* The URL a browser should open for a server on bind_addr:port. */
+void ws_server_url(const char *bind_addr, int port, char *out, size_t outsz);
 
 /* Non-blocking poll: accept new connections, read incoming data, handle close/ping. */
 void ws_server_poll(ws_server_t *srv);

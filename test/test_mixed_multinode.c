@@ -1813,7 +1813,7 @@ static void ctl_restart(void *u) {
 /* --ui-bind ADDR; NULL = loopback.  File scope because the shell's "ui"
  * command starts the UI mid-run and must listen where --ui would have. */
 static const char *g_ui_bind = NULL;
-static int ctl_start_ui(void *u, int port) {
+static int ctl_start_ui(void *u, int port, char *url, size_t urlsz) {
     (void)u;
     if (ui_service_active(&ui_svc)) return -1;
     if (!ui_service_start(&ui_svc, g_ui_bind, port, node_states, prev_node_states,
@@ -1823,6 +1823,7 @@ static int ctl_start_ui(void *u, int port) {
         return -1;
     ui_svc.rt = &sim_rt;
     shell_svc.external_resume = true;
+    ws_server_url(g_ui_bind, port, url, urlsz);
     return 0;
 }
 static int ctl_set_input_pin(void *u, int idx, int port, int pin, int level) {
@@ -2173,7 +2174,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     static const char *const value_flags[] = {
         "--gdb", "--pcap", "--plugin", "--renode-freq", "--seed",
         "--save-config", "--script", "--wall-timeout", "--speed",
-        "-n", "-t", "-d", NULL
+        "--ui-bind", "-n", "-t", "-d", NULL
     };
     for (int i = 0; i < argc; i++) {
         for (int k = 0; value_flags[k]; k++) {
@@ -2192,6 +2193,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         else if (strcmp(argv[i], "--ui-bind") == 0 && i + 1 < argc) {
             /* The UI accepts commands: listening beyond loopback is opt-in. */
             g_ui_bind = argv[++i];
+            if (!ws_server_bind_addr_valid(g_ui_bind)) {
+                fprintf(stderr, "--ui-bind: '%s' is not an IPv4 address\n",
+                        g_ui_bind);
+                return SHELL_EXIT_INVALID;
+            }
         }
         else if (strcmp(argv[i], "--gdb") == 0 && i + 1 < argc) {
             /* Forms accepted:
@@ -2349,6 +2355,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         }
     }
 
+    if (g_ui_bind && !ui_enabled && !shell_enabled && !script_path) {
+        fprintf(stderr, "--ui-bind: no web UI to bind (add --ui, or start "
+                        "one with the shell's `ui` command)\n");
+        return SHELL_EXIT_INVALID;
+    }
     if (start_paused && !shell_enabled && !script_path && !ui_enabled) {
         fprintf(stderr, "--paused: nothing could resume the simulation (add --shell, --script or --ui)\n");
         return SHELL_EXIT_INVALID;
@@ -2689,9 +2700,13 @@ sim_restart:
                               node_states, prev_node_states,
                               node_last_tx_ns, prev_last_tx_ns,
                               &radio_medium, &timeline_svc.tl,
-                              &node_count, ui_describe_node, &sim_ctl))
-            fprintf(stderr, "Warning: failed to start UI server on port %d\n",
-                    ui_port);
+                              &node_count, ui_describe_node, &sim_ctl)) {
+            /* --ui was asked for: a run without it is not the run asked
+             * for (with --ui, -t no longer ends it), so fail loudly. */
+            fprintf(stderr, "--ui: cannot start the web UI on %s:%d\n",
+                    g_ui_bind ? g_ui_bind : "127.0.0.1", ui_port);
+            return SHELL_EXIT_INVALID;
+        }
         ui_svc.rt = &sim_rt;   /* plugin UI panels source */
     }
 
