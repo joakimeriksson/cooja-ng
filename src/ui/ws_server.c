@@ -394,10 +394,29 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
 
 /* ---- Public API ---- */
 
+/* NULL and "localhost" both mean 127.0.0.1. */
+static const char *bind_or_default(const char *bind_addr) {
+    return !bind_addr || strcmp(bind_addr, "localhost") == 0 ? "127.0.0.1"
+                                                              : bind_addr;
+}
+
+int ws_server_bind_addr_valid(const char *bind_addr) {
+    struct in_addr a;
+    return inet_pton(AF_INET, bind_or_default(bind_addr), &a) == 1;
+}
+
+void ws_server_url(const char *bind_addr, int port, char *out, size_t outsz) {
+    bind_addr = bind_or_default(bind_addr);
+    /* localhost reaches 127.0.0.1 and a wildcard bind; any other address
+     * (127.0.0.2 included) is only reachable as itself. */
+    if (strcmp(bind_addr, "127.0.0.1") == 0 || strcmp(bind_addr, "0.0.0.0") == 0)
+        bind_addr = "localhost";
+    snprintf(out, outsz, "http://%s:%d/", bind_addr, port);
+}
+
 ws_server_t *ws_server_init(const char *bind_addr, int port) {
     struct in_addr bind_in;
-    if (!bind_addr || strcmp(bind_addr, "localhost") == 0)
-        bind_addr = "127.0.0.1";
+    bind_addr = bind_or_default(bind_addr);
     if (inet_pton(AF_INET, bind_addr, &bind_in) != 1) {
         fprintf(stderr, "ws_server: '%s' is not an IPv4 address\n", bind_addr);
         return NULL;
@@ -437,8 +456,10 @@ ws_server_t *ws_server_init(const char *bind_addr, int port) {
         return NULL;
     }
 
+    char url[64];
+    ws_server_url(bind_addr, port, url, sizeof(url));
     if (srv->loopback_only)
-        printf("WebSocket UI server listening on http://localhost:%d\n", port);
+        printf("WebSocket UI server listening on %s\n", url);
     else
         printf("WebSocket UI server listening on %s:%d (NOT loopback-only: "
                "reachable from the network)\n", bind_addr, port);
