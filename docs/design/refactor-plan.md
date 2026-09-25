@@ -3222,6 +3222,24 @@ the same patch.
 - **Determinism reproducibility check is in the broad gate** (§10).
 - **Rolling back a regressed phase is revert + follow-up branch**, not fix-
   forward by default (§11.5).
+- **The kernel event queue is closed as a performance topic after PR #60**
+  (2026-09-26; measurement and reasoning in
+  [`kernel-radio-review-and-performance-plan.md`](kernel-radio-review-and-performance-plan.md)
+  Tier 2 item 1).  `sim_eq_schedule_gen` reschedules in place and both sifts
+  use a hole; that took 7% on the 100-node Sky grid and 1.6% on the 4-node
+  chain.  What is left of the queue's 12–13% of samples is fixed per-call
+  cost, and the fix for that is calling it less — same-mote slice batching in
+  the pump (that plan's Tier 1) — not a different container.  No radix heap,
+  calendar queue or 4-ary layout unless a profile taken *after* Tier 1 puts
+  `sim_eq_*` back above a few percent.
+- **Performance and refactoring work on the kernel, runner and radio bus
+  follows `kernel-radio-review-and-performance-plan.md`** (2026-09-25): its
+  findings F1–F16 and Tiers 0–3 are the ordered backlog; every tier is gated
+  by `check-determinism.sh` + `check-baseline.sh`, and Tier 3 (longer
+  execute slices) is the only one allowed to move the simulation, with its
+  own sign-off.  The runner's per-wakeup O(N) loops (Tier 0) wait for PR #56
+  to merge; the dead synchronous chip-delivery subsystem in
+  `sim_radio_bus.c` (F1/R1) is deleted after that, not in parallel with it.
 
 ## Doc Status
 
