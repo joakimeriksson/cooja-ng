@@ -31,7 +31,12 @@
 #endif
 
 #define MAX_CLIENTS  8
-#define RECV_BUF     4096
+/* Per-client input buffer: the whole HTTP request, or one WebSocket frame.
+ * Cookies are not port-scoped, so a browser sends the page every cookie
+ * any dev server on localhost has set; 4 KB of them closed the page load
+ * with no reply.  16 KB is Node's request-header limit, and a request that
+ * does not fit is answered 431 rather than dropped. */
+#define RECV_BUF     16384
 /* A client must finish its HTTP request within this long of connecting.
  * Without it, eight connections that never do (idle, or a request the
  * parser never sees end: an embedded NUL, LF-only line endings) hold every
@@ -417,8 +422,11 @@ static void handle_http_request(ws_server_t *srv, int idx) {
     c->recv_buf[c->recv_len] = '\0';
 
     /* Check for complete HTTP request (double CRLF) */
-    if (!strstr(c->recv_buf, "\r\n\r\n"))
+    if (!strstr(c->recv_buf, "\r\n\r\n")) {
+        if (c->recv_len >= RECV_BUF - 1)
+            reply_and_close(srv, idx, "431 Request Header Fields Too Large");
         return;
+    }
 
     char host[256] = "", origin[256] = "";
     int has_host = http_header(c->recv_buf, "Host", host, sizeof(host));
@@ -767,8 +775,11 @@ void ws_server_poll(ws_server_t *srv) {
             continue;
         }
 
+        /* The HTTP request is parsed as a string and keeps a byte for its
+         * terminator; a WebSocket frame may fill the buffer, which is the
+         * size the frame parser accepts up to. */
         ws_client_t *c = &srv->clients[i];
-        int space = RECV_BUF - c->recv_len - 1;
+        int space = RECV_BUF - c->recv_len - (c->state == CLIENT_HTTP);
         if (space <= 0) { close_client(srv, i); i--; continue; }
 
         ssize_t n = recv(c->fd, c->recv_buf + c->recv_len, space, 0);
