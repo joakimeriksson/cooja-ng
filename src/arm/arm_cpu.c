@@ -322,6 +322,12 @@ static inline void arm_insn_undo(arm_cpu_t *cpu) {
             if (cpu->insn_snap.reg[i] != cpu->insn_snap_eager.reg[i])
                 fprintf(stderr, "  r%d: start 0x%08x, snapshot 0x%08x\n", i,
                         cpu->insn_snap_eager.reg[i], cpu->insn_snap.reg[i]);
+        if (cpu->insn_snap.xpsr != cpu->insn_snap_eager.xpsr)
+            fprintf(stderr, "  xpsr: start 0x%08x, snapshot 0x%08x\n",
+                    cpu->insn_snap_eager.xpsr, cpu->insn_snap.xpsr);
+        if (cpu->insn_snap.it_state != cpu->insn_snap_eager.it_state)
+            fprintf(stderr, "  itstate: start 0x%02x, snapshot 0x%02x\n",
+                    cpu->insn_snap_eager.it_state, cpu->insn_snap.it_state);
         abort();
     }
 #endif
