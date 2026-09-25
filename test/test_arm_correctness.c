@@ -2876,6 +2876,48 @@ static void test_trustzone_bus_fault(void) {
     }
 }
 
+/* NMI, HardFault and BusFault share one targeting rule: Secure unless
+ * AIRCR.BFHFNMINS hands them to the Non-secure world. Nothing in the
+ * emulator pends an NMI, so entry is driven directly. */
+#define NMI_S_HANDLER   (CODE_BASE + 0xC0)
+#define NMI_NS_HANDLER  (CODE_BASE + 0xE0)
+#define NS_VTOR         (ARM_FLASH_BASE + 0x1000)
+static void test_trustzone_nmi_target(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone NMI targeting tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+
+    bf_setup(&cpu, &nvic);                       /* Non-secure thread, MSP */
+    write_flash32(&cpu, ARM_FLASH_BASE + EXC_NMI * 4, NMI_S_HANDLER | 1);
+    cpu.vtor = NS_VTOR;
+    write_flash32(&cpu, NS_VTOR + EXC_NMI * 4, NMI_NS_HANDLER | 1);
+    write_thumb16(&cpu, NMI_S_HANDLER, 0x4770);  /* BX LR */
+    write_thumb16(&cpu, NMI_NS_HANDLER, 0x4770); /* BX LR */
+
+    /* BFHFNMINS clear: the NMI is Secure, like BusFault and HardFault. */
+    arm_exception_entry(&cpu, EXC_NMI);
+    assert_true("NMI, BFHFNMINS clear: taken Secure", cpu.secure);
+    assert_eq("NMI, BFHFNMINS clear: PC = Secure NMI handler", NMI_S_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("NMI, BFHFNMINS clear: IPSR = 2", EXC_NMI, (int)(cpu.xpsr & 0x1FF));
+    assert_eq("NMI, BFHFNMINS clear: frame on the NS stack", BF_NS_FRAME, cpu.msp_ns);
+    assert_eq("NMI, BFHFNMINS clear: stacked PC", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+    arm_step(&cpu, 1);                           /* BX LR */
+    assert_true("NMI return: back to Non-secure", !cpu.secure);
+    assert_eq("NMI return: PC = the interrupted instruction", CODE_BASE, cpu.reg[ARM_PC]);
+
+    /* BFHFNMINS set: the NMI is Non-secure. */
+    bf_setup(&cpu, &nvic);
+    write_flash32(&cpu, ARM_FLASH_BASE + EXC_NMI * 4, NMI_S_HANDLER | 1);
+    cpu.vtor = NS_VTOR;
+    write_flash32(&cpu, NS_VTOR + EXC_NMI * 4, NMI_NS_HANDLER | 1);
+    nvic.aircr |= ARM_AIRCR_BFHFNMINS;
+    arm_exception_entry(&cpu, EXC_NMI);
+    assert_true("NMI, BFHFNMINS set: stays Non-secure", !cpu.secure);
+    assert_eq("NMI, BFHFNMINS set: PC = Non-secure NMI handler", NMI_NS_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("NMI, BFHFNMINS set: IPSR = 2", EXC_NMI, (int)(cpu.xpsr & 0x1FF));
+    assert_eq("NMI, BFHFNMINS set: frame on the NS stack", BF_NS_FRAME, cpu.reg[ARM_SP]);
+}
+
 /* VFP loads and stores are the core's own accesses like any other: the
  * attribution unit refuses a Non-secure one to Secure memory (AUVIOL), the
  * bus check refuses one to a claimed peripheral (BusFault), and either way
@@ -3313,6 +3355,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_blxns();
     test_trustzone_ns_fetch();
     test_trustzone_bus_fault();
+    test_trustzone_nmi_target();
     test_trustzone_vfp();
     test_io_lookup();
 

@@ -1096,7 +1096,8 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     if (cpu->tz_enabled) {
         if (exception_num == EXC_SECUREFAULT)
             target_secure = true;
-        else if ((exception_num == EXC_BUSFAULT || exception_num == EXC_HARDFAULT) && cpu->nvic)
+        else if ((exception_num == EXC_NMI || exception_num == EXC_HARDFAULT ||
+                  exception_num == EXC_BUSFAULT) && cpu->nvic)
             target_secure = arm_nvic_bfhfnmi_secure((arm_nvic_t *)cpu->nvic);
         else if (exception_num >= 16 && cpu->nvic)
             target_secure = arm_nvic_targets_secure(
