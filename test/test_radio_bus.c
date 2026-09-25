@@ -69,6 +69,7 @@ typedef struct {
     int      recv_at_count;         /* bytes via receive_byte_at */
     int64_t  recv_air_ns;           /* air time of the last one */
     int      collision_marks;       /* mark_collisions calls */
+    int64_t  coll_start, coll_end;  /* window of the last one */
 } mock_rx_t;
 
 static void mock_receive_byte(void *m, uint8_t byte, int8_t rssi) {
@@ -111,8 +112,10 @@ static const mote_radio_ops_t mock_ops_on_air = {
     .on_air           = mock_on_air,
 };
 static int mock_mark_collisions(void *m, int64_t start, int64_t end) {
-    (void)start; (void)end;
-    ((mock_rx_t *)m)->collision_marks++;
+    mock_rx_t *r = (mock_rx_t *)m;
+    r->collision_marks++;
+    r->coll_start = start;
+    r->coll_end = end;
     return 0;
 }
 static const mote_radio_ops_t mock_ops_collisions = {
@@ -850,7 +853,11 @@ static void test_on_air_reach_and_channel(void) {
 
     uint8_t mac[30] = {0};
     sim_radio_bus_tx_frame(&f.bus, &f.sim, 0, mac, (int)sizeof(mac));
-    int64_t end = f.sim.now_ns + 30 * IEEE802154_BYTE_NS;
+    /* The PHY frame's air time: the header and FCS the bus carries the
+     * same frame to chip receivers with, not the MAC bytes alone. */
+    int64_t end = f.sim.now_ns + IEEE802154_FRAME_AIR_NS(30);
+    ASSERT_EQ(end, f.sim.now_ns + (6 + 30 + 2) * IEEE802154_BYTE_NS,
+              "on_air: a native frame is on the air as its PHY frame");
     ASSERT_EQ(f.rx[0].on_air_count, 0, "on_air: not announced to the sender");
     ASSERT_EQ(f.rx[1].on_air_count, 1, "on_air: reception neighbour, radio off");
     ASSERT_EQ(f.rx[1].on_air_end, end, "on_air: reception window = the frame's air time");
@@ -897,6 +904,9 @@ static void test_interference_marks_same_channel(void) {
     uint8_t mac[20] = {0};
     sim_radio_bus_tx_frame(&f.bus, &f.sim, 0, mac, (int)sizeof(mac));
     ASSERT_EQ(f.rx[1].collision_marks, 1, "interference: marked on the sender's channel");
+    ASSERT_EQ(f.rx[1].coll_start, f.sim.now_ns, "interference: over the frame's window ...");
+    ASSERT_EQ(f.rx[1].coll_end, f.sim.now_ns + IEEE802154_FRAME_AIR_NS(20),
+              "interference: ... the one the on-air window uses");
     ASSERT_EQ(f.rx[2].collision_marks, 0, "interference: not marked on another channel");
 }
 

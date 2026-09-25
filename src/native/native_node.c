@@ -419,11 +419,14 @@ void native_check_radio_tx(native_node_t *node) {
     /* Match COOJA ContikiRadio: once simOutSize becomes non-zero, the
      * packet is delivered to the medium immediately, but the mote stays
      * in a transmitting state until the on-air duration has elapsed.
-     * simOutSize is only cleared when transmission finishes. */
+     * simOutSize is only cleared when transmission finishes.  The
+     * duration is the PHY frame's -- the bytes just put on the air above
+     * -- which is also how long the bus keeps every receiver's channel
+     * busy for it. */
     node->radio_is_transmitting = true;
     node->radio_tx_finished = false;
     node->radio_tx_end_ns = node->sim_time_ns +
-                            (int64_t)frame_len * IEEE802154_BYTE_NS;
+                            IEEE802154_FRAME_AIR_NS(frame_len);
     if (node->radio_tx_end_ns <= node->sim_time_ns) {
         node->radio_tx_end_ns = node->sim_time_ns + 1000LL;
     }
@@ -448,10 +451,12 @@ void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
     memcpy(slot->data, frame, (size_t)len);
     slot->len = len;
     slot->arrival_ns = arrival_ns;
-    /* On-air time as COOJA computes it for ContikiRadio: 8*len bits at
-     * 250 kbit/s = 32 µs per payload byte, ending exactly when the
-     * sender's simOutSize is cleared (radio_tx_end_ns uses the same rule). */
-    slot->end_ns = arrival_ns + (int64_t)len * IEEE802154_BYTE_NS;
+    /* The frame is in the air for its PHY frame -- header, MAC bytes and
+     * FCS -- from arrival_ns: exactly the window the bus keeps this
+     * node's channel busy over, and when the sender's simOutSize is
+     * cleared (radio_tx_end_ns uses the same rule), so a frame is never
+     * completed while the channel it came on still reads busy. */
+    slot->end_ns = arrival_ns + IEEE802154_FRAME_AIR_NS(len);
     slot->sender_idx = sender_idx;
     slot->collided = false;
 

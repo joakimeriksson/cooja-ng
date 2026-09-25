@@ -139,12 +139,12 @@ bool native_rx_assembler_feed(native_node_t *node, uint8_t byte,
                  * byte leaves the air, on the bus's clock -- the same
                  * instant the bus's on-air window (this node's CCA) ends,
                  * so the frame is never read while the channel it came
-                 * on still reads busy.  Queue it with the arrival that
-                 * puts its end there; it is completed on the tick at that
-                 * time (the caller wakes the node for it). */
+                 * on still reads busy.  Queue it from its first preamble
+                 * byte, which puts its end there; it is completed on the
+                 * tick at that time (the caller wakes the node for it). */
                 int64_t end_ns = air_ns + IEEE802154_BYTE_NS;
                 native_deliver_frame(node, a->buf, frame_len,
-                                     end_ns - (int64_t)frame_len * IEEE802154_BYTE_NS,
+                                     end_ns - IEEE802154_FRAME_AIR_NS(frame_len),
                                      -1);
                 delivered = true;
             }

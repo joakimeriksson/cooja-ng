@@ -940,11 +940,15 @@ void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, sim_runtime_t *sim,
     bus_sync_channel(bus, sim, sender_idx);
     bus->frame_start_ns = now;   /* a frame-level sender's frame starts now */
 
-    /* The frame occupies the air for 8 * len bits at 250 kbit/s, as
-     * Cooja's ContikiRadio computes it, and as the native model's own TX
-     * end and RX end (native_node.c) do: no PHY header. */
+    /* The frame occupies the air as its PHY frame -- header, MAC bytes
+     * and FCS: the bytes this same frame is carried to chip receivers
+     * as, and what the native model's own TX end and RX end
+     * (native_node.c) use.  A window that counted the MAC bytes only read
+     * clear to a native while a chip receiver was still taking the
+     * frame's last eight bytes, and a native transmitting then
+     * interleaved its own with them. */
     int64_t tx_start = now;
-    int64_t tx_end = tx_start + (int64_t)len * IEEE802154_BYTE_NS;
+    int64_t tx_end = tx_start + IEEE802154_FRAME_AIR_NS(len);
     bus_on_air(bus, sim, sender_idx, 0, tx_end);
 
     if (medium->type != RADIO_MEDIUM_NONE) {

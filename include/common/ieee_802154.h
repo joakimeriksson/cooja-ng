@@ -36,6 +36,19 @@
  * it, so they cannot drift apart. */
 #define IEEE802154_BYTE_NS        32000LL
 
+/* On-air bytes, and time, of a frame carrying mac_len MAC bytes: the PHY
+ * header, the MAC frame and its FCS -- the bytes a chip receiver is fed
+ * one by one, and how long any sender of that frame occupies the air.
+ * The one rule for a frame-level (native / JS / external) sender: the
+ * bus's busy window and collision marking, the native model's TX end and
+ * RX end, and the PHY wrap it is carried in all use it.  A window that
+ * counts the MAC bytes only reads clear while a chip receiver is still
+ * taking the last bytes. */
+#define IEEE802154_FRAME_AIR_BYTES(mac_len) \
+    (IEEE802154_PHY_HEADER_BYTES + (mac_len) + IEEE802154_FCS_LEN)
+#define IEEE802154_FRAME_AIR_NS(mac_len) \
+    ((int64_t)IEEE802154_FRAME_AIR_BYTES(mac_len) * IEEE802154_BYTE_NS)
+
 /* RX byte-stream parser phases.  Every radio that builds a frame from
  * incoming on-air bytes walks this same sequence. */
 enum ieee802154_rx_phase {
