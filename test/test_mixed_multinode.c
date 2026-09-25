@@ -487,6 +487,17 @@ static int phase_timing_on(void) {
     return v;
 }
 
+/* CSIM_PC_TRACE=1 installs the MSP430 PC-trace instrumentation (firmware
+ * cc2420_transmit / TSCH EB-process / queue-add counters).  Off by default:
+ * the hook is an indirect call per executed instruction on every MSP430
+ * node, and the two TSCH addresses it watches belong to one historical
+ * firmware image, so the counters mean nothing for any other. */
+static int pc_trace_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CSIM_PC_TRACE"); v = (e && *e == '1'); }
+    return v;
+}
+
 /* ============================================================
  * Mote vtable adapters — Phase 2 milestone 11 (§3.16).
  *
@@ -2790,8 +2801,8 @@ sim_restart:
 
     /* Debug: PC trace for cc2420_transmit + TSCH EB on all MSP430 nodes (M55:
      * the install + counters live in the MSP430 module; the call is type-blind
-     * — non-MSP430 nodes return 0). */
-    for (int i = 0; i < node_count; i++) {
+     * — non-MSP430 nodes return 0).  Opt-in via CSIM_PC_TRACE=1. */
+    for (int i = 0; pc_trace_on() && i < node_count; i++) {
         uint32_t tx_addr = msp430_elf_mote_install_pc_trace(&nodes[i]);
         if (tx_addr)
             printf("  PC trace: cc2420_transmit=0x%04x eb_process=0xcb32 queue_add=0xb138 (Node %d)\n",
@@ -3500,10 +3511,13 @@ sim_restart:
     msp430_timer_dump_ccr_counts();
     extern int msp430_gpio_get_isr_count(void);
     printf("  GPIO ISR count: %d\n", msp430_gpio_get_isr_count());
-    int fw_cc2420_tx = 0, fw_eb_process = 0, fw_queue_add = 0;
-    msp430_elf_mote_pc_trace_counts(&fw_cc2420_tx, &fw_eb_process, &fw_queue_add);
-    printf("  FW cc2420_transmit=%d eb_process=%d queue_add=%d\n",
-           fw_cc2420_tx, fw_eb_process, fw_queue_add);
+    if (pc_trace_on()) {
+        int fw_cc2420_tx = 0, fw_eb_process = 0, fw_queue_add = 0;
+        msp430_elf_mote_pc_trace_counts(&fw_cc2420_tx, &fw_eb_process,
+                                        &fw_queue_add);
+        printf("  FW cc2420_transmit=%d eb_process=%d queue_add=%d\n",
+               fw_cc2420_tx, fw_eb_process, fw_queue_add);
+    }
     /* Dump SFD timestamp and Timer B state for TSCH debugging (M58: the
      * per-node MSP430 chip-memory reads moved behind dump_diagnostics; a NULL
      * op means "not an MSP430 mote", the type-blind replacement for the old

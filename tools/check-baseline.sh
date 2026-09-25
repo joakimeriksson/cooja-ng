@@ -78,10 +78,13 @@ WORKLOADS=(
     "armmn|arm-multinode firmware/cc2538dk/udp-server.cc2538dk firmware/cc2538dk/udp-client.cc2538dk -t 60000"
 )
 
-# Wall-clock lines legitimately differ between two builds of the same code.
-# Everything else — simulated timestamps, packet counts, cycle totals, exit
-# codes — must match exactly.
-FILTER='^ *(Wall-clock time|Speed ratio|Throughput):'
+# Wall-clock lines legitimately differ between two builds of the same code,
+# and the MSP430 PC-trace diagnostics ("PC trace:" / "FW cc2420_transmit=")
+# are opt-in (CSIM_PC_TRACE=1) since the hook stopped being installed by
+# default, so a reference from before that prints two lines this tree does
+# not.  Everything else — simulated timestamps, packet counts, cycle totals,
+# exit codes — must match exactly.
+FILTER='^ *(Wall-clock time|Speed ratio|Throughput|PC trace):|^ *FW cc2420_transmit='
 
 build() {  # build <srcdir> <label>
     echo "  building $2 ..."
@@ -94,8 +97,14 @@ build() {  # build <srcdir> <label>
     fi
 }
 
+# stdout and stderr are captured separately.  Merged into one pipe they
+# interleave at stdout's buffer-flush boundaries, so a run that prints one
+# line more or less early on shows every later stderr line ([PKT], [RF],
+# warnings) at a different place in the merged log -- a diff with nothing
+# behind it.  Compared apart, each stream is exactly what the run wrote.
 run_one() {  # run_one <binary> <outdir> <workload>
-    ( timeout 900 "$1" ${3#*|} >"$2/${3%%|*}.log" 2>&1; echo "rc=$?" >>"$2/${3%%|*}.log" ) &
+    ( timeout 900 "$1" ${3#*|} >"$2/${3%%|*}.log" 2>"$2/${3%%|*}.err"
+      echo "rc=$?" >>"$2/${3%%|*}.log" ) &
     if [ -n "${TIMING:-}" ]; then wait; fi
 }
 
@@ -155,12 +164,17 @@ for w in "${WORKLOADS[@]}"; do
         KEEP=1
         continue
     fi
+    ae="$WORK/out-ref/$name.err"
+    be="$WORK/out-head/$name.err"
     n=$(diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | wc -l)
-    if [ "$n" -eq 0 ]; then
+    ne=$(diff "$ae" "$be" | wc -l)
+    if [ "$n" -eq 0 ] && [ "$ne" -eq 0 ]; then
         printf "  ok    %-9s %s\n" "$name" "$(timing "$a" "$b")"
     else
-        printf "  DIFF  %-9s (%d lines)  %s\n" "$name" "$n" "$(timing "$a" "$b")"
+        printf "  DIFF  %-9s (stdout %d lines, stderr %d lines)  %s\n" \
+               "$name" "$n" "$ne" "$(timing "$a" "$b")"
         diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | head -20
+        [ "$ne" -eq 0 ] || diff "$ae" "$be" | head -20
         rc=1
         KEEP=1
     fi

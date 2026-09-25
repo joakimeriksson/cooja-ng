@@ -685,6 +685,9 @@ CSIM_ARM_JIT_VERIFY=1     # lockstep: run each block, rewind (incl. SRAM), re-ru
 CSIM_ARM_JIT_MIN_BLOCK=n  # minimum block length to compile (default 1 — NOT a tuning
                           # knob, see the comment in arm_jit.c: 4 costs 3x)
 CSIM_ARM_JIT_THRESHOLD=n  # executions before compiling (default 50)
+CSIM_PC_TRACE=1           # MSP430 PC-trace counters (firmware cc2420_transmit / TSCH EB-process /
+                          # queue-add) in the end-of-run stats. Off by default: an indirect call per
+                          # executed instruction, and the TSCH addresses are one firmware's
 NRF54L_UART_RX_TRACE=1    # nRF54L15 console bytes delivered into the firmware's receive buffer
 ARM_TZ_TRACE=1            # log every world transition (SG / BLXNS / BXNS /
                           # FNC_RETURN / cross-domain exception) with ns time
