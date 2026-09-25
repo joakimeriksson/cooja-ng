@@ -498,14 +498,24 @@ The `tools/csc2json.py` script converts Cooja simulation files to Cooja-NG's JSO
 
 ```sh
 # Convert a .csc file to JSON
-python3 tools/csc2json.py test.csc --firmware-dir firmware/cc2538dk -o out.json
-
-# List firmware files needed by a .csc file
-python3 tools/csc2json.py test.csc --list-firmware
+python3 tools/csc2json.py test.csc --contiki ../contiki-ng --firmware-dir firmware/cc2538dk -o out.json
 
 # Show conversion warnings
-python3 tools/csc2json.py test.csc --firmware-dir firmware/cc2538dk --warn
+python3 tools/csc2json.py test.csc --contiki ../contiki-ng --firmware-dir firmware/cc2538dk --warn
+
+# List the local (not shipped) firmware builds in a firmware directory —
+# what run-cooja-tests.sh --clean removes
+python3 tools/csc2json.py --local-firmware firmware/cooja
 ```
+
+Firmware is named `<source>-<hash>.<target>`, where the hash covers the
+source directory *relative to the Contiki-NG root* and the make arguments,
+so two tests that build a same-named source from different directories never
+share a build, and a name is the same on every machine. `--contiki` may be
+omitted for a `.csc` inside a Contiki-NG tree (the root is found above it, by
+its `Makefile.include` and `os/`) or when `CONTIKI_DIR` / `csim.conf` names
+it; with `--firmware-dir` and no root to be found, conversion fails rather
+than name firmware nothing would build.
 
 ### What Gets Converted
 

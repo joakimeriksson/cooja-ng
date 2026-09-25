@@ -3,12 +3,18 @@
 # Build Contiki-NG firmware needed for Cooja test suite
 #
 # Usage:
-#   ./tools/build-test-firmware.sh [--target <cooja|cc2538dk>] [test-dir-pattern]
-#   ./tools/build-test-firmware.sh --from-json <config.json> [config2.json ...]
+#   ./tools/build-test-firmware.sh [--force] [--dry-run] [test-dir-pattern]
+#   ./tools/build-test-firmware.sh [--force] [--dry-run] [--target <cooja|cc2538dk>] \
+#       --from-json <config.json> [config2.json ...]
 #
 # Mode 1 (default): Converts each matching .csc the way run-cooja-tests.sh does
 #                   and builds the firmware it will look up, under the same name.
-# Mode 2 (--from-json): Reads build info from JSON configs (target, board, make_args).
+#                   Each .csc names its own TARGET, so there is no --target here.
+# Mode 2 (--from-json): Reads build info from JSON configs (target, board, make_args);
+#                   --target is the target for a node whose JSON names none.
+#
+# --force rebuilds firmware that already exists; --dry-run only reports what
+# would be built.
 #
 # CONTIKI_DIR resolution: env variable -> csim.conf -> ../contiki-ng
 #
@@ -17,6 +23,19 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CSIM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CSC2JSON="$SCRIPT_DIR/csc2json.py"
+
+# Every temporary this script makes, removed on exit whichever mode ran.
+RESULTS_FILE=""
+FW_LIST_FILE=""
+JSON_DIR=""
+cleanup() {
+    local f
+    for f in "$RESULTS_FILE" "$FW_LIST_FILE" "$JSON_DIR"; do
+        [ -n "$f" ] && rm -rf "$f"
+    done
+    return 0
+}
+trap cleanup EXIT
 
 # Resolve CONTIKI_DIR: env -> csim.conf -> default
 resolve_contiki_dir() {
@@ -36,11 +55,12 @@ resolve_contiki_dir() {
     CONTIKI_DIR="$(cd "$CONTIKI_DIR" && pwd)"
 }
 
-# Strip variant suffix from firmware name to find the source .c file.
-# Handles hash suffixes (node-378324 -> node) and routing-variant
-# suffixes (receiver-node-classic -> receiver-node).
+# Strip the cache-name suffix from a firmware name to find the source .c
+# file: node-378324 -> node.  Every name csc2json asks this script to build
+# is <source>-<6 hex digits> (firmware_variant); the shipped images under the
+# previous scheme's names are never built here.
 strip_variant_suffix() {
-    echo "$1" | sed -E 's/-(classic|storing|non-storing)$//; s/-[0-9a-f]{6}$//'
+    echo "$1" | sed -E 's/-[0-9a-f]{6}$//'
 }
 
 # Build a single firmware
@@ -53,7 +73,7 @@ build_one() {
     shift 4
     local extra_args="$@"
 
-    if [ -f "$target_file" ]; then
+    if [ -f "$target_file" ] && [ "$FORCE" -eq 0 ]; then
         echo "  SKIP $fw (already exists)"
         echo "skip" >> "$RESULTS_FILE"
         return
@@ -79,6 +99,11 @@ build_one() {
     local extra_info=""
     if [ -n "$extra_args" ]; then
         extra_info=" $extra_args"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  WOULD $fw ($build_name.c in $src_dir, TARGET=$target$extra_info)"
+        echo "built" >> "$RESULTS_FILE"
+        return
     fi
     echo "  BUILD $fw (TARGET=$target$extra_info)"
 
@@ -122,7 +147,11 @@ print_summary() {
         rm -f "$RESULTS_FILE"
     fi
     echo ""
-    echo "=== Summary: $built built, $skipped skipped, $failed failed ==="
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "=== Summary: $built would be built, $skipped skipped, $failed failed ==="
+    else
+        echo "=== Summary: $built built, $skipped skipped, $failed failed ==="
+    fi
 }
 
 # ---- Mode 2: Build from JSON configs ----
@@ -137,7 +166,6 @@ build_from_json() {
 
     RESULTS_FILE=$(mktemp)
     FW_LIST_FILE=$(mktemp)
-    trap "rm -rf $RESULTS_FILE $FW_LIST_FILE $EXTRA_CLEANUP" EXIT
 
     # Extract unique firmware entries from all JSON files
     for json_file in $json_files; do
@@ -223,42 +251,58 @@ build_from_csc() {
 
     echo "=== Build Test Firmware ==="
     echo "  Test pattern: $test_pattern"
-    echo "  Default target: $DEFAULT_TARGET"
 
-    local json_dir n=0
-    json_dir=$(mktemp -d)
-    EXTRA_CLEANUP="$json_dir"
-    trap "rm -rf $json_dir" EXIT
+    local n=0 name log
+    JSON_DIR=$(mktemp -d)
 
     # csc2json looks for existing firmware relative to its cwd, and the suite
-    # runs it from this tree.
+    # runs it from this tree.  Its stderr is kept: the reason a .csc could not
+    # be converted, and the warning that a test falls back to shipped firmware
+    # under the previous scheme's name, are the two things a user building
+    # firmware needs to see.
     for csc_file in "$CONTIKI_DIR"/tests/$test_pattern/*.csc; do
         [ -f "$csc_file" ] || continue
         n=$((n + 1))
+        name="$(basename "$(dirname "$csc_file")")/$(basename "$csc_file" .csc)"
+        log="$JSON_DIR/$n.log"
         if ! (cd "$CSIM_DIR" && python3 "$CSC2JSON" "$csc_file" \
-                --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$DEFAULT_TARGET" \
-                --js-native -o "$json_dir/$n.json" 2>/dev/null); then
-            echo "  SKIP $(basename "$(dirname "$csc_file")")/$(basename "$csc_file" .csc) (conversion failed)"
-            rm -f "$json_dir/$n.json"
+                --contiki "$CONTIKI_DIR" --firmware-dir "firmware/cooja" \
+                --js-native -o "$JSON_DIR/$n.json" 2>"$log"); then
+            echo "  SKIP $name (conversion failed)"
+            grep -E '^ *ERROR: ' "$log" | sed 's/^ */        /' || true
+            rm -f "$JSON_DIR/$n.json"
+        else
+            grep '^WARNING: ' "$log" | sed "s|^WARNING: |  WARN $name: |" || true
         fi
     done
     echo ""
 
-    build_from_json "$json_dir"/*.json
+    build_from_json "$JSON_DIR"/*.json
 }
 
 # ---- Main ----
 DEFAULT_TARGET="cooja"
+TARGET_GIVEN=0
 TEST_PATTERN="*"
 JSON_MODE=0
 JSON_FILES=""
-EXTRA_CLEANUP=""
+FORCE=0
+DRY_RUN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --target)
             DEFAULT_TARGET="$2"
+            TARGET_GIVEN=1
             shift 2
+            ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
             ;;
         --from-json)
             JSON_MODE=1
@@ -268,12 +312,16 @@ while [ $# -gt 0 ]; do
             break
             ;;
         -h|--help)
-            echo "Usage: $0 [--target <cooja|cc2538dk>] [test-dir-pattern]"
-            echo "       $0 --from-json <config.json> [config2.json ...]"
+            echo "Usage: $0 [--force] [--dry-run] [test-dir-pattern]"
+            echo "       $0 [--force] [--dry-run] [--target <cooja|cc2538dk>] --from-json <config.json> [config2.json ...]"
             echo ""
-            echo "  --target: default build target (default: cooja)"
+            echo "  test-dir-pattern: glob to filter test dirs (e.g. '14-rpl-lite'); each .csc"
+            echo "                    is built for the TARGET it names"
             echo "  --from-json: build using per-node build info from JSON configs"
-            echo "  test-dir-pattern: glob to filter test dirs (e.g. '14-rpl-lite')"
+            echo "  --target: with --from-json, the target for a node whose JSON names none"
+            echo "            (default: cooja)"
+            echo "  --force: rebuild firmware that already exists"
+            echo "  --dry-run: report what would be built without building"
             echo ""
             echo "JSON build info per node:"
             echo "  {\"build\": {\"target\": \"cooja\", \"board\": \"srf06\", \"make_args\": [\"DEFINES=...\"],"
@@ -292,5 +340,9 @@ done
 if [ $JSON_MODE -eq 1 ]; then
     build_from_json $JSON_FILES
 else
+    if [ $TARGET_GIVEN -eq 1 ]; then
+        echo "Error: --target applies to --from-json only; a .csc names its own TARGET"
+        exit 1
+    fi
     build_from_csc "$TEST_PATTERN"
 fi

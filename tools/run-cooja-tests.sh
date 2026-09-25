@@ -74,7 +74,9 @@ while [ $# -gt 0 ]; do
             echo "  --no-build: skip auto-building missing firmware"
             echo "  --with-tun: include border-router tests (requires sudo for TUN)"
             echo "  --clean: remove local firmware builds from firmware/{cooja,sky,z1} before"
-            echo "           running (forces a rebuild); shipped firmware is kept"
+            echo "           running (forces a rebuild). Shipped firmware is kept: in a git"
+            echo "           checkout the tracked files; elsewhere every .sky/.z1 (firmware/cooja"
+            echo "           is never shipped, so it is always emptied)"
             echo "  --seed N: run with random seed N instead of each .csc's own (Cooja --random-seed)"
             echo "  --logdir DIR: write DIR/<category>/<csc-name>.testlog per test (Contiki-NG tests/ layout)"
             echo ""
@@ -150,30 +152,23 @@ if [ "$CLEAN" -eq 1 ]; then
     #
     # Only local builds are removed.  firmware/sky and firmware/z1 also hold
     # shipped prebuilt images that cannot be rebuilt without msp430-gcc, and
-    # deleting those broke every test that needs them.  In a git checkout of
-    # this tree the shipped images are the tracked ones.  Otherwise they cannot
-    # be told apart from local builds, so nothing is removed — and being
-    # *inside* some other repository (a dotfiles-managed $HOME, a monorepo)
-    # does not count: none of this tree's files is tracked there.
-    csim_top=$(git -C "$CSIM_DIR" rev-parse --show-toplevel 2>/dev/null || true)
-    if [ -n "$csim_top" ] && [ "$csim_top" -ef "$CSIM_DIR" ]; then
-        for sub in cooja sky z1; do
-            d="$CSIM_DIR/firmware/$sub"
-            [ -d "$d" ] || continue
-            wiped=0
-            # --others without --exclude-standard lists ignored files too.
-            while IFS= read -r f; do
-                case "$f" in
-                    */*) continue ;;   # top level of the directory only
-                    *."$sub") rm -f "$d/$f"; wiped=$((wiped + 1)) ;;
-                esac
-            done < <(git -C "$d" ls-files --others -- .)
-            echo "  CLEAN $d (removed $wiped local firmware builds)"
-        done
-    else
-        echo "  CLEAN skipped: $CSIM_DIR is not a git checkout, so shipped firmware cannot be"
-        echo "        told apart from local builds; remove stale ones by hand"
-    fi
+    # deleting those broke every test that needs them.  csc2json decides what
+    # is shipped — the same answer its firmware lookup gives, so the clean and
+    # the lookup cannot drift apart: in a git checkout of this tree the tracked
+    # files; in a tree that is not one (a release archive, or a tree unpacked
+    # inside some other repository) every .sky/.z1, since firmware/cooja is
+    # gitignored and never shipped.
+    for sub in cooja sky z1; do
+        d="$CSIM_DIR/firmware/$sub"
+        [ -d "$d" ] || continue
+        wiped=0
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            rm -f "$f"
+            wiped=$((wiped + 1))
+        done < <(python3 "$CSC2JSON" --local-firmware "$d")
+        echo "  CLEAN $d (removed $wiped local firmware builds)"
+    done
 fi
 
 if [ ! -f "$TEST_RUNNER" ]; then
