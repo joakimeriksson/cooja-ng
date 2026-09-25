@@ -4265,6 +4265,13 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         cpu->instructions++;
         remaining--;
 
+        /* The release's skip is spent once the instruction at its pc has
+         * retired.  One undone by a precise fault below, or abandoned by a
+         * `continue` above, has not: it is skipped again when retried. */
+        if (__builtin_expect(dbg_hook != NULL, 0) && pc == cpu->dbg_skip_pc &&
+            !cpu->bus_fault_pending && !(cpu->secure_fault_pending && cpu->secure_fault_undo))
+            cpu->dbg_skip_pc = UINT32_MAX;
+
         /* ARMv8-M: take a recorded SecureFault (Step 2/4). It is the
          * highest-priority configurable fault; escalation to secure HardFault
          * when masked is not modelled. Gated on tz_enabled. A refused data
@@ -4355,12 +4362,6 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * for the entire spin.  A per-instruction check is what real
          * Cortex-M does between every instruction; gate on has_pending so
          * the common no-IRQ-pending path stays O(1). */
-        /* The release's skip is spent once the instruction at its pc has
-         * retired: the fault paths above `continue` before this point and
-         * keep it, so a retried instruction is skipped again. */
-        if (__builtin_expect(dbg_hook != NULL, 0) && pc == cpu->dbg_skip_pc)
-            cpu->dbg_skip_pc = UINT32_MAX;
-
         if (cpu->nvic) {
             arm_nvic_t *nvic = (arm_nvic_t *)cpu->nvic;
             if (nvic->has_pending && (cpu->primask & 1) == 0)

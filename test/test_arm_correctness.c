@@ -3110,6 +3110,8 @@ static void test_trustzone_vfp(void) {
     assert_eq("VLDR from Non-secure: s2 loaded", 0x3F800000, cpu.vfp_s[2]);
 }
 
+static void test_debug_skip_survives_precise_fault(void);
+
 /* A core in debug halt (a shell breakpoint) dispatches nothing: an IRQ a
  * peripheral pends stays pending, with PC and SP untouched, and is taken at
  * the release. */
@@ -3180,12 +3182,17 @@ static void test_debug_halt_holds_irqs(void) {
     /* The release books the halt as time the core was not running (the
      * energy view's LPM), arms the skip at the hit and re-anchors the
      * execute clock, so the halt is neither replayed nor charged as active. */
-    cpu.dbg_halted = true; cpu.dbg_hit_kind = 1; cpu.dbg_hit_pc = CODE_BASE + 2;
+    cpu.dbg_halted = true; cpu.dbg_hit_kind = 1; cpu.dbg_hit_pc = CODE_BASE + 2; cpu.reg[ARM_PC] = CODE_BASE + 2;
     cpu.sim_time_ns = 3000000000LL; cpu.lpm_ns = 1000000000LL; cpu.dbg_skip_pc = UINT32_MAX;
     arm_dbg_release(&cpu, 8000000000LL);
     assert_true("release: not halted, skip at the hit", !cpu.dbg_halted && cpu.dbg_skip_pc == CODE_BASE + 2);
     assert_true("release: the 5 s halt is LPM, not active", cpu.lpm_ns == 6000000000LL);
+    assert_true("release: the node's time is now (active stays 0 until it runs)", cpu.sim_time_ns == 8000000000LL);
     assert_true("release: execute anchor at the release time", cpu.last_execute_us == 8000000LL);
+    cpu.dbg_halted = true; cpu.reg[ARM_PC] = CODE_BASE + 8;         /* `reg pc =` moved on */
+    cpu.dbg_skip_pc = UINT32_MAX;
+    arm_dbg_release(&cpu, 8000000000LL);
+    assert_true("release elsewhere: no skip armed", cpu.dbg_skip_pc == UINT32_MAX);
     arm_cpu_destroy(&cpu);
 }
 
@@ -3216,6 +3223,22 @@ static void test_trustzone_nvic_itns(void) {
     cpu.secure = true;
     assert_eq("ITNS unchanged after NS write (WI)", (1u << 5),
               arm_read32(&cpu, 0xE000E380));
+}
+
+/* The release's skip is spent only by a retired instruction: a breakpoint
+ * on a load the bus refuses (precise BusFault, the instruction undone)
+ * keeps it, so the handler's return to the same pc does not re-hit. */
+static void test_debug_skip_survives_precise_fault(void) {
+    if (verbose) printf("--- debug skip survives a precise fault ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+    bf_setup(&cpu, &nvic);                             /* LDR r0,[r1] at CODE_BASE is refused */
+    cpu.dbg_bp[0] = CODE_BASE; cpu.dbg_bp_n = 1; cpu.dbg_count = 1;
+    cpu.dbg_skip_pc = CODE_BASE;                       /* released at the breakpoint */
+    arm_step(&cpu, 1);
+    assert_eq("refused load: BusFault handler entered", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_true("the undone instruction did not spend the skip", cpu.dbg_skip_pc == CODE_BASE);
+    arm_cpu_destroy(&cpu);
 }
 
 /* Step 8: BLXNS (Secure->NS call) and FNC_RETURN (NS->Secure return), the
@@ -3605,6 +3628,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_bus_fault();
     test_trustzone_nmi_target();
     test_trustzone_multi_load_skip();
+    test_debug_skip_survives_precise_fault();
     test_trustzone_vfp();
     test_io_lookup();
 
