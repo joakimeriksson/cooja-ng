@@ -46,18 +46,25 @@ static inline int sreg_m(uint16_t hw1, uint16_t hw2) {
  * registers (the base writeback included) at its end, but the undo does
  * not cover the FP registers: a load therefore commits to s[] only once
  * every beat has been accepted, and a refused one leaves them as they
- * were, as on silicon. */
-static void vfp_load(arm_cpu_t *cpu, int sd, uint32_t addr, int n) {
-    uint32_t buf[32];
+ * were, as on silicon. The FPSCR word that VLSTM/VLLDM add after the
+ * registers is one more beat of the same access, inside the same commit.
+ * Shared with those two, which live in arm_cpu.c. */
+void arm_vfp_load(arm_cpu_t *cpu, int sd, uint32_t addr, int n, bool fpscr) {
+    uint32_t buf[33];
     for (int i = 0; i < n; i++)
         buf[i] = arm_insn_read32(cpu, addr + (uint32_t)(i * 4));
-    if (!arm_insn_refused(cpu))
-        memcpy(&cpu->vfp_s[sd], buf, sizeof(uint32_t) * (size_t)n);
+    if (fpscr)
+        buf[n] = arm_insn_read32(cpu, addr + (uint32_t)(n * 4));
+    if (arm_insn_refused(cpu)) return;
+    memcpy(&cpu->vfp_s[sd], buf, sizeof(uint32_t) * (size_t)n);
+    if (fpscr) cpu->fpscr = buf[n];
 }
 
-static void vfp_store(arm_cpu_t *cpu, int sd, uint32_t addr, int n) {
+void arm_vfp_store(arm_cpu_t *cpu, int sd, uint32_t addr, int n, bool fpscr) {
     for (int i = 0; i < n; i++)
         arm_insn_write32(cpu, addr + (uint32_t)(i * 4), cpu->vfp_s[sd + i]);
+    if (fpscr)
+        arm_insn_write32(cpu, addr + (uint32_t)(n * 4), cpu->fpscr);
 }
 
 bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
@@ -115,7 +122,7 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t sp = cpu->reg[13];
         uint32_t newsp = sp - (uint32_t)(regs * 4);
-        vfp_store(cpu, sd, newsp, regs);
+        arm_vfp_store(cpu, sd, newsp, regs, false);
         cpu->reg[13] = newsp;
         return true;
     }
@@ -133,7 +140,7 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         if (dp_alias) sd &= ~1;
         if (regs == 0 || sd + regs > 32) return false;
         uint32_t sp = cpu->reg[13];
-        vfp_load(cpu, sd, sp, regs);
+        arm_vfp_load(cpu, sd, sp, regs, false);
         cpu->reg[13] = sp + (uint32_t)(regs * 4);
         return true;
     }
@@ -161,8 +168,8 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         /* Double-precision: an 8-byte transfer spanning vfp_s[sd] and
          * vfp_s[sd+1]; single-precision: 4 bytes. */
         int words = (coproc == 0xB) ? 2 : 1;
-        if (L) vfp_load(cpu, sd, addr, words);
-        else   vfp_store(cpu, sd, addr, words);
+        if (L) arm_vfp_load(cpu, sd, addr, words, false);
+        else   arm_vfp_store(cpu, sd, addr, words, false);
         return true;
     }
 
@@ -202,8 +209,8 @@ bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2) {
         } else {
             return false;         /* Other PU combos not encoded for VFP LD/ST-multiple */
         }
-        if (L) vfp_load(cpu, sd, addr, regs);
-        else   vfp_store(cpu, sd, addr, regs);
+        if (L) arm_vfp_load(cpu, sd, addr, regs, false);
+        else   arm_vfp_store(cpu, sd, addr, regs, false);
         /* Write back after the accesses: a precise fault on one of them
          * snapshots the register file when the refusal is recorded, so the
          * base must still be unchanged there. */

@@ -250,9 +250,10 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * run. For every other form an allowed access costs nothing.
  *
  * FP registers are not in the snapshot. VFP loads and stores take the same
- * checked path (VLSTM/VLLDM here, arm_vfp.c through arm_insn_read32/write32)
- * and commit a load to the FP registers only once every beat has been
- * accepted, so a refused one leaves them as they were.
+ * checked path (arm_vfp_load/arm_vfp_store, through arm_insn_read32/write32;
+ * VLSTM/VLLDM here use them too) and commit a load to the FP registers only
+ * once every beat has been accepted, so a refused one leaves them as they
+ * were.
  *
  * Out of line: called from arm_tz_blocks, which is inlined into the six
  * mem_* helpers at hundreds of sites. */
@@ -1832,6 +1833,18 @@ static inline void arm_trace_step(arm_cpu_t *cpu) {
             cpu->reg[0], cpu->reg[1], cpu->reg[2], cpu->reg[3],
             cpu->reg[4], cpu->reg[5], cpu->reg[6], cpu->reg[7],
             cpu->xpsr, (void*)cpu);
+}
+
+/* ARMv8-M VLSTM (store S0-S15 + FPSCR at [Rn]) / VLLDM (restore them):
+ * one CMSE world switch each, so cold. Out of line because inlined in the
+ * interpreter it moved the IT-block hot path (-7 % on arm-bench it-block,
+ * gcc x86-64); out of line the layout is +5 %. */
+static void __attribute__((noinline)) arm_vlstm_vlldm(arm_cpu_t *cpu, uint16_t hw1) {
+    uint32_t base = cpu->reg[hw1 & 0xF];
+    if ((hw1 & 0x0010) == 0)
+        arm_vfp_store(cpu, 0, base, 16, true);
+    else
+        arm_vfp_load(cpu, 0, base, 16, true);
 }
 
 static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
@@ -4196,25 +4209,11 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                  * eagerly (no lazy state preservation): VLSTM stores
                  * S0-S15 + FPSCR at [Rn], VLLDM restores them. The 0x48-byte
                  * slot is reserved by the caller; nothing else touches it.
-                 * Checked accesses like every other load/store; VLLDM
-                 * commits only once all 17 words are accepted, since the
+                 * The VFP's own beat helpers (arm_vlstm_vlldm): checked
+                 * accesses like every other load/store, and VLLDM commits
+                 * only once all 17 words are accepted, since the
                  * precise-fault undo does not cover the FP registers. */
-                int rn = hw1 & 0xF;
-                uint32_t base = cpu->reg[rn];
-                bool store = (hw1 & 0x0010) == 0;
-                if (store) {
-                    for (int i = 0; i < 16; i++)
-                        mem_write32(cpu, base + 4 * i, cpu->vfp_s[i]);
-                    mem_write32(cpu, base + 0x40, cpu->fpscr);
-                } else {
-                    uint32_t buf[17];
-                    for (int i = 0; i < 17; i++)
-                        buf[i] = mem_read32(cpu, base + 4 * i);
-                    if (!arm_insn_refused(cpu)) {
-                        memcpy(cpu->vfp_s, buf, sizeof(uint32_t) * 16);
-                        cpu->fpscr = buf[16];
-                    }
-                }
+                arm_vlstm_vlldm(cpu, hw1);
                 (void)insn32;
             } else if ((hw1 & 0xEC00) == 0xEC00) {
                 /* Cortex-M4F single-precision VFP. Real implementations

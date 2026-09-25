@@ -491,6 +491,11 @@ void arm_stop(arm_cpu_t *cpu);
 /* Cortex-M4F VFP step — defined in arm_vfp.c. Returns true if hw1/hw2
  * was handled, false otherwise (caller should fault loudly). */
 bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2);
+/* The VFP's checked multi-word load/store beats (arm_vfp.c): n words from
+ * addr into/out of s[sd..], then the FPSCR if fpscr. A load commits only
+ * once every beat was accepted. VLSTM/VLLDM in arm_cpu.c use them too. */
+void arm_vfp_load(arm_cpu_t *cpu, int sd, uint32_t addr, int n, bool fpscr);
+void arm_vfp_store(arm_cpu_t *cpu, int sd, uint32_t addr, int n, bool fpscr);
 
 /* Data accesses issued by an instruction handler outside arm_cpu.c: the
  * interpreter's checked path (attribution unit + bus check, precise-fault
