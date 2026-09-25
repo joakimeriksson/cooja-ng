@@ -2434,9 +2434,12 @@ static void test_trustzone_secure_exception(void) {
  * XIAO nRF54L15: CFSR 0x8200, BFAR = the Non-secure alias, load not done. */
 static arm_nvic_t *bf_hook_nvic;      /* set by bf_setup; used by refuse_and_pend */
 static int         bf_hook_irq = -1;  /* IRQ the refusing "security unit" raises */
+static uint32_t    bf_refuse_also;    /* a second refused page, 0 = none */
 static bool refuse_0x40001000(void *user, uint32_t addr, bool is_write) {
     (void)user; (void)is_write;
-    if ((addr & ~0xFFFu) != 0x40001000u) return true;
+    if ((addr & ~0xFFFu) != 0x40001000u &&
+        (bf_refuse_also == 0 || (addr & ~0xFFFu) != bf_refuse_also))
+        return true;
     /* Like the nRF54L15 security unit: the refused transaction also raises
      * the unit's interrupt, marked pending but not dispatched. */
     if (bf_hook_irq >= 0 && bf_hook_nvic)
@@ -2455,6 +2458,7 @@ static void bf_setup(arm_cpu_t *cpu, arm_nvic_t *nvic) {
     arm_nvic_init(nvic, cpu);
     bf_hook_nvic = nvic;
     bf_hook_irq = -1;
+    bf_refuse_also = 0;
     cpu->tz_enabled = true;
     cpu->secure = false;
     cpu->use_psp = false;
@@ -2874,6 +2878,88 @@ static void test_trustzone_bus_fault(void) {
         snprintf(name, sizeof name, "%s: r0 untouched", what);
         assert_eq(name, 0xDEADBEEF, cpu.reg[0]);
     }
+}
+
+/* A multi-register load skips its explicit snapshot when no beat can be
+ * refused: the core is Secure or has no security extension, and every
+ * beat is in SRAM or flash. The boundary of that span check is what a
+ * refused beat in Secure state exercises — the only other refused
+ * multi-load tests run Non-secure, where the copy is taken regardless.
+ * A wrong bound would skip the copy, and the BusFault would be imprecise
+ * with the earlier beats' registers already written. */
+#define ML_S_SP  0x20007000u
+static void test_trustzone_multi_load_skip(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone multi-load snapshot boundary tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+    uint32_t sram_end = ARM_SRAM_BASE + ARM_SRAM_SIZE;
+
+    /* Secure LDRD r0, r1, [r2] from the refused page: precise, r0 and r1
+     * untouched, frame on the Secure stack. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.reg[ARM_SP] = ML_S_SP;
+    write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0100);  /* LDRD r0, r1, [r2] */
+    cpu.reg[1] = 0xCAFEBABE;
+    cpu.reg[2] = 0x40001000;
+    arm_step(&cpu, 1);
+    assert_eq("Secure LDRD refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("Secure LDRD refused: BFAR = first beat", 0x40001000, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("Secure LDRD refused: stacked PC = the LDRD", CODE_BASE, arm_read32(&cpu, ML_S_SP - 32 + 24));
+    assert_eq("Secure LDRD refused: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("Secure LDRD refused: r1 untouched", 0xCAFEBABE, cpu.reg[1]);
+
+    /* Secure LDM r2!, {r0, r1} straddling the end of SRAM: the first beat
+     * is the last SRAM word and loads r0, the second is past the end and
+     * refused (the hook refuses that page too). The r0 write is undone. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.reg[ARM_SP] = ML_S_SP;
+    bf_refuse_also = sram_end;
+    write_thumb16(&cpu, CODE_BASE, 0xCA03);          /* LDM r2!, {r0, r1} */
+    arm_write32(&cpu, sram_end - 4, 0x11111111);
+    cpu.reg[1] = 0xCAFEBABE;
+    cpu.reg[2] = sram_end - 4;
+    arm_step(&cpu, 1);
+    assert_eq("Secure LDM across sram_end: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("Secure LDM across sram_end: BFAR = the beat past the end", sram_end, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("Secure LDM across sram_end: stacked PC = the LDM", CODE_BASE, arm_read32(&cpu, ML_S_SP - 32 + 24));
+    assert_eq("Secure LDM across sram_end: r0 write undone", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("Secure LDM across sram_end: r1 untouched", 0xCAFEBABE, cpu.reg[1]);
+    assert_eq("Secure LDM across sram_end: no writeback", sram_end - 4, cpu.reg[2]);
+
+    /* The same LDM one word lower ends exactly at the SRAM end: every beat
+     * is SRAM, the copy is skipped (insn_snap_valid stays clear) and the
+     * load completes. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.reg[ARM_SP] = ML_S_SP;
+    bf_refuse_also = sram_end;
+    write_thumb16(&cpu, CODE_BASE, 0xCA03);          /* LDM r2!, {r0, r1} */
+    arm_write32(&cpu, sram_end - 8, 0x22222222);
+    arm_write32(&cpu, sram_end - 4, 0x11111111);
+    cpu.reg[2] = sram_end - 8;
+    arm_step(&cpu, 1);
+    assert_eq("Secure LDM to sram_end: no fault", CODE_BASE + 2, cpu.reg[ARM_PC]);
+    assert_eq("Secure LDM to sram_end: r0 loaded", 0x22222222, cpu.reg[0]);
+    assert_eq("Secure LDM to sram_end: r1 loaded", 0x11111111, cpu.reg[1]);
+    assert_eq("Secure LDM to sram_end: written back", sram_end, cpu.reg[2]);
+    assert_true("Secure LDM to sram_end: snapshot skipped", !cpu.insn_snap_valid);
+
+    /* No security extension, a bus check alone: Secure-or-not is moot and
+     * the span check decides. POP {r0, r1} with SP in the refused page. */
+    bf_setup(&cpu, &nvic);
+    cpu.tz_enabled = false;
+    cpu.vtor = ARM_FLASH_BASE;                       /* the one vector table */
+    cpu.reg[ARM_SP] = 0x40001000;
+    write_thumb16(&cpu, CODE_BASE, 0xBC03);          /* POP {r0, r1} */
+    cpu.reg[1] = 0xCAFEBABE;
+    arm_step(&cpu, 1);
+    assert_eq("no-TZ POP refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("no-TZ POP refused: BFAR = first beat", 0x40001000, cpu.bfar);
+    assert_eq("no-TZ POP refused: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("no-TZ POP refused: r1 untouched", 0xCAFEBABE, cpu.reg[1]);
+    assert_eq("no-TZ POP refused: frame below the original SP", 0x40001000 - 32, cpu.reg[ARM_SP]);
 }
 
 /* NMI, HardFault and BusFault share one targeting rule: Secure unless
@@ -3404,6 +3490,7 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_ns_fetch();
     test_trustzone_bus_fault();
     test_trustzone_nmi_target();
+    test_trustzone_multi_load_skip();
     test_trustzone_vfp();
     test_io_lookup();
 
