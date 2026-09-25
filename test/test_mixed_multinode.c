@@ -2474,6 +2474,30 @@ int run_mixed_multinode_test(int argc, char **argv) {
          * paused is not a deadlock when it is up. */
         shell_svc.external_resume = ui_enabled != 0;
     }
+    /* Web UI.  The speed ratio (default 10x, shared with serial-socket
+     * pacing) and the pause state live in sim_control, which is initialized
+     * here -- before the UI service, which is one of its clients.  Started
+     * here, before the motes boot and before the GDB stubs attach: an
+     * explicit --ui that cannot start is fatal, and with --gdb-wait that
+     * verdict must come before the run blocks for a debugger, not after
+     * the user has attached one.  The service holds pointers only, so
+     * nothing it needs is settled later than this. */
+    ctl_init_once(&node_count);
+    if (ui_enabled && !ui_service_active(&ui_svc)) {
+        if (!ui_service_start(&ui_svc, g_ui_bind, ui_port,
+                              node_states, prev_node_states,
+                              node_last_tx_ns, prev_last_tx_ns,
+                              &radio_medium, &timeline_svc.tl,
+                              &node_count, ui_describe_node, &sim_ctl)) {
+            /* --ui was asked for: a run without it is not the run asked
+             * for (with --ui, -t no longer ends it), so fail loudly. */
+            fprintf(stderr, "--ui: cannot start the web UI on %s:%d\n",
+                    g_ui_bind ? g_ui_bind : "127.0.0.1", ui_port);
+            return SHELL_EXIT_INVALID;
+        }
+        ui_svc.rt = &sim_rt;   /* plugin UI panels source */
+    }
+
     /* A restart re-creates the configured nodes only; nodes added since
      * (shell `add`, JS addMote) are destroyed with the rest. */
     int base_node_count = node_count;
@@ -2690,25 +2714,6 @@ sim_restart:
     memset(prev_node_states, 0, sizeof(prev_node_states));
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
 
-    /* Initialize WebSocket UI service (only on first run, not restart).
-     * The speed ratio (default 10x, shared with serial-socket pacing) and
-     * the pause state live in sim_control, which is initialized here —
-     * before the UI service, which is one of its clients. */
-    ctl_init_once(&node_count);
-    if (ui_enabled && !ui_service_active(&ui_svc)) {
-        if (!ui_service_start(&ui_svc, g_ui_bind, ui_port,
-                              node_states, prev_node_states,
-                              node_last_tx_ns, prev_last_tx_ns,
-                              &radio_medium, &timeline_svc.tl,
-                              &node_count, ui_describe_node, &sim_ctl)) {
-            /* --ui was asked for: a run without it is not the run asked
-             * for (with --ui, -t no longer ends it), so fail loudly. */
-            fprintf(stderr, "--ui: cannot start the web UI on %s:%d\n",
-                    g_ui_bind ? g_ui_bind : "127.0.0.1", ui_port);
-            return SHELL_EXIT_INVALID;
-        }
-        ui_svc.rt = &sim_rt;   /* plugin UI panels source */
-    }
 
     /* Set up serial socket server for border-router tests */
     if (config_loaded && config.has_serial_socket) {
