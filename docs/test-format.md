@@ -539,14 +539,14 @@ Complex validation logic (e.g., collecting IP addresses and cross-checking per-n
 # Single test
 ./build/test_runner mixed-multinode configs/my-test.json -v
 
-# All Cooja tests (requires firmware to be built)
-./tools/run-cooja-tests.sh /path/to/contiki-ng
+# All Cooja tests (builds missing firmware; CONTIKI_DIR: env -> csim.conf -> ../contiki-ng)
+./tools/run-cooja-tests.sh
 
 # Specific test directory
-./tools/run-cooja-tests.sh /path/to/contiki-ng "14-rpl-lite"
+./tools/run-cooja-tests.sh "14-rpl-lite"
 
-# Build firmware for tests
-./tools/build-test-firmware.sh /path/to/contiki-ng
+# Build the firmware those tests use, without running them
+./tools/build-test-firmware.sh "14-rpl-lite"
 ```
 
 ### Test Runner Options

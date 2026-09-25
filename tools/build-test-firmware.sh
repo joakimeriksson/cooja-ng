@@ -6,7 +6,8 @@
 #   ./tools/build-test-firmware.sh [--target <cooja|cc2538dk>] [test-dir-pattern]
 #   ./tools/build-test-firmware.sh --from-json <config.json> [config2.json ...]
 #
-# Mode 1 (default): Scans .csc files for source references, builds each firmware.
+# Mode 1 (default): Converts each matching .csc the way run-cooja-tests.sh does
+#                   and builds the firmware it will look up, under the same name.
 # Mode 2 (--from-json): Reads build info from JSON configs (target, board, make_args).
 #
 # CONTIKI_DIR resolution: env variable -> csim.conf -> ../contiki-ng
@@ -136,7 +137,7 @@ build_from_json() {
 
     RESULTS_FILE=$(mktemp)
     FW_LIST_FILE=$(mktemp)
-    trap "rm -f $RESULTS_FILE $FW_LIST_FILE" EXIT
+    trap "rm -rf $RESULTS_FILE $FW_LIST_FILE $EXTRA_CLEANUP" EXIT
 
     # Extract unique firmware entries from all JSON files
     for json_file in $json_files; do
@@ -210,61 +211,40 @@ for n in d.get('nodes', []):
 }
 
 # ---- Mode 1: Scan .csc files ----
+# Each .csc is converted exactly as run-cooja-tests.sh converts it, and the
+# JSON is built as by Mode 2.  So the firmware lands under the name the suite
+# looks up — per source directory and make arguments, with the .csc's own
+# target, board and make arguments — instead of a plain <name>.<target> the
+# suite no longer trusts, since it may have been built from another directory.
 build_from_csc() {
     local test_pattern="$1"
 
     resolve_contiki_dir
 
-    FIRMWARE_DIR="$CSIM_DIR/firmware/$DEFAULT_TARGET"
-    mkdir -p "$FIRMWARE_DIR"
-
     echo "=== Build Test Firmware ==="
-    echo "  Contiki-NG: $CONTIKI_DIR"
-    echo "  Target: $DEFAULT_TARGET"
     echo "  Test pattern: $test_pattern"
-    echo "  Output: $FIRMWARE_DIR"
-    echo ""
+    echo "  Default target: $DEFAULT_TARGET"
 
-    RESULTS_FILE=$(mktemp)
-    FW_LIST_FILE=$(mktemp)
-    trap "rm -f $RESULTS_FILE $FW_LIST_FILE" EXIT
+    local json_dir n=0
+    json_dir=$(mktemp -d)
+    EXTRA_CLEANUP="$json_dir"
+    trap "rm -rf $json_dir" EXIT
 
+    # csc2json looks for existing firmware relative to its cwd, and the suite
+    # runs it from this tree.
     for csc_file in "$CONTIKI_DIR"/tests/$test_pattern/*.csc; do
         [ -f "$csc_file" ] || continue
-        test_dir="$(dirname "$csc_file")"
-
-        firmware_list=$(python3 "$CSC2JSON" --list-firmware "$csc_file" 2>/dev/null || true)
-        for fw in $firmware_list; do
-            if grep -q "^${fw}	" "$FW_LIST_FILE" 2>/dev/null; then
-                continue
-            fi
-
-            src_dir=""
-            code_dir="$test_dir/code"
-            if [ -f "$code_dir/$fw.c" ]; then
-                src_dir="$code_dir"
-            else
-                for d in "$test_dir" "$test_dir/.."; do
-                    if [ -f "$d/code/$fw.c" ]; then
-                        src_dir="$d/code"
-                        break
-                    fi
-                done
-            fi
-            echo "${fw}	${src_dir}" >> "$FW_LIST_FILE"
-        done
+        n=$((n + 1))
+        if ! (cd "$CSIM_DIR" && python3 "$CSC2JSON" "$csc_file" \
+                --contiki "$CONTIKI_DIR" --firmware-dir "firmware/$DEFAULT_TARGET" \
+                --js-native -o "$json_dir/$n.json" 2>/dev/null); then
+            echo "  SKIP $(basename "$(dirname "$csc_file")")/$(basename "$csc_file" .csc) (conversion failed)"
+            rm -f "$json_dir/$n.json"
+        fi
     done
-
-    fw_count=$(wc -l < "$FW_LIST_FILE" | tr -d ' ')
-    echo "Firmware to build: $fw_count"
     echo ""
 
-    sort "$FW_LIST_FILE" | while IFS='	' read -r fw src_dir; do
-        target_file="$FIRMWARE_DIR/$fw.$DEFAULT_TARGET"
-        build_one "$fw" "$src_dir" "$DEFAULT_TARGET" "$target_file"
-    done
-
-    print_summary
+    build_from_json "$json_dir"/*.json
 }
 
 # ---- Main ----
@@ -272,6 +252,7 @@ DEFAULT_TARGET="cooja"
 TEST_PATTERN="*"
 JSON_MODE=0
 JSON_FILES=""
+EXTRA_CLEANUP=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
