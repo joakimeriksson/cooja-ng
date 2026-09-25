@@ -64,6 +64,8 @@ typedef struct ext_node {
     bool     failed;           /* sticky: peer died / protocol violation    */
 
     int      timeout_ms;       /* CSIM_EXT_TIMEOUT_MS, default 5000         */
+    int      idle_steps;       /* consecutive exchanges that did not move
+                                * sim_time_ns (livelock guard)              */
 
     /* Pending RX, oldest first (ring). */
     ext_node_rx_t rx_queue[EXT_NODE_RX_QUEUE];

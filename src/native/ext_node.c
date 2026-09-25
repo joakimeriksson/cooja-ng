@@ -12,6 +12,7 @@
 #include "ext_node.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <poll.h>
 #include <signal.h>
@@ -188,6 +189,30 @@ int ext_node_deliver_frame(ext_node_t *node, const uint8_t *frame, int len,
  * Applying the peer's output events
  * ============================================================ */
 
+/* Consecutive exchanges a peer may make without its clock moving before it
+ * is failed.  A few in a row are legitimate -- a peer yields at each of
+ * several transmissions at one instant -- but one that keeps emitting at the
+ * same instant would exchange steps forever while the simulation never
+ * advances.  A peer that emits nothing is caught on its first such exchange
+ * (ext_node_step_until_ns); this bounds the rest. */
+#define EXT_NODE_MAX_IDLE_STEPS 10000
+
+/* A time field from the peer, in ns.  Returns 1 and sets *out for a finite
+ * number in [0, INT64_MAX), 0 if the field is absent (or not a number), and
+ * -1 -- after failing the node -- for anything else: converting an infinite
+ * or out-of-range double to int64_t is undefined. */
+static int json_ns(ext_node_t *node, const cJSON *v, const char *what,
+                   int64_t *out) {
+    if (!cJSON_IsNumber(v)) return 0;
+    double d = v->valuedouble;
+    if (!isfinite(d) || d < 0 || d >= 9223372036854775807.0) {
+        ext_fail(node, "`%s` is not a time in ns: %g", what, d);
+        return -1;
+    }
+    *out = (int64_t)d;
+    return 1;
+}
+
 static void emit_log_line(ext_node_t *node, const char *line) {
     if (!node->log_callback) return;
     for (const char *p = line; *p; p++)
@@ -195,12 +220,14 @@ static void emit_log_line(ext_node_t *node, const char *line) {
     node->log_callback(node->log_callback_data, (uint8_t)'\n');
 }
 
-static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
-                            int64_t step_t) {
+/* Apply one output event.  Returns 1 if it had an effect outside the
+ * peer's own schedule (a frame or a console line), else 0. */
+static int apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
+                           int64_t step_t) {
     const cJSON *type = cJSON_GetObjectItemCaseSensitive(ev, "type");
     if (!cJSON_IsString(type)) {
         ext_fail(node, "output event with no `type`");
-        return;
+        return 0;
     }
 
     /* Events are stamped in sim time.  A peer that emulates a CPU lags the
@@ -212,18 +239,23 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
      * radio output.  Only a stamp before the slice is a protocol error.
      * Deferring a future-stamped event needs the pending queue that
      * arrives with M1. */
+    char what[48];
+    snprintf(what, sizeof(what), "%.40s.t", type->valuestring);
     const cJSON *t = cJSON_GetObjectItemCaseSensitive(ev, "t");
-    if (cJSON_IsNumber(t) && (int64_t)t->valuedouble < slice_start) {
+    int64_t t_ns = 0;
+    int has_t = json_ns(node, t, what, &t_ns);
+    if (has_t < 0) return 0;
+    if (has_t && t_ns < slice_start) {
         ext_fail(node, "output event stamped t=%lld before the slice start t=%lld",
-                 (long long)t->valuedouble, (long long)slice_start);
-        return;
+                 (long long)t_ns, (long long)slice_start);
+        return 0;
     }
 
     if (strcmp(type->valuestring, "tx") == 0) {
         const cJSON *frame = cJSON_GetObjectItemCaseSensitive(ev, "frame");
         if (!cJSON_IsString(frame)) {
             ext_fail(node, "tx event with no `frame`");
-            return;
+            return 0;
         }
         uint8_t buf[EXT_NODE_MAX_FRAME];
         int len = hex_decode(frame->valuestring, buf, (int)sizeof(buf));
@@ -232,47 +264,45 @@ static void apply_out_event(ext_node_t *node, cJSON *ev, int64_t slice_start,
              * silently — a jammer would look like it was working. */
             ext_fail(node, "tx frame is malformed hex or longer than %d bytes",
                      EXT_NODE_MAX_FRAME);
-            return;
+            return 0;
         }
         /* The stamp is what makes an acknowledgement land in the sender's
          * CSMA window: the peer computed it from the frame's true end on
          * the air, and the bus puts it on the air there rather than at the
          * end of this catch-up slice. */
-        int64_t at_ns = cJSON_IsNumber(t) ? (int64_t)t->valuedouble : 0;
         if (node->rf_frame_callback)
             node->rf_frame_callback(node->rf_frame_callback_data, buf, len,
-                                    at_ns);
+                                    t_ns);
+        return 1;
 
     } else if (strcmp(type->valuestring, "log") == 0) {
         const cJSON *line = cJSON_GetObjectItemCaseSensitive(ev, "line");
         /* The console line carries the node's clock (timeline, log
          * timestamps): stamp it with the event's own time inside the
          * slice, as an emulated mote's line would be, not the slice end. */
-        if (cJSON_IsNumber(t)) {
-            int64_t at = (int64_t)t->valuedouble;
-            if (at > step_t) at = step_t;
-            node->sim_time_ns = at;
-        }
+        if (has_t)
+            node->sim_time_ns = t_ns > step_t ? step_t : t_ns;
         if (cJSON_IsString(line))
             emit_log_line(node, line->valuestring);
+        return 1;
 
     } else if (strcmp(type->valuestring, "wake") == 0) {
-        if (cJSON_IsNumber(t)) {
-            int64_t when = (int64_t)t->valuedouble;
-            if (when < node->next_wakeup_ns) node->next_wakeup_ns = when;
-        }
+        if (has_t && t_ns < node->next_wakeup_ns) node->next_wakeup_ns = t_ns;
 
     } else {
         /* Unknown types are ignored on purpose: the protocol only ever gains
          * event kinds, and an old csim must not reject a newer peer. */
     }
+    return 0;
 }
 
 /* Read one `done` reply and apply it.  `slice_start` is where the peer
  * stood before this step, `step_t` the time it was asked to reach.  The
  * reply's own `t` -- where the peer actually stopped, which is earlier
  * than `step_t` when it yielded at a transmission -- becomes the node's
- * clock, so the next slice's lower bound is where the peer really is. */
+ * clock, so the next slice's lower bound is where the peer really is.
+ * Returns -1 if the node failed, else how many output events had an
+ * effect (apply_out_event). */
 static int consume_done(ext_node_t *node, int64_t slice_start, int64_t step_t) {
     char line[EXT_NODE_LINE_MAX];
     if (read_line(node, line, sizeof(line)) != 0) return -1;
@@ -292,14 +322,18 @@ static int consume_done(ext_node_t *node, int64_t slice_start, int64_t step_t) {
 
     /* `wake` first, so a `wake` output event can only pull it earlier. */
     const cJSON *wake = cJSON_GetObjectItemCaseSensitive(msg, "wake");
-    node->next_wakeup_ns = cJSON_IsNumber(wake)
-                         ? (int64_t)wake->valuedouble : INT64_MAX;
+    node->next_wakeup_ns = INT64_MAX;
+    if (json_ns(node, wake, "done.wake", &node->next_wakeup_ns) < 0) {
+        cJSON_Delete(msg);
+        return -1;
+    }
 
     const cJSON *out = cJSON_GetObjectItemCaseSensitive(msg, "out");
+    int effects = 0;
     if (cJSON_IsArray(out)) {
         cJSON *ev = NULL;
         cJSON_ArrayForEach(ev, out) {
-            apply_out_event(node, ev, slice_start, step_t);
+            effects += apply_out_event(node, ev, slice_start, step_t);
             if (node->failed) break;
         }
     }
@@ -308,15 +342,20 @@ static int consume_done(ext_node_t *node, int64_t slice_start, int64_t step_t) {
      * `step_t` otherwise.  A reply that claims a time outside the slice is
      * taken as `step_t` -- the old peers stamp their reply with it anyway. */
     const cJSON *done_t = cJSON_GetObjectItemCaseSensitive(msg, "t");
-    int64_t reached = step_t;
-    if (cJSON_IsNumber(done_t)) {
-        int64_t claimed = (int64_t)done_t->valuedouble;
-        if (claimed >= slice_start && claimed <= step_t) reached = claimed;
+    int64_t reached = step_t, claimed;
+    int has_t = json_ns(node, done_t, "done.t", &claimed);
+    if (has_t < 0) {
+        cJSON_Delete(msg);
+        return -1;
     }
+    if (has_t && claimed >= slice_start && claimed <= step_t) reached = claimed;
     node->sim_time_ns = reached;
 
+    /* A peer cannot ask to be woken before where it stands. */
+    if (node->next_wakeup_ns < reached) node->next_wakeup_ns = reached;
+
     cJSON_Delete(msg);
-    return node->failed ? -1 : 0;
+    return node->failed ? -1 : effects;
 }
 
 /* ============================================================
@@ -394,12 +433,12 @@ int ext_node_start(ext_node_t *node, double x, double y, uint32_t seed) {
     if (write_all(node, line, (size_t)n) != 0) return -1;
 
     /* The reply to hello is what carries the peer's first wakeup. */
-    return consume_done(node, 0, 0);
+    return consume_done(node, 0, 0) < 0 ? -1 : 0;
 }
 
 /* One step exchange, carrying every RX that has arrived by `when`.
  * `slice_start` is where the peer stood before it. */
-static void do_step(ext_node_t *node, int64_t slice_start, int64_t when) {
+static int do_step(ext_node_t *node, int64_t slice_start, int64_t when) {
     char line[EXT_NODE_LINE_MAX];
     int n = snprintf(line, sizeof(line),
                      "{\"type\":\"step\",\"t\":%lld,\"in\":[",
@@ -432,12 +471,13 @@ static void do_step(ext_node_t *node, int64_t slice_start, int64_t when) {
     int m = snprintf(line + n, sizeof(line) - (size_t)n, "]}\n");
     if (m < 0 || n + m >= (int)sizeof(line)) {
         ext_fail(node, "step line does not fit in %zu bytes", sizeof(line));
-        return;
+        return -1;
     }
     n += m;
 
-    if (write_all(node, line, (size_t)n) != 0) return;
-    consume_done(node, slice_start, when);
+    if (write_all(node, line, (size_t)n) != 0) return -1;
+    int effects = consume_done(node, slice_start, when);
+    return effects < 0 ? -1 : emitted + effects;
 }
 
 void ext_node_step_until_ns(ext_node_t *node, int64_t target_ns) {
@@ -459,7 +499,25 @@ void ext_node_step_until_ns(ext_node_t *node, int64_t target_ns) {
         int64_t slice_start = node->sim_time_ns;
         if (next_ev > node->sim_time_ns) node->sim_time_ns = next_ev;
         node->next_wakeup_ns = INT64_MAX;
-        do_step(node, slice_start, next_ev);
+        int traffic = do_step(node, slice_start, next_ev);
+        if (traffic < 0) break;
+
+        if (node->sim_time_ns > slice_start) {
+            node->idle_steps = 0;
+        } else if (traffic == 0 && node->next_wakeup_ns <= node->sim_time_ns) {
+            /* Nothing in, nothing out, the clock where it was, and a wake
+             * that asks for the same exchange again.  The loop does not
+             * return to the kernel in between, so nothing the peer could
+             * respond to will have changed: fail it now, not after
+             * EXT_NODE_MAX_IDLE_STEPS round trips with every node stalled. */
+            ext_fail(node, "asked to be woken at %lld ns, where it already "
+                     "stands, with no input or output in between",
+                     (long long)node->sim_time_ns);
+        } else if (++node->idle_steps >= EXT_NODE_MAX_IDLE_STEPS) {
+            ext_fail(node, "%d steps in a row without its clock moving past "
+                     "%lld ns (a wake at or before where it stands?)",
+                     node->idle_steps, (long long)node->sim_time_ns);
+        }
     }
 }
 

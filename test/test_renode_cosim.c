@@ -641,6 +641,37 @@ static void test_service_tick_arithmetic(int verbose) {
     mock_teardown(&k);
 }
 
+/* The tick count comes off the wire.  One that would carry the horizon past
+ * int64_t ns must end the run loudly rather than overflow into a clock that
+ * stalls or leaps; a large one that fits must still be honoured exactly. */
+static void test_service_tick_range(int verbose) {
+    if (verbose) printf("  -- service: tick count out of range --\n");
+    mock_t k;
+    mock_setup(&k);
+    renode_msg_t r;
+    master_recv(k.master_main, &r);
+
+    /* 10^15 ticks at 1 MHz: 10^9 s, about 31.7 years.  Fits. */
+    master_send(&k, RENODE_TICK_CLOCK, 0, 1000000000000000ULL);
+    int64_t h = renode_cosim_next_horizon(&k.svc, 0);
+    ASSERT_EQ(h, 1000000000000000000LL, "a large tick that fits is exact");
+    master_drain(k.master_async);
+
+    master_send(&k, RENODE_TICK_CLOCK, 0, UINT64_MAX);
+    h = renode_cosim_next_horizon(&k.svc, h);
+    ASSERT_EQ(h, -1, "a tick past the int64 ns range ends the run");
+    ASSERT(!renode_cosim_active(&k.svc), "service is inactive after it");
+    mock_teardown(&k);
+
+    /* Well inside uint64 but past int64 ns: 10^13 s at 1 MHz. */
+    mock_setup(&k);
+    master_recv(k.master_main, &r);
+    master_send(&k, RENODE_TICK_CLOCK, 0, 10000000000000000000ULL);
+    h = renode_cosim_next_horizon(&k.svc, 0);
+    ASSERT_EQ(h, -1, "a tick whose horizon overflows int64 ends the run");
+    mock_teardown(&k);
+}
+
 static void test_service_bus(int verbose) {
     if (verbose) printf("  -- service: bus reads and writes --\n");
     mock_t k;
@@ -872,6 +903,7 @@ int run_renode_cosim_tests(int verbose) {
     test_service_config_parse(verbose);
     test_service_handshake_ticks(verbose);
     test_service_tick_arithmetic(verbose);
+    test_service_tick_range(verbose);
     test_service_bus(verbose);
     test_service_async_plane(verbose);
     test_service_disconnect(verbose);

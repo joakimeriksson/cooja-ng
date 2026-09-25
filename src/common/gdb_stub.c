@@ -17,6 +17,8 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <poll.h>
+#include <time.h>
 #include <arpa/inet.h>
 
 /* ============================================================
@@ -70,6 +72,53 @@ static uint32_t parse_hex(const char **pp) {
  * Receiver sends '+' to ack, '-' to request retransmit.
  * ============================================================ */
 
+/* Once a packet has started (or a reply awaits its ack), the rest must
+ * arrive within this long -- the whole rest, not each byte of it.  GDB sends a packet whole and acks at once, so
+ * only a stalled or broken peer waits this out -- and the stub reads on the
+ * simulation's thread, so without a bound that peer would freeze the run. */
+#define GDB_IO_TIMEOUT_MS 5000
+
+/* Read one byte.  timeout_ms < 0 blocks.  Returns 1, 0 on timeout, -1 on
+ * EOF or error. */
+static int read_byte(gdb_stub_t *stub, char *c, int timeout_ms) {
+    for (;;) {
+        struct pollfd pfd = { .fd = stub->client_fd, .events = POLLIN };
+        int r = poll(&pfd, 1, timeout_ms);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return 0;
+        ssize_t n = read(stub->client_fd, c, 1);
+        if (n == 1) return 1;
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        return -1;
+    }
+}
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Milliseconds left before `deadline` (a now_ms() value), never negative. */
+static int ms_until(int64_t deadline) {
+    int64_t left = deadline - now_ms();
+    return left > 0 ? (int)left : 0;
+}
+
+/* Forget the client and everything it set up: the next one to connect
+ * starts clean, as after a detach. */
+static void drop_client(gdb_stub_t *stub) {
+    if (stub->client_fd >= 0) close(stub->client_fd);
+    stub->client_fd = -1;
+    stub->connected = false;
+    stub->halted = false;
+    stub->num_breakpoints = 0;
+}
+
 /* Send a fully formed reply packet. data is the payload (no $ or #). */
 static int send_packet(gdb_stub_t *stub, const char *data) {
     if (stub->client_fd < 0) return -1;
@@ -107,8 +156,11 @@ static int send_packet(gdb_stub_t *stub, const char *data) {
     /* Wait for + ack (single byte). We don't retry on - to keep things
      * simple — modern GDB rarely nacks unless the link is corrupting. */
     char ack;
-    ssize_t n = read(stub->client_fd, &ack, 1);
-    if (n != 1) return -1;
+    if (read_byte(stub, &ack, GDB_IO_TIMEOUT_MS) != 1) {
+        fprintf(stderr, "gdb_stub: no ack from client, disconnecting\n");
+        drop_client(stub);
+        return -1;
+    }
     return 0;
 }
 
@@ -140,29 +192,28 @@ static int recv_packet(gdb_stub_t *stub) {
     if (stub->client_fd < 0) return -1;
 
     char c;
-    /* Skip ack bytes and detect Ctrl+C */
+    /* Skip ack bytes and detect Ctrl+C.  Halted, wait for the user's next
+     * command as long as it takes; running, take only what has arrived. */
     for (;;) {
-        ssize_t n = read(stub->client_fd, &c, 1);
-        if (n == 0) return -1;            /* peer closed */
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
-            return -1;
-        }
+        int r = read_byte(stub, &c, stub->halted ? -1 : 0);
+        if (r < 0) return -1;             /* peer closed */
+        if (r == 0) return -2;            /* nothing more to read */
         if (c == '+' || c == '-') continue;
         if (c == 0x03) return GDB_RX_INTERRUPT;
         if (c == '$') break;
         /* Anything else: framing error, drop it */
     }
 
-    /* Read body until '#', then 2 hex chars */
+    /* Read body until '#', then 2 hex chars, all before one deadline: a
+     * client dripping a byte at a time must not hold the run either. */
+    int64_t deadline = now_ms() + GDB_IO_TIMEOUT_MS;
     int len = 0;
     uint8_t sum = 0;
     for (;;) {
-        ssize_t n = read(stub->client_fd, &c, 1);
-        if (n == 0) return -1;
-        if (n < 0) {
-            if (errno == EINTR) continue;
+        int r = read_byte(stub, &c, ms_until(deadline));
+        if (r <= 0) {
+            if (r == 0)
+                fprintf(stderr, "gdb_stub: client stalled mid-packet, disconnecting\n");
             return -1;
         }
         if (c == '#') break;
@@ -177,14 +228,13 @@ static int recv_packet(gdb_stub_t *stub) {
 
     /* Read 2 checksum chars */
     char ck[2];
-    int got = 0;
-    while (got < 2) {
-        ssize_t n = read(stub->client_fd, ck + got, (size_t)(2 - got));
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+    for (int got = 0; got < 2; got++) {
+        int r = read_byte(stub, &ck[got], ms_until(deadline));
+        if (r <= 0) {
+            if (r == 0)
+                fprintf(stderr, "gdb_stub: client stalled mid-packet, disconnecting\n");
             return -1;
         }
-        got += (int)n;
     }
     int expected = hex_to_byte(ck);
     if (expected < 0 || (uint8_t)expected != sum) {
@@ -337,11 +387,24 @@ static void handle_step(gdb_stub_t *stub) {
      * insn and then calling gdb_stub_notify_halt(stub, 5). */
 }
 
+/* The address of a "Z0,addr[,kind]" or "z0,..." packet.  Returns 0, or
+ * -1 unless "addr" is at least one hex digit followed by ',' or the end:
+ * parse_hex() alone reads "Z0,zz" as address 0 (the reset vector).
+ * rx_buf is NUL-terminated at rx_len, so the previous packet's bytes past
+ * it are never read. */
+static int parse_bp_addr(const gdb_stub_t *stub, uint32_t *addr) {
+    if (stub->rx_len < 4 || stub->rx_buf[2] != ',') return -1;
+    const char *start = stub->rx_buf + 3, *p = start;  /* skip "Z0," */
+    *addr = parse_hex(&p);
+    if (p == start || (*p != ',' && *p != '\0')) return -1;
+    return 0;
+}
+
 /* Z0,addr,kind — set software breakpoint */
 static void handle_set_bp(gdb_stub_t *stub) {
     if (stub->rx_buf[1] != '0') { send_empty(stub); return; }  /* only Z0 */
-    const char *p = stub->rx_buf + 3;  /* skip "Z0," */
-    uint32_t addr = parse_hex(&p);
+    uint32_t addr;
+    if (parse_bp_addr(stub, &addr) < 0) { send_error(stub, 1); return; }
     /* kind (length) ignored — we just match on PC */
 
     /* Already set? idempotent */
@@ -358,8 +421,8 @@ static void handle_set_bp(gdb_stub_t *stub) {
 /* z0,addr,kind — clear software breakpoint */
 static void handle_clear_bp(gdb_stub_t *stub) {
     if (stub->rx_buf[1] != '0') { send_empty(stub); return; }
-    const char *p = stub->rx_buf + 3;
-    uint32_t addr = parse_hex(&p);
+    uint32_t addr;
+    if (parse_bp_addr(stub, &addr) < 0) { send_error(stub, 1); return; }
 
     for (int i = 0; i < stub->num_breakpoints; i++) {
         if (stub->breakpoints[i] == addr) {
@@ -374,20 +437,12 @@ static void handle_clear_bp(gdb_stub_t *stub) {
 /* D — detach */
 static void handle_detach(gdb_stub_t *stub) {
     send_ok(stub);
-    close(stub->client_fd);
-    stub->client_fd = -1;
-    stub->connected = false;
-    stub->halted = false;
-    stub->num_breakpoints = 0;
+    drop_client(stub);
 }
 
 /* k — kill (we treat as detach + leave the simulator running) */
 static void handle_kill(gdb_stub_t *stub) {
-    close(stub->client_fd);
-    stub->client_fd = -1;
-    stub->connected = false;
-    stub->halted = false;
-    stub->num_breakpoints = 0;
+    drop_client(stub);
 }
 
 /* Main command dispatcher: called for each received packet. */
@@ -507,6 +562,11 @@ static int try_accept(gdb_stub_t *stub) {
         perror("gdb_stub: accept");
         return -1;
     }
+    /* accept() on macOS/BSD inherits the listener's O_NONBLOCK; Linux does
+     * not.  Set it one way on both -- every read below goes through poll. */
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+
     /* Disable Nagle so single-byte ack/packets aren't delayed */
     int yes = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
@@ -537,6 +597,7 @@ bool gdb_stub_poll(gdb_stub_t *stub) {
     /* Drain all pending packets. When halted, block on the read; when
      * running, use select() with zero timeout so we don't slow the sim. */
     for (;;) {
+        if (!stub->connected) return false;   /* a reply's ack timed out */
         if (!stub->halted) {
             fd_set rfds;
             FD_ZERO(&rfds);
@@ -548,10 +609,7 @@ bool gdb_stub_poll(gdb_stub_t *stub) {
         int r = recv_packet(stub);
         if (r == -1) {
             /* Disconnect */
-            close(stub->client_fd);
-            stub->client_fd = -1;
-            stub->connected = false;
-            stub->halted = false;
+            drop_client(stub);
             return false;
         }
         if (r == -2) continue;  /* bad packet, retry */
@@ -578,7 +636,8 @@ bool gdb_stub_check_breakpoint(gdb_stub_t *stub, uint32_t pc) {
             stub->halted = true;
             stub->stop_signal = 5;
             send_stop_reply(stub, 5);
-            return true;
+            /* false if the reply's ack timed out and dropped the client */
+            return stub->halted;
         }
     }
     return false;
