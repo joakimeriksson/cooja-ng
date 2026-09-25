@@ -475,6 +475,9 @@ typedef struct arm_cpu {
                                       * armed until the instruction at that pc
                                       * has retired (an ISR taken first returns
                                       * to it); reset by re-arming and a pc write */
+    bool      dbg_skip_started;      /* that instruction began this iteration;
+                                      * spent at the next iteration's top unless
+                                      * it was undone (fault) or never fetched */
 } arm_cpu_t;
 
 /* --- Public API --- */
