@@ -59,6 +59,20 @@
 
 typedef enum { CLIENT_HTTP, CLIENT_WS } client_state_t;
 
+/* Why a request was refused; each keeps its own place in the log. */
+typedef enum {
+    REFUSED_HEADER,     /* oversized, repeated or malformed Host/Origin */
+    REFUSED_HOST,       /* non-loopback Host on a loopback-bound server */
+    REFUSED_ORIGIN,     /* WebSocket upgrade from another site's page */
+    REFUSED_REASONS
+} refusal_t;
+
+static const char *const refusal_text[REFUSED_REASONS] = {
+    "oversized, repeated or malformed header",
+    "non-loopback Host",
+    "cross-origin WebSocket from",
+};
+
 typedef struct {
     int fd;
     client_state_t state;
@@ -82,8 +96,9 @@ struct ws_server {
     int html_len;
     ws_message_cb_t msg_cb;
     void *msg_userdata;
-    time_t refused_logged_at;   /* refusal log: one line per second ... */
-    unsigned refused_unlogged;  /* ... and a count of the ones held back */
+    /* Refusal log: one line a second for each reason, and a count of the
+     * ones held back meanwhile (see log_refusal). */
+    struct { time_t logged_at; unsigned held; } refused[REFUSED_REASONS];
 };
 
 /* ---- SHA-1 (public domain, from RFC 3174 / Steve Reid) ---- */
@@ -353,14 +368,18 @@ static int origin_matches_host(const char *origin, const char *host) {
            strcasecmp(origin + 7, host) == 0;
 }
 
-/* One stderr line per refusal, at most one a second: a page that loops
- * `new WebSocket()` would otherwise flood it.  The value is the client's,
- * so it is quoted, capped and escaped -- raw, it could carry terminal
- * control sequences that retitle or clear the operator's terminal. */
-static void log_refusal(ws_server_t *srv, const char *why, const char *what) {
+/* One stderr line per refusal, at most one a second for each reason: a
+ * page that loops `new WebSocket()` would otherwise flood it.  The ones
+ * held back are counted, per reason, and the count is reported when the
+ * second is over (flush_refusals, from the poll) -- not with the next
+ * refusal, which on a long run could be hours away.  The value is the
+ * client's, so it is quoted, capped and escaped -- raw, it could carry
+ * terminal control sequences that retitle or clear the operator's
+ * terminal. */
+static void log_refusal(ws_server_t *srv, refusal_t why, const char *what) {
     time_t now = time(NULL);
-    if (now == srv->refused_logged_at) {
-        srv->refused_unlogged++;
+    if (now == srv->refused[why].logged_at) {
+        srv->refused[why].held++;
         return;
     }
     char safe[64 * 4 + 1];
@@ -374,14 +393,27 @@ static void log_refusal(ws_server_t *srv, const char *why, const char *what) {
     }
     safe[o] = '\0';
     fflush(stdout);         /* keep the line off a half-written stdout line */
-    fprintf(stderr, "ws_server: refused request: %s \"%s\"%s", why, safe,
-            what[i] ? "..." : "");
-    if (srv->refused_unlogged)
-        fprintf(stderr, " (%u more refused since the last report)",
-                srv->refused_unlogged);
+    fprintf(stderr, "ws_server: refused request: %s \"%s\"%s", refusal_text[why],
+            safe, what[i] ? "..." : "");
+    if (srv->refused[why].held)
+        fprintf(stderr, " (%u more since the last report)", srv->refused[why].held);
     fputc('\n', stderr);
-    srv->refused_logged_at = now;
-    srv->refused_unlogged = 0;
+    srv->refused[why].logged_at = now;
+    srv->refused[why].held = 0;
+}
+
+/* Report the refusals held back once their second is over (always, at
+ * shutdown). */
+static void flush_refusals(ws_server_t *srv, int all) {
+    time_t now = time(NULL);
+    for (int why = 0; why < REFUSED_REASONS; why++) {
+        if (!srv->refused[why].held) continue;
+        if (!all && now == srv->refused[why].logged_at) continue;
+        fflush(stdout);
+        fprintf(stderr, "ws_server: %u more request(s) refused: %s\n",
+                srv->refused[why].held, refusal_text[why]);
+        srv->refused[why].held = 0;
+    }
 }
 
 /* Answer a short status-only reply and close. */
@@ -395,7 +427,7 @@ static void reply_and_close(ws_server_t *srv, int idx, const char *status) {
         finish_client(srv, idx);
 }
 
-static void refuse(ws_server_t *srv, int idx, const char *why, const char *what) {
+static void refuse(ws_server_t *srv, int idx, refusal_t why, const char *what) {
     log_refusal(srv, why, what);
     reply_and_close(srv, idx, "403 Forbidden");
 }
@@ -432,12 +464,11 @@ static void handle_http_request(ws_server_t *srv, int idx) {
     int has_host = http_header(c->recv_buf, "Host", host, sizeof(host));
     int has_origin = http_header(c->recv_buf, "Origin", origin, sizeof(origin));
     if (has_host < 0 || has_origin < 0) {
-        refuse(srv, idx, "oversized, repeated or malformed header",
-               has_host < 0 ? "Host" : "Origin");
+        refuse(srv, idx, REFUSED_HEADER, has_host < 0 ? "Host" : "Origin");
         return;
     }
     if (srv->loopback_only && has_host && !host_is_loopback(host)) {
-        refuse(srv, idx, "non-loopback Host", host);
+        refuse(srv, idx, REFUSED_HOST, host);
         return;
     }
 
@@ -453,7 +484,7 @@ static void handle_http_request(ws_server_t *srv, int idx) {
         http_header(c->recv_buf, "Upgrade", upgrade, sizeof(upgrade)) == 1 &&
         strcasecmp(upgrade, "websocket") == 0) {
         if (has_origin && !(has_host && origin_matches_host(origin, host))) {
-            refuse(srv, idx, "cross-origin WebSocket from", origin);
+            refuse(srv, idx, REFUSED_ORIGIN, origin);
             return;
         }
         if (http_header(c->recv_buf, "Sec-WebSocket-Key", key, sizeof(key)) != 1) {
@@ -680,6 +711,7 @@ ws_server_t *ws_server_init(const char *bind_addr, int port) {
 void ws_server_poll(ws_server_t *srv) {
     if (!srv) return;
 
+    flush_refusals(srv, 0);
     int64_t now_ms = monotonic_ms();
     for (int i = 0; i < srv->client_count; i++) {
         ws_client_t *c = &srv->clients[i];
@@ -874,11 +906,7 @@ int ws_server_client_count(ws_server_t *srv) {
 
 void ws_server_destroy(ws_server_t *srv) {
     if (!srv) return;
-    if (srv->refused_unlogged) {
-        fflush(stdout);
-        fprintf(stderr, "ws_server: %u more request(s) refused since the last "
-                "report\n", srv->refused_unlogged);
-    }
+    flush_refusals(srv, 1);
     for (int i = 0; i < srv->client_count; i++) {
         close(srv->clients[i].fd);
         free(srv->clients[i].out);
