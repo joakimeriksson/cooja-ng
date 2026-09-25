@@ -387,14 +387,24 @@ static void handle_step(gdb_stub_t *stub) {
      * insn and then calling gdb_stub_notify_halt(stub, 5). */
 }
 
+/* The address of a "Z0,addr[,kind]" or "z0,..." packet.  Returns 0, or
+ * -1 unless "addr" is at least one hex digit followed by ',' or the end:
+ * parse_hex() alone reads "Z0,zz" as address 0 (the reset vector).
+ * rx_buf is NUL-terminated at rx_len, so the previous packet's bytes past
+ * it are never read. */
+static int parse_bp_addr(const gdb_stub_t *stub, uint32_t *addr) {
+    if (stub->rx_len < 4 || stub->rx_buf[2] != ',') return -1;
+    const char *start = stub->rx_buf + 3, *p = start;  /* skip "Z0," */
+    *addr = parse_hex(&p);
+    if (p == start || (*p != ',' && *p != '\0')) return -1;
+    return 0;
+}
+
 /* Z0,addr,kind — set software breakpoint */
 static void handle_set_bp(gdb_stub_t *stub) {
     if (stub->rx_buf[1] != '0') { send_empty(stub); return; }  /* only Z0 */
-    /* rx_buf past rx_len holds the previous packet's bytes: parse only a
-     * well-formed "Z0,addr". */
-    if (stub->rx_len < 4 || stub->rx_buf[2] != ',') { send_error(stub, 1); return; }
-    const char *p = stub->rx_buf + 3;  /* skip "Z0," */
-    uint32_t addr = parse_hex(&p);
+    uint32_t addr;
+    if (parse_bp_addr(stub, &addr) < 0) { send_error(stub, 1); return; }
     /* kind (length) ignored — we just match on PC */
 
     /* Already set? idempotent */
@@ -411,9 +421,8 @@ static void handle_set_bp(gdb_stub_t *stub) {
 /* z0,addr,kind — clear software breakpoint */
 static void handle_clear_bp(gdb_stub_t *stub) {
     if (stub->rx_buf[1] != '0') { send_empty(stub); return; }
-    if (stub->rx_len < 4 || stub->rx_buf[2] != ',') { send_error(stub, 1); return; }
-    const char *p = stub->rx_buf + 3;
-    uint32_t addr = parse_hex(&p);
+    uint32_t addr;
+    if (parse_bp_addr(stub, &addr) < 0) { send_error(stub, 1); return; }
 
     for (int i = 0; i < stub->num_breakpoints; i++) {
         if (stub->breakpoints[i] == addr) {
@@ -627,7 +636,8 @@ bool gdb_stub_check_breakpoint(gdb_stub_t *stub, uint32_t pc) {
             stub->halted = true;
             stub->stop_signal = 5;
             send_stop_reply(stub, 5);
-            return true;
+            /* false if the reply's ack timed out and dropped the client */
+            return stub->halted;
         }
     }
     return false;

@@ -11,7 +11,9 @@ packet, and asserts:
     whole packet, not on each byte;
   - a client that never acknowledges a reply is dropped the same way;
   - a bare "Z0" after another packet is refused (E01) rather than parsed
-    out of the previous packet's leftover bytes into a breakpoint;
+    out of the previous packet's leftover bytes into a breakpoint, and so
+    are Z0/z0 packets with no hex address ("Z0,zz,2" would otherwise set a
+    breakpoint at address 0);
   - breakpoints set by a client that is dropped are gone for the next one.
 
 The stub waits 5 s for the rest of a packet, so each stall case takes ~5 s.
@@ -166,6 +168,16 @@ def main():
                 raise OSError('no ack')
             last = reply(sock)
         expect('bare Z0 after m0,4', last.decode() if last else 'EOF', 'E01')
+        for body in (b'Z0,zz,2', b'Z0,,2', b'Z0,1g,2', b'z0,zz,2'):
+            sock.sendall(packet(body))
+            if sock.recv(1) != b'+':
+                raise OSError('no ack')
+            got = reply(sock)
+            expect(body.decode(), got.decode() if got else 'EOF', 'E01')
+        sock.sendall(packet(b'Z0,2000,2'))
+        sock.recv(1)
+        got = reply(sock)
+        expect('Z0,2000,2', got.decode() if got else 'EOF', 'OK')
         sock.sendall(packet(b'D'))
         reply(sock)
     except OSError as e:
