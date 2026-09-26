@@ -149,10 +149,12 @@ wait
 rc=0
 for w in "${WORKLOADS[@]}"; do
     name=${w%%|*}
-    a="$WORK/out-ref/$name.log"
-    b="$WORK/out-head/$name.log"
+    a="$WORK/out-ref/$name.log";  ae="$WORK/out-ref/$name.err"
+    b="$WORK/out-head/$name.log"; be="$WORK/out-head/$name.err"
     # A workload that fails the same way under both binaries diffs clean, so
     # it must not complete: a non-zero exit or no Wall-clock line fails it.
+    # The reason is on stderr (config rejection, node init, plugin errors),
+    # so that stream is shown too.
     brc=$(run_rc "$b")
     bwall=$(wall_ms "$b")
     if [ "$brc" != 0 ] || [ -z "$bwall" ]; then
@@ -160,21 +162,24 @@ for w in "${WORKLOADS[@]}"; do
         [ -n "$bwall" ] || note="$note, no wall time"
         printf "  FAIL  %-9s (%s)\n" "$name" "$note"
         tail -10 "$b"
+        if [ -s "$be" ]; then echo "  --- stderr:"; tail -20 "$be"; fi
         rc=1
         KEEP=1
         continue
     fi
-    ae="$WORK/out-ref/$name.err"
-    be="$WORK/out-head/$name.err"
-    n=$(diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | wc -l)
-    ne=$(diff "$ae" "$be" | wc -l)
+    # Both streams through the same FILTER, each diffed once; the diffs stay
+    # with the logs under KEEP=1.
+    diff <(grep -vE "$FILTER" "$a")  <(grep -vE "$FILTER" "$b")  >"$WORK/$name.out.diff"
+    diff <(grep -vE "$FILTER" "$ae") <(grep -vE "$FILTER" "$be") >"$WORK/$name.err.diff"
+    n=$(wc -l <"$WORK/$name.out.diff" | tr -d ' ')
+    ne=$(wc -l <"$WORK/$name.err.diff" | tr -d ' ')
     if [ "$n" -eq 0 ] && [ "$ne" -eq 0 ]; then
         printf "  ok    %-9s %s\n" "$name" "$(timing "$a" "$b")"
     else
         printf "  DIFF  %-9s (stdout %d lines, stderr %d lines)  %s\n" \
                "$name" "$n" "$ne" "$(timing "$a" "$b")"
-        diff <(grep -vE "$FILTER" "$a") <(grep -vE "$FILTER" "$b") | head -20
-        [ "$ne" -eq 0 ] || diff "$ae" "$be" | head -20
+        head -20 "$WORK/$name.out.diff"
+        [ "$ne" -eq 0 ] || head -20 "$WORK/$name.err.diff"
         rc=1
         KEEP=1
     fi
