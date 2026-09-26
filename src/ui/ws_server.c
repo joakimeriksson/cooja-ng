@@ -60,6 +60,14 @@
 #define OUT_QUEUE_MAX  (WS_SERVER_PAGE_MAX + 256)
 #define OUT_STALL_MS   10000
 
+/* After a 431 the client may still be writing the rest of its request.
+ * Its input is read and discarded until it hangs up, or for this long
+ * after the reply went out: closing with unread bytes in the socket would
+ * reset the connection, and a browser then reports the reset rather than
+ * the 431.  A browser reads the reply and closes at once; this only bounds
+ * a client that never does. */
+#define HTTP_DRAIN_MS 2000
+
 typedef enum { CLIENT_HTTP, CLIENT_WS } client_state_t;
 
 /* Why a request was refused; each keeps its own place in the log. */
@@ -88,6 +96,8 @@ typedef struct {
     size_t out_head, out_len, out_cap;
     int64_t out_progress_ms; /* the socket last took some of the queue */
     int close_when_sent;    /* the reply is queued; close after it */
+    int64_t drain_until_ms; /* ... but first read its input until EOF or
+                               this time (0: close as soon as it is sent) */
 } ws_client_t;
 
 struct ws_server {
@@ -419,20 +429,28 @@ static void flush_refusals(ws_server_t *srv, int all) {
     }
 }
 
-/* Answer a short status-only reply and close. */
-static void reply_and_close(ws_server_t *srv, int idx, const char *status) {
+/* Answer a short status-only reply and close: once it has gone out, or,
+ * with drain set, once the client has hung up or HTTP_DRAIN_MS have passed
+ * (for a reply to a request the client may still be writing). */
+static void reply_and_close(ws_server_t *srv, int idx, const char *status,
+                            int drain) {
+    ws_client_t *c = &srv->clients[idx];
     char resp[128];
     int n = snprintf(resp, sizeof(resp), "HTTP/1.1 %s\r\nContent-Length: 0\r\n"
                      "Connection: close\r\n\r\n", status);
-    if (client_write(&srv->clients[idx], resp, (size_t)n) != 0)
+    if (client_write(c, resp, (size_t)n) != 0) {
         close_client(srv, idx);
-    else
+    } else if (drain) {
+        c->close_when_sent = 1;
+        c->drain_until_ms = monotonic_ms() + HTTP_DRAIN_MS;
+    } else {
         finish_client(srv, idx);
+    }
 }
 
 static void refuse(ws_server_t *srv, int idx, refusal_t why, const char *what) {
     log_refusal(srv, why, what);
-    reply_and_close(srv, idx, "403 Forbidden");
+    reply_and_close(srv, idx, "403 Forbidden", 0);
 }
 
 /* ---- HTTP / WebSocket handling ---- */
@@ -459,7 +477,7 @@ static void handle_http_request(ws_server_t *srv, int idx) {
     /* Check for complete HTTP request (double CRLF) */
     if (!strstr(c->recv_buf, "\r\n\r\n")) {
         if (c->recv_len >= RECV_BUF - 1)
-            reply_and_close(srv, idx, "431 Request Header Fields Too Large");
+            reply_and_close(srv, idx, "431 Request Header Fields Too Large", 1);
         return;
     }
 
@@ -543,7 +561,7 @@ static void handle_http_request(ws_server_t *srv, int idx) {
     }
 
     /* 404 for everything else */
-    reply_and_close(srv, idx, "404 Not Found");
+    reply_and_close(srv, idx, "404 Not Found", 0);
 }
 
 static void handle_ws_frame(ws_server_t *srv, int idx) {
@@ -722,6 +740,9 @@ void ws_server_poll(ws_server_t *srv) {
             now_ms - c->accepted_ms >
                 (c->close_when_sent ? HTTP_RESPONSE_MS : HTTP_REQUEST_MS)) {
             close_client(srv, i); i--;
+        } else if (c->drain_until_ms && c->out_len == 0 &&
+                   now_ms > c->drain_until_ms) {
+            close_client(srv, i); i--;          /* the reply is out; drained long enough */
         } else if (c->out_len > 0 && now_ms - c->out_progress_ms > OUT_STALL_MS) {
             char how[48];
             snprintf(how, sizeof(how), "took nothing for %d s", OUT_STALL_MS / 1000);
@@ -785,7 +806,8 @@ void ws_server_poll(ws_server_t *srv) {
         ws_client_t *c = &srv->clients[i];
         if (c->out_len == 0 || !FD_ISSET(c->fd, &write_fds))
             continue;
-        if (client_flush(c) < 0 || (c->out_len == 0 && c->close_when_sent)) {
+        if (client_flush(c) < 0 ||
+            (c->out_len == 0 && c->close_when_sent && !c->drain_until_ms)) {
             close_client(srv, i); i--;
         }
     }
@@ -797,9 +819,9 @@ void ws_server_poll(ws_server_t *srv) {
 
         /* A client whose reply is queued has nothing more to say: its
          * input is read and dropped, which notices it hanging up and,
-         * for a request that did not fit, takes the rest of it off the
-         * socket so closing does not reset the connection under the
-         * reply. */
+         * for a request that did not fit (drain_until_ms), takes the rest
+         * of it off the socket so closing does not reset the connection
+         * under the reply. */
         if (srv->clients[i].close_when_sent) {
             char sink[1024];
             ssize_t n = recv(srv->clients[i].fd, sink, sizeof(sink), 0);
