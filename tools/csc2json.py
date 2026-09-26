@@ -326,8 +326,11 @@ PREBUILT_TARGETS = frozenset({"sky", "z1"})
 
 
 def _configured_contiki_dir():
-    """CONTIKI_DIR from the environment or csim.conf, the same lookup the
-    shell scripts make, or None."""
+    """The Contiki-NG root the shell scripts would use: CONTIKI_DIR from the
+    environment, else from csim.conf, else the checkout beside this tree
+    (../contiki-ng) -- the same lookup, in the same order, as
+    run-cooja-tests.sh and build-test-firmware.sh.  None if the result is not
+    a directory."""
     d = os.environ.get("CONTIKI_DIR")
     if not d:
         try:
@@ -337,13 +340,16 @@ def _configured_contiki_dir():
                         d = line[len("CONTIKI_DIR="):].strip()
         except OSError:
             pass
-    return d if d and os.path.isdir(d) else None
+    if not d:
+        d = os.path.join(os.path.dirname(CSIM_DIR), "contiki-ng")
+    return d if os.path.isdir(d) else None
 
 
 def find_contiki_dir(csc_dir):
     """The Contiki-NG root a .csc belongs to, or None.  A Contiki-NG tree is
     recognised by Makefile.include beside os/; the nearest such ancestor of
-    the .csc's directory wins, then the configured CONTIKI_DIR.  Firmware
+    the .csc's directory wins, then the configured CONTIKI_DIR (environment,
+    csim.conf, ../contiki-ng).  Firmware
     names are keyed on the source directory relative to this root, so a
     conversion without it would name firmware the suite never builds."""
     d = os.path.realpath(csc_dir)
@@ -1590,7 +1596,8 @@ def main():
     parser.add_argument("csc_file", nargs="?", help="Path to .csc file")
     parser.add_argument("--contiki",
                         help="Path to contiki-ng root (default: found above "
-                             "the .csc, else CONTIKI_DIR / csim.conf)")
+                             "the .csc, else CONTIKI_DIR / csim.conf / "
+                             "../contiki-ng)")
     parser.add_argument("--firmware-dir", help="Directory containing .cc2538dk firmware files")
     parser.add_argument("-o", "--output", help="Output JSON file (default: stdout)")
     parser.add_argument("--local-firmware", metavar="DIR",

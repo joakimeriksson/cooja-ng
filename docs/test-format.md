@@ -513,9 +513,10 @@ source directory *relative to the Contiki-NG root* and the make arguments,
 so two tests that build a same-named source from different directories never
 share a build, and a name is the same on every machine. `--contiki` may be
 omitted for a `.csc` inside a Contiki-NG tree (the root is found above it, by
-its `Makefile.include` and `os/`) or when `CONTIKI_DIR` / `csim.conf` names
-it; with `--firmware-dir` and no root to be found, conversion fails rather
-than name firmware nothing would build.
+its `Makefile.include` and `os/`), when `CONTIKI_DIR` / `csim.conf` names
+it, or when a `contiki-ng` checkout sits beside this tree (the scripts'
+default); with `--firmware-dir` and no root to be found, conversion fails
+rather than name firmware nothing would build.
 
 ### What Gets Converted
 

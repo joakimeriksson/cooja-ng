@@ -240,7 +240,14 @@ class ContikiRoot(FakeTree):
             f.write(f"CONTIKI_DIR={self.contiki}\n")
         self.assertEqual(csc2json.find_contiki_dir(self.csc_dir), self.contiki)
 
+    def test_from_sibling_checkout(self):
+        # The scripts' last resort, ../contiki-ng beside the tree -- which is
+        # where FakeTree puts it.
+        self.assertEqual(csc2json.find_contiki_dir(self.csc_dir), self.contiki)
+        self.assertEqual(self.names(None), self.names(self.contiki))
+
     def test_none_is_an_error_with_firmware_dir(self):
+        self.use_tree(os.path.join(self.tmp, "elsewhere", "csim"))
         self.assertIsNone(csc2json.find_contiki_dir(self.csc_dir))
         with self.assertRaises(csc2json.ConversionError) as cm:
             self.names(None)
