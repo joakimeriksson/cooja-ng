@@ -60,7 +60,7 @@ expect_rc 0 $BIN test configs/shell-2node-nrf54l15-dk.yaml -q --script test/scri
 grep -q "SCRIPT PASSED" "$TMP/rc.out" || fail "halt script did not pass"
 # the two `nodes` tables (at the hit, and 5 s later) show the same time for
 # the halted node: its own clock stands still while the others run on
-n=$(grep -E '^ +1 +ARM +running' "$TMP/rc.out" | awk '{print $6}' | sort -u | wc -l)
+n=$(grep -E '^ +1 +ARM +running' "$TMP/rc.out" | awk '{print $6}' | sort -u | wc -l | tr -d ' ')
 [ "$n" = 1 ] || { grep -E '^ +1 +ARM +running' "$TMP/rc.out"; fail "the halted node's clock moved"; }
 
 echo "== breakpoints and watchpoints (TrustZone Normal world)"
