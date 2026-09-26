@@ -65,6 +65,25 @@ static void heap_sift_down(sim_event_queue_t *q, int i) {
     track_slot(q, i);
 }
 
+/* The node's live NODE_WAKEUP slot, or -1.  node_heap_idx[] is trusted
+ * only when the slot it names is inside the heap and holds this node's
+ * wakeup; a stale entry (past count, or a slot since reused by an
+ * untracked kind or another node) reads as "no wakeup" and the caller
+ * inserts afresh, as remove_heap_index() did before the in-place path.
+ * The invariant holds today (the suite's heap_ok checks it), so this is
+ * the safety net for a future path that breaks it: a mote with a lost
+ * index gets a new wakeup instead of stalling for good.  What the guard
+ * cannot do is find a wakeup the index has lost sight of; if one is in
+ * the heap, the node ticks twice, which was also the case before. */
+static inline int wakeup_slot(const sim_event_queue_t *q, int node_idx) {
+    int i = q->node_heap_idx[node_idx];
+    if (i >= 0 && i < q->count &&
+        q->heap[i].kind == SIM_EV_NODE_WAKEUP &&
+        q->heap[i].node_idx == node_idx)
+        return i;
+    return -1;
+}
+
 static void clear_index(sim_event_queue_t *q, int slot) {
     const sim_event_t *e = &q->heap[slot];
     if (e->kind == SIM_EV_NODE_WAKEUP &&
@@ -91,7 +110,7 @@ void sim_eq_schedule_gen(sim_event_queue_t *q, int node_idx, int64_t time_ns,
      * as remove + insert (the key alone decides), at one sift instead of
      * two, and net-zero on the count, so a full queue still replaces the
      * entry rather than dropping the wakeup (which stalled the mote). */
-    int existing = q->node_heap_idx[node_idx];
+    int existing = wakeup_slot(q, node_idx);
     if (existing >= 0) {
         sim_event_t *e = &q->heap[existing];
         bool earlier = time_ns < e->time_ns;
@@ -135,7 +154,7 @@ void sim_eq_schedule_if_earlier_gen(sim_event_queue_t *q, int node_idx,
         fprintf(stderr, "WARNING: invalid event node index %d\n", node_idx);
         return;
     }
-    int i = q->node_heap_idx[node_idx];
+    int i = wakeup_slot(q, node_idx);
     if (i >= 0 && q->heap[i].time_ns <= time_ns)
         return;  /* already scheduled earlier — ignore */
     sim_eq_schedule_gen(q, node_idx, time_ns, target_generation);

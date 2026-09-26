@@ -194,6 +194,54 @@ static void test_remove_node(void) {
     }
 }
 
+/* A stale node_heap_idx[] entry must read as "no wakeup" and be
+ * replaced by a fresh insert, never rewritten in place: a rewritten
+ * dead or foreign slot is a wakeup the node never gets. */
+static bool heap_ok(const sim_event_queue_t *hq);
+
+static void test_stale_index_self_heals(void) {
+    /* Past count. */
+    sim_eq_init(&q);
+    sim_eq_schedule(&q, 1, 100);
+    q.node_heap_idx[0] = q.count;             /* points past the heap */
+    sim_eq_schedule(&q, 0, 50);
+    ASSERT_EQ(q.count, 2, "stale index past count: a fresh wakeup is inserted");
+    ASSERT(heap_ok(&q), "index repaired to the new slot");
+    ASSERT_EQ(sim_eq_pop(&q).node_idx, 0, "and the node gets its wakeup");
+    ASSERT_EQ(sim_eq_pop(&q).node_idx, 1, "node 1's wakeup untouched");
+
+    /* Pointing at a slot an RX_BYTE has since taken. */
+    sim_eq_init(&q);
+    sim_eq_schedule_rx_byte(&q, 2, 3, 0xAB, -50, 100);
+    q.node_heap_idx[0] = 0;                   /* names the rx byte's slot */
+    sim_eq_schedule(&q, 0, 200);
+    ASSERT_EQ(q.count, 2, "stale index on an rx byte: a fresh wakeup is inserted");
+    ASSERT(heap_ok(&q), "index repaired to the new slot");
+    sim_event_t ev = sim_eq_pop(&q);
+    ASSERT(ev.kind == SIM_EV_RX_BYTE && ev.byte == 0xAB, "the rx byte survives intact");
+    ev = sim_eq_pop(&q);
+    ASSERT(ev.kind == SIM_EV_NODE_WAKEUP && ev.node_idx == 0, "then the node's wakeup");
+
+    /* Pointing at another node's wakeup. */
+    sim_eq_init(&q);
+    sim_eq_schedule(&q, 5, 100);
+    q.node_heap_idx[0] = q.node_heap_idx[5];
+    sim_eq_schedule(&q, 0, 300);
+    ASSERT_EQ(q.count, 2, "stale index on another node: a fresh wakeup is inserted");
+    ASSERT(heap_ok(&q), "both indices point at their own wakeup");
+    ASSERT_EQ(sim_eq_pop(&q).node_idx, 5, "node 5 keeps its wakeup at 100");
+    ASSERT_EQ(sim_eq_pop(&q).node_idx, 0, "node 0 gets its wakeup at 300");
+
+    /* if_earlier reads the same guard: a stale slot's time is not
+     * evidence of an earlier wakeup. */
+    sim_eq_init(&q);
+    sim_eq_schedule_rx_byte(&q, 2, 3, 0xAB, -50, 10);
+    q.node_heap_idx[0] = 0;                   /* rx byte at 10 < 100 */
+    sim_eq_schedule_if_earlier(&q, 0, 100);
+    ASSERT_EQ(q.count, 2, "if_earlier ignores the stale slot and schedules");
+    ASSERT(heap_ok(&q), "index repaired to the new slot");
+}
+
 /* ====================================================================
  * Heap invariants after arbitrary churn
  * ==================================================================== */
@@ -402,6 +450,7 @@ int run_event_queue_tests(int verbose) {
     test_rx_bytes_interleave_and_stack();
     test_wakeup_index_survives_untracked_churn();
     test_remove_node();
+    test_stale_index_self_heals();
     test_differential();
 
     printf("  %d passed, %d failed\n", passed, failed);
