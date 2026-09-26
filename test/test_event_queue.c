@@ -24,12 +24,16 @@ static int failed = 0;
     else { failed++; printf("  FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__); } \
 } while (0)
 
+/* Each operand is evaluated once: several callers pass sim_eq_pop(&q),
+ * and a second evaluation on failure would pop the next event and shift
+ * every later assertion. */
 #define ASSERT_EQ(actual, expected, msg) do {                            \
-    if ((actual) == (expected)) { passed++; }                            \
+    long long got_ = (long long)(actual);                                \
+    long long want_ = (long long)(expected);                             \
+    if (got_ == want_) { passed++; }                                     \
     else { failed++;                                                     \
         printf("  FAIL: %s — got %lld, want %lld (%s:%d)\n",             \
-               msg, (long long)(actual), (long long)(expected),          \
-               __FILE__, __LINE__); }                                    \
+               msg, got_, want_, __FILE__, __LINE__); }                  \
 } while (0)
 
 static sim_event_queue_t q;
@@ -339,6 +343,17 @@ static void ref_remove_node(ref_queue_t *r, int node) {
         if (r->ev[i].node_idx == node) ref_erase(r, i);
 }
 
+/* Exact: seq and generation are compared too, so a schedule that
+ * consumes a seq twice, or not at all, is caught on the next pop rather
+ * than only when a same-time collision happens to expose it. */
+static bool ev_same(const sim_event_t *a, const sim_event_t *b) {
+    return a->kind == b->kind && a->node_idx == b->node_idx &&
+           a->time_ns == b->time_ns && a->seq == b->seq &&
+           a->target_generation == b->target_generation &&
+           a->byte == b->byte &&
+           (a->kind != SIM_EV_RX_BYTE || a->sender_idx == b->sender_idx);
+}
+
 static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 static uint32_t rnd(void) {
     rng_state ^= rng_state << 13;
@@ -398,9 +413,7 @@ static void test_differential(void) {
                 sim_event_t a = sim_eq_pop(&q);
                 sim_event_t b = ref_pop(&ref);
                 pops++;
-                if (a.kind != b.kind || a.node_idx != b.node_idx ||
-                    a.time_ns != b.time_ns || a.byte != b.byte ||
-                    (a.kind == SIM_EV_RX_BYTE && a.sender_idx != b.sender_idx)) {
+                if (!ev_same(&a, &b)) {
                     if (mismatches == 0)
                         printf("  first pop mismatch at step %d: heap kind=%d node=%d t=%lld seq=%llu | ref kind=%d node=%d t=%lld seq=%llu (counts %d/%d)\n",
                                step, (int)a.kind, a.node_idx, (long long)a.time_ns, (unsigned long long)a.seq,
@@ -422,8 +435,7 @@ static void test_differential(void) {
         sim_event_t a = sim_eq_pop(&q);
         sim_event_t b = ref_pop(&ref);
         pops++;
-        if (a.kind != b.kind || a.node_idx != b.node_idx ||
-            a.time_ns != b.time_ns || a.byte != b.byte)
+        if (!ev_same(&a, &b))
             mismatches++;
     }
     printf("  differential: %d pops, %d mismatches\n", pops, mismatches);
