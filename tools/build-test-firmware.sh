@@ -13,8 +13,13 @@
 # Mode 2 (--from-json): Reads build info from JSON configs (target, board, make_args);
 #                   --target is the target for a node whose JSON names none.
 #
-# --force rebuilds firmware that already exists; --dry-run only reports what
-# would be built.
+# --force rebuilds local firmware builds that already exist.  It never
+# rebuilds shipped firmware (what csc2json --local-firmware does not list):
+# those images were committed under the previous scheme's names, and a
+# rebuild from whichever directory was processed last would overwrite them
+# in place.  --dry-run only reports what would be built.
+#
+# Exit status is non-zero if any build failed.
 #
 # CONTIKI_DIR resolution: env variable -> csim.conf -> ../contiki-ng
 #
@@ -28,9 +33,10 @@ CSC2JSON="$SCRIPT_DIR/csc2json.py"
 RESULTS_FILE=""
 FW_LIST_FILE=""
 JSON_DIR=""
+LOCAL_LIST_DIR=""
 cleanup() {
     local f
-    for f in "$RESULTS_FILE" "$FW_LIST_FILE" "$JSON_DIR"; do
+    for f in "$RESULTS_FILE" "$FW_LIST_FILE" "$JSON_DIR" "$LOCAL_LIST_DIR"; do
         [ -n "$f" ] && rm -rf "$f"
     done
     return 0
@@ -63,6 +69,24 @@ strip_variant_suffix() {
     echo "$1" | sed -E 's/-[0-9a-f]{6}$//'
 }
 
+# Is an existing firmware file a local build, as opposed to firmware the
+# tree ships?  csc2json --local-firmware answers, by the one definition of
+# "shipped" its lookup and run-cooja-tests.sh --clean use; the listing is
+# taken once per firmware directory.  A file whose directory cannot be
+# listed is not called local: --force must never rebuild a shipped image.
+is_local_build() {
+    local path="$1" dir list
+    dir="$(dirname "$path")"
+    [ -n "$LOCAL_LIST_DIR" ] || LOCAL_LIST_DIR=$(mktemp -d)
+    list="$LOCAL_LIST_DIR/$(basename "$dir")"
+    if [ ! -f "$list" ]; then
+        local paths
+        paths=$(python3 "$CSC2JSON" --local-firmware "$dir" 2>/dev/null) || return 1
+        printf '%s\n' "$paths" | sed 's|.*/||' > "$list"
+    fi
+    grep -qxF "$(basename "$path")" "$list"
+}
+
 # Build a single firmware
 # Args: fw_name src_dir target_ext output_file extra_make_args...
 build_one() {
@@ -73,10 +97,17 @@ build_one() {
     shift 4
     local extra_args="$@"
 
-    if [ -f "$target_file" ] && [ "$FORCE" -eq 0 ]; then
-        echo "  SKIP $fw (already exists)"
-        echo "skip" >> "$RESULTS_FILE"
-        return
+    if [ -f "$target_file" ]; then
+        if [ "$FORCE" -eq 0 ]; then
+            echo "  SKIP $fw (already exists)"
+            echo "skip" >> "$RESULTS_FILE"
+            return
+        fi
+        if ! is_local_build "$target_file"; then
+            echo "  SKIP $fw (shipped firmware, never rebuilt)"
+            echo "skip" >> "$RESULTS_FILE"
+            return
+        fi
     fi
 
     # The firmware name may have a hash suffix (e.g., node-378324) derived
@@ -107,31 +138,32 @@ build_one() {
     fi
     echo "  BUILD $fw (TARGET=$target$extra_info)"
 
-    (
-        cd "$src_dir"
+    # The build is judged by its own outcome, not by whether the output file
+    # exists afterwards: with --force it existed before, and a failed rebuild
+    # of it must count as failed.
+    if (
+        cd "$src_dir" || exit 1
         make TARGET="$target" clean >/dev/null 2>&1 || true
-        if make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" TARGET="$target" "$build_name.$target" \
+        if ! make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" TARGET="$target" "$build_name.$target" \
             WERROR=0 CONTIKI="$CONTIKI_DIR" COOJA_CI=1 $extra_args >/dev/null 2>&1; then
-            # Contiki-NG may place output in build/<target>/ or current dir
-            local built_file=""
-            if [ -f "$build_name.$target" ]; then
-                built_file="$build_name.$target"
-            elif [ -f "build/$target/$build_name.$target" ]; then
-                built_file="build/$target/$build_name.$target"
-            fi
-            if [ -n "$built_file" ]; then
-                cp "$built_file" "$target_file"
-                echo "    -> $target_file"
-            else
-                echo "    FAILED: output not found"
-            fi
-            make TARGET="$target" clean >/dev/null 2>&1 || true
-        else
             echo "    FAILED to build $fw"
+            exit 1
         fi
-    )
-
-    if [ -f "$target_file" ]; then
+        # Contiki-NG may place output in build/<target>/ or current dir
+        built_file=""
+        if [ -f "$build_name.$target" ]; then
+            built_file="$build_name.$target"
+        elif [ -f "build/$target/$build_name.$target" ]; then
+            built_file="build/$target/$build_name.$target"
+        fi
+        if [ -z "$built_file" ]; then
+            echo "    FAILED: output not found"
+            exit 1
+        fi
+        cp "$built_file" "$target_file" || exit 1
+        echo "    -> $target_file"
+        make TARGET="$target" clean >/dev/null 2>&1 || true
+    ); then
         echo "built" >> "$RESULTS_FILE"
     else
         echo "fail" >> "$RESULTS_FILE"
@@ -152,6 +184,7 @@ print_summary() {
     else
         echo "=== Summary: $built built, $skipped skipped, $failed failed ==="
     fi
+    [ "$failed" -eq 0 ]
 }
 
 # ---- Mode 2: Build from JSON configs ----
@@ -320,7 +353,8 @@ while [ $# -gt 0 ]; do
             echo "  --from-json: build using per-node build info from JSON configs"
             echo "  --target: with --from-json, the target for a node whose JSON names none"
             echo "            (default: cooja)"
-            echo "  --force: rebuild firmware that already exists"
+            echo "  --force: rebuild local firmware builds that already exist (never"
+            echo "           shipped firmware -- what csc2json --local-firmware does not list)"
             echo "  --dry-run: report what would be built without building"
             echo ""
             echo "JSON build info per node:"

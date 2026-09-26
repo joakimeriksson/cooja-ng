@@ -18,7 +18,10 @@ run-cooja-tests.sh --clean):
   - the Contiki-NG root is found above a .csc when --contiki is not given, so
     a name does not depend on the flag either;
   - --clean removes local builds and keeps shipped ones, by the same
-    definition of "shipped" (csc2json --local-firmware).
+    definition of "shipped" (csc2json --local-firmware);
+  - build-test-firmware.sh --force rebuilds local builds only, never shipped
+    firmware, and a build that fails is reported failed even when the file
+    it was to replace still exists.
 
 A reordered lookup or a changed hash key reintroduces silent cross-directory
 firmware reuse, which the suite itself cannot see: the wrong firmware often
@@ -424,6 +427,109 @@ class Clean(FakeTree):
         self.assertIn("not a git checkout", out)
         self.assertKept(self.shipped, self.local)
         self.assertRemoved(self.cooja_plain, self.cooja_hashed)
+
+
+FAKE_MAKE = """#!/usr/bin/env python3
+# A make(1) for build-test-firmware.sh: `make ... clean` succeeds and does
+# nothing; a build writes its target under build/<TARGET>/, or fails when
+# FAKE_MAKE_FAIL is set.
+import os, sys
+args = sys.argv[1:]
+if "clean" in args:
+    sys.exit(0)
+if os.environ.get("FAKE_MAKE_FAIL"):
+    sys.exit(1)
+target = dict(a.split("=", 1) for a in args if "=" in a)["TARGET"]
+out = [a for a in args if a.endswith("." + target)][0]
+os.makedirs(os.path.join("build", target), exist_ok=True)
+with open(os.path.join("build", target, out), "w") as f:
+    f.write("rebuilt\\n")
+"""
+
+
+class Build(FakeTree):
+    """build-test-firmware.sh --from-json in a scratch copy of the tree, with
+    a fake make(1) on the PATH."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.csim, "tools"))
+        for tool in ("build-test-firmware.sh", "csc2json.py"):
+            shutil.copy(os.path.join(TOOLS, tool),
+                        os.path.join(self.csim, "tools"))
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        make = os.path.join(self.bin, "make")
+        with open(make, "w") as f:
+            f.write(FAKE_MAKE)
+        os.chmod(make, 0o755)
+        self.code = os.path.join(self.csc_dir, "code")
+        touch(os.path.join(self.code, "node.c"))
+        git(self.csim, "init", "-q")
+        self.shipped = os.path.join(self.fw, "node.z1")
+        touch(self.shipped)
+        git(self.csim, "add", "firmware/z1/node.z1")
+        self.local = os.path.join(self.fw, "node-abcdef.z1")
+        touch(self.local)
+
+    def build(self, firmware, *flags, fail=False):
+        json_path = os.path.join(self.tmp, "t.json")
+        with open(json_path, "w") as f:
+            f.write('{"nodes": [{"id": 1, "firmware": "%s", "build": '
+                    '{"target": "z1", "source_dir": "%s"}}]}\n'
+                    % (firmware, self.code))
+        env = dict(os.environ, CONTIKI_DIR=self.contiki,
+                   PATH=self.bin + os.pathsep + os.environ["PATH"])
+        if fail:
+            env["FAKE_MAKE_FAIL"] = "1"
+        r = subprocess.run(
+            ["bash", os.path.join(self.csim, "tools", "build-test-firmware.sh"),
+             *flags, "--from-json", json_path],
+            env=env, capture_output=True, text=True, check=False)
+        return r.returncode, r.stdout + r.stderr
+
+    def content(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_force_rebuilds_a_local_build(self):
+        rc, out = self.build("firmware/z1/node-abcdef.z1", "--force")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Summary: 1 built, 0 skipped, 0 failed", out)
+        self.assertEqual(self.content(self.local), "rebuilt\n")
+
+    def test_force_failed_rebuild_is_a_failure(self):
+        rc, out = self.build("firmware/z1/node-abcdef.z1", "--force", fail=True)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("FAILED to build node-abcdef", out)
+        self.assertIn("Summary: 0 built, 0 skipped, 1 failed", out)
+        self.assertEqual(self.content(self.local), "x\n")
+
+    def test_force_never_rebuilds_shipped_firmware(self):
+        rc, out = self.build("firmware/z1/node.z1", "--force")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP node (shipped firmware", out)
+        self.assertIn("Summary: 0 built, 1 skipped, 0 failed", out)
+        self.assertEqual(self.content(self.shipped), "x\n")
+        rc, out = self.build("firmware/z1/node.z1", "--force", "--dry-run")
+        self.assertNotIn("WOULD", out)
+
+    def test_force_outside_a_checkout_keeps_prebuilt(self):
+        # Not a checkout: every .z1 counts as shipped, --force touches none.
+        shutil.rmtree(os.path.join(self.csim, ".git"))
+        rc, out = self.build("firmware/z1/node-abcdef.z1", "--force")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Summary: 0 built, 1 skipped, 0 failed", out)
+        self.assertEqual(self.content(self.local), "x\n")
+
+    def test_missing_plain_named_firmware_is_built(self):
+        # A JSON naming a plain-named file that does not exist yet: the
+        # ordinary --from-json build, unchanged.
+        os.remove(self.shipped)
+        rc, out = self.build("firmware/z1/node.z1")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Summary: 1 built, 0 skipped, 0 failed", out)
+        self.assertEqual(self.content(self.shipped), "rebuilt\n")
 
 
 if __name__ == "__main__":

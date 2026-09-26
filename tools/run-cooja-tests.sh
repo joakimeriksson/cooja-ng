@@ -388,7 +388,9 @@ if [ "$need_rebuild_count" -gt 0 ]; then
 
     # Use --from-json to get per-firmware build info (target, board, make_args)
     json_list=$(cat "$NEED_REBUILD_FILE.jsons" 2>/dev/null | sort -u)
-    CONTIKI_DIR="$CONTIKI_DIR" "$BUILD_FIRMWARE" --from-json $json_list
+    # A failed build exits non-zero; the tests that needed that firmware
+    # are re-run below and each reports the missing file itself.
+    CONTIKI_DIR="$CONTIKI_DIR" "$BUILD_FIRMWARE" --from-json $json_list || true
     rm -f "$NEED_REBUILD_FILE.jsons"
 
     echo ""
