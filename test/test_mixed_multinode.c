@@ -481,10 +481,23 @@ static int parse_wall_timeout(const char *v, double *out_ms) {
 /* CSIM_PHASE_TIMING=1 enables the step-vs-kernel wall-time breakdown at the
  * end of a run.  Off by default: it needs two clock reads per event-pump
  * iteration, which profiled at 7.0% of self time on an ARM workload. */
+static int env_flag_on(const char *name, int *cache) {
+    if (*cache < 0) { const char *e = getenv(name); *cache = (e && *e == '1'); }
+    return *cache;
+}
 static int phase_timing_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("CSIM_PHASE_TIMING"); v = (e && *e == '1'); }
-    return v;
+    return env_flag_on("CSIM_PHASE_TIMING", &v);
+}
+
+/* CSIM_PC_TRACE=1 installs the MSP430 PC-trace instrumentation (firmware
+ * cc2420_transmit / TSCH EB-process / queue-add counters).  Off by default:
+ * with it on, the interpreter calls the hook for every instruction in
+ * [0x3d00, 0x10000) on every MSP430 node; off, the loop keeps only the NULL
+ * test of the hook pointer. */
+static int pc_trace_on(void) {
+    static int v = -1;
+    return env_flag_on("CSIM_PC_TRACE", &v);
 }
 
 /* ============================================================
@@ -2790,12 +2803,15 @@ sim_restart:
 
     /* Debug: PC trace for cc2420_transmit + TSCH EB on all MSP430 nodes (M55:
      * the install + counters live in the MSP430 module; the call is type-blind
-     * — non-MSP430 nodes return 0). */
-    for (int i = 0; i < node_count; i++) {
-        uint32_t tx_addr = msp430_elf_mote_install_pc_trace(&nodes[i]);
-        if (tx_addr)
-            printf("  PC trace: cc2420_transmit=0x%04x eb_process=0xcb32 queue_add=0xb138 (Node %d)\n",
-                   tx_addr, nodes[i].id);
+     * — non-MSP430 nodes return 0).  Opt-in via CSIM_PC_TRACE=1. */
+    if (pc_trace_on()) {
+        for (int i = 0; i < node_count; i++) {
+            uint32_t eb = 0, qa = 0;
+            uint32_t tx_addr = msp430_elf_mote_install_pc_trace(&nodes[i], &eb, &qa);
+            if (tx_addr)
+                printf("  PC trace: cc2420_transmit=0x%04x eb_process=0x%04x queue_add=0x%04x (Node %d)\n",
+                       tx_addr, eb, qa, nodes[i].id);
+        }
     }
 
     /* Start sim_time_ns at max of all nodes' current sim_time_ns */
@@ -3500,10 +3516,13 @@ sim_restart:
     msp430_timer_dump_ccr_counts();
     extern int msp430_gpio_get_isr_count(void);
     printf("  GPIO ISR count: %d\n", msp430_gpio_get_isr_count());
-    int fw_cc2420_tx = 0, fw_eb_process = 0, fw_queue_add = 0;
-    msp430_elf_mote_pc_trace_counts(&fw_cc2420_tx, &fw_eb_process, &fw_queue_add);
-    printf("  FW cc2420_transmit=%d eb_process=%d queue_add=%d\n",
-           fw_cc2420_tx, fw_eb_process, fw_queue_add);
+    if (pc_trace_on()) {
+        int fw_cc2420_tx = 0, fw_eb_process = 0, fw_queue_add = 0;
+        msp430_elf_mote_pc_trace_counts(&fw_cc2420_tx, &fw_eb_process,
+                                        &fw_queue_add);
+        printf("  FW cc2420_transmit=%d eb_process=%d queue_add=%d\n",
+               fw_cc2420_tx, fw_eb_process, fw_queue_add);
+    }
     /* Dump SFD timestamp and Timer B state for TSCH debugging (M58: the
      * per-node MSP430 chip-memory reads moved behind dump_diagnostics; a NULL
      * op means "not an MSP430 mote", the type-blind replacement for the old
