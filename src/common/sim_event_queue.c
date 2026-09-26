@@ -30,8 +30,15 @@ static inline void track_slot(sim_event_queue_t *q, int slot) {
  * smaller child) into the hole, and drop the element in at the end.  One
  * copy per level instead of the three a swap costs, and one track_slot
  * per moved element.  Order is a pure function of the (time_ns, seq)
- * keys, which are unique, so the heap's pop sequence is unchanged. */
+ * keys, which are unique, so the heap's pop sequence is unchanged.
+ *
+ * A sift that does not move writes nothing and tracks nothing: the slot
+ * is as the caller left it, and every caller has tracked it already
+ * (the insert writes node_heap_idx[] before sifting, pop tracks slot 0
+ * before sifting down, the in-place reschedule keeps its slot, and
+ * sim_eq_remove_node tracks every slot after its heapify). */
 static void heap_sift_up(sim_event_queue_t *q, int i) {
+    const int start = i;
     sim_event_t ev = q->heap[i];
     while (i > 0) {
         int parent = (i - 1) / 2;
@@ -41,11 +48,14 @@ static void heap_sift_up(sim_event_queue_t *q, int i) {
         track_slot(q, i);
         i = parent;
     }
-    q->heap[i] = ev;
-    track_slot(q, i);
+    if (i != start) {
+        q->heap[i] = ev;
+        track_slot(q, i);
+    }
 }
 
 static void heap_sift_down(sim_event_queue_t *q, int i) {
+    const int start = i;
     int n = q->count;
     sim_event_t ev = q->heap[i];
     for (;;) {
@@ -61,8 +71,10 @@ static void heap_sift_down(sim_event_queue_t *q, int i) {
         track_slot(q, i);
         i = child;
     }
-    q->heap[i] = ev;
-    track_slot(q, i);
+    if (i != start) {
+        q->heap[i] = ev;
+        track_slot(q, i);
+    }
 }
 
 /* The node's live NODE_WAKEUP slot, or -1.  node_heap_idx[] is trusted
