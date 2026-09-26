@@ -293,10 +293,12 @@ nothing was ever refused. Now:
   stores; the copy is made when a refusal is recorded — by the attribution
   unit in `arm_tz_blocks()`, by the bus check in `io_lookup()` — or before
   the first beat of a multi-register load (LDM, POP, LDRD, LDREXD), whose
-  earlier beats write registers, so those pay the copy on every execution
-  (every POP-return), still far cheaper than the eager copy, which
-  measured +5–10 % wall on every nRF54L15 run. Any other instruction that
-  is not refused pays nothing more. This relies on an ordering invariant
+  earlier beats write registers — unless none of its beats can be refused
+  (the core is not Non-secure and every beat is in SRAM or flash), so the
+  copy is paid by Non-secure POP-returns and not by Secure or
+  non-TrustZone ones. The eager copy measured +5–10 % wall on every
+  nRF54L15 run. Any other instruction that is not refused pays nothing
+  more. This relies on an ordering invariant
   every other load/store form keeps: all of an instruction's accesses are
   issued before it writes any register (PUSH, LDR with writeback and
   VLDM/VSTM were reordered for it); a new form must keep it, or snapshot
@@ -325,7 +327,15 @@ nothing was ever refused. Now:
   refused beat does not act: an EXC_RETURN or FNC_RETURN in the last beat of
   `POP {…, pc}` / `LDM` would otherwise unstack a frame, deactivate the
   handler or switch security state before the undo, which restores
-  registers only. One effect inside an instruction the undo cannot cover:
+  registers only. FNC_RETURN's own pops from the Secure stack are checked
+  accesses of the returning instruction too: a refused one (the Secure SP
+  in a claimed peripheral) abandons the return and restores the security
+  state the instruction started in, so the BusFault stacks the
+  instruction on the stack it ran on. That holds for all four ways in —
+  `BX` / `POP` / `LDM` / `LDR pc` with writeback from Non-secure, and
+  `BXNS` from Secure — because each snapshots before its first register
+  write.
+  One effect inside an instruction the undo cannot cover:
   a peripheral write handler that pends an interrupt enters it at once
   (`arm_nvic_set_pending` → `arm_nvic_check_pending`), so a multi-beat
   Non-secure store whose early beat raises an interrupt and whose later

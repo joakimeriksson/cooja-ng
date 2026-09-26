@@ -133,6 +133,14 @@ typedef struct arm_nvic {
     int       scan_prio;
 } arm_nvic_t;
 
+/* ARMv8-M: BusFault, HardFault and NMI are Secure exceptions unless
+ * AIRCR.BFHFNMINS hands them to the Non-secure world. The one spelling of
+ * that rule: exception targeting and the Non-secure view of their state
+ * (SHCSR bits, SHPR1.PRI_5, CFSR/HFSR/BFAR) all derive from it. */
+static inline bool arm_nvic_bfhfnmi_secure(const arm_nvic_t *nvic) {
+    return !(nvic->aircr & ARM_AIRCR_BFHFNMINS);
+}
+
 /* Initialize NVIC and register IO regions */
 void arm_nvic_init(arm_nvic_t *nvic, arm_cpu_t *cpu);
 

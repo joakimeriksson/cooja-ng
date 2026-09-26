@@ -2434,9 +2434,12 @@ static void test_trustzone_secure_exception(void) {
  * XIAO nRF54L15: CFSR 0x8200, BFAR = the Non-secure alias, load not done. */
 static arm_nvic_t *bf_hook_nvic;      /* set by bf_setup; used by refuse_and_pend */
 static int         bf_hook_irq = -1;  /* IRQ the refusing "security unit" raises */
+static uint32_t    bf_refuse_also;    /* a second refused page, 0 = none */
 static bool refuse_0x40001000(void *user, uint32_t addr, bool is_write) {
     (void)user; (void)is_write;
-    if ((addr & ~0xFFFu) != 0x40001000u) return true;
+    if ((addr & ~0xFFFu) != 0x40001000u &&
+        (bf_refuse_also == 0 || (addr & ~0xFFFu) != bf_refuse_also))
+        return true;
     /* Like the nRF54L15 security unit: the refused transaction also raises
      * the unit's interrupt, marked pending but not dispatched. */
     if (bf_hook_irq >= 0 && bf_hook_nvic)
@@ -2455,6 +2458,7 @@ static void bf_setup(arm_cpu_t *cpu, arm_nvic_t *nvic) {
     arm_nvic_init(nvic, cpu);
     bf_hook_nvic = nvic;
     bf_hook_irq = -1;
+    bf_refuse_also = 0;
     cpu->tz_enabled = true;
     cpu->secure = false;
     cpu->use_psp = false;
@@ -2876,6 +2880,130 @@ static void test_trustzone_bus_fault(void) {
     }
 }
 
+/* A multi-register load skips its explicit snapshot when no beat can be
+ * refused: the core is Secure or has no security extension, and every
+ * beat is in SRAM or flash. The boundary of that span check is what a
+ * refused beat in Secure state exercises — the only other refused
+ * multi-load tests run Non-secure, where the copy is taken regardless.
+ * A wrong bound would skip the copy, and the BusFault would be imprecise
+ * with the earlier beats' registers already written. */
+#define ML_S_SP  0x20007000u
+static void test_trustzone_multi_load_skip(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone multi-load snapshot boundary tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+    uint32_t sram_end = ARM_SRAM_BASE + ARM_SRAM_SIZE;
+
+    /* Secure LDRD r0, r1, [r2] from the refused page: precise, r0 and r1
+     * untouched, frame on the Secure stack. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.reg[ARM_SP] = ML_S_SP;
+    write_thumb32(&cpu, CODE_BASE, 0xE9D2, 0x0100);  /* LDRD r0, r1, [r2] */
+    cpu.reg[1] = 0xCAFEBABE;
+    cpu.reg[2] = 0x40001000;
+    arm_step(&cpu, 1);
+    assert_eq("Secure LDRD refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("Secure LDRD refused: BFAR = first beat", 0x40001000, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("Secure LDRD refused: stacked PC = the LDRD", CODE_BASE, arm_read32(&cpu, ML_S_SP - 32 + 24));
+    assert_eq("Secure LDRD refused: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("Secure LDRD refused: r1 untouched", 0xCAFEBABE, cpu.reg[1]);
+
+    /* Secure LDM r2!, {r0, r1} straddling the end of SRAM: the first beat
+     * is the last SRAM word and loads r0, the second is past the end and
+     * refused (the hook refuses that page too). The r0 write is undone. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.reg[ARM_SP] = ML_S_SP;
+    bf_refuse_also = sram_end;
+    write_thumb16(&cpu, CODE_BASE, 0xCA03);          /* LDM r2!, {r0, r1} */
+    arm_write32(&cpu, sram_end - 4, 0x11111111);
+    cpu.reg[1] = 0xCAFEBABE;
+    cpu.reg[2] = sram_end - 4;
+    arm_step(&cpu, 1);
+    assert_eq("Secure LDM across sram_end: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("Secure LDM across sram_end: BFAR = the beat past the end", sram_end, arm_read32(&cpu, 0xE000ED38));
+    assert_eq("Secure LDM across sram_end: stacked PC = the LDM", CODE_BASE, arm_read32(&cpu, ML_S_SP - 32 + 24));
+    assert_eq("Secure LDM across sram_end: r0 write undone", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("Secure LDM across sram_end: r1 untouched", 0xCAFEBABE, cpu.reg[1]);
+    assert_eq("Secure LDM across sram_end: no writeback", sram_end - 4, cpu.reg[2]);
+
+    /* The same LDM one word lower ends exactly at the SRAM end: every beat
+     * is SRAM, the copy is skipped (insn_snap_valid stays clear) and the
+     * load completes. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.reg[ARM_SP] = ML_S_SP;
+    bf_refuse_also = sram_end;
+    write_thumb16(&cpu, CODE_BASE, 0xCA03);          /* LDM r2!, {r0, r1} */
+    arm_write32(&cpu, sram_end - 8, 0x22222222);
+    arm_write32(&cpu, sram_end - 4, 0x11111111);
+    cpu.reg[2] = sram_end - 8;
+    arm_step(&cpu, 1);
+    assert_eq("Secure LDM to sram_end: no fault", CODE_BASE + 2, cpu.reg[ARM_PC]);
+    assert_eq("Secure LDM to sram_end: r0 loaded", 0x22222222, cpu.reg[0]);
+    assert_eq("Secure LDM to sram_end: r1 loaded", 0x11111111, cpu.reg[1]);
+    assert_eq("Secure LDM to sram_end: written back", sram_end, cpu.reg[2]);
+    assert_true("Secure LDM to sram_end: snapshot skipped", !cpu.insn_snap_valid);
+
+    /* No security extension, a bus check alone: Secure-or-not is moot and
+     * the span check decides. POP {r0, r1} with SP in the refused page. */
+    bf_setup(&cpu, &nvic);
+    cpu.tz_enabled = false;
+    cpu.vtor = ARM_FLASH_BASE;                       /* the one vector table */
+    cpu.reg[ARM_SP] = 0x40001000;
+    write_thumb16(&cpu, CODE_BASE, 0xBC03);          /* POP {r0, r1} */
+    cpu.reg[1] = 0xCAFEBABE;
+    arm_step(&cpu, 1);
+    assert_eq("no-TZ POP refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("no-TZ POP refused: BFAR = first beat", 0x40001000, cpu.bfar);
+    assert_eq("no-TZ POP refused: r0 untouched", 0xDEADBEEF, cpu.reg[0]);
+    assert_eq("no-TZ POP refused: r1 untouched", 0xCAFEBABE, cpu.reg[1]);
+    assert_eq("no-TZ POP refused: frame below the original SP", 0x40001000 - 32, cpu.reg[ARM_SP]);
+}
+
+/* NMI, HardFault and BusFault share one targeting rule: Secure unless
+ * AIRCR.BFHFNMINS hands them to the Non-secure world. Nothing in the
+ * emulator pends an NMI, so entry is driven directly. */
+#define NMI_S_HANDLER   (CODE_BASE + 0xC0)
+#define NMI_NS_HANDLER  (CODE_BASE + 0xE0)
+#define NS_VTOR         (ARM_FLASH_BASE + 0x1000)
+static void test_trustzone_nmi_target(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone NMI targeting tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+
+    bf_setup(&cpu, &nvic);                       /* Non-secure thread, MSP */
+    write_flash32(&cpu, ARM_FLASH_BASE + EXC_NMI * 4, NMI_S_HANDLER | 1);
+    cpu.vtor = NS_VTOR;
+    write_flash32(&cpu, NS_VTOR + EXC_NMI * 4, NMI_NS_HANDLER | 1);
+    write_thumb16(&cpu, NMI_S_HANDLER, 0x4770);  /* BX LR */
+    write_thumb16(&cpu, NMI_NS_HANDLER, 0x4770); /* BX LR */
+
+    /* BFHFNMINS clear: the NMI is Secure, like BusFault and HardFault. */
+    arm_exception_entry(&cpu, EXC_NMI);
+    assert_true("NMI, BFHFNMINS clear: taken Secure", cpu.secure);
+    assert_eq("NMI, BFHFNMINS clear: PC = Secure NMI handler", NMI_S_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("NMI, BFHFNMINS clear: IPSR = 2", EXC_NMI, (int)(cpu.xpsr & 0x1FF));
+    assert_eq("NMI, BFHFNMINS clear: frame on the NS stack", BF_NS_FRAME, cpu.msp_ns);
+    assert_eq("NMI, BFHFNMINS clear: stacked PC", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+    arm_step(&cpu, 1);                           /* BX LR */
+    assert_true("NMI return: back to Non-secure", !cpu.secure);
+    assert_eq("NMI return: PC = the interrupted instruction", CODE_BASE, cpu.reg[ARM_PC]);
+
+    /* BFHFNMINS set: the NMI is Non-secure. */
+    bf_setup(&cpu, &nvic);
+    write_flash32(&cpu, ARM_FLASH_BASE + EXC_NMI * 4, NMI_S_HANDLER | 1);
+    cpu.vtor = NS_VTOR;
+    write_flash32(&cpu, NS_VTOR + EXC_NMI * 4, NMI_NS_HANDLER | 1);
+    nvic.aircr |= ARM_AIRCR_BFHFNMINS;
+    arm_exception_entry(&cpu, EXC_NMI);
+    assert_true("NMI, BFHFNMINS set: stays Non-secure", !cpu.secure);
+    assert_eq("NMI, BFHFNMINS set: PC = Non-secure NMI handler", NMI_NS_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("NMI, BFHFNMINS set: IPSR = 2", EXC_NMI, (int)(cpu.xpsr & 0x1FF));
+    assert_eq("NMI, BFHFNMINS set: frame on the NS stack", BF_NS_FRAME, cpu.reg[ARM_SP]);
+}
+
 /* VFP loads and stores are the core's own accesses like any other: the
  * attribution unit refuses a Non-secure one to Secure memory (AUVIOL), the
  * bus check refuses one to a claimed peripheral (BusFault), and either way
@@ -3088,6 +3216,87 @@ static void test_trustzone_blxns(void) {
         assert_true("tampered signature: returned to Secure to fault",
                     cpu.secure);
     }
+}
+
+/* FNC_RETURN pops the return address and signature from the Secure stack
+ * as accesses of the returning instruction: a refused pop (the Secure SP
+ * in a claimed peripheral) is a precise BusFault on the BX or POP that
+ * carried it, with the world switch reverted — the frame is on the
+ * Non-secure stack, the Non-secure registers are as they were. Reached
+ * through BX LR and through POP {pc}, the two ways a callee returns. */
+static void test_trustzone_fnc_return_refused(void) {
+    if (verbose) printf("--- ARMv8-M TrustZone FNC_RETURN refused-pop tests ---\n");
+    arm_cpu_t cpu;
+    arm_nvic_t nvic;
+
+    for (int pop = 0; pop < 2; pop++) {
+        const char *what = pop ? "POP {pc} FNC_RETURN refused" : "BX FNC_RETURN refused";
+        char name[96];
+        bf_setup(&cpu, &nvic);                   /* Non-secure thread, MSP */
+        cpu.msp_s = 0x40001000;                  /* Secure stack in the refused page */
+        if (pop) {
+            write_thumb16(&cpu, CODE_BASE, 0xBD00);            /* POP {pc} */
+            arm_write32(&cpu, BF_NS_SP, 0xFEFFFFFFu);
+            cpu.reg[ARM_LR] = 0x12345678;
+        } else {
+            write_thumb16(&cpu, CODE_BASE, 0x4770);            /* BX LR */
+            cpu.reg[ARM_LR] = 0xFEFFFFFFu;
+        }
+        arm_step(&cpu, 1);
+        snprintf(name, sizeof name, "%s: BusFault taken", what);
+        assert_eq(name, BF_HANDLER, cpu.reg[ARM_PC]);
+        snprintf(name, sizeof name, "%s: BFAR = the first pop", what);
+        assert_eq(name, 0x40001000, arm_read32(&cpu, 0xE000ED38));
+        snprintf(name, sizeof name, "%s: no SecureFault recorded", what);
+        assert_eq(name, 0, (int)cpu.sfsr);
+        snprintf(name, sizeof name, "%s: frame on the NS stack", what);
+        assert_eq(name, BF_NS_FRAME, cpu.msp_ns);
+        snprintf(name, sizeof name, "%s: stacked PC = the return", what);
+        assert_eq(name, CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+        snprintf(name, sizeof name, "%s: stacked LR", what);
+        assert_eq(name, pop ? 0x12345678 : 0xFEFFFFFFu, arm_read32(&cpu, BF_NS_FRAME + 20));
+        snprintf(name, sizeof name, "%s: Secure SP untouched", what);
+        assert_eq(name, 0x40001000, cpu.reg[ARM_SP]);
+        snprintf(name, sizeof name, "%s: handler patches the frame, back Non-secure", what);
+        arm_step(&cpu, 5);                       /* MRS, LDR, ADDS, STR, BX LR */
+        assert_true(name, !cpu.secure && cpu.reg[ARM_PC] == CODE_BASE + 2);
+        snprintf(name, sizeof name, "%s: NS SP back", what);
+        assert_eq(name, BF_NS_SP, cpu.reg[ARM_SP]);
+    }
+
+    /* LDR.W pc, [sp], #4: the base writeback happens before the PC load
+     * reaches FNC_RETURN, so the snapshot must be taken ahead of it — the
+     * frame is pushed from the original SP, and the undo restores SP. */
+    bf_setup(&cpu, &nvic);
+    cpu.msp_s = 0x40001000;
+    write_thumb32(&cpu, CODE_BASE, 0xF85D, 0xFB04);        /* LDR.W pc, [sp], #4 */
+    arm_write32(&cpu, BF_NS_SP, 0xFEFFFFFFu);
+    arm_step(&cpu, 1);
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: BFAR = the first pop", 0x40001000, arm_read32(&cpu, 0xE000ED38));
+    assert_true("LDR pc,[sp],#4 FNC_RETURN refused: Secure handler", cpu.secure);
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: frame from the original SP", BF_NS_FRAME, cpu.msp_ns);
+    /* The frame position alone cannot tell: SP + 4 aligns down to the same
+     * frame. The stacked alignment bit can — set only for an SP that was
+     * not 8-byte aligned, which BF_NS_SP is. */
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: SP stacked unadvanced (xPSR bit 9 clear)",
+              0, (int)(arm_read32(&cpu, BF_NS_FRAME + 28) & (1u << 9)));
+    assert_eq("LDR pc,[sp],#4 FNC_RETURN refused: stacked PC = the LDR", CODE_BASE, arm_read32(&cpu, BF_NS_FRAME + 24));
+
+    /* BXNS LR in Secure state with LR = FNC_RETURN also returns through
+     * FNC_RETURN, from a core already Secure: a refused pop must leave it
+     * Secure, and the BusFault is stacked on the Secure stack. */
+    bf_setup(&cpu, &nvic);
+    cpu.secure = true;
+    cpu.msp_ns = BF_NS_SP;
+    cpu.reg[ARM_SP] = 0x40001000;                          /* MSP_S in the refused page */
+    write_thumb16(&cpu, CODE_BASE, 0x4774);                /* BXNS LR */
+    cpu.reg[ARM_LR] = 0xFEFFFFFFu;
+    arm_step(&cpu, 1);
+    assert_eq("Secure BXNS FNC_RETURN refused: BusFault taken", BF_HANDLER, cpu.reg[ARM_PC]);
+    assert_true("Secure BXNS FNC_RETURN refused: still Secure", cpu.secure);
+    assert_eq("Secure BXNS FNC_RETURN refused: frame on the Secure stack", 0x40001000 - 32, cpu.reg[ARM_SP]);
+    assert_eq("Secure BXNS FNC_RETURN refused: NS SP bank untouched", BF_NS_SP, cpu.msp_ns);
 }
 
 /* Non-secure code must not execute from Secure memory, and may fetch from
@@ -3311,8 +3520,11 @@ int run_arm_correctness_tests(int v) {
     test_trustzone_nvic_itns();
     test_trustzone_instrumentation();
     test_trustzone_blxns();
+    test_trustzone_fnc_return_refused();
     test_trustzone_ns_fetch();
     test_trustzone_bus_fault();
+    test_trustzone_nmi_target();
+    test_trustzone_multi_load_skip();
     test_trustzone_vfp();
     test_io_lookup();
 

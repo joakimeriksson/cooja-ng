@@ -265,7 +265,8 @@ typedef struct arm_cpu {
      * xPSR and ITSTATE are copied when a refusal is recorded
      * (arm_insn_snapshot), so an instruction that is not refused pays two
      * stores — except a multi-register load (LDM, POP, LDRD, LDREXD),
-     * which copies before its first beat: ~60 bytes on every POP-return.
+     * which copies before its first beat (~60 bytes) unless none of its
+     * beats can be refused: Secure or non-TrustZone, all in SRAM/flash.
      * Sound because no other load/store form writes a register before its
      * accesses. FP registers are not in the snapshot: an FP load commits
      * only once every beat was accepted (arm_insn_refused). */
@@ -274,6 +275,15 @@ typedef struct arm_cpu {
         uint32_t xpsr;
         uint8_t  it_state;
     } insn_snap;
+    /* Debug builds also copy at every instruction start and check the
+     * lazy snapshot against it when a fault undoes the instruction. Always
+     * present: DEBUG selects code, never the layout of this struct, which
+     * objects built with either setting share. */
+    struct {
+        uint32_t reg[15];
+        uint32_t xpsr;
+        uint8_t  it_state;
+    } insn_snap_eager;
     /* SoC attribution unit (the Nordic security unit acts as the IDAU).
      * Consulted by arm_security_attr() alongside the SAU; NULL leaves
      * attribution entirely to the SAU. */
@@ -481,6 +491,11 @@ void arm_stop(arm_cpu_t *cpu);
 /* Cortex-M4F VFP step — defined in arm_vfp.c. Returns true if hw1/hw2
  * was handled, false otherwise (caller should fault loudly). */
 bool arm_vfp_step(arm_cpu_t *cpu, uint16_t hw1, uint16_t hw2);
+/* The VFP's checked multi-word load/store beats (arm_vfp.c): n words from
+ * addr into/out of s[sd..], then the FPSCR if fpscr. A load commits only
+ * once every beat was accepted. VLSTM/VLLDM in arm_cpu.c use them too. */
+void arm_vfp_load(arm_cpu_t *cpu, int sd, uint32_t addr, int n, bool fpscr);
+void arm_vfp_store(arm_cpu_t *cpu, int sd, uint32_t addr, int n, bool fpscr);
 
 /* Data accesses issued by an instruction handler outside arm_cpu.c: the
  * interpreter's checked path (attribution unit + bus check, precise-fault

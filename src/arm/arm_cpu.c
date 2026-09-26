@@ -243,16 +243,17 @@ uint32_t arm_read32(arm_cpu_t *cpu, uint32_t addr) {
  * writing a register (PUSH, LDR with writeback and VLDM/VSTM were
  * reordered for this). The exception is a multi-register load, whose
  * earlier beats write registers before a later beat can be refused: those
- * forms (LDM, POP, LDRD, LDREXD) snapshot before their first beat, so they
- * pay the copy on every execution — every POP-return on a part with a bus
- * check or TrustZone, still far cheaper than the eager copy, which
- * measured +5–10 % wall on every nRF54L15 run. For every other form an
- * allowed access costs nothing.
+ * forms (LDM, POP, LDRD, LDREXD) snapshot before their first beat
+ * (arm_insn_snapshot_multi) unless no beat can be refused, so the copy is
+ * paid by Non-secure multi-register loads and by those reaching beyond
+ * SRAM and flash. The eager copy measured +5–10 % wall on every nRF54L15
+ * run. For every other form an allowed access costs nothing.
  *
  * FP registers are not in the snapshot. VFP loads and stores take the same
- * checked path (VLSTM/VLLDM here, arm_vfp.c through arm_insn_read32/write32)
- * and commit a load to the FP registers only once every beat has been
- * accepted, so a refused one leaves them as they were.
+ * checked path (arm_vfp_load/arm_vfp_store, through arm_insn_read32/write32;
+ * VLSTM/VLLDM here use them too) and commit a load to the FP registers only
+ * once every beat has been accepted, so a refused one leaves them as they
+ * were.
  *
  * Out of line: called from arm_tz_blocks, which is inlined into the six
  * mem_* helpers at hundreds of sites. */
@@ -267,11 +268,78 @@ static inline void arm_insn_snapshot(arm_cpu_t *cpu) {
     if (!cpu->insn_snap_valid) arm_insn_snapshot_slow(cpu);
 }
 
+/* Can an access by this core be refused at all: a bus-side permission
+ * check installed, or the security extension's attribution unit? The
+ * interpreter keeps the snapshot state only then.
+ *
+ * Code layout. arm_step_interpreter is one large function, and the
+ * compiler's placement of its cold fault paths moves the hot dispatch
+ * measurably. Three constructs here are shaped by that, not by
+ * semantics: this predicate is a macro (as an inline function inside
+ * __builtin_expect the unlikely block landed in the hot path), and
+ * arm_insn_snapshot_slow (reached from hundreds of mem_* sites) and
+ * arm_vlstm_vlldm are noinline. Nothing checks
+ * layout automatically: vet any edit of the interpreter loop with
+ * arm-bench against the base, per compiler and host. */
+#define ARM_PRECISE_FAULTS(cpu) \
+    ((cpu)->io_access_check != NULL || (cpu)->tz_enabled)
+
+/* [addr, addr + len) lies within [base, end), without wrapping. */
+static inline bool arm_span_in(uint32_t addr, uint32_t len,
+                               uint32_t base, uint32_t end) {
+    return end - base >= len && addr - base <= end - base - len;
+}
+
+/* The explicit snapshot of a multi-register load, whose beats span
+ * [addr, addr + len). Skipped where no beat can be refused: the core is
+ * not Non-secure (so the attribution unit passes everything) and every
+ * beat is in SRAM or flash (which the bus check never sees) — every
+ * Secure-world or non-TrustZone POP-return from the stack. */
+static inline void arm_insn_snapshot_multi(arm_cpu_t *cpu, uint32_t addr,
+                                           uint32_t len) {
+    if (__builtin_expect(!ARM_PRECISE_FAULTS(cpu), 1)) return;
+    if (!(cpu->tz_enabled && !cpu->secure) &&
+        (arm_span_in(addr, len, cpu->sram_base, cpu->sram_end) ||
+         arm_span_in(addr, len, cpu->flash_base, cpu->flash_end)))
+        return;
+    arm_insn_snapshot(cpu);
+}
+
 /* Undo the instruction being executed: restore the register file, xPSR and
  * ITSTATE captured at its start, so a precise fault stacks the instruction
  * itself and none of its writes survive. Cycles stay charged. A fault is
  * only ever armed by a checked access, which snapshots first. */
 static inline void arm_insn_undo(arm_cpu_t *cpu) {
+#ifdef DEBUG
+    /* The lazy snapshot is only right if nothing was written before it:
+     * a load/store form that writes a register before a beat that can be
+     * refused breaks the ordering invariant above, and its fault would be
+     * imprecise without anyone noticing. Debug builds compare it with the
+     * eager copy of the instruction start. */
+    if (!cpu->insn_snap_valid ||
+        memcmp(cpu->insn_snap.reg, cpu->insn_snap_eager.reg,
+               sizeof(cpu->insn_snap_eager.reg)) != 0 ||
+        cpu->insn_snap.xpsr != cpu->insn_snap_eager.xpsr ||
+        cpu->insn_snap.it_state != cpu->insn_snap_eager.it_state) {
+        uint32_t pc = cpu->insn_snap.reg[ARM_PC];
+        fprintf(stderr, "ARM precise-fault snapshot %s at PC=0x%08x "
+                "(%04x %04x)\n",
+                cpu->insn_snap_valid ? "taken after a register write"
+                                     : "missing",
+                pc, arm_read16(cpu, pc), arm_read16(cpu, pc + 2));
+        for (int i = 0; i < 15; i++)
+            if (cpu->insn_snap.reg[i] != cpu->insn_snap_eager.reg[i])
+                fprintf(stderr, "  r%d: start 0x%08x, snapshot 0x%08x\n", i,
+                        cpu->insn_snap_eager.reg[i], cpu->insn_snap.reg[i]);
+        if (cpu->insn_snap.xpsr != cpu->insn_snap_eager.xpsr)
+            fprintf(stderr, "  xpsr: start 0x%08x, snapshot 0x%08x\n",
+                    cpu->insn_snap_eager.xpsr, cpu->insn_snap.xpsr);
+        if (cpu->insn_snap.it_state != cpu->insn_snap_eager.it_state)
+            fprintf(stderr, "  itstate: start 0x%02x, snapshot 0x%02x\n",
+                    cpu->insn_snap_eager.it_state, cpu->insn_snap.it_state);
+        abort();
+    }
+#endif
     if (!cpu->insn_snap_valid) return;
     memcpy(cpu->reg, cpu->insn_snap.reg, sizeof(cpu->reg));
     cpu->xpsr = cpu->insn_snap.xpsr;
@@ -980,13 +1048,29 @@ static void arm_switch_security_state(arm_cpu_t *cpu, bool to_secure) {
 /* ARMv8-M FNC_RETURN (0xFExxxxxx): return from a Non-secure callee to the
  * Secure caller that invoked it via BLXNS. Restore Secure state (and its
  * stack), then pop the return address + integrity signature BLXNS pushed. A
- * corrupted signature raises a SecureFault (INVIS). */
+ * corrupted signature raises a SecureFault (INVIS).
+ *
+ * The pops are the returning instruction's own accesses, checked like any
+ * other (the bus check can refuse them: a Secure SP in peripheral space).
+ * Four instructions get here: BX and POP/LDM from Non-secure code, LDR pc
+ * with writeback, and BXNS from Secure code. Each has its register file
+ * snapshotted before any write of its own (POP/LDM before the first beat,
+ * the LDR before its writeback, BX and BXNS here, before the switch), so
+ * the precise BusFault undoes it. The undo restores registers only, so a
+ * refusal restores the security state the instruction started in; the
+ * return then does nothing, and INVIS can only follow accepted reads. */
 static void arm_fnc_return(arm_cpu_t *cpu, uint32_t magic) {
     (void)magic;
+    bool was_secure = cpu->secure;
+    arm_insn_snapshot(cpu);
     arm_switch_security_state(cpu, true);
     uint32_t sp = cpu->reg[ARM_SP];
-    uint32_t ret = arm_read32(cpu, sp + 0);
-    uint32_t sig = arm_read32(cpu, sp + 4);
+    uint32_t ret = mem_read32(cpu, sp + 0);
+    uint32_t sig = mem_read32(cpu, sp + 4);
+    if (__builtin_expect(arm_insn_refused(cpu), 0)) {
+        arm_switch_security_state(cpu, was_secure);
+        return;
+    }
     arm_tz_trace(cpu, "fnc-return", ret, sig);
     if (sig != 0xFEFA125Au) {
         cpu->sfsr |= ARM_SFSR_INVIS;
@@ -1037,10 +1121,9 @@ void arm_exception_entry(arm_cpu_t *cpu, int exception_num) {
     if (cpu->tz_enabled) {
         if (exception_num == EXC_SECUREFAULT)
             target_secure = true;
-        else if ((exception_num == EXC_BUSFAULT || exception_num == EXC_HARDFAULT) && cpu->nvic)
-            /* BusFault and HardFault target Secure unless AIRCR.BFHFNMINS
-             * hands them to the Non-secure world. */
-            target_secure = !(((arm_nvic_t *)cpu->nvic)->aircr & ARM_AIRCR_BFHFNMINS);
+        else if ((exception_num == EXC_NMI || exception_num == EXC_HARDFAULT ||
+                  exception_num == EXC_BUSFAULT) && cpu->nvic)
+            target_secure = arm_nvic_bfhfnmi_secure((arm_nvic_t *)cpu->nvic);
         else if (exception_num >= 16 && cpu->nvic)
             target_secure = arm_nvic_targets_secure(
                 (arm_nvic_t *)cpu->nvic, exception_num);
@@ -1764,6 +1847,17 @@ static inline void arm_trace_step(arm_cpu_t *cpu) {
             cpu->xpsr, (void*)cpu);
 }
 
+/* ARMv8-M VLSTM (store S0-S15 + FPSCR at [Rn]) / VLLDM (restore them):
+ * one CMSE world switch each, so cold. Out of line for code layout (see
+ * ARM_PRECISE_FAULTS). */
+static void __attribute__((noinline)) arm_vlstm_vlldm(arm_cpu_t *cpu, uint16_t hw1) {
+    uint32_t base = cpu->reg[hw1 & 0xF];
+    if ((hw1 & 0x0010) == 0)
+        arm_vfp_store(cpu, 0, base, 16, true);
+    else
+        arm_vfp_load(cpu, 0, base, 16, true);
+}
+
 static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
     int remaining = count;
 
@@ -1906,10 +2000,16 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * instructions (a refused access by the FLPR, the GDB stub or an
          * event callback, and the snapshot it took) is discarded here — it
          * was not this core's transaction. */
-        if (__builtin_expect(cpu->io_access_check != NULL || cpu->tz_enabled, 0)) {
+        if (__builtin_expect(ARM_PRECISE_FAULTS(cpu), 0)) {
             cpu->insn_snap.reg[ARM_PC] = pc;
             cpu->insn_snap_valid = false;
             cpu->bus_fault_pending = false;
+#ifdef DEBUG
+            memcpy(cpu->insn_snap_eager.reg, cpu->reg,
+                   sizeof(cpu->insn_snap_eager.reg));
+            cpu->insn_snap_eager.xpsr = cpu->xpsr;
+            cpu->insn_snap_eager.it_state = cpu->it_state;
+#endif
         }
 
         /* ARMv8-M: Non-secure code may not execute from Secure memory, and
@@ -2752,7 +2852,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     uint32_t reglist = hw1 & 0xFF;
                     int pop_pc = (hw1 >> 8) & 1;
                     uint32_t addr = cpu->reg[ARM_SP];
-                    arm_insn_snapshot(cpu);   /* multi-register load */
+                    arm_insn_snapshot_multi(cpu, addr,
+                        4u * (uint32_t)(__builtin_popcount(reglist) + pop_pc));
                     for (int i = 0; i < 8; i++) {
                         if (reglist & (1 << i)) {
                             cpu->reg[i] = mem_read32(cpu, addr);
@@ -2830,7 +2931,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
             int rn = (hw1 >> 8) & 7;
             uint32_t reglist = hw1 & 0xFF;
             uint32_t addr = cpu->reg[rn];
-            arm_insn_snapshot(cpu);   /* multi-register load */
+            arm_insn_snapshot_multi(cpu, addr,
+                                    4u * (uint32_t)__builtin_popcount(reglist));
             for (int i = 0; i < 8; i++) {
                 if (reglist & (1 << i)) {
                     cpu->reg[i] = mem_read32(cpu, addr);
@@ -2936,7 +3038,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         addr -= 4u * (uint32_t)__builtin_popcount(reglist);
                         wb_db = addr;
                     }
-                    arm_insn_snapshot(cpu);   /* multi-register load */
+                    arm_insn_snapshot_multi(cpu, addr,
+                        4u * (uint32_t)__builtin_popcount(reglist));
                     uint32_t exc_ret = 0;
                     bool do_exc_ret = false;
                     for (int i = 0; i < 16; i++) {
@@ -3075,7 +3178,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         switch (op3) {
                             case 0x4: cpu->reg[rt] = mem_read8(cpu, addr);  break;
                             case 0x5: cpu->reg[rt] = mem_read16(cpu, addr); break;
-                            default:  arm_insn_snapshot(cpu);   /* LDREXD: two beats */
+                            default:  arm_insn_snapshot_multi(cpu, addr, 8);   /* LDREXD */
                                       cpu->reg[rt]  = mem_read32(cpu, addr);
                                       cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                                       break;
@@ -3111,7 +3214,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                     uint32_t base = (pc + 4) & ~3u;
                     uint32_t off  = imm8;
                     uint32_t addr = U ? base + off : base - off;
-                    arm_insn_snapshot(cpu);   /* multi-register load */
+                    arm_insn_snapshot_multi(cpu, addr, 8);   /* LDRD */
                     cpu->reg[rt]  = mem_read32(cpu, addr);
                     cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                 } else if (!P && !U && !L && (hw2 & 0x0F00) != 0x0F00) {
@@ -3147,7 +3250,7 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         addr = cpu->reg[rn];
                     }
                     if (L) {
-                        arm_insn_snapshot(cpu);   /* multi-register load */
+                        arm_insn_snapshot_multi(cpu, addr, 8);   /* LDRD */
                         cpu->reg[rt]  = mem_read32(cpu, addr);
                         cpu->reg[rt2] = mem_read32(cpu, addr + 4);
                     } else {
@@ -3783,6 +3886,11 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                         val = mem_read32_unaligned(cpu, addr);
                         break;
                 }
+                /* A PC load can return through FNC_RETURN, whose own pops
+                 * can be refused after this writeback: snapshot first. */
+                if (writeback && rt == ARM_PC &&
+                    __builtin_expect(ARM_PRECISE_FAULTS(cpu), 0))
+                    arm_insn_snapshot(cpu);
                 if (writeback) cpu->reg[rn] = wb_val;
                 if (rt == ARM_PC) {
                     if (size != 2) {
@@ -4117,26 +4225,11 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                  * eagerly (no lazy state preservation): VLSTM stores
                  * S0-S15 + FPSCR at [Rn], VLLDM restores them. The 0x48-byte
                  * slot is reserved by the caller; nothing else touches it.
-                 * Checked accesses like every other load/store; VLLDM
-                 * commits only once all 17 words are accepted, since the
+                 * The VFP's own beat helpers (arm_vlstm_vlldm): checked
+                 * accesses like every other load/store, and VLLDM commits
+                 * only once all 17 words are accepted, since the
                  * precise-fault undo does not cover the FP registers. */
-                int rn = hw1 & 0xF;
-                uint32_t base = cpu->reg[rn];
-                bool store = (hw1 & 0x0010) == 0;
-                if (store) {
-                    for (int i = 0; i < 16; i++)
-                        mem_write32(cpu, base + 4 * i, cpu->vfp_s[i]);
-                    mem_write32(cpu, base + 0x40, cpu->fpscr);
-                } else {
-                    uint32_t buf[17];
-                    for (int i = 0; i < 17; i++)
-                        buf[i] = mem_read32(cpu, base + 4 * i);
-                    if (!arm_insn_refused(cpu)) {
-                        memcpy(cpu->vfp_s, buf, sizeof(uint32_t) * 16);
-                        cpu->fpscr = buf[16];
-                    }
-                }
-                (void)insn32;
+                arm_vlstm_vlldm(cpu, hw1);
             } else if ((hw1 & 0xEC00) == 0xEC00) {
                 /* Cortex-M4F single-precision VFP. Real implementations
                  * live in arm_vfp.c — `arm_vfp_step` returns true if it
@@ -4187,9 +4280,24 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * branch: a second undo after the entry would restore SP, PC and LR
          * from before it and leave the SecureFault frame above SP. The
          * refusal is dropped with its arming; the instruction re-executes
-         * after the handler and re-faults. */
+         * after the handler and re-faults.
+         *
+         * INVIS and INVEP undo nothing, so a refusal dropped with one of
+         * them would be lost, the instruction's writes standing. None can
+         * be recorded: SG makes no data access, a POP/LDM whose earlier
+         * beat was refused never performs its FNC_RETURN (arm_load_pc),
+         * and FNC_RETURN gives up before its signature check when one of
+         * its own stack pops is refused (arm_fnc_return). */
         if (cpu->tz_enabled && cpu->secure_fault_pending) {
             cpu->secure_fault_pending = false;
+#ifdef DEBUG
+            if (!cpu->secure_fault_undo && cpu->bus_fault_pending) {
+                fprintf(stderr, "ARM bus refusal at 0x%08x lost to an "
+                        "INVIS/INVEP SecureFault, PC=0x%08x\n",
+                        cpu->bus_fault_addr, cpu->insn_snap.reg[ARM_PC]);
+                abort();
+            }
+#endif
             cpu->bus_fault_pending = false;
             if (cpu->secure_fault_undo) {
                 cpu->secure_fault_undo = false;
