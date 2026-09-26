@@ -311,6 +311,27 @@ bool radio_medium_filter_frame(radio_medium_t *rm, int sender, int receiver);
 bool radio_medium_filter_frame_radio(radio_medium_t *rm,
     int sender, int sender_radio, int receiver, int receiver_radio);
 
+/* Whether receiver lies within sender's LIVE reach: its interference
+ * range (or reception range, if larger) scaled by the sender radio's
+ * current output power, as the byte and frame filters scale it.  The
+ * neighbour lists hold the reach at the last recompute; a walk over them
+ * asks this so a sender that has since lowered its power does not busy,
+ * or corrupt, nodes it no longer reaches.  NONE reaches everyone. */
+bool radio_medium_in_reach(const radio_medium_t *rm, int sender,
+                           int sender_radio, int receiver);
+
+/*
+ * Whether a transmission from (sender, sender_radio) occupies the channel
+ * (receiver, receiver_radio) listens on: the link is not cut, the bands
+ * match and the live channels match.  Unlike the filters there is no range
+ * check (callers walk the neighbour lists), no dice roll and no rx_enabled
+ * gate: a receiver that is off, or loses the frame, still has a busy
+ * channel (Cooja's UDGM raises the signal strength on every radio a
+ * transmission reaches, the interference range included).
+ */
+bool radio_medium_shares_channel(const radio_medium_t *rm,
+    int sender, int sender_radio, int receiver, int receiver_radio);
+
 /*
  * Recompute neighbor lists from current positions and tx_range.
  * Call after setting positions or changing tx_range.

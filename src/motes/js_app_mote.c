@@ -51,7 +51,8 @@ static int js_radio_rxfifo_available(void *m) { (void)m; return 0; }
 static bool js_radio_rx_busy(void *m) { (void)m; return false; }
 static const mote_radio_ops_t js_radio_ops = {
     js_radio_receive_byte, js_radio_rxfifo_available,
-    js_radio_rx_busy, NULL /* rx_stall */, NULL /* current_channel */, NULL /* mark_collisions */
+    js_radio_rx_busy, NULL /* rx_stall */, NULL /* current_channel */, NULL /* mark_collisions */,
+    NULL /* on_air */, NULL /* receive_byte_at */
 };
 
 void js_app_mote_register_radio(mixed_node_t *node, int slot,

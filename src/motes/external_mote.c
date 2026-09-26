@@ -62,7 +62,7 @@ static bool ext_radio_rx_busy(void *m) { (void)m; return false; }
 static const mote_radio_ops_t ext_radio_ops = {
     ext_radio_receive_byte, ext_radio_rxfifo_available,
     ext_radio_rx_busy, NULL /* rx_stall */, NULL /* current_channel */,
-    NULL /* mark_collisions */
+    NULL /* mark_collisions */, NULL /* on_air */, NULL /* receive_byte_at */
 };
 
 void external_mote_register_radio(mixed_node_t *node, int slot,

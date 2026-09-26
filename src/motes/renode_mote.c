@@ -127,7 +127,7 @@ static bool renode_radio_rx_busy(void *m) { (void)m; return false; }
 static const mote_radio_ops_t renode_radio_ops = {
     renode_radio_receive_byte, renode_radio_rxfifo_available,
     renode_radio_rx_busy, NULL /* rx_stall */, NULL /* current_channel */,
-    NULL /* mark_collisions */
+    NULL /* mark_collisions */, NULL /* on_air */, NULL /* receive_byte_at */
 };
 
 void renode_mote_register_radio(mixed_node_t *node, int slot,

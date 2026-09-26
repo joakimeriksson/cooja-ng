@@ -160,6 +160,7 @@ void sim_radio_bus_register(sim_radio_bus_t *bus, int idx,
     bus->mote[idx] = mote;
     bus->delivery[idx] = mode;
     bus->caps[idx] = caps;
+    if (ops && ops->on_air) bus->any_on_air = true;
     if (idx >= bus->node_count) bus->node_count = idx + 1;
 }
 
@@ -242,6 +243,70 @@ static void bus_sync_channel(sim_radio_bus_t *bus, sim_runtime_t *sim,
     radio_medium_set_channel(&sim->radio_medium, idx, ch);
 }
 
+/* On-air bytes of the frame the assembler has parsed the length of:
+ * 802.15.4 = 4 preamble + SFD + length byte + payload (length includes
+ * the 2 FCS); 802.15.4g = 4 preamble + 4 sync + PHR(1/2) + payload +
+ * 2 auto-CRC. */
+static int frame_air_bytes(const tx_frame_asm_t *a) {
+    return a->subghz
+        ? (4 + 4 + a->subghz_phr_len + a->expected_len + 2)
+        : (IEEE802154_PHY_HEADER_BYTES + a->expected_len);
+}
+
+/* Whether a transmission from sender_idx occupies receiver i's channel
+ * (range aside: callers walk the neighbour lists).  Pulls a native
+ * receiver's channel into the medium first. */
+static bool bus_shares_channel(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                               int sender_idx, int sender_radio, int i) {
+    radio_medium_t *medium = &sim->radio_medium;
+    bus_sync_channel(bus, sim, i);
+    int rr = sim_radio_bus_pick_receiver_radio(medium, sender_idx,
+                                               sender_radio, i);
+    return rr >= 0 &&
+           radio_medium_shares_channel(medium, sender_idx, sender_radio, i, rr);
+}
+
+/* Whether a transmission from sender_idx reaches mote i: within the
+ * sender's live range and on its channel.  Callers take their candidates
+ * from the neighbour lists, which hold the reach at the last recompute;
+ * a sender that has since lowered its output power reaches fewer of
+ * them, as the byte and frame filters already see it. */
+static bool bus_reaches(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                        int sender_idx, int sender_radio, int i) {
+    return radio_medium_in_reach(&sim->radio_medium, sender_idx,
+                                 sender_radio, i) &&
+           bus_shares_channel(bus, sim, sender_idx, sender_radio, i);
+}
+
+/* Tell every mote a transmission reaches that it occupies the channel
+ * until end_ns: the sender's reception and interference neighbours, on
+ * the sender's channel.  One window per transmission, from the bus's own
+ * air-time clock, for every path that puts one on the air. */
+static void bus_on_air(sim_radio_bus_t *bus, sim_runtime_t *sim,
+                       int sender_idx, int sender_radio, int64_t end_ns) {
+    if (!bus->any_on_air) return;
+    const sim_radio_bus_host_t *h = &bus->host;
+    radio_medium_t *medium = &sim->radio_medium;
+    const neighbor_list_t *lists[2] = {
+        &medium->neighbors[sender_idx],
+        &medium->interference_neighbors[sender_idx],
+    };
+    bool everyone = medium->type == RADIO_MEDIUM_NONE;
+    int nlists = everyone ? 1 : 2;
+    for (int l = 0; l < nlists; l++) {
+        int count = everyone ? bus->node_count : lists[l]->count;
+        for (int n = 0; n < count; n++) {
+            int i = everyone ? n : lists[l]->neighbors[n];
+            if (i == sender_idx || i >= bus->node_count) continue;
+            if (!bus->ops[i] || !bus->ops[i]->on_air) continue;
+            if (h->node_active && !h->node_active(h->user, i)) continue;
+            if (!bus_reaches(bus, sim, sender_idx, sender_radio, i))
+                continue;
+            bus->ops[i]->on_air(bus->mote[i], end_ns);
+        }
+    }
+}
+
 /* Dispatch one on-air byte to every receiver the medium accepts.
  * Identical policy for outer and re-entrant (auto-ACK) bytes; `depth`
  * only flows into the host's debug hooks. */
@@ -269,9 +334,15 @@ static void dispatch_tx_byte(sim_radio_bus_t *bus, sim_runtime_t *sim,
                                             i, rr, byte))
             continue;
         if (bus->delivery[i] == SIM_RADIO_DELIVERY_SYNC) {
-            /* Native: feed the mote's frame assembler synchronously.
-             * (RSSI unused — natives get it at frame level.) */
-            bus->ops[i]->receive_byte(bus->mote[i], byte, 0);
+            /* Native: feed the mote's frame assembler synchronously, with
+             * the byte's air time so the frame it completes ends on the
+             * bus clock -- the clock its on_air window is on.  (RSSI
+             * unused — natives get it at frame level.) */
+            if (bus->ops[i]->receive_byte_at)
+                bus->ops[i]->receive_byte_at(bus->mote[i], byte, 0,
+                                             byte_time_ns);
+            else
+                bus->ops[i]->receive_byte(bus->mote[i], byte, 0);
             continue;
         }
         int8_t rssi = radio_medium_get_rssi(medium, sender_idx, i);
@@ -361,6 +432,7 @@ void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
                                                  : sim_runtime_now_ns(sim);
         a->at_override_ns = 0;
         cap->len = 0;
+        bus->on_air_end_ns[sender_idx] = 0;   /* a new frame's window */
     }
     /* Per-sender byte period — sub-GHz CC1200 frames take 5x longer per
      * byte than 2.4 GHz IEEE 802.15.4. Use the sender's frame profile
@@ -379,15 +451,40 @@ void sim_radio_bus_tx_byte(sim_radio_bus_t *bus, struct sim_runtime *sim,
     dispatch_tx_byte(bus, sim, sender_idx, sender_radio, byte,
                      byte_time_ns, depth);
 
+    /* A frame-level sender (native/JS/external) announced its whole frame
+     * in sim_radio_bus_tx_frame; these bytes only carry it to emulated
+     * receivers. */
+    bool on_air = bus->delivery[sender_idx] == SIM_RADIO_DELIVERY_PER_BYTE;
+
     if (depth > 0) {
         /* Re-entrant byte (a receiver's auto-ACK emitted while the outer
          * frame_complete delivers): dispatched above, but never fed to
          * the assembler — the outer frame_complete flushes staged ACK
-         * bytes per receiver. */
+         * bytes per receiver.  Only BATCH receivers are delivered to
+         * there, so these never come from a PER_BYTE sender: an emulated
+         * chip sends its auto-ACK later, as a frame of its own. */
         return;
     }
 
-    if (!sim_radio_bus_asm_feed(a, byte))
+    bool complete = sim_radio_bus_asm_feed(a, byte);
+    if (on_air) {
+        /* The channel is busy from the first preamble byte: through the
+         * PHY header until the length is known, then to the frame's end.
+         * The end only changes at those two bytes, so only then is it
+         * announced -- the neighbour walk is not paid per byte. */
+        int64_t end_ns = byte_time_ns + sender_byte_ns;
+        int air_bytes = (complete || a->state == TX_ASM_PAYLOAD)
+            ? frame_air_bytes(a)
+            : (a->subghz ? 0 : IEEE802154_PHY_HEADER_BYTES);
+        int64_t frame_end_ns = a->first_byte_ns +
+                               (int64_t)air_bytes * sender_byte_ns;
+        if (frame_end_ns > end_ns) end_ns = frame_end_ns;
+        if (end_ns > bus->on_air_end_ns[sender_idx]) {
+            bus->on_air_end_ns[sender_idx] = end_ns;
+            bus_on_air(bus, sim, sender_idx, sender_radio, end_ns);
+        }
+    }
+    if (!complete)
         return;  /* frame not yet complete */
 
     /* Frame complete — the bus delivers staged frames, runs collision/
@@ -582,12 +679,8 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
     int64_t now = sim_runtime_now_ns(sim);
 
     /* Air-byte budget for the dispatch loop must match what the chip
-     * driver emitted: 802.15.4 = 4 preamble + SFD + length byte +
-     * payload (length includes the 2 FCS); 802.15.4g = 4 preamble +
-     * 4 sync + PHR(1/2) + payload + 2 auto-CRC. */
-    int total_air_bytes = a->subghz
-        ? (4 + 4 + a->subghz_phr_len + a->expected_len + 2)
-        : (4 + 1 + 1 + a->expected_len);
+     * driver emitted. */
+    int total_air_bytes = frame_air_bytes(a);
     int64_t frame_air_dur = (int64_t)total_air_bytes * sender_byte_ns;
     int64_t accurate_tx_end = byte_time_ns + sender_byte_ns;
     int64_t accurate_tx_start = accurate_tx_end - frame_air_dur;
@@ -698,7 +791,8 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
                 bus->emu_rx_end_ns[i] = coll_end;
                 continue;
             }
-            const int phy_hdr = 6, fcs = 2;
+            const int phy_hdr = IEEE802154_PHY_HEADER_BYTES;
+            const int fcs = IEEE802154_FCS_LEN;
             int mac_len = frame_snap_len[i] - phy_hdr - fcs;
             if (mac_len > 0) {
                 bus->frame_start_ns = a->subghz ? now : accurate_tx_start;
@@ -791,14 +885,23 @@ static void sim_radio_bus_frame_complete(sim_radio_bus_t *bus,
         }
     }
 
-    /* Interference: mark queued frames on the sender's interference-range
-     * neighbours as collided if they overlap this transmission. */
+    /* Interference: this transmission corrupts every frame that overlaps
+     * it at an interference-range neighbour on its channel -- a native's
+     * queue through its mark_collisions op, an emulated queue bus-side.  The
+     * window is the frame's own, the one the reception path used above. */
     if (sim->radio_medium.type != RADIO_MEDIUM_NONE) {
         neighbor_list_t *inl = &sim->radio_medium.interference_neighbors[sender_idx];
-        int64_t int_start = now;
-        int64_t int_end = now + SIM_RADIO_INTERFERENCE_WINDOW_NS;
+        int64_t int_start = a->subghz ? now : accurate_tx_start;
+        int64_t int_end = a->subghz ? now + frame_air_dur : accurate_tx_end;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
+            if (!bus_reaches(bus, sim, sender_idx, sender_radio, i))
+                continue;
+            if (bus->ops[i] && bus->ops[i]->mark_collisions) {
+                bus->stats.frame_collided +=
+                    bus->ops[i]->mark_collisions(bus->mote[i], int_start, int_end);
+                continue;
+            }
             if (bus->delivery[i] == SIM_RADIO_DELIVERY_SYNC) continue;
             emu_rx_queue_t *q = &bus->emu_rx_queue[i];
             for (int f = 0; f < q->count; f++) {
@@ -858,6 +961,17 @@ void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, sim_runtime_t *sim,
     bus_sync_channel(bus, sim, sender_idx);
     bus->frame_start_ns = now;   /* a frame-level sender's frame starts now */
 
+    /* The frame occupies the air as its PHY frame -- header, MAC bytes
+     * and FCS: the bytes this same frame is carried to chip receivers
+     * as, and what the native model's own TX end and RX end
+     * (native_node.c) use.  A window that counted the MAC bytes only read
+     * clear to a native while a chip receiver was still taking the
+     * frame's last eight bytes, and a native transmitting then
+     * interleaved its own with them. */
+    int64_t tx_start = now;
+    int64_t tx_end = tx_start + IEEE802154_FRAME_AIR_NS(len);
+    bus_on_air(bus, sim, sender_idx, 0, tx_end);
+
     if (medium->type != RADIO_MEDIUM_NONE) {
         neighbor_list_t *nl = &medium->neighbors[sender_idx];
         for (int n = 0; n < nl->count; n++) {
@@ -878,12 +992,14 @@ void sim_radio_bus_tx_frame_at(sim_radio_bus_t *bus, sim_runtime_t *sim,
         }
 
         /* Interference-range neighbours: mark overlapping queued frames
-         * as collided. */
+         * as collided -- within the sender's live range and on its
+         * channel only, since a frame on another channel cannot corrupt
+         * them. */
         neighbor_list_t *inl = &medium->interference_neighbors[sender_idx];
-        int64_t tx_start = now;
-        int64_t tx_end = tx_start + (int64_t)(len + 6) * IEEE802154_BYTE_NS;
         for (int n = 0; n < inl->count; n++) {
             int i = inl->neighbors[n];
+            if (!bus_reaches(bus, sim, sender_idx, 0, i))
+                continue;
             if (bus->ops[i] && bus->ops[i]->mark_collisions) {
                 bus->stats.frame_collided +=
                     bus->ops[i]->mark_collisions(bus->mote[i], tx_start, tx_end);

@@ -118,6 +118,12 @@ typedef struct native_node {
     bool     radio_is_transmitting;
     bool     radio_tx_finished;
     int64_t  radio_tx_end_ns;
+    /* End of the latest transmission on the air within this node's
+     * interference range.  simSignalStrength is derived from it before
+     * every tick: raised while any transmission reaches the node, back to
+     * the floor when the last one ends, whether or not a frame was
+     * received or read. */
+    int64_t  rf_busy_until_ns;
     native_rx_queue_t      rx_queue;           /* queued frames for delivery */
     native_rx_assembler_t  rx_asm;             /* byte-stream reassembler */
 
@@ -174,13 +180,23 @@ void native_deliver_frame(native_node_t *node, const uint8_t *frame, int len,
 /* Dequeue one non-collided frame into simInDataBuffer. Returns true if delivered. */
 bool native_dequeue_rx_frame(native_node_t *node);
 void native_radio_flush_rx(native_node_t *node);
+/* A transmission reaching this node is on the air until end_ns. */
+void native_radio_mark_busy(native_node_t *node, int64_t end_ns);
+/* The signal strength the node's CCA reads at now_ns: raised while a
+ * transmission reaches it, at the floor otherwise. */
+int native_radio_signal_strength(const native_node_t *node, int64_t now_ns);
 int64_t native_rx_next_end_ns(const native_node_t *node);
 
 /* Return the next time the node needs to wake up (ns), INT64_MAX if idle */
 int64_t native_next_wakeup_ns(const native_node_t *node);
 
-/* Feed a byte from emulated radio byte-stream into the reassembler */
-void native_rx_assembler_feed(native_node_t *node, uint8_t byte);
+/* Feed a byte from an emulated radio's byte stream into the reassembler.
+ * air_ns is the byte's air time on the bus's clock: the SFD stamps the
+ * frame's reception start, and a completed frame is queued to end when its
+ * last byte leaves the air.  Returns true when a frame was queued -- the
+ * caller then wakes the node at native_rx_next_end_ns(). */
+bool native_rx_assembler_feed(native_node_t *node, uint8_t byte,
+                              int64_t air_ns);
 
 /* --- Radio bridging helpers (in native_radio.c) --- */
 

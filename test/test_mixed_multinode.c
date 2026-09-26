@@ -1985,14 +1985,13 @@ static void dispatch_mote_wakeup(const sim_event_t *ev) {
     sim_mote_t *m = &mote_store[i];
     nodes[i].exec_had_tx = false;
     int64_t next_ns = m->ops->execute(m, ev_time);
-    bool sender_had_tx = nodes[i].exec_had_tx;
     if (next_ns < INT64_MAX)
         sim_schedule_mote_wakeup_if_earlier(&sim_rt, i, next_ns);
 
-    /* RF delivery: if this node TX'd, schedule receivers
-     * and set signal strength on ALL in-range neighbors
-     * (like COOJA's signalReceptionStart + createConnections).
-     * This prevents simultaneous TX via CCA. */
+    /* RF delivery: if this node TX'd, wake the receivers that got a frame.
+     * Their signal strength, which is what keeps a neighbour's CCA from
+     * transmitting over this frame, is derived from the frame's on-air time
+     * on the receiver's own next tick. */
     for (int r = 0; r < num_nodes; r++) {
         if (r == i || !node_active(r)) continue;
         if (nodes[r].type == NODE_NATIVE) {
@@ -2003,14 +2002,6 @@ static void dispatch_mote_wakeup(const sim_event_t *ev) {
                 *nodes[r].plat.native.simReceiving = 1;
                 sim_schedule_mote_wakeup_if_earlier(&sim_rt, r, ev_time);
             }
-            /* Set signal strength on in-range neighbors so CCA
-             * detects the channel as busy. Only for nodes within
-             * interference range (matching COOJA's signalReceptionStart).
-             * Setting on ALL nodes causes CCA poisoning where out-of-range
-             * nodes permanently see channel busy, breaking SMRF/ESMRF. */
-            if (sender_had_tx && got_frame &&
-                nodes[r].plat.native.simSignalStrength)
-                *nodes[r].plat.native.simSignalStrength = -60;
         }
     }
 

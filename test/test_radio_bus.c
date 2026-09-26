@@ -21,6 +21,8 @@
 #include "sim_runtime.h"
 #include "radio_medium.h"
 #include "sim_event_queue.h"
+#include "native_node.h"
+#include "mote_impl.h"         /* the native Cooja mote's real radio ops */
 
 #include <stdio.h>
 #include <string.h>
@@ -63,6 +65,12 @@ typedef struct {
     sim_radio_bus_t *bus;
     sim_runtime_t   *sim;
     int64_t  now_at_recv;           /* the pump stamps this before calling */
+    int      on_air_count;          /* on_air windows announced to it */
+    int64_t  on_air_end;            /* latest end announced */
+    int      recv_at_count;         /* bytes via receive_byte_at */
+    int64_t  recv_air_ns;           /* air time of the last one */
+    int      collision_marks;       /* mark_collisions calls */
+    int64_t  coll_start, coll_end;  /* window of the last one */
 } mock_rx_t;
 
 static void mock_receive_byte(void *m, uint8_t byte, int8_t rssi) {
@@ -81,10 +89,44 @@ static bool mock_rx_busy(void *m) { return ((mock_rx_t *)m)->busy; }
 static void mock_rx_stall(void *m) { ((mock_rx_t *)m)->stall_count++; }
 
 static const mote_radio_ops_t mock_ops = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, NULL, NULL, NULL, NULL, NULL,
+};
+static void mock_on_air(void *m, int64_t end) {
+    mock_rx_t *r = (mock_rx_t *)m;
+    if (r->on_air_count == 0 || end > r->on_air_end) r->on_air_end = end;
+    r->on_air_count++;
+}
+/* A SYNC receiver that takes each byte with its air time, as the native
+ * mote does. */
+static void mock_receive_byte_at(void *m, uint8_t byte, int8_t rssi,
+                                 int64_t air_ns) {
+    mock_rx_t *r = (mock_rx_t *)m;
+    r->recv_at_count++;
+    r->recv_air_ns = air_ns;
+    mock_receive_byte(m, byte, rssi);
+}
+static const mote_radio_ops_t mock_ops_on_air = {
+    .receive_byte     = mock_receive_byte,
+    .receive_byte_at  = mock_receive_byte_at,
+    .rxfifo_available = mock_rxfifo_available,
+    .rx_busy          = mock_rx_busy,
+    .on_air           = mock_on_air,
+};
+static int mock_mark_collisions(void *m, int64_t start, int64_t end) {
+    mock_rx_t *r = (mock_rx_t *)m;
+    r->collision_marks++;
+    r->coll_start = start;
+    r->coll_end = end;
+    return 0;
+}
+static const mote_radio_ops_t mock_ops_collisions = {
+    .receive_byte     = mock_receive_byte,
+    .rxfifo_available = mock_rxfifo_available,
+    .rx_busy          = mock_rx_busy,
+    .mark_collisions  = mock_mark_collisions,
 };
 static const mote_radio_ops_t mock_ops_stall = {
-    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL,
+    mock_receive_byte, mock_rxfifo_available, mock_rx_busy, mock_rx_stall, NULL, NULL, NULL, NULL,
 };
 
 /* ============================================================
@@ -651,6 +693,348 @@ static void test_drain_max_arrival(void) {
     ASSERT_EQ(mm.sync_times[0], future, "drain: delivered at max(arrival, now)");
 }
 
+/* A native mote's CCA reads the channel from on-air time alone: busy while
+ * any transmission reaches the node, clear once the last one ends.  It used
+ * to be raised on reception and lowered only when a frame was read, so a
+ * collided frame, or one dropped because the radio turned off, left the
+ * channel reading busy. */
+static void test_native_signal_strength_follows_air(void) {
+    native_node_t n;
+    int in_size = 0;
+    char receiving = 0;
+    memset(&n, 0, sizeof(n));
+    /* The receive path writes these through the firmware's symbols. */
+    n.simInSize = &in_size;
+    n.simReceiving = &receiving;
+
+    ASSERT_EQ(native_radio_signal_strength(&n, 0), -100, "native: quiet channel reads clear");
+
+    native_radio_mark_busy(&n, 5000);
+    ASSERT_EQ(native_radio_signal_strength(&n, 4999), -60, "native: busy while a frame is on the air");
+    ASSERT_EQ(native_radio_signal_strength(&n, 5000), -100, "native: clear once it ends, unread or not");
+
+    native_radio_mark_busy(&n, 9000);
+    native_radio_mark_busy(&n, 7000);
+    ASSERT_EQ(native_radio_signal_strength(&n, 8000), -60, "native: a shorter frame does not end a longer one");
+    ASSERT_EQ(native_radio_signal_strength(&n, 9000), -100, "native: clear when the last frame ends");
+
+    /* Nothing in the receive path holds the channel busy past the air. */
+    uint8_t frame[20] = {0};
+    native_deliver_frame(&n, frame, (int)sizeof(frame), 10000, -1);
+    native_radio_flush_rx(&n);
+    ASSERT_EQ(native_radio_signal_strength(&n, 10000), -100, "native: queueing and flushing leave it alone");
+}
+
+static void tx_frame(fixture_t *f, int sender, const uint8_t *frame, int n);
+static void reg_batch(fixture_t *f, mock_mote_t *mm, int idx, uint32_t caps);
+
+/* ============================================================
+ * On-air windows: the one busy window the bus announces to every mote a
+ * transmission reaches (what a native mote's CCA reads).
+ * ============================================================ */
+
+/* Sender 0 at the origin on channel 26; nodes placed on the x axis.
+ * UDGM with a 50 m reception range and a 100 m interference range. */
+static void on_air_udgm(fixture_t *f, int nodes, const double *x,
+                        const int *channel) {
+    radio_medium_configure_udgm(&f->sim.radio_medium, 50.0, 100.0, 1.0, 1.0);
+    for (int i = 0; i < nodes; i++) {
+        radio_medium_set_position(&f->sim.radio_medium, i, x[i], 0.0);
+        radio_medium_set_channel(&f->sim.radio_medium, i, channel[i]);
+    }
+    radio_medium_compute_neighbors(&f->sim.radio_medium);
+}
+
+static void test_on_air_emulated_sender(void) {
+    /* An emulated sender's frame occupies the channel from its first
+     * preamble byte, on the bus's byte clock -- not on the receiver's own
+     * clock, which for a native mote is the time of its last tick. */
+    fixture_t f; fx_init(&f, 2);
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops_on_air, &f.rx[1],
+                           SIM_RADIO_DELIVERY_SYNC, 0);
+    const int64_t t0 = 10000000;          /* 10 ms: long after any tick */
+    f.sim.now_ns = t0;
+
+    uint8_t frame[64]; int n = build_802154(frame, 20);
+    sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[0]);
+    ASSERT_EQ(f.rx[1].on_air_count, 1, "on_air: announced at the first preamble byte");
+    ASSERT_EQ(f.rx[1].on_air_end, t0 + 6 * IEEE802154_BYTE_NS,
+              "on_air: covers the PHY header before the length is known");
+    ASSERT_EQ(f.rx[1].recv_at_count, 1, "sync: the byte came with its air time");
+    ASSERT_EQ(f.rx[1].recv_air_ns, t0, "sync: the first byte's air time is the bus clock");
+
+    for (int i = 1; i < n; i++)
+        sim_radio_bus_tx_byte(&f.bus, &f.sim, 0, 0, frame[i]);
+    ASSERT_EQ(f.rx[1].on_air_end, t0 + (6 + 20) * IEEE802154_BYTE_NS,
+              "on_air: ends with the frame's last byte");
+    ASSERT_EQ(f.rx[1].on_air_count, 2,
+              "on_air: announced once for the header, once for the frame -- not per byte");
+    ASSERT_EQ(f.rx[1].recv_at_count, n, "sync: every byte came with its air time");
+    ASSERT_EQ(f.rx[1].recv_air_ns, t0 + (n - 1) * IEEE802154_BYTE_NS,
+              "sync: the last byte's air time is one byte before the window ends");
+}
+
+static void test_on_air_byte_path_radio_off(void) {
+    /* A receiver the medium delivers nothing to (here: RX disabled) is
+     * busy for the frame all the same: the window does not depend on a
+     * byte having been accepted.  (The native mote's own radio-off state,
+     * which the medium never sees, is test_native_mote_radio_off_reads_busy.) */
+    fixture_t f; fx_init(&f, 2);
+    const double x[2] = { 0, 30 };
+    const int ch[2]   = { 26, 26 };
+    on_air_udgm(&f, 2, x, ch);
+    radio_medium_set_radio_rx_enabled(&f.sim.radio_medium, 1, 0, false);
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+    sim_radio_bus_register(&f.bus, 1, &mock_ops_on_air, &f.rx[1],
+                           SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 7000000;
+
+    uint8_t frame[64]; int n = build_802154(frame, 10);
+    tx_frame(&f, 0, frame, n);
+    ASSERT_EQ(f.rx[1].recv_count + f.rx[1].recv_at_count, 0,
+              "radio off: no byte delivered");
+    ASSERT_EQ(f.rx[1].on_air_count, 2, "radio off: the window is still announced");
+    ASSERT_EQ(f.rx[1].on_air_end, f.sim.now_ns + (6 + 10) * IEEE802154_BYTE_NS,
+              "radio off: busy until the emulated sender's frame ends");
+}
+
+static void test_native_byte_frame_ends_on_bus_clock(void) {
+    /* A frame assembled from an emulated sender's bytes is stamped on the
+     * bus clock: reception starts at the SFD's air time and the frame ends
+     * when its last byte leaves the air -- the instant the bus's on-air
+     * window (this node's CCA) ends.  Before, the arrival was derived from
+     * the node's last tick, so the frame was read while the channel it
+     * came on still read busy. */
+    native_node_t n;
+    uint64_t last_ts = 0;
+    char receiving = 0;
+    memset(&n, 0, sizeof(n));
+    n.simLastPacketTimestamp = &last_ts;
+    n.simReceiving = &receiving;
+    n.sim_time_ns = 1000000;              /* last tick: 1 ms */
+
+    const int64_t t0 = 20000000;          /* first byte on the air: 20 ms */
+    const int payload = 10;
+    /* The PHY length counts the two FCS bytes: 6 header + 10 + 2 on the air. */
+    uint8_t frame[64]; int len = build_802154(frame, payload + 2);
+    int completed = 0;
+    for (int i = 0; i < len; i++) {
+        int64_t air = t0 + i * IEEE802154_BYTE_NS;
+        if (native_rx_assembler_feed(&n, frame[i], air)) completed++;
+    }
+    ASSERT_EQ(completed, 1, "native byte path: one frame queued, on the last byte");
+    ASSERT_EQ(receiving, 1, "native byte path: receiving from the SFD on");
+    ASSERT_EQ(last_ts, (t0 + 4 * IEEE802154_BYTE_NS) / 1000, "native byte path: reception start = the SFD's air time");
+    ASSERT_EQ(n.rx_queue.count, 1, "native byte path: frame queued");
+    const native_pending_frame_t *q = &n.rx_queue.frames[n.rx_queue.head];
+    ASSERT_EQ(q->len, payload, "native byte path: FCS stripped");
+    ASSERT_EQ(q->end_ns, t0 + len * IEEE802154_BYTE_NS,
+              "native byte path: the frame ends when its last byte leaves the air");
+    ASSERT_EQ(q->end_ns, t0 + (6 + payload + 2) * IEEE802154_BYTE_NS,
+              "native byte path: ... which is where the bus's on-air window ends");
+    ASSERT_EQ(native_rx_next_end_ns(&n), q->end_ns, "native byte path: the node wakes at that end");
+    ASSERT(q->end_ns > n.sim_time_ns, "native byte path: not completed on a stale tick");
+}
+
+static void test_on_air_reach_and_channel(void) {
+    /* A native sender's frame: the reception and the interference
+     * neighbours on the sender's channel get the same window; a neighbour
+     * on another channel and a node out of range get none.  A receiver
+     * that is not listening still has a busy channel. */
+    fixture_t f; fx_init(&f, 5);
+    const double x[5] = { 0, 30, 80, 80, 150 };
+    const int ch[5]   = { 26, 26, 26, 15, 26 };
+    on_air_udgm(&f, 5, x, ch);
+    radio_medium_set_radio_rx_enabled(&f.sim.radio_medium, 1, 0, false);
+    for (int i = 0; i < 5; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_on_air, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 3000000;
+
+    uint8_t mac[30] = {0};
+    sim_radio_bus_tx_frame(&f.bus, &f.sim, 0, mac, (int)sizeof(mac));
+    /* The PHY frame's air time: the header and FCS the bus carries the
+     * same frame to chip receivers with, not the MAC bytes alone. */
+    int64_t end = f.sim.now_ns + IEEE802154_FRAME_AIR_NS(30);
+    ASSERT_EQ(end, f.sim.now_ns + (6 + 30 + 2) * IEEE802154_BYTE_NS,
+              "on_air: a native frame is on the air as its PHY frame");
+    ASSERT_EQ(f.rx[0].on_air_count, 0, "on_air: not announced to the sender");
+    ASSERT_EQ(f.rx[1].on_air_count, 1, "on_air: reception neighbour, radio off");
+    ASSERT_EQ(f.rx[1].on_air_end, end, "on_air: reception window = the frame's air time");
+    ASSERT_EQ(f.rx[2].on_air_count, 1, "on_air: interference neighbour on the channel");
+    ASSERT_EQ(f.rx[2].on_air_end, end, "on_air: interference window = reception window");
+    ASSERT_EQ(f.rx[3].on_air_count, 0, "on_air: interference neighbour on another channel");
+    ASSERT_EQ(f.rx[4].on_air_count, 0, "on_air: out of range");
+}
+
+static void test_on_air_emulated_interference(void) {
+    /* An emulated sender reaches a native mote in its interference ring:
+     * no bytes are delivered, but the channel is busy for the frame. */
+    fixture_t f; fx_init(&f, 3);
+    const double x[3] = { 0, 80, 80 };
+    const int ch[3]   = { 26, 26, 15 };
+    on_air_udgm(&f, 3, x, ch);
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+    for (int i = 1; i < 3; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_on_air, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 1000000;
+
+    uint8_t frame[64]; int n = build_802154(frame, 10);
+    tx_frame(&f, 0, frame, n);
+    ASSERT_EQ(f.rx[1].recv_count, 0, "on_air: nothing received in the interference ring");
+    ASSERT_EQ(f.rx[1].on_air_end, f.sim.now_ns + (6 + 10) * IEEE802154_BYTE_NS,
+              "on_air: busy for the frame in the interference ring");
+    ASSERT_EQ(f.rx[2].on_air_count, 0, "on_air: not on another channel");
+}
+
+static void test_interference_marks_same_channel(void) {
+    /* A frame-level sender's frame collides with frames queued in its
+     * interference ring on its own channel only: a frame on another
+     * channel cannot corrupt them. */
+    fixture_t f; fx_init(&f, 3);
+    const double x[3] = { 0, 80, 80 };
+    const int ch[3]   = { 26, 26, 15 };
+    on_air_udgm(&f, 3, x, ch);
+    for (int i = 0; i < 3; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_collisions, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    f.sim.now_ns = 2000000;
+
+    uint8_t mac[20] = {0};
+    sim_radio_bus_tx_frame(&f.bus, &f.sim, 0, mac, (int)sizeof(mac));
+    ASSERT_EQ(f.rx[1].collision_marks, 1, "interference: marked on the sender's channel");
+    ASSERT_EQ(f.rx[1].coll_start, f.sim.now_ns, "interference: over the frame's window ...");
+    ASSERT_EQ(f.rx[1].coll_end, f.sim.now_ns + IEEE802154_FRAME_AIR_NS(20),
+              "interference: ... the one the on-air window uses");
+    ASSERT_EQ(f.rx[2].collision_marks, 0, "interference: not marked on another channel");
+}
+
+static void test_on_air_follows_live_power(void) {
+    /* The neighbour lists hold the reach at the last recompute; the byte
+     * and frame filters scale the range by the sender's live output
+     * power.  The window follows the live range too: a listed neighbour
+     * the sender no longer reaches at its current power neither gets the
+     * bytes nor reads the channel busy. */
+    fixture_t f; fx_init(&f, 4);
+    const double x[4] = { 0, 10, 30, 80 };
+    const int ch[4]   = { 26, 26, 26, 26 };
+    on_air_udgm(&f, 4, x, ch);   /* full power: 10, 30 reception; 80 interference */
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+    for (int i = 1; i < 4; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_on_air, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    /* 8/32 of full power: 12.5 m reception, 25 m interference range. */
+    radio_medium_set_radio_power(&f.sim.radio_medium, 0, 0, 8, 32);
+    f.sim.now_ns = 1000000;
+
+    uint8_t frame[64]; int n = build_802154(frame, 10);
+    tx_frame(&f, 0, frame, n);
+    ASSERT_EQ(f.rx[1].recv_at_count, n, "live power: a node within the scaled range gets the bytes");
+    ASSERT_EQ(f.rx[1].on_air_count, 2, "live power: ... and is busy");
+    ASSERT_EQ(f.rx[2].recv_at_count, 0, "live power: a listed neighbour outside it gets no bytes");
+    ASSERT_EQ(f.rx[2].on_air_count, 0, "live power: ... and is not busy");
+    ASSERT_EQ(f.rx[3].on_air_count, 0, "live power: nor is the listed interference neighbour");
+
+    /* Back at full power, with the same lists, every one of them is. */
+    radio_medium_set_radio_power(&f.sim.radio_medium, 0, 0, 32, 32);
+    f.sim.now_ns = 2000000;
+    tx_frame(&f, 0, frame, n);
+    ASSERT_EQ(f.rx[2].on_air_count, 2, "full power: the reception neighbour is busy");
+    ASSERT_EQ(f.rx[3].on_air_count, 2, "full power: the interference neighbour is busy");
+}
+
+static void test_emulated_interference_marks_queued(void) {
+    /* An emulated sender's frame corrupts what its interference-ring
+     * neighbours were receiving over its own window, on its channel only:
+     * a native's queue through mark_collisions, an emulated queue
+     * bus-side.  It used to skip natives, ignore the channel, and use a
+     * fixed 1 ms window from the frame's completion. */
+    fixture_t f; fx_init(&f, 5);
+    const double x[5] = { 0, 80, 80, 80, 80 };
+    const int ch[5]   = { 26, 26, 15, 26, 15 };
+    on_air_udgm(&f, 5, x, ch);
+    mock_mote_t mm[5]; register_emulated(&f, &mm[0], 0, 0);
+    for (int i = 1; i < 3; i++)
+        sim_radio_bus_register(&f.bus, i, &mock_ops_collisions, &f.rx[i],
+                               SIM_RADIO_DELIVERY_SYNC, 0);
+    for (int i = 3; i < 5; i++) reg_batch(&f, &mm[i], i, 0);
+    f.bus.executing_node = -1;
+    const int64_t t0 = 5000000;
+    f.sim.now_ns = t0;
+
+    /* Frames in flight at the two emulated neighbours: started 1 ms ago,
+     * still in the air when this frame starts. */
+    uint8_t q[64]; int nq = short_frame(q, 3);
+    sim_radio_bus_queue_frame(&f.bus, 3, q, nq, -40, t0 - 1000000, t0 + 100000, false);
+    sim_radio_bus_queue_frame(&f.bus, 4, q, nq, -40, t0 - 1000000, t0 + 100000, false);
+
+    uint8_t frame[64]; int n = build_802154(frame, 10);
+    tx_frame(&f, 0, frame, n);
+    int64_t end = t0 + n * IEEE802154_BYTE_NS;
+    ASSERT_EQ(f.rx[1].collision_marks, 1, "emulated interference: the native on the channel is marked");
+    ASSERT_EQ(f.rx[1].coll_start, t0, "emulated interference: over the frame's window ...");
+    ASSERT_EQ(f.rx[1].coll_end, end, "emulated interference: ... to its last byte, not a fixed 1 ms");
+    ASSERT_EQ(f.rx[2].collision_marks, 0, "emulated interference: not the native on another channel");
+    ASSERT(f.bus.emu_rx_queue[3].frames[f.bus.emu_rx_queue[3].head].collided,
+           "emulated interference: the emulated neighbour's frame on the channel collided");
+    ASSERT(!f.bus.emu_rx_queue[4].frames[f.bus.emu_rx_queue[4].head].collided,
+           "emulated interference: not the one on another channel");
+}
+
+static void test_native_mote_radio_off_reads_busy(void) {
+    /* The native Cooja mote itself, through its registered radio ops.
+     * With simRadioHWOn == 0 -- a state the medium never sees -- an
+     * emulated sender's bytes are refused, but its frame keeps the
+     * channel busy until its last byte, so a duty-cycled native waking
+     * mid-frame does not transmit over it.  With the radio on, the same
+     * bytes queue a frame that ends on the bus clock, the instant the
+     * channel clears. */
+    fixture_t f; fx_init(&f, 2);
+    const double x[2] = { 0, 30 };
+    const int ch[2]   = { 26, 26 };
+    on_air_udgm(&f, 2, x, ch);
+    mock_mote_t mm; register_emulated(&f, &mm, 0, 0);
+
+    static mixed_node_t mn;
+    memset(&mn, 0, sizeof(mn));
+    mn.slot = 1;                         /* no env: nothing to wake */
+    native_node_t *nat = &mn.plat.native;
+    char hw_on = 0, receiving = 0;
+    int in_size = 0, channel = 26;
+    uint64_t last_ts = 0;
+    nat->simRadioHWOn = &hw_on;
+    nat->simReceiving = &receiving;
+    nat->simInSize = &in_size;
+    nat->simRadioChannel = &channel;
+    nat->simLastPacketTimestamp = &last_ts;
+    native_cooja_mote_register_radio(&mn, 1, &f.bus);
+
+    const int64_t t0 = 7000000;
+    nat->sim_time_ns = 1000000;          /* last tick: 6 ms ago */
+    f.sim.now_ns = t0;
+    uint8_t frame[64]; int n = build_802154(frame, 12);   /* 10 MAC + FCS */
+    tx_frame(&f, 0, frame, n);
+    int64_t end = t0 + n * IEEE802154_BYTE_NS;
+    ASSERT_EQ(nat->rx_queue.count, 0, "native off: no frame queued");
+    ASSERT_EQ(receiving, 0, "native off: not receiving");
+    ASSERT_EQ(native_radio_signal_strength(nat, end - 1), -60,
+              "native off: busy until the frame's last byte");
+    ASSERT_EQ(native_radio_signal_strength(nat, end), -100, "native off: clear when it ends");
+
+    hw_on = 1;
+    f.sim.now_ns = t0 + 20000000;
+    tx_frame(&f, 0, frame, n);
+    end = f.sim.now_ns + n * IEEE802154_BYTE_NS;
+    ASSERT_EQ(nat->rx_queue.count, 1, "native on: the frame is queued");
+    ASSERT_EQ(receiving, 1, "native on: receiving until it ends");
+    ASSERT_EQ(nat->rx_queue.frames[nat->rx_queue.head].len, 10, "native on: the FCS is stripped");
+    ASSERT_EQ(nat->rx_queue.frames[nat->rx_queue.head].end_ns, end,
+              "native on: it ends on the bus clock");
+    ASSERT_EQ(nat->rf_busy_until_ns, end, "native on: the channel clears at that same instant");
+}
+
 static void test_deliver_native_noop(void) {
     /* A receiver whose sim_mote has no rx_byte_sync (native/JS) gets no
      * byte delivery — only the on_rx timeline notification. */
@@ -840,6 +1224,16 @@ int run_radio_bus_tests(int verbose) {
     test_drain_collided_skip();
     test_drain_max_arrival();
     test_deliver_native_noop();
+    test_native_signal_strength_follows_air();
+    test_on_air_emulated_sender();
+    test_on_air_byte_path_radio_off();
+    test_native_byte_frame_ends_on_bus_clock();
+    test_on_air_reach_and_channel();
+    test_on_air_emulated_interference();
+    test_interference_marks_same_channel();
+    test_on_air_follows_live_power();
+    test_emulated_interference_marks_queued();
+    test_native_mote_radio_off_reads_busy();
     test_frame_collision_window();
     test_frame_no_collision_when_clear();
     test_frame_backpressure_queue();
