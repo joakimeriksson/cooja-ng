@@ -3212,7 +3212,7 @@ static void test_debug_halt_holds_irqs(void) {
     assert_true("trap: the skip is spent", cpu.dbg_skip_pc == UINT32_MAX);
     cpu.reg[ARM_PC] = CODE_BASE + 0x40;
     assert_true("trap: the next visit hits", arm_dbg_check(&cpu) && cpu.dbg_halted);
-
+    cpu.fw_udivmoddi4 = 0;                           /* the address runs as code again */
 
     /* The release books the halt as time the core was not running (the
      * energy view's LPM), arms the skip at the hit and re-anchors the
