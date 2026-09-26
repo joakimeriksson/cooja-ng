@@ -3237,9 +3237,10 @@ the same patch.
   findings F1–F16 and Tiers 0–3 are the ordered backlog; every tier is gated
   by `check-determinism.sh` + `check-baseline.sh`, and Tier 3 (longer
   execute slices) is the only one allowed to move the simulation, with its
-  own sign-off.  The runner's per-wakeup O(N) loops (Tier 0) wait for PR #56
-  to merge; the dead synchronous chip-delivery subsystem in
-  `sim_radio_bus.c` (F1/R1) is deleted after that, not in parallel with it.
+  own sign-off.  The runner's per-wakeup O(N) loops (Tier 0) waited for
+  PR #56 (native CCA), which merged 2026-09-26, so Tier 0 items 1–2 can
+  start; the dead synchronous chip-delivery subsystem in `sim_radio_bus.c`
+  (F1/R1) is deleted after that, not in parallel with it.
 
 ## Doc Status
 

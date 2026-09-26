@@ -1,6 +1,6 @@
 # Kernel and radio-path review, with a performance and refactoring plan
 
-Status: **review complete; Tier 0 item 3 and Tier 2 item 1 are in PRs #61 and #60** (2026-09-26). Every number
+Status: **review complete; Tier 0 item 3 and Tier 2 item 1 are in PRs #61 and #60; PR #56 merged 2026-09-26, so Tier 0 items 1–2 are unblocked** (2026-09-27). Every number
 below was measured on this machine (Apple Silicon, stock `make`, GNU Lightning
 present) against `main` at `252fc0e`; every code claim carries a file:line.
 Companion to [`arm-performance-plan.md`](arm-performance-plan.md) (the ARM
