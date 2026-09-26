@@ -137,9 +137,9 @@ int  shell_script_sendfile(shell_service_t *s, const char *path, int idx,
                            int node_id, int64_t timeout_ns);
 int  shell_script_at_add(shell_service_t *s, int64_t at_ns, int64_t period_ns,
                          const char *cmd);
-int  shell_script_at_remove(shell_service_t *s, int id);
+int  shell_script_at_remove(shell_service_t *s, int id);   /* id < 0 = all */
 void shell_script_clear_triggers(shell_service_t *s);
-void shell_script_free_all(shell_service_t *s);   /* id < 0 = all */
+void shell_script_free_all(shell_service_t *s);
 int  shell_script_watch_add(shell_service_t *s, shell_watch_kind_t kind,
                             const char *pattern, const int *ids, int nids,
                             bool any, const char *cmd);

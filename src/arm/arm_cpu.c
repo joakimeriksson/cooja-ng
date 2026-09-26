@@ -2001,7 +2001,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
 
         uint32_t pc = cpu->reg[ARM_PC];
         if (__builtin_expect(dbg_hook != NULL, 0))
-            cpu->dbg_skip_started = (pc & ~1u) == cpu->dbg_skip_pc;
+            cpu->dbg_skip_started = (pc & ~1u) == cpu->dbg_skip_pc &&
+                                    cpu->reg[ARM_SP] == cpu->dbg_skip_sp;
 
         /* Precise fault support (a SoC with a bus-side permission check, or
          * the security extension's attribution unit): a refusal is taken at

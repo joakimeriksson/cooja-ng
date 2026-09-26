@@ -727,7 +727,7 @@ void shell_script_tick(shell_service_t *s) {
 
     shell_at_entry_t e;
     int guard = 0;
-    while (at_pop_due(s, now, &e) && guard++ < SHELL_ATQ_MAX * 4) {
+    while (guard++ < SHELL_ATQ_MAX * 4 && at_pop_due(s, now, &e)) {   /* guard first: a popped entry is owned */
         shell_hold_output(s);
         if (s->verbose) shell_out(s, "at #%d> %s\n", e.id, e.cmd);
         shell_origin_t o = { .kind = SHELL_ORIGIN_AT, .script = e.origin.script };

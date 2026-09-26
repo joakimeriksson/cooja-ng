@@ -471,6 +471,9 @@ typedef struct arm_cpu {
     uint32_t  dbg_hit_pc;            /* bp: its address; wp: the writer's pc */
     uint32_t  dbg_hit_old, dbg_hit_value;
     uint32_t  dbg_prev_pc;
+    uint32_t  dbg_skip_sp;           /* ...and the stack it was armed on: an ISR
+                                      * reaching the same pc (another frame) is
+                                      * a genuine hit, not the released one */
     uint32_t  dbg_skip_pc;           /* continue from a bp without re-hitting it:
                                       * armed until the instruction at that pc
                                       * has retired (an ISR taken first returns

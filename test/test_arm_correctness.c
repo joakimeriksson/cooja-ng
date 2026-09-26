@@ -3149,7 +3149,7 @@ static void test_debug_halt_holds_irqs(void) {
     write_thumb16(&cpu, CODE_BASE, 0x2001);          /* MOVS r0, #1 */
     write_thumb16(&cpu, CODE_BASE + 2, 0xE7FD);      /* B CODE_BASE */
     cpu.dbg_bp[0] = CODE_BASE; cpu.dbg_bp_n = 1; cpu.dbg_count = 1;
-    cpu.dbg_skip_pc = CODE_BASE;                     /* as dbg_release arms it */
+    cpu.dbg_skip_pc = CODE_BASE; cpu.dbg_skip_sp = 0x20007F00;   /* as dbg_release armed it, on the main stack */
     cpu.dbg_prev_pc = 0;
     cpu.reg[0] = 0;
     arm_step(&cpu, 1);                               /* BX LR: exception return */
@@ -3168,7 +3168,7 @@ static void test_debug_halt_holds_irqs(void) {
     write_thumb16(&cpu, CODE_BASE + 2, 0xB672);      /* CPSID i */
     write_thumb16(&cpu, CODE_BASE + 4, 0xE7FC);      /* B CODE_BASE */
     cpu.dbg_halted = false; cpu.dbg_hit_new = false;
-    cpu.dbg_skip_pc = CODE_BASE;                     /* released at the breakpoint */
+    cpu.dbg_skip_pc = CODE_BASE; cpu.dbg_skip_sp = 0x20007F00;   /* released at the breakpoint */
     cpu.reg[ARM_PC] = CODE_BASE;
     cpu.reg[ARM_SP] = 0x20007F00;
     cpu.primask = 1;
@@ -3179,6 +3179,23 @@ static void test_debug_halt_holds_irqs(void) {
     assert_true("CPSIE retired, IRQ taken, handler returned", steps > 1);
     assert_true("the second visit after an IRQ at the boundary halts", cpu.dbg_halted && cpu.dbg_hit_pc == CODE_BASE);
     assert_true("halted on the second visit, not the third", steps <= 5);
+
+    /* The skip belongs to the stack it was armed on: an ISR reaching the
+     * breakpoint (its own frame, another SP) is a genuine hit and does not
+     * spend the skip; the return to the released site is still skipped. */
+    write_thumb16(&cpu, CODE_BASE, 0x2001);          /* MOVS r0, #1 */
+    cpu.dbg_halted = false; cpu.dbg_hit_new = false; cpu.stopping = false; cpu.it_state = 0;
+    cpu.dbg_bp[0] = CODE_BASE; cpu.dbg_bp_n = 1; cpu.dbg_count = 1;
+    cpu.reg[ARM_PC] = CODE_BASE; cpu.reg[ARM_SP] = 0x20007F00;
+    cpu.dbg_halted = true; cpu.dbg_hit_kind = 1; cpu.dbg_hit_pc = CODE_BASE;
+    arm_dbg_release(&cpu, cpu.sim_time_ns);
+    assert_true("release: skip armed on the main stack", cpu.dbg_skip_pc == CODE_BASE && cpu.dbg_skip_sp == 0x20007F00);
+    cpu.reg[ARM_SP] = 0x20007EE0;                    /* inside a handler: a frame below */
+    assert_true("an ISR's visit to the breakpoint hits", arm_dbg_check(&cpu) && cpu.dbg_halted && cpu.dbg_hit_pc == CODE_BASE);
+    assert_true("the ISR's hit leaves the released skip alone", cpu.dbg_skip_pc == CODE_BASE && cpu.dbg_skip_sp == 0x20007F00);
+    cpu.dbg_halted = false; cpu.dbg_hit_new = false; cpu.stopping = false;
+    cpu.reg[ARM_PC] = CODE_BASE; cpu.reg[ARM_SP] = 0x20007F00;   /* back on the released stack */
+    assert_true("the released site is still skipped", !arm_dbg_check(&cpu) && !cpu.dbg_halted);
 
     /* A conditional instruction whose condition fails at the release still
      * retires (skipped by the IT block), so the next visit hits. */
@@ -3191,7 +3208,7 @@ static void test_debug_halt_holds_irqs(void) {
     cpu.reg[ARM_PC] = CODE_BASE; cpu.reg[0] = 0;
     arm_step(&cpu, 1);                               /* IT EQ */
     assert_eq("IT: at the conditional instruction", CODE_BASE + 2, cpu.reg[ARM_PC]);
-    cpu.dbg_skip_pc = CODE_BASE + 2;                 /* released there */
+    cpu.dbg_skip_pc = CODE_BASE + 2; cpu.dbg_skip_sp = cpu.reg[ARM_SP];                 /* released there */
     steps = 0;
     while (!cpu.dbg_halted && steps++ < 8) arm_step(&cpu, 1);
     assert_true("IT: the skipped instruction did not run", cpu.reg[0] == 0);
@@ -3202,7 +3219,7 @@ static void test_debug_halt_holds_irqs(void) {
     cpu.fw_udivmoddi4 = CODE_BASE + 0x40;
     write_thumb16(&cpu, CODE_BASE + 0x20, 0x4770);   /* return site: BX LR */
     cpu.dbg_bp[0] = CODE_BASE + 0x40; cpu.dbg_bp_n = 1; cpu.dbg_count = 1;
-    cpu.dbg_skip_pc = CODE_BASE + 0x40;
+    cpu.dbg_skip_pc = CODE_BASE + 0x40; cpu.dbg_skip_sp = 0x20007F00;
     cpu.reg[ARM_PC] = CODE_BASE + 0x40; cpu.reg[ARM_LR] = (CODE_BASE + 0x20) | 1;
     cpu.reg[0] = 100; cpu.reg[1] = 0; cpu.reg[2] = 7; cpu.reg[3] = 0; cpu.reg[ARM_SP] = 0x20007F00;
     arm_write32(&cpu, cpu.reg[ARM_SP], 0);           /* no remainder pointer */
@@ -3269,7 +3286,7 @@ static void test_debug_skip_survives_precise_fault(void) {
     arm_nvic_t nvic;
     bf_setup(&cpu, &nvic);                             /* LDR r0,[r1] at CODE_BASE is refused */
     cpu.dbg_bp[0] = CODE_BASE; cpu.dbg_bp_n = 1; cpu.dbg_count = 1;
-    cpu.dbg_skip_pc = CODE_BASE;                       /* released at the breakpoint */
+    cpu.dbg_skip_pc = CODE_BASE; cpu.dbg_skip_sp = cpu.reg[ARM_SP];                       /* released at the breakpoint */
     arm_step(&cpu, 1);
     assert_eq("refused load: BusFault handler entered", BF_HANDLER, cpu.reg[ARM_PC]);
     assert_true("the undone instruction did not spend the skip", cpu.dbg_skip_pc == CODE_BASE);
