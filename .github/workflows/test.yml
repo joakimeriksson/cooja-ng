@@ -193,6 +193,14 @@ jobs:
         # timeout.
         run: python3 tools/check-gdb-stub.py
 
+      - name: Cooja-suite firmware cache names
+        # A test never runs firmware built from another directory: names are
+        # per source directory + make args, only shipped (tracked) images are
+        # reused under the old names, and --clean keeps those.  The suite
+        # cannot catch a regression here itself — the wrong firmware often
+        # passes.
+        run: python3 tools/check-firmware-names.py
+
       - name: "Plugin system (build + smoke: service, medium, energy, UI)"
         run: |
           make plugins

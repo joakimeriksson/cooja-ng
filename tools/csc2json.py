@@ -8,13 +8,20 @@ the JavaScript test script into csim JSON test steps/actions.
 Usage:
   python3 tools/csc2json.py test.csc --contiki /path/to/contiki-ng \\
       --firmware-dir firmware/cc2538dk -o out.json
-  python3 tools/csc2json.py test.csc --list-firmware
+  python3 tools/csc2json.py --local-firmware firmware/cooja
+
+Firmware names are keyed on the source directory relative to the Contiki-NG
+root; --contiki may be omitted for a .csc inside a Contiki-NG tree (the root
+is found above it) or when CONTIKI_DIR / csim.conf names it.
 """
 
 import argparse
+import functools
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from html import unescape
@@ -210,7 +217,7 @@ def extract_radio_medium(sim_elem):
     return result
 
 
-def extract_mote_types(sim_elem, csc_dir):
+def extract_mote_types(sim_elem, csc_dir, contiki_dir=None):
     """Extract mote type definitions: maps description to source file and build info."""
     mote_types = {}
     for mt in sim_elem.findall("motetype"):
@@ -221,8 +228,7 @@ def extract_mote_types(sim_elem, csc_dir):
         source = source_elem.text.strip() if source_elem is not None and source_elem.text else None
         commands = commands_elem.text if commands_elem is not None else None
 
-        if source:
-            source = source.replace("[CONFIG_DIR]", csc_dir)
+        source = resolve_source(source, csc_dir, contiki_dir)
 
         # Parse build info from <commands>
         build = parse_build_commands(commands)
@@ -307,9 +313,191 @@ def source_to_firmware_name(source_path):
     return basename
 
 
-def extract_nodes(sim_elem, csc_dir, firmware_dir):
+# The Cooja-NG tree this script belongs to.  Firmware under it is "shipped"
+# when the tree's git checkout tracks it (see is_shipped_firmware).
+CSIM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Targets whose firmware the tree ships prebuilt, because their toolchain
+# (msp430-gcc) is not one most machines have.  firmware/cooja is gitignored
+# and the release package carries no firmware, so a native Cooja image is
+# never shipped: in a tree that is not a git checkout, where tracked and
+# untracked cannot be told apart, only these targets' files count as shipped.
+PREBUILT_TARGETS = frozenset({"sky", "z1"})
+
+
+def _configured_contiki_dir():
+    """CONTIKI_DIR from the environment or csim.conf, the same lookup the
+    shell scripts make, or None."""
+    d = os.environ.get("CONTIKI_DIR")
+    if not d:
+        try:
+            with open(os.path.join(CSIM_DIR, "csim.conf")) as f:
+                for line in f:
+                    if line.startswith("CONTIKI_DIR="):
+                        d = line[len("CONTIKI_DIR="):].strip()
+        except OSError:
+            pass
+    return d if d and os.path.isdir(d) else None
+
+
+def find_contiki_dir(csc_dir):
+    """The Contiki-NG root a .csc belongs to, or None.  A Contiki-NG tree is
+    recognised by Makefile.include beside os/; the nearest such ancestor of
+    the .csc's directory wins, then the configured CONTIKI_DIR.  Firmware
+    names are keyed on the source directory relative to this root, so a
+    conversion without it would name firmware the suite never builds."""
+    d = os.path.realpath(csc_dir)
+    while True:
+        if (os.path.isfile(os.path.join(d, "Makefile.include")) and
+                os.path.isdir(os.path.join(d, "os"))):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return _configured_contiki_dir()
+
+
+def resolve_source(source, csc_dir, contiki_dir):
+    """A .csc <source> path with Cooja's placeholders replaced.  Without a
+    Contiki-NG root, [CONTIKI_DIR] is left in place: firmware_variant() still
+    reads it correctly, and the build scripts replace it themselves."""
+    if not source:
+        return source
+    source = source.replace("[CONFIG_DIR]", csc_dir)
+    if contiki_dir:
+        source = source.replace("[CONTIKI_DIR]", contiki_dir)
+    return source
+
+
+def _is_within(path, root):
+    rel = os.path.relpath(path, root)
+    return rel != os.pardir and not rel.startswith(os.pardir + os.sep)
+
+
+def source_dir_key(source, contiki_dir):
+    """The directory `source` is built in, named so that it is the same on
+    every machine and from every working directory: relative to the
+    Contiki-NG root (tests/15-rpl-classic/code), or to this tree.  Only a
+    directory outside both is named by its absolute path."""
+    if not source:
+        return ""
+    if source.startswith("[CONTIKI_DIR]"):
+        rel = source[len("[CONTIKI_DIR]"):].lstrip("/")
+        return os.path.normpath(os.path.dirname(rel) or ".").replace(os.sep, "/")
+    src_dir = os.path.realpath(os.path.dirname(source))
+    for root, prefix in ((contiki_dir, ""), (CSIM_DIR, "csim:")):
+        if root and _is_within(src_dir, os.path.realpath(root)):
+            rel = os.path.relpath(src_dir, os.path.realpath(root))
+            return prefix + rel.replace(os.sep, "/")
+    return src_dir
+
+
+def firmware_variant(fw_name, source, make_args, contiki_dir=None):
+    """The cache name for firmware built from `source` with `make_args`.
+
+    Every build gets a hash of its source directory and make arguments, so
+    two tests that build a file of the same name from different directories,
+    each with its own project-conf.h, never share a cached build.  Before
+    this only the make arguments were hashed, and a test could silently run
+    another test's firmware.  The directory is hashed relative to the
+    Contiki-NG root (source_dir_key), so a name does not depend on where the
+    checkout lives or on the working directory."""
+    key = source_dir_key(source, contiki_dir) + "\n" + " ".join(sorted(make_args))
+    return f"{fw_name}-{hashlib.md5(key.encode()).hexdigest()[:6]}"
+
+
+def legacy_firmware_variant(fw_name, source, make_args):
+    """The name the previous scheme gave the same build.  Shipped prebuilt
+    firmware, which some platforms cannot rebuild without their toolchain,
+    was committed under these names."""
+    if make_args:
+        h = hashlib.md5(" ".join(sorted(make_args)).encode()).hexdigest()[:6]
+        return f"{fw_name}-{h}"
+    if "rpl-classic" in (source or ""):
+        return f"{fw_name}-classic"
+    return fw_name
+
+
+@functools.lru_cache(maxsize=None)
+def _csim_is_checkout():
+    """True if CSIM_DIR is the top of a git work tree of its own.  Only
+    being *inside* one is not enough: a tree unpacked inside some other
+    repository (a dotfiles-managed $HOME, a monorepo) would find none of its
+    shipped firmware tracked there."""
+    try:
+        top = subprocess.run(
+            ["git", "-C", CSIM_DIR, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False)
+        return (top.returncode == 0 and
+                os.path.samefile(top.stdout.strip(), CSIM_DIR))
+    except OSError:
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def _tracked_names(directory):
+    """The names of the files git tracks directly in `directory`, a real
+    path inside a checkout of CSIM_DIR."""
+    rel = os.path.relpath(directory, os.path.realpath(CSIM_DIR))
+    listing = subprocess.run(
+        ["git", "-C", CSIM_DIR, "ls-files", "-z", "--", rel],
+        capture_output=True, text=True, check=False)
+    rel = "" if rel == os.curdir else rel.replace(os.sep, "/")
+    return frozenset(f.rsplit("/", 1)[-1] for f in listing.stdout.split("\0")
+                     if f and f.rpartition("/")[0] == rel)
+
+
+def is_shipped_firmware(path):
+    """True if `path` is firmware this tree ships, not a local build.
+
+    In a git checkout of the tree that means tracked.  In a tree that is not
+    one (a release archive, or a tree unpacked inside some other repository)
+    a file of a PREBUILT_TARGETS target came with the tree, and anything else
+    is a local build.  Nothing outside the tree is shipped."""
+    directory = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    if not _is_within(directory, os.path.realpath(CSIM_DIR)):
+        return False
+    if not _csim_is_checkout():
+        return os.path.basename(path).rpartition(".")[2] in PREBUILT_TARGETS
+    try:
+        return os.path.basename(path) in _tracked_names(directory)
+    except OSError:
+        return False
+
+
+def local_firmware_files(directory):
+    """The local firmware builds directly in `directory`, a firmware/<target>
+    directory: its <name>.<target> files that are not shipped.  This is what
+    run-cooja-tests.sh --clean removes, so that the one definition of
+    "shipped" serves both the lookup and the clean."""
+    target = os.path.basename(os.path.realpath(directory))
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    return [os.path.join(directory, n) for n in names
+            if n.endswith("." + target)
+            and os.path.isfile(os.path.join(directory, n))
+            and not is_shipped_firmware(os.path.join(directory, n))]
+
+
+def find_firmware(target_firmware_dir, name, build_target):
+    """The existing firmware file for `name`, or None."""
+    exts = []
+    if build_target:
+        exts.append("." + build_target)
+    exts += [".cooja", ".cc2538dk", ".sky"]
+    for ext in exts:
+        candidate = os.path.join(target_firmware_dir, name + ext)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def extract_nodes(sim_elem, csc_dir, firmware_dir, contiki_dir=None):
     """Extract all nodes with positions, IDs, firmware paths, and build info."""
-    mote_types = extract_mote_types(sim_elem, csc_dir)
+    mote_types = extract_mote_types(sim_elem, csc_dir, contiki_dir)
     nodes = []
 
     # Iterate mote types in order, collecting motes
@@ -321,8 +509,7 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
         source = source_elem.text.strip() if source_elem is not None and source_elem.text else None
         commands = commands_elem.text if commands_elem is not None else None
 
-        if source:
-            source = source.replace("[CONFIG_DIR]", csc_dir)
+        source = resolve_source(source, csc_dir, contiki_dir)
 
         # Parse build info to get target for extension detection
         build = parse_build_commands(commands)
@@ -330,21 +517,9 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
 
         fw_name = source_to_firmware_name(source)
         if fw_name and firmware_dir:
-            # Generate a unique variant name from all build flags.
-            # Any difference in make_args or source path produces a different name.
-            fw_variant = fw_name
-            if build:
-                make_args = build.get("make_args", [])
-                if make_args:
-                    # Build a short hash suffix from all make args
-                    import hashlib
-                    args_str = " ".join(sorted(make_args))
-                    h = hashlib.md5(args_str.encode()).hexdigest()[:6]
-                    fw_variant = f"{fw_name}-{h}"
-                # Check source path for routing variant (rpl-classic vs rpl-lite)
-                src_path = source or ""
-                if "rpl-classic" in src_path and not make_args:
-                    fw_variant = f"{fw_name}-classic"
+            make_args = build.get("make_args", []) if build else []
+            fw_variant = firmware_variant(fw_name, source, make_args,
+                                          contiki_dir)
 
             # If the per-mote build.target differs from firmware_dir's leaf
             # (e.g. firmware-dir=firmware/cooja but target=sky), route to the
@@ -354,25 +529,25 @@ def extract_nodes(sim_elem, csc_dir, firmware_dir):
                 parent = os.path.dirname(firmware_dir.rstrip(os.sep)) or "."
                 target_firmware_dir = os.path.join(parent, build_target)
 
-            # When make_args produce a variant name, use ONLY the variant.
-            # Don't fall back to the base name — it's a different build.
-            # When no variant (no make_args), try the base name as usual.
-            fw_path = None
-            search_names = [fw_variant] if fw_variant != fw_name else [fw_name]
-            for name_candidate in search_names:
-                if build_target:
-                    ext = "." + build_target
-                    candidate = os.path.join(target_firmware_dir, name_candidate + ext)
-                    if os.path.exists(candidate):
-                        fw_path = candidate
-                        break
-                for ext in (".cooja", ".cc2538dk", ".sky"):
-                    candidate = os.path.join(target_firmware_dir, name_candidate + ext)
-                    if os.path.exists(candidate):
-                        fw_path = candidate
-                        break
-                if fw_path:
-                    break
+            # This build's own cache entry first.  Failing that, firmware the
+            # repository ships under the previous scheme's name, which may not
+            # be rebuildable here; a local build left under that name is
+            # ignored, since it may have come from another directory.
+            fw_path = find_firmware(target_firmware_dir, fw_variant, build_target)
+            if fw_path is None:
+                legacy = find_firmware(
+                    target_firmware_dir,
+                    legacy_firmware_variant(fw_name, source, make_args),
+                    build_target)
+                if legacy is not None and is_shipped_firmware(legacy):
+                    fw_path = legacy
+                    # Named by the old scheme, so possibly built from another
+                    # directory with its own project-conf.h.  Say so: a test
+                    # that runs the wrong firmware can still pass.
+                    print(f"WARNING: {desc or fw_name}: no {fw_variant} build "
+                          f"for {source_dir_key(source, contiki_dir)}; using "
+                          f"shipped {legacy}, which is not tied to that "
+                          f"directory", file=sys.stderr)
             if fw_path is None:
                 fallback_ext = "." + build_target if build_target else ".cc2538dk"
                 fw_path = os.path.join(target_firmware_dir, fw_variant + fallback_ext)
@@ -1257,25 +1432,6 @@ def translate_script(script, nodes):
     return test, warnings
 
 
-def list_firmware_files(root, csc_dir):
-    """List all firmware files needed by a .csc file."""
-    sim = root.find("simulation")
-    if sim is None:
-        return []
-
-    firmware = set()
-    for mt in sim.findall("motetype"):
-        source_elem = mt.find("source")
-        if source_elem is not None and source_elem.text:
-            source = source_elem.text.strip()
-            source = source.replace("[CONFIG_DIR]", csc_dir)
-            fw_name = source_to_firmware_name(source)
-            if fw_name:
-                firmware.add(fw_name)
-
-    return sorted(firmware)
-
-
 def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False,
                 lax=False):
     """Convert a .csc file to csim JSON config dict.
@@ -1285,6 +1441,13 @@ def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False,
     raises ConversionError (see its docstring for why).  lax=True downgrades
     those to warnings — for exploration only, never for CI."""
     csc_dir = os.path.dirname(os.path.abspath(csc_path))
+    if contiki_dir is None:
+        contiki_dir = find_contiki_dir(csc_dir)
+        if contiki_dir is None and firmware_dir:
+            raise ConversionError([
+                f"cannot find the Contiki-NG root for {csc_path}: pass "
+                "--contiki or set CONTIKI_DIR (firmware names are keyed on "
+                "the source directory relative to it)"])
     root = parse_csc(csc_path)
     sim = root.find("simulation")
     if sim is None:
@@ -1318,7 +1481,7 @@ def convert_csc(csc_path, contiki_dir=None, firmware_dir=None, js_native=False,
         config["radiomedium"] = rm
 
     # Nodes
-    nodes = extract_nodes(sim, csc_dir, firmware_dir)
+    nodes = extract_nodes(sim, csc_dir, firmware_dir, contiki_dir)
     if nodes:
         config["nodes"] = nodes
 
@@ -1424,12 +1587,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert Cooja .csc files to csim JSON config"
     )
-    parser.add_argument("csc_file", help="Path to .csc file")
-    parser.add_argument("--contiki", help="Path to contiki-ng root")
+    parser.add_argument("csc_file", nargs="?", help="Path to .csc file")
+    parser.add_argument("--contiki",
+                        help="Path to contiki-ng root (default: found above "
+                             "the .csc, else CONTIKI_DIR / csim.conf)")
     parser.add_argument("--firmware-dir", help="Directory containing .cc2538dk firmware files")
     parser.add_argument("-o", "--output", help="Output JSON file (default: stdout)")
-    parser.add_argument("--list-firmware", action="store_true",
-                        help="Just list needed firmware files and exit")
+    parser.add_argument("--local-firmware", metavar="DIR",
+                        help="Instead of converting, list the local (not "
+                             "shipped) firmware builds in firmware/<target> "
+                             "directory DIR, one path per line, and exit")
     parser.add_argument("--warn", action="store_true",
                         help="Show warnings on stderr")
     parser.add_argument("--js-native", action="store_true",
@@ -1443,19 +1610,23 @@ def main():
 
     args = parser.parse_args()
 
+    if args.local_firmware:
+        target = os.path.basename(os.path.realpath(args.local_firmware))
+        if target in PREBUILT_TARGETS and not _csim_is_checkout():
+            print(f"note: every .{target} under {args.local_firmware} is taken "
+                  f"as shipped: {CSIM_DIR} is not a git checkout, so shipped "
+                  "firmware cannot be told apart from local builds",
+                  file=sys.stderr)
+        for path in local_firmware_files(args.local_firmware):
+            print(path)
+        return
+
     csc_path = args.csc_file
+    if not csc_path:
+        parser.error("a .csc file is required")
     if not os.path.exists(csc_path):
         print(f"Error: file not found: {csc_path}", file=sys.stderr)
         sys.exit(1)
-
-    csc_dir = os.path.dirname(os.path.abspath(csc_path))
-
-    if args.list_firmware:
-        root = parse_csc(csc_path)
-        firmware = list_firmware_files(root, csc_dir)
-        for fw in firmware:
-            print(fw)
-        return
 
     try:
         config, warnings = convert_csc(csc_path, args.contiki, args.firmware_dir,

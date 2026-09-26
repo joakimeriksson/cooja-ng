@@ -73,7 +73,10 @@ while [ $# -gt 0 ]; do
             echo "  -v, --verbose: show test output"
             echo "  --no-build: skip auto-building missing firmware"
             echo "  --with-tun: include border-router tests (requires sudo for TUN)"
-            echo "  --clean: wipe firmware/<target>/* before running (forces full rebuild)"
+            echo "  --clean: remove local firmware builds from firmware/{cooja,sky,z1} before"
+            echo "           running (forces a rebuild). Shipped firmware is kept: in a git"
+            echo "           checkout the tracked files; elsewhere every .sky/.z1 (firmware/cooja"
+            echo "           is never shipped, so it is always emptied)"
             echo "  --seed N: run with random seed N instead of each .csc's own (Cooja --random-seed)"
             echo "  --logdir DIR: write DIR/<category>/<csc-name>.testlog per test (Contiki-NG tests/ layout)"
             echo ""
@@ -143,15 +146,28 @@ esac
 FIRMWARE_DIR="$CSIM_DIR/firmware/$FIRMWARE_TARGET"
 
 if [ "$CLEAN" -eq 1 ]; then
-    # Wipe every Cooja-suite firmware target so nothing is reused across the
-    # rebuild.  cc2538dk is left alone — it belongs to the standalone ARM
-    # test_runner suite, not to the Cooja suite.
+    # Remove the local firmware builds of every Cooja-suite target, so none is
+    # reused across the rebuild.  cc2538dk is left alone — it belongs to the
+    # standalone ARM test_runner suite, not to the Cooja suite.
+    #
+    # Only local builds are removed.  firmware/sky and firmware/z1 also hold
+    # shipped prebuilt images that cannot be rebuilt without msp430-gcc, and
+    # deleting those broke every test that needs them.  csc2json decides what
+    # is shipped — the same answer its firmware lookup gives, so the clean and
+    # the lookup cannot drift apart: in a git checkout of this tree the tracked
+    # files; in a tree that is not one (a release archive, or a tree unpacked
+    # inside some other repository) every .sky/.z1, since firmware/cooja is
+    # gitignored and never shipped.
     for sub in cooja sky z1; do
         d="$CSIM_DIR/firmware/$sub"
         [ -d "$d" ] || continue
-        wiped=$(find "$d" -maxdepth 1 -type f -name "*.$sub" | wc -l | tr -d ' ')
-        find "$d" -maxdepth 1 -type f -name "*.$sub" -delete
-        echo "  CLEAN $d (removed $wiped firmware artifacts)"
+        wiped=0
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            rm -f "$f"
+            wiped=$((wiped + 1))
+        done < <(python3 "$CSC2JSON" --local-firmware "$d")
+        echo "  CLEAN $d (removed $wiped local firmware builds)"
     done
 fi
 
@@ -295,6 +311,9 @@ for csc_file in $csc_files; do
         errors=$((errors + 1))
         continue
     fi
+    # csc2json warns when a test falls back to shipped firmware named by the
+    # old scheme, which may have been built from another directory.
+    grep '^WARNING: ' "$conv_log" | sed "s|^WARNING: |  WARN  $test_name: |" || true
 
     # Check if test has any meaningful test criteria
     has_test=$(python3 -c "

@@ -374,7 +374,7 @@ chain-tests: $(BUILD_DIR)/test_runner
 
 # Build firmware for Cooja tests
 build-firmware:
-	CONTIKI_DIR=$(CONTIKI_DIR) ./tools/build-test-firmware.sh --target cooja $(PATTERN)
+	CONTIKI_DIR=$(CONTIKI_DIR) ./tools/build-test-firmware.sh $(PATTERN)
 
 # Write csim.conf with CONTIKI_DIR
 configure:
