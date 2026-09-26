@@ -18,7 +18,8 @@ run-cooja-tests.sh --clean):
   - the Contiki-NG root is found above a .csc when --contiki is not given, so
     a name does not depend on the flag either;
   - --clean removes local builds and keeps shipped ones, by the same
-    definition of "shipped" (csc2json --local-firmware);
+    definition of "shipped" (csc2json --local-firmware), and a clean whose
+    listing fails is an error, not an empty clean;
   - build-test-firmware.sh --force rebuilds local builds only, never shipped
     firmware, and a build that fails is reported failed even when the file
     it was to replace still exists.
@@ -434,6 +435,19 @@ class Clean(FakeTree):
         self.assertIn("not a git checkout", out)
         self.assertKept(self.shipped, self.local)
         self.assertRemoved(self.cooja_plain, self.cooja_hashed)
+
+    def test_listing_failure_is_an_error(self):
+        # csc2json cannot run: the clean must fail, not report an empty one.
+        with open(os.path.join(self.csim, "tools", "csc2json.py"), "w") as f:
+            f.write("import nonexistent_module_for_this_test\n")
+        env = dict(os.environ, CONTIKI_DIR=self.contiki)
+        r = subprocess.run(
+            ["bash", os.path.join(self.csim, "tools", "run-cooja-tests.sh"), "--clean"],
+            env=env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("could not list the local firmware builds", r.stdout + r.stderr)
+        self.assertNotIn("removed 0 local firmware builds", r.stdout)
+        self.assertKept(self.shipped, self.local, self.cooja_plain, self.cooja_hashed)
 
 
 FAKE_MAKE = """#!/usr/bin/env python3

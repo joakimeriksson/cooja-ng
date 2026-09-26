@@ -161,12 +161,18 @@ if [ "$CLEAN" -eq 1 ]; then
     for sub in cooja sky z1; do
         d="$CSIM_DIR/firmware/$sub"
         [ -d "$d" ] || continue
+        # Listed once, and a listing that fails fails the clean: a clean
+        # that could not run must not read as one that found nothing.
+        if ! local_builds=$(python3 "$CSC2JSON" --local-firmware "$d"); then
+            echo "Error: could not list the local firmware builds in $d"
+            exit 1
+        fi
         wiped=0
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             rm -f "$f"
             wiped=$((wiped + 1))
-        done < <(python3 "$CSC2JSON" --local-firmware "$d")
+        done <<< "$local_builds"
         echo "  CLEAN $d (removed $wiped local firmware builds)"
     done
 fi
