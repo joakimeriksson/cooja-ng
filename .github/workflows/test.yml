@@ -193,6 +193,12 @@ jobs:
         # timeout.
         run: python3 tools/check-gdb-stub.py
 
+      - name: Web UI access (loopback by default, cross-origin and DNS rebinding refused)
+        # The UI accepts commands and WebSocket is exempt from the
+        # same-origin policy, so this is what stops any page the operator has
+        # open from driving a run.
+        run: python3 tools/check-ui-access.py
+
       - name: "Plugin system (build + smoke: service, medium, energy, UI)"
         run: |
           make plugins

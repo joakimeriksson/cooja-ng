@@ -1810,16 +1810,20 @@ static void ctl_restart(void *u) {
     (void)u;
     g_restart_requested = true;
 }
-static int ctl_start_ui(void *u, int port) {
+/* --ui-bind ADDR; NULL = loopback.  File scope because the shell's "ui"
+ * command starts the UI mid-run and must listen where --ui would have. */
+static const char *g_ui_bind = NULL;
+static int ctl_start_ui(void *u, int port, char *url, size_t urlsz) {
     (void)u;
     if (ui_service_active(&ui_svc)) return -1;
-    if (!ui_service_start(&ui_svc, port, node_states, prev_node_states,
+    if (!ui_service_start(&ui_svc, g_ui_bind, port, node_states, prev_node_states,
                           node_last_tx_ns, prev_last_tx_ns, &radio_medium,
                           &timeline_svc.tl, ctl_node_count_ptr, ui_describe_node,
                           &sim_ctl))
         return -1;
     ui_svc.rt = &sim_rt;
     shell_svc.external_resume = true;
+    ws_server_url(g_ui_bind, port, url, urlsz);
     return 0;
 }
 static int ctl_set_input_pin(void *u, int idx, int port, int pin, int level) {
@@ -2161,7 +2165,7 @@ int run_mixed_multinode_test(int argc, char **argv) {
     static const char *const value_flags[] = {
         "--gdb", "--pcap", "--plugin", "--renode-freq", "--seed",
         "--save-config", "--script", "--wall-timeout", "--speed",
-        "-n", "-t", "-d", NULL
+        "--ui-bind", "-n", "-t", "-d", NULL
     };
     for (int i = 0; i < argc; i++) {
         for (int k = 0; value_flags[k]; k++) {
@@ -2175,6 +2179,15 @@ int run_mixed_multinode_test(int argc, char **argv) {
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 ui_port = atoi(argv[++i]);
                 if (ui_port <= 0) ui_port = 8080;
+            }
+        }
+        else if (strcmp(argv[i], "--ui-bind") == 0 && i + 1 < argc) {
+            /* The UI accepts commands: listening beyond loopback is opt-in. */
+            g_ui_bind = argv[++i];
+            if (!ws_server_bind_addr_valid(g_ui_bind)) {
+                fprintf(stderr, "--ui-bind: '%s' is not an IPv4 address\n",
+                        g_ui_bind);
+                return SHELL_EXIT_INVALID;
             }
         }
         else if (strcmp(argv[i], "--gdb") == 0 && i + 1 < argc) {
@@ -2333,6 +2346,11 @@ int run_mixed_multinode_test(int argc, char **argv) {
         }
     }
 
+    if (g_ui_bind && !ui_enabled && !shell_enabled && !script_path) {
+        fprintf(stderr, "--ui-bind: no web UI to bind (add --ui, or start "
+                        "one with the shell's `ui` command)\n");
+        return SHELL_EXIT_INVALID;
+    }
     if (start_paused && !shell_enabled && !script_path && !ui_enabled) {
         fprintf(stderr, "--paused: nothing could resume the simulation (add --shell, --script or --ui)\n");
         return SHELL_EXIT_INVALID;
@@ -2373,8 +2391,8 @@ int run_mixed_multinode_test(int argc, char **argv) {
     }
 
     if (firmware_count < 1) {
-        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port]]\n");
-        printf("       test_runner mixed-multinode <config.yaml|json> [-t ms] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port]]\n");
+        printf("Usage: test_runner mixed-multinode <firmware1> [firmware2...] [-t ms] [-n nodes] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port] [--ui-bind addr]]\n");
+        printf("       test_runner mixed-multinode <config.yaml|json> [-t ms] [--seed N] [--save-config out.yaml] [-v] [-q] [--ui [port] [--ui-bind addr]]\n");
         printf("  Firmware types detected by extension:\n");
         printf("    .sky      -> MSP430 (Tmote Sky)\n");
         printf("    .cc2538dk -> ARM (CC2538DK)\n");
@@ -2447,6 +2465,30 @@ int run_mixed_multinode_test(int argc, char **argv) {
          * paused is not a deadlock when it is up. */
         shell_svc.external_resume = ui_enabled != 0;
     }
+    /* Web UI.  The speed ratio (default 10x, shared with serial-socket
+     * pacing) and the pause state live in sim_control, which is initialized
+     * here -- before the UI service, which is one of its clients.  Started
+     * here, before the motes boot and before the GDB stubs attach: an
+     * explicit --ui that cannot start is fatal, and with --gdb-wait that
+     * verdict must come before the run blocks for a debugger, not after
+     * the user has attached one.  The service holds pointers only, so
+     * nothing it needs is settled later than this. */
+    ctl_init_once(&node_count);
+    if (ui_enabled && !ui_service_active(&ui_svc)) {
+        if (!ui_service_start(&ui_svc, g_ui_bind, ui_port,
+                              node_states, prev_node_states,
+                              node_last_tx_ns, prev_last_tx_ns,
+                              &radio_medium, &timeline_svc.tl,
+                              &node_count, ui_describe_node, &sim_ctl)) {
+            /* --ui was asked for: a run without it is not the run asked
+             * for (with --ui, -t no longer ends it), so fail loudly. */
+            fprintf(stderr, "--ui: cannot start the web UI on %s:%d\n",
+                    g_ui_bind ? g_ui_bind : "127.0.0.1", ui_port);
+            return SHELL_EXIT_INVALID;
+        }
+        ui_svc.rt = &sim_rt;   /* plugin UI panels source */
+    }
+
     /* A restart re-creates the configured nodes only; nodes added since
      * (shell `add`, JS addMote) are destroyed with the rest. */
     int base_node_count = node_count;
@@ -2663,21 +2705,6 @@ sim_restart:
     memset(prev_node_states, 0, sizeof(prev_node_states));
     memset(prev_last_tx_ns, 0, sizeof(prev_last_tx_ns));
 
-    /* Initialize WebSocket UI service (only on first run, not restart).
-     * The speed ratio (default 10x, shared with serial-socket pacing) and
-     * the pause state live in sim_control, which is initialized here —
-     * before the UI service, which is one of its clients. */
-    ctl_init_once(&node_count);
-    if (ui_enabled && !ui_service_active(&ui_svc)) {
-        if (!ui_service_start(&ui_svc, ui_port,
-                              node_states, prev_node_states,
-                              node_last_tx_ns, prev_last_tx_ns,
-                              &radio_medium, &timeline_svc.tl,
-                              &node_count, ui_describe_node, &sim_ctl))
-            fprintf(stderr, "Warning: failed to start UI server on port %d\n",
-                    ui_port);
-        ui_svc.rt = &sim_rt;   /* plugin UI panels source */
-    }
 
     /* Set up serial socket server for border-router tests */
     if (config_loaded && config.has_serial_socket) {

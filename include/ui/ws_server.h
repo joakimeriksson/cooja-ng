@@ -3,17 +3,31 @@
  *
  * Single-threaded, POSIX sockets, select()-based polling.
  * Serves embedded HTML on GET / and upgrades GET /ws to WebSocket.
+ * Binds loopback unless told otherwise; see ws_server_init.
  * Supports up to 8 concurrent WebSocket clients.
  */
 #ifndef WS_SERVER_H
 #define WS_SERVER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct ws_server ws_server_t;
 
-/* Create and bind a WebSocket server on the given port. Returns NULL on failure. */
-ws_server_t *ws_server_init(int port);
+/* Create and bind a WebSocket server on bind_addr:port.  bind_addr is an
+ * IPv4 address; NULL (or "localhost") means 127.0.0.1, the default -- the UI
+ * accepts commands, so reaching it from the network is an explicit choice.
+ * A loopback-bound server refuses requests whose Host is not a loopback
+ * name (DNS rebinding), and every server refuses a WebSocket upgrade whose
+ * Origin is not the server itself.  Returns NULL on failure. */
+ws_server_t *ws_server_init(const char *bind_addr, int port);
+
+/* Nonzero if ws_server_init would accept bind_addr (NULL included), so a
+ * bad --ui-bind can be refused when the options are parsed. */
+int ws_server_bind_addr_valid(const char *bind_addr);
+
+/* The URL a browser should open for a server on bind_addr:port. */
+void ws_server_url(const char *bind_addr, int port, char *out, size_t outsz);
 
 /* Non-blocking poll: accept new connections, read incoming data, handle close/ping. */
 void ws_server_poll(ws_server_t *srv);
@@ -24,8 +38,16 @@ void ws_server_broadcast(ws_server_t *srv, const char *data, int len);
 /* Send a binary WebSocket frame to all connected clients. */
 void ws_server_broadcast_binary(ws_server_t *srv, const uint8_t *data, int len);
 
-/* Set the HTML content to serve on GET /. The data is copied internally. */
-void ws_server_set_html(ws_server_t *srv, const char *html, int len);
+/* The largest page ws_server_set_html accepts.  GET / is answered through
+ * the client's outgoing queue, which is sized to hold a whole page and its
+ * header (OUT_QUEUE_MAX in ws_server.c); a larger one would be cut off
+ * where the queue ends. */
+#define WS_SERVER_PAGE_MAX (4 * 1024 * 1024)
+
+/* Set the HTML content to serve on GET /.  The data is copied internally.
+ * Returns 0, or -1 for a page over WS_SERVER_PAGE_MAX, which is not
+ * taken. */
+int ws_server_set_html(ws_server_t *srv, const char *html, int len);
 
 /* Callback for incoming text/binary messages from clients. */
 typedef void (*ws_message_cb_t)(const char *data, int len, void *userdata);

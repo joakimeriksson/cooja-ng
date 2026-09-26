@@ -1954,11 +1954,13 @@ static int cmd_ui(shell_service_t *s, int argc, char **argv, const char *line, c
     (void)argc; (void)line; (void)argpos;
     long port;
     if (shell_parse_int(argv[1], &port) != 0 || port < 1 || port > 65535) { shell_error(s, "ui: expected a TCP port"); return -1; }
-    if (!s->ctl->ops.start_ui || s->ctl->ops.start_ui(s->ctl->ops.user, (int)port) != 0) {
+    char url[64];
+    if (!s->ctl->ops.start_ui ||
+        s->ctl->ops.start_ui(s->ctl->ops.user, (int)port, url, sizeof(url)) != 0) {
         shell_error(s, "ui: cannot start the web UI on port %ld (already running, or the port is taken)", port);
         return -1;
     }
-    shell_out(s, "web UI on http://localhost:%ld/\n", port);
+    shell_out(s, "web UI on %s\n", url);
     return 0;
 }
 
