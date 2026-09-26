@@ -26,43 +26,74 @@ static inline void track_slot(sim_event_queue_t *q, int slot) {
         q->node_heap_idx[e->node_idx] = slot;
 }
 
-static void heap_swap(sim_event_queue_t *q, int i, int j) {
-    sim_event_t tmp = q->heap[i];
-    q->heap[i] = q->heap[j];
-    q->heap[j] = tmp;
-    track_slot(q, i);
-    track_slot(q, j);
-}
-
+/* Sift with a hole: lift the element out once, slide parents (or the
+ * smaller child) into the hole, and drop the element in at the end.  One
+ * copy per level instead of the three a swap costs, and one track_slot
+ * per moved element.  Order is a pure function of the (time_ns, seq)
+ * keys, which are unique, so the heap's pop sequence is unchanged.
+ *
+ * A sift that does not move writes nothing and tracks nothing: the slot
+ * is as the caller left it, and every caller has tracked it already
+ * (the insert writes node_heap_idx[] before sifting, pop tracks slot 0
+ * before sifting down, the in-place reschedule keeps its slot, and
+ * sim_eq_remove_node tracks every slot after its heapify). */
 static void heap_sift_up(sim_event_queue_t *q, int i) {
+    const int start = i;
+    sim_event_t ev = q->heap[i];
     while (i > 0) {
         int parent = (i - 1) / 2;
-        if (ev_less(&q->heap[i], &q->heap[parent])) {
-            heap_swap(q, i, parent);
-            i = parent;
-        } else {
+        if (!ev_less(&ev, &q->heap[parent]))
             break;
-        }
+        q->heap[i] = q->heap[parent];
+        track_slot(q, i);
+        i = parent;
+    }
+    if (i != start) {
+        q->heap[i] = ev;
+        track_slot(q, i);
     }
 }
 
 static void heap_sift_down(sim_event_queue_t *q, int i) {
+    const int start = i;
     int n = q->count;
-    while (1) {
-        int smallest = i;
+    sim_event_t ev = q->heap[i];
+    for (;;) {
         int left = 2 * i + 1;
-        int right = 2 * i + 2;
-        if (left < n && ev_less(&q->heap[left], &q->heap[smallest]))
-            smallest = left;
-        if (right < n && ev_less(&q->heap[right], &q->heap[smallest]))
-            smallest = right;
-        if (smallest != i) {
-            heap_swap(q, i, smallest);
-            i = smallest;
-        } else {
+        if (left >= n) break;
+        int child = left;
+        int right = left + 1;
+        if (right < n && ev_less(&q->heap[right], &q->heap[left]))
+            child = right;
+        if (!ev_less(&q->heap[child], &ev))
             break;
-        }
+        q->heap[i] = q->heap[child];
+        track_slot(q, i);
+        i = child;
     }
+    if (i != start) {
+        q->heap[i] = ev;
+        track_slot(q, i);
+    }
+}
+
+/* The node's live NODE_WAKEUP slot, or -1.  node_heap_idx[] is trusted
+ * only when the slot it names is inside the heap and holds this node's
+ * wakeup; a stale entry (past count, or a slot since reused by an
+ * untracked kind or another node) reads as "no wakeup" and the caller
+ * inserts afresh, as remove_heap_index() did before the in-place path.
+ * The invariant holds today (the suite's heap_ok checks it), so this is
+ * the safety net for a future path that breaks it: a mote with a lost
+ * index gets a new wakeup instead of stalling for good.  What the guard
+ * cannot do is find a wakeup the index has lost sight of; if one is in
+ * the heap, the node ticks twice, which was also the case before. */
+static inline int wakeup_slot(const sim_event_queue_t *q, int node_idx) {
+    int i = q->node_heap_idx[node_idx];
+    if (i >= 0 && i < q->count &&
+        q->heap[i].kind == SIM_EV_NODE_WAKEUP &&
+        q->heap[i].node_idx == node_idx)
+        return i;
+    return -1;
 }
 
 static void clear_index(sim_event_queue_t *q, int slot) {
@@ -70,18 +101,6 @@ static void clear_index(sim_event_queue_t *q, int slot) {
     if (e->kind == SIM_EV_NODE_WAKEUP &&
         e->node_idx >= 0 && e->node_idx < SIM_EQ_MAX_NODES)
         q->node_heap_idx[e->node_idx] = -1;
-}
-
-static void remove_heap_index(sim_event_queue_t *q, int i) {
-    if (i < 0 || i >= q->count)
-        return;
-    clear_index(q, i);
-    q->heap[i] = q->heap[--q->count];
-    if (i < q->count) {
-        track_slot(q, i);
-        heap_sift_up(q, i);
-        heap_sift_down(q, i);
-    }
 }
 
 void sim_eq_init(sim_event_queue_t *q) {
@@ -96,15 +115,27 @@ void sim_eq_schedule_gen(sim_event_queue_t *q, int node_idx, int64_t time_ns,
         fprintf(stderr, "WARNING: invalid event node index %d\n", node_idx);
         return;
     }
-    /* Remove any existing wakeup for this node BEFORE the capacity check —
-     * a reschedule is net-zero on the count, so a full queue must replace
-     * the entry rather than drop the wakeup (which stalled the mote). */
-    int existing = q->node_heap_idx[node_idx];
+    /* Reschedule: the node already has a pending wakeup.  Match Cooja
+     * scheduleNextWakeup() — the old entry is replaced by one with a fresh
+     * same-time insertion order — by rewriting the entry in place with a
+     * new seq and sifting it to where the new key belongs.  Same pop order
+     * as remove + insert (the key alone decides), at one sift instead of
+     * two, and net-zero on the count, so a full queue still replaces the
+     * entry rather than dropping the wakeup (which stalled the mote). */
+    int existing = wakeup_slot(q, node_idx);
     if (existing >= 0) {
-        /* Match Cooja scheduleNextWakeup(): rescheduling an already-queued
-         * execute event removes the old queue entry and inserts a new one,
-         * giving it a fresh same-time insertion order. */
-        remove_heap_index(q, existing);
+        sim_event_t *e = &q->heap[existing];
+        bool earlier = time_ns < e->time_ns;
+        e->time_ns = time_ns;
+        e->seq = q->next_seq++;
+        e->target_generation = target_generation;
+        /* A larger seq at the same time, or a later time, only ever moves
+         * the entry down; an earlier time only ever moves it up. */
+        if (earlier)
+            heap_sift_up(q, existing);
+        else
+            heap_sift_down(q, existing);
+        return;
     }
     if (q->count >= SIM_EQ_MAX_EVENTS) {
         fprintf(stderr, "WARNING: event queue full (%d events), dropping wakeup for node %d\n",
@@ -135,7 +166,7 @@ void sim_eq_schedule_if_earlier_gen(sim_event_queue_t *q, int node_idx,
         fprintf(stderr, "WARNING: invalid event node index %d\n", node_idx);
         return;
     }
-    int i = q->node_heap_idx[node_idx];
+    int i = wakeup_slot(q, node_idx);
     if (i >= 0 && q->heap[i].time_ns <= time_ns)
         return;  /* already scheduled earlier — ignore */
     sim_eq_schedule_gen(q, node_idx, time_ns, target_generation);

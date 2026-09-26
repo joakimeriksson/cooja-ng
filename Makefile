@@ -227,6 +227,7 @@ TEST_SOURCES = $(TEST_DIR)/test_main.c \
                $(TEST_DIR)/test_enc28j60.c \
                $(TEST_DIR)/test_radio_medium.c \
                $(TEST_DIR)/test_radio_bus.c \
+               $(TEST_DIR)/test_event_queue.c \
                $(TEST_DIR)/test_renode_cosim.c \
                $(TEST_DIR)/test_shell.c
 
