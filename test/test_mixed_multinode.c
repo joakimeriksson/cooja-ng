@@ -481,21 +481,23 @@ static int parse_wall_timeout(const char *v, double *out_ms) {
 /* CSIM_PHASE_TIMING=1 enables the step-vs-kernel wall-time breakdown at the
  * end of a run.  Off by default: it needs two clock reads per event-pump
  * iteration, which profiled at 7.0% of self time on an ARM workload. */
+static int env_flag_on(const char *name, int *cache) {
+    if (*cache < 0) { const char *e = getenv(name); *cache = (e && *e == '1'); }
+    return *cache;
+}
 static int phase_timing_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("CSIM_PHASE_TIMING"); v = (e && *e == '1'); }
-    return v;
+    return env_flag_on("CSIM_PHASE_TIMING", &v);
 }
 
 /* CSIM_PC_TRACE=1 installs the MSP430 PC-trace instrumentation (firmware
  * cc2420_transmit / TSCH EB-process / queue-add counters).  Off by default:
- * the hook is an indirect call per executed instruction on every MSP430
- * node, and the two TSCH addresses it watches belong to one historical
- * firmware image, so the counters mean nothing for any other. */
+ * with it on, the interpreter calls the hook for every instruction in
+ * [0x3d00, 0x10000) on every MSP430 node; off, the loop keeps only the NULL
+ * test of the hook pointer. */
 static int pc_trace_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("CSIM_PC_TRACE"); v = (e && *e == '1'); }
-    return v;
+    return env_flag_on("CSIM_PC_TRACE", &v);
 }
 
 /* ============================================================
@@ -2802,11 +2804,14 @@ sim_restart:
     /* Debug: PC trace for cc2420_transmit + TSCH EB on all MSP430 nodes (M55:
      * the install + counters live in the MSP430 module; the call is type-blind
      * — non-MSP430 nodes return 0).  Opt-in via CSIM_PC_TRACE=1. */
-    for (int i = 0; pc_trace_on() && i < node_count; i++) {
-        uint32_t tx_addr = msp430_elf_mote_install_pc_trace(&nodes[i]);
-        if (tx_addr)
-            printf("  PC trace: cc2420_transmit=0x%04x eb_process=0xcb32 queue_add=0xb138 (Node %d)\n",
-                   tx_addr, nodes[i].id);
+    if (pc_trace_on()) {
+        for (int i = 0; i < node_count; i++) {
+            uint32_t eb = 0, qa = 0;
+            uint32_t tx_addr = msp430_elf_mote_install_pc_trace(&nodes[i], &eb, &qa);
+            if (tx_addr)
+                printf("  PC trace: cc2420_transmit=0x%04x eb_process=0x%04x queue_add=0x%04x (Node %d)\n",
+                       tx_addr, eb, qa, nodes[i].id);
+        }
     }
 
     /* Start sim_time_ns at max of all nodes' current sim_time_ns */

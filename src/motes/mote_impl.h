@@ -226,9 +226,12 @@ void msp430_elf_mote_register_radio(mixed_node_t *node, int slot,
                                     sim_radio_bus_t *bus);
 int64_t msp430_elf_mote_tick(mixed_node_t *node, int64_t sim_ns);
 /* PC-trace debug instrumentation (Phase 10 M55).  install returns the
- * resolved cc2420_transmit address (0 = non-MSP430 or unresolved); the
- * counts getter feeds the end-of-run stats. */
-uint32_t msp430_elf_mote_install_pc_trace(mixed_node_t *node);
+ * resolved cc2420_transmit address (0 = non-MSP430 or unresolved) and the
+ * node's two TSCH entry points (0 = not in this image); the counts getter
+ * feeds the end-of-run stats. */
+uint32_t msp430_elf_mote_install_pc_trace(mixed_node_t *node,
+                                          uint32_t *eb_process,
+                                          uint32_t *queue_add);
 void msp430_elf_mote_pc_trace_counts(int *cc2420_tx, int *eb_process,
                                      int *queue_add);
 /* Verbose [UIP] dump of a sending MSP430 node (Phase 10 M57); no-op unless

@@ -79,44 +79,67 @@ static uint8_t *patch_at(const msp430_cpu_t *cpu, const char *sym,
  * runner) so the runner needs no MSP430 chip access for it.
  * ============================================================ */
 
-static uint32_t srh_trace_fn_addr;
+/* The three watched entry points, resolved from each node's own image and
+ * handed to the hook as its data pointer, so two nodes running different
+ * firmware each count their own.  0 = the image has no such symbol; no
+ * executed pc is 0, so that entry simply never matches. */
+typedef struct pc_trace_addrs {
+    uint32_t cc2420_transmit;   /* cc2420_transmit */
+    uint32_t eb_process;        /* process_thread_tsch_send_eb_process */
+    uint32_t queue_add;         /* tsch_queue_add_packet */
+} pc_trace_addrs_t;
+
+/* Run totals over every traced node. */
 static int cc2420_transmit_count;
 static int tsch_eb_process_count;
 static int tsch_queue_add_count;
 
 static void srh_trace_cb(void *data, uint32_t pc, uint32_t *reg, uint8_t *mem) {
-    (void)data; (void)reg; (void)mem;
-    /* Track firmware-level cc2420_transmit calls */
-    if (srh_trace_fn_addr && pc == srh_trace_fn_addr)
+    const pc_trace_addrs_t *w = data;
+    (void)reg; (void)mem;
+    if (pc == w->cc2420_transmit)
         cc2420_transmit_count++;
-    /* Track EB process calls */
-    if (pc == 0xcb32)
+    if (pc == w->eb_process)
         tsch_eb_process_count++;
-    /* Track queue add */
-    if (pc == 0xb138)
+    if (pc == w->queue_add)
         tsch_queue_add_count++;
 }
 
 /* Install the PC-trace instrumentation on an MSP430 node.  No-op + returns 0
  * for non-MSP430 nodes or when cc2420_transmit can't be resolved; otherwise
- * returns the resolved cc2420_transmit address so the caller can emit its
- * historical "PC trace: ..." line. */
-uint32_t msp430_elf_mote_install_pc_trace(mixed_node_t *node) {
+ * returns the resolved cc2420_transmit address, with the two TSCH entry
+ * points (0 when the image lacks them) in *eb_process / *queue_add, so the
+ * caller can emit its "PC trace: ..." line.  Called for every node before
+ * the run starts, so zeroing the run totals here once per node is the same
+ * as zeroing them once. */
+uint32_t msp430_elf_mote_install_pc_trace(mixed_node_t *node,
+                                          uint32_t *eb_process,
+                                          uint32_t *queue_add) {
     if (node->type != NODE_MSP430)
         return 0;
-    uint32_t tx_addr =
-        msp430_elf_find_symbol(node->firmware_path, "cc2420_transmit");
+    const char *path = node->firmware_path;
+    uint32_t tx_addr = msp430_elf_find_symbol(path, "cc2420_transmit");
     if (!tx_addr)
         return 0;
-    srh_trace_fn_addr = tx_addr;
+    msp430_cpu_t *cpu = &node->plat.msp.cpu;
+    pc_trace_addrs_t *w = cpu->pc_trace_fn == srh_trace_cb
+                          ? cpu->pc_trace_data      /* restart: reuse */
+                          : calloc(1, sizeof *w);
+    if (!w)
+        return 0;
+    w->cc2420_transmit = tx_addr;
+    w->eb_process = msp430_elf_find_symbol(path, "process_thread_tsch_send_eb_process");
+    w->queue_add  = msp430_elf_find_symbol(path, "tsch_queue_add_packet");
+    if (eb_process) *eb_process = w->eb_process;
+    if (queue_add)  *queue_add  = w->queue_add;
     cc2420_transmit_count = 0;
     tsch_eb_process_count = 0;
     tsch_queue_add_count = 0;
     /* Set range to cover all code including memcpy in .rodata area */
-    node->plat.msp.cpu.pc_trace_lo = 0x3d00;
-    node->plat.msp.cpu.pc_trace_hi = 0x10000;
-    node->plat.msp.cpu.pc_trace_fn = srh_trace_cb;
-    node->plat.msp.cpu.pc_trace_data = node;
+    cpu->pc_trace_lo = 0x3d00;
+    cpu->pc_trace_hi = 0x10000;
+    cpu->pc_trace_fn = srh_trace_cb;
+    cpu->pc_trace_data = w;
     return tx_addr;
 }
 
@@ -757,6 +780,12 @@ static int msp_mote_serial_input(sim_mote_t *m, const uint8_t *buf, int len) {
 }
 
 static void msp_mote_destroy(sim_mote_t *m) {
+    msp430_cpu_t *cpu = &MOTE_IMPL(m)->plat.msp.cpu;
+    if (cpu->pc_trace_fn == srh_trace_cb) {
+        free(cpu->pc_trace_data);
+        cpu->pc_trace_fn = NULL;
+        cpu->pc_trace_data = NULL;
+    }
     msp430_platform_destroy(&MOTE_IMPL(m)->plat.msp);
 }
 static void msp_mote_reset_time(sim_mote_t *m, int64_t now_ns) {
