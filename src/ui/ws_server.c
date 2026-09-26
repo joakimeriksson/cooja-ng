@@ -630,10 +630,13 @@ static void handle_ws_frame(ws_server_t *srv, int idx) {
         }
 
         if (opcode == 0x8) {
-            /* Close frame — send close back */
+            /* Close frame: answer it, then close -- once the answer has
+             * gone out, since a client that is behind has it queued. */
             uint8_t close_frame[2] = { 0x88, 0x00 };
-            client_write(c, close_frame, 2);
-            close_client(srv, idx);
+            if (client_write(c, close_frame, 2) != 0)
+                close_client(srv, idx);
+            else
+                finish_client(srv, idx);
             return;
         } else if (opcode == 0x9) {
             /* Ping — respond with pong */
