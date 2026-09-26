@@ -34,10 +34,13 @@ sends raw requests shaped like the ones a browser would send, asserting:
     (port in use) ends the run -- neither is ignored for the whole run;
   - a ui/index.html that is a FIFO with no writer, or a directory, does not
     hang startup or serve an empty page: the built-in page is served; an
-    empty one is served as it is, without a warning;
+    empty one is served as it is, without a warning; one at the size limit
+    is served whole and one just over it draws the warning and the
+    built-in page, rather than being cut off where the client's queue ends;
   - a request that does not fit the input buffer is answered 431, not
     dropped, and 6 KB of cookies (localhost cookies are shared across
-    ports) still gets the page;
+    ports) still gets the page; a client still writing such a request when
+    the 431 goes out sees the rest taken and then EOF, not a reset;
   - a client that stops reading, or reads the page a byte at a time,
     never holds the simulation thread: a healthy viewer keeps its cadence
     meanwhile, and the one that stopped reading is dropped with a line on
@@ -63,6 +66,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 RUNNER = os.environ.get('RUNNER', os.path.join(ROOT, 'build', 'test_runner'))
 FIRMWARE = os.path.join(ROOT, 'firmware', 'sky', 'hello-world.sky')
 ARM_FIRMWARE = os.path.join(ROOT, 'firmware', 'cc2538dk', 'hello-world.cc2538dk')  # --gdb is ARM-only
+PAGE_MAX = 4 * 1024 * 1024          # WS_SERVER_PAGE_MAX
 
 
 def free_port():
@@ -110,6 +114,42 @@ def status(addr, port, path='/ws', host=None, origin=None, upgrade=True,
         return f'error: {e.__class__.__name__}'
     parts = line.split()
     return parts[1] if len(parts) > 1 else f'error: bad reply {line!r}'
+
+
+def page_length(port):
+    """The length of the body GET / serves, read to EOF."""
+    with socket.create_connection(('127.0.0.1', port), timeout=30) as s:
+        s.sendall(f'GET / HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n'.encode())
+        got = b''
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+    return len(got.partition(b'\r\n\r\n')[2])
+
+
+def request_too_large_then_tail(port):
+    """Send most of an oversized request, read the 431 it draws, then send
+    the rest and half-close: 'EOF' if the server took the rest and closed
+    cleanly, else the error the reset shows up as."""
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as s:
+            s.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\nCookie: a=' + b'x' * 17000)
+            reply = b''
+            while b'\r\n' not in reply:
+                chunk = s.recv(4096)
+                if not chunk:
+                    return 'closed before replying'
+                reply += chunk
+            if not reply.startswith(b'HTTP/1.1 431'):
+                return f'bad reply {reply[:20]!r}'
+            time.sleep(0.2)             # the server has had its chance to close
+            s.sendall(b'y' * 3000 + b'\r\n\r\n')
+            s.shutdown(socket.SHUT_WR)
+            return 'EOF' if not s.recv(4096) else 'more data'
+    except OSError as e:
+        return f'error: {e.__class__.__name__}'
 
 
 def ws_open(port):
@@ -314,6 +354,8 @@ def main():
                headers='Cookie: a=' + 'x' * 6000 + '\r\n'), '200')
         expect('20 KB of cookies (does not fit)', status(a, port, path='/', upgrade=False,
                host=here, headers='Cookie: a=' + 'x' * 20000 + '\r\n'), '431')
+        expect('431 while the client is still writing: rest taken, then EOF',
+               request_too_large_then_tail(port), 'EOF')
         expect('125-byte ping', pong_for(port, 125), 'echo')
         expect('200-byte ping (over the control-frame cap)', pong_for(port, 200), 'closed')
         expect('fragmented ping (FIN=0)', pong_for(port, 4, fin=False), 'closed')
@@ -362,23 +404,32 @@ def main():
                exit_code('--ui', str(taken.getsockname()[1]), '--gdb', f'1:{free_port()}',
                          '--gdb-wait', firmware=ARM_FIRMWARE), 2)
 
-    for kind in ('a FIFO', 'a directory', 'an empty file'):
+    for kind in ('a FIFO', 'a directory', 'an empty file',
+                 'at the size limit', 'over the size limit'):
         port = free_port()
         print(f'== ui/index.html is {kind} (port {port})')
         with tempfile.TemporaryDirectory() as tmp:
             os.mkdir(os.path.join(tmp, 'ui'))
             page = os.path.join(tmp, 'ui', 'index.html')
+            size = {'at the size limit': PAGE_MAX, 'over the size limit': PAGE_MAX + 1}.get(kind)
             if kind == 'a FIFO':
                 os.mkfifo(page)
             elif kind == 'a directory':
                 os.mkdir(page)
             else:
-                open(page, 'w').close()
+                with open(page, 'wb') as f:
+                    f.write(b'x' * (size or 0))
             r = Runner(port, cwd=tmp)     # exits the check if it never listens
             try:
                 expect('page served', status('127.0.0.1', port, path='/',
                        upgrade=False, host=f'localhost:{port}'), '200')
-                expect('warned about it', b'Warning:' in r.errors(), kind != 'an empty file')
+                expect('warned about it', b'Warning:' in r.errors(),
+                       kind not in ('an empty file', 'at the size limit'))
+                if kind == 'at the size limit':
+                    expect('served whole', page_length(port), PAGE_MAX)
+                elif kind == 'over the size limit':
+                    expect('the built-in page instead, not a cut-off one',
+                           page_length(port) < 4096, True)
             finally:
                 r.close()
 
