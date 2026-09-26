@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* --- helpers --------------------------------------------------------------- */
 
@@ -582,6 +583,64 @@ static arm_cpu_t *node_arm_cpu(shell_service_t *s, const char *what, const char 
 
 /* "0x2000", "main", "main+0x10": a number, or a symbol of the node's
  * firmware (then its Secure-world image) plus an optional offset. */
+/* The file behind an image path: mtime (ns, so a rebuild within the same
+ * second is seen), size and inode, or zeros. */
+static void image_stamp(const char *path, int64_t stamp[3]) {
+    struct stat st;
+    if (path[0] && stat(path, &st) == 0) {
+#ifdef __APPLE__
+        stamp[0] = (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+        stamp[0] = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+        stamp[1] = (int64_t)st.st_size; stamp[2] = (int64_t)st.st_ino;
+    } else {
+        stamp[0] = stamp[1] = stamp[2] = 0;
+    }
+}
+
+/* A node's symbol, through its per-slot cache.  The cache is keyed on the
+ * image paths and the files behind them (one stat per lookup — what the
+ * old read-the-ELF-every-time did, minus the read), so a reboot into
+ * another firmware, a reused slot and a rebuild at the same path all start
+ * the slot empty; misses are not cached.  A symbol at address 0 is found. */
+static bool node_symbol(shell_service_t *s, const sim_control_node_info_t *info,
+                        const char *name, uint32_t *addr) {
+    const char *fw = info->firmware ? info->firmware : "";
+    const char *sfw = info->secure_firmware ? info->secure_firmware : "";
+    int idx = sim_control_index_of_id(s->ctl, info->id);
+    shell_sym_cache_t *c = NULL;
+    if (idx >= 0 && idx < SIM_EQ_MAX_NODES) {
+        if (!s->sym_cache[idx]) s->sym_cache[idx] = calloc(1, sizeof(*c));
+        c = s->sym_cache[idx];
+        int64_t fs[3], ss[3];
+        image_stamp(fw, fs);
+        image_stamp(sfw, ss);
+        if (c && (strncmp(c->firmware, fw, sizeof(c->firmware) - 1) != 0 ||
+                  strncmp(c->secure_firmware, sfw, sizeof(c->secure_firmware) - 1) != 0 ||
+                  memcmp(c->fw_stamp, fs, sizeof(fs)) != 0 || memcmp(c->sfw_stamp, ss, sizeof(ss)) != 0)) {
+            memset(c, 0, sizeof(*c));
+            snprintf(c->firmware, sizeof(c->firmware), "%s", fw);
+            snprintf(c->secure_firmware, sizeof(c->secure_firmware), "%s", sfw);
+            memcpy(c->fw_stamp, fs, sizeof(fs));
+            memcpy(c->sfw_stamp, ss, sizeof(ss));
+        }
+        if (c)
+            for (int i = 0; i < c->count; i++)
+                if (strcmp(c->e[i].name, name) == 0) { *addr = c->e[i].addr; return true; }
+    }
+    bool found = (fw[0] && elf_lookup_symbol(fw, name, addr)) ||
+                 (sfw[0] && elf_lookup_symbol(sfw, name, addr));
+    if (found && c && strlen(name) < sizeof(c->e[0].name)) {
+        int k = c->next;
+        snprintf(c->e[k].name, sizeof(c->e[k].name), "%s", name);
+        c->e[k].addr = *addr;
+        c->next = (k + 1) % SHELL_SYM_CACHE;
+        if (c->count < SHELL_SYM_CACHE) c->count++;
+    }
+    return found;
+}
+
 static int resolve_addr(shell_service_t *s, const sim_control_node_info_t *info,
                         const char *spec, uint32_t *out) {
     long v;
@@ -595,10 +654,7 @@ static int resolve_addr(shell_service_t *s, const sim_control_node_info_t *info,
         if (shell_parse_int(plus + 1, &off) != 0) { shell_error(s, "bad offset in '%s'", spec); return -1; }
     }
     uint32_t a = 0;
-    if (info->firmware && info->firmware[0]) a = elf_find_symbol(info->firmware, name);
-    if (!a && info->secure_firmware && info->secure_firmware[0])
-        a = elf_find_symbol(info->secure_firmware, name);
-    if (!a) { shell_error(s, "no symbol '%s' in node %d's firmware", name, info->id); return -1; }
+    if (!node_symbol(s, info, name, &a)) { shell_error(s, "no symbol '%s' in node %d's firmware", name, info->id); return -1; }
     *out = a + (uint32_t)off;
     return 0;
 }
@@ -870,7 +926,10 @@ static int cmd_reg(shell_service_t *s, int argc, char **argv, const char *line, 
             return -1;
         }
         uint32_t val = (uint32_t)v;
-        if (m.arm && target == &m.arm->reg[ARM_PC]) val &= ~1u;      /* Thumb bit is not PC */
+        if (m.arm && target == &m.arm->reg[ARM_PC]) {
+            val &= ~1u;                                             /* Thumb bit is not PC */
+            m.arm->dbg_skip_pc = UINT32_MAX;                        /* the halt site is left behind */
+        }
         if (m.msp) val &= m.msp->is_msp430x ? 0xfffffu : 0xffffu;
         *target = val;
         if (s->verbose) shell_out(s, "%s = 0x%08x\n", n, val);
@@ -912,9 +971,7 @@ static arm_cpu_t *dbg_cpu(shell_service_t *s, int node_id) {
  * resumes at the current instant with its clock that much behind.  A halted
  * node is parked (no wakeup of its own), so schedule one. */
 static void dbg_release(shell_service_t *s, int node_id, arm_cpu_t *cpu) {
-    if (cpu->dbg_hit_kind == 1) cpu->dbg_skip_pc = cpu->reg[ARM_PC] & ~1u;
-    cpu->dbg_halted = false;
-    cpu->last_execute_us = now_ns(s) / 1000LL;
+    arm_dbg_release(cpu, now_ns(s));
     for (int k = 0; k < s->dbg_count; k++)
         if (s->dbg[k].node_id == node_id) s->dbg[k].halted = false;
     int idx = sim_control_index_of_id(s->ctl, node_id);
@@ -927,6 +984,11 @@ static void dbg_release(shell_service_t *s, int node_id, arm_cpu_t *cpu) {
 static void dbg_arm_node(shell_service_t *s, int node_id) {
     arm_cpu_t *cpu = dbg_cpu(s, node_id);
     if (!cpu) return;
+    /* A stale skip would miss the first hit — but only a node that is
+     * halted, or had nothing armed (the interpreter's clear is gated on an
+     * armed node), can hold one; a node just released by `continue` keeps
+     * its skip, or adding a breakpoint would re-hit the one it left. */
+    if (cpu->dbg_halted || cpu->dbg_count == 0) cpu->dbg_skip_pc = UINT32_MAX;
     cpu->dbg_bp_n = cpu->dbg_wp_n = 0;
     for (int i = 0; i < s->dbg_count; i++) {
         const shell_dbg_t *d = &s->dbg[i];
@@ -1267,16 +1329,25 @@ static int cmd_console(shell_service_t *s, int argc, char **argv, const char *li
 /* --- scheduling ------------------------------------------------------------ */
 
 /* Validate a command that at/every/on will run later.  Blocking commands
- * are refused: they would take over the command stream's own wait. */
+ * are refused (they would take over the command stream's own wait), and so
+ * is one that discards the stream (restart). */
 static int check_command_text(shell_service_t *s, const char *what, const char *cmd) {
-    char *argv[SHELL_MAX_ARGS]; char storage[SHELL_LINE_MAX]; char err[128];
+    /* The text is kept as given (expanded, escaped); like exec_tokens it
+     * can hold escaped values, so the token storage matches. */
+    char *argv[SHELL_MAX_ARGS]; char storage[4 * SHELL_LINE_MAX]; char err[128];
     int argc = shell_tokenize(cmd, argv, NULL, SHELL_MAX_ARGS, storage, sizeof(storage), err, sizeof(err));
     if (argc < 0) { shell_error(s, "%s", err); return -1; }
     if (argc == 0) { shell_error(s, "missing command"); return -1; }
-    if (!shell_find_command(argv[0])) { shell_error(s, "unknown command '%s'", argv[0]); return -1; }
-    if (shell_line_blocks(cmd)) {
+    const shell_command_t *c = shell_find_command(argv[0]);
+    if (!c) { shell_error(s, "unknown command '%s'", argv[0]); return -1; }
+    if (shell_cmd_blocks(c, argc)) {
         shell_error(s, "%s cannot run '%s': it would block the command stream "
-                    "(put the sequence in a script instead)", what, argv[0]);
+                    "(put the sequence in a script instead)", what, c->name);
+        return -1;
+    }
+    if (c->flags & SHELL_CMD_NO_SCHEDULE) {  /* the mirror image: it discards the stream */
+        shell_error(s, "%s cannot run '%s': it would discard the pending command "
+                    "stream (type it, or put it in a script)", what, c->name);
         return -1;
     }
     return 0;
@@ -1885,7 +1956,7 @@ static int schedule_release(shell_service_t *s, int64_t dur, const char *cmd) {
     return 0;
 }
 
-/* gpio <node> <port.pin> high|low|pulse [duration] */
+/* gpio <node> <port.pin> high|low|pulse [duration]|release */
 static int cmd_gpio(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)line; (void)argpos;
     int idx;
@@ -1896,6 +1967,8 @@ static int cmd_gpio(shell_service_t *s, int argc, char **argv, const char *line,
     const char *op = argv[3];
     if (!strcmp(op, "high") || !strcmp(op, "low"))
         return drive_pin(s, "gpio", idx, port, pin, op[0] == 'h');
+    if (!strcmp(op, "release"))                 /* stop forcing: the pin is the firmware's again */
+        return drive_pin(s, "gpio", idx, port, pin, -1);
     if (!strcmp(op, "pulse")) {
         int64_t dur = 100 * SHELL_MS_TO_NS;
         if (argc == 5 && parse_dur(s, argv[4], &dur) != 0) return -1;
@@ -1904,7 +1977,7 @@ static int cmd_gpio(shell_service_t *s, int argc, char **argv, const char *line,
         snprintf(cmd, sizeof(cmd), "gpio %d %d.%d low", id, port, pin);
         return schedule_release(s, dur, cmd);
     }
-    shell_error(s, "gpio: expected high, low or pulse, got '%s'", op);
+    shell_error(s, "gpio: expected high, low, pulse or release, got '%s'", op);
     return -1;
 }
 
@@ -2040,18 +2113,23 @@ static int cmd_on_list(shell_service_t *s, int argc, char **argv, const char *li
         }
         const char *kind = w->kind == SHELL_WATCH_COUNT ? "count" : w->kind == SHELL_WATCH_FAIL ? "fail-on" : w->once ? "on --once" : "on";
         shell_out(s, "  #%d %-9s %-8s \"%s\"%s%s  (%d matches)\n", i + 1, kind, nodes, w->pattern,
-                  w->kind == SHELL_WATCH_RUN ? " -> " : "", w->kind == SHELL_WATCH_RUN ? w->cmd : "", w->count);
+                  w->kind == SHELL_WATCH_RUN ? " -> " : "", w->kind == SHELL_WATCH_RUN && w->cmd ? w->cmd : "", w->count);
     }
     return 0;
 }
 
 static int cmd_on_clear(shell_service_t *s, int argc, char **argv, const char *line, const int *argpos) {
     (void)argc; (void)line; (void)argpos;
-    if (!strcmp(argv[1], "all")) { s->watch_count = 0; return 0; }
+    if (!strcmp(argv[1], "all")) {
+        for (int i = 0; i < s->watch_count; i++) { free(s->watches[i].cmd); s->watches[i].cmd = NULL; }
+        s->watch_count = 0;
+        return 0;
+    }
     long n;
     if (shell_parse_int(argv[1], &n) != 0 || n < 1 || n > s->watch_count) {
         shell_error(s, "on clear: no watch #%s (see on list)", argv[1]); return -1;
     }
+    free(s->watches[n - 1].cmd);
     memmove(&s->watches[n - 1], &s->watches[n], (size_t)(s->watch_count - n) * sizeof(s->watches[0]));
     s->watch_count--;
     return 0;
@@ -2233,6 +2311,7 @@ static int cmd_help(shell_service_t *s, int argc, char **argv, const char *line,
 
 #define IMM SHELL_CMD_IMMEDIATE
 #define BLK SHELL_CMD_BLOCKING
+#define NOSCHED SHELL_CMD_NO_SCHEDULE
 static const shell_command_t commands[] = {
     { "run",        "run [duration]",                  "resume; with a duration, pause again after it (run 500ms)", 0, 1, IMM, cmd_run },
     { "pause",      "pause",                           "stop dispatching events (services keep polling)", 0, 0, IMM, cmd_pause },
@@ -2249,9 +2328,9 @@ static const shell_command_t commands[] = {
     { "pcap",       "pcap <file>|off",                 "start or stop an 802.15.4 capture", 1, 1, IMM, cmd_pcap },
     { "clock",      "clock <node> [deviation]",        "show or set a node's clock deviation (1.0 exact, e.g. 1.00002 = 20 ppm fast)", 1, 2, IMM, cmd_clock },
     { "leds",       "leds [nodes]",                    "LED states", 0, 1, IMM, cmd_leds },
-    { "gpio",       "gpio <node> <port>.<pin> high|low|pulse [duration]", "drive a GPIO input pin (MSP430 P1-P10, CC2538 A-D, nRF54L15 P0-P2 without GPIOTE)", 3, 4, IMM, cmd_gpio },
+    { "gpio",       "gpio <node> <port>.<pin> high|low|pulse [duration]|release", "drive a GPIO input pin (MSP430 P1-P10, CC2538 A-D, nRF54L15 P0-P2 without GPIOTE)", 3, 4, IMM, cmd_gpio },
     { "button",     "button <node> press|release|click [duration]", "the board's user button (click = press, release after 100ms)", 2, 3, IMM, cmd_button },
-    { "restart",    "restart",                         "restart the simulation from its configuration (aborts scripts, clears at)", 0, 0, IMM, cmd_restart },
+    { "restart",    "restart",                         "restart the simulation from its configuration (aborts scripts, clears at)", 0, 0, IMM | NOSCHED, cmd_restart },
     { "ui",         "ui <port>",                       "start the live web UI now", 1, 1, IMM, cmd_ui },
     { "stats",      "stats",                           "RF bytes, frames, collisions, console bytes; per-node cycles and instructions", 0, 0, IMM, cmd_stats },
     { "tail",       "tail [-n N] [nodes]",             "the last N console lines (default 20) from the remembered 2000", 0, 3, IMM, cmd_tail },
@@ -2307,6 +2386,7 @@ static const shell_command_t commands[] = {
     { "help",       "help [command]",                  "this list, or one command's syntax", 0, 1, IMM, cmd_help },
 };
 #undef IMM
+#undef NOSCHED
 #undef BLK
 static const int command_count = (int)(sizeof(commands) / sizeof(commands[0]));
 
@@ -2338,13 +2418,8 @@ void shell_complete(const char *prefix, linenoiseCompletions *lc) {
             linenoiseAddCompletion(lc, commands[i].name);
 }
 
-bool shell_line_blocks(const char *line) {
-    char *argv[SHELL_MAX_ARGS]; char storage[SHELL_LINE_MAX];
-    int argc = shell_tokenize(line, argv, NULL, SHELL_MAX_ARGS, storage,
-                              sizeof(storage), NULL, 0);
-    if (argc <= 0) return false;
-    const shell_command_t *c = shell_find_command(argv[0]);
-    if (!c) return false;
+/* Does this command, with these arguments, hold the command stream? */
+bool shell_cmd_blocks(const shell_command_t *c, int argc) {
     if (c->flags & SHELL_CMD_BLOCKING) return true;
     return strcmp(c->name, "run") == 0 && argc >= 2;   /* run <duration> */
 }
@@ -2352,9 +2427,11 @@ bool shell_line_blocks(const char *line) {
 static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only) {
     char *argv[SHELL_MAX_ARGS];
     int argpos[SHELL_MAX_ARGS];
-    char storage[SHELL_LINE_MAX];
+    /* A substituted value is escaped (up to 4 bytes per byte), so the
+     * expanded line and its decoded tokens can outgrow one line's worth. */
+    char storage[4 * SHELL_LINE_MAX];
     char err[128];
-    char expanded[SHELL_LINE_MAX];
+    char expanded[4 * SHELL_LINE_MAX];
     if (strchr(line, '$')) {
         if (shell_expand_vars(line, expanded, sizeof(expanded), shell_var_get, s,
                               err, sizeof(err)) < 0) {
@@ -2376,9 +2453,9 @@ static int exec_tokens(shell_service_t *s, const char *line, bool immediate_only
     /* Scheduled commands were validated when scheduled; this is the
      * backstop for anything that slipped through. */
     if ((s->origin.kind == SHELL_ORIGIN_AT || s->origin.kind == SHELL_ORIGIN_ON) &&
-        shell_line_blocks(line)) {
-        shell_error(s, "'%s' cannot run from at/every/on: it would block the command stream",
-                    c->name);
+        (shell_cmd_blocks(c, argc) || (c->flags & SHELL_CMD_NO_SCHEDULE))) {
+        shell_error(s, "'%s' cannot run from at/every/on: it would %s the command stream",
+                    c->name, shell_cmd_blocks(c, argc) ? "block" : "discard");
         return -1;
     }
     int nargs = argc - 1;

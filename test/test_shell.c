@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <utime.h>
+#include <time.h>
 
 #include "shell_parse.h"
 #include "sim_mote.h"
@@ -15,6 +17,7 @@
 #include "sim_runtime.h"
 #include "sim_control.h"
 #include "../src/services/shell_internal.h"
+#include "elf_loader.h"
 
 static int g_fail = 0, g_pass = 0, g_verbose = 0;
 #define CHECK(cond, ...) do { if (cond) { g_pass++; if (g_verbose) { printf("  ok: "); printf(__VA_ARGS__); printf("\n"); } } \
@@ -206,6 +209,8 @@ static void mock_reset(void) {
     mock_cpu.flash = mock_flash;
     mock_cpu.flash_base = 0x1000u;
     mock_cpu.flash_end = 0x1000u + sizeof(mock_flash);
+    for (int i = 0; i < SIM_EQ_MAX_NODES; i++) { free(sh.sym_cache[i]); sh.sym_cache[i] = NULL; }
+    shell_script_free_all(&sh);
     memset(&sh, 0, sizeof(sh));
     sh.sim = &mock_sim; sh.ctl = &mock_ctl; sh.active = true; sh.interactive = false;
     sh.verbose = false; sh.next_at_id = 1; sh.default_expect_timeout_ns = 30000000000LL;
@@ -450,6 +455,16 @@ static void test_review_fixes(void) {
     shell_script_tick(&sh);
     CHECK(sh.atq_count == 1 && sh.watch_count == 0, "only the non-blocking 'at +1s run' was scheduled (atq=%d watches=%d)", sh.atq_count, sh.watch_count);
     CHECK(!sh.failed, "refusals typed at the prompt do not set a verdict");
+
+    /* More due entries than the per-tick guard: the popped one is never dropped. */
+    {
+        mock_reset();
+        sh.interactive = true;
+        shell_enqueue_line(&sh, "every 1us echo x");
+        shell_script_tick(&sh);
+        advance(1000000LL); shell_script_tick(&sh);             /* 1000 due, the guard stops at 256 */
+        CHECK(sh.atq_count == 1, "an every survives the per-tick guard (%d)", sh.atq_count);
+    }
 
     /* at list / at clear, and the atq / atrm aliases. */
     mock_reset();
@@ -782,6 +797,7 @@ static const char *t_lookup(void *u, const char *name) {
     (void)u;
     if (!strcmp(name, "x")) return "42";
     if (!strcmp(name, "sp")) return "a  b";
+    if (!strcmp(name, "q")) return "a\"b'c #d\\e\n";     /* a captured console line can hold anything */
     return NULL;
 }
 
@@ -790,7 +806,35 @@ static void test_expand(void) {
     int n = shell_expand_vars("echo $x ${x}y $$x \\$x '$x' \"$x\" $ $1 # $nope", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
     CHECK(n > 0 && !strcmp(out, "echo 42 42y $x \\$x '$x' \"42\" $ $1 # $nope"), "expansion rules ('%s')", out);
     n = shell_expand_vars("send 1 $sp", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
-    CHECK(n > 0 && !strcmp(out, "send 1 a  b"), "value substituted as text");
+    CHECK(n > 0 && !strcmp(out, "send 1 a\\ \\ b"), "a value is one word: its spaces are escaped ('%s')", out);
+    /* Quotes, a comment marker, a backslash and a newline in a value stay
+     * literal and do not change how the rest of the line is read. */
+    n = shell_expand_vars("sendln 1 $q tail", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+    {
+        char *av[8]; char stg[128];
+        int ac = shell_tokenize(out, av, NULL, 8, stg, sizeof(stg), err, sizeof(err));
+        CHECK(n > 0 && ac == 4 && !strcmp(av[2], "a\"b'c #d\\e\n") && !strcmp(av[3], "tail"),
+              "hostile value tokenizes back to itself, the line goes on ('%s' -> %d args, %s)", out, ac, ac > 0 ? "" : err);
+        n = shell_expand_vars("echo \"$q\"", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
+        ac = shell_tokenize(out, av, NULL, 8, stg, sizeof(stg), err, sizeof(err));
+        CHECK(n > 0 && ac == 2 && !strcmp(av[1], "a\"b'c #d\\e\n"), "the same inside double quotes ('%s')", out);
+    }
+    /* A captured console line of 700 bytes, half of them spaces, still expands
+     * (escaping doubles the spaces) and tokenizes back to one argument. */
+    {
+        char big[701];
+        for (int i = 0; i < 700; i++) big[i] = (i % 2) ? ' ' : 'a' + (i % 26);   /* 350 spaces: 1050 bytes escaped */
+        big[700] = '\0';
+        mock_reset();
+        sh.interactive = true;
+        shell_var_set(&sh, "big", big);
+        shell_enqueue_line(&sh, "echo $big");
+        shell_enqueue_line(&sh, "at +1s echo $big");     /* 1050 bytes escaped: the entry is heap-allocated */
+        shell_script_tick(&sh);
+        CHECK(!sh.failed && sh.atq_count == 1, "a 700-byte value expands and can be scheduled (%d)", sh.atq_count);
+        advance(1000000000LL); shell_script_tick(&sh);
+        CHECK(!sh.failed && sh.atq_count == 0, "the scheduled long command ran");
+    }
     n = shell_expand_vars("echo $missing", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
     CHECK(n == -1 && strstr(err, "undefined variable 'missing'"), "undefined -> error (%s)", err);
     n = shell_expand_vars("echo ${x", out, sizeof(out), t_lookup, NULL, err, sizeof(err));
@@ -885,6 +929,59 @@ static void test_node_commands(void) {
     unlink(p); unlink(data);
 }
 
+/* Symbols: one file read per miss, a per-node cache keyed on the image, and
+ * a symbol at address 0 is found (the loader's 0-means-absent idiom is not
+ * the shell's).  Needs a checked-in image; skipped without it. */
+static void test_symbols(void) {
+    const char *img = "firmware/nrf54l15-dk/shell.nrf54l15-dk";
+    FILE *f = fopen(img, "rb");
+    if (!f) return;
+    fclose(f);
+    mock_reset();
+    sh.interactive = true;
+    snprintf(mock_nodes[0].fw, sizeof(mock_nodes[0].fw), "%s", img);
+    shell_enqueue_line(&sh, "sym -c a 1 process_run");
+    shell_enqueue_line(&sh, "sym -c b 1 process_run");
+    shell_enqueue_line(&sh, "sym -c z 1 __ctors_size");     /* an absolute symbol, value 0 */
+    shell_enqueue_line(&sh, "sym 1 no_such_symbol_here");
+    shell_script_tick(&sh);
+    const char *a = shell_var_get(&sh, "a"), *b = shell_var_get(&sh, "b"), *z = shell_var_get(&sh, "z");
+    CHECK(a && b && !strcmp(a, b) && strcmp(a, "0x00000000") != 0, "symbol resolved twice to the same address");
+    CHECK(sh.sym_cache[0] && sh.sym_cache[0]->count == 2 && !strcmp(sh.sym_cache[0]->firmware, img),
+          "two entries cached for the image (%d)", sh.sym_cache[0] ? sh.sym_cache[0]->count : -1);
+    CHECK(z && !strcmp(z, "0x00000000"), "a symbol at address 0 is found ('%s')", z ? z : "");
+    snprintf(mock_nodes[0].fw, sizeof(mock_nodes[0].fw), "other.elf");   /* the slot rebooted into another image */
+    shell_enqueue_line(&sh, "sym 1 process_run");
+    shell_script_tick(&sh);
+    CHECK(sh.sym_cache[0]->count == 0 && !strcmp(sh.sym_cache[0]->firmware, "other.elf"), "another image empties the cache");
+    /* A rebuild at the same path (new mtime) empties it too. */
+    {
+        char copy[256];
+        snprintf(copy, sizeof(copy), "/tmp/csim_shell_test_img_%d.elf", (int)getpid());
+        FILE *in = fopen(img, "rb"), *out = fopen(copy, "wb");
+        char buf[65536]; size_t n;
+        while (in && out && (n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
+        if (in) fclose(in);
+        if (out) fclose(out);
+        snprintf(mock_nodes[0].fw, sizeof(mock_nodes[0].fw), "%s", copy);
+        shell_enqueue_line(&sh, "sym 1 process_run");
+        shell_script_tick(&sh);
+        CHECK(sh.sym_cache[0]->count == 1, "resolved from the copy");
+        struct utimbuf ub = { .actime = time(NULL), .modtime = time(NULL) + 100 };
+        utime(copy, &ub);                                /* "rebuilt": a new mtime, same path */
+        shell_enqueue_line(&sh, "sym -c again 1 process_run");
+        shell_script_tick(&sh);
+        CHECK(sh.sym_cache[0]->count == 1 && sh.sym_cache[0]->fw_stamp[0] == (int64_t)ub.modtime * 1000000000LL,
+              "a rebuilt image empties the cache and is re-read (%d)", sh.sym_cache[0]->count);
+        unlink(copy);
+    }
+    uint32_t addr = 1;
+    CHECK(elf_lookup_symbol(img, "__ctors_size", &addr) && addr == 0, "elf_lookup_symbol: found at 0");
+    CHECK(!elf_lookup_symbol(img, "no_such_symbol_here", &addr), "elf_lookup_symbol: absent is false");
+    CHECK(!elf_lookup_symbol(img, "crtstuff.c", &addr), "elf_lookup_symbol: a file symbol (value 0) is not a match");
+    CHECK(!elf_lookup_symbol(img, ".data", &addr), "elf_lookup_symbol: a section symbol is not a match");
+}
+
 static void test_arm_inspection(void) {
     const char *p;
     mock_reset();
@@ -937,9 +1034,10 @@ static void test_arm_inspection(void) {
     shell_enqueue_line(&sh, "sym 1 main");               /* firmware "fw1" does not exist */
     shell_script_tick(&sh);
     CHECK(sh.block == SHELL_BLOCK_NONE && !sh.failed, "non-ARM node, bad register, bad fault kind, missing symbol are errors");
-    CHECK(shell_line_blocks("expect-fault 1") && shell_line_blocks("capture v 1 \"x\"") &&
-          shell_line_blocks("sendfile 1 f") && shell_line_blocks("expect-not 1 \"x\" 1s") &&
-          !shell_line_blocks("mem 1 0x0"), "blocking classification");
+    CHECK(shell_cmd_blocks(shell_find_command("expect-fault"), 2) && shell_cmd_blocks(shell_find_command("capture"), 4) &&
+          shell_cmd_blocks(shell_find_command("sendfile"), 3) && shell_cmd_blocks(shell_find_command("expect-not"), 4) &&
+          shell_cmd_blocks(shell_find_command("run"), 2) && !shell_cmd_blocks(shell_find_command("run"), 1) &&
+          !shell_cmd_blocks(shell_find_command("mem"), 3), "blocking classification");
 }
 
 static void test_workflow(void) {
@@ -1082,6 +1180,15 @@ static void test_environment(void) {
     CHECK(m_pin_level == 0 && m_pin_pin == 3, "pulse released after 5 ms");
     advance(15 * SHELL_MS_TO_NS); shell_script_tick(&sh);
     CHECK(m_pin_port == 1 && m_pin_pin == 13 && m_pin_level == 1, "button release drives the active-low pin high");
+    shell_enqueue_line(&sh, "gpio 1 P1.6 release");
+    shell_script_tick(&sh);
+    CHECK(m_pin_port == 1 && m_pin_pin == 6 && m_pin_level == -1, "gpio release passes level -1 (%d)", m_pin_level);
+    int atq = sh.atq_count, restarts = m_restarts;
+    shell_enqueue_line(&sh, "at +1s restart");
+    shell_enqueue_line(&sh, "every 1s restart");
+    shell_enqueue_line(&sh, "on 1 \"x\" restart");
+    shell_script_tick(&sh);
+    CHECK(sh.atq_count == atq && sh.trigger_count == 0 && m_restarts == restarts, "restart is refused from at/every/on");
     unlink(p);
 
     radio_medium_destroy(&mock_sim.radio_medium);   /* before the reset re-inits it */
@@ -1130,6 +1237,7 @@ static void test_debug(void) {
     CHECK(!strcmp(shell_var_get(&sh, "pc") ? shell_var_get(&sh, "pc") : "", "0x00002000"), "script continued at the hit");
     CHECK(!mock_cpu.dbg_halted && !sim_control_paused(&mock_ctl), "continue releases and resumes");
     CHECK(!arm_dbg_check(&mock_cpu), "not hit again on the way out");
+    mock_cpu.dbg_skip_pc = UINT32_MAX;       /* the interpreter spends the skip once the instruction retires */
     mock_cpu.reg[ARM_PC] = 0x2002; arm_dbg_check(&mock_cpu);
     mock_cpu.reg[ARM_PC] = 0x2000;
     CHECK(arm_dbg_check(&mock_cpu), "hit again on the next pass");
@@ -1138,6 +1246,41 @@ static void test_debug(void) {
     unlink(p);
 
     /* Watchpoint: a changed SRAM value is reported with the writer's pc. */
+    mock_reset();
+    mock_cpu.dbg_skip_pc = UINT32_MAX;
+    sh.interactive = true;
+    /* A stale skip: hit, `break clear all` (no check runs while nothing is
+     * armed), release, re-arm at the same address — the first hit after the
+     * re-arm must not be skipped; nor after `reg pc =` while halted. */
+    mock_reset();
+    sh.interactive = true;
+    mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000; mock_cpu.dbg_halted = true;
+    shell_enqueue_line(&sh, "break 1 0x2001");
+    shell_script_tick(&sh);
+    mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000; mock_cpu.dbg_halted = true;
+    shell_enqueue_line(&sh, "break clear all");
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.dbg_count == 0 && !mock_cpu.dbg_halted, "break clear all released the node");
+    shell_enqueue_line(&sh, "break 1 0x2001");
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.dbg_count == 1 && mock_cpu.dbg_skip_pc == UINT32_MAX, "re-arming resets a stale skip (0x%x)", mock_cpu.dbg_skip_pc);
+    mock_cpu.dbg_skip_pc = 0x2000;
+    shell_enqueue_line(&sh, "reg 1 pc = 0x3000");
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.reg[ARM_PC] == 0x3000 && mock_cpu.dbg_skip_pc == UINT32_MAX, "a pc write resets the skip");
+    /* ... and the following release does not arm it again: the pc left the hit site. */
+    mock_cpu.dbg_halted = true; mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000;
+    shell_enqueue_line(&sh, "continue");
+    shell_script_tick(&sh);
+    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_skip_pc == UINT32_MAX, "release after a pc write arms no skip (0x%x)", mock_cpu.dbg_skip_pc);
+    /* A node released by `continue` (not halted, still armed) keeps its skip
+     * when another breakpoint is added: it must not re-hit the one it left. */
+    mock_cpu.reg[ARM_PC] = 0x2000; mock_cpu.dbg_halted = true; mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000;
+    shell_enqueue_line(&sh, "continue");
+    shell_enqueue_line(&sh, "break 1 0x2401");
+    shell_script_tick(&sh);
+    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_count == 2 && mock_cpu.dbg_skip_pc == 0x2000, "adding a breakpoint keeps a released node's skip (0x%x)", mock_cpu.dbg_skip_pc);
+
     mock_reset();
     mock_cpu.dbg_skip_pc = UINT32_MAX;
     sh.interactive = true;
@@ -1180,6 +1323,7 @@ int run_shell_tests(int verbose) {
     test_cmd();
     test_expand();
     test_node_commands();
+    test_symbols();
     test_arm_inspection();
     test_workflow();
     test_environment();

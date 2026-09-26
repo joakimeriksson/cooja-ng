@@ -471,7 +471,16 @@ typedef struct arm_cpu {
     uint32_t  dbg_hit_pc;            /* bp: its address; wp: the writer's pc */
     uint32_t  dbg_hit_old, dbg_hit_value;
     uint32_t  dbg_prev_pc;
-    uint32_t  dbg_skip_pc;           /* continue from a bp without re-hitting it */
+    uint32_t  dbg_skip_sp;           /* ...and the stack it was armed on: an ISR
+                                      * reaching the same pc (another frame) is
+                                      * a genuine hit, not the released one */
+    uint32_t  dbg_skip_pc;           /* continue from a bp without re-hitting it:
+                                      * armed until the instruction at that pc
+                                      * has retired (an ISR taken first returns
+                                      * to it); reset by re-arming and a pc write */
+    bool      dbg_skip_started;      /* that instruction began this iteration;
+                                      * spent at the next iteration's top unless
+                                      * it was undone (fault) or never fetched */
 } arm_cpu_t;
 
 /* --- Public API --- */
@@ -567,6 +576,7 @@ void arm_cpu_set_frequency(arm_cpu_t *cpu, uint32_t freq_hz);
 /* Shell breakpoints/watchpoints: true (and dbg_halted set) on a hit at the
  * current instruction boundary.  Only called while cpu->dbg_count > 0. */
 bool arm_dbg_check(arm_cpu_t *cpu);
+void arm_dbg_release(arm_cpu_t *cpu, int64_t now_ns);
 /* The interpreter loop's debugger check (GDB stub + shell), called only while
  * one is attached.  True = stop the slice here. */
 bool arm_debug_stop(arm_cpu_t *cpu);

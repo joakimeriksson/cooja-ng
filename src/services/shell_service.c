@@ -720,7 +720,9 @@ static void shell_destroy(sim_runtime_t *sim, void *state) {
     if (s->transcript) { fclose(s->transcript); s->transcript = NULL; }
     free(s->hist);
     s->hist = NULL;
+    for (int i = 0; i < SIM_EQ_MAX_NODES; i++) { free(s->sym_cache[i]); s->sym_cache[i] = NULL; }
     shell_script_abort(s);
+    shell_script_free_all(s);
     install_signals(false);
     s->active = false;
 }
@@ -801,9 +803,10 @@ void shell_service_on_restart(shell_service_t *s) {
      * aborted — their state described the old run. */
     shell_script_abort(s);
     shell_script_at_remove(s, -1);
-    s->trigger_count = 0;
+    shell_script_clear_triggers(s);
     s->triggers_dropped = 0;
     s->restart_pending = false;
+    for (int i = 0; i < SIM_EQ_MAX_NODES; i++) { free(s->sym_cache[i]); s->sym_cache[i] = NULL; }
 }
 
 int shell_service_report(shell_service_t *s, int64_t elapsed_ns) {
