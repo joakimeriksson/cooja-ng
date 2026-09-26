@@ -456,6 +456,16 @@ static void test_review_fixes(void) {
     CHECK(sh.atq_count == 1 && sh.watch_count == 0, "only the non-blocking 'at +1s run' was scheduled (atq=%d watches=%d)", sh.atq_count, sh.watch_count);
     CHECK(!sh.failed, "refusals typed at the prompt do not set a verdict");
 
+    /* More due entries than the per-tick guard: the popped one is never dropped. */
+    {
+        mock_reset();
+        sh.interactive = true;
+        shell_enqueue_line(&sh, "every 1us echo x");
+        shell_script_tick(&sh);
+        advance(1000000LL); shell_script_tick(&sh);             /* 1000 due, the guard stops at 256 */
+        CHECK(sh.atq_count == 1, "an every survives the per-tick guard (%d)", sh.atq_count);
+    }
+
     /* at list / at clear, and the atq / atrm aliases. */
     mock_reset();
     sh.interactive = true;
