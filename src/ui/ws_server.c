@@ -53,8 +53,11 @@
  * reading -- or its socket taking nothing at all for this long, which
  * with small messages comes first.  A live link, however slow, takes
  * *something* in 10 s; the browser, not the operator's JavaScript, reads
- * the socket, so a page busy parsing does not go quiet for that long. */
-#define OUT_QUEUE_MAX  (4 * 1024 * 1024)
+ * the socket, so a page busy parsing does not go quiet for that long.
+ * The queue also carries GET /'s reply, so it holds the largest page
+ * ws_server_set_html accepts plus that reply's header: a page can never
+ * be cut off at the queue limit. */
+#define OUT_QUEUE_MAX  (WS_SERVER_PAGE_MAX + 256)
 #define OUT_STALL_MS   10000
 
 typedef enum { CLIENT_HTTP, CLIENT_WS } client_state_t;
@@ -889,15 +892,19 @@ void ws_server_set_message_callback(ws_server_t *srv, ws_message_cb_t cb, void *
     srv->msg_userdata = userdata;
 }
 
-void ws_server_set_html(ws_server_t *srv, const char *html, int len) {
-    if (!srv) return;
+int ws_server_set_html(ws_server_t *srv, const char *html, int len) {
+    if (!srv) return -1;
+    if (len < 0 || len > WS_SERVER_PAGE_MAX) return -1;
     free(srv->html);
     srv->html = malloc(len + 1);
-    if (srv->html) {
-        memcpy(srv->html, html, len);
-        srv->html[len] = '\0';
-        srv->html_len = len;
+    if (!srv->html) {
+        srv->html_len = 0;
+        return -1;
     }
+    memcpy(srv->html, html, len);
+    srv->html[len] = '\0';
+    srv->html_len = len;
+    return 0;
 }
 
 int ws_server_client_count(ws_server_t *srv) {

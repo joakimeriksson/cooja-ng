@@ -38,8 +38,16 @@ void ws_server_broadcast(ws_server_t *srv, const char *data, int len);
 /* Send a binary WebSocket frame to all connected clients. */
 void ws_server_broadcast_binary(ws_server_t *srv, const uint8_t *data, int len);
 
-/* Set the HTML content to serve on GET /. The data is copied internally. */
-void ws_server_set_html(ws_server_t *srv, const char *html, int len);
+/* The largest page ws_server_set_html accepts.  GET / is answered through
+ * the client's outgoing queue, which is sized to hold a whole page and its
+ * header (OUT_QUEUE_MAX in ws_server.c); a larger one would be cut off
+ * where the queue ends. */
+#define WS_SERVER_PAGE_MAX (4 * 1024 * 1024)
+
+/* Set the HTML content to serve on GET /.  The data is copied internally.
+ * Returns 0, or -1 for a page over WS_SERVER_PAGE_MAX, which is not
+ * taken. */
+int ws_server_set_html(ws_server_t *srv, const char *html, int len);
 
 /* Callback for incoming text/binary messages from clients. */
 typedef void (*ws_message_cb_t)(const char *data, int len, void *userdata);

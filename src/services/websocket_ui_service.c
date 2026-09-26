@@ -22,7 +22,9 @@
 #include <unistd.h>
 
 #define UI_PAGE_PATH "ui/index.html"
-#define UI_PAGE_MAX  (16L * 1024L * 1024L)
+/* The server answers GET / through the client's outgoing queue, which is
+ * sized for this much page; a larger one would be cut off there. */
+#define UI_PAGE_MAX  ((long)WS_SERVER_PAGE_MAX)
 
 /* Serve ui/index.html if it is a regular file of at most UI_PAGE_MAX bytes;
  * otherwise say why and leave the server's built-in page.  The file is
@@ -52,10 +54,9 @@ static void load_page(ws_server_t *server) {
             got += (size_t)n;
         }
     }
-    if (ok) {
-        html[got] = '\0';
-        ws_server_set_html(server, html, (int)got);
-    } else {
+    if (ok)
+        ok = ws_server_set_html(server, html, (int)got) == 0;
+    if (!ok) {
         fprintf(stderr, "Warning: " UI_PAGE_PATH " is not a readable file of "
                         "at most %ld bytes, serving default page\n", UI_PAGE_MAX);
     }
