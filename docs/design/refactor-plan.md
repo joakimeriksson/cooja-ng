@@ -3234,13 +3234,12 @@ the same patch.
   `sim_eq_*` back above a few percent.
 - **Performance and refactoring work on the kernel, runner and radio bus
   follows `kernel-radio-review-and-performance-plan.md`** (2026-09-25): its
-  findings F1–F16 and Tiers 0–3 are the ordered backlog; every tier is gated
-  by `check-determinism.sh` + `check-baseline.sh`, and Tier 3 (longer
-  execute slices) is the only one allowed to move the simulation, with its
-  own sign-off.  The runner's per-wakeup O(N) loops (Tier 0) waited for
-  PR #56 (native CCA), which merged 2026-09-26, so Tier 0 items 1–2 can
-  start; the dead synchronous chip-delivery subsystem in `sim_radio_bus.c`
-  (F1/R1) is deleted after that, not in parallel with it.
+  findings F1–F16 and Tiers 0–3 are the ordered backlog, and its §7 holds
+  the current sequencing.  Every step is gated by `check-determinism.sh` +
+  `check-baseline.sh`.  A step that moves the simulation (Tier 3, R2, R3,
+  and Tier 1's horizon change if the baseline shows it moves) gets an
+  explicit "expected to move" sign-off and is never folded into a
+  byte-identical step.
 
 ## Doc Status
 
