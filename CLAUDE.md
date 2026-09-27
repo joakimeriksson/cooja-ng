@@ -7,6 +7,13 @@ Before kernel, platform, plugin, or simulation-runner refactors, read
 internal simulation kernel direction, static plugin registry model, and staged
 runtime extraction plan.
 
+Before performance work on the kernel, runner or radio bus, read
+[`docs/design/kernel-radio-review-and-performance-plan.md`](docs/design/kernel-radio-review-and-performance-plan.md):
+where the time goes per ISA and node count (measured), the radio-delivery
+findings, and the ordered, gated tiers.  Decisions that must not be silently
+reversed live in the refactor plan's **Decisions Log**; add to it in the same
+patch that makes a new one.
+
 ## Build
 
 ```sh
