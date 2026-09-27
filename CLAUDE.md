@@ -138,6 +138,8 @@ python3 tools/check-shell-tty.py            # terminal-only paths via a pseudo-t
 # Chip-driver + radio-medium unit suites
 ./build/test_runner cc1200-mock-host        # 73 CC1200 chip tests (mock host, no CPU)
 ./build/test_runner radio-medium            # 241 radio-medium routing tests
+./build/test_runner event-queue             # kernel heap: (time, seq) order, one wakeup per node,
+                                            # reschedule-in-place vs a sorted-array reference
 ./build/test_runner renode-cosim -v         # Renode co-simulation (csim as clock SLAVE):
                                             # 24-byte wire codec, the memory-mapped register
                                             # window + its FIFOs, and the protocol/horizon
