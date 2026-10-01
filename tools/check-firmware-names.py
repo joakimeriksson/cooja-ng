@@ -17,6 +17,8 @@ run-cooja-tests.sh --clean):
     since firmware/cooja is gitignored and the release package has none;
   - the Contiki-NG root is found above a .csc when --contiki is not given, so
     a name does not depend on the flag either;
+  - when git cannot say what it tracks, nothing is taken as not shipped:
+    the lookup and csc2json --local-firmware fail;
   - --clean removes local builds and keeps shipped ones, by the same
     definition of "shipped" (csc2json --local-firmware), and a clean whose
     listing fails is an error, not an empty clean;
@@ -57,6 +59,13 @@ def touch(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write("x\n")
+
+
+def break_index(checkout):
+    """Make `git ls-files` fail in `checkout` (for root too, which an
+    unreadable index would not)."""
+    with open(os.path.join(checkout, ".git", "index"), "w") as f:
+        f.write("not an index\n")
 
 
 CSC = """<?xml version="1.0" encoding="UTF-8"?>
@@ -292,6 +301,14 @@ class Lookup(FakeTree):
         self.assertFalse(csc2json.is_shipped_firmware(
             os.path.join(self.fw, "node.z1")))
 
+    def test_git_failure_is_an_error(self):
+        # Not "untracked", which would pass over a shipped image.
+        touch(os.path.join(self.fw, "node.z1"))
+        git(self.csim, "add", "firmware/z1/node.z1")
+        break_index(self.csim)
+        with self.assertRaises(csc2json.FirmwareListingError):
+            self.nodes(("n", self.src, "z1"))
+
     def test_same_name_different_directories(self):
         fw, _ = self.nodes(("a", "[CONTIKI_DIR]/tests/14-rpl-lite/code/node.c", "z1"),
                            ("b", "[CONTIKI_DIR]/tests/15-rpl-classic/code/node.c", "z1"))
@@ -364,6 +381,50 @@ class Shipped(FakeTree):
         path = os.path.join(self.tmp, "elsewhere", "node.z1")
         touch(path)
         self.assertFalse(csc2json.is_shipped_firmware(path))
+
+    def test_git_failure_is_not_untracked(self):
+        git(self.csim, "init", "-q")
+        path = self.firmware()
+        git(self.csim, "add", "firmware/z1/node.z1")
+        break_index(self.csim)
+        with self.assertRaises(csc2json.FirmwareListingError):
+            csc2json.is_shipped_firmware(path)
+
+
+class LocalFirmwareListing(FakeTree):
+    """csc2json --local-firmware, run from a scratch copy of the tree: a
+    listing that cannot be made fails, it never reads as an empty one."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.csim, "tools"))
+        shutil.copy(os.path.join(TOOLS, "csc2json.py"),
+                    os.path.join(self.csim, "tools"))
+
+    def listing(self, directory):
+        return subprocess.run(
+            ["python3", os.path.join(self.csim, "tools", "csc2json.py"),
+             "--local-firmware", directory],
+            capture_output=True, text=True, check=False)
+
+    def test_lists_local_builds(self):
+        git(self.csim, "init", "-q")
+        touch(os.path.join(self.fw, "node.z1"))
+        touch(os.path.join(self.fw, "node-abcdef.z1"))
+        git(self.csim, "add", "firmware/z1/node.z1")
+        r = self.listing(self.fw)
+        self.assertEqual((r.returncode, r.stdout),
+                         (0, os.path.join(self.fw, "node-abcdef.z1") + "\n"))
+
+    def test_git_failure(self):
+        git(self.csim, "init", "-q")
+        touch(os.path.join(self.fw, "node.z1"))
+        git(self.csim, "add", "firmware/z1/node.z1")
+        break_index(self.csim)
+        r = self.listing(self.fw)
+        self.assertEqual((r.returncode, r.stdout), (1, ""))
+        self.assertIn("ERROR: cannot list the local firmware builds", r.stderr)
+
 
 
 class Clean(FakeTree):
@@ -448,6 +509,21 @@ class Clean(FakeTree):
         self.assertIn("could not list the local firmware builds", r.stdout + r.stderr)
         self.assertNotIn("removed 0 local firmware builds", r.stdout)
         self.assertKept(self.shipped, self.local, self.cooja_plain, self.cooja_hashed)
+
+    def test_git_failure_keeps_shipped_firmware(self):
+        # git cannot say what it tracks: nothing is taken as a local build,
+        # and the clean fails.
+        git(self.csim, "init", "-q")
+        git(self.csim, "add", "firmware/z1/node.z1")
+        break_index(self.csim)
+        env = dict(os.environ, CONTIKI_DIR=self.contiki)
+        env.pop("CSIM_DIR", None)
+        r = subprocess.run(
+            ["bash", os.path.join(self.csim, "tools", "run-cooja-tests.sh"), "--clean"],
+            env=env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("could not list the local firmware builds", r.stdout + r.stderr)
+        self.assertKept(self.shipped)
 
 
 FAKE_MAKE = """#!/usr/bin/env python3

@@ -441,14 +441,27 @@ def _csim_is_checkout():
         return False
 
 
+class FirmwareListingError(Exception):
+    """Whether a firmware file is shipped could not be decided.  Never
+    answered as "not shipped": run-cooja-tests.sh --clean deletes what is
+    not, so an empty listing would take every shipped image with it."""
+
+
 @functools.lru_cache(maxsize=None)
 def _tracked_names(directory):
     """The names of the files git tracks directly in `directory`, a real
     path inside a checkout of CSIM_DIR."""
     rel = os.path.relpath(directory, os.path.realpath(CSIM_DIR))
-    listing = subprocess.run(
-        ["git", "-C", CSIM_DIR, "ls-files", "-z", "--", rel],
-        capture_output=True, text=True, check=False)
+    try:
+        listing = subprocess.run(
+            ["git", "-C", CSIM_DIR, "ls-files", "-z", "--", rel],
+            capture_output=True, text=True, check=False)
+    except OSError as e:
+        raise FirmwareListingError(f"cannot run git ls-files: {e}") from e
+    if listing.returncode != 0:
+        raise FirmwareListingError(
+            f"git ls-files failed for {directory}: "
+            f"{listing.stderr.strip() or f'exit {listing.returncode}'}")
     rel = "" if rel == os.curdir else rel.replace(os.sep, "/")
     return frozenset(f.rsplit("/", 1)[-1] for f in listing.stdout.split("\0")
                      if f and f.rpartition("/")[0] == rel)
@@ -460,16 +473,14 @@ def is_shipped_firmware(path):
     In a git checkout of the tree that means tracked.  In a tree that is not
     one (a release archive, or a tree unpacked inside some other repository)
     a file of a PREBUILT_TARGETS target came with the tree, and anything else
-    is a local build.  Nothing outside the tree is shipped."""
+    is a local build.  Nothing outside the tree is shipped.  Raises
+    FirmwareListingError when git cannot say what it tracks."""
     directory = os.path.realpath(os.path.dirname(os.path.abspath(path)))
     if not _is_within(directory, os.path.realpath(CSIM_DIR)):
         return False
     if not _csim_is_checkout():
         return os.path.basename(path).rpartition(".")[2] in PREBUILT_TARGETS
-    try:
-        return os.path.basename(path) in _tracked_names(directory)
-    except OSError:
-        return False
+    return os.path.basename(path) in _tracked_names(directory)
 
 
 def local_firmware_files(directory):
@@ -1624,7 +1635,13 @@ def main():
                   f"as shipped: {CSIM_DIR} is not a git checkout, so shipped "
                   "firmware cannot be told apart from local builds",
                   file=sys.stderr)
-        for path in local_firmware_files(args.local_firmware):
+        try:
+            paths = local_firmware_files(args.local_firmware)
+        except FirmwareListingError as e:
+            print(f"ERROR: cannot list the local firmware builds in "
+                  f"{args.local_firmware}: {e}", file=sys.stderr)
+            sys.exit(1)
+        for path in paths:
             print(path)
         return
 
@@ -1645,6 +1662,10 @@ def main():
         print("  (unknown .csc features are fatal by design — see "
               "ConversionError in this file; --lax downgrades for exploration)",
               file=sys.stderr)
+        sys.exit(2)
+    except FirmwareListingError as e:
+        print(f"CONVERSION FAILED: {csc_path}", file=sys.stderr)
+        print(f"  ERROR: {e}", file=sys.stderr)
         sys.exit(2)
 
     if warnings and args.warn:
