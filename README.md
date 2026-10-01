@@ -110,7 +110,7 @@ Shared 802.15.4 helpers live in [`include/common/ieee_802154.h`](include/common/
 
 **Test scripting** — JSON config files (see [`docs/test-format.md`](docs/test-format.md)), embedded QuickJS engine for Cooja-style JS scripts (`TIMEOUT`, `WAIT_UNTIL`, `log.testOK`, `log.testFailed`), `tools/csc2json.py` to convert `.csc` files, `tools/run-cooja-tests.sh` to drive the whole upstream test suite.
 
-**Web UI** — `--ui [port]` starts a WebSocket server, single embedded HTML page at `http://localhost:8080/`: live node positions, packet animations, RPL parent edges, per-node UART, pause/step/speed.  No Node.js, no build step.
+**Web UI** — `--ui [port]` starts a WebSocket server, single embedded HTML page at `http://localhost:8080/`: live node positions, packet animations, RPL parent edges, per-node UART, pause/step/speed.  No Node.js, no build step.  The UI accepts commands, so it listens on loopback only and refuses WebSocket connections from other sites' pages; `--ui-bind 0.0.0.0` (or a specific IPv4 address) makes it reachable from the network — anyone who can reach the port can then pause, restart or reconfigure the run.  It also turns off the Host check that stops DNS rebinding (a server meant to be reached by name cannot insist on a loopback name), so any web page open in the operator's own browser can then drive the run, even when a firewall keeps the port off the network.
 
 ## Running tests
 
@@ -149,7 +149,7 @@ Shared 802.15.4 helpers live in [`include/common/ieee_802154.h`](include/common/
 ./build/test_runner mixed-multinode configs/udgm-100node-grid-arm.json
 ```
 
-Platform is auto-detected from the firmware extension (see table above).  Options: `-t ms` (sim duration), `-n nodes`, `-v` (verbose), `-q` (quiet), `--threads N`, `--ui [port]`.
+Platform is auto-detected from the firmware extension (see table above).  Options: `-t ms` (sim duration), `-n nodes`, `-v` (verbose), `-q` (quiet), `--threads N`, `--ui [port]`, `--ui-bind addr`.
 
 ### The Cooja test suite
 

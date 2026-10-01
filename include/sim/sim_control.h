@@ -110,8 +110,9 @@ typedef struct sim_control_ops {
     void  (*set_clock_deviation)(void *u, int idx, double deviation);
     /* Restart the run from its configuration at the next loop turn. */
     void  (*restart)(void *u);
-    /* Start the live web UI on a port.  0 on success. */
-    int   (*start_ui)(void *u, int port);
+    /* Start the live web UI on a port, where --ui-bind says.  0 on
+     * success, with the URL to open written to url. */
+    int   (*start_ui)(void *u, int port, char *url, size_t urlsz);
     /* sim_mote_ops_t pass-throughs; -1 / false = unsupported. */
     int   (*set_input_pin)(void *u, int idx, int port, int pin, int level);
     int   (*button_pin)(void *u, int idx, int *port, int *pin, bool *active_low);
