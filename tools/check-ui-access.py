@@ -41,6 +41,8 @@ sends raw requests shaped like the ones a browser would send, asserting:
     dropped, and 6 KB of cookies (localhost cookies are shared across
     ports) still gets the page; a client still writing such a request when
     the 431 goes out sees the rest taken and then EOF, not a reset;
+  - a client that is behind when it sends a Close gets the server's Close
+    after its backlog and nothing after it (RFC 6455 5.5.1);
   - a client that stops reading, or reads the page a byte at a time,
     never holds the simulation thread: a healthy viewer keeps its cadence
     meanwhile, and the one that stopped reading is dropped with a line on
@@ -219,6 +221,43 @@ def pong_for(port, size, fin=True):
         return 'no reply'
     except OSError as e:
         return f'error: {e}'
+
+
+def frames_around_close(port):
+    """(whether frames came before the server's Close, how many came after
+    it) for a client that falls behind -- asking for the full state every
+    millisecond for a second without reading -- then sends a Close and
+    reads to EOF 1.5 s later.  'no Close' if the server never sent one."""
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)    # falls behind sooner
+    s.settimeout(5)
+    s.connect(('127.0.0.1', port))
+    s.sendall(b'GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n'
+              b'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+              b'Sec-WebSocket-Version: 13\r\n\r\n')
+    reply = b''
+    while b'\r\n\r\n' not in reply:
+        chunk = s.recv(1)
+        if not chunk:
+            return 'closed during handshake'
+        reply += chunk
+    with s:
+        t0 = time.time()
+        while time.time() - t0 < 1:
+            ws_send(s, 0x1, b'{"cmd":"full"}')
+            time.sleep(0.001)
+        ws_send(s, 0x8, b'')
+        time.sleep(1.5)
+        before = after = 0
+        seen = False
+        while (frame := ws_next(s)) is not None:
+            if seen:
+                after += 1
+            elif frame[0] == 0x8:
+                seen = True
+            else:
+                before += 1
+    return (before > 0, after) if seen else 'no Close'
 
 
 def exit_code(*args, firmware=FIRMWARE):
@@ -482,6 +521,9 @@ def main():
         expect('the one that stopped reading is dropped, and logged', dropped(), True)
         stalled.close()
         healthy.close()
+
+        expect('a client behind sends Close: (backlog before the server\'s Close, '
+               'frames after it)', frames_around_close(port), (True, 0))
     finally:
         r.close()
         tmp.cleanup()
