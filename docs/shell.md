@@ -216,7 +216,11 @@ scheduled it, and the message names both (`at #3 (test.cnsh:4): ...`).
 
 A hit halts that node where it is and pauses the simulation at the next slice
 boundary (other nodes may finish the slice they are in).  `run` resumes the
-others with the node still halted; `continue` releases it.  The time the
+others with the node still halted; `continue` releases it.  The release
+skips the breakpoint once per stack frame: an interrupt that reaches the
+same breakpoint before the released instruction has run is reported as a
+hit of its own, and continuing from it still leaves the interrupted code's
+release in place.  The time the
 others ran on is not replayed: the node resumes at the current instant with
 its clock — timers and radio included — that much behind.  An armed node runs
 in the interpreter, never the JIT, and costs one out-of-line check per

@@ -26,11 +26,9 @@ bool arm_debug_stop(arm_cpu_t *cpu) {
  * behind, while its peripherals' time jumps forward at the release, as on
  * a real debug halt where the counters keep running. */
 void arm_dbg_release(arm_cpu_t *cpu, int64_t now_ns) {
-    if (cpu->dbg_hit_kind == 1 && (cpu->reg[ARM_PC] & ~1u) == cpu->dbg_hit_pc) {
-        cpu->dbg_skip_pc = cpu->dbg_hit_pc;
-        cpu->dbg_skip_sp = cpu->reg[ARM_SP];
-    }
-    cpu->dbg_skip_started = false;
+    if (cpu->dbg_hit_kind == 1 && (cpu->reg[ARM_PC] & ~1u) == cpu->dbg_hit_pc)
+        arm_dbg_skip_arm(cpu, cpu->dbg_hit_pc, cpu->reg[ARM_SP]);   /* other frames keep theirs */
+    for (int i = 0; i < cpu->dbg_skip_n; i++) cpu->dbg_skip[i].started = false;
     cpu->dbg_halted = false;
     if (now_ns > cpu->sim_time_ns) {
         cpu->lpm_ns += now_ns - cpu->sim_time_ns;
@@ -74,7 +72,7 @@ bool arm_dbg_check(arm_cpu_t *cpu) {
      * exception taken in between (a due event, a pending IRQ, a WFI
      * fast-forward) that returns to the same pc with the instruction still
      * to run does not re-hit, and the next visit after it ran does. */
-    bool skip = pc == cpu->dbg_skip_pc && cpu->reg[ARM_SP] == cpu->dbg_skip_sp;
+    bool skip = cpu->dbg_skip_n && arm_dbg_skip_find(cpu, pc, cpu->reg[ARM_SP]) >= 0;
     for (int i = 0; !skip && i < cpu->dbg_bp_n; i++) {
         if (cpu->dbg_bp[i] != pc) continue;
         cpu->dbg_hit_kind = 1;

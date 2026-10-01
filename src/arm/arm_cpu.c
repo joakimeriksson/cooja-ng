@@ -310,7 +310,8 @@ static inline void arm_insn_snapshot_multi(arm_cpu_t *cpu, uint32_t addr,
  * itself and none of its writes survive. Cycles stay charged. A fault is
  * only ever armed by a checked access, which snapshots first. */
 static inline void arm_insn_undo(arm_cpu_t *cpu) {
-    cpu->dbg_skip_started = false;     /* not retired: the debug skip stays */
+    for (int i = 0; i < cpu->dbg_skip_n; i++)
+        cpu->dbg_skip[i].started = false;   /* not retired: the debug skip stays */
 #ifdef DEBUG
     /* The lazy snapshot is only right if nothing was written before it:
      * a load/store form that writes a register before a beat that can be
@@ -1930,10 +1931,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
              * point every exit of the loop passes through — unless that
              * instruction was undone by a precise fault (arm_insn_undo) or
              * never fetched (INVEP), which reset the flag. */
-            if (cpu->dbg_skip_started) {
-                cpu->dbg_skip_started = false;
-                cpu->dbg_skip_pc = UINT32_MAX;
-            }
+            for (int i = cpu->dbg_skip_n - 1; i >= 0; i--)
+                if (cpu->dbg_skip[i].started) arm_dbg_skip_remove(cpu, i);
             if (arm_debug_stop(cpu)) {
                 cpu->stopping = true;
                 break;
@@ -2000,9 +1999,10 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         }
 
         uint32_t pc = cpu->reg[ARM_PC];
-        if (__builtin_expect(dbg_hook != NULL, 0))
-            cpu->dbg_skip_started = (pc & ~1u) == cpu->dbg_skip_pc &&
-                                    cpu->reg[ARM_SP] == cpu->dbg_skip_sp;
+        if (__builtin_expect(dbg_hook != NULL, 0) && cpu->dbg_skip_n) {
+            int k = arm_dbg_skip_find(cpu, pc & ~1u, cpu->reg[ARM_SP]);
+            if (k >= 0) cpu->dbg_skip[k].started = true;
+        }
 
         /* Precise fault support (a SoC with a bus-side permission check, or
          * the security extension's attribution unit): a refusal is taken at
@@ -2054,7 +2054,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                 cpu->fetch_ok_len = 0;
                 cpu->instructions++;
                 remaining--;
-                cpu->dbg_skip_started = false;     /* never fetched: the debug skip stays */
+                for (int i = 0; i < cpu->dbg_skip_n; i++)
+                    cpu->dbg_skip[i].started = false;   /* never fetched: the debug skip stays */
                 arm_exception_entry(cpu, EXC_SECUREFAULT);
                 continue;
             }

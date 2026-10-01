@@ -458,6 +458,7 @@ typedef struct arm_cpu {
      * hit sets dbg_halted: the node stops mid-slice and its execute is
      * skipped until the shell clears the flag. */
 #define ARM_DBG_MAX_BP 8
+#define ARM_DBG_MAX_SKIP 4         /* released frames pending their instruction */
 #define ARM_DBG_MAX_WP 4
     int       dbg_count;             /* armed breakpoints + watchpoints     */
     uint32_t  dbg_bp[ARM_DBG_MAX_BP];
@@ -471,16 +472,16 @@ typedef struct arm_cpu {
     uint32_t  dbg_hit_pc;            /* bp: its address; wp: the writer's pc */
     uint32_t  dbg_hit_old, dbg_hit_value;
     uint32_t  dbg_prev_pc;
-    uint32_t  dbg_skip_sp;           /* ...and the stack it was armed on: an ISR
-                                      * reaching the same pc (another frame) is
-                                      * a genuine hit, not the released one */
-    uint32_t  dbg_skip_pc;           /* continue from a bp without re-hitting it:
-                                      * armed until the instruction at that pc
-                                      * has retired (an ISR taken first returns
-                                      * to it); reset by re-arming and a pc write */
-    bool      dbg_skip_started;      /* that instruction began this iteration;
-                                      * spent at the next iteration's top unless
-                                      * it was undone (fault) or never fetched */
+    /* `continue` from a breakpoint without re-hitting it: one entry per
+     * released frame (pc + the stack it was armed on), so an ISR reaching
+     * the same pc is a genuine hit, and releasing that hit does not
+     * overwrite the thread's entry.  An entry stays until the instruction
+     * at its pc has retired in its own frame: `started` is set at the pc
+     * read and the entry is spent at the next iteration's top, unless the
+     * instruction was undone (precise fault) or never fetched (INVEP).
+     * When full, the oldest entry is evicted. */
+    struct { uint32_t pc, sp; bool started; } dbg_skip[ARM_DBG_MAX_SKIP];
+    int       dbg_skip_n;
 } arm_cpu_t;
 
 /* --- Public API --- */
@@ -577,6 +578,31 @@ void arm_cpu_set_frequency(arm_cpu_t *cpu, uint32_t freq_hz);
  * current instruction boundary.  Only called while cpu->dbg_count > 0. */
 bool arm_dbg_check(arm_cpu_t *cpu);
 void arm_dbg_release(arm_cpu_t *cpu, int64_t now_ns);
+
+/* The release's skip list (see dbg_skip).  arm: keep an existing (pc, sp)
+ * entry, else append, evicting the oldest when full. */
+static inline int arm_dbg_skip_find(const arm_cpu_t *cpu, uint32_t pc, uint32_t sp) {
+    for (int i = 0; i < cpu->dbg_skip_n; i++)
+        if (cpu->dbg_skip[i].pc == pc && cpu->dbg_skip[i].sp == sp) return i;
+    return -1;
+}
+static inline void arm_dbg_skip_remove(arm_cpu_t *cpu, int i) {
+    for (int k = i + 1; k < cpu->dbg_skip_n; k++) cpu->dbg_skip[k - 1] = cpu->dbg_skip[k];
+    cpu->dbg_skip_n--;
+}
+static inline void arm_dbg_skip_arm(arm_cpu_t *cpu, uint32_t pc, uint32_t sp) {
+    if (arm_dbg_skip_find(cpu, pc, sp) >= 0) return;
+    if (cpu->dbg_skip_n == ARM_DBG_MAX_SKIP) arm_dbg_skip_remove(cpu, 0);
+    cpu->dbg_skip[cpu->dbg_skip_n].pc = pc;
+    cpu->dbg_skip[cpu->dbg_skip_n].sp = sp;
+    cpu->dbg_skip[cpu->dbg_skip_n].started = false;
+    cpu->dbg_skip_n++;
+}
+/* A frame left behind (`reg pc =`): drop its entry; outer frames keep theirs. */
+static inline void arm_dbg_skip_drop_sp(arm_cpu_t *cpu, uint32_t sp) {
+    for (int i = cpu->dbg_skip_n - 1; i >= 0; i--)
+        if (cpu->dbg_skip[i].sp == sp) arm_dbg_skip_remove(cpu, i);
+}
 /* The interpreter loop's debugger check (GDB stub + shell), called only while
  * one is attached.  True = stop the slice here. */
 bool arm_debug_stop(arm_cpu_t *cpu);

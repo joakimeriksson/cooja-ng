@@ -462,8 +462,11 @@ static void test_review_fixes(void) {
         sh.interactive = true;
         shell_enqueue_line(&sh, "every 1us echo x");
         shell_script_tick(&sh);
+        int64_t first = sh.atq[0].at_ns;
         advance(1000000LL); shell_script_tick(&sh);             /* 1000 due, the guard stops at 256 */
         CHECK(sh.atq_count == 1, "an every survives the per-tick guard (%d)", sh.atq_count);
+        CHECK(sh.atq[0].at_ns == first + 256 * 1000LL,          /* the old order advanced it 257 times */
+              "exactly 256 runs that tick, none popped and dropped (%lld)", (long long)(sh.atq[0].at_ns - first));
     }
 
     /* at list / at clear, and the atq / atrm aliases. */
@@ -1223,7 +1226,7 @@ static void test_debug(void) {
      * expect-halt released, continue steps past it. */
     mock_reset();
     mock_cpu.reg[ARM_PC] = 0x1000;
-    mock_cpu.dbg_skip_pc = UINT32_MAX;
+    mock_cpu.dbg_skip_n = 0;
     p = write_script("d1", "break 1 0x2001\nexpect-halt 1 1s\nreg -c pc 1 pc\ncontinue\nexpect-halt 1 1s\nbreak clear all\npass\n");
     shell_script_source(&sh, p);
     shell_script_tick(&sh);
@@ -1237,7 +1240,7 @@ static void test_debug(void) {
     CHECK(!strcmp(shell_var_get(&sh, "pc") ? shell_var_get(&sh, "pc") : "", "0x00002000"), "script continued at the hit");
     CHECK(!mock_cpu.dbg_halted && !sim_control_paused(&mock_ctl), "continue releases and resumes");
     CHECK(!arm_dbg_check(&mock_cpu), "not hit again on the way out");
-    mock_cpu.dbg_skip_pc = UINT32_MAX;       /* the interpreter spends the skip once the instruction retires */
+    mock_cpu.dbg_skip_n = 0;       /* the interpreter spends the skip once the instruction retires */
     mock_cpu.reg[ARM_PC] = 0x2002; arm_dbg_check(&mock_cpu);
     mock_cpu.reg[ARM_PC] = 0x2000;
     CHECK(arm_dbg_check(&mock_cpu), "hit again on the next pass");
@@ -1247,7 +1250,7 @@ static void test_debug(void) {
 
     /* Watchpoint: a changed SRAM value is reported with the writer's pc. */
     mock_reset();
-    mock_cpu.dbg_skip_pc = UINT32_MAX;
+    mock_cpu.dbg_skip_n = 0;
     sh.interactive = true;
     /* A stale skip: hit, `break clear all` (no check runs while nothing is
      * armed), release, re-arm at the same address — the first hit after the
@@ -1263,26 +1266,32 @@ static void test_debug(void) {
     CHECK(mock_cpu.dbg_count == 0 && !mock_cpu.dbg_halted, "break clear all released the node");
     shell_enqueue_line(&sh, "break 1 0x2001");
     shell_script_tick(&sh);
-    CHECK(mock_cpu.dbg_count == 1 && mock_cpu.dbg_skip_pc == UINT32_MAX, "re-arming resets a stale skip (0x%x)", mock_cpu.dbg_skip_pc);
-    mock_cpu.dbg_skip_pc = 0x2000;
+    CHECK(mock_cpu.dbg_count == 1 && mock_cpu.dbg_skip_n == 0, "re-arming resets a stale skip (%d)", mock_cpu.dbg_skip_n);
+    mock_cpu.dbg_skip_n = 0; arm_dbg_skip_arm(&mock_cpu, 0x2000, mock_cpu.reg[ARM_SP]);
     shell_enqueue_line(&sh, "reg 1 pc = 0x3000");
     shell_script_tick(&sh);
-    CHECK(mock_cpu.reg[ARM_PC] == 0x3000 && mock_cpu.dbg_skip_pc == UINT32_MAX, "a pc write resets the skip");
+    CHECK(mock_cpu.reg[ARM_PC] == 0x3000 && mock_cpu.dbg_skip_n == 0, "a pc write resets the skip");
     /* ... and the following release does not arm it again: the pc left the hit site. */
     mock_cpu.dbg_halted = true; mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000;
     shell_enqueue_line(&sh, "continue");
     shell_script_tick(&sh);
-    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_skip_pc == UINT32_MAX, "release after a pc write arms no skip (0x%x)", mock_cpu.dbg_skip_pc);
+    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_skip_n == 0, "release after a pc write arms no skip (%d)", mock_cpu.dbg_skip_n);
     /* A node released by `continue` (not halted, still armed) keeps its skip
      * when another breakpoint is added: it must not re-hit the one it left. */
     mock_cpu.reg[ARM_PC] = 0x2000; mock_cpu.dbg_halted = true; mock_cpu.dbg_hit_kind = 1; mock_cpu.dbg_hit_pc = 0x2000;
     shell_enqueue_line(&sh, "continue");
     shell_enqueue_line(&sh, "break 1 0x2401");
     shell_script_tick(&sh);
-    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_count == 2 && mock_cpu.dbg_skip_pc == 0x2000, "adding a breakpoint keeps a released node's skip (0x%x)", mock_cpu.dbg_skip_pc);
+    CHECK(!mock_cpu.dbg_halted && mock_cpu.dbg_count == 2 && arm_dbg_skip_find(&mock_cpu, 0x2000, mock_cpu.reg[ARM_SP]) >= 0, "adding a breakpoint keeps a released node's skip (%d)", mock_cpu.dbg_skip_n);
+    /* ...and a node halted (in an ISR, say) keeps its pending entry too. */
+    mock_cpu.dbg_halted = true;
+    shell_enqueue_line(&sh, "break 1 0x2801");
+    shell_script_tick(&sh);
+    CHECK(mock_cpu.dbg_count == 3 && arm_dbg_skip_find(&mock_cpu, 0x2000, mock_cpu.reg[ARM_SP]) >= 0, "adding a breakpoint while halted keeps a pending skip (%d)", mock_cpu.dbg_skip_n);
+    mock_cpu.dbg_halted = false;
 
     mock_reset();
-    mock_cpu.dbg_skip_pc = UINT32_MAX;
+    mock_cpu.dbg_skip_n = 0;
     sh.interactive = true;
     shell_enqueue_line(&sh, "watch 1 0x20000100 2");
     shell_enqueue_line(&sh, "watch 1 0x40000000");       /* not SRAM */

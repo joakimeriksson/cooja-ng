@@ -928,7 +928,7 @@ static int cmd_reg(shell_service_t *s, int argc, char **argv, const char *line, 
         uint32_t val = (uint32_t)v;
         if (m.arm && target == &m.arm->reg[ARM_PC]) {
             val &= ~1u;                                             /* Thumb bit is not PC */
-            m.arm->dbg_skip_pc = UINT32_MAX;                        /* the halt site is left behind */
+            arm_dbg_skip_drop_sp(m.arm, m.arm->reg[ARM_SP]);        /* this frame's halt site is left behind */
         }
         if (m.msp) val &= m.msp->is_msp430x ? 0xfffffu : 0xffffu;
         *target = val;
@@ -984,11 +984,12 @@ static void dbg_release(shell_service_t *s, int node_id, arm_cpu_t *cpu) {
 static void dbg_arm_node(shell_service_t *s, int node_id) {
     arm_cpu_t *cpu = dbg_cpu(s, node_id);
     if (!cpu) return;
-    /* A stale skip would miss the first hit — but only a node that is
-     * halted, or had nothing armed (the interpreter's clear is gated on an
-     * armed node), can hold one; a node just released by `continue` keeps
-     * its skip, or adding a breakpoint would re-hit the one it left. */
-    if (cpu->dbg_halted || cpu->dbg_count == 0) cpu->dbg_skip_pc = UINT32_MAX;
+    /* A stale skip would miss the first hit — but only a node that had
+     * nothing armed can hold one (the interpreter's spend is gated on an
+     * armed node).  Any other node keeps its pending entries: one released
+     * by `continue`, or one halted in an ISR whose thread still waits to
+     * retire the instruction it was released at. */
+    if (cpu->dbg_count == 0) cpu->dbg_skip_n = 0;
     cpu->dbg_bp_n = cpu->dbg_wp_n = 0;
     for (int i = 0; i < s->dbg_count; i++) {
         const shell_dbg_t *d = &s->dbg[i];
