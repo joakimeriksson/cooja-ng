@@ -42,7 +42,9 @@ tools/run-cooja-tests.sh 14-rpl-lite -v                   # show each test's out
 
 For each `.csc` the runner: converts it to Cooja-NG's native JSON config
 (`csc2json.py`), builds any firmware the test needs from the Contiki-NG tree
-(cached under `firmware/`; `--no-build` to skip, `--clean` to force), runs the
+(cached under `firmware/`, one build per source directory and make
+arguments; `--no-build` to skip, `--clean` to force — shipped prebuilt images
+are kept), runs the
 simulation with the test's JavaScript attached, and prints `PASS`/`FAIL` per
 test plus a summary.
 
