@@ -41,9 +41,10 @@
  * Without it, eight connections that never do (idle, or a request the
  * parser never sees end: an embedded NUL, LF-only line endings) hold every
  * slot and the UI turns everyone else away for the rest of the run.  The
- * reply gets longer: the page is 60-odd KB and a slow link is not a
- * fault, but a client that reads it a byte at a time is holding a slot,
- * and 30 s is a 2 KB/s floor that no browser goes under. */
+ * reply gets longer: a slow link is not a fault, but a client that reads
+ * the page a byte at a time is holding a slot.  30 s is a 2 KB/s floor
+ * for the 60-odd KB page we ship, and about 140 KB/s for one at
+ * WS_SERVER_PAGE_MAX. */
 #define HTTP_REQUEST_MS   5000
 #define HTTP_RESPONSE_MS 30000
 
@@ -62,10 +63,11 @@
 
 /* After a 431 the client may still be writing the rest of its request.
  * Its input is read and discarded until it hangs up, or for this long
- * after the reply went out: closing with unread bytes in the socket would
- * reset the connection, and a browser then reports the reset rather than
- * the 431.  A browser reads the reply and closes at once; this only bounds
- * a client that never does. */
+ * after the reply was queued (it is short enough to go out in the first
+ * send): closing with unread bytes in the socket would reset the
+ * connection, and a browser then reports the reset rather than the 431.
+ * A browser reads the reply and closes at once; this only bounds a client
+ * that never does. */
 #define HTTP_DRAIN_MS 2000
 
 typedef enum { CLIENT_HTTP, CLIENT_WS } client_state_t;
