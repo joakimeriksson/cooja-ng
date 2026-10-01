@@ -2530,6 +2530,10 @@ static int nrf54l_gpio_read(void *user, uint32_t addr) {
 int nrf54l15_soc_set_input_pin(struct nrf54l15_soc *soc, int port, int pin, int level) {
     if (!soc || port < 0 || port > 2 || pin < 0 || pin > 31) return -1;
     nrf54l_gpio_state_t *g = &soc->gpio[port];
+    if (level < 0) {                       /* release: IN follows OUT (loopback) again */
+        g->in_forced &= ~(1u << pin);
+        return 0;
+    }
     g->in_forced |= 1u << pin;
     if (level) g->in_level |= 1u << pin;
     else       g->in_level &= ~(1u << pin);

@@ -31,6 +31,7 @@ const char *shell_origin(shell_service_t *s, char *buf, size_t len);
 
 #define SHELL_CMD_IMMEDIATE 1u   /* allowed via "!" while the stream is blocked */
 #define SHELL_CMD_BLOCKING  2u   /* holds the command stream: not from at/every/on */
+#define SHELL_CMD_NO_SCHEDULE 4u /* discards the command stream: not from at/every/on either */
 
 typedef int (*shell_cmd_fn)(shell_service_t *s, int argc, char **argv,
                             const char *line, const int *argpos);
@@ -52,9 +53,10 @@ void shell_complete(const char *prefix, linenoiseCompletions *lc);
  * or -1 after printing an error. */
 int  shell_exec_line(shell_service_t *s, const char *line, bool immediate_only,
                      const shell_origin_t *origin);
-/* Would this command line block the stream?  (expect, sleep, wait-until,
- * step, source, and run with a duration.) */
-bool shell_line_blocks(const char *line);
+/* Would this command, with these arguments, hold the command stream?
+ * (SHELL_CMD_BLOCKING: expect, sleep, wait-until, step, source, ...; and
+ * run with a duration.) */
+bool shell_cmd_blocks(const shell_command_t *c, int argc);
 /* Refuse a command that needs the simulation's own clock while an external
  * clock source (Renode) drives it.  Returns true (and prints) if refused. */
 bool shell_refuse_external_clock(shell_service_t *s, const char *what);
@@ -136,6 +138,8 @@ int  shell_script_sendfile(shell_service_t *s, const char *path, int idx,
 int  shell_script_at_add(shell_service_t *s, int64_t at_ns, int64_t period_ns,
                          const char *cmd);
 int  shell_script_at_remove(shell_service_t *s, int id);   /* id < 0 = all */
+void shell_script_clear_triggers(shell_service_t *s);
+void shell_script_free_all(shell_service_t *s);
 int  shell_script_watch_add(shell_service_t *s, shell_watch_kind_t kind,
                             const char *pattern, const int *ids, int nids,
                             bool any, const char *cmd);

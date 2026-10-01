@@ -310,6 +310,8 @@ static inline void arm_insn_snapshot_multi(arm_cpu_t *cpu, uint32_t addr,
  * itself and none of its writes survive. Cycles stay charged. A fault is
  * only ever armed by a checked access, which snapshots first. */
 static inline void arm_insn_undo(arm_cpu_t *cpu) {
+    for (int i = 0; i < cpu->dbg_skip_n; i++)
+        cpu->dbg_skip[i].started = false;   /* not retired: the debug skip stays */
 #ifdef DEBUG
     /* The lazy snapshot is only right if nothing was written before it:
      * a load/store form that writes a register before a beat that can be
@@ -1924,6 +1926,13 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
          * commands. If halted, stop the inner loop so the multinode
          * driver can pump the stub's command processor. */
         if (__builtin_expect(dbg_hook != NULL, 0)) {
+            /* The release's skip is spent here, at the top of the iteration
+             * after the one that started the instruction at its pc — the one
+             * point every exit of the loop passes through — unless that
+             * instruction was undone by a precise fault (arm_insn_undo) or
+             * never fetched (INVEP), which reset the flag. */
+            for (int i = cpu->dbg_skip_n - 1; i >= 0; i--)
+                if (cpu->dbg_skip[i].started) arm_dbg_skip_remove(cpu, i);
             if (arm_debug_stop(cpu)) {
                 cpu->stopping = true;
                 break;
@@ -1990,6 +1999,10 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
         }
 
         uint32_t pc = cpu->reg[ARM_PC];
+        if (__builtin_expect(dbg_hook != NULL, 0) && cpu->dbg_skip_n) {
+            int k = arm_dbg_skip_find(cpu, pc & ~1u, cpu->reg[ARM_SP]);
+            if (k >= 0) cpu->dbg_skip[k].started = true;
+        }
 
         /* Precise fault support (a SoC with a bus-side permission check, or
          * the security extension's attribution unit): a refusal is taken at
@@ -2041,6 +2054,8 @@ static int arm_step_interpreter(arm_cpu_t *cpu, int count) {
                 cpu->fetch_ok_len = 0;
                 cpu->instructions++;
                 remaining--;
+                for (int i = 0; i < cpu->dbg_skip_n; i++)
+                    cpu->dbg_skip[i].started = false;   /* never fetched: the debug skip stays */
                 arm_exception_entry(cpu, EXC_SECUREFAULT);
                 continue;
             }
@@ -4758,8 +4773,8 @@ void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
      * pending event at exactly cycle_limit stays queued until the next
      * arm_step call, introducing one tick of latency per boundary event.
      * Matches msp430_step_until's drain loop. */
-    while (cpu->cycles >= cpu->next_event_cycle)
-        execute_events(cpu);
+    while (!cpu->dbg_halted && cpu->cycles >= cpu->next_event_cycle)
+        execute_events(cpu);      /* not on a halted core: its events wait too */
 
     cpu->cycle_limit = INT64_MAX;
     if (cpu->cpu_freq_hz > 0)
@@ -4769,6 +4784,10 @@ void arm_step_until(arm_cpu_t *cpu, int64_t target_cycle) {
 int64_t arm_step_micros(arm_cpu_t *cpu, int64_t jump_us, int64_t execute_us) {
     if (jump_us < 0) jump_us = 0;
     if (execute_us < 0) execute_us = 0;
+    /* A halted core does not move: a radio byte delivered to a parked node
+     * (arm_mote_rx_byte_sync) must not step it, drain its events or count
+     * the jump.  The release re-anchors last_execute_us. */
+    if (cpu->dbg_halted) return 0;
 
     /* Direct port of msp430_step_micros — exact MSPSim stepMicros replication:
      * - last_micros_delta accumulates ALL jump values (never reset)
