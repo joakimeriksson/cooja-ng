@@ -18,7 +18,8 @@ run-cooja-tests.sh --clean):
   - the Contiki-NG root is found above a .csc when --contiki is not given, so
     a name does not depend on the flag either;
   - when git cannot say what it tracks, nothing is taken as not shipped:
-    the lookup and csc2json --local-firmware fail;
+    the lookup and csc2json --local-firmware fail, and so does a listing of
+    a directory that cannot be read;
   - --clean removes local builds and keeps shipped ones, by the same
     definition of "shipped" (csc2json --local-firmware), and a clean whose
     listing fails is an error, not an empty clean;
@@ -425,6 +426,10 @@ class LocalFirmwareListing(FakeTree):
         self.assertEqual((r.returncode, r.stdout), (1, ""))
         self.assertIn("ERROR: cannot list the local firmware builds", r.stderr)
 
+    def test_unreadable_directory(self):
+        r = self.listing(os.path.join(self.csim, "firmware", "missing"))
+        self.assertEqual((r.returncode, r.stdout), (1, ""))
+        self.assertIn("ERROR: cannot list the local firmware builds", r.stderr)
 
 
 class Clean(FakeTree):

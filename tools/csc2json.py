@@ -487,12 +487,10 @@ def local_firmware_files(directory):
     """The local firmware builds directly in `directory`, a firmware/<target>
     directory: its <name>.<target> files that are not shipped.  This is what
     run-cooja-tests.sh --clean removes, so that the one definition of
-    "shipped" serves both the lookup and the clean."""
+    "shipped" serves both the lookup and the clean.  A directory that
+    cannot be read raises OSError rather than reading as empty."""
     target = os.path.basename(os.path.realpath(directory))
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError:
-        return []
+    names = sorted(os.listdir(directory))
     return [os.path.join(directory, n) for n in names
             if n.endswith("." + target)
             and os.path.isfile(os.path.join(directory, n))
@@ -1637,7 +1635,7 @@ def main():
                   file=sys.stderr)
         try:
             paths = local_firmware_files(args.local_firmware)
-        except FirmwareListingError as e:
+        except (OSError, FirmwareListingError) as e:
             print(f"ERROR: cannot list the local firmware builds in "
                   f"{args.local_firmware}: {e}", file=sys.stderr)
             sys.exit(1)
