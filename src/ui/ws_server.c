@@ -882,7 +882,11 @@ static void broadcast_frame(ws_server_t *srv, const uint8_t *header, int hlen,
                             const void *data, int len) {
     for (int i = 0; i < srv->client_count; i++) {
         ws_client_t *c = &srv->clients[i];
-        if (c->state != CLIENT_WS)
+        /* Nothing goes after a queued Close (RFC 6455 5.5.1): the client
+         * is only waiting for it, and frames piling up behind it would
+         * get a client that closed politely dropped as one that stopped
+         * reading. */
+        if (c->state != CLIENT_WS || c->close_when_sent)
             continue;
         int r = client_write(c, header, (size_t)hlen);
         if (r == 0)
